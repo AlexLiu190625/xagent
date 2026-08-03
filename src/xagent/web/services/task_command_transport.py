@@ -1,6 +1,9 @@
 """Durable, cross-worker transport for task execution commands.
 
-Ingress commits a command before acknowledging it. Every web worker runs the
+Ingress commits a command before acknowledging it: enqueue_task_command is
+the committing wrapper most callers use, built on stage_task_command, the
+staging primitive that deliberately does not commit so a caller can fold a
+command into a larger transaction of its own. Every web worker runs the
 same dispatcher; a database claim chooses one consumer while per-task ordering
 prevents a later command from overtaking an earlier unfinished command.
 """
@@ -103,6 +106,22 @@ class StagedTaskCommand:
     payload_matches: bool
     status: str
 
+    def to_enqueued(self) -> EnqueuedTaskCommand:
+        """Project this staged row into the committing wrapper's result shape.
+
+        ``staged_db_id`` becomes ``EnqueuedTaskCommand.command_id`` -- valid
+        only once the caller has committed the transaction this row was
+        staged on.
+        """
+
+        return EnqueuedTaskCommand(
+            command_id=self.staged_db_id,
+            client_command_id=self.client_command_id,
+            created=self.created,
+            payload_matches=self.payload_matches,
+            status=self.status,
+        )
+
 
 class TaskCommandOwnerStateError(RuntimeError):
     """The caller's own pending writes failed to flush before staging began.
@@ -191,6 +210,19 @@ def _canonical_payload(payload: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _normalize_command_id(command_id: str) -> str:
+    """Strip and validate a caller-supplied command_id.
+
+    Shared by every normalization site in this module so the accepted format
+    -- 1-64 URL-safe characters -- cannot drift between them.
+    """
+
+    normalized = command_id.strip()
+    if COMMAND_ID_PATTERN.fullmatch(normalized) is None:
+        raise ValueError("command_id must be 1-64 URL-safe characters")
+    return normalized
+
+
 def _matches_existing(
     command: TaskExecutionCommand,
     *,
@@ -240,19 +272,27 @@ def stage_task_command(
     5. Add and flush the new row last, so any remaining IntegrityError is
        attributable to the command insert itself.
 
-    On every exit path -- a created row, an idempotent hit, or
-    TaskCommandTaskMissing -- this call must be the last write a caller
-    issues before it commits, with no I/O or other slow work in between.
-    Returning leaves the caller holding a write lock (database-wide on
-    SQLite) over its pre-flushed writes, and over the new command row on the
-    created path, until its transaction ends; anything slow placed after
-    this call stalls every concurrent writer, the dispatcher's claim
-    included.
+    Caller obligations:
+
+    a. After the caller's own commit, it should invoke
+       notify_task_command_dispatcher(). Skipping it does not lose the
+       command -- the dispatcher's idle poll still recovers it -- but
+       delivery silently degrades to up to DISPATCHER_IDLE_SECONDS of added
+       latency instead of an immediate wakeup.
+    b. On IntegrityError from the command-insert flush in step 5, the caller
+       must roll back the whole transaction before issuing any further
+       statement on this session -- classify_task_command_conflict below
+       assumes that rollback has already happened.
+    c. On every exit path -- a created row, an idempotent hit, or
+       TaskCommandTaskMissing -- this call must be the last write a caller
+       issues before it commits, with no I/O or other slow work in between.
+       A caller that instead stays in a long transaction after staging holds
+       SQLite's database-wide writer lock for the entire transaction, not
+       the microseconds an immediate commit implies; every concurrent
+       writer, including the dispatcher's claim, blocks for that whole span.
     """
 
-    normalized_id = command_id.strip()
-    if COMMAND_ID_PATTERN.fullmatch(normalized_id) is None:
-        raise ValueError("command_id must be 1-64 URL-safe characters")
+    normalized_id = _normalize_command_id(command_id)
     resolved_task_id = int(task_id)
 
     try:
@@ -333,6 +373,10 @@ def classify_task_command_conflict(
 ) -> TaskCommandConflictClassification:
     """Classify an IntegrityError from staging a command insert.
 
+    Normalizes command_id the same way stage_task_command does -- strip plus
+    full-format validation, not strip alone -- so a lookup here targets the
+    same row a duplicate-command race would have inserted.
+
     Call only after the caller has rolled back the transaction the failed
     stage happened on -- this queries post-rollback state to tell apart a
     duplicate command_id that won the race (RACED_DUPLICATE, carrying a
@@ -352,7 +396,7 @@ def classify_task_command_conflict(
     """
 
     resolved_task_id = int(task_id)
-    normalized_id = command_id.strip()
+    normalized_id = _normalize_command_id(command_id)
     raced = (
         db.query(TaskExecutionCommand)
         .filter(
@@ -392,7 +436,14 @@ def enqueue_task_command(
     kind: TaskCommandKind,
     payload: dict[str, Any],
 ) -> EnqueuedTaskCommand:
-    """Commit an idempotent command and return only after it is durable."""
+    """Commit an idempotent command and return only after it is durable.
+
+    TaskCommandOwnerStateError from stage_task_command's owner pre-flush
+    propagates uncaught -- it is deliberately not caught alongside
+    IntegrityError below. A caller managing its own session lifetime must
+    treat it as its own write failure, not a command-staging failure, and
+    roll back before issuing any further statement on the session.
+    """
 
     try:
         staged = stage_task_command(
@@ -410,6 +461,12 @@ def enqueue_task_command(
             db.commit()
     except IntegrityError:
         db.rollback()
+        # A constraint that only fires at commit time on the caller's own row
+        # (rather than on the command insert) would still land here and enter
+        # conflict classification below. No deferrable constraint exists in
+        # the current schema, so this residual conflation cannot yet trigger
+        # in practice; it is left as-is to keep parity with the original
+        # single-function behavior this was extracted from.
         classification = classify_task_command_conflict(
             db,
             task_id=task_id,
@@ -423,7 +480,7 @@ def enqueue_task_command(
             assert raced is not None
             return EnqueuedTaskCommand(
                 command_id=raced.command_db_id,
-                client_command_id=command_id.strip(),
+                client_command_id=_normalize_command_id(command_id),
                 created=False,
                 payload_matches=raced.payload_matches,
                 status=raced.status,
@@ -433,22 +490,10 @@ def enqueue_task_command(
         raise
 
     if not staged.created:
-        return EnqueuedTaskCommand(
-            command_id=staged.staged_db_id,
-            client_command_id=staged.client_command_id,
-            created=False,
-            payload_matches=staged.payload_matches,
-            status=staged.status,
-        )
+        return staged.to_enqueued()
 
     notify_task_command_dispatcher()
-    return EnqueuedTaskCommand(
-        command_id=staged.staged_db_id,
-        client_command_id=staged.client_command_id,
-        created=True,
-        payload_matches=True,
-        status=COMMAND_PENDING,
-    )
+    return staged.to_enqueued()
 
 
 def _claim_availability_predicate(now: datetime) -> Any:

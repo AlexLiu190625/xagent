@@ -141,6 +141,12 @@ def postgres_task_command_sessions():
     url = os.getenv("XAGENT_TEST_POSTGRES_URL")
     if not url:
         pytest.skip("XAGENT_TEST_POSTGRES_URL is not set")
+    # init_db rebinds the module-global engine/sessionmaker in place, and
+    # every other fixture and test in this file depends on that global
+    # pointing at its own sqlite engine -- the prior binding must be restored
+    # on exit rather than left pointed at this fixture's postgres engine.
+    prior_engine = database_module._engine
+    prior_session_local = database_module._SessionLocal
     init_db(db_url=url)
     engine = get_engine()
     Base.metadata.drop_all(bind=engine)
@@ -157,6 +163,8 @@ def postgres_task_command_sessions():
         yield SessionLocal, task_id, actor_id
     finally:
         Base.metadata.drop_all(bind=engine)
+        database_module._engine = prior_engine
+        database_module._SessionLocal = prior_session_local
 
 
 def _create_running_task(db) -> tuple[User, Task]:
@@ -2017,6 +2025,9 @@ def test_task_foreign_key_violation_is_reported_as_a_missing_task(
         # command-insert flush is intercepted below.
         nonlocal flush_calls
         flush_calls += 1
+        # flush_calls is coupled to stage_task_command's exact two-flush
+        # sequence -- owner pre-flush first, command-insert flush second.
+        # If that sequence changes, this injection lands on the wrong flush.
         if flush_calls == 1:
             return real_flush(*args, **kwargs)
         db_session.flush = real_flush
@@ -2062,6 +2073,9 @@ def test_actor_foreign_key_failure_is_not_reported_as_a_missing_task(
         # command-insert flush is intercepted below.
         nonlocal flush_calls
         flush_calls += 1
+        # flush_calls is coupled to stage_task_command's exact two-flush
+        # sequence -- owner pre-flush first, command-insert flush second.
+        # If that sequence changes, this injection lands on the wrong flush.
         if flush_calls == 1:
             return real_flush(*args, **kwargs)
         db_session.flush = real_flush
@@ -2081,6 +2095,49 @@ def test_actor_foreign_key_failure_is_not_reported_as_a_missing_task(
 
 
 # --- stage_task_command / classify_task_command_conflict (#1073) ---------
+
+
+def test_stage_rejects_malformed_command_id_before_any_db_write(db_session) -> None:
+    """A malformed command_id must fail before touching the database, so a
+    caller cannot end up with a partially-written row for an id it rejects."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+
+    with pytest.raises(ValueError, match="command_id must be 1-64"):
+        stage_task_command(
+            db_session,
+            task_id=task_id,
+            actor_user_id=int(user.id),
+            command_id="bad id!",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+
+    assert db_session.query(TaskExecutionCommand).count() == 0
+
+
+def test_stage_strips_whitespace_from_the_staged_command_id(db_session) -> None:
+    """A whitespace-padded command_id must stage a row carrying the stripped
+    id, not the raw padded string."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+
+    staged = stage_task_command(
+        db_session,
+        task_id=task_id,
+        actor_user_id=int(user.id),
+        command_id="  cmd-1  ",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    assert staged.client_command_id == "cmd-1"
+
+    db_session.commit()
+    row = db_session.get(TaskExecutionCommand, staged.staged_db_id)
+    assert row is not None
+    assert row.command_id == "cmd-1"
 
 
 def test_stage_does_not_commit(db_session) -> None:
@@ -2204,6 +2261,32 @@ def test_enqueue_idempotent_hit_issues_no_commit(db_session) -> None:
         observed_task = observer.get(Task, int(task.id))
         assert observed_task is not None
         assert observed_task.title != "uncommitted sibling write"
+
+    # stage_task_command's owner pre-flush already pushed the title change
+    # above into the open transaction, so it no longer shows up as dirty by
+    # this point -- a fresh, still-unflushed write on the same session is
+    # what proves the session was left healthy rather than silently rolled
+    # back by the idempotent-hit path.
+    sibling_user = User(
+        username="idempotent-hit-sibling-write",
+        password_hash="hash",
+        is_admin=False,
+    )
+    db_session.add(sibling_user)
+    assert sibling_user in db_session.new
+
+    db_session.commit()
+
+    with SessionLocal() as observer:
+        observed_task = observer.get(Task, int(task.id))
+        assert observed_task is not None
+        assert observed_task.title == "uncommitted sibling write"
+        assert (
+            observer.query(User)
+            .filter(User.username == "idempotent-hit-sibling-write")
+            .first()
+            is not None
+        )
 
 
 def test_enqueue_missing_task_issues_no_commit(db_session) -> None:
