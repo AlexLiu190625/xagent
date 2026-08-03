@@ -13,6 +13,7 @@ from sqlalchemy.pool import QueuePool
 from xagent.core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
+    CheckpointReadError,
     CheckpointUnavailableError,
 )
 from xagent.web.api import a2a as a2a_api
@@ -1181,6 +1182,105 @@ def test_checkpoint_access_refused_reuses_existing_running_task_message() -> Non
 
     assert response.status_code == 400, response.text
     assert "currently running" in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    ("reason", "unexpected_phrase"),
+    [
+        ("lease_mismatch", "currently running"),
+        ("superseded_legacy", "currently running"),
+    ],
+)
+def test_checkpoint_access_refused_reason_gets_a_distinct_message(
+    reason: str,
+    unexpected_phrase: str,
+) -> None:
+    """Only the ``active_run`` reason reuses the pre-existing 'currently
+    running' message; the other two refusal reasons are distinct facts
+    (a stray lease, a superseded legacy partition) and must not be reported
+    with a message that claims a run is in progress."""
+    agent_id, full_key = _create_published_agent_with_key()
+    task_id = _resume_error_task(agent_id, context_id=f"ctx-refused-{reason}")
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(
+        side_effect=CheckpointAccessRefusedError(f"refused for {reason}", reason=reason)
+    )
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    with patch(
+        "xagent.web.api.chat.get_agent_manager",
+        return_value=agent_manager,
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": f"msg-refused-{reason}",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "retry safely"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 400, response.text
+    message = response.json()["error"]["message"]
+    assert unexpected_phrase not in message
+    db = _direct_db_session()
+    try:
+        recovered = db.query(Task).filter(Task.id == task_id).one()
+        assert recovered.status == TaskStatus.WAITING_FOR_USER
+    finally:
+        db.close()
+
+
+def test_checkpoint_read_error_unknown_subclass_is_treated_as_retryable() -> None:
+    """A ``CheckpointReadError`` subclass this dispatch does not recognize
+    must default to the retryable (unavailable) branch, not silently fall
+    into the terminal refused/corrupt handling -- conservative in the face
+    of an unrecognized failure mode, matching the unavailable status code
+    and the waiting-status restoration."""
+
+    class _UnknownCheckpointReadError(CheckpointReadError):
+        pass
+
+    agent_id, full_key = _create_published_agent_with_key()
+    task_id = _resume_error_task(agent_id, context_id="ctx-unknown-checkpoint-error")
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(
+        side_effect=_UnknownCheckpointReadError("unrecognized checkpoint failure")
+    )
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    with patch(
+        "xagent.web.api.chat.get_agent_manager",
+        return_value=agent_manager,
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-unknown-checkpoint-error",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "retry safely"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 503, response.text
+    db = _direct_db_session()
+    try:
+        recovered = db.query(Task).filter(Task.id == task_id).one()
+        assert recovered.status == TaskStatus.WAITING_FOR_USER
+    finally:
+        db.close()
 
 
 def test_list_tasks_uses_database_filters_and_pagination() -> None:

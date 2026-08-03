@@ -311,7 +311,8 @@ class DatabaseTraceHandler(BaseTraceHandler):
         if lease is not None:
             if lease.task_id != self.task_id or lease.run_id is None:
                 raise CheckpointAccessRefusedError(
-                    f"task {self.task_id}: active lease is not bound to this reader"
+                    f"task {self.task_id}: active lease is not bound to this reader",
+                    reason="lease_mismatch",
                 )
             return lease.run_id
 
@@ -325,7 +326,8 @@ class DatabaseTraceHandler(BaseTraceHandler):
         if task_run[0] is not None:
             raise CheckpointAccessRefusedError(
                 f"task {self.task_id}: an active run is in progress under "
-                "a different lease"
+                "a different lease",
+                reason="active_run",
             )
         tagged_checkpoint_exists = (
             db.query(DatabaseTraceEvent.id)
@@ -348,7 +350,8 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # reader is not allowed to read -- a refusal, not an absence.
             raise CheckpointAccessRefusedError(
                 f"task {self.task_id}: a tagged run has already superseded "
-                "legacy checkpoints"
+                "legacy checkpoints",
+                reason="superseded_legacy",
             )
         return None
 

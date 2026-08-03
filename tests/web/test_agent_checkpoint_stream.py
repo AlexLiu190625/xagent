@@ -1153,10 +1153,11 @@ def test_database_trace_handler_unbound_legacy_load_fails_closed_after_tagged_ru
         # this unbound legacy reader is not authoritative for. That is a
         # refusal, not the "queried successfully, found nothing" fact that
         # ``None`` reserves.
-        with pytest.raises(CheckpointAccessRefusedError):
+        with pytest.raises(CheckpointAccessRefusedError) as excinfo:
             DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             )
+        assert excinfo.value.reason == "superseded_legacy"
     finally:
         db.close()
 
@@ -1226,10 +1227,43 @@ def test_database_trace_handler_unbound_root_load_fails_closed_for_active_run(
     try:
         # An active run is in progress under a different lease; this unbound
         # legacy reader is refused, not told the checkpoint is absent.
-        with pytest.raises(CheckpointAccessRefusedError):
+        with pytest.raises(CheckpointAccessRefusedError) as excinfo:
             DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             )
+        assert excinfo.value.reason == "active_run"
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_load_refuses_lease_bound_to_another_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound lease for a different task id is not this reader's partition
+    -- distinct from ``active_run``/``superseded_legacy``: the read itself
+    is contaminated by a stray context, not a policy decision about this
+    task's own rows."""
+    SessionLocal, db, task = _create_trace_handler_test_task("lease-mismatch-load")
+    task_id = int(task.id)
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    try:
+        with (
+            bind_task_lease_context(TaskLease(task_id + 1, "runner-a", "run-a")),
+            pytest.raises(CheckpointAccessRefusedError) as excinfo,
+        ):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "shared-execution"
+            )
+        assert excinfo.value.reason == "lease_mismatch"
     finally:
         db.close()
 

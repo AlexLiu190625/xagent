@@ -15,7 +15,7 @@ from sqlalchemy import String, and_, cast, func, or_, update
 from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
-    CheckpointUnavailableError,
+    CheckpointReadError,
 )
 from ..models.agent import Agent
 from ..models.database import get_session_local
@@ -452,11 +452,7 @@ async def _resume_input_required_a2a_task(
             resumable_status=resumable_status,
         )
         ownership_transferred = True
-    except (
-        CheckpointUnavailableError,
-        CheckpointCorruptError,
-        CheckpointAccessRefusedError,
-    ) as exc:
+    except CheckpointReadError as exc:
         # Ownership was never transferred, so restore the exact prelease
         # to the prior input-required status exactly like the absent-
         # checkpoint fallback above, then translate the failure instead of
@@ -466,13 +462,6 @@ async def _resume_input_required_a2a_task(
             raise TaskLeaseLostError(
                 f"Task {task_id} lease changed before A2A checkpoint-failure fallback"
             ) from exc
-        if isinstance(exc, CheckpointUnavailableError):
-            raise a2a_error(
-                "temporarily_unavailable",
-                "The task's saved progress could not be read. Please retry.",
-                status_code=503,
-                details={"taskId": task_id},
-            ) from exc
         if isinstance(exc, CheckpointCorruptError):
             raise a2a_error(
                 "unsupported_operation",
@@ -480,10 +469,34 @@ async def _resume_input_required_a2a_task(
                 status_code=400,
                 details={"taskId": task_id},
             ) from exc
+        if isinstance(exc, CheckpointAccessRefusedError):
+            if exc.reason == "lease_mismatch":
+                message = (
+                    "This task is currently owned by a different execution "
+                    "and cannot accept a new message."
+                )
+            elif exc.reason == "superseded_legacy":
+                message = (
+                    "This task's checkpoint history has been superseded by "
+                    "a newer run and cannot accept a new message."
+                )
+            else:
+                message = "Task is currently running and cannot accept a new message."
+            raise a2a_error(
+                "unsupported_operation",
+                message,
+                status_code=400,
+                details={"taskId": task_id},
+            ) from exc
+        # CheckpointUnavailableError, or any future CheckpointReadError
+        # subclass this dispatch does not yet know about: treat it
+        # conservatively as retryable rather than assuming a terminal or
+        # policy failure, so an unrecognized failure mode never silently
+        # collapses into a data-losing branch.
         raise a2a_error(
-            "unsupported_operation",
-            "Task is currently running and cannot accept a new message.",
-            status_code=400,
+            "temporarily_unavailable",
+            "The task's saved progress could not be read. Please retry.",
+            status_code=503,
             details={"taskId": task_id},
         ) from exc
     except BaseException:

@@ -9,6 +9,7 @@ from xagent.core.agent.checkpoint import (
     CHECKPOINT_EVENT_TYPE,
     CHECKPOINT_TYPE,
     LEGACY_CHECKPOINT_TYPES,
+    CheckpointAccessRefusedError,
     CheckpointCorruptError,
     CheckpointPersistenceError,
     CheckpointUnavailableError,
@@ -381,3 +382,15 @@ async def test_trace_checkpoint_store_readable_type_without_snapshot_raises_corr
 
     with pytest.raises(CheckpointCorruptError):
         await store.load_latest_checkpoint("exec-no-snapshot")
+
+
+def test_checkpoint_access_refused_error_reason_defaults_to_active_run() -> None:
+    """Existing call sites that construct this error without ``reason`` keep
+    working, and get the most common refusal classification for free."""
+    error = CheckpointAccessRefusedError("refused")
+    assert error.reason == "active_run"
+
+
+def test_checkpoint_access_refused_error_carries_an_explicit_reason() -> None:
+    error = CheckpointAccessRefusedError("refused", reason="lease_mismatch")
+    assert error.reason == "lease_mismatch"

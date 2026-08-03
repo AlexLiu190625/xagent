@@ -81,7 +81,20 @@ class CheckpointAccessRefusedError(CheckpointReadError):
     build scope) is not the one allowed to observe it right now. Distinct
     from absence: callers must not treat a refusal as "no checkpoint" and
     fall back to building fresh state.
+
+    ``reason`` discriminates *why* the read was refused, so consumers can
+    report an accurate message instead of one generic sentence for every
+    case: ``"lease_mismatch"`` (an active lease exists but is not bound to
+    this reader), ``"active_run"`` (a different run is in progress under
+    its own lease), or ``"superseded_legacy"`` (a tagged run has already
+    superseded the untagged/legacy partition this reader is confined to).
+    Defaults to ``"active_run"``, the most common case, so existing call
+    sites that do not pass ``reason`` keep working unchanged.
     """
+
+    def __init__(self, message: str, *, reason: str = "active_run") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 async def read_latest_checkpoint_payload(
