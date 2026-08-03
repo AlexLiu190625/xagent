@@ -2793,12 +2793,14 @@ def _restore_resumed_task_lease_to_prior_status(
 ) -> bool:
     """Release the exact resume lease back to its pre-acquisition status.
 
-    Mirrors the A2A input-required prelease restore: a checkpoint read
-    failure during resume must not silently downgrade a paused/waiting
-    task to a terminal FAILED. Uses the same exact-lease WHERE fence
-    (task id + runner id + run id) as the TTL reaper, so the two can never
-    both release the same row -- whichever loses the race affects zero
-    rows instead of double-releasing.
+    A checkpoint read failure during resume must not silently downgrade a
+    paused/waiting task to a terminal FAILED. Uses the same exact-lease
+    WHERE fence (task id + runner id + run id) as the TTL reaper, so the
+    two can never both release the same row -- whichever loses the race
+    affects zero rows instead of double-releasing. The commit below is
+    unconditional, unlike the A2A prelease restore: when the fence excludes
+    every row, the UPDATE affects zero rows and this commits that no-op
+    rather than rolling back.
     """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -3510,7 +3512,7 @@ async def execute_resume_background(
             isinstance(e, (CheckpointUnavailableError, CheckpointAccessRefusedError))
             and lease is not None
             and not lease_released
-            and resume_prior_status is not None
+            and resume_prior_status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}
         ):
             # Not pool exhaustion (handled above) but still a read that
             # could not be completed, or a partition this reader was not
@@ -3518,7 +3520,11 @@ async def execute_resume_background(
             # task made. Restore it to whatever it was before this resume
             # attempt claimed the lease instead of a terminal FAILED; the
             # finally block below performs the actual write once the
-            # heartbeat has stopped.
+            # heartbeat has stopped. RUNNING is never a restore target:
+            # ``release_task_lease_no_commit`` refuses to release a lease
+            # back to RUNNING, so a prior status of RUNNING (an abandoned
+            # lease this attempt stole via TTL expiry) falls through to the
+            # settle/FAILED branch below instead of dead-ending here.
             restore_lease_to_prior_status = resume_prior_status
             logger.error(
                 "task_id=%s component=resume checkpoint could not be read; "
@@ -3675,6 +3681,53 @@ async def execute_resume_background(
                             task_id,
                             exc_info=True,
                         )
+                    else:
+                        if restored:
+                            # Correct the optimistic RUNNING state a client
+                            # may still be showing after the lease claim
+                            # above flipped it, before this failure restored
+                            # the prior status. Best-effort: a missed
+                            # broadcast does not change the restore result
+                            # that already committed.
+                            try:
+                                restored_snapshot = (
+                                    await task_execution_controller.snapshot(task_id)
+                                )
+                                event_type = (
+                                    "task_waiting_for_user"
+                                    if restore_lease_to_prior_status
+                                    == TaskStatus.WAITING_FOR_USER
+                                    else "task_paused"
+                                )
+                                message = (
+                                    "Task waiting for user response"
+                                    if restore_lease_to_prior_status
+                                    == TaskStatus.WAITING_FOR_USER
+                                    else "Task paused"
+                                )
+                                await manager.broadcast_to_task(
+                                    {
+                                        "type": event_type,
+                                        "task_id": task_id,
+                                        "message": message,
+                                        "timestamp": datetime.now(
+                                            timezone.utc
+                                        ).timestamp(),
+                                        **(
+                                            restored_snapshot.as_dict()
+                                            if restored_snapshot is not None
+                                            else {}
+                                        ),
+                                    },
+                                    task_id,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "resume lease restore-to-prior-status "
+                                    "broadcast failed for task %s",
+                                    task_id,
+                                    exc_info=True,
+                                )
                 elif (
                     lease is not None
                     and not lease_released

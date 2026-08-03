@@ -2818,6 +2818,100 @@ async def test_execute_resume_background_persists_missing_checkpoint_failure(
     assert failures[0]["task"]["status"] == TaskStatus.FAILED.value
 
 
+@pytest.mark.asyncio
+async def test_resume_background_settles_running_prior_status_on_checkpoint_unavailable(
+    db_session,
+) -> None:
+    """A RUNNING prior status is never a valid restore target.
+
+    ``release_task_lease_no_commit`` refuses to release a lease back to
+    RUNNING. A resume that steals an abandoned lease from a task whose row
+    was still RUNNING (no active runner, expired TTL) must therefore fall
+    through to the ordinary settle/FAILED path on a checkpoint read failure,
+    not attempt a "restore to prior status" that can only dead-end with the
+    lease stuck unreleased until TTL recovery.
+    """
+    owner = _user(db_session, "running-prior-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    assert task.runner_id is None
+    assert task.lease_expires_at is None
+    agent = MagicMock(
+        resume_execution_by_id=AsyncMock(
+            side_effect=CheckpointUnavailableError("checkpoint query failed")
+        ),
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        _register_current_resume(int(task.id))
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+        )
+
+    db_session.expire_all()
+    db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.runner_id is None
+    failures = [
+        call.args[0]
+        for call in ws_manager.broadcast_to_task.call_args_list
+        if call.args[0].get("type") == "task_error"
+    ]
+    assert len(failures) == 1
+
+
+@pytest.mark.parametrize(
+    ("prior_status", "expected_event_type"),
+    [
+        (TaskStatus.PAUSED, "task_paused"),
+        (TaskStatus.WAITING_FOR_USER, "task_waiting_for_user"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_resume_background_broadcasts_corrective_event_after_restore(
+    db_session,
+    prior_status: TaskStatus,
+    expected_event_type: str,
+) -> None:
+    """After a checkpoint-unavailable restore, clients that saw the optimistic
+    RUNNING transition need the prior status re-asserted -- reusing the same
+    event vocabulary the historical-replay path uses for PAUSED/WAITING_FOR_USER."""
+    owner = _user(db_session, "restore-broadcast-owner")
+    task = _task(db_session, owner.id, status=prior_status)
+    agent = MagicMock(
+        resume_execution_by_id=AsyncMock(
+            side_effect=CheckpointUnavailableError("checkpoint query failed")
+        ),
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        _register_current_resume(int(task.id))
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+        )
+
+    db_session.expire_all()
+    db_session.refresh(task)
+    assert task.status == prior_status
+
+    corrective = [
+        call.args[0]
+        for call in ws_manager.broadcast_to_task.call_args_list
+        if call.args[0].get("type") == expected_event_type
+    ]
+    assert len(corrective) == 1
+    assert corrective[0]["status"] == prior_status.value
+    assert not any(
+        call.args[0].get("type") == "task_error"
+        for call in ws_manager.broadcast_to_task.call_args_list
+    )
+
+
 @pytest.mark.parametrize(
     ("settled", "expected_error_broadcasts"),
     [(True, 1), (False, 0)],

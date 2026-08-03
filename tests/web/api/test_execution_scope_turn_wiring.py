@@ -1365,6 +1365,87 @@ async def test_resume_background_restores_prior_status_on_checkpoint_unavailable
 
 
 @pytest.mark.asyncio
+async def test_resume_background_restore_broadcast_failure_does_not_affect_restore() -> (
+    None
+):
+    """The corrective post-restore broadcast is best-effort: a failure there
+    must not undo the already-committed restore or escape the call."""
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    settle = MagicMock()
+    restore = MagicMock(return_value=True)
+    mark_delivery = MagicMock()
+
+    class FakeTracker:
+        quota_interrupt_reason = None
+
+        def __init__(self, *, task_id: int, **kwargs: Any) -> None:
+            self.complete_tracking = AsyncMock()
+            self.stop_periodic_updates = AsyncMock()
+
+        async def start_tracking(self) -> None:
+            return None
+
+        async def interrupt_reason_for_quota(self) -> None:
+            return None
+
+    agent_service = MagicMock()
+    agent_service.resume_execution_by_id = AsyncMock(
+        side_effect=CheckpointUnavailableError("checkpoint query failed")
+    )
+
+    async def _broadcast(payload: dict, *_args: Any, **_kwargs: Any) -> None:
+        if payload.get("type") in {"task_waiting_for_user", "task_paused"}:
+            raise RuntimeError("broadcast down")
+
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock(side_effect=_broadcast))
+
+    with _Patches(
+        [
+            patch(
+                "xagent.web.api.websocket._acquire_resume_task_lease",
+                side_effect=_fake_acquire_with_prior_status(
+                    lease, TaskStatus.WAITING_FOR_USER
+                ),
+            ),
+            patch("xagent.web.api.websocket._settle_resumed_task_lease", settle),
+            patch(
+                "xagent.web.api.websocket._restore_resumed_task_lease_to_prior_status",
+                restore,
+            ),
+            patch(
+                "xagent.web.api.websocket.mark_user_message_delivery_sync",
+                mark_delivery,
+            ),
+            patch(
+                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                new=AsyncMock(),
+            ),
+            patch(
+                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                new=AsyncMock(),
+            ),
+            patch("xagent.web.api.websocket.manager", ws_manager),
+            patch(
+                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+            ),
+            patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
+        ]
+    ):
+        # Must not raise even though the corrective broadcast fails.
+        await execute_resume_background(
+            task_id=42,
+            agent_service=agent_service,
+            task_owner_user_id=1,
+            delivery_turn_id="resume-turn",
+            expected_run_id="run-a",
+            resolved_execution_scope=None,
+        )
+
+    settle.assert_not_called()
+    restore.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_resume_background_checkpoint_unavailable_from_pool_timeout_keeps_lease() -> (
     None
 ):
