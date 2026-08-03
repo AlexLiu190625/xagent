@@ -12,6 +12,11 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import String, and_, cast, func, or_, update
 
+from ...core.agent.checkpoint import (
+    CheckpointAccessRefusedError,
+    CheckpointCorruptError,
+    CheckpointUnavailableError,
+)
 from ..models.agent import Agent
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -441,6 +446,40 @@ async def _resume_input_required_a2a_task(
             heartbeat_task=heartbeat_task,
         )
         ownership_transferred = True
+    except (
+        CheckpointUnavailableError,
+        CheckpointCorruptError,
+        CheckpointAccessRefusedError,
+    ) as exc:
+        # Ownership was never transferred, so restore the exact prelease
+        # to the prior input-required status exactly like the absent-
+        # checkpoint fallback above, then translate the failure instead of
+        # letting it escape as a raw exception.
+        cleanup_task = asyncio.create_task(stop_and_restore_prelease())
+        if not await drain_async_task_cancellation_safe(cleanup_task):
+            raise TaskLeaseLostError(
+                f"Task {task_id} lease changed before A2A checkpoint-failure fallback"
+            ) from exc
+        if isinstance(exc, CheckpointUnavailableError):
+            raise a2a_error(
+                "temporarily_unavailable",
+                "The task's saved progress could not be read. Please retry.",
+                status_code=503,
+                details={"taskId": task_id},
+            ) from exc
+        if isinstance(exc, CheckpointCorruptError):
+            raise a2a_error(
+                "unsupported_operation",
+                "The task's saved progress is unreadable.",
+                status_code=400,
+                details={"taskId": task_id},
+            ) from exc
+        raise a2a_error(
+            "unsupported_operation",
+            "Task is currently running and cannot accept a new message.",
+            status_code=400,
+            details={"taskId": task_id},
+        ) from exc
     except BaseException:
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())

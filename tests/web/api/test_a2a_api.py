@@ -10,6 +10,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from xagent.core.agent.checkpoint import (
+    CheckpointAccessRefusedError,
+    CheckpointCorruptError,
+    CheckpointUnavailableError,
+)
 from xagent.web.api import a2a as a2a_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.agent_api_key import AgentApiKey
@@ -1067,6 +1072,115 @@ def test_checkpoint_resume_exception_restores_input_required_status() -> None:
         assert recovered.status == TaskStatus.WAITING_FOR_USER
     finally:
         db.close()
+
+
+def _resume_error_task(agent_id: int, *, context_id: str) -> int:
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="waiting",
+            status=TaskStatus.WAITING_FOR_USER,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": context_id},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        return int(task.id)
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (CheckpointUnavailableError("checkpoint query failed"), 503),
+        (CheckpointCorruptError("all matching rows undecodable"), 400),
+        (
+            CheckpointAccessRefusedError("active lease is not bound to this reader"),
+            400,
+        ),
+    ],
+)
+def test_checkpoint_read_error_maps_to_distinct_status_and_restores_waiting(
+    error: Exception,
+    expected_status: int,
+) -> None:
+    """Unlike a generic exception (500, above), a checkpoint read failure
+    gets a status distinguishing retryable (unavailable) from terminal
+    (corrupt, refused) -- and, like the generic case, restores the prior
+    input-required status since ownership was never transferred."""
+    agent_id, full_key = _create_published_agent_with_key()
+    task_id = _resume_error_task(agent_id, context_id=f"ctx-{type(error).__name__}")
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(side_effect=error)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    with patch(
+        "xagent.web.api.chat.get_agent_manager",
+        return_value=agent_manager,
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": f"msg-{type(error).__name__}",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "retry safely"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == expected_status, response.text
+    db = _direct_db_session()
+    try:
+        recovered = db.query(Task).filter(Task.id == task_id).one()
+        assert recovered.status == TaskStatus.WAITING_FOR_USER
+    finally:
+        db.close()
+
+
+def test_checkpoint_access_refused_reuses_existing_running_task_message() -> None:
+    """Refused reuses the same 400 message as the pre-existing 'another run
+    is already active' rejection -- it is the same fact from the reader's
+    point of view, discovered later in the resume attempt."""
+    agent_id, full_key = _create_published_agent_with_key()
+    task_id = _resume_error_task(agent_id, context_id="ctx-refused-message")
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(
+        side_effect=CheckpointAccessRefusedError("active lease is not bound")
+    )
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    with patch(
+        "xagent.web.api.chat.get_agent_manager",
+        return_value=agent_manager,
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-refused-message",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "retry safely"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 400, response.text
+    assert "currently running" in response.json()["error"]["message"]
 
 
 def test_list_tasks_uses_database_filters_and_pagination() -> None:
