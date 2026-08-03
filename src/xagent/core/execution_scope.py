@@ -727,10 +727,19 @@ class DeferToSnapshot:
     Neither value distinguishes a snapshot that arrived inside a
     client-supplied ``Task.agent_config`` from one written server-side out of
     an already-resolved scope -- those are different trust tiers, and this
-    contract cannot tell them apart at read time. Closing that gap is tracked
-    separately (issue #1016); until then, ``snapshot_defines_namespace=True``
-    should only be used by a resolver whose embedder controls how that task's
-    snapshot was written.
+    contract cannot tell them apart at read time. It cannot be fixed here
+    either: any provenance marker would live in the same client-writable
+    field as the snapshot it vouches for, so the fix belongs at the input
+    boundary, where that key stops being accepted from a request (tracked as
+    issue #1016).
+
+    That makes ``snapshot_defines_namespace=True`` unshippable for now, not
+    merely delicate: with the namespace taken verbatim, a request that can
+    write ``Task.agent_config`` chooses the namespace, and public widget and
+    share task creation copy that field wholesale. No resolver in this
+    repository sets it, and none should until the snapshot is server-owned.
+    The flag exists so the abstention shape a workforce sub-task needs is
+    expressible and reviewable; it is inert until something opts in.
 
     Construction enforces that opt-in's precondition: with
     ``snapshot_defines_namespace=True`` the ``fallback`` must claim no

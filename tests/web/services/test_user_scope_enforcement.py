@@ -111,9 +111,12 @@ def test_restore_rejects_foreign_storage_key(storage_env, tmp_path):
 
 
 def test_signed_url_never_issued_for_foreign_storage_key(storage_env, tmp_path):
-    # signed_access_url degrades to None when the checksum probe fails; the
-    # scope check makes that probe fail for foreign keys, so no URL is issued
-    # even though the foreign object exists and the checksum matches.
+    # No URL may be issued for a foreign key even though the foreign object
+    # exists and its checksum matches. The containment violation is a
+    # permanent authority fault, so it propagates to be classified once at the
+    # application boundary rather than being reported as an unavailable
+    # checksum -- which would read as a transient reason to fall back to
+    # backend-mediated access, a fallback that hits the same violation anyway.
     foreign = get_unscoped_file_storage().put_bytes(
         b"foreign", "users/8/uploads/file-123/missing.txt"
     )
@@ -125,7 +128,8 @@ def test_signed_url_never_issued_for_foreign_storage_key(storage_env, tmp_path):
         checksum=foreign.checksum,
     )
 
-    assert ManagedFileRef(record).signed_access_url(expires=300) is None
+    with pytest.raises(StorageKeyScopeError):
+        ManagedFileRef(record).signed_access_url(expires=300)
 
 
 def test_delete_durable_rejects_foreign_storage_key(storage_env, tmp_path):

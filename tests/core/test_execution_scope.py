@@ -83,12 +83,13 @@ def scope_log_records(level: int = logging.WARNING):
             self.records.append(msg % args if args else msg)
             self._wrapped.error(msg, *args, **kwargs)
 
-        def __getattr__(self, name: str) -> object:
-            # Deliberately does not cover ``isEnabledFor``: delegating that to
-            # the wrapped logger would put the ambient level and the global
-            # disable threshold back in charge of what the code under test
-            # does, which is what this helper exists to avoid.
-            return getattr(self._wrapped, name)
+        # There is deliberately no ``__getattr__`` delegating the rest to the
+        # wrapped logger. ``isEnabledFor`` must not be delegated -- that would
+        # put the ambient level and the process-wide disable threshold back in
+        # charge of what the code under test does, which is the whole reason
+        # this helper exists -- and modelling exactly the levels the module
+        # logs at means a newly introduced level surfaces as a loud
+        # ``AttributeError`` instead of a silently unrecorded call.
 
     # The function's own globals: the binding it resolves `logger` against at
     # call time, whichever module instance that turns out to be.

@@ -520,6 +520,12 @@ class ManagedFileRef:
             if not checksum:
                 try:
                     checksum = self._bound_storage().content_hash(expected_key)
+                except _NAMESPACE_AUTHORITY_ERRORS:
+                    # The rule holds at every site in this module, not only
+                    # where a downstream call happens to raise the same class
+                    # again: relying on that would make this a silent swallow
+                    # the moment the fallback path changes.
+                    raise
                 except Exception:
                     self.sync_to_durable(
                         storage_key=expected_key,
@@ -596,6 +602,11 @@ class ManagedFileRef:
 
         try:
             actual_checksum = self._bound_storage().content_hash(self.storage_key)
+        except _NAMESPACE_AUTHORITY_ERRORS:
+            # A permanent authority fault must not be reported as "checksum
+            # unavailable", which reads as a transient reason to fall back to
+            # backend-mediated access.
+            raise
         except Exception as exc:
             logger.warning(
                 "Falling back to backend-mediated durable access because content "

@@ -414,3 +414,71 @@ def test_resolve_fails_closed_on_registered_scope_authority_mismatch(
     finally:
         register_scope_resolver(None)
         engine.dispose()
+
+
+def test_malformed_persisted_snapshot_does_not_fail_the_turn(
+    tmp_path: Path,
+) -> None:
+    """This path reads the persisted snapshot itself, outside the try/except
+    that ``resolve_execution_scope`` wraps the registered loader in. A row
+    whose snapshot fails field validation must therefore be ignored here the
+    same way it is ignored there -- the registered resolver's answer stands
+    alone and the turn proceeds -- rather than refusing a turn the resolver
+    could answer on its own."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'malformed-snapshot.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    local_path = tmp_path / "attached.txt"
+    local_path.write_text("payload")
+
+    register_scope_resolver(
+        lambda _task_id: ExecutionScope(workspace_segments=("resolver-tenant",))
+    )
+    try:
+        with SessionLocal() as db:
+            user = User(username="corrupt-owner", password_hash="hash", is_admin=False)
+            db.add(user)
+            db.flush()
+            task = Task(
+                user_id=int(user.id),
+                title="corrupt snapshot task",
+                description="corrupt snapshot task",
+                status=TaskStatus.COMPLETED,
+                source="sdk",
+                # workspace_segments must be a list/tuple: this row cannot be
+                # decoded into a scope at all.
+                agent_config={"execution_scope": {"workspace_segments": 5}},
+            )
+            db.add(task)
+            db.flush()
+            db.add(
+                UploadedFile(
+                    file_id="attached",
+                    user_id=int(user.id),
+                    task_id=int(task.id),
+                    filename="attached.txt",
+                    storage_path=str(local_path),
+                    file_size=local_path.stat().st_size,
+                )
+            )
+            db.commit()
+            user_id = int(user.id)
+            task_id = int(task.id)
+
+        with SessionLocal() as db:
+            infos, missing = resolve_turn_file_infos(
+                file_ids=["attached"],
+                owner_user_id=user_id,
+                task_id=task_id,
+                db=db,
+            )
+
+        assert missing == []
+        assert [info["file_id"] for info in infos] == ["attached"]
+    finally:
+        register_scope_resolver(None)
+        engine.dispose()

@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 from ...core.agent.attachments import project_file_info_to_chip
 from ...core.execution_scope import (
     ExecutionScope,
+    ExecutionScopeResolverContractError,
     execution_scope_from_agent_config,
     resolve_execution_scope,
 )
@@ -66,12 +67,31 @@ def _task_execution_scope_in_session(
     db: Session,
     task_id: int | None,
 ) -> tuple[int | None, ExecutionScope | None]:
-    """Read the persisted half of canonical scope resolution in this Session."""
+    """Read the persisted half of canonical scope resolution in this Session.
+
+    A snapshot that fails field validation is reported as "no candidate"
+    rather than raised. The registered-loader path decodes inside
+    ``resolve_execution_scope``'s own try/except, where a malformed candidate
+    is logged and ignored so an authoritative resolver still answers the
+    turn; this call site sits outside that umbrella, so it applies the same
+    tolerance itself. Without it the two paths would refuse and accept the
+    very same persisted row differently, and a corrupt row would fail a turn
+    that the resolver could have answered on its own.
+    """
 
     if task_id is None:
         return None, None
     row = db.query(Task.agent_config).filter(Task.id == task_id).first()
-    return task_id, execution_scope_from_agent_config(row[0] if row else None)
+    try:
+        return task_id, execution_scope_from_agent_config(row[0] if row else None)
+    except ExecutionScopeResolverContractError:
+        logger.warning(
+            "Ignoring malformed persisted execution scope snapshot for task %s; "
+            "the resolver's answer stands alone for this turn",
+            task_id,
+            exc_info=True,
+        )
+        return task_id, None
 
 
 def normalize_filename(filename: str) -> str:
