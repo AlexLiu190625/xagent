@@ -5,9 +5,9 @@ test_task_status_storage_postgresql.py (PostgreSQL, skips without
 XAGENT_TEST_POSTGRES_URL) so the PostgreSQL suite can use the
 skip-if-unset fixture pattern in test_runtime_key_transition_postgres.py
 without dragging a real Postgres dependency into every local test run. The
-assertions below are written once here and called from both files so the
-two backends are pinned to the identical exception shape (R-F1: "ORM 路径的
-pin 是 bind 层 StatementError(LookupError),两后端对称").
+assertions below are written once here and called from both files so both
+backends are pinned to the identical bind-layer exception shape,
+StatementError wrapping LookupError.
 """
 
 from __future__ import annotations
@@ -21,9 +21,10 @@ from xagent.web.models.task import Task, TaskStatus
 # Primary sentinel target: sqlalchemy.Enum(TaskStatus) with no
 # values_callable persists member *names*, not member values. This is a
 # hand-written literal, deliberately not derived from the column at import
-# time -- test_storage_names_match_column_compilation (drift check) is what
-# keeps it honest against the real column instead of the other way around
-# (V2-7/V3-8: "主看守=手写字面量字典(测试域);编译派生降级为 drift check").
+# time. This literal is the primary guard;
+# test_storage_names_match_column_compilation is a drift check that keeps it
+# honest against the real column, not the reverse -- deriving the expectation
+# from the column would make the pin agree with any change made to it.
 TASK_STATUS_STORAGE_NAMES: dict[TaskStatus, str] = {
     TaskStatus.PENDING: "PENDING",
     TaskStatus.RUNNING: "RUNNING",

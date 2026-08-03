@@ -6,7 +6,7 @@ exemption table's provenance. Two independent claims are pinned here:
 1. Every raw Task.status comparison/write anywhere under src/xagent is
    either absent or an explicitly reasoned, still-live exemption -- a new
    file (or new code in an existing file) that adds one fails closed.
-2. The two production call sites this PR actually converts
+2. The two production call sites routed through the binding
    (task_lease_service.py, monitor.py) have zero raw comparisons at all --
    full conversion, not "mostly converted".
 """
@@ -17,6 +17,7 @@ import ast
 
 from tests.web.services.task_status_predicate_guard import (
     A2A_PROTOCOL_VALUE_LOOKUP_NOTE,
+    COLUMN_KEYED_WRITE_NOTE,
     EXEMPTIONS,
     REPO_ROOT,
     SCAN_ROOT,
@@ -67,7 +68,7 @@ def test_task_lease_service_and_monitor_have_no_raw_status_comparisons() -> None
     the binding produces the same predicate as the code it replaced; it
     does not prove the raw comparison is actually gone. This asserts the
     AST shape itself is absent, with zero exemptions allowed here -- these
-    two files are the PR's production consumers, not pre-existing debt.
+    two files are the binding's production consumers, not existing debt.
     """
     for relative in (
         "src/xagent/web/services/task_lease_service.py",
@@ -80,7 +81,7 @@ def test_task_lease_service_and_monitor_have_no_raw_status_comparisons() -> None
         )
 
 
-# --- Meta-tests: prove the guard itself actually fires (R-F3 fixture) -----
+# --- Meta-tests: prove the guard itself actually fires --------------------
 
 _FIXTURE_ALL_FOUR_SHAPES = """
 from sqlalchemy import update
@@ -128,6 +129,16 @@ def wrapped_write_side_is_compliant(db):
     )
 """
 
+_FIXTURE_COLUMN_KEYED_WRITE = """
+from sqlalchemy import update
+from xagent.web.models.task import Task, TaskStatus
+
+def column_keyed_write(db, status):
+    values = {Task.control_state: "idle"}
+    values[Task.status] = status
+    return db.execute(update(Task).where(Task.id == 1).values(**values))
+"""
+
 
 def test_guard_detects_all_four_node_shapes() -> None:
     violations = scan_source(_FIXTURE_ALL_FOUR_SHAPES, "fixture_all_four_shapes.py")
@@ -160,14 +171,14 @@ def test_fixtures_are_syntactically_valid() -> None:
     # test loudly, but assert it explicitly so the intent is on the page).
     ast.parse(_FIXTURE_ALL_FOUR_SHAPES)
     ast.parse(_FIXTURE_NEGATIVE_CONTROLS)
+    ast.parse(_FIXTURE_COLUMN_KEYED_WRITE)
 
 
 def test_a2a_protocol_value_lookup_note_still_targets_live_code() -> None:
-    """FREEZE record item 2: a2a_protocol.py:104 is not a guard violation
-    (TaskStatus(task.status) is a Call, not one of the four flagged
-    shapes), so its safety reasoning is recorded here instead, and pinned
-    against the line it describes so a refactor there does not leave a
-    stale claim unwritten anywhere.
+    """a2a_protocol.py:104 is not a guard violation (TaskStatus(task.status)
+    is a Call, not one of the four flagged shapes), so its safety reasoning
+    is recorded in the guard module instead, and pinned against the line it
+    describes so a refactor there does not leave a stale claim behind.
     """
     path = REPO_ROOT / "src/xagent/web/services/a2a_protocol.py"
     lines = path.read_text().splitlines()
@@ -177,6 +188,40 @@ def test_a2a_protocol_value_lookup_note_still_targets_live_code() -> None:
         f"(and this test) to match. Found: {target_line!r}"
     )
     assert "TaskStatus(task.status)" in A2A_PROTOCOL_VALUE_LOOKUP_NOTE
+
+
+def test_column_keyed_write_note_still_targets_live_code() -> None:
+    """The Column-keyed write shape (values[Task.status] = ...) is outside
+    the four scanned shapes, so the one live site is pinned by line here.
+    Without this, the docstring's scope-limit claim silently goes stale the
+    moment that site moves, is removed, or is joined by a second one.
+    """
+    path = REPO_ROOT / "src/xagent/web/services/task_execution_controller.py"
+    source = path.read_text()
+    lines = source.splitlines()
+    target_line = lines[138]  # 1-indexed line 139
+    assert "values[Task.status]" in target_line, (
+        "task_execution_controller.py:139 changed -- update "
+        f"COLUMN_KEYED_WRITE_NOTE (and this test) to match. Found: {target_line!r}"
+    )
+    assert "values[Task.status]" in COLUMN_KEYED_WRITE_NOTE
+    assert source.count("values[Task.status]") == 1, (
+        "a second Column-keyed Task.status write appeared; the guard does not "
+        "scan this shape, so each site needs its own recorded reasoning"
+    )
+
+
+def test_guard_does_not_flag_the_column_keyed_write_shape() -> None:
+    """Pins the scope limit itself, so a future guard change that starts
+    covering Column-keyed writes cannot leave the docstring claiming
+    otherwise.
+    """
+    violations = scan_source(_FIXTURE_COLUMN_KEYED_WRITE, "fixture_column_keyed.py")
+    assert violations == [], (
+        "the Column-keyed write shape is documented as out of scan scope; if "
+        "the guard now covers it, update the module docstring and "
+        f"COLUMN_KEYED_WRITE_NOTE: {violations}"
+    )
 
 
 def test_scan_root_is_src_xagent() -> None:

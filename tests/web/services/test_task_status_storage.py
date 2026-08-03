@@ -134,7 +134,7 @@ def test_wrong_case_literal_query_zero_hits_sqlite(db_session) -> None:
     )
 
     correct_case_rows = db_session.execute(
-        text(RAW_VALUE_LITERAL_ZERO_MATCH_SQL.replace(":value", ":value")),
+        text(RAW_VALUE_LITERAL_ZERO_MATCH_SQL),
         {"value": TASK_STATUS_STORAGE_NAMES[TaskStatus.WAITING_FOR_USER]},
     ).fetchall()
     assert correct_case_rows == [(task.id,)], (
@@ -171,15 +171,15 @@ def test_orm_bind_rejects_raw_value_string_sqlite(db_session) -> None:
 
 
 def test_poison_write_orm_rejected_raw_sql_still_poisons_sqlite(db_session) -> None:
-    """Poison-write, both halves (R-F2).
+    """Poison-write, both halves.
 
     Half A: the ORM write path is rejected (validate_strings=True) --
     reuses the bind-layer sentinel above on the real Task model.
     Half B: validate_strings only closes the ORM/Core bind path. A raw
     text() UPDATE still writes an unknown label straight into the column,
     and a subsequent ORM read of that row raises LookupError while trying
-    to construct the TaskStatus member -- the asymmetry the FREEZE record
-    calls out explicitly (R-F2/C-m2).
+    to construct the TaskStatus member. Both halves are asserted here so
+    the guarantee is not overstated as "the column cannot hold a bad value".
     """
     user_id = _create_user(db_session)
     task = Task(user_id=user_id, title="poison-write", status=TaskStatus.RUNNING)
@@ -210,7 +210,7 @@ def test_poison_write_orm_rejected_raw_sql_still_poisons_sqlite(db_session) -> N
 def test_poison_write_control_throwaway_model_without_validate_strings(
     tmp_path,
 ) -> None:
-    """Control for the poison-write test above (FREEZE C-m3).
+    """Control for the poison-write test above.
 
     Once Task.status has validate_strings=True, the "before" behavior can
     no longer be demonstrated on the real Task column. A throwaway model
@@ -257,10 +257,14 @@ def test_poison_write_control_throwaway_model_without_validate_strings(
 # --------------------------------------------------------------------------
 # Predicate <-> raw-comparison compiled-SQL equivalence, one per real site
 # --------------------------------------------------------------------------
-# Mutation check (per taskbook section 7): flip task_status_predicate.eq to
-# return `Task.status == status.value` (lowercase) and every test below
-# goes red, because the compiled literal no longer matches the raw-literal
-# reference on the right-hand side.
+# Mutation check: flipping task_status_predicate.eq to return
+# `Task.status == status.value` (lowercase) turns
+# test_predicate_eq_matches_raw_comparison and all four
+# test_where_eq_site_matches_raw_comparison cases red, because the compiled
+# literal no longer matches the raw-literal reference on the right-hand
+# side. The round-trip sentinels are unaffected by that mutation: they write
+# through the ORM and never call the binding, so equivalence coverage here is
+# what catches an eq regression, not the round trip.
 
 
 def test_predicate_eq_matches_raw_comparison() -> None:
@@ -276,7 +280,7 @@ def test_predicate_ne_matches_raw_comparison() -> None:
 
 
 def test_predicate_ne_accepts_a_runtime_status_variable() -> None:
-    """C-m4: the ne() form must work with a runtime TaskStatus, not just a
+    """The ne() form must work with a runtime TaskStatus, not just a
     literal constant -- release_task_lease_no_commit and
     release_current_runner_task_lease both call ne(status) where status is
     a caller-supplied parameter.
@@ -343,8 +347,8 @@ def test_predicate_value_passes_through_a_valid_status() -> None:
 
 
 # --- Full-statement equivalence for the 5 UPDATE SET-case sites -----------
-# C-m4: these 5 are case() expressions inside .values(), not WHERE clauses;
-# the equivalence check must diff the complete compiled UPDATE, not just an
+# These 5 are case() expressions inside .values(), not WHERE clauses; the
+# equivalence check must diff the complete compiled UPDATE, not just an
 # isolated boolean expression, since the case()'s THEN/ELSE wiring is part
 # of what "equivalent" means here.
 
@@ -525,7 +529,9 @@ def test_where_eq_site_matches_raw_comparison(site, status) -> None:
 
 
 def test_where_ne_site_or_clause_matches_raw_comparison() -> None:
-    """task_lease_service.py:508-516 and :520 (acquire_task_lease_no_commit)."""
+    """task_lease_service.py:510 (acquire_task_lease_no_commit) -- the ne()
+    inside the or_() that gates whether the lease can be taken.
+    """
     stmt_raw = update(Task).where(
         Task.id == 1,
         or_(
@@ -540,6 +546,20 @@ def test_where_ne_site_or_clause_matches_raw_comparison() -> None:
             Task.runner_id == "runner",
         ),
     )
+    assert _compiled(stmt_raw) == _compiled(stmt_bound)
+
+
+def test_where_ne_new_run_site_matches_raw_comparison() -> None:
+    """task_lease_service.py:520 (acquire_task_lease_no_commit) -- the
+    standalone new_run guard, appended as its own .where() on an existing
+    statement rather than nested in an or_(). Different composition from the
+    site above, so it gets its own full-statement diff instead of being
+    assumed equivalent by shape.
+    """
+    stmt_raw = update(Task).where(Task.id == 1)
+    stmt_raw = stmt_raw.where(Task.status != TaskStatus.RUNNING)
+    stmt_bound = update(Task).where(Task.id == 1)
+    stmt_bound = stmt_bound.where(task_status_predicate.ne(TaskStatus.RUNNING))
     assert _compiled(stmt_raw) == _compiled(stmt_bound)
 
 

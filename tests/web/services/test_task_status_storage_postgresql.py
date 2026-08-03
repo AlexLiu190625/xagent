@@ -12,7 +12,7 @@ fail differently for the same misuse:
 - Once that error happens, PostgreSQL marks the transaction failed and
   every further statement on the same connection raises
   InFailedSqlTransaction until a rollback -- each sentinel below that
-  provokes a DB-layer error rolls back immediately afterward (R6/C8).
+  provokes a DB-layer error rolls back immediately afterward.
 """
 
 from __future__ import annotations
@@ -83,12 +83,12 @@ def test_task_status_round_trip_postgresql(db_session) -> None:
 def test_pg_enum_reflects_exactly_the_taskstatus_members(db_session) -> None:
     """create_all's produced native ENUM must equal the model's member set.
 
-    This is a structural sentinel, not a deployed-database check (V2 item
-    10 / FREEZE): it pins that a *fresh* create_all schema has no drift
-    between the model's TaskStatus and the PostgreSQL ENUM type's labels.
-    It cannot observe a pre-#395 deployed database that predates a member
-    being added -- that is a separate, startup-validation-domain risk that
-    was reported upward rather than folded into this PR's sentinels.
+    This is a structural sentinel, not a deployed-database check: it pins
+    that a *fresh* create_all schema has no drift between the model's
+    TaskStatus and the PostgreSQL ENUM type's labels. It cannot observe a
+    deployed database whose ENUM type was created before a member was added
+    to TaskStatus and never altered since; detecting that belongs to
+    startup validation and is out of reach of any fixture-created schema.
     """
     rows = db_session.execute(
         text(
@@ -109,9 +109,9 @@ def test_pg_enum_reflects_exactly_the_taskstatus_members(db_session) -> None:
 def test_wrong_case_literal_query_raises_on_postgresql(db_session) -> None:
     """The DB-layer sentinel's PostgreSQL half: DataError, not zero rows.
 
-    Independent-session recovery per R6/C8: this session's transaction is
-    left failed after the DataError, so a fresh Session is used for the
-    positive control that follows instead of reusing this one uncommitted.
+    The DataError leaves this session's transaction in a failed state, so
+    it is rolled back before the positive control below runs; without that
+    rollback every following statement raises InFailedSqlTransaction.
     """
     user_id = _create_user(db_session)
     task = Task(
@@ -160,9 +160,8 @@ def test_cast_without_lower_silently_zero_matches_postgresql(db_session) -> None
 def test_orm_bind_rejects_raw_value_string_postgresql(db_session) -> None:
     """Bind-layer sentinel's PostgreSQL half -- same StatementError(LookupError)
     shape as SQLite (test_orm_bind_rejects_raw_value_string_sqlite), pinned
-    symmetrically per R-F1. This raises before a statement ever reaches the
-    server, so unlike the DB-layer sentinel above, no independent-session
-    recovery is needed.
+    symmetrically. This raises before a statement ever reaches the server,
+    so unlike the DB-layer sentinel above, no rollback recovery is needed.
     """
     user_id = _create_user(db_session)
     task = Task(
@@ -180,8 +179,8 @@ def test_poison_write_orm_rejected_raw_sql_poisons_on_postgresql(db_session) -> 
     PostgreSQL equivalent: PostgreSQL's native ENUM type rejects the raw
     write itself (test_wrong_case_literal_query_raises_on_postgresql above)
     -- there is no window where an invalid label reaches the column, so
-    there is nothing left to poison a later ORM read. That asymmetry is the
-    point of pinning both backends separately rather than one shared test.
+    there is nothing left to poison a later ORM read. That asymmetry is why
+    the two backends are pinned separately rather than by one shared test.
     """
     user_id = _create_user(db_session)
     task = Task(user_id=user_id, title="poison-write pg", status=TaskStatus.RUNNING)

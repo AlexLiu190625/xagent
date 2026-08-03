@@ -39,6 +39,13 @@ Known, accepted scope limits:
   ``xagent.web.models.task.Task``.
 - ``db.query(Task.status)`` (a bare projection, not a comparison) is not one
   of the four shapes and is never flagged.
+- A write keyed by the *Column object* instead of the column name --
+  ``values[Task.status] = status`` spread into
+  ``update(Task).values(**values)`` -- is a fifth shape, outside the four
+  above, and is not flagged. One such site exists at
+  ``src/xagent/web/services/task_execution_controller.py:139``; see
+  ``COLUMN_KEYED_WRITE_NOTE`` below for why it is safe and what would break
+  that reasoning.
 """
 
 from __future__ import annotations
@@ -252,10 +259,10 @@ class Exemption:
     owner: str
 
 
-# Pre-existing typed Task.status call sites as of the 478333c0 baseline,
-# before this predicate binding existed. New lifecycle code must go through
-# task_status_predicate; this table is debt inventory for what was already
-# there, not an endorsement to add more. Each entry is checked by
+# Typed Task.status call sites that predate task_status_predicate and are not
+# routed through it. New lifecycle code must go through the binding; this
+# table is a debt inventory of what is already there, not an endorsement to
+# add more. Each entry is checked by
 # test_exemptions_still_resolve_to_live_call_sites in
 # test_task_status_predicate_guard.py -- a stale line/shape turns that test
 # red so the table cannot silently rot into a blanket suppression list.
@@ -264,161 +271,187 @@ EXEMPTIONS: tuple[Exemption, ...] = (
         "src/xagent/web/api/a2a.py",
         210,
         ViolationKind.COMPARE,
-        "pre-existing typed comparison; out of this PR's blast radius "
-        "(range lock covers task.py/task_lease_service.py/monitor.py only)",
+        "typed comparison that predates the binding; conversion is confined to "
+        "task.py, task_lease_service.py and monitor.py",
         "a2a",
     ),
     Exemption(
         "src/xagent/web/api/a2a.py",
         288,
         ViolationKind.COMPARE,
-        "pre-existing typed comparison; out of this PR's blast radius",
+        "typed comparison that predates the binding; outside the three files "
+        "routed through it",
         "a2a",
     ),
     Exemption(
         "src/xagent/web/api/a2a.py",
         1449,
         ViolationKind.VALUES_KEYWORD,
-        "pre-existing typed .values(status=...) write; out of this PR's blast radius",
+        "typed .values(status=...) write that predates the binding; outside the "
+        "three files routed through it",
         "a2a",
     ),
     Exemption(
         "src/xagent/web/api/a2a.py",
         1465,
         ViolationKind.COMPARE,
-        "pre-existing typed comparison; out of this PR's blast radius",
+        "typed comparison that predates the binding; outside the three files "
+        "routed through it",
         "a2a",
     ),
     Exemption(
         "src/xagent/web/api/a2a.py",
         1471,
         ViolationKind.IN_LIKE_CALL,
-        "pre-existing typed comparison; out of this PR's blast radius",
+        "typed comparison that predates the binding; outside the three files "
+        "routed through it",
         "a2a",
     ),
     Exemption(
         "src/xagent/web/services/triggers.py",
         1934,
         ViolationKind.COMPARE,
-        "pre-existing typed comparison; out of this PR's blast radius",
+        "typed comparison that predates the binding; outside the three files "
+        "routed through it",
         "triggers",
     ),
     Exemption(
         "src/xagent/web/api/trace_handlers.py",
         328,
         ViolationKind.COMPARE,
-        "pre-existing typed comparison; out of this PR's blast radius",
+        "typed comparison that predates the binding; outside the three files "
+        "routed through it",
         "trace_handlers",
     ),
     Exemption(
         "src/xagent/web/api/websocket.py",
         369,
         ViolationKind.VALUES_KEYWORD,
-        "pre-existing typed .values(status=...) write; out of this PR's blast radius",
+        "typed .values(status=...) write that predates the binding; outside the "
+        "three files routed through it",
         "websocket",
     ),
     Exemption(
         "src/xagent/web/api/websocket.py",
         376,
         ViolationKind.COMPARE,
-        "pre-existing typed comparison; out of this PR's blast radius",
+        "typed comparison that predates the binding; outside the three files "
+        "routed through it",
         "websocket",
     ),
     Exemption(
         "src/xagent/web/api/websocket.py",
         389,
         ViolationKind.COMPARE,
-        "pre-existing typed comparison; out of this PR's blast radius",
+        "typed comparison that predates the binding; outside the three files "
+        "routed through it",
         "websocket",
     ),
     Exemption(
         "src/xagent/web/api/websocket.py",
         4489,
         ViolationKind.COMPARE,
-        "pre-existing typed comparison; out of this PR's blast radius",
+        "typed comparison that predates the binding; outside the three files "
+        "routed through it",
         "websocket",
     ),
     Exemption(
         "src/xagent/web/api/websocket.py",
         7167,
         ViolationKind.COMPARE,
-        "pre-existing typed comparison; out of this PR's blast radius",
+        "typed comparison that predates the binding; outside the three files "
+        "routed through it",
         "websocket",
     ),
     Exemption(
         "src/xagent/web/services/task_orchestrator.py",
         839,
         ViolationKind.COMPARE,
-        "pre-existing typed comparison; out of this PR's blast radius",
+        "typed comparison that predates the binding; outside the three files "
+        "routed through it",
         "task_orchestrator",
     ),
     Exemption(
         "src/xagent/web/services/task_orchestrator.py",
         841,
         ViolationKind.IN_LIKE_CALL,
-        "pre-existing typed comparison; out of this PR's blast radius",
+        "typed comparison that predates the binding; outside the three files "
+        "routed through it",
         "task_orchestrator",
     ),
     Exemption(
         "src/xagent/web/services/task_orchestrator.py",
         933,
         ViolationKind.COMPARE,
-        "pre-existing typed comparison; out of this PR's blast radius",
+        "typed comparison that predates the binding; outside the three files "
+        "routed through it",
         "task_orchestrator",
     ),
     Exemption(
         "src/xagent/web/services/task_orchestrator.py",
         1040,
         ViolationKind.COMPARE,
-        "pre-existing typed comparison; out of this PR's blast radius",
+        "typed comparison that predates the binding; outside the three files "
+        "routed through it",
         "task_orchestrator",
     ),
-    # a2a_protocol.py:479-512 (a2a_task_state_filter) -- reviewed and kept as
-    # a known existing typed predicate factory in Round 1 review (C6): "the
-    # existing typed surface is not migrated in this PR, only new lifecycle
-    # code must use the binding." Listed individually because the guard
-    # matches per-node, not per-function.
+    # a2a_protocol.py:479-512 (a2a_task_state_filter) is an existing typed
+    # predicate factory that stays on its own typed surface: only new
+    # lifecycle code is required to use the binding. Listed per node rather
+    # than per function because the guard matches per node.
     Exemption(
         "src/xagent/web/services/a2a_protocol.py",
         491,
         ViolationKind.COMPARE,
-        "pre-existing typed predicate factory (a2a_task_state_filter); "
-        "reviewed exemption, not converted to keep blast radius to the two "
-        "conversion files",
+        "typed predicate factory (a2a_task_state_filter) that predates the "
+        "binding; outside the three files routed through it",
         "a2a_protocol",
     ),
     Exemption(
         "src/xagent/web/services/a2a_protocol.py",
         495,
         ViolationKind.COMPARE,
-        "pre-existing typed predicate factory (a2a_task_state_filter); "
-        "reviewed exemption, not converted to keep blast radius to the two "
-        "conversion files",
+        "typed predicate factory (a2a_task_state_filter) that predates the "
+        "binding; outside the three files routed through it",
         "a2a_protocol",
     ),
     Exemption(
         "src/xagent/web/services/a2a_protocol.py",
         502,
         ViolationKind.COMPARE,
-        "pre-existing typed predicate factory (a2a_task_state_filter); "
-        "reviewed exemption, not converted to keep blast radius to the two "
-        "conversion files",
+        "typed predicate factory (a2a_task_state_filter) that predates the "
+        "binding; outside the three files routed through it",
         "a2a_protocol",
     ),
 )
 
-# a2a_protocol.py:104 is a documented fragile point, not a guard violation
-# (TaskStatus(task.status) is a Call, not one of the four flagged shapes).
-# Recorded here so the safety reasoning has one home instead of being
-# unwritten anywhere, per the FREEZE record: it is correct only because
-# ``task.status`` on a live ORM instance is already a ``TaskStatus`` member
-# (the column's Python-side value), and ``TaskStatus(member)`` is an
-# identity lookup for a member argument. Feeding this a raw storage string
-# (the enum *name*, e.g. "WAITING_FOR_USER") would raise ValueError instead
-# of returning a member.
+# a2a_protocol.py:104 is a fragile point, not a guard violation
+# (TaskStatus(task.status) is a Call, not one of the four flagged shapes), so
+# its safety reasoning is recorded here rather than left unwritten: it is
+# correct only because ``task.status`` on a live ORM instance is already a
+# ``TaskStatus`` member (the column's Python-side value), and
+# ``TaskStatus(member)`` is an identity lookup for a member argument. Feeding
+# it a raw storage string (the enum *name*, e.g. "WAITING_FOR_USER") raises
+# ValueError instead of returning a member.
 A2A_PROTOCOL_VALUE_LOOKUP_NOTE = (
     "src/xagent/web/services/a2a_protocol.py:104 -- "
     "TaskStatus(task.status) is safe only while task.status is sourced from "
     "an ORM-loaded Task instance (already a TaskStatus member); it must "
     "never be called with a raw storage string."
+)
+
+# task_execution_controller.py:139 writes Task.status through a Column-object
+# dict key (``values[Task.status] = status``), the fifth shape named in this
+# module's docstring, which the four scanned shapes do not reach. It is not
+# routed through task_status_predicate.value(...), so its only enforcement is
+# the column itself: Enum(TaskStatus, validate_strings=True) rejects a raw
+# string at bind time. apply_task_control_transition annotates the parameter
+# as TaskStatus but performs no runtime check of its own, so widening the
+# guard to Column-object keys -- or routing this site through the binding --
+# is what would restore construction-time failure here.
+COLUMN_KEYED_WRITE_NOTE = (
+    "src/xagent/web/services/task_execution_controller.py:139 -- "
+    "values[Task.status] = status is a Column-keyed write outside the four "
+    "scanned shapes; it fails closed only at the column's validate_strings "
+    "bind check, not at construction time."
 )
