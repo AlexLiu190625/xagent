@@ -1778,11 +1778,14 @@ def test_load_checkpoint_generic_decode_failure_raises_unavailable(
         db.close()
 
 
-def test_load_checkpoint_undecodable_window_full_raises_unavailable_not_corrupt(
+def test_load_checkpoint_undecodable_full_batch_is_exhausted_raises_corrupt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A full scan window can't prove the candidate set is exhausted."""
-    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    """A first batch exactly at the page size is not ambiguous: the scan
+    pages past it, finds nothing more, and that proves the matching set was
+    exhausted -- exclusively permanent decode failures is corrupt, not a
+    conservative unavailable."""
+    from xagent.core.agent.checkpoint import CheckpointCorruptError
     from xagent.web.api.trace_handlers import CHECKPOINT_ROW_SCAN_LIMIT
 
     SessionLocal = _session_factory()
@@ -1795,11 +1798,11 @@ def test_load_checkpoint_undecodable_window_full_raises_unavailable_not_corrupt(
             db.add(
                 DatabaseTraceEvent(
                     task_id=task_id,
-                    event_id=f"window-full-{i}",
+                    event_id=f"full-batch-{i}",
                     event_type="system_update_general",
                     timestamp=now + timedelta(seconds=i),
                     data=_checkpoint_data(
-                        "exec-window-full",
+                        "exec-full-batch",
                         {
                             "__encoding": MESSAGE_REFS_ENCODING,
                             "count": 1,
@@ -1815,10 +1818,205 @@ def test_load_checkpoint_undecodable_window_full_raises_unavailable_not_corrupt(
             "xagent.web.api.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
-        with pytest.raises(CheckpointUnavailableError):
+        with pytest.raises(CheckpointCorruptError):
             DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
-                "exec-window-full"
+                "exec-full-batch"
             )
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_scan_continues_past_a_batch_of_undecodable_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A readable row in a later batch is still found -- the scan does not
+    give up after the first page, it pages until the set is exhausted or a
+    readable row turns up."""
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        # Newest four rows (scanned first, in two pages of two) are
+        # undecodable; the oldest row (third page) is readable.
+        for i in range(4):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"multi-batch-bad-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=10 - i),
+                    data=_checkpoint_data(
+                        "exec-multi-batch",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="multi-batch-readable",
+                event_type="system_update_general",
+                timestamp=now,
+                data=_checkpoint_data(
+                    "exec-multi-batch", [{"role": "user", "content": "hello"}]
+                ),
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+        )
+        loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+            "exec-multi-batch"
+        )
+        assert loaded is not None
+        assert loaded["context"]["messages"] == [{"role": "user", "content": "hello"}]
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_scan_exhausts_multiple_batches_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every row across every batch is permanently undecodable, and the
+    scan proves the set exhausted (a page shorter than the batch size) --
+    corrupt, not unavailable."""
+    from xagent.core.agent.checkpoint import CheckpointCorruptError
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        for i in range(4):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"multi-batch-corrupt-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=i),
+                    data=_checkpoint_data(
+                        "exec-multi-batch-corrupt",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+        )
+        with pytest.raises(CheckpointCorruptError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-multi-batch-corrupt"
+            )
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_generic_failure_mid_scan_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generic (transient) failure on one row anywhere in a multi-batch
+    scan is conservatively unavailable, even if every other row in the scan
+    is a confirmed permanent decode failure."""
+    from unittest.mock import patch
+
+    import xagent.web.services.trace_message_storage as tms
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        # Newest row is marked to fail the blob prefetch generically; it is
+        # otherwise perfectly readable (encoded so decode actually needs the
+        # blob lookup this test makes fail).
+        flaky_data = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data(
+                "exec-mid-scan-failure",
+                [{"role": "user", "content": "needs prefetch"}],
+            ),
+        )
+        flaky_data["__test_trigger_generic_failure"] = True
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="mid-scan-flaky",
+                event_type="system_update_general",
+                timestamp=now + timedelta(seconds=10),
+                data=flaky_data,
+            )
+        )
+        # Older rows are permanently undecodable, spanning a second batch.
+        for i in range(3):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"mid-scan-corrupt-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=i),
+                    data=_checkpoint_data(
+                        "exec-mid-scan-failure",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+        )
+        original_lookup = tms._load_trace_blob_lookup
+
+        def _flaky_lookup(db: Session, *, task_id: int, data_items: list[Any]) -> Any:
+            if any(
+                isinstance(item, dict) and item.get("__test_trigger_generic_failure")
+                for item in data_items
+            ):
+                raise RuntimeError("transient db error")
+            return original_lookup(db, task_id=task_id, data_items=data_items)
+
+        with patch.object(tms, "_load_trace_blob_lookup", side_effect=_flaky_lookup):
+            with pytest.raises(CheckpointUnavailableError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "exec-mid-scan-failure"
+                )
     finally:
         db.close()
 
