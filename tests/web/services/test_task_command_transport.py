@@ -115,7 +115,9 @@ def low_timeout_sqlite_engine(tmp_path):
         f"sqlite:///{tmp_path / 'task-command-lock-path.db'}",
         connect_args={"check_same_thread": False},
     )
-    apply_sqlite_concurrency_pragmas(engine, busy_timeout_ms=50)
+    # Long enough to stay clear of thread-scheduling jitter under a loaded
+    # test run, short enough to keep the lock-path tests well under 2s.
+    apply_sqlite_concurrency_pragmas(engine, busy_timeout_ms=200)
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     try:
@@ -2640,8 +2642,11 @@ async def test_dispatcher_worker_recovers_from_a_lock_timeout_and_claims_once_re
         # Wait for the worker to actually observe the lock timeout (rather
         # than a fixed sleep) before releasing it -- releasing early would
         # let the blocked claim succeed once unblocked instead of timing out,
-        # never exercising the recovery path this test is for.
-        for _ in range(200):
+        # never exercising the recovery path this test is for. The bound is
+        # generous because the claim itself runs on the default thread-pool
+        # executor, whose scheduling delay grows under a heavily loaded test
+        # run rather than staying tied to busy_timeout.
+        for _ in range(2000):
             if "component=task-command-dispatcher" in caplog.text:
                 break
             await asyncio.sleep(0.01)
@@ -2649,7 +2654,7 @@ async def test_dispatcher_worker_recovers_from_a_lock_timeout_and_claims_once_re
             raise AssertionError("worker never logged a lock-timeout failure")
         assert not applied.is_set(), "must not have claimed while the lock was held"
         owner_db.commit()
-        await asyncio.wait_for(applied.wait(), timeout=2)
+        await asyncio.wait_for(applied.wait(), timeout=20)
     finally:
         worker.cancel()
         with pytest.raises(asyncio.CancelledError):
