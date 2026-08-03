@@ -29,9 +29,9 @@ from tests.web.services.task_status_predicate_guard import (
 
 
 def test_forward_guard_flags_only_exempted_sites() -> None:
-    exempt_keys = {(e.path, e.lineno, e.kind) for e in EXEMPTIONS}
+    exempt_ids = {e.identity for e in EXEMPTIONS}
     violations = scan_tree()
-    unexempted = [v for v in violations if v.key not in exempt_keys]
+    unexempted = [v for v in violations if v.identity not in exempt_ids]
     assert unexempted == [], (
         "raw Task.status comparison/write outside the typed binding "
         "(task_status_predicate) with no exemption entry -- route it "
@@ -42,21 +42,25 @@ def test_forward_guard_flags_only_exempted_sites() -> None:
 def test_exemptions_still_resolve_to_live_call_sites() -> None:
     """Every exemption row must still point at the violation it claims.
 
-    Without this, the exemption table degrades into a write-only
-    suppression list: a line renumbers or the code is rewritten to no
-    longer need the exemption, and nobody notices because the forward
-    guard above only ever complains about *new* unexempted violations.
+    Matching is by stable identity (path, kind, enclosing scope, ast.unparse
+    signature, occurrence) -- not line number, which drifts every time
+    unrelated code moves in the same file. Without this test, the
+    exemption table degrades into a write-only suppression list: a site is
+    rewritten or removed, and nobody notices because the forward guard
+    above only ever complains about *new* unexempted violations.
     """
     stale: list[str] = []
     for exemption in EXEMPTIONS:
         path = REPO_ROOT / exemption.path
-        violations = {v.key: v for v in scan_file(path)}
-        key = (exemption.path, exemption.lineno, exemption.kind)
-        if key not in violations:
+        live_ids = {v.identity for v in scan_file(path)}
+        if exemption.identity not in live_ids:
             stale.append(
-                f"{exemption.path}:{exemption.lineno} ({exemption.kind.value}) "
-                f"owner={exemption.owner!r} no longer resolves to a live "
-                "Task.status violation -- update or remove this exemption"
+                f"{exemption.path} scope={exemption.scope!r} "
+                f"sig={exemption.signature!r} occ={exemption.occurrence} "
+                f"({exemption.kind.value}) owner={exemption.owner!r} "
+                f"[advisory_lineno={exemption.advisory_lineno}] no longer "
+                "resolves to a live Task.status violation -- update or "
+                "remove this exemption"
             )
     assert stale == [], stale
 
