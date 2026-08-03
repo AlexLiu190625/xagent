@@ -403,6 +403,11 @@ def enqueue_task_command(
             kind=kind,
             payload=payload,
         )
+        # Only a newly created row is worth committing, and the commit stays
+        # inside this try so that a constraint failure surfacing there rather
+        # than at the staging flush is still rolled back and classified.
+        if staged.created:
+            db.commit()
     except IntegrityError:
         db.rollback()
         classification = classify_task_command_conflict(
@@ -436,7 +441,6 @@ def enqueue_task_command(
             status=staged.status,
         )
 
-    db.commit()
     notify_task_command_dispatcher()
     return EnqueuedTaskCommand(
         command_id=staged.staged_db_id,
