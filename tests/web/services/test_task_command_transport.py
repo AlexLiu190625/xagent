@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, is_dataclass
 from datetime import datetime, timedelta
@@ -10,11 +12,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     _load_command_message_delivery_status,
@@ -36,15 +39,20 @@ from xagent.web.services import task_command_transport as task_command_transport
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
+    COMMAND_PENDING,
+    DISPATCHER_IDLE_SECONDS,
     MAX_COMMAND_DEFERS,
     MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
+    TaskCommandConflictKind,
     TaskCommandDeferred,
     TaskCommandKind,
+    TaskCommandOwnerStateError,
     TaskCommandRejected,
     TaskCommandTaskMissing,
     _claim_heartbeat,
     claim_task_command,
+    classify_task_command_conflict,
     defer_task_command,
     dispatch_one_task_command,
     dispatch_task_command_promptly,
@@ -55,6 +63,7 @@ from xagent.web.services.task_command_transport import (
     notify_task_command_dispatcher,
     renew_task_command_claim,
     retry_failed_task_command,
+    stage_task_command,
     start_task_command_dispatcher,
     stop_task_command_dispatcher,
     task_has_live_foreign_runner,
@@ -90,6 +99,62 @@ def queue_pool_command_db(tmp_path):
         yield engine, SessionLocal
     finally:
         engine.dispose()
+
+
+@pytest.fixture()
+def low_timeout_sqlite_engine(tmp_path):
+    """A file-backed SQLite engine with a short busy_timeout for lock tests.
+
+    init_db does not expose apply_sqlite_concurrency_pragmas's busy_timeout_ms
+    parameter (it always uses the 5s production default), so a lock-path test
+    that needs a bounded wait builds its own engine directly instead of going
+    through init_db.
+    """
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'task-command-lock-path.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    apply_sqlite_concurrency_pragmas(engine, busy_timeout_ms=50)
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    try:
+        yield engine, SessionLocal
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture()
+def postgres_task_command_sessions():
+    """A real PostgreSQL sessionmaker plus one running task's id.
+
+    Used only by the truly-concurrent raced-duplicate test: SQLite serializes
+    all writers through one database-wide lock, so a second writer's insert
+    can never be genuinely in flight at the same instant as the first's --
+    it simply cannot begin until the first's transaction ends. PostgreSQL's
+    per-row locking lets two inserts targeting the same unique key both be
+    open at once, with the second blocking until the first resolves.
+    """
+
+    url = os.getenv("XAGENT_TEST_POSTGRES_URL")
+    if not url:
+        pytest.skip("XAGENT_TEST_POSTGRES_URL is not set")
+    init_db(db_url=url)
+    engine = get_engine()
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = get_session_local()
+    try:
+        with SessionLocal() as db:
+            user, task = _create_running_task(db)
+            task.runner_id = None
+            task.lease_expires_at = None
+            db.commit()
+            task_id = int(task.id)
+            actor_id = int(user.id)
+        yield SessionLocal, task_id, actor_id
+    finally:
+        Base.metadata.drop_all(bind=engine)
 
 
 def _create_running_task(db) -> tuple[User, Task]:
@@ -2011,3 +2076,619 @@ def test_actor_foreign_key_failure_is_not_reported_as_a_missing_task(
             kind=TaskCommandKind.PAUSE,
             payload={"type": "pause_task"},
         )
+
+
+# --- stage_task_command / classify_task_command_conflict (#1073) ---------
+
+
+def test_stage_does_not_commit(db_session) -> None:
+    """Staging must be observable only inside the caller's own session until
+    it commits -- a second session must see nothing beforehand."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+
+    staged = stage_task_command(
+        db_session,
+        task_id=task_id,
+        actor_user_id=int(user.id),
+        command_id="stage-visibility",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    assert staged.created is True
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as observer:
+        assert observer.get(TaskExecutionCommand, staged.staged_db_id) is None
+
+    db_session.commit()
+
+    with SessionLocal() as observer:
+        row = observer.get(TaskExecutionCommand, staged.staged_db_id)
+        assert row is not None
+        assert row.status == COMMAND_PENDING
+
+
+def test_stage_missing_task_leaves_no_command_pending(db_session) -> None:
+    """Staging against a task deleted before the call must not add any
+    command row to the session -- there is no write for a caller rollback to
+    even need to undo."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+    db_session.query(Task).filter(Task.id == task_id).delete()
+    db_session.commit()
+
+    with pytest.raises(TaskCommandTaskMissing):
+        stage_task_command(
+            db_session,
+            task_id=task_id,
+            actor_user_id=int(user.id),
+            command_id="stage-missing-task",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+
+    assert db_session.query(TaskExecutionCommand).count() == 0
+
+
+def test_outer_rollback_leaves_no_command(db_session) -> None:
+    """A caller that stages a command as part of a larger unit of work and
+    then rolls back must lose the command along with the rest of that work --
+    there is no SAVEPOINT isolating the command insert from the caller's own
+    writes. The sibling write is created before staging begins; created after,
+    this would only prove a single-row rollback rather than the caller's
+    whole transaction being undone."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+    task.title = "rolled-back-sibling-write"
+
+    staged = stage_task_command(
+        db_session,
+        task_id=task_id,
+        actor_user_id=int(user.id),
+        command_id="outer-rollback",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    assert staged.created is True
+
+    db_session.rollback()
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as observer:
+        observed_task = observer.get(Task, task_id)
+        assert observed_task is not None
+        assert observed_task.title != "rolled-back-sibling-write"
+        assert (
+            observer.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.task_id == task_id)
+            .count()
+            == 0
+        )
+
+
+def test_enqueue_idempotent_hit_issues_no_commit(db_session) -> None:
+    """Only the created=True path may end the caller's transaction -- a
+    duplicate command_id must leave an accompanying uncommitted write
+    uncommitted, observed from a second session."""
+
+    user, task = _create_running_task(db_session)
+    first = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="no-commit-duplicate",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    assert first.created is True
+
+    task.title = "uncommitted sibling write"
+    duplicate = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="no-commit-duplicate",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    assert duplicate.created is False
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as observer:
+        observed_task = observer.get(Task, int(task.id))
+        assert observed_task is not None
+        assert observed_task.title != "uncommitted sibling write"
+
+
+def test_enqueue_missing_task_issues_no_commit(db_session) -> None:
+    """A missing task must not commit -- an accompanying pending write on the
+    same session must still be observed as uncommitted by another session."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+    db_session.query(Task).filter(Task.id == task_id).delete()
+    db_session.add(
+        User(username="no-commit-sibling-write", password_hash="hash", is_admin=False)
+    )
+
+    with pytest.raises(TaskCommandTaskMissing):
+        enqueue_task_command(
+            db_session,
+            task_id=task_id,
+            actor_user_id=int(user.id),
+            command_id="no-commit-missing-task",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as observer:
+        assert (
+            observer.query(User)
+            .filter(User.username == "no-commit-sibling-write")
+            .first()
+            is None
+        )
+
+
+def test_owner_pre_flush_failure_raises_owner_state_error(db_session) -> None:
+    """A conflict on the caller's own pending write, surfaced by staging's
+    pre-flush, must be reported apart from a conflict on the command insert
+    itself so the two are never confused."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+    db_session.add(User(username=user.username, password_hash="hash", is_admin=False))
+
+    with pytest.raises(TaskCommandOwnerStateError):
+        stage_task_command(
+            db_session,
+            task_id=task_id,
+            actor_user_id=int(user.id),
+            command_id="owner-state-conflict",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+
+
+def test_owner_state_error_is_not_an_integrity_error(db_session) -> None:
+    """Pinned deliberately: TaskCommandOwnerStateError must not be an
+    IntegrityError subclass, or enqueue_task_command's
+    ``except IntegrityError`` would wrongly route an owner-write failure
+    through duplicate/missing-task classification."""
+
+    assert not issubclass(TaskCommandOwnerStateError, IntegrityError)
+
+
+def test_enqueue_does_not_catch_owner_state_error(db_session) -> None:
+    """enqueue_task_command's except IntegrityError must not swallow a
+    pre-flush failure on the caller's own pending write."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+    db_session.add(User(username=user.username, password_hash="hash", is_admin=False))
+
+    with pytest.raises(TaskCommandOwnerStateError):
+        enqueue_task_command(
+            db_session,
+            task_id=task_id,
+            actor_user_id=int(user.id),
+            command_id="owner-state-conflict-wrapper",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+
+
+def test_stage_snapshot_sees_a_bulk_cas_update_pending_in_the_same_session(
+    db_session,
+) -> None:
+    """A CAS-then-stage owner updates the row via a synchronize_session=False
+    bulk statement, which executes immediately. The staging snapshot must
+    observe it -- an ORM query here would instead return the identity map's
+    pre-update cached instance."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+
+    updated = (
+        db_session.query(Task)
+        .filter(Task.id == task_id, Task.runner_id == "runner-a")
+        .update({Task.runner_id: "runner-b"}, synchronize_session=False)
+    )
+    assert updated == 1
+
+    staged = stage_task_command(
+        db_session,
+        task_id=task_id,
+        actor_user_id=int(user.id),
+        command_id="cas-bulk-update",
+        kind=TaskCommandKind.CANCEL,
+        payload={"agent_id": 1},
+    )
+    db_session.commit()
+
+    row = db_session.get(TaskExecutionCommand, staged.staged_db_id)
+    assert row is not None
+    assert row.target_runner_id == "runner-b"
+
+
+def test_stage_snapshot_sees_an_orm_attribute_change_pending_in_the_same_session(
+    db_session,
+) -> None:
+    """A CAS-then-stage owner instead mutates the loaded ORM instance rather
+    than issuing a bulk update. With autoflush disabled this is invisible to
+    a raw Core select until something flushes it -- staging's own owner
+    pre-flush must be what surfaces it, not the identity map."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+
+    task.runner_id = "runner-c"
+    # No explicit flush here: stage_task_command's own pre-flush must be what
+    # pushes this to the database before its Core select runs.
+
+    staged = stage_task_command(
+        db_session,
+        task_id=task_id,
+        actor_user_id=int(user.id),
+        command_id="cas-orm-attribute",
+        kind=TaskCommandKind.CANCEL,
+        payload={"agent_id": 1},
+    )
+    db_session.commit()
+
+    row = db_session.get(TaskExecutionCommand, staged.staged_db_id)
+    assert row is not None
+    assert row.target_runner_id == "runner-c"
+
+
+def test_interleaved_duplicate_enqueue_reports_the_committed_winner(
+    db_session,
+) -> None:
+    """Two real sessions/threads both go through the public enqueue_task_command
+    entry point. B's idempotency precheck runs and finds nothing before A's
+    insert commits, so B's own insert genuinely races A's at the flush --
+    unlike a recipe where A commits first and B's precheck simply finds the
+    row, this exercises the IntegrityError-then-rollback-then-classify path
+    with a real concurrent writer."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+    actor_id = int(user.id)
+    SessionLocal = get_session_local()
+
+    precheck_done = Event()
+    release_b = Event()
+
+    def enqueue_as_b():
+        with SessionLocal() as db_b:
+            real_add = db_b.add
+
+            def paused_add(instance):
+                if isinstance(instance, TaskExecutionCommand):
+                    precheck_done.set()
+                    assert release_b.wait(timeout=10)
+                real_add(instance)
+
+            db_b.add = paused_add
+            return enqueue_task_command(
+                db_b,
+                task_id=task_id,
+                actor_user_id=actor_id,
+                command_id="interleaved-duplicate",
+                kind=TaskCommandKind.PAUSE,
+                payload={"type": "pause_task"},
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(enqueue_as_b)
+        assert precheck_done.wait(timeout=10)
+
+        with SessionLocal() as db_a:
+            winner = enqueue_task_command(
+                db_a,
+                task_id=task_id,
+                actor_user_id=actor_id,
+                command_id="interleaved-duplicate",
+                kind=TaskCommandKind.PAUSE,
+                payload={"type": "pause_task"},
+            )
+        release_b.set()
+        loser = future.result(timeout=10)
+
+    assert winner.created is True
+    assert loser.created is False
+    assert loser.command_id == winner.command_id
+    assert loser.payload_matches is True
+    assert loser.status == winner.status
+
+
+@pytest.mark.postgresql
+def test_postgres_concurrent_insert_blocks_until_the_winner_resolves(
+    postgres_task_command_sessions,
+) -> None:
+    """A genuinely-concurrent variant of the raced-duplicate test: both
+    writers' inserts are open against PostgreSQL at the same instant, with
+    B's insert blocked on A's uncommitted row rather than merely interleaved
+    by a test-code pause. Requires XAGENT_TEST_POSTGRES_URL; skipped
+    otherwise."""
+
+    SessionLocal, task_id, actor_id = postgres_task_command_sessions
+    a_flushed = Event()
+    allow_a_commit = Event()
+    b_blocked_then_resolved = Event()
+
+    def run_a():
+        with SessionLocal() as db_a:
+            staged = stage_task_command(
+                db_a,
+                task_id=task_id,
+                actor_user_id=actor_id,
+                command_id="pg-real-race",
+                kind=TaskCommandKind.PAUSE,
+                payload={"type": "pause_task"},
+            )
+            a_flushed.set()
+            assert allow_a_commit.wait(timeout=10)
+            db_a.commit()
+            return staged
+
+    def run_b():
+        assert a_flushed.wait(timeout=10)
+        with SessionLocal() as db_b:
+            try:
+                stage_task_command(
+                    db_b,
+                    task_id=task_id,
+                    actor_user_id=actor_id,
+                    command_id="pg-real-race",
+                    kind=TaskCommandKind.PAUSE,
+                    payload={"type": "pause_task"},
+                )
+            except IntegrityError:
+                db_b.rollback()
+                classification = classify_task_command_conflict(
+                    db_b,
+                    task_id=task_id,
+                    command_id="pg-real-race",
+                    actor_user_id=actor_id,
+                    kind=TaskCommandKind.PAUSE,
+                    payload={"type": "pause_task"},
+                )
+                b_blocked_then_resolved.set()
+                return classification
+            raise AssertionError("B's insert should have raced A's committed one")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_a = executor.submit(run_a)
+        future_b = executor.submit(run_b)
+        assert a_flushed.wait(timeout=10)
+        # Give B's flush time to genuinely be blocked inside PostgreSQL,
+        # rather than releasing A the instant B's thread has merely started.
+        time.sleep(0.2)
+        allow_a_commit.set()
+        staged_a = future_a.result(timeout=10)
+        classification = future_b.result(timeout=10)
+
+    assert b_blocked_then_resolved.is_set()
+    assert classification.kind is TaskCommandConflictKind.RACED_DUPLICATE
+    assert classification.raced is not None
+    assert classification.raced.command_db_id == staged_a.staged_db_id
+
+
+@pytest.mark.asyncio
+async def test_dispatch_with_staged_id_before_commit_is_noop_and_converges_after_commit(
+    db_session,
+) -> None:
+    """A staged id must not be dispatchable before its owning transaction
+    commits -- the dispatcher claims through its own isolated session, which
+    cannot see an uncommitted row. Once the owner commits without notifying,
+    durable polling converges on it within one idle cycle. The target task
+    has no earlier in-flight command, so unfinished-earlier-command ordering
+    cannot also explain the delay."""
+
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    task_id = int(task.id)
+
+    staged = stage_task_command(
+        db_session,
+        task_id=task_id,
+        actor_user_id=int(user.id),
+        command_id="staged-before-commit",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+
+    async def must_not_dispatch(_command):
+        raise AssertionError("must not dispatch an uncommitted staged command")
+
+    assert not await dispatch_one_task_command(
+        must_not_dispatch, command_db_id=staged.staged_db_id
+    )
+
+    db_session.commit()  # deliberately no notify_task_command_dispatcher() call
+
+    applied = asyncio.Event()
+
+    async def execute_after_commit(command):
+        assert command.id == staged.staged_db_id
+        applied.set()
+        return None
+
+    start_task_command_dispatcher(execute_after_commit)
+    try:
+        await asyncio.wait_for(applied.wait(), timeout=DISPATCHER_IDLE_SECONDS + 1.5)
+    finally:
+        await stop_task_command_dispatcher()
+
+
+def test_owner_holding_a_flushed_command_blocks_a_concurrent_claim(
+    low_timeout_sqlite_engine,
+) -> None:
+    """Staging is the last write before the owner's commit, so the row it
+    flushes stays under SQLite's writer lock for the rest of the owner's
+    transaction -- no longer the microseconds a bare insert-and-commit would
+    hold it for. SQLite's writer lock is database-wide, so a concurrent claim
+    of a different, already-committed command must still wait out
+    busy_timeout and fail with OperationalError rather than hang."""
+
+    engine, SessionLocal = low_timeout_sqlite_engine
+    with SessionLocal() as setup_db:
+        user, task = _create_running_task(setup_db)
+        task.runner_id = None
+        task.lease_expires_at = None
+        setup_db.commit()
+        task_id = int(task.id)
+        actor_id = int(user.id)
+        claimable = enqueue_task_command(
+            setup_db,
+            task_id=task_id,
+            actor_user_id=actor_id,
+            command_id="lock-path-claimable",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+
+    with SessionLocal() as owner_db:
+        stage_task_command(
+            owner_db,
+            task_id=task_id,
+            actor_user_id=actor_id,
+            command_id="lock-path-owner-holds",
+            kind=TaskCommandKind.CANCEL,
+            payload={"agent_id": 1},
+        )
+        # Deliberately not committed yet -- this is the window under test.
+        started = time.monotonic()
+        with SessionLocal() as claimant_db:
+            with pytest.raises(OperationalError):
+                claim_task_command(
+                    claimant_db,
+                    runner_id="lock-path-claimant",
+                    command_db_id=claimable.command_id,
+                )
+        elapsed = time.monotonic() - started
+        owner_db.commit()
+
+    assert elapsed < 2.0
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_worker_recovers_from_a_lock_timeout_and_claims_once_released(
+    low_timeout_sqlite_engine,
+    monkeypatch,
+    caplog,
+) -> None:
+    """The dispatcher worker pool must survive the OperationalError above --
+    logging it and continuing to poll -- and claim the command once the
+    owner's transaction ends, instead of the worker dying or hanging."""
+
+    engine, SessionLocal = low_timeout_sqlite_engine
+    with SessionLocal() as seed_db:
+        user, task = _create_running_task(seed_db)
+        task.runner_id = None
+        task.lease_expires_at = None
+        seed_db.commit()
+        task_id = int(task.id)
+        actor_id = int(user.id)
+        enqueued = enqueue_task_command(
+            seed_db,
+            task_id=task_id,
+            actor_user_id=actor_id,
+            command_id="dispatcher-progress-target",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(task_command_transport_module, "DISPATCHER_IDLE_SECONDS", 0.01)
+    monkeypatch.setattr(
+        task_command_transport_module, "_dispatcher_wakeup", asyncio.Event()
+    )
+
+    owner_db = SessionLocal()
+    stage_task_command(
+        owner_db,
+        task_id=task_id,
+        actor_user_id=actor_id,
+        command_id="dispatcher-progress-lock-holder",
+        kind=TaskCommandKind.CANCEL,
+        payload={"agent_id": 1},
+    )
+    # Deliberately uncommitted -- holds SQLite's writer lock across the
+    # dispatcher worker's first claim attempt.
+
+    caplog.set_level(logging.ERROR, logger="xagent.web.services.task_command_transport")
+    applied = asyncio.Event()
+
+    async def execute(command):
+        assert command.id == enqueued.command_id
+        applied.set()
+        return None
+
+    worker = asyncio.create_task(
+        task_command_transport_module._run_task_command_dispatcher_worker(execute)
+    )
+    try:
+        # Wait for the worker to actually observe the lock timeout (rather
+        # than a fixed sleep) before releasing it -- releasing early would
+        # let the blocked claim succeed once unblocked instead of timing out,
+        # never exercising the recovery path this test is for.
+        for _ in range(200):
+            if "component=task-command-dispatcher" in caplog.text:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("worker never logged a lock-timeout failure")
+        assert not applied.is_set(), "must not have claimed while the lock was held"
+        owner_db.commit()
+        await asyncio.wait_for(applied.wait(), timeout=2)
+    finally:
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+        owner_db.close()
+
+    assert "component=task-command-dispatcher" in caplog.text
+
+
+def test_enqueue_notifies_only_after_commit(db_session, monkeypatch) -> None:
+    """The dispatcher wakeup must fire only once the command is durable --
+    notifying before commit could wake a dispatcher onto a row it cannot yet
+    see, wasting the cycle instead of claiming it."""
+
+    user, task = _create_running_task(db_session)
+    order: list[str] = []
+    real_commit = db_session.commit
+
+    def recording_commit():
+        order.append("commit")
+        real_commit()
+
+    def recording_notify():
+        order.append("notify")
+
+    monkeypatch.setattr(db_session, "commit", recording_commit)
+    monkeypatch.setattr(
+        task_command_transport_module,
+        "notify_task_command_dispatcher",
+        recording_notify,
+    )
+
+    enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="notify-order",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+
+    assert order == ["commit", "notify"]
