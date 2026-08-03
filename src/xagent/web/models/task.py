@@ -275,9 +275,9 @@ def _require_task_status(status: Any) -> TaskStatus:
 def _require_task_status_members(
     statuses: Collection[TaskStatus],
 ) -> tuple[TaskStatus, ...]:
-    if isinstance(statuses, (TaskStatus, str)):
+    if statuses is None or isinstance(statuses, (TaskStatus, str)):
         raise TypeError(
-            "expected a collection of TaskStatus members, got a bare "
+            "expected a collection of TaskStatus members, got "
             f"{type(statuses).__name__}; wrap a single member in a list"
         )
     members = tuple(statuses)
@@ -295,11 +295,11 @@ class TaskStatusPredicate:
     The column stores ``TaskStatus`` member names, not member values (see
     the ``status`` column comment). A raw string literal built from the
     member value silently matches zero rows on SQLite and raises an invalid
-    enum label error on PostgreSQL. Every WHERE/SET-case comparison and
-    every ``.values(status=...)`` write must go through one of the methods
-    below instead of comparing or assigning ``Task.status`` directly, so a
-    non-``TaskStatus`` input fails at construction time (``TypeError``)
-    instead of silently miscompiling at query time.
+    enum label error on PostgreSQL. Every WHERE/SET-case comparison, every
+    null check, and every ``.values(status=...)`` write must go through one
+    of the methods below instead of comparing or assigning ``Task.status``
+    directly, so a non-``TaskStatus`` input fails at construction time
+    (``TypeError``) instead of silently miscompiling at query time.
     """
 
     @staticmethod
@@ -331,8 +331,24 @@ class TaskStatusPredicate:
         return Task.status.notin_(members)
 
     @staticmethod
+    def is_null() -> Any:
+        """``Task.status IS NULL``."""
+        return Task.status.is_(None)
+
+    @staticmethod
+    def is_not_null() -> Any:
+        """``Task.status IS NOT NULL``."""
+        return Task.status.is_not(None)
+
+    @staticmethod
     def value(status: TaskStatus) -> TaskStatus:
-        """Validate one status before it is passed to ``.values(status=...)``."""
+        """Validate one status before it is passed to ``.values(status=...)``.
+
+        Every call site today already passes a typed ``TaskStatus``, so this
+        check does no runtime work under a type-checked call graph; it exists
+        for callers whose status is dynamically sourced, and to give guarded
+        write sites a compliant expression to wrap.
+        """
         return _require_task_status(status)
 
 
