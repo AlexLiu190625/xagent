@@ -408,6 +408,18 @@ async def store_uploaded_files(
     completed = False
 
     try:
+        # Off-turn (this runs outside the ExecutionScopeContext/
+        # resolve_execution_scope turn boundary, from the upload HTTP
+        # endpoint) but a write path: the resolved scope selects the
+        # namespace (workspace segments / storage key) these bytes are
+        # written under. Unlike the off-turn *read* paths that call
+        # resolve_execution_scope_off_turn() and downgrade an authority
+        # mismatch to a warning, namespace selection for a write must not be
+        # downgraded -- so this calls resolve_execution_scope() directly and
+        # stays fail-closed: an ExecutionScopeAuthorityError propagates past
+        # the DurableStorageOperationError handler below to the
+        # application-level namespace-authority handler (500, no retry
+        # advertised) rather than silently writing under the wrong namespace.
         upload_execution_scope = (
             await run_db_io_cancellation_safe(
                 lambda: resolve_execution_scope(parsed_task_id)

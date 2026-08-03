@@ -614,6 +614,107 @@ class TestFileUpload:
         assert download.status_code == 503
         assert "durable storage" in download.json()["detail"].lower()
 
+    def test_download_namespace_containment_violation_is_not_reported_as_an_outage(
+        self, client, test_db, temp_uploads_dir, auth_headers
+    ):
+        """A key outside the handle's bound prefix is a permanent authority
+        fault, so it must not arrive as the retryable durable-storage 503.
+
+        Driven through ``xagent.web.app.app`` rather than this module's
+        router-only test app, because the classification lives in an
+        application-level exception handler. The response may not echo the
+        namespace values either -- prefixes and scope segments can carry
+        end-user identity.
+        """
+        from xagent.web.app import app as web_app
+
+        _, test_app = test_db
+        upload = client.post(
+            "/api/files/upload",
+            files={"file": ("foreign-namespace.txt", b"foreign content", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+        for path in temp_uploads_dir.rglob("foreign-namespace.txt"):
+            path.unlink()
+
+        foreign_key = (
+            f"users/999/clients/tenant-sentinel/uploads/{file_id}/foreign-namespace.txt"
+        )
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            record = (
+                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+            )
+            record.storage_key = foreign_key
+            db.commit()
+        finally:
+            db.close()
+
+        web_app.dependency_overrides[get_db] = test_app.dependency_overrides[get_db]
+        try:
+            download = TestClient(web_app).get(
+                f"/api/files/download/{file_id}",
+                headers=auth_headers,
+            )
+        finally:
+            web_app.dependency_overrides.pop(get_db, None)
+
+        assert download.status_code == 500
+        assert download.json() == {"detail": "Storage namespace authority violation."}
+        assert "tenant-sentinel" not in download.text
+        assert "users/999" not in download.text
+
+    def test_upload_scope_authority_mismatch_is_not_reported_as_an_outage(
+        self, test_db, temp_uploads_dir, auth_headers
+    ):
+        """The upload path resolves the write namespace fail-closed.
+
+        A resolver/snapshot disagreement there is a permanent authority fault,
+        so it must reach the same 500 classification as a containment
+        violation rather than the retryable durable-storage 503. The response
+        must not name the scope segments either.
+        """
+        from tests.shared.execution_scope import register_scope_resolver
+        from xagent.core.execution_scope import (
+            ExecutionScope,
+            set_execution_scope_snapshot_loader,
+        )
+        from xagent.web.app import app as web_app
+
+        del temp_uploads_dir
+        _, test_app = test_db
+        register_scope_resolver(
+            lambda task_id: ExecutionScope(
+                workspace_segments=("clients", "resolver-sentinel"),
+                isolate_external_dirs=True,
+            )
+        )
+        set_execution_scope_snapshot_loader(
+            lambda task_id: ExecutionScope(
+                workspace_segments=("clients", "snapshot-sentinel"),
+                isolate_external_dirs=True,
+            )
+        )
+
+        web_app.dependency_overrides[get_db] = test_app.dependency_overrides[get_db]
+        try:
+            response = TestClient(web_app).post(
+                "/api/files/upload",
+                files={"file": ("scoped.txt", b"scoped content", "text/plain")},
+                data={"task_type": "general", "task_id": "5"},
+                headers=auth_headers,
+            )
+        finally:
+            web_app.dependency_overrides.pop(get_db, None)
+
+        assert response.status_code == 500
+        assert response.json() == {"detail": "Storage namespace authority violation."}
+        assert "resolver-sentinel" not in response.text
+        assert "snapshot-sentinel" not in response.text
+
     def test_download_checksum_mismatch_asks_user_to_reupload(
         self, client, temp_uploads_dir, auth_headers, monkeypatch, tmp_path
     ):

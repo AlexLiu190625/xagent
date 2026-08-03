@@ -1,9 +1,10 @@
 """Pin that the orchestrator activates the execution scope on every turn.
 
-Slice 1 of #757 wires ``turn_execution_scope`` at the same places the acting
-user is resolved (``UserContext``): ``execute_task_background`` for normal
-turns and ``execute_resume_background`` for resumed turns. These tests use a
-fake resolver to pin that:
+The orchestrator resolves the scope and activates it via
+``ExecutionScopeContext`` at the same places the acting user is resolved
+(``UserContext``): ``execute_task_background`` for normal turns and
+``execute_resume_background`` for resumed turns. These tests use a fake
+resolver to pin that:
 
 * the resolver is called with the turn's ``task_id`` (as str),
 * the resolved scope is active inside the turn's execution context (visible
@@ -24,10 +25,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
+from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
+    EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
+    ExecutionScopeAuthorityError,
     get_execution_scope,
-    set_execution_scope_resolver,
     set_execution_scope_snapshot_loader,
 )
 from xagent.web.api.websocket import (
@@ -42,15 +45,6 @@ from xagent.web.services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
 )
-
-
-@pytest.fixture(autouse=True)
-def _clear_resolver():
-    set_execution_scope_resolver(None)
-    set_execution_scope_snapshot_loader(None)
-    yield
-    set_execution_scope_resolver(None)
-    set_execution_scope_snapshot_loader(None)
 
 
 def _make_task_orm() -> Task:
@@ -163,7 +157,7 @@ async def test_bg_turn_resolves_and_activates_scope() -> None:
         resolver_calls.append(task_id)
         return scope
 
-    set_execution_scope_resolver(resolver)
+    register_scope_resolver(resolver)
 
     seen: dict[str, Any] = {}
     agent_service = MagicMock()
@@ -237,7 +231,7 @@ async def test_bg_turn_explicit_unscoped_does_not_resolve_again() -> None:
     def unexpected_resolver(task_id: str) -> ExecutionScope:
         raise AssertionError(f"scope for task {task_id} was resolved twice")
 
-    set_execution_scope_resolver(unexpected_resolver)
+    register_scope_resolver(unexpected_resolver)
     agent_service = MagicMock()
     agent_manager = MagicMock(
         get_agent_for_task=AsyncMock(return_value=agent_service),
@@ -296,6 +290,44 @@ async def test_owned_bg_failure_waits_for_exact_settlement_before_broadcast() ->
 
 
 @pytest.mark.asyncio
+async def test_bg_turn_authority_mismatch_fails_the_turn() -> None:
+    """Turn-face consumer: a namespace-affecting disagreement between the
+    registered resolver and a persisted snapshot must fail the turn --
+    unlike the off-turn consumers (``ManagedFileRef``'s construction, the
+    pause/resume handlers), which downgrade the same mismatch to the
+    resolver's authoritative answer plus a warning. Being reached off a turn
+    is not by itself what decides this: ``websocket._scope_segments_for_task``
+    also runs off-turn yet resolves fail-closed, because its caller composes
+    a storage key for new bytes."""
+    register_scope_resolver(
+        lambda task_id: ExecutionScope(sandbox_key_suffix="from-resolver"),
+    )
+    set_execution_scope_snapshot_loader(
+        lambda task_id: ExecutionScope(sandbox_key_suffix="from-snapshot")
+    )
+    agent_manager = MagicMock()
+
+    with (
+        _Patches(_bg_patches(_build_db_mock())),
+        pytest.raises(ExecutionScopeAuthorityError),
+    ):
+        await execute_task_background(
+            task_id=42,
+            user_message="hi",
+            context={},
+            agent_manager=agent_manager,
+            task_owner_user_id=1,
+            task_lease=TaskLease(
+                task_id=42,
+                runner_id="runner-a",
+                run_id="run-a",
+            ),
+        )
+
+    agent_manager.get_agent_for_task.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_bg_turn_resolves_scope_before_loading_snapshot_off_loop() -> None:
     """Scope and setup snapshot are resolved sequentially in workers."""
     main_thread_id = threading.get_ident()
@@ -306,7 +338,7 @@ async def test_bg_turn_resolves_scope_before_loading_snapshot_off_loop() -> None
         events.append(("resolve", threading.get_ident()))
         return scope
 
-    set_execution_scope_resolver(resolver)
+    register_scope_resolver(resolver)
 
     def load_snapshot(*_args: Any, **_kwargs: Any) -> Any:
         events.append(("snapshot", threading.get_ident()))
@@ -365,7 +397,7 @@ async def test_resumed_turn_re_resolves_scope() -> None:
         resolver_calls.append(task_id)
         return scope
 
-    set_execution_scope_resolver(resolver)
+    register_scope_resolver(resolver)
 
     seen: dict[str, Any] = {}
     agent_service = MagicMock()
@@ -514,9 +546,15 @@ async def test_resume_background_adopts_preacquired_lease_without_reacquiring() 
 
 
 @pytest.mark.asyncio
-async def test_resume_handler_resolves_scope_once_off_loop_and_passes_it_through() -> (
-    None
-):
+async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() -> None:
+    """The handler's single off-loop resolution feeds only the agent lookup.
+
+    ``get_agent_for_task`` receives the resolved scope to locate the paused
+    task's existing agent. ``execute_resume_background`` is a different
+    consumer -- the turn that selects a namespace for new bytes -- so it is
+    not handed this same value; it gets ``EXECUTION_SCOPE_NOT_PROVIDED`` and
+    resolves for itself.
+    """
     main_thread_id = threading.get_ident()
     scope = ExecutionScope(
         sandbox_key_suffix="tenant-a", workspace_segments=("tenant-a",)
@@ -528,7 +566,7 @@ async def test_resume_handler_resolves_scope_once_off_loop_and_passes_it_through
         resolver_threads.append(threading.get_ident())
         return scope
 
-    set_execution_scope_resolver(resolver)
+    register_scope_resolver(resolver)
     snapshot = SimpleNamespace(
         task=SimpleNamespace(
             id=42,
@@ -591,7 +629,153 @@ async def test_resume_handler_resolves_scope_once_off_loop_and_passes_it_through
         agent_manager.get_agent_for_task.await_args.kwargs["resolved_execution_scope"]
         is scope
     )
-    assert resume_kwargs["resolved_execution_scope"] is scope
+    assert resume_kwargs["resolved_execution_scope"] is EXECUTION_SCOPE_NOT_PROVIDED
+
+
+@pytest.mark.asyncio
+async def test_resume_survives_a_scope_authority_mismatch() -> None:
+    """A control operation must stay available while the scope is in dispute.
+
+    Resume locates an already-established workspace and sandbox for a task
+    that already exists using the downgraded (never-raising) off-turn
+    resolution -- that lookup selects no namespace for new bytes, so it must
+    not be blocked by the dispute. The turn it hands off to is a different
+    consumer that does select a namespace for new bytes, so the handler must
+    not pass its own downgraded answer through: it leaves that argument at
+    ``EXECUTION_SCOPE_NOT_PROVIDED`` so the scheduled turn performs its own
+    fail-closed resolution (see
+    ``test_resume_background_fails_closed_on_scope_authority_mismatch`` for
+    that resolution actually raising). Failing the handler itself instead
+    would leave the user unable to resume, pause or stop the task at all,
+    with the authority error escaping the socket loop.
+    """
+    resolver_scope = ExecutionScope(
+        sandbox_key_suffix="from-resolver", workspace_segments=("from-resolver",)
+    )
+    register_scope_resolver(lambda task_id: resolver_scope)
+    set_execution_scope_snapshot_loader(
+        lambda task_id: ExecutionScope(
+            sandbox_key_suffix="from-snapshot", workspace_segments=("from-snapshot",)
+        )
+    )
+    snapshot = SimpleNamespace(
+        task=SimpleNamespace(
+            id=42,
+            user_id=1,
+            status=TaskStatus.PAUSED,
+            control_state="paused",
+            run_id="run-a",
+            state_version=3,
+        ),
+        runtime_user=SimpleNamespace(id=1, is_admin=False),
+    )
+    agent_service = MagicMock()
+    agent_service.supports_live_control.return_value = True
+    agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent_service))
+    resume_started = asyncio.Event()
+    resume_kwargs: dict[str, Any] = {}
+
+    async def execute_resume(**kwargs: Any) -> None:
+        resume_kwargs.update(kwargs)
+        resume_started.set()
+
+    background_manager = MagicMock()
+    background_manager.running_tasks = {}
+    background_manager.reserve_resume.return_value = True
+
+    with _Patches(
+        [
+            patch(
+                "xagent.web.services.task_setup_snapshot.load_task_setup_snapshot_sync",
+                return_value=snapshot,
+            ),
+            patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+            patch(
+                "xagent.web.api.websocket.task_execution_controller.transition",
+                new=AsyncMock(
+                    return_value=SimpleNamespace(
+                        run_id="run-a", status=TaskStatus.PAUSED
+                    )
+                ),
+            ),
+            patch(
+                "xagent.web.api.websocket.background_task_manager",
+                background_manager,
+            ),
+            patch(
+                "xagent.web.api.websocket.execute_resume_background",
+                side_effect=execute_resume,
+            ),
+        ]
+    ):
+        await _handle_resume_task_unserialized(
+            MagicMock(),
+            42,
+            {"user": SimpleNamespace(id=1, is_admin=False)},
+        )
+        await asyncio.wait_for(resume_started.wait(), timeout=1)
+
+    # The off-turn lookup that locates the existing agent still uses the
+    # downgraded resolver answer -- a control operation on an existing task
+    # must not be blocked by the dispute.
+    assert (
+        agent_manager.get_agent_for_task.await_args.kwargs["resolved_execution_scope"]
+        is resolver_scope
+    )
+    # The scheduled turn is a different consumer: the handler must not pass
+    # its own downgraded answer through, so the turn can run its own
+    # fail-closed resolution instead of silently selecting the resolver's
+    # disputed answer for new bytes.
+    assert resume_kwargs["resolved_execution_scope"] is EXECUTION_SCOPE_NOT_PROVIDED
+
+
+@pytest.mark.asyncio
+async def test_resume_background_fails_closed_on_scope_authority_mismatch() -> None:
+    """The scheduled turn's own re-resolution is fail-closed, not downgraded.
+
+    ``execute_resume_background`` is the consumer that selects a namespace
+    for new bytes for the resumed turn. Unlike the handler's off-turn lookup
+    pinned in ``test_resume_survives_a_scope_authority_mismatch``, a
+    resolver/snapshot disagreement reaching this function's own resolution
+    (``resolved_execution_scope`` left at ``EXECUTION_SCOPE_NOT_PROVIDED``)
+    must fail the turn instead of silently proceeding under either answer.
+    The ``ExecutionScopeAuthorityError`` raised inside this background task
+    is caught by its own settlement handler (a background task has no
+    caller to propagate to) and converted into a broadcast task-failure
+    event rather than executing the resume -- that conversion, not an
+    escaping exception, is what "fails closed" means for this consumer.
+    """
+    register_scope_resolver(
+        lambda task_id: ExecutionScope(sandbox_key_suffix="from-resolver")
+    )
+    set_execution_scope_snapshot_loader(
+        lambda task_id: ExecutionScope(sandbox_key_suffix="from-snapshot")
+    )
+    agent_service = MagicMock()
+    agent_service.resume_execution_by_id = AsyncMock()
+    broadcast_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with _Patches(
+        [
+            patch(
+                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+            ),
+            patch("xagent.web.api.websocket.manager", broadcast_manager),
+        ]
+    ):
+        await execute_resume_background(
+            task_id=42,
+            agent_service=agent_service,
+            task_owner_user_id=1,
+        )
+
+    agent_service.resume_execution_by_id.assert_not_awaited()
+    broadcast_manager.broadcast_to_task.assert_awaited_once()
+    broadcast_args, _ = broadcast_manager.broadcast_to_task.await_args
+    event, broadcast_task_id = broadcast_args
+    assert broadcast_task_id == 42
+    assert event["type"] == "task_error"
+    assert "execution scope authority mismatch" in event["message"]
 
 
 def test_resume_acquire_checkout_timeout_before_claim_does_not_try_cleanup() -> None:

@@ -7,6 +7,7 @@ import os
 import pathlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Iterator
 
 import pytest
 from dotenv import load_dotenv
@@ -20,6 +21,10 @@ from openai.types.chat.chat_completion_message_tool_call import (
     Function as ToolCallFunction,
 )
 
+from xagent.core.execution_scope import (
+    set_execution_scope_resolver,
+    set_execution_scope_snapshot_loader,
+)
 from xagent.core.model import ChatModelConfig, EmbeddingModelConfig, RerankModelConfig
 from xagent.core.tools.core.RAG_tools.storage import reset_rag_storage_for_tests
 from xagent.core.tracing.langfuse import reset_langfuse_client
@@ -240,6 +245,31 @@ def mock_workspace_db():
 
     with patch.object(TaskWorkspace, "_create_file_record", mock_create_record):
         yield
+
+
+@pytest.fixture(autouse=True, scope="function")
+def isolate_execution_scope_hooks() -> Iterator[None]:
+    """Reset the execution-scope resolver and snapshot loader around every test.
+
+    Both are process-global module state (``xagent.core.execution_scope``).
+    A test (or a direct ``startup_event()`` call in
+    ``tests/integration/test_auto_migration_startup.py``, which registers the
+    real Task-table-backed snapshot loader with no patch/reset of its own)
+    that registers either without resetting it leaks into every test that
+    runs afterward in the same process/worker. Root-level and autouse so no
+    test module can forget it; scoped narrowly to just these two globals so
+    it composes with any test's own *function-scoped* registration (a
+    session- or module-scoped registration would still be torn down mid-
+    session by this fixture's teardown, since that always re-registers
+    ``None`` regardless of what a wider-scoped fixture set up). That
+    teardown call also never carries the acknowledgement keyword, so this
+    safety net alone never exercises the acknowledged-registration path.
+    """
+    set_execution_scope_resolver(None)
+    set_execution_scope_snapshot_loader(None)
+    yield
+    set_execution_scope_resolver(None)
+    set_execution_scope_snapshot_loader(None)
 
 
 @pytest.fixture(autouse=True, scope="function")
@@ -701,7 +731,7 @@ def clear_langfuse_traces(request):
 # YAML entrypoint has been removed, commenting out this fixture
 # @pytest.fixture
 # def mock_migration_manager(tmp_path):
-#     """Initialize a temporary MigrationManager."""
+#    """Initialize a temporary MigrationManager."""
 #     test_migrations_dir = tmp_path / "test_migrations"
 #     test_migrations_dir.mkdir()
 #

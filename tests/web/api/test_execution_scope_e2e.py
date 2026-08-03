@@ -25,11 +25,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.shared.execution_scope import register_scope_resolver
 from xagent.config import get_uploads_dir
 from xagent.core.execution_scope import (
+    DeferToSnapshot,
     ExecutionScope,
     scope_fingerprint,
-    set_execution_scope_resolver,
     set_execution_scope_snapshot_loader,
 )
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
@@ -70,15 +71,6 @@ SCOPE_EU8 = ExecutionScope(
     workspace_segments=("client-3", "eu-8"),
     sandbox_mount_segments=("client-3",),
 )
-
-
-@pytest.fixture(autouse=True)
-def _clear_hooks():
-    set_execution_scope_resolver(None)
-    set_execution_scope_snapshot_loader(None)
-    yield
-    set_execution_scope_resolver(None)
-    set_execution_scope_snapshot_loader(None)
 
 
 def _make_user() -> User:
@@ -223,7 +215,7 @@ async def test_scoped_build_applies_the_scope_to_every_subsystem() -> None:
     ``sandbox_key_suffix``, but the Actor-logical workspace base dir (below)
     is what actually isolates task 42's files under the tenant-a subtree.
     """
-    set_execution_scope_resolver(lambda task_id: SCOPE_A)
+    register_scope_resolver(lambda task_id: SCOPE_A)
     build = await _run_build(AgentServiceManager(), 42)
 
     scoped_base = str(scoped_user_root(get_uploads_dir(), 1, ("tenant-a",)))
@@ -241,11 +233,11 @@ async def test_two_scopes_under_one_user_are_disjoint_everywhere() -> None:
     def resolver(task_id: str):
         return {"42": SCOPE_A, "43": SCOPE_B}.get(task_id)
 
-    set_execution_scope_resolver(resolver)
+    register_scope_resolver(resolver)
     manager = AgentServiceManager()
     build_a = await _run_build(manager, 42)
     build_b = await _run_build(manager, 43)
-    set_execution_scope_resolver(None)
+    register_scope_resolver(None)
     build_unscoped = await _run_build(AgentServiceManager(), 44)
 
     keys = {
@@ -267,9 +259,22 @@ async def test_two_scopes_under_one_user_are_disjoint_everywhere() -> None:
 
 @pytest.mark.asyncio
 async def test_delegated_task_builds_scoped_from_persisted_snapshot() -> None:
-    """A delegated (workforce) task id is unknown to the resolver; the
-    persisted snapshot drives the whole build instead."""
-    set_execution_scope_resolver(lambda task_id: None)  # embedder can't map it
+    """A delegated task the embedder does not own: the snapshot drives the build.
+
+    This is what :class:`DeferToSnapshot` exists for. The resolver cannot
+    supply the namespace because it does not know it -- that is why it defers
+    -- so its fallback claims no scoping at all, and it says so explicitly
+    with ``snapshot_defines_namespace=True``. Without that declaration the
+    same abstention fails closed, because an abstention that claims no
+    namespace authority must not hand one out (see
+    ``tests/core/test_execution_scope.py``).
+    """
+    register_scope_resolver(
+        lambda task_id: DeferToSnapshot(
+            fallback=ExecutionScope(strict_memory_isolation=True),
+            snapshot_defines_namespace=True,
+        ),
+    )
     set_execution_scope_snapshot_loader(
         lambda task_id: SCOPE_A if task_id == "42" else None
     )
@@ -279,6 +284,23 @@ async def test_delegated_task_builds_scoped_from_persisted_snapshot() -> None:
     assert build.recorded_sandbox_key == "user:1:tenant-a"
     assert build.agent_service_kwargs["scope_segments"] == ("tenant-a",)
     assert build.recorded_fingerprint == scope_fingerprint(SCOPE_A)
+
+
+@pytest.mark.asyncio
+async def test_resolver_authoritative_unscoped_ignores_persisted_snapshot() -> None:
+    """``None`` from the resolver is authoritative unscoped for the task, not
+    an abstention: a persisted snapshot is not consulted at all, unlike the
+    :class:`DeferToSnapshot` case above."""
+    register_scope_resolver(lambda task_id: None)
+    set_execution_scope_snapshot_loader(
+        lambda task_id: SCOPE_A if task_id == "42" else None
+    )
+    build = await _run_build(AgentServiceManager(), 42)
+
+    assert build.sandbox_lifecycle == ("user", "1")
+    assert build.recorded_sandbox_key == "user:1"
+    assert build.agent_service_kwargs["scope_segments"] == ()
+    assert build.recorded_fingerprint is None
 
 
 @pytest.mark.asyncio
@@ -311,7 +333,7 @@ async def test_tool_workspace_lives_inside_the_tree_the_sandbox_binds(
     base = tmp_path / "base"
     base.mkdir()
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", f"{base}/nonexistent/..")
-    set_execution_scope_resolver(lambda task_id: SCOPE_A)
+    register_scope_resolver(lambda task_id: SCOPE_A)
 
     build = await _run_build(AgentServiceManager(), 42)
     mount_root = build.sandbox_mount_intent.mount_root
@@ -372,7 +394,7 @@ async def test_mount_prefix_shares_sandbox_root_across_deeper_segments() -> None
     def resolver(task_id: str):
         return {"42": SCOPE_EU7, "43": SCOPE_EU8}.get(task_id)
 
-    set_execution_scope_resolver(resolver)
+    register_scope_resolver(resolver)
     manager = AgentServiceManager()
     build_eu7 = await _run_build(manager, 42)
     build_eu8 = await _run_build(manager, 43)
@@ -415,7 +437,7 @@ async def test_prefix_shared_mount_passes_config_equivalence_gate() -> None:
     def resolver(task_id: str):
         return {"42": SCOPE_EU7, "43": SCOPE_EU8}.get(task_id)
 
-    set_execution_scope_resolver(resolver)
+    register_scope_resolver(resolver)
     manager = AgentServiceManager()
     build_eu7 = await _run_build(manager, 42)
     build_eu8 = await _run_build(manager, 43)

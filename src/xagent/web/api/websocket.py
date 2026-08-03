@@ -53,6 +53,7 @@ from ...core.execution_scope import (
     ExecutionScopeContext,
     ExecutionScopeNotProvided,
     resolve_execution_scope,
+    resolve_execution_scope_off_turn,
 )
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
 from ..auth_dependencies import get_user_from_websocket_token
@@ -1173,6 +1174,12 @@ def _scope_segments_for_task(task_id: Any) -> tuple[str, ...]:
     A None ``task_id`` (e.g. the legacy-preview backfill, whose owner
     inference may find a user but no task) means there is no task identity
     to resolve a scope from — unscoped, never the string ``"None"``.
+
+    Fails closed (its only caller, ``_register_legacy_preview_isolated``,
+    uses these segments to compose the storage key for a brand-new durable
+    object): choosing that namespace is an authority decision, and a
+    resolver/snapshot mismatch here must not be downgraded to either side's
+    guess -- ``ExecutionScopeAuthorityError`` propagates instead.
     """
     if task_id is None:
         return ()
@@ -7227,8 +7234,31 @@ async def _handle_pause_task_unserialized(
         task_fields = task_setup_snapshot.task
         task_owner_user_id = int(task_fields.user_id)
         expected_run_id = task_fields.run_id
+        # Off-turn: on an agent-cache hit this only locates the already-
+        # running agent's existing workspace/sandbox to pause it. On a miss,
+        # get_agent_for_task below builds a fresh agent from this value,
+        # which can materialize a workspace directory tree and acquire a
+        # sandbox lease. resolve_execution_scope_off_turn resolves this value
+        # through three distinct outcomes:
+        # - resolver authoritative, snapshot disagrees on a namespace field:
+        #   downgrades to the resolver's own answer (with a warning) instead
+        #   of raising, so the pause still proceeds -- the value here is the
+        #   trusted resolver answer, not the snapshot.
+        # - resolver abstains, snapshot widens the abstention's fallback:
+        #   ExecutionScopeAbstentionMismatchError is re-raised rather than
+        #   downgraded, so the pause is refused outright -- an abstention
+        #   never produced an authoritative value to fall back to.
+        # - resolver abstains, snapshot narrows the abstention's fallback:
+        #   the returned value IS the snapshot (policy fields overlaid from
+        #   the fallback). That is persisted, client-influenceable data, and
+        #   it is trusted here only because it was already validated as a
+        #   narrowing of what the resolver granted, so anything the build
+        #   below materializes from it still lands inside the authorised
+        #   subtree.
+        # Pause schedules no turn, so nothing downstream re-resolves or
+        # corrects a build that happens here.
         execution_scope = await run_db_io_cancellation_safe(
-            lambda: resolve_execution_scope(task_id)
+            lambda: resolve_execution_scope_off_turn(task_id)
         )
 
         # Get agent service (as the task owner)
@@ -7412,8 +7442,37 @@ async def _handle_resume_task_unserialized(
         task_fields = task_setup_snapshot.task
         task_owner_user_id = int(task_fields.user_id)
         task_status = cast(TaskStatus, task_fields.status)
+        # Off-turn: on an agent-cache hit this only locates the paused task's
+        # existing workspace/sandbox for ``get_agent_for_task`` below. On a
+        # miss (or a cached-scope-fingerprint mismatch), that call builds a
+        # fresh agent from this value, which can materialize a workspace
+        # directory tree and acquire a sandbox lease.
+        # resolve_execution_scope_off_turn resolves this value through three
+        # distinct outcomes:
+        # - resolver authoritative, snapshot disagrees on a namespace field:
+        #   downgrades to the resolver's own answer (with a warning) instead
+        #   of raising, so the resume still proceeds -- the value here is the
+        #   trusted resolver answer, not the snapshot.
+        # - resolver abstains, snapshot widens the abstention's fallback:
+        #   ExecutionScopeAbstentionMismatchError is re-raised rather than
+        #   downgraded, so the resume is refused outright -- an abstention
+        #   never produced an authoritative value to fall back to.
+        # - resolver abstains, snapshot narrows the abstention's fallback:
+        #   the returned value IS the snapshot (policy fields overlaid from
+        #   the fallback). That is persisted, client-influenceable data, and
+        #   it is trusted here only because it was already validated as a
+        #   narrowing of what the resolver granted, so anything the build
+        #   below materializes from it still lands inside the authorised
+        #   subtree.
+        # The turn this handler schedules is a different consumer: it is
+        # passed ``EXECUTION_SCOPE_NOT_PROVIDED`` instead of this value below
+        # so ``execute_resume_background`` performs its own fail-closed
+        # resolution before producing the resumed turn's own output, rather
+        # than inheriting this off-turn result -- that protects where the
+        # turn's own new bytes land, not the workspace/sandbox root a build
+        # above may already have fixed.
         resolved_execution_scope = await run_db_io_cancellation_safe(
-            lambda: resolve_execution_scope(task_id)
+            lambda: resolve_execution_scope_off_turn(task_id)
         )
         raw_control_state = task_fields.control_state
         try:
@@ -7476,7 +7535,17 @@ async def _handle_resume_task_unserialized(
                         task_owner_user_id=task_owner_user_id,
                         expected_run_id=resume_snapshot.run_id,
                         previous_task=previous_task,
-                        resolved_execution_scope=resolved_execution_scope,
+                        # Not `resolved_execution_scope`: that value is the
+                        # off-turn downgrade used above to obtain
+                        # `agent_service` (which, on an agent-cache miss, may
+                        # itself have built the workspace/sandbox from it --
+                        # see the comment above `resolved_execution_scope`).
+                        # The scheduled turn selects the namespace its own
+                        # output lands under, so it explicitly gets
+                        # `EXECUTION_SCOPE_NOT_PROVIDED` and runs its own
+                        # fail-closed resolution instead of inheriting a
+                        # disputed answer.
+                        resolved_execution_scope=EXECUTION_SCOPE_NOT_PROVIDED,
                     )
                 )
                 background_task_manager.register_reserved_resume(task_id, bg_task)

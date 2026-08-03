@@ -4,13 +4,21 @@ Covers ``_build_allowed_external_dirs`` scoping (shared by default,
 scope-local under ``isolate_external_dirs``) and the websocket
 output-path task-scope check tolerating scope segments between the user
 root and the task dir.
+
+``_scope_segments_for_task`` composes the storage key for a brand-new
+durable object (its only caller stages a fresh upload), so it fails closed:
+a resolver/snapshot authority mismatch there raises
+``ExecutionScopeAuthorityError`` instead of being downgraded (see
+``TestScopeSegmentsForTask``).
 """
 
 import pytest
 
+from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
     ExecutionScope,
-    set_execution_scope_resolver,
+    ExecutionScopeAuthorityError,
+    set_execution_scope_snapshot_loader,
 )
 from xagent.web.api.chat import _build_allowed_external_dirs
 from xagent.web.api.websocket import (
@@ -18,13 +26,6 @@ from xagent.web.api.websocket import (
     _scope_segments_for_task,
 )
 from xagent.web.services.workspace_binding import _build_external_allowlist
-
-
-@pytest.fixture(autouse=True)
-def _clear_resolver():
-    set_execution_scope_resolver(None)
-    yield
-    set_execution_scope_resolver(None)
 
 
 class TestAllowedExternalDirs:
@@ -131,15 +132,30 @@ class TestScopeSegmentsForTask:
         no task identity means unscoped — never a resolver query for the
         literal string "None"."""
         seen = []
-        set_execution_scope_resolver(lambda task_id: seen.append(task_id))
+        register_scope_resolver(
+            lambda task_id: seen.append(task_id),
+        )
         assert _scope_segments_for_task(None) == ()
         assert seen == []
 
     def test_scoped_task_yields_its_segments(self):
-        set_execution_scope_resolver(
-            lambda task_id: ExecutionScope(workspace_segments=("tenant-a",))
+        register_scope_resolver(
+            lambda task_id: ExecutionScope(workspace_segments=("tenant-a",)),
         )
         assert _scope_segments_for_task(42) == ("tenant-a",)
+
+    def test_namespace_mismatch_fails_closed(self):
+        """These segments compose the storage key for a brand-new durable
+        object, so an authority mismatch must not be downgraded to either
+        side's guess -- it fails closed instead."""
+        register_scope_resolver(
+            lambda task_id: ExecutionScope(workspace_segments=("tenant-a",)),
+        )
+        set_execution_scope_snapshot_loader(
+            lambda task_id: ExecutionScope(workspace_segments=("tenant-b",))
+        )
+        with pytest.raises(ExecutionScopeAuthorityError):
+            _scope_segments_for_task(42)
 
 
 class TestOutputPathTaskScopeCheck:
@@ -174,7 +190,7 @@ class TestOutputPathTaskScopeCheck:
     def test_segment_named_like_the_task_dir_does_not_shadow_it(self):
         """The segment charset allows a scope segment literally named like
         the task dir; the scan must not stop at it and reject the real task
-        dir further down (Gemini round-2 finding on #789)."""
+        dir further down (#789)."""
         assert _output_path_in_current_task_scope(
             "user_1/web_task_5/web_task_5/output/a.txt", 5, 1
         )

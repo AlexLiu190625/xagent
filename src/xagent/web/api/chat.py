@@ -25,6 +25,7 @@ from ...core.execution_scope import (
     ScopeFingerprint,
     get_execution_scope,
     resolve_execution_scope,
+    resolve_execution_scope_off_turn,
     scope_fingerprint,
 )
 from ...core.memory.base import MemoryStore
@@ -3261,7 +3262,13 @@ class AgentServiceManager:
             # cleanup inside an activated turn reuses the turn's resolution.
             scope = get_execution_scope()
             if scope is None:
-                scope = resolve_execution_scope(task_id)
+                # Off-turn: this runs when the agent is no longer in memory,
+                # so there is no turn left to fail. An authority mismatch here
+                # would abandon the directory instead of deleting it, and the
+                # resolver has already given an authoritative answer to delete
+                # against -- so the off-turn helper takes that answer and
+                # warns. Every other resolution failure still propagates.
+                scope = resolve_execution_scope_off_turn(task_id)
             segments = scope.workspace_segments if scope is not None else ()
             for base_dir in (
                 canonical_workspace_base(user_id, segments),

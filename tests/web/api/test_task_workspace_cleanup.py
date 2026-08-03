@@ -13,19 +13,16 @@ from pathlib import Path
 
 import pytest
 
-from xagent.core.execution_scope import set_execution_scope_resolver
+from tests.shared.execution_scope import register_scope_resolver
+from xagent.core.execution_scope import (
+    ExecutionScope,
+    set_execution_scope_snapshot_loader,
+)
 from xagent.web.api.chat import AgentServiceManager
 
 OWNER_ID = 7
 TASK_ID = 42
 WORKSPACE_ID = f"web_task_{TASK_ID}"
-
-
-@pytest.fixture(autouse=True)
-def _no_resolver():
-    set_execution_scope_resolver(None)
-    yield
-    set_execution_scope_resolver(None)
 
 
 @pytest.fixture(autouse=True)
@@ -62,3 +59,31 @@ def test_probing_candidates_creates_nothing(tmp_path, monkeypatch):
     AgentServiceManager()._cleanup_workspace_directory(TASK_ID, OWNER_ID)
 
     assert not (uploads / f"user_{OWNER_ID}").exists()
+
+
+def test_an_authority_mismatch_still_deletes_the_workspace(tmp_path, monkeypatch):
+    """Cleanup runs off-turn, so a mismatch must not abandon the directory.
+
+    There is no turn left to fail here -- the agent is already gone -- and the
+    resolver has given an authoritative answer to delete against. Resolving
+    fail-closed instead would leave the tree on disk for good, with nothing
+    left to retry it.
+    """
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path / "uploads"))
+    register_scope_resolver(
+        lambda task_id: ExecutionScope(
+            sandbox_key_suffix="from-resolver", workspace_segments=("from-resolver",)
+        )
+    )
+    set_execution_scope_snapshot_loader(
+        lambda task_id: ExecutionScope(
+            sandbox_key_suffix="from-snapshot", workspace_segments=("from-snapshot",)
+        )
+    )
+    workspace = _make_workspace(
+        tmp_path / "uploads" / f"user_{OWNER_ID}" / "from-resolver"
+    )
+
+    AgentServiceManager()._cleanup_workspace_directory(TASK_ID, OWNER_ID)
+
+    assert not workspace.exists()

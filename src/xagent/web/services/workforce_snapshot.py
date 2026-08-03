@@ -534,9 +534,14 @@ def build_workforce_task_config(
         config["selected_file_ids"] = selected_file_ids
     # Workforce runs create fresh Task rows whose ids the embedder's scope
     # resolver cannot map. Persist the creating context's ExecutionScope
-    # snapshot into agent_config (no schema migration); per-turn activation
-    # prefers this snapshot over the resolver, so the run executes fully
-    # scoped even after a process restart.
+    # snapshot into agent_config (no schema migration); resolve_execution_scope
+    # treats this as a corroborating candidate, not an override -- it is
+    # authoritative only when a resolver defers to it or none is registered,
+    # and is ignored when its version predates the current shape -- so the
+    # run stays scoped across a process restart without ever overriding a
+    # registered resolver's answer. ``to_dict()`` always stamps the current
+    # shape version, regardless of whether the in-context scope was itself
+    # decoded from an older persisted snapshot.
     scope = get_execution_scope()
     if scope is not None:
         config[EXECUTION_SCOPE_AGENT_CONFIG_KEY] = scope.to_dict()

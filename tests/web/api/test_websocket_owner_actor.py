@@ -23,9 +23,9 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
     ExecutionScope,
-    set_execution_scope_resolver,
 )
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
@@ -1208,7 +1208,7 @@ async def test_running_chat_message_uses_one_offloop_scope_and_no_request_sessio
         resolver_threads.append(threading.get_ident())
         return scope
 
-    set_execution_scope_resolver(resolver)
+    register_scope_resolver(resolver)
     original_get_db = get_db
     tracked_sessions: list[SimpleNamespace] = []
 
@@ -1304,7 +1304,7 @@ async def test_running_chat_message_uses_one_offloop_scope_and_no_request_sessio
             )
             await asyncio.sleep(0)
     finally:
-        set_execution_scope_resolver(None)
+        register_scope_resolver(None)
 
     assert len(manager_calls) == 1
     manager_db, manager_kwargs = manager_calls[0]

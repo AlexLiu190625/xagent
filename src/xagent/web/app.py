@@ -32,6 +32,11 @@ from ..config import (
     get_uploaded_file_recovery_stale_seconds,
     get_uploads_dir,
 )
+from ..core.execution_scope import (
+    ExecutionScopeAuthorityError,
+    ExecutionScopeResolverContractError,
+)
+from ..core.file_storage import StorageKeyScopeError
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.a2a import router as a2a_router
 from .api.admin_mcp import admin_mcp_router
@@ -63,7 +68,7 @@ from .api.templates import router as templates_router
 from .api.tools import tools_router
 from .api.triggers import router as triggers_router
 from .api.v1 import v1_router
-from .api.v1.errors import V1ApiError, v1_api_error_handler
+from .api.v1.errors import V1ApiError, V1ErrorCode, v1_api_error_handler
 from .api.websocket import ws_router
 from .api.widget import widget_router
 from .api.workforces import router as workforces_router
@@ -847,6 +852,87 @@ async def global_exception_handler(request: Request, exc: Exception) -> Any:
     raise exc
 
 
+STORAGE_NAMESPACE_AUTHORITY_MESSAGE = "Storage namespace authority violation."
+
+
+async def storage_namespace_authority_error_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """Answer a storage namespace containment/authority fault once, app-wide.
+
+    ``StorageKeyScopeError`` (a storage key outside the prefix its handle is
+    bound to), ``ExecutionScopeAuthorityError`` (the scope resolver and a
+    task's persisted snapshot disagree about the task's namespace) and
+    ``ExecutionScopeResolverContractError`` (a resolver broke its return
+    contract, or a persisted snapshot cannot be decoded at all) are permanent
+    server-side configuration/authority faults. Registering them
+    here instead of at each file endpoint keeps one classification for every
+    route that touches durable storage -- and keeps them out of the retryable
+    503 that ``DurableStorageOperationError`` maps to, since retrying a
+    containment violation can never succeed.
+
+    Status is 500: the fault is on the server, in its own namespace
+    configuration or in a task's persisted scope, and there is nothing for the
+    client to correct or retry. 503 would tell operators and clients to wait
+    and retry a condition that is stable until someone changes the
+    configuration, and no 4xx applies because the request itself is
+    well-formed and authorized.
+
+    The response body names the fault and nothing else. Scope segments,
+    storage prefixes, and tenant identifiers can encode end-user identity, and
+    ``str(exc)`` carries them; that detail belongs in the server-side log line
+    below, which records the full traceback.
+
+    ``/v1/*`` keeps the SDK's ``{"error": {"code", "message"}}`` envelope (see
+    web/api/v1/errors.py) -- those endpoints reach durable storage while
+    resolving a turn's attachments, and a bare ``{"detail": ...}`` there would
+    break clients that switch on ``body.error.code``. Every other path gets
+    FastAPI's default ``{"detail": ...}`` shape.
+
+    Only HTTP scopes get a response. Starlette routes websocket exceptions
+    through the same handler table, and websocket file attachments do reach
+    durable storage, but a websocket connection cannot receive an HTTP
+    response -- so those scopes re-raise and stay owned by the connection
+    handler that established them.
+    """
+    logger.error(
+        "Storage namespace authority violation for %s",
+        request.url.path,
+        exc_info=exc,
+    )
+    if request.scope.get("type") != "http":
+        raise exc
+    if request.url.path.startswith("/v1/"):
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": V1ErrorCode.INTERNAL_ERROR.value,
+                    "message": STORAGE_NAMESPACE_AUTHORITY_MESSAGE,
+                }
+            },
+        )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": STORAGE_NAMESPACE_AUTHORITY_MESSAGE},
+    )
+
+
+app.add_exception_handler(
+    StorageKeyScopeError, storage_namespace_authority_error_handler
+)
+# Covers ExecutionScopeAbstentionMismatchError too: Starlette matches a
+# handler by walking the raised exception's MRO.
+app.add_exception_handler(
+    ExecutionScopeAuthorityError, storage_namespace_authority_error_handler
+)
+# A resolver that broke its return contract, or a persisted snapshot that
+# cannot be decoded, is the same permanent authority fault: nothing about the
+# request can be corrected or retried into working.
+app.add_exception_handler(
+    ExecutionScopeResolverContractError, storage_namespace_authority_error_handler
+)
+
 # /v1/* SDK surface uses a stable {"error": {"code", "message"}} envelope
 # distinct from FastAPI's default {"detail": "..."} shape used by /api/*.
 # Typed V1ApiError raises pass through this handler so endpoints can
@@ -942,13 +1028,30 @@ async def startup_event() -> None:
     start_uploaded_file_recovery_task(app)
     start_orphan_upload_gc_task(app)
 
-    # Persisted ExecutionScope snapshots (workforce sub-tasks) are preferred
-    # over the embedder's resolver during per-task scope resolution.
+    # Persisted ExecutionScope snapshots (workforce sub-tasks) keep a
+    # sub-task scoped across process restarts. With no resolver registered
+    # they are the sole answer; with one registered they are a
+    # corroborating candidate (see
+    # xagent.core.execution_scope.resolve_execution_scope).
+    from ..core.execution_scope import execution_scope_resolver_registered
     from .services.execution_scope_snapshot import (
         register_execution_scope_snapshot_loader,
     )
 
     register_execution_scope_snapshot_loader()
+    # This reflects only whether a resolver is registered at this point in
+    # startup; it is not re-evaluated afterward. An embedder that registers
+    # its resolver later (e.g. from its own startup hook running after this
+    # one) leaves this line reporting "snapshot-only" even once a resolver
+    # is in fact authoritative -- the mode itself is live and re-checked on
+    # every resolution (see resolve_execution_scope), only this log line is
+    # a startup-time snapshot of it.
+    logger.info(
+        "Execution scope authority mode at startup: %s",
+        "resolver-authoritative (snapshot is a corroborating candidate)"
+        if execution_scope_resolver_registered()
+        else "snapshot-only (no resolver registered yet)",
+    )
 
     from .services.trigger_rate_limit import warn_if_rate_limits_are_per_process
 
