@@ -48,7 +48,7 @@ from ...config import (
 from ...core.agent.checkpoint import (
     CHECKPOINT_EVENT_TYPE,
     CheckpointAccessRefusedError,
-    CheckpointCorruptError,
+    CheckpointReadError,
     CheckpointUnavailableError,
 )
 from ...core.agent.trace import TraceEvent, TraceHandler
@@ -5866,10 +5866,13 @@ async def _handle_chat_message_unserialized(
                                 # from corrupt/refused, which are not
                                 # retryable by simply deferring.
                                 posted = False
-                            except (
-                                CheckpointCorruptError,
-                                CheckpointAccessRefusedError,
-                            ):
+                            except CheckpointReadError:
+                                # Corrupt and refused reach here today. The
+                                # base class is deliberate: a read failure
+                                # that is not the retryable-by-deferring
+                                # unavailable case must reject the claimed
+                                # delivery rather than escape this handler
+                                # and orphan it.
                                 background_task_manager.release_resume_reservation(
                                     task_id
                                 )

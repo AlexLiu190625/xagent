@@ -1105,6 +1105,88 @@ async def test_resume_pool_timeout_does_not_start_secondary_db_cleanup(caplog) -
     )
 
 
+def test_acquire_resume_lease_reports_prior_status_before_claiming() -> None:
+    """The real acquire must fill the prior-status box on the claim path.
+
+    Every restore-to-prior test below patches this function with a fake
+    that mirrors the out parameter, so nothing else would notice if the
+    production function stopped populating it -- the resume path would
+    just silently fall back to the terminal FAILED branch. Pin the real
+    function against its own contract, and pin that the status recorded
+    is the pre-acquisition one rather than the RUNNING the claim writes.
+    """
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    task = SimpleNamespace(id=42, user_id=1, status=TaskStatus.WAITING_FOR_USER)
+    query = MagicMock()
+    query.filter.return_value = query
+    query.first.return_value = task
+    db = MagicMock()
+    db.query.return_value = query
+    session_context = MagicMock()
+    session_context.__enter__.return_value = db
+    session_context.__exit__.return_value = False
+    session_factory = MagicMock(return_value=session_context)
+
+    prior_status_box: list[TaskStatus] = []
+    with (
+        patch(
+            "xagent.web.api.websocket.get_session_local",
+            return_value=session_factory,
+        ),
+        patch(
+            "xagent.web.api.websocket.acquire_task_lease_no_commit",
+            return_value=lease,
+        ),
+        patch("xagent.web.api.websocket.sync_workforce_run_status"),
+    ):
+        acquired = _acquire_resume_task_lease(
+            42,
+            1,
+            "run-a",
+            prior_status_out=prior_status_box,
+        )
+
+    assert acquired is lease
+    assert prior_status_box == [TaskStatus.WAITING_FOR_USER]
+
+
+def test_acquire_resume_lease_reports_prior_status_when_claim_is_lost() -> None:
+    """A lost claim must not leave the box holding a fabricated status."""
+    task = SimpleNamespace(id=42, user_id=1, status=TaskStatus.PAUSED)
+    query = MagicMock()
+    query.filter.return_value = query
+    query.first.return_value = task
+    db = MagicMock()
+    db.query.return_value = query
+    session_context = MagicMock()
+    session_context.__enter__.return_value = db
+    session_context.__exit__.return_value = False
+    session_factory = MagicMock(return_value=session_context)
+
+    prior_status_box: list[TaskStatus] = []
+    with (
+        patch(
+            "xagent.web.api.websocket.get_session_local",
+            return_value=session_factory,
+        ),
+        patch(
+            "xagent.web.api.websocket.acquire_task_lease_no_commit",
+            return_value=None,
+        ),
+    ):
+        acquired = _acquire_resume_task_lease(
+            42,
+            1,
+            "run-a",
+            prior_status_out=prior_status_box,
+        )
+
+    assert acquired is None
+    # Recorded, but the caller only consults it when a lease was claimed,
+    # so a lost claim can never restore a status it does not own.
+    assert prior_status_box == [TaskStatus.PAUSED]
+
+
 def _fake_acquire_with_prior_status(lease: TaskLease, prior_status: TaskStatus):
     """Mirror ``_acquire_resume_task_lease``'s prior-status side channel."""
 
