@@ -305,6 +305,10 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     # A short page proves the matching set is exhausted --
                     # no further rows exist beyond this one.
                     break
+                # OFFSET paging over (timestamp DESC, id DESC): a row inserted
+                # mid-scan shifts later pages by one. Root reads are fenced to a
+                # single run partition, which excludes concurrent writers there;
+                # build-scoped histories are append-only per build.
                 offset += CHECKPOINT_ROW_SCAN_LIMIT
 
             if not saw_any_row:

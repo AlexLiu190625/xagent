@@ -27,6 +27,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.agent.checkpoint import (
+    CheckpointAccessRefusedError,
     CheckpointCorruptError,
     CheckpointUnavailableError,
 )
@@ -1279,12 +1280,20 @@ def _fake_acquire_with_prior_status(lease: TaskLease, prior_status: TaskStatus):
 
 
 @pytest.mark.asyncio
-async def test_resume_background_restores_prior_status_on_checkpoint_unavailable() -> (
-    None
-):
-    """A checkpoint read failure during resume (not a pool timeout) must
-    restore the task to whatever it was before this attempt claimed the
-    lease, not fall through to the generic terminal FAILED path."""
+@pytest.mark.parametrize(
+    "read_error",
+    [
+        CheckpointUnavailableError("checkpoint store unavailable"),
+        CheckpointAccessRefusedError("partition refused"),
+    ],
+)
+async def test_resume_background_restores_prior_status_on_checkpoint_read_failure(
+    read_error: Exception,
+) -> None:
+    """A retryable checkpoint read failure during resume (not a pool
+    timeout) must restore the task to whatever it was before this attempt
+    claimed the lease, not fall through to the generic terminal FAILED
+    path. Unavailable and refused reads share the restore branch."""
     lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
     settle = MagicMock()
     restore = MagicMock(return_value=True)
@@ -1304,9 +1313,7 @@ async def test_resume_background_restores_prior_status_on_checkpoint_unavailable
             return None
 
     agent_service = MagicMock()
-    agent_service.resume_execution_by_id = AsyncMock(
-        side_effect=CheckpointUnavailableError("checkpoint query failed")
-    )
+    agent_service.resume_execution_by_id = AsyncMock(side_effect=read_error)
     ws_manager = MagicMock(broadcast_to_task=AsyncMock())
 
     with _Patches(

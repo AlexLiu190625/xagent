@@ -58,9 +58,10 @@ class CheckpointReadError(RuntimeError):
 class CheckpointUnavailableError(CheckpointReadError):
     """Raised when a checkpoint read could not be completed.
 
-    Covers query failures (session checkout, transient DB errors) and
-    decode failures that cannot be proven to be permanent corruption
-    because the candidate row window was exhausted before ruling it out.
+    Covers infrastructure failures only: session checkout, query
+    execution, and generic per-row decode errors such as a failed blob
+    prefetch. Rows that decode as permanently unreadable are classified
+    by the corrupt error once the matching set is exhausted.
     """
 
 
