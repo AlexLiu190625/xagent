@@ -3354,6 +3354,14 @@ Build when you need.`,
     unknownWorker: "Unknown Worker",
     viewAgentExecution: "View Agent details"
   },
+  deployment_config: {
+    actions: {
+      retry: "Retry"
+    },
+    messages: {
+      load_failed: "Failed to load deployment configuration; using this browser's origin."
+    }
+  },
   deploy_agent: {
     title: "Deploy Agent",
     tabs: {
@@ -3438,6 +3446,7 @@ Build when you need.`,
     title: "Deploy via REST API / SDK",
     desc: "Create runs on this workforce with a workforce API key, then poll GET /v1/chat/tasks/{id} for results.",
     copy: "Copy",
+    copy_failed: "Failed to copy to clipboard",
     new_key: "Copy this key now — it won't be shown again.",
     keys_title: "API keys",
     label_placeholder: "Label (optional), e.g. CI pipeline",
@@ -3936,6 +3945,7 @@ Build when you need.`,
         disabled: "Share link disabled",
         failed: "Share link action failed",
         link_copied: "Link copied to clipboard",
+        copy_failed: "Failed to copy to clipboard",
       },
     },
     widget: {
@@ -3962,6 +3972,7 @@ Build when you need.`,
         rotated: "Widget key rotated",
         failed: "Widget action failed",
         copied: "Copied to clipboard",
+        copy_failed: "Failed to copy to clipboard",
       },
     },
     deployHub: {

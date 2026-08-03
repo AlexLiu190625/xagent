@@ -6,6 +6,7 @@ from tempfile import gettempdir
 
 import pytest
 
+import xagent.config as config
 from xagent.config import (
     AGENT_RUNTIME,
     APP_BASE_URL,
@@ -52,6 +53,7 @@ from xagent.config import (
     PREVIEW_TMP_DIR,
     PUBLIC_API_BASE_URL,
     REDIS_URL,
+    S2S_API_BASE_URL,
     SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY,
     SANDBOX_CPUS,
     SANDBOX_ENV,
@@ -81,7 +83,6 @@ from xagent.config import (
     TASK_LEASE_TTL_SECONDS,
     TASK_RUNTIME_HOOK_MAX_WORKERS,
     TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS,
-    TRIGGER_CALLBACK_BASE_URL,
     TRIGGER_DISPATCHER_BATCH_SIZE,
     TRIGGER_DISPATCHER_ENABLED,
     TRIGGER_DISPATCHER_INTERVAL_SECONDS,
@@ -142,6 +143,7 @@ from xagent.config import (
     get_preview_tmp_dir,
     get_public_api_base_url,
     get_redis_url,
+    get_s2s_api_base_url,
     get_sandbox_allow_local_fallback_on_capacity,
     get_sandbox_cpus,
     get_sandbox_env,
@@ -170,7 +172,6 @@ from xagent.config import (
     get_task_lease_recovery_interval_seconds,
     get_task_runtime_hook_max_workers,
     get_task_runtime_hook_queue_timeout_seconds,
-    get_trigger_callback_base_url,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
@@ -1834,6 +1835,7 @@ class TestGmailPubSubProvisioningConfig:
             == "XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS"
         )
         assert PUBLIC_API_BASE_URL == "XAGENT_PUBLIC_API_BASE_URL"
+        assert S2S_API_BASE_URL == "XAGENT_S2S_API_BASE_URL"
 
     def test_defaults(self, monkeypatch):
         monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_PROJECT_ID", raising=False)
@@ -1842,6 +1844,7 @@ class TestGmailPubSubProvisioningConfig:
         monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT", raising=False)
         monkeypatch.delenv("XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS", raising=False)
         monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
+        monkeypatch.delenv("XAGENT_S2S_API_BASE_URL", raising=False)
 
         assert get_gmail_pubsub_project_id() is None
         assert get_gmail_pubsub_topic_prefix() == "xagent-gmail"
@@ -1849,6 +1852,7 @@ class TestGmailPubSubProvisioningConfig:
         assert get_gmail_pubsub_push_service_account() is None
         assert get_gmail_registration_timeout_seconds() == 10
         assert get_public_api_base_url() is None
+        assert get_s2s_api_base_url() is None
 
     def test_env_overrides(self, monkeypatch):
         monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_PROJECT_ID", " demo ")
@@ -1860,6 +1864,9 @@ class TestGmailPubSubProvisioningConfig:
         )
         monkeypatch.setenv("XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS", "3")
         monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", " https://api.example.com/ ")
+        monkeypatch.setenv(
+            "XAGENT_S2S_API_BASE_URL", " https://sg-origin.example.com/ "
+        )
 
         assert get_gmail_pubsub_project_id() == "demo"
         assert get_gmail_pubsub_topic_prefix() == "mail-topic"
@@ -1870,6 +1877,79 @@ class TestGmailPubSubProvisioningConfig:
         )
         assert get_gmail_registration_timeout_seconds() == 3
         assert get_public_api_base_url() == "https://api.example.com"
+        assert get_s2s_api_base_url() == "https://sg-origin.example.com"
+
+    def test_s2s_base_falls_back_to_public_api_base(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_S2S_API_BASE_URL", raising=False)
+        monkeypatch.setenv(
+            "XAGENT_PUBLIC_API_BASE_URL", " https://api.example.com/base/ "
+        )
+
+        assert get_s2s_api_base_url() == "https://api.example.com/base"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "api.example.com",
+            "ftp://api.example.com",
+            "https:///missing-host",
+        ],
+    )
+    def test_s2s_base_rejects_invalid_http_urls(self, monkeypatch, value) -> None:
+        monkeypatch.setenv("XAGENT_S2S_API_BASE_URL", value)
+
+        with pytest.raises(ValueError, match="XAGENT_S2S_API_BASE_URL"):
+            get_s2s_api_base_url()
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "https://api.example.com/base?region=sg",
+            "https://api.example.com/base#callbacks",
+        ],
+    )
+    def test_s2s_base_rejects_query_and_fragment(self, monkeypatch, value) -> None:
+        monkeypatch.setenv("XAGENT_S2S_API_BASE_URL", value)
+
+        with pytest.raises(ValueError, match="XAGENT_S2S_API_BASE_URL"):
+            get_s2s_api_base_url()
+
+    def test_s2s_base_validates_public_api_fallback(self, monkeypatch) -> None:
+        monkeypatch.delenv("XAGENT_S2S_API_BASE_URL", raising=False)
+        monkeypatch.setenv(
+            "XAGENT_PUBLIC_API_BASE_URL",
+            "https://api.example.com?region=sg",
+        )
+
+        with pytest.raises(ValueError, match="XAGENT_PUBLIC_API_BASE_URL"):
+            get_s2s_api_base_url()
+
+    def test_gmail_callback_validates_legacy_fallback(self, monkeypatch) -> None:
+        monkeypatch.delenv("XAGENT_S2S_API_BASE_URL", raising=False)
+        monkeypatch.setenv(
+            "XAGENT_TRIGGER_CALLBACK_BASE_URL",
+            "https://legacy-callback.example.com#gmail",
+        )
+
+        resolver = getattr(config, "get_gmail_callback_base_url", lambda: None)
+        with pytest.raises(ValueError, match="XAGENT_TRIGGER_CALLBACK_BASE_URL"):
+            resolver()
+
+    def test_gmail_callback_preserves_legacy_base_url_fallback(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_S2S_API_BASE_URL", raising=False)
+        monkeypatch.setenv(
+            "XAGENT_TRIGGER_CALLBACK_BASE_URL",
+            " https://legacy-callback.example.com/ ",
+        )
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
+
+        assert (
+            getattr(config, "TRIGGER_CALLBACK_BASE_URL", None)
+            == "XAGENT_TRIGGER_CALLBACK_BASE_URL"
+        )
+        resolver = getattr(config, "get_gmail_callback_base_url", lambda: None)
+        assert resolver() == "https://legacy-callback.example.com"
+        assert get_s2s_api_base_url() == "https://api.example.com"
 
     def test_invalid_timeout_uses_default(self, monkeypatch):
         monkeypatch.setenv("XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS", "0")
@@ -1886,49 +1966,6 @@ class TestGmailPubSubProvisioningConfig:
         assert get_gmail_pubsub_transport() == "rest"
         monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TRANSPORT", "carrier-pigeon")
         assert get_gmail_pubsub_transport() == "grpc"
-
-
-class TestTriggerCallbackBaseUrlConfig:
-    """Dedicated base URL for inbound trigger callbacks (issue #1009)."""
-
-    def test_env_var_name(self):
-        assert TRIGGER_CALLBACK_BASE_URL == "XAGENT_TRIGGER_CALLBACK_BASE_URL"
-
-    def test_env_set_strips_whitespace_and_trailing_slash(self, monkeypatch):
-        monkeypatch.setenv(
-            "XAGENT_TRIGGER_CALLBACK_BASE_URL", " https://callbacks.example.com/ "
-        )
-        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
-        assert get_trigger_callback_base_url() == "https://callbacks.example.com"
-
-    def test_unset_falls_back_to_public_api_base_url(self, monkeypatch):
-        monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raising=False)
-        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com/")
-        assert get_trigger_callback_base_url() == "https://api.example.com"
-
-    @pytest.mark.parametrize("raw_value", ["   ", " /// "])
-    def test_empty_after_cleaning_falls_back_to_public_api_base_url(
-        self, monkeypatch, raw_value
-    ):
-        # "   " exercises .strip(); " /// " exercises .rstrip("/"). Either way
-        # the cleaned value is empty and must fall back rather than return "".
-        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raw_value)
-        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
-        assert get_trigger_callback_base_url() == "https://api.example.com"
-
-    def test_both_unset_returns_none(self, monkeypatch):
-        monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raising=False)
-        monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
-        assert get_trigger_callback_base_url() is None
-
-    def test_override_does_not_affect_public_api_base_url(self, monkeypatch):
-        # The isolation between the two getters is the whole reason MCP and A2A
-        # (which read get_public_api_base_url) are unaffected by the override.
-        monkeypatch.setenv(
-            "XAGENT_TRIGGER_CALLBACK_BASE_URL", "https://callbacks.example.com"
-        )
-        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
-        assert get_public_api_base_url() == "https://api.example.com"
 
 
 class TestTrustedProxyHopsConfig:

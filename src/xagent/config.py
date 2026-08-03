@@ -134,6 +134,7 @@ GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT = "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT"
 GMAIL_PUBSUB_TRANSPORT = "XAGENT_GMAIL_PUBSUB_TRANSPORT"
 GMAIL_REGISTRATION_TIMEOUT_SECONDS = "XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS"
 PUBLIC_API_BASE_URL = "XAGENT_PUBLIC_API_BASE_URL"
+S2S_API_BASE_URL = "XAGENT_S2S_API_BASE_URL"
 TRIGGER_CALLBACK_BASE_URL = "XAGENT_TRIGGER_CALLBACK_BASE_URL"
 GMAIL_WATCH_ENABLED = "XAGENT_GMAIL_WATCH_ENABLED"
 GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS"
@@ -359,6 +360,31 @@ def _normalized_env_url(env_var: str) -> str | None:
     """
     value = (os.getenv(env_var) or "").strip()
     return value.rstrip("/") or None
+
+
+def _normalized_http_env_url(env_var: str) -> str | None:
+    """Return a normalized HTTP(S) base URL or reject invalid configuration.
+
+    Server-to-server URLs are copied into externally consumed callback,
+    audience, and Agent Card fields. Validating them at the configuration
+    boundary produces an actionable error before those integrations receive a
+    malformed endpoint.
+    """
+    value = _normalized_env_url(env_var)
+    if value is None:
+        return None
+    parts = urlsplit(value)
+    if (
+        parts.scheme not in {"http", "https"}
+        or not parts.netloc
+        or parts.query
+        or parts.fragment
+    ):
+        raise ValueError(
+            f"Invalid {env_var} value: {value!r}. "
+            "Expected an absolute http:// or https:// URL without a query or fragment."
+        )
+    return value
 
 
 def get_password_reset_expire_minutes() -> int:
@@ -1030,30 +1056,51 @@ def get_public_api_base_url() -> str | None:
         2. None (consumers apply their own compatibility or validation policy)
 
     Deliberately separate from XAGENT_APP_BASE_URL (the frontend URL used in
-    e.g. password-reset emails): externally advertised API and provider callback
-    URLs should normally use the public backend origin. Inbound trigger
-    callbacks can override this via XAGENT_TRIGGER_CALLBACK_BASE_URL
-    (see get_trigger_callback_base_url).
+    e.g. password-reset emails): externally advertised browser and MCP API URLs
+    should normally use the public backend origin. Server-to-server consumers
+    can override this via XAGENT_S2S_API_BASE_URL (see
+    get_s2s_api_base_url).
     """
-    return _normalized_env_url(PUBLIC_API_BASE_URL)
+    return _normalized_http_env_url(PUBLIC_API_BASE_URL)
 
 
-def get_trigger_callback_base_url() -> str | None:
-    """Base URL for inbound trigger callbacks (Gmail Pub/Sub push, webhooks).
+def get_s2s_api_base_url() -> str | None:
+    """Backend base URL advertised to server-to-server integrations.
 
     Priority:
-        1. XAGENT_TRIGGER_CALLBACK_BASE_URL environment variable
-        2. get_public_api_base_url() (backward compatible fallback)
+        1. XAGENT_S2S_API_BASE_URL environment variable
+        2. XAGENT_PUBLIC_API_BASE_URL for backward-compatible deployments
+        3. None
 
-    Only used when building inbound trigger callback endpoints; MCP and A2A
-    keep using XAGENT_PUBLIC_API_BASE_URL. Set this when server-to-server
-    callbacks must reach a different host than the advertised public API
-    origin (e.g. a dedicated ingress).
+    The separate value lets deployments send provider callbacks and A2A
+    traffic directly to a regional backend while browser and MCP traffic keep
+    using the canonical public API. Trailing slashes are removed so consumers
+    can append absolute API paths without producing duplicate separators.
     """
-    cleaned = _normalized_env_url(TRIGGER_CALLBACK_BASE_URL)
-    if cleaned is not None:
-        return cleaned
-    return get_public_api_base_url()
+    return _normalized_http_env_url(S2S_API_BASE_URL) or get_public_api_base_url()
+
+
+def get_gmail_callback_base_url() -> str | None:
+    """Return the base URL used for Gmail Pub/Sub callbacks.
+
+    ``XAGENT_TRIGGER_CALLBACK_BASE_URL`` was the Gmail-specific override
+    before the broader S2S URL was introduced. Keep it as a deprecated
+    fallback so upgrading does not silently move existing subscriptions back
+    to a browser-facing public edge. A2A deliberately uses
+    :func:`get_s2s_api_base_url` directly and never advertises this legacy
+    Gmail-only endpoint.
+
+    Priority:
+        1. XAGENT_S2S_API_BASE_URL
+        2. XAGENT_TRIGGER_CALLBACK_BASE_URL (deprecated)
+        3. XAGENT_PUBLIC_API_BASE_URL
+        4. None
+    """
+    return (
+        _normalized_http_env_url(S2S_API_BASE_URL)
+        or _normalized_http_env_url(TRIGGER_CALLBACK_BASE_URL)
+        or get_public_api_base_url()
+    )
 
 
 def get_gmail_watch_enabled() -> bool:

@@ -2,6 +2,7 @@
 
 import React, { useEffect, useState } from "react"
 import { Check, Copy, Share } from "lucide-react"
+import { DeploymentConfigFallbackAlert } from "@/components/deployment/deployment-config-fallback-alert"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
@@ -10,6 +11,12 @@ import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { copyToClipboard } from "@/lib/clipboard"
 import { getBrowserLocationOrigin } from "@/lib/browser-location"
+import {
+  browserDeploymentConfig,
+  buildDeploymentShareUrl,
+  fetchDeploymentConfig,
+  type DeploymentConfig,
+} from "@/lib/deployment-config"
 import {
   disableWorkforceShareLink,
   enableWorkforceShareLink,
@@ -31,10 +38,19 @@ export function WorkforceShareDialog({ workforce, open, onClose }: WorkforceShar
   const [isUpdating, setIsUpdating] = useState(false)
   const [copied, setCopied] = useState(false)
   const [appOrigin, setAppOrigin] = useState("")
+  const [deploymentConfig, setDeploymentConfig] =
+    useState<DeploymentConfig | null>(null)
+  const [deploymentConfigFailed, setDeploymentConfigFailed] = useState(false)
 
   const isActive = workforce?.status === "active"
   const shareEnabled = shareLink?.share_enabled ?? false
-  const shareUrl = shareLink?.share_token ? `${appOrigin}/share/${shareLink.share_token}` : ""
+  const shareUrl = shareLink?.share_token
+    ? buildDeploymentShareUrl(
+        shareLink.share_token,
+        deploymentConfig,
+        appOrigin,
+      )
+    : ""
 
   useEffect(() => {
     setAppOrigin(getBrowserLocationOrigin())
@@ -48,8 +64,27 @@ export function WorkforceShareDialog({ workforce, open, onClose }: WorkforceShar
     const load = async () => {
       try {
         setIsLoading(true)
-        const state = await getWorkforceShareLink(workforce.id)
-        if (!cancelled) setShareLink(state)
+        const [stateResult, targetsResult] = await Promise.allSettled([
+          getWorkforceShareLink(workforce.id),
+          fetchDeploymentConfig(),
+        ])
+        if (cancelled) return
+
+        if (targetsResult.status === "fulfilled") {
+          setDeploymentConfig(targetsResult.value)
+          setDeploymentConfigFailed(false)
+        } else {
+          console.error(targetsResult.reason)
+          setDeploymentConfig(browserDeploymentConfig())
+          setDeploymentConfigFailed(true)
+          toast.error(
+            t("deployment_config.messages.load_failed")
+            || "Failed to load deployment configuration; using this browser's origin.",
+          )
+        }
+
+        if (stateResult.status === "rejected") throw stateResult.reason
+        setShareLink(stateResult.value)
       } catch (err) {
         if (!cancelled) {
           console.error(err)
@@ -67,6 +102,19 @@ export function WorkforceShareDialog({ workforce, open, onClose }: WorkforceShar
     // would refetch on every render where the i18n function identity changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, workforce?.id, isActive])
+
+  const retryDeploymentConfig = async () => {
+    try {
+      setDeploymentConfig(await fetchDeploymentConfig())
+      setDeploymentConfigFailed(false)
+    } catch (error) {
+      console.error(error)
+      toast.error(
+        t("deployment_config.messages.load_failed")
+        || "Failed to load deployment configuration; using this browser's origin.",
+      )
+    }
+  }
 
   const runShareAction = async (
     action: (id: number) => Promise<WorkforceShareLink>,
@@ -92,6 +140,11 @@ export function WorkforceShareDialog({ workforce, open, onClose }: WorkforceShar
       setCopied(true)
       toast.success(t("workforces.share_link.messages.link_copied") || "Link copied to clipboard")
       setTimeout(() => setCopied(false), 2000)
+    } else {
+      toast.error(
+        t("workforces.share_link.messages.copy_failed")
+        || "Failed to copy to clipboard",
+      )
     }
   }
 
@@ -105,6 +158,10 @@ export function WorkforceShareDialog({ workforce, open, onClose }: WorkforceShar
           </DialogTitle>
           <DialogDescription>{workforce?.name}</DialogDescription>
         </DialogHeader>
+
+        {deploymentConfigFailed && (
+          <DeploymentConfigFallbackAlert onRetry={retryDeploymentConfig} />
+        )}
 
         <div className="space-y-4 border rounded-lg p-4">
           <div className="space-y-1">

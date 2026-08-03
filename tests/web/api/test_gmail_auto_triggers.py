@@ -367,6 +367,33 @@ def _gmail_pubsub_push_body(
     ).encode("utf-8")
 
 
+def test_gmail_watch_state_persists_previous_callback_audience_grace() -> None:
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-audience-grace-state-user")
+        oauth = _create_gmail_oauth(db, user)
+        state = _create_gmail_watch_state(db, user, oauth, callback_id="cb-grace-state")
+        previous_audience = str(state.push_audience)
+        grace_expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+        setattr(state, "previous_push_audience", previous_audience)
+        setattr(state, "previous_push_audience_expires_at", grace_expires_at)
+        db.add(state)
+        db.commit()
+        state_id = int(state.id)
+        db.expunge_all()
+
+        persisted = (
+            db.query(GmailWatchState).filter(GmailWatchState.id == state_id).one()
+        )
+        assert getattr(persisted, "previous_push_audience", None) == previous_audience
+        persisted_expiry = getattr(persisted, "previous_push_audience_expires_at", None)
+        assert persisted_expiry is not None
+        assert persisted_expiry.replace(tzinfo=timezone.utc) == grace_expires_at
+    finally:
+        db.close()
+
+
 def test_gmail_provider_verifies_oidc_with_stored_audience_and_service_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -418,6 +445,239 @@ def test_gmail_provider_verifies_oidc_with_stored_audience_and_service_account(
         assert result.verified is True
         assert result.attested_resource_id == "codeacme17@gmail.com"
         assert seen == {"token": "oidc-token", "audience": state.push_audience}
+    finally:
+        db.close()
+
+
+def test_gmail_provider_accepts_configured_audience_during_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT",
+        "push-sa@example.iam.gserviceaccount.com",
+    )
+    monkeypatch.setenv(
+        "XAGENT_S2S_API_BASE_URL",
+        "https://new-origin.example.test",
+    )
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-oidc-transition-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        state = _create_gmail_watch_state(db, user, oauth, callback_id="cb-transition")
+        configured_audience = (
+            "https://new-origin.example.test/api/triggers/callback/gmail/cb-transition"
+        )
+        seen_audiences: list[str] = []
+
+        def fake_verify(_token: str, audience: str) -> dict[str, object]:
+            seen_audiences.append(audience)
+            if audience == state.push_audience:
+                raise ValueError("token uses the newly configured audience")
+            return {
+                "iss": "https://accounts.google.com",
+                "aud": configured_audience,
+                "email": "push-sa@example.iam.gserviceaccount.com",
+                "email_verified": True,
+            }
+
+        async def run_verifier_inline(function, *args):
+            """Keep this unit test independent of the default executor lifecycle."""
+
+            return function(*args)
+
+        monkeypatch.setattr(
+            "xagent.web.services.trigger_providers.gmail.asyncio.to_thread",
+            run_verifier_inline,
+        )
+        provider = GmailProvider(oidc_verifier=fake_verify)
+        result = asyncio.run(
+            provider.verify(
+                type(
+                    "Context",
+                    (),
+                    {
+                        "callback_id": "cb-transition",
+                        "url_path": "/api/triggers/callback/gmail/cb-transition",
+                        "header": lambda _self, name: (
+                            "Bearer oidc-token"
+                            if name.lower() == "authorization"
+                            else None
+                        ),
+                    },
+                )(),
+                db=db,
+                trigger=trigger,
+                raw_body=b"{}",
+            )
+        )
+
+        assert result.verified is True
+        assert seen_audiences == [state.push_audience, configured_audience]
+    finally:
+        db.close()
+
+
+def test_gmail_provider_accepts_previous_audience_after_reconciliation_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT",
+        "push-sa@example.iam.gserviceaccount.com",
+    )
+    monkeypatch.setenv(
+        "XAGENT_S2S_API_BASE_URL",
+        "https://new-origin.example.test",
+    )
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-oidc-post-commit-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        state = _create_gmail_watch_state(db, user, oauth, callback_id="cb-post-commit")
+        previous_audience = str(state.push_audience)
+        configured_audience = (
+            "https://new-origin.example.test/api/triggers/callback/gmail/cb-post-commit"
+        )
+        setattr(state, "push_audience", configured_audience)
+        setattr(state, "previous_push_audience", previous_audience)
+        setattr(
+            state,
+            "previous_push_audience_expires_at",
+            datetime.now(timezone.utc) + timedelta(minutes=10),
+        )
+        db.add(state)
+        db.commit()
+        seen_audiences: list[str] = []
+
+        def fake_verify(_token: str, audience: str) -> dict[str, object]:
+            seen_audiences.append(audience)
+            if audience != previous_audience:
+                raise ValueError("token was signed for the previous audience")
+            return {
+                "iss": "https://accounts.google.com",
+                "aud": previous_audience,
+                "email": "push-sa@example.iam.gserviceaccount.com",
+                "email_verified": True,
+            }
+
+        async def run_verifier_inline(function, *args):
+            """Keep this unit test independent of the default executor lifecycle."""
+
+            return function(*args)
+
+        monkeypatch.setattr(
+            "xagent.web.services.trigger_providers.gmail.asyncio.to_thread",
+            run_verifier_inline,
+        )
+        provider = GmailProvider(oidc_verifier=fake_verify)
+        result = asyncio.run(
+            provider.verify(
+                type(
+                    "Context",
+                    (),
+                    {
+                        "callback_id": "cb-post-commit",
+                        "url_path": ("/api/triggers/callback/gmail/cb-post-commit"),
+                        "header": lambda _self, name: (
+                            "Bearer oidc-token"
+                            if name.lower() == "authorization"
+                            else None
+                        ),
+                    },
+                )(),
+                db=db,
+                trigger=trigger,
+                raw_body=b"{}",
+            )
+        )
+
+        assert result.verified is True
+        assert seen_audiences == [configured_audience, previous_audience]
+    finally:
+        db.close()
+
+
+def test_gmail_provider_rejects_previous_audience_after_grace_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT",
+        "push-sa@example.iam.gserviceaccount.com",
+    )
+    monkeypatch.setenv(
+        "XAGENT_S2S_API_BASE_URL",
+        "https://new-origin.example.test",
+    )
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-oidc-expired-grace-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        state = _create_gmail_watch_state(
+            db, user, oauth, callback_id="cb-expired-grace"
+        )
+        previous_audience = str(state.push_audience)
+        configured_audience = (
+            "https://new-origin.example.test/api/triggers/callback/gmail/"
+            "cb-expired-grace"
+        )
+        setattr(state, "push_audience", configured_audience)
+        setattr(state, "previous_push_audience", previous_audience)
+        setattr(
+            state,
+            "previous_push_audience_expires_at",
+            datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+        db.add(state)
+        db.commit()
+        seen_audiences: list[str] = []
+
+        def fake_verify(_token: str, audience: str) -> dict[str, object]:
+            seen_audiences.append(audience)
+            if audience != previous_audience:
+                raise ValueError("token was signed for the previous audience")
+            return {
+                "iss": "https://accounts.google.com",
+                "aud": previous_audience,
+                "email": "push-sa@example.iam.gserviceaccount.com",
+                "email_verified": True,
+            }
+
+        async def run_verifier_inline(function, *args):
+            """Keep this unit test independent of the default executor lifecycle."""
+
+            return function(*args)
+
+        monkeypatch.setattr(
+            "xagent.web.services.trigger_providers.gmail.asyncio.to_thread",
+            run_verifier_inline,
+        )
+        provider = GmailProvider(oidc_verifier=fake_verify)
+        result = asyncio.run(
+            provider.verify(
+                type(
+                    "Context",
+                    (),
+                    {
+                        "callback_id": "cb-expired-grace",
+                        "url_path": ("/api/triggers/callback/gmail/cb-expired-grace"),
+                        "header": lambda _self, name: (
+                            "Bearer oidc-token"
+                            if name.lower() == "authorization"
+                            else None
+                        ),
+                    },
+                )(),
+                db=db,
+                trigger=trigger,
+                raw_body=b"{}",
+            )
+        )
+
+        assert result.verified is False
+        assert seen_audiences == [configured_audience]
     finally:
         db.close()
 

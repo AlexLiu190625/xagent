@@ -1,6 +1,7 @@
 "use client"
 
 import React, { useEffect, useMemo, useState } from "react"
+import { DeploymentConfigFallbackAlert } from "@/components/deployment/deployment-config-fallback-alert"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card"
@@ -18,6 +19,13 @@ import { getApiSnippetTarget } from "@/lib/api-snippet-base-url"
 import { formatAgentApiSnippets, type ApiSnippetTab } from "@/lib/api-snippet-format"
 import type { ApiSnippetTarget } from "@/lib/api-snippet-target"
 import { getBrowserLocationOrigin } from "@/lib/browser-location"
+import {
+  browserDeploymentConfig,
+  buildDeploymentShareUrl,
+  fetchDeploymentConfig,
+  resolveDeploymentOrigin,
+  type DeploymentConfig,
+} from "@/lib/deployment-config"
 import { buildWidgetSnippet, fetchAgentWidgetKey, isValidAllowedDomain, normalizeAllowedDomain, rotateAgentWidgetKey, updateAgentWidgetConfig } from "@/lib/agent-widget-config"
 
 export interface Agent {
@@ -70,9 +78,17 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
   const [widgetKey, setWidgetKey] = useState<string | null>(null)
   const [newDomain, setNewDomain] = useState("")
   const [appOrigin, setAppOrigin] = useState("")
+  const [deploymentConfig, setDeploymentConfig] =
+    useState<DeploymentConfig | null>(null)
+  const [deploymentConfigFailed, setDeploymentConfigFailed] = useState(false)
   const isPublished = deployAgent?.status === "published"
   const shareEnabled = shareLink?.share_enabled ?? deployAgent?.share_enabled ?? false
-  const shareUrl = shareLink?.share_token ? `${appOrigin}/share/${shareLink.share_token}` : ""
+  const shareUrl = buildDeploymentShareUrl(
+    shareLink?.share_token ?? "",
+    deploymentConfig,
+    appOrigin,
+  )
+  const widgetOrigin = resolveDeploymentOrigin(deploymentConfig, appOrigin)
 
   const agentId = deployAgent?.id ?? 0
   const [apiSnippetTarget, setApiSnippetTarget] = useState<ApiSnippetTarget>({
@@ -83,9 +99,48 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
   }, [agentId, apiSnippetTarget])
 
   useEffect(() => {
-    setApiSnippetTarget(getApiSnippetTarget())
-    setAppOrigin(getBrowserLocationOrigin())
-  }, [])
+    let cancelled = false
+    const browserOrigin = getBrowserLocationOrigin()
+    setAppOrigin(browserOrigin)
+
+    fetchDeploymentConfig()
+      .then((config) => {
+        if (cancelled) return
+        setDeploymentConfig(config)
+        setApiSnippetTarget(getApiSnippetTarget(config.deployment_origin))
+        setDeploymentConfigFailed(false)
+      })
+      .catch((error) => {
+        if (cancelled) return
+        console.error("Failed to load deployment configuration", error)
+        setDeploymentConfig(browserDeploymentConfig())
+        setApiSnippetTarget(getApiSnippetTarget(browserOrigin))
+        setDeploymentConfigFailed(true)
+        toast.error(
+          t("deployment_config.messages.load_failed")
+          || "Failed to load deployment configuration; using this browser's origin.",
+        )
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [t])
+
+  const retryDeploymentConfig = async () => {
+    try {
+      const config = await fetchDeploymentConfig()
+      setDeploymentConfig(config)
+      setApiSnippetTarget(getApiSnippetTarget(config.deployment_origin))
+      setDeploymentConfigFailed(false)
+    } catch (error) {
+      console.error("Failed to load deployment configuration", error)
+      toast.error(
+        t("deployment_config.messages.load_failed")
+        || "Failed to load deployment configuration; using this browser's origin.",
+      )
+    }
+  }
 
   useEffect(() => {
     setShareLink(null)
@@ -238,14 +293,17 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
     void handleUpdateWidgetConfig({ allowed_domains: currentDomains.filter(d => d !== domain) })
   }
 
-  const handleCopySnippet = () => {
+  const handleCopySnippet = async () => {
     if (!deployAgent) return
-    const snippet = buildWidgetSnippet(widgetKey ?? "", appOrigin)
+    const snippet = buildWidgetSnippet(widgetKey ?? "", widgetOrigin)
     if (!snippet) return
-    navigator.clipboard.writeText(snippet)
-    setCopiedSnippet(true)
-    toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
-    setTimeout(() => setCopiedSnippet(false), 2000)
+    if (await copyToClipboard(snippet)) {
+      setCopiedSnippet(true)
+      toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
+      setTimeout(() => setCopiedSnippet(false), 2000)
+    } else {
+      toast.error(t("deploy_agent.messages.copy_failed") || "Failed to copy to clipboard")
+    }
   }
 
   const handleRotateWidgetKey = async () => {
@@ -269,12 +327,15 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
     }
   }
 
-  const handleCopyShareLink = () => {
+  const handleCopyShareLink = async () => {
     if (!shareUrl) return
-    navigator.clipboard.writeText(shareUrl)
-    setCopiedShareLink(true)
-    toast.success(t("deploy_agent.messages.link_copied") || "Link copied to clipboard")
-    setTimeout(() => setCopiedShareLink(false), 2000)
+    if (await copyToClipboard(shareUrl)) {
+      setCopiedShareLink(true)
+      toast.success(t("deploy_agent.messages.link_copied") || "Link copied to clipboard")
+      setTimeout(() => setCopiedShareLink(false), 2000)
+    } else {
+      toast.error(t("deploy_agent.messages.copy_failed") || "Failed to copy to clipboard")
+    }
   }
 
   const handleEnableShare = async () => {
@@ -416,6 +477,10 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
           </DialogTitle>
           <DialogDescription>{deployAgent?.name}</DialogDescription>
         </DialogHeader>
+
+        {deploymentConfigFailed && (
+          <DeploymentConfigFallbackAlert onRetry={retryDeploymentConfig} />
+        )}
 
         {activeView === "options" ? (
           <div className="mt-6">
@@ -581,13 +646,16 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
               </div>
               <div className="bg-muted p-4 rounded-md text-xs font-mono relative overflow-hidden group mt-4">
                 <pre className="whitespace-pre-wrap break-all text-muted-foreground">
-                  {widgetKey ? buildWidgetSnippet(widgetKey, appOrigin) : "…"}
+                  {widgetKey && widgetOrigin
+                    ? buildWidgetSnippet(widgetKey, widgetOrigin)
+                    : "…"}
                 </pre>
                 <Button
                   variant="secondary"
                   size="icon"
                   className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity"
-                  onClick={handleCopySnippet}
+                  onClick={() => void handleCopySnippet()}
+                  disabled={!widgetKey || !widgetOrigin}
                   title={t("deploy_agent.embed_snippet.copy_btn") || "Copy Snippet"}
                 >
                   {copiedSnippet ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
@@ -623,7 +691,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
                     <Label className="text-sm">{t("deploy_agent.share_link.public_url") || "Public URL"}</Label>
                     <div className="flex gap-2">
                       <Input readOnly value={shareUrl} className="flex-1" />
-                      <Button variant="secondary" onClick={handleCopyShareLink} disabled={isUpdatingShare}>
+                      <Button variant="secondary" onClick={() => void handleCopyShareLink()} disabled={isUpdatingShare}>
                         {copiedShareLink ? <Check className="h-4 w-4 mr-1 text-green-500" /> : <Copy className="h-4 w-4 mr-1" />}
                         {t("common.copy") || "Copy"}
                       </Button>

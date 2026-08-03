@@ -17,21 +17,25 @@ import logging
 import secrets
 import threading
 from collections.abc import Sequence
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
-from sqlalchemy import func
+from sqlalchemy import String
+from sqlalchemy import cast as sql_cast
+from sqlalchemy import func, or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import (
+    get_gmail_callback_base_url,
     get_gmail_pubsub_project_id,
     get_gmail_pubsub_push_service_account,
     get_gmail_pubsub_subscription_prefix,
     get_gmail_pubsub_topic_prefix,
     get_gmail_pubsub_transport,
     get_gmail_registration_timeout_seconds,
-    get_trigger_callback_base_url,
 )
 from ..models.gmail_watch import GmailWatchState
 from ..models.trigger import (
@@ -45,6 +49,13 @@ logger = logging.getLogger(__name__)
 
 GMAIL_PUSH_PUBLISHER = "gmail-api-push@system.gserviceaccount.com"
 GMAIL_WATCH_LABEL_IDS = ["INBOX"]
+# Pub/Sub can reuse an authenticated push token for up to one hour:
+# https://docs.cloud.google.com/pubsub/docs/authenticate-push-subscriptions
+# Retain five additional minutes for rollout propagation and ordinary clock
+# skew so an old, still-valid audience is never rejected during rotation.
+GMAIL_CALLBACK_AUDIENCE_GRACE_PERIOD = timedelta(hours=1, minutes=5)
+GMAIL_WATCH_TRANSITION_LOCK_NAMESPACE = 0x58414754
+_LOCAL_GMAIL_WATCH_TRANSITION_LOCK = threading.RLock()
 
 PublisherFactory = Callable[[], Any]
 SubscriberFactory = Callable[[], Any]
@@ -52,6 +63,67 @@ SubscriberFactory = Callable[[], Any]
 
 class GmailProvisioningError(RuntimeError):
     """Raised when per-mailbox Gmail provisioning cannot proceed."""
+
+
+@contextmanager
+def _gmail_watch_transition_lock(
+    db: Session,
+    oauth_account_id: int,
+) -> Iterator[Session]:
+    """Serialize one mailbox's cloud-plus-database provisioning transition.
+
+    PostgreSQL deployments use a session advisory lock keyed by OAuth account,
+    and bind the transition Session to that same physical connection. Commits
+    can therefore expose intermediate state without releasing the advisory
+    lock or checking out a second pooled connection during remote API calls.
+    SQLite deployments use the caller Session under an in-process lock; SQLite
+    already serializes database writers, and XAgent's background provisioning
+    and reconciliation workers share one process.
+    """
+    bind = db.get_bind()
+    engine = bind.engine
+    if engine.dialect.name != "postgresql":
+        with _LOCAL_GMAIL_WATCH_TRANSITION_LOCK:
+            yield db
+        return
+
+    parameters = {
+        "namespace": GMAIL_WATCH_TRANSITION_LOCK_NAMESPACE,
+        "oauth_account_id": int(oauth_account_id),
+    }
+    # The caller's read transaction may already own a pooled connection.
+    # Commit it before acquiring the lock connection; the transition Session
+    # below performs all database work on that one lock-owning connection.
+    db.commit()
+    with engine.connect() as lock_connection:
+        lock_connection.execute(
+            text("SELECT pg_advisory_lock(:namespace, :oauth_account_id)"),
+            parameters,
+        )
+        lock_connection.commit()
+        try:
+            with Session(bind=lock_connection, expire_on_commit=False) as transition_db:
+                yield transition_db
+        finally:
+            if lock_connection.in_transaction():
+                lock_connection.rollback()
+            lock_connection.execute(
+                text("SELECT pg_advisory_unlock(:namespace, :oauth_account_id)"),
+                parameters,
+            )
+            lock_connection.commit()
+
+
+@dataclass(frozen=True)
+class GmailPushEndpointReconciliation:
+    """Outcome of auditing or applying regional Gmail push endpoints."""
+
+    scanned: int
+    changed: int
+    unchanged: int
+    failed: int
+    skipped: int = 0
+    errors: tuple[str, ...] = ()
 
 
 def _default_publisher() -> Any:
@@ -104,6 +176,17 @@ def _new_callback_id() -> str:
     return secrets.token_urlsafe(24)
 
 
+def gmail_callback_url(base_url: str, callback_id: str) -> str:
+    """Build the canonical Gmail push endpoint and OIDC audience.
+
+    Pub/Sub's push endpoint, its signed OIDC audience, the persisted watch
+    audience, and callback verification must use this exact value. Keeping the
+    path construction here prevents those independently configured surfaces
+    from drifting apart.
+    """
+    return f"{base_url}/api/triggers/callback/gmail/{callback_id}"
+
+
 def _is_already_exists(exc: Exception) -> bool:
     try:
         # gRPC raises AlreadyExists; the REST transport maps HTTP 409 to its
@@ -133,11 +216,11 @@ def _validate_provisioning_config() -> tuple[str, str, str]:
         raise GmailProvisioningError(
             "XAGENT_GMAIL_PUBSUB_PROJECT_ID is required for Gmail provisioning"
         )
-    base_url = get_trigger_callback_base_url()
+    base_url = get_gmail_callback_base_url()
     if not base_url:
         raise GmailProvisioningError(
-            "XAGENT_PUBLIC_API_BASE_URL (or XAGENT_TRIGGER_CALLBACK_BASE_URL to "
-            "override it) is required for Gmail push registration"
+            "XAGENT_S2S_API_BASE_URL, XAGENT_TRIGGER_CALLBACK_BASE_URL, or "
+            "XAGENT_PUBLIC_API_BASE_URL is required for Gmail push registration"
         )
     push_service_account = get_gmail_pubsub_push_service_account()
     if not push_service_account:
@@ -146,6 +229,64 @@ def _validate_provisioning_config() -> tuple[str, str, str]:
             "OIDC-verified Gmail push delivery"
         )
     return project_id, base_url, push_service_account
+
+
+def _referenced_gmail_oauth_account_ids(
+    db: Session,
+    accounts: Sequence[tuple[int, str]],
+) -> set[int]:
+    """Resolve enabled Gmail trigger bindings for a bounded account batch.
+
+    Modern triggers bind to ``config.oauth_account_id``. Legacy or malformed
+    configs fall back to their mailbox resource ID, but only when no valid
+    account binding exists; this preserves the explicit choice when multiple
+    OAuth accounts share one email address.
+    """
+    account_ids = {int(account_id) for account_id, _email in accounts}
+    account_ids_by_email: dict[str, set[int]] = {}
+    for account_id, raw_email in accounts:
+        email = str(raw_email or "").strip().lower()
+        if email:
+            account_ids_by_email.setdefault(email, set()).add(int(account_id))
+    if not account_ids:
+        return set()
+
+    binding_text = sql_cast(
+        AgentTrigger.config["oauth_account_id"].as_string(),
+        String,
+    )
+    candidate_rows = (
+        db.query(AgentTrigger.config, AgentTrigger.resource_id)
+        .filter(
+            AgentTrigger.type == TriggerType.GMAIL.value,
+            AgentTrigger.enabled.is_(True),
+            or_(
+                binding_text.in_({str(account_id) for account_id in account_ids}),
+                func.lower(AgentTrigger.resource_id).in_(account_ids_by_email),
+            ),
+        )
+        .distinct()
+        .all()
+    )
+
+    referenced: set[int] = set()
+    for raw_config, raw_resource_id in candidate_rows:
+        config = raw_config if isinstance(raw_config, dict) else {}
+        raw_account_id = config.get("oauth_account_id")
+        try:
+            bound_account_id = (
+                int(raw_account_id) if raw_account_id is not None else None
+            )
+        except (TypeError, ValueError):
+            bound_account_id = None
+        if bound_account_id in account_ids:
+            referenced.add(bound_account_id)
+            continue
+        if bound_account_id is not None:
+            continue
+        resource_id = str(raw_resource_id or "").strip().lower()
+        referenced.update(account_ids_by_email.get(resource_id, ()))
+    return referenced
 
 
 def _get_or_create_watch_state(
@@ -238,13 +379,10 @@ def _ensure_push_subscription(
     push_audience: str,
     push_service_account: str,
 ) -> None:
-    push_config = {
-        "push_endpoint": push_audience,
-        "oidc_token": {
-            "service_account_email": push_service_account,
-            "audience": push_audience,
-        },
-    }
+    push_config = _build_push_config(
+        push_audience=push_audience,
+        push_service_account=push_service_account,
+    )
     try:
         subscriber.create_subscription(
             request={
@@ -258,13 +396,25 @@ def _ensure_push_subscription(
             raise
         # The deterministic name survives config changes; make sure an
         # existing subscription still pushes to the current audience
-        # (e.g. after XAGENT_TRIGGER_CALLBACK_BASE_URL or
-        # XAGENT_PUBLIC_API_BASE_URL was changed).
+        # (e.g. after XAGENT_S2S_API_BASE_URL was changed).
         _sync_push_config(
             subscriber,
             subscription_path=subscription_path,
             push_config=push_config,
         )
+
+
+def _build_push_config(
+    *, push_audience: str, push_service_account: str
+) -> dict[str, Any]:
+    """Build the endpoint and matching OIDC audience as one atomic contract."""
+    return {
+        "push_endpoint": push_audience,
+        "oidc_token": {
+            "service_account_email": push_service_account,
+            "audience": push_audience,
+        },
+    }
 
 
 def _sync_push_config(
@@ -301,30 +451,306 @@ def _sync_push_config(
             exc,
         )
     else:
-        existing_push = getattr(existing, "push_config", None)
-        existing_oidc = getattr(existing_push, "oidc_token", None)
-        current = (
-            str(getattr(existing_push, "push_endpoint", "") or ""),
-            str(getattr(existing_oidc, "service_account_email", "") or ""),
-            str(getattr(existing_oidc, "audience", "") or ""),
-        )
-        desired_oidc = push_config.get("oidc_token", {})
-        desired = (
-            str(push_config.get("push_endpoint", "")),
-            str(desired_oidc.get("service_account_email", "")),
-            str(desired_oidc.get("audience", "")),
-        )
         # Compare the full push config, not just the endpoint: the OIDC service
         # account can change (e.g. XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT)
         # while the endpoint/audience stay the same, and it still needs
         # re-syncing.
-        if current == desired:
+        if _push_config_matches(existing, push_config):
             return
     subscriber.modify_push_config(
         request={
             "subscription": subscription_path,
             "push_config": push_config,
         }
+    )
+
+
+def _push_config_matches(subscription: Any, expected: dict[str, Any]) -> bool:
+    """Return whether Pub/Sub exposes the complete expected push contract."""
+    current_push = getattr(subscription, "push_config", None)
+    current_oidc = getattr(current_push, "oidc_token", None)
+    expected_oidc = expected["oidc_token"]
+    return bool(
+        str(getattr(current_push, "push_endpoint", "") or "")
+        == expected["push_endpoint"]
+        and str(getattr(current_oidc, "audience", "") or "")
+        == expected_oidc["audience"]
+        and str(getattr(current_oidc, "service_account_email", "") or "")
+        == expected_oidc["service_account_email"]
+    )
+
+
+def _reconcile_gmail_push_endpoint(
+    db: Session,
+    *,
+    state_row: Any,
+    base_url: str,
+    push_service_account: str,
+    subscriber: Any,
+    execute: bool,
+) -> str:
+    """Reconcile one snapshotted watch and return changed/unchanged/skipped.
+
+    Execute mode takes the same mailbox transition lock as provisioning, then
+    re-reads and row-locks the state. The snapshot may have become stale while
+    waiting for another worker; using the refreshed metadata prevents a cloud
+    update based on an earlier provisioning generation.
+    """
+    (
+        state_id,
+        oauth_account_id,
+        _raw_email,
+        raw_callback_id,
+        raw_subscription_name,
+        raw_push_audience,
+    ) = state_row
+    transition = (
+        _gmail_watch_transition_lock(db, int(oauth_account_id))
+        if execute
+        else nullcontext(db)
+    )
+    with transition as transition_db:
+        if execute:
+            current_row = (
+                transition_db.query(
+                    GmailWatchState.id,
+                    GmailWatchState.oauth_account_id,
+                    GmailWatchState.email,
+                    GmailWatchState.callback_id,
+                    GmailWatchState.subscription_name,
+                    GmailWatchState.push_audience,
+                    GmailWatchState.previous_push_audience,
+                )
+                .filter(
+                    GmailWatchState.id == int(state_id),
+                    GmailWatchState.oauth_account_id == int(oauth_account_id),
+                    GmailWatchState.status == TriggerProvisioningStatus.ACTIVE.value,
+                )
+                .with_for_update()
+                .one_or_none()
+            )
+            if current_row is None:
+                transition_db.rollback()
+                return "skipped"
+            (
+                state_id,
+                oauth_account_id,
+                _raw_email,
+                raw_callback_id,
+                raw_subscription_name,
+                raw_push_audience,
+                raw_previous_push_audience,
+            ) = current_row
+        else:
+            raw_previous_push_audience = None
+
+        callback_id = str(raw_callback_id or "").strip()
+        subscription_path = str(raw_subscription_name or "").strip()
+        if not callback_id or not subscription_path:
+            raise GmailProvisioningError(
+                f"Active Gmail watch {state_id} has incomplete push metadata"
+            )
+        expected_audience = gmail_callback_url(base_url, callback_id)
+        expected_push_config = _build_push_config(
+            push_audience=expected_audience,
+            push_service_account=push_service_account,
+        )
+        try:
+            existing = subscriber.get_subscription(
+                request={"subscription": subscription_path}
+            )
+        except Exception:
+            # Audit mode cannot claim convergence without observing cloud
+            # state. Execute mode can still honor a deliberately update-only
+            # service identity because modify_push_config is idempotent.
+            if not execute:
+                raise
+            cloud_is_current = False
+        else:
+            cloud_is_current = _push_config_matches(existing, expected_push_config)
+        database_is_current = str(raw_push_audience or "") == expected_audience
+        if cloud_is_current and database_is_current:
+            if execute:
+                transition_db.rollback()
+            return "unchanged"
+
+        if execute:
+            if not cloud_is_current:
+                subscriber.modify_push_config(
+                    request={
+                        "subscription": subscription_path,
+                        "push_config": expected_push_config,
+                    }
+                )
+
+            # Keep the stored cloud audience authoritative until Pub/Sub has
+            # accepted the new endpoint. Callback verification also derives
+            # the configured audience, so both sides remain valid if the
+            # process stops after the cloud call but before this commit.
+            transition_values: dict[Any, Any] = {
+                GmailWatchState.push_audience: expected_audience,
+            }
+            grace_deadline = _now() + GMAIL_CALLBACK_AUDIENCE_GRACE_PERIOD
+            previous_audience = str(raw_push_audience or "").strip()
+            if not database_is_current:
+                transition_values.update(
+                    {
+                        GmailWatchState.previous_push_audience: (
+                            previous_audience or None
+                        ),
+                        GmailWatchState.previous_push_audience_expires_at: (
+                            grace_deadline if previous_audience else None
+                        ),
+                    }
+                )
+            elif not cloud_is_current:
+                # Older releases could persist the new audience before a
+                # failed cloud patch. Start a fresh grace window only after a
+                # later retry actually moves Pub/Sub.
+                durable_previous = str(raw_previous_push_audience or "").strip()
+                if durable_previous:
+                    transition_values.update(
+                        {
+                            GmailWatchState.previous_push_audience: durable_previous,
+                            GmailWatchState.previous_push_audience_expires_at: grace_deadline,
+                        }
+                    )
+
+            # Besides releasing the row lock, this guarded update detects a
+            # concurrent SQLite teardown after the cloud call (PostgreSQL's
+            # FOR UPDATE lock prevents that race directly).
+            updated = (
+                transition_db.query(GmailWatchState)
+                .filter(
+                    GmailWatchState.id == int(state_id),
+                    GmailWatchState.oauth_account_id == int(oauth_account_id),
+                    GmailWatchState.status == TriggerProvisioningStatus.ACTIVE.value,
+                )
+                .update(
+                    transition_values,
+                    synchronize_session=False,
+                )
+            )
+            if updated == 0:
+                raise GmailProvisioningError(
+                    f"Active Gmail watch {state_id} disappeared during "
+                    "the callback audience transition"
+                )
+            transition_db.commit()
+        return "changed"
+
+
+def reconcile_gmail_push_endpoints(
+    db: Session,
+    *,
+    execute: bool = False,
+    subscriber_factory: SubscriberFactory | None = None,
+    batch_size: int = 100,
+) -> GmailPushEndpointReconciliation:
+    """Audit or migrate active Gmail subscriptions to the configured S2S URL.
+
+    Only active watch states still referenced by an enabled Gmail trigger are
+    candidates. Applying a change first modifies the Pub/Sub push endpoint and
+    OIDC audience, then persists the new and previous accepted audiences. The
+    configured and stored audiences keep callbacks verifiable across that
+    transition. Reconciliation deliberately does not call ``users.watch`` or
+    alter the callback identifier, history cursor, watch expiration,
+    provisioning status, or error state.
+
+    The default is a dry run. Re-running after a partial failure is safe:
+    already-converged rows are skipped and each successful cloud update is
+    committed independently.
+    """
+    _, base_url, push_service_account = _validate_provisioning_config()
+    subscriber_factory = subscriber_factory or _default_subscriber
+    subscriber: Any | None = None
+    scanned = 0
+    changed = 0
+    unchanged = 0
+    skipped = 0
+    failed = 0
+    errors: list[str] = []
+
+    page_size = max(1, batch_size)
+    last_state_id = 0
+    while True:
+        # Scalar rows remain valid across the per-watch commits below, unlike
+        # ORM instances whose attributes are expired and implicitly refreshed.
+        state_rows = (
+            db.query(
+                GmailWatchState.id,
+                GmailWatchState.oauth_account_id,
+                GmailWatchState.email,
+                GmailWatchState.callback_id,
+                GmailWatchState.subscription_name,
+                GmailWatchState.push_audience,
+            )
+            .filter(
+                GmailWatchState.status == TriggerProvisioningStatus.ACTIVE.value,
+                GmailWatchState.id > last_state_id,
+            )
+            .order_by(GmailWatchState.id.asc())
+            .limit(page_size)
+            .all()
+        )
+        if not state_rows:
+            break
+        last_state_id = int(state_rows[-1].id)
+        referenced_account_ids = _referenced_gmail_oauth_account_ids(
+            db,
+            [(int(row.oauth_account_id), str(row.email or "")) for row in state_rows],
+        )
+
+        for (
+            state_id,
+            oauth_account_id,
+            raw_email,
+            raw_callback_id,
+            raw_subscription_name,
+            raw_push_audience,
+        ) in state_rows:
+            email = str(raw_email or "").strip().lower()
+            if int(oauth_account_id) not in referenced_account_ids:
+                continue
+
+            scanned += 1
+            try:
+                if subscriber is None:
+                    subscriber = subscriber_factory()
+                outcome = _reconcile_gmail_push_endpoint(
+                    db,
+                    state_row=(
+                        state_id,
+                        oauth_account_id,
+                        raw_email,
+                        raw_callback_id,
+                        raw_subscription_name,
+                        raw_push_audience,
+                    ),
+                    base_url=base_url,
+                    push_service_account=push_service_account,
+                    subscriber=subscriber,
+                    execute=execute,
+                )
+                if outcome == "unchanged":
+                    unchanged += 1
+                    continue
+                if outcome == "skipped":
+                    skipped += 1
+                    continue
+                changed += 1
+            except Exception as exc:
+                db.rollback()
+                failed += 1
+                errors.append(f"watch {state_id} ({email}): {exc}")
+
+    return GmailPushEndpointReconciliation(
+        scanned=scanned,
+        changed=changed,
+        unchanged=unchanged,
+        failed=failed,
+        skipped=skipped,
+        errors=tuple(errors),
     )
 
 
@@ -365,6 +791,36 @@ def ensure_gmail_mailbox_provisioned(
     Never raises for provisioning failures: the watch state converges to
     failed with a clear last_error, and later reconcile attempts retry.
     """
+    oauth_account_id = int(oauth_account.id)
+    with _gmail_watch_transition_lock(db, oauth_account_id) as transition_db:
+        transition_account = (
+            oauth_account
+            if transition_db is db
+            else transition_db.query(UserOAuth)
+            .filter(UserOAuth.id == oauth_account_id)
+            .one()
+        )
+        state = _ensure_gmail_mailbox_provisioned_locked(
+            transition_db,
+            transition_account,
+            service_factory=service_factory,
+            publisher_factory=publisher_factory,
+            subscriber_factory=subscriber_factory,
+        )
+    if transition_db is not db:
+        db.expire_all()
+    return state
+
+
+def _ensure_gmail_mailbox_provisioned_locked(
+    db: Session,
+    oauth_account: UserOAuth,
+    *,
+    service_factory: Callable[[Session, UserOAuth], Any] | None = None,
+    publisher_factory: PublisherFactory | None = None,
+    subscriber_factory: SubscriberFactory | None = None,
+) -> GmailWatchState:
+    """Provision one mailbox while its cross-worker transition lock is held."""
     service_factory = service_factory or _default_gmail_service
     publisher_factory = publisher_factory or _default_publisher
     subscriber_factory = subscriber_factory or _default_subscriber
@@ -378,7 +834,9 @@ def ensure_gmail_mailbox_provisioned(
         project_id, base_url, push_service_account = _validate_provisioning_config()
         topic_path = gmail_topic_path(project_id, email)
         subscription_path = gmail_subscription_path(project_id, email)
-        push_audience = f"{base_url}/api/triggers/callback/gmail/{state.callback_id}"
+        push_audience = gmail_callback_url(base_url, str(state.callback_id))
+
+        previous_audience = str(state.push_audience or "").strip()
 
         publisher = publisher_factory()
         _ensure_topic(publisher, topic_path)
@@ -402,9 +860,18 @@ def ensure_gmail_mailbox_provisioned(
         logger.warning("Gmail provisioning failed for %s: %s", email, exc)
         return state
 
+    if previous_audience != push_audience:
+        if previous_audience:
+            setattr(state, "previous_push_audience", previous_audience)
+            setattr(
+                state,
+                "previous_push_audience_expires_at",
+                _now() + GMAIL_CALLBACK_AUDIENCE_GRACE_PERIOD,
+            )
+        setattr(state, "push_audience", push_audience)
+
     setattr(state, "topic_name", topic_path)
     setattr(state, "subscription_name", subscription_path)
-    setattr(state, "push_audience", push_audience)
     setattr(state, "history_id", history_id)
     setattr(state, "watch_expiration", watch_expiration)
     setattr(state, "status", TriggerProvisioningStatus.ACTIVE.value)
@@ -707,21 +1174,14 @@ def sweep_gmail_provisioning(
         .limit(max(1, min(limit, 500)))
         .all()
     )
+    referenced_account_ids = _referenced_gmail_oauth_account_ids(
+        db,
+        [(int(state.oauth_account_id), str(state.email or "")) for state in candidates],
+    )
 
     attempts = 0
     for state in candidates:
-        email = str(state.email or "").strip().lower()
-        referenced = (
-            db.query(AgentTrigger.id)
-            .filter(
-                AgentTrigger.type == TriggerType.GMAIL.value,
-                AgentTrigger.enabled.is_(True),
-                func.lower(AgentTrigger.resource_id) == email,
-            )
-            .first()
-            is not None
-        )
-        if not referenced:
+        if int(state.oauth_account_id) not in referenced_account_ids:
             continue
         oauth_account = (
             db.query(UserOAuth)
@@ -762,21 +1222,15 @@ def best_effort_provision_gmail_watches_for_user(
         .filter(UserOAuth.user_id == int(user_id), UserOAuth.provider == "gmail")
         .all()
     )
+    referenced_account_ids = _referenced_gmail_oauth_account_ids(
+        db,
+        [(int(account.id), str(account.email or "")) for account in accounts],
+    )
     for account in accounts:
         email = str(account.email or "").strip().lower()
         if not email:
             continue
-        referenced = (
-            db.query(AgentTrigger.id)
-            .filter(
-                AgentTrigger.type == TriggerType.GMAIL.value,
-                AgentTrigger.enabled.is_(True),
-                func.lower(AgentTrigger.resource_id) == email,
-            )
-            .first()
-            is not None
-        )
-        if not referenced:
+        if int(account.id) not in referenced_account_ids:
             continue
         try:
             ensure_gmail_mailbox_provisioned(db, account)

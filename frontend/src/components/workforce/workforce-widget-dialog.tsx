@@ -2,6 +2,7 @@
 
 import React, { useEffect, useState } from "react"
 import { Check, Copy, LayoutGrid } from "lucide-react"
+import { DeploymentConfigFallbackAlert } from "@/components/deployment/deployment-config-fallback-alert"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
@@ -12,6 +13,12 @@ import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { copyToClipboard } from "@/lib/clipboard"
 import { getBrowserLocationOrigin } from "@/lib/browser-location"
+import {
+  browserDeploymentConfig,
+  fetchDeploymentConfig,
+  resolveDeploymentOrigin,
+  type DeploymentConfig,
+} from "@/lib/deployment-config"
 import { buildWidgetSnippet, isValidAllowedDomain, normalizeAllowedDomain } from "@/lib/agent-widget-config"
 import {
   getWorkforceWidgetConfig,
@@ -35,11 +42,15 @@ export function WorkforceWidgetDialog({ workforce, open, onClose }: WorkforceWid
   const [newDomain, setNewDomain] = useState("")
   const [copied, setCopied] = useState(false)
   const [appOrigin, setAppOrigin] = useState("")
+  const [deploymentConfig, setDeploymentConfig] =
+    useState<DeploymentConfig | null>(null)
+  const [deploymentConfigFailed, setDeploymentConfigFailed] = useState(false)
 
   const isActive = workforce?.status === "active"
   const widgetEnabled = config?.widget_enabled ?? false
   const allowedDomains = config?.allowed_domains ?? []
   const widgetKey = config?.widget_key ?? null
+  const widgetOrigin = resolveDeploymentOrigin(deploymentConfig, appOrigin)
 
   useEffect(() => {
     setAppOrigin(getBrowserLocationOrigin())
@@ -53,8 +64,27 @@ export function WorkforceWidgetDialog({ workforce, open, onClose }: WorkforceWid
     const load = async () => {
       try {
         setIsLoading(true)
-        const state = await getWorkforceWidgetConfig(workforce.id)
-        if (!cancelled) setConfig(state)
+        const [stateResult, targetsResult] = await Promise.allSettled([
+          getWorkforceWidgetConfig(workforce.id),
+          fetchDeploymentConfig(),
+        ])
+        if (cancelled) return
+
+        if (targetsResult.status === "fulfilled") {
+          setDeploymentConfig(targetsResult.value)
+          setDeploymentConfigFailed(false)
+        } else {
+          console.error(targetsResult.reason)
+          setDeploymentConfig(browserDeploymentConfig())
+          setDeploymentConfigFailed(true)
+          toast.error(
+            t("deployment_config.messages.load_failed")
+            || "Failed to load deployment configuration; using this browser's origin.",
+          )
+        }
+
+        if (stateResult.status === "rejected") throw stateResult.reason
+        setConfig(stateResult.value)
       } catch (err) {
         if (!cancelled) {
           console.error(err)
@@ -72,6 +102,19 @@ export function WorkforceWidgetDialog({ workforce, open, onClose }: WorkforceWid
     // would refetch on every render where the i18n function identity changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, workforce?.id])
+
+  const retryDeploymentConfig = async () => {
+    try {
+      setDeploymentConfig(await fetchDeploymentConfig())
+      setDeploymentConfigFailed(false)
+    } catch (error) {
+      console.error(error)
+      toast.error(
+        t("deployment_config.messages.load_failed")
+        || "Failed to load deployment configuration; using this browser's origin.",
+      )
+    }
+  }
 
   const applyUpdate = async (
     updates: { widget_enabled?: boolean; allowed_domains?: string[] },
@@ -148,12 +191,17 @@ export function WorkforceWidgetDialog({ workforce, open, onClose }: WorkforceWid
   }
 
   const handleCopySnippet = async () => {
-    const snippet = buildWidgetSnippet(widgetKey ?? "", appOrigin)
+    const snippet = buildWidgetSnippet(widgetKey ?? "", widgetOrigin)
     if (!snippet) return
     if (await copyToClipboard(snippet)) {
       setCopied(true)
       toast.success(t("workforces.widget.messages.copied") || "Copied to clipboard")
       setTimeout(() => setCopied(false), 2000)
+    } else {
+      toast.error(
+        t("workforces.widget.messages.copy_failed")
+        || "Failed to copy to clipboard",
+      )
     }
   }
 
@@ -167,6 +215,10 @@ export function WorkforceWidgetDialog({ workforce, open, onClose }: WorkforceWid
           </DialogTitle>
           <DialogDescription>{workforce?.name}</DialogDescription>
         </DialogHeader>
+
+        {deploymentConfigFailed && (
+          <DeploymentConfigFallbackAlert onRetry={retryDeploymentConfig} />
+        )}
 
         {!isActive ? (
           <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
@@ -254,7 +306,9 @@ export function WorkforceWidgetDialog({ workforce, open, onClose }: WorkforceWid
                 </div>
                 <div className="bg-muted p-4 rounded-md text-xs font-mono relative overflow-hidden group mt-4">
                   <pre className="whitespace-pre-wrap break-all text-muted-foreground">
-                    {widgetKey ? buildWidgetSnippet(widgetKey, appOrigin) : "…"}
+                    {widgetKey && widgetOrigin
+                      ? buildWidgetSnippet(widgetKey, widgetOrigin)
+                      : "…"}
                   </pre>
                   <Button
                     variant="secondary"

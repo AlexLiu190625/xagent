@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useState } from "react"
 import { Check, Copy, KeyRound, Loader2 } from "lucide-react"
 
+import { DeploymentConfigFallbackAlert } from "@/components/deployment/deployment-config-fallback-alert"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -15,7 +16,9 @@ import { Input } from "@/components/ui/input"
 import { toast } from "@/components/ui/sonner"
 import { useI18n } from "@/contexts/i18n-context"
 import { copyToClipboard } from "@/lib/clipboard"
+import { fetchDeploymentConfig } from "@/lib/deployment-config"
 import { getApiSnippetTarget } from "@/lib/api-snippet-base-url"
+import { getBrowserLocationOrigin } from "@/lib/browser-location"
 import {
   formatWorkforceApiSnippets,
   type ApiSnippetTab,
@@ -53,6 +56,7 @@ export function DeployWorkforceDialog({
   const [apiTab, setApiTab] = useState<ApiSnippetTab>("curl")
   const [copiedSnippet, setCopiedSnippet] = useState(false)
   const [apiTarget, setApiTarget] = useState<ApiSnippetTarget>({ baseUrl: "" })
+  const [deploymentConfigFailed, setDeploymentConfigFailed] = useState(false)
 
   const [keys, setKeys] = useState<AgentApiKeyListItem[]>([])
   const [loadingKeys, setLoadingKeys] = useState(false)
@@ -62,8 +66,47 @@ export function DeployWorkforceDialog({
   const [copiedKey, setCopiedKey] = useState(false)
 
   useEffect(() => {
-    if (open) setApiTarget(getApiSnippetTarget())
-  }, [open])
+    if (!open) {
+      setApiTarget({ baseUrl: "" })
+      setDeploymentConfigFailed(false)
+      return
+    }
+
+    let cancelled = false
+    fetchDeploymentConfig()
+      .then((config) => {
+        if (!cancelled) {
+          setApiTarget(getApiSnippetTarget(config.deployment_origin))
+          setDeploymentConfigFailed(false)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setApiTarget(getApiSnippetTarget(getBrowserLocationOrigin()))
+          setDeploymentConfigFailed(true)
+          toast.error(
+            t("deployment_config.messages.load_failed")
+            || "Failed to load deployment configuration; using this browser's origin.",
+          )
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open, t])
+
+  const retryDeploymentConfig = async () => {
+    try {
+      const config = await fetchDeploymentConfig()
+      setApiTarget(getApiSnippetTarget(config.deployment_origin))
+      setDeploymentConfigFailed(false)
+    } catch {
+      toast.error(
+        t("deployment_config.messages.load_failed")
+        || "Failed to load deployment configuration; using this browser's origin.",
+      )
+    }
+  }
 
   useEffect(() => {
     if (!open) {
@@ -99,6 +142,10 @@ export function DeployWorkforceDialog({
     if (ok) {
       setCopiedSnippet(true)
       setTimeout(() => setCopiedSnippet(false), 1500)
+    } else {
+      toast.error(
+        t("deploy_workforce.copy_failed") || "Failed to copy to clipboard",
+      )
     }
   }
 
@@ -108,6 +155,10 @@ export function DeployWorkforceDialog({
     if (ok) {
       setCopiedKey(true)
       setTimeout(() => setCopiedKey(false), 1500)
+    } else {
+      toast.error(
+        t("deploy_workforce.copy_failed") || "Failed to copy to clipboard",
+      )
     }
   }
 
@@ -149,6 +200,10 @@ export function DeployWorkforceDialog({
               `Create runs on "${workforceName}" with a workforce API key, then poll GET /v1/chat/tasks/{id} for results.`}
           </DialogDescription>
         </DialogHeader>
+
+        {deploymentConfigFailed && (
+          <DeploymentConfigFallbackAlert onRetry={retryDeploymentConfig} />
+        )}
 
         <div className="space-y-5">
           {/* Snippet tabs */}

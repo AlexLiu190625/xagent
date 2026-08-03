@@ -29,8 +29,8 @@ def test_optional_session_factory_preserves_strict_database_contract(
     assert database.get_optional_session_local() is None
     with pytest.raises(RuntimeError) as caught:
         database.get_session_local()
-    assert (
-        str(caught.value) == "Session Local is not initialized. Call init_db() first."
+    assert str(caught.value) == (
+        "Session Local is not initialized. Call configure_db() or init_db() first."
     )
 
     session_factory = object()

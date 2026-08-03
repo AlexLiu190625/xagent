@@ -112,10 +112,13 @@ def test_agent_card_exposes_published_agent(monkeypatch: pytest.MonkeyPatch) -> 
     assert body["skills"][0]["examples"] == ["Summarize this"]
 
 
-def test_agent_card_uses_public_api_base_url(
+def test_agent_card_uses_s2s_api_base_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", " https://sg.cloud.xagent.co/ ")
+    monkeypatch.setenv(
+        "XAGENT_S2S_API_BASE_URL", " https://sg-origin.cloud.xagent.co/ "
+    )
     headers = _admin_headers()
     agent_id = _create_agent(headers)
     _publish_agent(headers, agent_id)
@@ -124,7 +127,7 @@ def test_agent_card_uses_public_api_base_url(
 
     assert response.status_code == 200, response.text
     assert response.json()["supportedInterfaces"][0]["url"] == (
-        f"https://sg.cloud.xagent.co/api/a2a/agents/{agent_id}"
+        f"https://sg-origin.cloud.xagent.co/api/a2a/agents/{agent_id}"
     )
 
 

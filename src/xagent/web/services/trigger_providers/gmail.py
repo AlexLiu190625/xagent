@@ -7,7 +7,8 @@ import base64
 import json
 import logging
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Any
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, cast
 
 from google.auth.exceptions import TransportError as GoogleTransportError
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -17,12 +18,14 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from ....config import (
+    get_gmail_callback_base_url,
     get_gmail_pubsub_project_id,
     get_gmail_pubsub_push_service_account,
 )
 from ...models.gmail_watch import GmailWatchState
 from ...models.trigger import AgentTrigger, TriggerProvisioningStatus, TriggerType
 from ..gmail_provisioning import (
+    gmail_callback_url,
     provision_gmail_trigger,
     release_gmail_mailbox_if_unused,
 )
@@ -88,6 +91,51 @@ def _binding_oauth_account_id(config: Any) -> int | None:
     """
     value = (config or {}).get("oauth_account_id")
     return int(value) if value is not None else None
+
+
+def _accepted_callback_audiences(
+    state: GmailWatchState, callback_id: str
+) -> tuple[str, ...]:
+    """Return the audiences valid during a callback endpoint transition.
+
+    Reconciliation must update Pub/Sub before it can persist the corresponding
+    audience locally. During that short interval, the stored old audience and
+    the configured new audience cover both sides of the cloud-before-database
+    transition. After the commit, those values collapse to the new URL while
+    the durable previous audience remains accepted until its bounded grace
+    period expires.
+    """
+    stored_audience = str(state.push_audience or "").strip()
+    callback_base_url = get_gmail_callback_base_url()
+    configured_audience = (
+        gmail_callback_url(callback_base_url, callback_id) if callback_base_url else ""
+    )
+    previous_audience = str(state.previous_push_audience or "").strip()
+    previous_audience_expires_at = cast(
+        datetime | None, state.previous_push_audience_expires_at
+    )
+    if previous_audience_expires_at is None or _as_utc(
+        previous_audience_expires_at
+    ) <= datetime.now(timezone.utc):
+        previous_audience = ""
+    return tuple(
+        dict.fromkeys(
+            audience
+            for audience in (
+                stored_audience,
+                configured_audience,
+                previous_audience,
+            )
+            if audience
+        )
+    )
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Normalize SQLite's timezone-naive datetime round trips to UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _watch_state_for_callback(db: Session, callback_id: str) -> GmailWatchState | None:
@@ -298,8 +346,8 @@ class GmailProvider:
         if state is None:
             return VerificationResult.reject("Unknown Gmail callback")
 
-        audience = str(state.push_audience or "").strip()
-        if not audience:
+        audiences = _accepted_callback_audiences(state, context.callback_id)
+        if not audiences:
             return VerificationResult.reject(
                 "Gmail callback audience is not configured"
             )
@@ -308,25 +356,38 @@ class GmailProvider:
         if token is None:
             return VerificationResult.reject("Missing Gmail OIDC bearer token")
 
-        try:
-            claims = await asyncio.to_thread(self.oidc_verifier, token, audience)
-        except GoogleTransportError:
-            # Fetching Google's JWKS certs failed; nothing about the token was
-            # proven invalid. Propagate so the pipeline answers with
-            # failure_status and Pub/Sub redelivers, instead of rejecting -
-            # Gmail's rejected_status=200 would drop the event permanently.
-            raise
-        except Exception as exc:
-            return VerificationResult.reject(
-                f"Gmail OIDC token verification failed: {type(exc).__name__}"
-            )
+        claims: Mapping[str, Any] | None = None
+        verification_error: Exception | None = None
+        for audience in audiences:
+            try:
+                candidate_claims = await asyncio.to_thread(
+                    self.oidc_verifier, token, audience
+                )
+            except GoogleTransportError:
+                # Fetching Google's JWKS certs failed; nothing about the token
+                # was proven invalid. Propagate so the pipeline answers with
+                # failure_status and Pub/Sub redelivers, instead of rejecting -
+                # Gmail's rejected_status=200 would drop the event permanently.
+                raise
+            except Exception as exc:
+                verification_error = exc
+                continue
+
+            if _claim_audience_matches(candidate_claims.get("aud"), audience):
+                claims = candidate_claims
+                break
+
+        if claims is None:
+            if verification_error is not None:
+                return VerificationResult.reject(
+                    "Gmail OIDC token verification failed: "
+                    f"{type(verification_error).__name__}"
+                )
+            return VerificationResult.reject("Gmail OIDC audience does not match")
 
         issuer = str(claims.get("iss") or "")
         if issuer not in GOOGLE_OIDC_ISSUERS:
             return VerificationResult.reject("Gmail OIDC issuer is not trusted")
-
-        if not _claim_audience_matches(claims.get("aud"), audience):
-            return VerificationResult.reject("Gmail OIDC audience does not match")
 
         expected_service_account = get_gmail_pubsub_push_service_account()
         if expected_service_account:

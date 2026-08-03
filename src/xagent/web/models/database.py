@@ -1,8 +1,9 @@
 import logging
+from pathlib import Path
 from typing import Any, Generator
 
 from sqlalchemy import Engine, create_engine, event
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool, QueuePool
@@ -23,10 +24,34 @@ logger = logging.getLogger(__name__)
 Base: Any = declarative_base()
 
 
+def _sqlite_read_only_url(database_url: str) -> str:
+    """Return a SQLite URI that refuses to create or modify its database.
+
+    SQLite's default file connection creates a missing database before the
+    first query. Audit commands need URI ``mode=ro`` semantics so a typo or
+    stale path fails without leaving an empty artifact. In-memory databases
+    have no filesystem state and therefore retain their original URL.
+    """
+    url = make_url(database_url)
+    database = url.database
+    if not database or database == ":memory:" or url.query.get("mode") == "memory":
+        return database_url
+    uri_database = (
+        database
+        if database.startswith("file:")
+        else f"file:{Path(database).expanduser().resolve().as_posix()}"
+    )
+    return str(
+        url.set(database=uri_database).update_query_dict({"mode": "ro", "uri": "true"})
+    )
+
+
 def get_db() -> Generator[Session, None, None]:
     """Get database session"""
     if _SessionLocal is None:
-        raise RuntimeError("Session Local is not initialized. Call init_db() first.")
+        raise RuntimeError(
+            "Session Local is not initialized. Call configure_db() or init_db() first."
+        )
     db = _SessionLocal()
     try:
         yield db
@@ -114,7 +139,9 @@ def release_db_connection_if_clean(db: Session | None) -> bool:
 
 def get_session_local() -> sessionmaker[Session]:
     if _SessionLocal is None:
-        raise RuntimeError("Session Local is not initialized. Call init_db() first.")
+        raise RuntimeError(
+            "Session Local is not initialized. Call configure_db() or init_db() first."
+        )
     return _SessionLocal
 
 
@@ -125,8 +152,58 @@ def get_optional_session_local() -> sessionmaker[Session] | None:
 
 def get_engine() -> Engine:
     if _engine is None:
-        raise RuntimeError("Engine is not initialized. Call init_db() first.")
+        raise RuntimeError(
+            "Engine is not initialized. Call configure_db() or init_db() first."
+        )
     return _engine
+
+
+def configure_db(
+    db_url: str | None = None,
+    *,
+    read_only: bool = False,
+) -> None:
+    """Bind the engine and session factory without initializing the schema.
+
+    This is the database entry point for read-only operational commands that
+    must inspect an already-deployed schema without running migrations,
+    creating tables, or seeding application data. SQLite's write-oriented
+    connection pragmas are deliberately omitted in ``read_only`` mode.
+    """
+    global _SessionLocal
+    global _engine
+
+    database_url = db_url if db_url is not None else get_database_url()
+    if make_url(database_url).get_backend_name() == "sqlite":
+        if read_only:
+            database_url = _sqlite_read_only_url(database_url)
+        else:
+            database_url = ensure_sqlite_parent_directory(database_url)
+        _engine = create_engine(
+            database_url,
+            connect_args={"check_same_thread": False},
+            poolclass=NullPool,
+        )
+        if not read_only:
+            # WAL + busy_timeout let concurrent writes wait for the lock instead
+            # of failing with "database is locked".
+            apply_sqlite_concurrency_pragmas(_engine)
+    else:
+        engine_kwargs: dict[str, Any] = {
+            "poolclass": QueuePool,
+            **get_db_pool_kwargs(),
+        }
+        if read_only:
+            # SQLAlchemy applies PostgreSQL's READ ONLY transaction mode when
+            # each connection begins a transaction. This makes audit safety a
+            # database-enforced property rather than a reconciler convention.
+            engine_kwargs["execution_options"] = {"postgresql_readonly": True}
+        _engine = create_engine(
+            database_url,
+            **engine_kwargs,
+        )
+
+    _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
 
 
 def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
@@ -202,40 +279,8 @@ def init_db(db_url: str | None = None) -> None:
     from .agent import Agent  # noqa: F401
     from .sandbox import SandboxInfo, SandboxSnapshot  # noqa: F401
 
-    global _SessionLocal
-    global _engine
-
-    # Database configuration
-    if db_url is not None:
-        database_url = db_url
-    else:
-        database_url = get_database_url()
-
-    # Create database engine
-    # For SQLite, use NullPool to prevent connection pool issues
-    # For other databases, use QueuePool with timeout settings
-    if "sqlite" in database_url:
-        database_url = ensure_sqlite_parent_directory(database_url)
-        _engine = create_engine(
-            database_url,
-            connect_args={"check_same_thread": False},
-            poolclass=NullPool,  # SQLite doesn't need connection pooling
-        )
-        # WAL + busy_timeout so concurrent writes (e.g. concurrent tool
-        # execution) wait for the lock instead of failing with "database is
-        # locked".
-        apply_sqlite_concurrency_pragmas(_engine)
-    else:
-        _engine = create_engine(
-            database_url,
-            poolclass=QueuePool,
-            **get_db_pool_kwargs(),
-        )
-
-    # Create session factory
-    _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
-
-    builtin_mcp_mismatches = _initialize_database_schema(_engine)
+    configure_db(db_url)
+    builtin_mcp_mismatches = _initialize_database_schema(get_engine())
 
     for mismatch in builtin_mcp_mismatches:
         logger.warning(
