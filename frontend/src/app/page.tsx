@@ -30,10 +30,8 @@ import { useApp } from "@/contexts/app-context-chat";
 import { WelcomeModal } from "@/components/welcome-modal";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { useVoiceInputControls } from "@/components/voice-input-controller";
-import {
-  HomePageExtension,
-  homeGetStartedDestinationOverrides,
-} from "@/lib/home-page-extension";
+import * as homePageExtensionModule from "@/lib/home-page-extension";
+import { HomePageExtension } from "@/lib/home-page-extension";
 import type { HomeGetStartedDestinationOverrides } from "@/lib/page-extension-contracts";
 import { toast } from "@/components/ui/sonner";
 
@@ -146,8 +144,13 @@ function decodeRecentTasks(value: unknown): RecentTask[] | null {
   return tasks;
 }
 
-const configuredHomeGetStartedDestinationOverrides:
-  HomeGetStartedDestinationOverrides = homeGetStartedDestinationOverrides
+// `homeGetStartedDestinationOverrides` is an OPTIONAL export of the replaceable
+// home-page-extension module: a replacement that only implements the required
+// `HomePageExtension` export must still build, so this is read through the
+// module namespace with a fallback rather than a static named import.
+const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides =
+  (homePageExtensionModule as { homeGetStartedDestinationOverrides?: HomeGetStartedDestinationOverrides })
+    .homeGetStartedDestinationOverrides ?? {}
 
 const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string> = {
   docs: "https://docs.xagent.co/api-reference/introduction",
@@ -180,7 +183,6 @@ export default function Home() {
   const activeTaskCreateAttemptRef = useRef<number | null>(null);
   const taskCreateCounterRef = useRef(0);
   const draftRevisionRef = useRef(0);
-  const templateGenerationRef = useRef(0);
   const homeVoiceInput = useVoiceInputControls();
 
   useEffect(() => {
@@ -189,9 +191,8 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const generation = ++templateGenerationRef.current;
     let active = true;
-    const isCurrent = () => active && generation === templateGenerationRef.current;
+    const isCurrent = () => active;
 
     const fetchTemplates = async () => {
       try {
@@ -288,8 +289,7 @@ export default function Home() {
   };
 
   const handleCreateTask = async (content: string) => {
-    const rawPrompt = content;
-    const submittedPrompt = rawPrompt.trim();
+    const submittedPrompt = content.trim();
     if (!submittedPrompt) return;
     if (activeTaskCreateAttemptRef.current !== null) return;
 
@@ -514,9 +514,9 @@ export default function Home() {
           <div ref={getStartedSectionRef} className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-10">
             {[
               { title: t("home.getStarted.video.title"), desc: t("home.getStarted.video.description", { appName: branding.appName }), video: "/videos/Tutorial.mp4", link: null },
-              { title: t("home.getStarted.docs.title"), desc: t("home.getStarted.docs.description"), video: "/videos/Documentation.mp4", link: resolveHomeGetStartedDestination(configuredHomeGetStartedDestinationOverrides.docs, defaultHomeGetStartedDestinations.docs) },
-              { title: t("home.getStarted.guides.title"), desc: t("home.getStarted.guides.description"), icon: <ListChecks className="w-8 h-8 text-green-500" />, bg: "bg-green-50 dark:bg-green-950/30", link: resolveHomeGetStartedDestination(configuredHomeGetStartedDestinationOverrides.guides, defaultHomeGetStartedDestinations.guides) },
-              { title: t("home.getStarted.whatsNew.title"), desc: t("home.getStarted.whatsNew.description"), icon: <Sparkles className="w-8 h-8 text-orange-500" />, bg: "bg-orange-50 dark:bg-orange-950/30", link: resolveHomeGetStartedDestination(configuredHomeGetStartedDestinationOverrides.whatsNew, defaultHomeGetStartedDestinations.whatsNew) }
+              { title: t("home.getStarted.docs.title"), desc: t("home.getStarted.docs.description"), video: "/videos/Documentation.mp4", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.docs, defaultHomeGetStartedDestinations.docs) },
+              { title: t("home.getStarted.guides.title"), desc: t("home.getStarted.guides.description"), icon: <ListChecks className="w-8 h-8 text-green-500" />, bg: "bg-green-50 dark:bg-green-950/30", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.guides, defaultHomeGetStartedDestinations.guides) },
+              { title: t("home.getStarted.whatsNew.title"), desc: t("home.getStarted.whatsNew.description"), icon: <Sparkles className="w-8 h-8 text-orange-500" />, bg: "bg-orange-50 dark:bg-orange-950/30", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.whatsNew, defaultHomeGetStartedDestinations.whatsNew) }
             ].map((card, i) => {
               const shouldLoadVideo = card.video ? visibleGetStartedVideos.has(i) : false;
               const isLinked = typeof card.link === "string";

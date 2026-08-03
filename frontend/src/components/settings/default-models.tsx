@@ -92,54 +92,38 @@ const modelTypeConfig = {
 type SettingsDefaultModelType = Exclude<DefaultModelType, 'rerank'>
 const defaultModelTypes = Object.keys(modelTypeConfig) as SettingsDefaultModelType[]
 
-const getModelCategory = (model: ModelWithAccess): string => {
-  return model.category
-}
-
-const getModelAbilities = (model: ModelWithAccess): string[] => {
-  return model.abilities || []
-}
-
-const getModelDisplayName = (model: ModelWithAccess): string => {
-  return model.model_name
-}
-
-const getModelProviderLabel = (model: ModelWithAccess): string => {
-  return model.model_provider
-}
-
 const getCompatibleModels = (models: ModelWithAccess[], configType: SettingsDefaultModelType): ModelWithAccess[] => {
   if (configType === 'embedding') {
-    return models.filter((model) => getModelCategory(model) === 'embedding')
+    return models.filter((model) => model.category === 'embedding')
   }
   if (configType === 'image') {
-    return models.filter((model) => getModelCategory(model) === 'image')
+    return models.filter((model) => model.category === 'image')
   }
   if (configType === 'image_edit') {
-    return models.filter((model) => getModelCategory(model) === 'image' && getModelAbilities(model).includes('edit'))
+    return models.filter((model) => model.category === 'image' && (model.abilities || []).includes('edit'))
   }
   if (configType === 'video') {
-    return models.filter((model) => getModelCategory(model) === 'video' && getModelAbilities(model).includes('generate'))
+    return models.filter((model) => model.category === 'video' && (model.abilities || []).includes('generate'))
   }
   if (configType === 'asr') {
-    return models.filter((model) => getModelCategory(model) === 'speech' && getModelAbilities(model).includes('asr'))
+    return models.filter((model) => model.category === 'speech' && (model.abilities || []).includes('asr'))
   }
   if (configType === 'tts') {
-    return models.filter((model) => getModelCategory(model) === 'speech' && getModelAbilities(model).includes('tts'))
+    return models.filter((model) => model.category === 'speech' && (model.abilities || []).includes('tts'))
   }
   if (configType === 'speech') {
     return models.filter((model) => {
-      const abilities = getModelAbilities(model)
-      return getModelCategory(model) === 'speech' && abilities.includes('asr') && abilities.includes('tts')
+      const abilities = model.abilities || []
+      return model.category === 'speech' && abilities.includes('asr') && abilities.includes('tts')
     })
   }
   if (configType === 'sound_effect') {
-    return models.filter((model) => getModelCategory(model) === 'sound_effect')
+    return models.filter((model) => model.category === 'sound_effect')
   }
   if (configType === 'music') {
-    return models.filter((model) => getModelCategory(model) === 'music')
+    return models.filter((model) => model.category === 'music')
   }
-  return models.filter((model) => getModelCategory(model) === 'llm')
+  return models.filter((model) => model.category === 'llm')
 }
 
 export function DefaultModelsSettings() {
@@ -285,16 +269,16 @@ export function DefaultModelsSettings() {
                       <div className="flex items-center justify-between">
                         <div className="flex-1 min-w-0">
                           <p className="text-sm font-medium truncate">
-                            {getModelDisplayName(currentDefault.model)}
+                            {currentDefault.model.model_name}
                           </p>
                           <div className="flex items-center gap-1 mt-1">
                             <Badge variant="secondary" className="text-xs">
-                              {getModelProviderLabel(currentDefault.model)}
+                              {currentDefault.model.model_provider}
                             </Badge>
                             <Badge variant="outline" className="text-xs">
                               {tDynamic(
-                                `models.tabs.${getModelCategory(currentDefault.model)}`,
-                                getModelCategory(currentDefault.model),
+                                `models.tabs.${currentDefault.model.category}`,
+                                currentDefault.model.category,
                               )}
                             </Badge>
                           </div>
@@ -323,7 +307,7 @@ export function DefaultModelsSettings() {
                         }
                         options={compatibleModels.map((model) => ({
                           value: model.id.toString(),
-                          label: `${getModelDisplayName(model)} (${getModelProviderLabel(model)})`,
+                          label: `${model.model_name} (${model.model_provider})`,
                         }))}
                         placeholder={t('settings.defaultModels.labels.selectModel')}
                       />

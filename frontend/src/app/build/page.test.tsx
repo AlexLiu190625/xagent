@@ -931,9 +931,17 @@ describe("BuildsPage publication lifecycle", () => {
     const mutation = source.slice(mutationStart, wrapperStart)
     const wrapper = source.slice(wrapperStart, nextOwnerStart)
     expect(mutation).not.toContain("fetchAgents")
-    expect(wrapper).not.toContain("catch")
-    expect(wrapper).toContain("void fetchAgents()")
-    expect(wrapper).not.toContain("await fetchAgents()")
+    // A bare `not.toContain("catch")` also passes if the wrapper is rewritten as
+    // `.then(onFulfilled, onRejected)`, which reintroduces error handling in the
+    // wrapper without the literal word "catch". Pin the exact refresh statement
+    // and additionally rule out any `.then(` usage so that rewrite is caught too.
+    expect(wrapper).toContain(
+      "const outcome = await performPublicationMutation(agentId, kind)\n"
+      + "    if (outcome === \"success\" && isMountedRef.current) {\n"
+      + "      void fetchAgents()\n"
+      + "    }",
+    )
+    expect(wrapper.match(/\.then\(/g) ?? []).toHaveLength(0)
   })
 })
 
@@ -961,6 +969,26 @@ function typeCreatePrompt(value: string) {
 
 function startBuildWithEnter() {
   fireEvent.keyDown(createPromptInput(), { key: "Enter" })
+}
+
+// Reproduces only voice-input-controller.tsx's native-setter write + bubbled
+// input/change event dispatch (setNativeValue + dispatchInputEvents): the native
+// HTMLTextAreaElement.prototype value setter (bypassing React's tracked instance
+// setter) followed by the same bubbled input/change events production dispatches
+// after a transcription lands, rather than testing-library's fireEvent convenience
+// helpers. This does NOT cover insertTranscribedText's focus/caret-splice/
+// setSelectionRange/fragment-data behavior — caret handling is untested here.
+function simulateVoiceTranscription(target: HTMLTextAreaElement, text: string) {
+  const descriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")
+  act(() => {
+    descriptor?.set?.call(target, text)
+    try {
+      target.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }))
+    } catch {
+      target.dispatchEvent(new Event("input", { bubbles: true }))
+    }
+    target.dispatchEvent(new Event("change", { bubbles: true }))
+  })
 }
 
 function openCreateModal() {
@@ -1287,6 +1315,27 @@ describe("BuildsPage task creation lifecycle", () => {
     await act(async () => aba.resolve(jsonResponse(taskCore())))
     openCreateModal()
     expect(createPromptInput()).toHaveValue("A")
+  })
+
+  it("treats a native voice transcription write as an edit that blocks a stale successful clear (A3)", async () => {
+    const result = deferred<Response>()
+    configureCreateApi(() => result.promise)
+    render(<BuildsPage />)
+    await waitFor(() => expect(screen.queryByText("common.loading")).not.toBeInTheDocument())
+    openCreateModal()
+    typeCreatePrompt("A")
+    startBuildWithEnter()
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/chat/task/create", expect.anything()))
+
+    simulateVoiceTranscription(createPromptInput(), "A transcribed by voice")
+    expect(createPromptInput()).toHaveValue("A transcribed by voice")
+
+    await act(async () => result.resolve(jsonResponse(taskCore())))
+
+    expect(setPendingMessageMock).toHaveBeenCalledTimes(1)
+    expect(setTaskIdMock).toHaveBeenCalledWith(7)
+    openCreateModal()
+    expect(createPromptInput()).toHaveValue("A transcribed by voice")
   })
 
   it("keeps B pending when stale A settles first, and does not operationalize commit exceptions", async () => {

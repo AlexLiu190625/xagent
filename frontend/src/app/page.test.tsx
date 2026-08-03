@@ -165,6 +165,26 @@ function submitWithEnter() {
   fireEvent.keyDown(input(), { key: "Enter" })
 }
 
+// Reproduces only voice-input-controller.tsx's native-setter write + bubbled
+// input/change event dispatch (setNativeValue + dispatchInputEvents): the native
+// HTMLTextAreaElement.prototype value setter (bypassing React's tracked instance
+// setter) followed by the same bubbled input/change events production dispatches
+// after a transcription lands, rather than testing-library's fireEvent convenience
+// helpers. This does NOT cover insertTranscribedText's focus/caret-splice/
+// setSelectionRange/fragment-data behavior — caret handling is untested here.
+function simulateVoiceTranscription(target: HTMLTextAreaElement, text: string) {
+  const descriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")
+  act(() => {
+    descriptor?.set?.call(target, text)
+    try {
+      target.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }))
+    } catch {
+      target.dispatchEvent(new Event("input", { bubbles: true }))
+    }
+    target.dispatchEvent(new Event("change", { bubbles: true }))
+  })
+}
+
 function taskCore(taskId = 7) {
   return {
     task_id: taskId,
@@ -401,17 +421,63 @@ describe("Home", () => {
       expect(slot).toHaveClass("shrink-0", { exact: true })
       expect(slot).not.toHaveAttribute("style")
       expect(slot).toBeEmptyDOMElement()
-      expect(defaultExtension.homeGetStartedDestinationOverrides).toEqual({})
+      expect(
+        (defaultExtension as { homeGetStartedDestinationOverrides?: unknown })
+          .homeGetStartedDestinationOverrides,
+      ).toEqual({})
     } finally {
       vi.doMock("@/lib/home-page-extension", createHomeExtensionMock)
       vi.resetModules()
     }
     const restoredMock = await import("@/lib/home-page-extension")
-    expect(restoredMock.homeGetStartedDestinationOverrides).toBe(homeGetStartedDestinationOverridesMock)
+    expect(
+      (restoredMock as { homeGetStartedDestinationOverrides?: unknown })
+        .homeGetStartedDestinationOverrides,
+    ).toBe(homeGetStartedDestinationOverridesMock)
     const { default: RestoredHome } = await import("./page")
     render(<RestoredHome />)
     expect(await screen.findByTestId("home-extension")).toBeInTheDocument()
     expect(homeExtensionRenderMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("renders every canonical Get Started destination when a replacement extension omits homeGetStartedDestinationOverrides entirely (A1 old-surface compatibility)", async () => {
+    vi.doUnmock("@/lib/home-page-extension")
+    vi.resetModules()
+    try {
+      vi.doMock("@/lib/home-page-extension", async () => {
+        const ReactModule = await vi.importActual<typeof import("react")>("react")
+        return {
+          HomePageExtension: ReactModule.memo(() => (
+            ReactModule.createElement("div", { "data-testid": "old-surface-extension" })
+          )),
+          // The old replacement surface genuinely has no such export; vitest's
+          // mock proxy throws on access of a key absent from the factory's
+          // return value (a stricter guard than real module namespace access),
+          // so this is declared with an undefined value to reproduce the real
+          // "export absent" shape without tripping that guard.
+          homeGetStartedDestinationOverrides: undefined,
+        }
+      })
+      vi.resetModules()
+      const { default: OldSurfaceHome } = await import("./page")
+      render(<OldSurfaceHome />)
+
+      expect(await screen.findByTestId("old-surface-extension")).toBeInTheDocument()
+      expectLinkedGetStartedCard("home.getStarted.docs.title", "https://docs.xagent.co/api-reference/introduction")
+      expectLinkedGetStartedCard("home.getStarted.guides.title", "https://docs.xagent.co/models/overview")
+      expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
+    } finally {
+      vi.doMock("@/lib/home-page-extension", createHomeExtensionMock)
+      vi.resetModules()
+    }
+    const restoredMock = await import("@/lib/home-page-extension")
+    expect(
+      (restoredMock as { homeGetStartedDestinationOverrides?: unknown })
+        .homeGetStartedDestinationOverrides,
+    ).toBe(homeGetStartedDestinationOverridesMock)
+    const { default: RestoredHome } = await import("./page")
+    render(<RestoredHome />)
+    expect(await screen.findByTestId("home-extension")).toBeInTheDocument()
   })
 
   it("resolves canonical and distinct configured Get Started destinations per key", () => {
@@ -706,7 +772,10 @@ describe("Home", () => {
     expect(contractInterface.match(/^\s+\w+\??:/gm)).toHaveLength(3)
     expect(contractInterface).not.toContain("tutorial")
     expect(extensionSource).toMatch(/export const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides = \{\}/)
-    expect(pageSource).toMatch(/const configuredHomeGetStartedDestinationOverrides:\s*HomeGetStartedDestinationOverrides = homeGetStartedDestinationOverrides/)
+    expect(pageSource).toMatch(/import \* as homePageExtensionModule from "@\/lib\/home-page-extension";/)
+    expect(pageSource).toMatch(
+      /const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides =\s*\(homePageExtensionModule as \{ homeGetStartedDestinationOverrides\?: HomeGetStartedDestinationOverrides \}\)\s*\.homeGetStartedDestinationOverrides \?\? \{\}/,
+    )
     expect(pageSource).toMatch(/const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string> = \{/)
     expect(resolver).toContain("configured === undefined")
     expect(resolver).toContain("typeof configured !== \"string\"")
@@ -718,7 +787,7 @@ describe("Home", () => {
     expect(cardRender).toContain("focus-visible:ring-2")
     expect(cardRender).not.toMatch(/\bon[A-Z][A-Za-z]*|\btabIndex\b|\brole\b|\bcontrols\b|\bstyle\b|\bcursor\s*=|\bcontentEditable\b|\bsuppressContentEditableWarning\b|\bdraggable\b|\{\s*\.\.\./)
     const destinationCalls = Array.from(cardRender.matchAll(
-      /resolveHomeGetStartedDestination\(configuredHomeGetStartedDestinationOverrides\.(docs|guides|whatsNew), defaultHomeGetStartedDestinations\.\1\)/g,
+      /resolveHomeGetStartedDestination\(homeGetStartedDestinationOverrides\.(docs|guides|whatsNew), defaultHomeGetStartedDestinations\.\1\)/g,
     )).map((match) => match[1])
     expect(destinationCalls).toEqual(["docs", "guides", "whatsNew"])
     expect(cardRender.match(/resolveHomeGetStartedDestination\(/g)).toHaveLength(3)
@@ -943,6 +1012,33 @@ describe("Home", () => {
     expect(consoleErrorMock).not.toHaveBeenCalled()
   })
 
+  it("reports a mounted create transport rejection and preserves the draft and height", async () => {
+    const response = deferred<Response>()
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/task/create") return response.promise
+      throw new Error(`Unexpected apiRequest: ${url}`)
+    })
+    render(<Home />)
+    const rejectedPrompt = "prompt"
+    typePrompt(rejectedPrompt)
+    input().style.height = "80px"
+    const rejectedStyle = input().getAttribute("style")
+    submitWithEnter()
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/chat/task/create", expect.anything()))
+
+    await act(async () => response.reject(new Error("transport unavailable")))
+
+    await waitFor(() => expect(toastErrorMock).toHaveBeenCalledWith("common.errors.taskFailed"))
+    expect(setPendingMessageMock).not.toHaveBeenCalled()
+    expect(setTaskIdMock).not.toHaveBeenCalled()
+    expect(routerPushMock).not.toHaveBeenCalled()
+    expect(consoleErrorMock).toHaveBeenCalled()
+    expect(input().value).toBe(rejectedPrompt)
+    expect(input()).toHaveAttribute("style", rejectedStyle)
+  })
+
   it.each([
     ["non-OK", jsonResponse(taskCore(), { status: 500 })],
     ["empty", new Response("")],
@@ -956,13 +1052,18 @@ describe("Home", () => {
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     render(<Home />)
-    typePrompt("prompt")
+    const failurePrompt = "prompt"
+    typePrompt(failurePrompt)
+    input().style.height = "88px"
+    const failureStyle = input().getAttribute("style")
     submitWithEnter()
 
     await waitFor(() => expect(toastErrorMock).toHaveBeenCalledWith("common.errors.taskFailed"))
     expect(setPendingMessageMock).not.toHaveBeenCalled()
     expect(setTaskIdMock).not.toHaveBeenCalled()
     expect(consoleErrorMock).toHaveBeenCalled()
+    expect(input().value).toBe(failurePrompt)
+    expect(input()).toHaveAttribute("style", failureStyle)
   })
 
   it("reports a current unreadable task body as one operational failure", async () => {
@@ -977,12 +1078,17 @@ describe("Home", () => {
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     render(<Home />)
-    typePrompt("prompt")
+    const unreadablePrompt = "prompt"
+    typePrompt(unreadablePrompt)
+    input().style.height = "92px"
+    const unreadableStyle = input().getAttribute("style")
     submitWithEnter()
 
     await waitFor(() => expect(toastErrorMock).toHaveBeenCalledWith("common.errors.taskFailed"))
     expect(setPendingMessageMock).not.toHaveBeenCalled()
     expect(setTaskIdMock).not.toHaveBeenCalled()
+    expect(input().value).toBe(unreadablePrompt)
+    expect(input()).toHaveAttribute("style", unreadableStyle)
   })
 
   it("never overwrites a newer B draft or its height after A succeeds or fails", async () => {
@@ -1044,6 +1150,29 @@ describe("Home", () => {
 
     expect(input().value).toBe("A")
     expect(input().style.height).toBe("64px")
+  })
+
+  it("treats a native voice transcription write as an edit that blocks a stale successful clear (A3)", async () => {
+    const result = deferred<Response>()
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/task/create") return result.promise
+      throw new Error(`Unexpected apiRequest: ${url}`)
+    })
+    render(<Home />)
+    typePrompt("A")
+    submitWithEnter()
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/chat/task/create", expect.anything()))
+
+    simulateVoiceTranscription(input(), "A transcribed by voice")
+    expect(input().value).toBe("A transcribed by voice")
+
+    await act(async () => result.resolve(jsonResponse(taskCore())))
+
+    expect(setPendingMessageMock).toHaveBeenCalledTimes(1)
+    expect(setTaskIdMock).toHaveBeenCalledWith(7)
+    expect(input().value).toBe("A transcribed by voice")
   })
 
   it("does not classify a synchronous commit collaborator throw as an operational create failure", async () => {
@@ -1653,7 +1782,7 @@ describe("Home", () => {
       )
       const templateLoader = sourceSlice(
         source,
-        "const generation = ++templateGenerationRef.current;",
+        "let active = true;",
         "    void fetchTemplates();",
       )
       const recentLoader = sourceSlice(
@@ -1664,9 +1793,9 @@ describe("Home", () => {
 
       expect(source).toMatch(/interface HomeTemplateCard[\s\S]*id: string[\s\S]*used_count: number/)
       expect(source).toMatch(/interface RecentTask[\s\S]*task_id: number[\s\S]*agent_logo_url\?: string \| null/)
-      expect(source).toMatch(/const templateGenerationRef = useRef\(0\)/)
+      expect(source).not.toMatch(/templateGenerationRef/)
       expect(templateLoader).toContain(
-        "const isCurrent = () => active && generation === templateGenerationRef.current;",
+        "const isCurrent = () => active;",
       )
       expect(templateLoader).toMatch(
         /const response = await apiRequest\(`\$\{getApiUrl\(\)\}\/api\/templates\/\?lang=\$\{locale\}`\);\s*if \(!isCurrent\(\)\) return;\s*if \(!response\.ok\)[\s\S]*?const parsed = await parseApiResponse\(response\);\s*if \(!isCurrent\(\)\) return;\s*const decoded = decodeHomeTemplates\(parsed\.data\);/,
