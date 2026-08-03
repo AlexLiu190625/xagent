@@ -15,6 +15,7 @@ from ...core.agent.checkpoint import (
     READABLE_CHECKPOINT_TYPES,
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
+    CheckpointReadError,
     CheckpointUnavailableError,
     checkpoint_execution_id,
 )
@@ -170,7 +171,26 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 == str(execution_id),
             )
             if self.build_id is None:
-                run_id = self._root_checkpoint_read_partition(db)
+                try:
+                    run_id = self._root_checkpoint_read_partition(db)
+                except CheckpointReadError:
+                    # Already a partition verdict (refused, or the task row
+                    # is missing); it carries its own classification.
+                    raise
+                except Exception as exc:
+                    # Resolving the partition is part of the read. A DB
+                    # failure here leaves the partition unknown, so the read
+                    # could not be completed -- same translation the main
+                    # query below gets, or the failure would escape the
+                    # contract as a raw driver exception no consumer catches.
+                    register_degradation(
+                        CHECKPOINT_LOAD_UNAVAILABLE,
+                        f"task {self.task_id}: checkpoint partition resolution failed",
+                    )
+                    raise CheckpointUnavailableError(
+                        f"task {self.task_id}: could not resolve the "
+                        "checkpoint read partition"
+                    ) from exc
                 query = query.filter(
                     DatabaseTraceEvent.build_id.is_(None),
                     self._checkpoint_run_partition_filter(run_id),

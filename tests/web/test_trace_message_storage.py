@@ -1859,3 +1859,133 @@ def test_load_checkpoint_readable_type_without_snapshot_raises_corrupt(
             )
     finally:
         db.close()
+
+
+def test_checkpoint_read_failure_preserves_pool_timeout_cause_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Translating a read failure must chain the original exception.
+
+    Resume consumers discriminate pool exhaustion before they act on an
+    unavailable checkpoint, and ``is_database_pool_timeout`` finds that
+    fact by walking ``__cause__``/``__context__``. A translation that drops
+    the chain would make an exhausted-pool read look like an ordinary
+    unavailable one, and the recovery path would answer it by issuing more
+    database writes against the same exhausted pool.
+    """
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.db_runtime import is_database_pool_timeout
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        clear_degradation,
+    )
+
+    def timing_out_get_db() -> Iterator[Session]:
+        raise SQLAlchemyTimeoutError("QueuePool limit reached")
+        yield  # pragma: no cover - unreachable, keeps this a generator
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", timing_out_get_db)
+    clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    try:
+        handler = DatabaseTraceHandler(999999)
+        with pytest.raises(CheckpointUnavailableError) as checkout_failure:
+            handler._sync_load_latest_checkpoint("exec-checkout-timeout")
+        assert is_database_pool_timeout(checkout_failure.value)
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+
+
+def test_checkpoint_query_failure_preserves_pool_timeout_cause_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The row-scan translation carries the same obligation as checkout."""
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+    from sqlalchemy.orm import Query
+
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.db_runtime import is_database_pool_timeout
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+
+        def failing_all(self: Query) -> Any:
+            del self
+            raise SQLAlchemyTimeoutError("QueuePool limit reached")
+
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        # Only the row scan uses ``.all()``; partition resolution reads
+        # through ``one_or_none``/``first`` and still completes, so this
+        # lands on the row-scan translation rather than the partition one.
+        monkeypatch.setattr(Query, "all", failing_all)
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        handler = DatabaseTraceHandler(task_id)
+        with pytest.raises(CheckpointUnavailableError) as query_failure:
+            handler._sync_load_latest_checkpoint("exec-query-timeout")
+        assert "checkpoint query failed" in str(query_failure.value)
+        assert is_database_pool_timeout(query_failure.value)
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
+
+
+def test_checkpoint_partition_read_failure_is_translated_and_chained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Partition resolution is part of the read, not a step outside it.
+
+    A database failure while resolving which run partition this reader may
+    observe leaves the partition unknown, so the read could not be
+    completed. It must surface as ``CheckpointUnavailableError`` like any
+    other query failure -- a raw driver exception here would bypass every
+    consumer that catches the checkpoint read contract.
+    """
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.db_runtime import is_database_pool_timeout
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+
+        def failing_partition(self: DatabaseTraceHandler, _db: Session) -> Any:
+            del self
+            raise SQLAlchemyTimeoutError("QueuePool limit reached")
+
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            DatabaseTraceHandler,
+            "_root_checkpoint_read_partition",
+            failing_partition,
+        )
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        handler = DatabaseTraceHandler(task_id)
+        with pytest.raises(CheckpointUnavailableError) as partition_failure:
+            handler._sync_load_latest_checkpoint("exec-partition-failure")
+        assert is_database_pool_timeout(partition_failure.value)
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
