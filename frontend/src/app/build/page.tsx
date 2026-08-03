@@ -18,8 +18,11 @@ import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import { useRouter, useSearchParams } from "next/navigation"
-import { apiRequest } from "@/lib/api-wrapper"
-import { getApiUrl } from "@/lib/utils"
+import { apiRequest, parseApiResponse } from "@/lib/api-wrapper"
+import { getApiUrl, resolveAgentLogoUrl } from "@/lib/utils"
+import { formatDisplayDate } from "@/lib/time-utils"
+import { resolveTaskLlmSelection } from "@/lib/models"
+import { normalizeTaskPromptTitle, parseTaskCreateCore } from "@/lib/task-create"
 import {
   canDeleteAgent,
   canEditAgent,
@@ -44,45 +47,8 @@ import {
   BuildPageExtensionProvider,
 } from "@/lib/build-page-extension"
 
-interface LlmModel {
-  model_id: string
-  is_default?: boolean
-}
-
-interface DefaultModelRecord {
-  config_type?: "general" | "small_fast" | "visual" | "compact"
-  model?: {
-    model_id?: string
-  } | null
-}
-
-interface TaskCreateResponse {
-  task_id: number
-}
-
-const isLlmModel = (value: unknown): value is LlmModel => {
-  if (!value || typeof value !== "object") {
-    return false
-  }
-
-  const candidate = value as Record<string, unknown>
-  return (
-    typeof candidate.model_id === "string" &&
-    (candidate.is_default === undefined || typeof candidate.is_default === "boolean")
-  )
-}
-
-const isTaskCreateResponse = (value: unknown): value is TaskCreateResponse => {
-  if (!value || typeof value !== "object") {
-    return false
-  }
-
-  const candidate = value as Record<string, unknown>
-  return typeof candidate.task_id === "number"
-}
-
 function BuildsPageContent() {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const { dispatch, setTaskId, setPendingMessage } = useApp()
   const router = useRouter()
   const searchParams = useSearchParams()
@@ -91,6 +57,9 @@ function BuildsPageContent() {
   const isMountedRef = useRef(false)
   const agentListRequestGenerationRef = useRef(0)
   const agentDeleteActionGenerationRef = useRef(0)
+  const activeTaskCreateAttemptRef = useRef<number | null>(null)
+  const taskCreateCounterRef = useRef(0)
+  const draftRevisionRef = useRef(0)
   const [searchTerm, setSearchTerm] = useState("")
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
@@ -162,34 +131,56 @@ function BuildsPageContent() {
     void fetchAgents()
     return () => {
       isMountedRef.current = false
+      activeTaskCreateAttemptRef.current = null
       agentListRequestGenerationRef.current += 1
       agentDeleteActionGenerationRef.current += 1
     }
   }, [])
 
-  const handlePublish = async (agentId: number) => {
+  const publicationOperations = {
+    publish: {
+      suffix: "publish",
+      errorKey: "builds.publication.publishFailed",
+      diagnostic: "Failed to publish agent:",
+    },
+    unpublish: {
+      suffix: "unpublish",
+      errorKey: "builds.publication.unpublishFailed",
+      diagnostic: "Failed to unpublish agent:",
+    },
+  } as const
+
+  const performPublicationMutation = async (
+    agentId: number,
+    kind: keyof typeof publicationOperations,
+  ): Promise<"success" | "failed" | "stale"> => {
+    const operation = publicationOperations[kind]
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/publish`, {
+      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/${operation.suffix}`, {
         method: "POST",
       })
-      if (response.ok) {
-        fetchAgents() // Refresh list
+      if (!isMountedRef.current) return "stale"
+      if (!response.ok) {
+        console.error(operation.diagnostic, response)
+        toast.error(t(operation.errorKey))
+        return "failed"
       }
+      return "success"
     } catch (error) {
-      console.error("Failed to publish agent:", error)
+      if (!isMountedRef.current) return "stale"
+      console.error(operation.diagnostic, error)
+      toast.error(t(operation.errorKey))
+      return "failed"
     }
   }
 
-  const handleUnpublish = async (agentId: number) => {
-    try {
-      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/unpublish`, {
-        method: "POST",
-      })
-      if (response.ok) {
-        fetchAgents() // Refresh list
-      }
-    } catch (error) {
-      console.error("Failed to unpublish agent:", error)
+  const handlePublication = async (
+    agentId: number,
+    kind: keyof typeof publicationOperations,
+  ) => {
+    const outcome = await performPublicationMutation(agentId, kind)
+    if (outcome === "success" && isMountedRef.current) {
+      void fetchAgents()
     }
   }
 
@@ -339,106 +330,105 @@ function BuildsPageContent() {
     setIsCreateModalOpen(true)
   }
 
-  const resolveTaskLlmIds = async (): Promise<[string, string | null, string | null, string | null] | null> => {
-    const apiUrl = getApiUrl()
-    const [modelsResponse, defaultResponse] = await Promise.all([
-      apiRequest(`${apiUrl}/api/models/?category=llm`, { headers: {} }),
-      apiRequest(`${apiUrl}/api/models/user-default`, { headers: {} }),
-    ])
-
-    let allModels: LlmModel[] = []
-    if (modelsResponse.ok) {
-      const modelsData = await modelsResponse.json()
-      if (Array.isArray(modelsData)) {
-        allModels = modelsData.filter(isLlmModel)
-      }
-    }
-
-    const defaultModels: Record<string, string | undefined> = {}
-    if (defaultResponse.ok) {
-      const defaultsData = await defaultResponse.json()
-      if (Array.isArray(defaultsData)) {
-        defaultsData.forEach((defaultConfig: DefaultModelRecord) => {
-          if (defaultConfig?.config_type && defaultConfig.model?.model_id) {
-            defaultModels[defaultConfig.config_type] = defaultConfig.model.model_id
-          }
-        })
-      }
-    }
-
-    const generalModelId =
-      defaultModels.general ||
-      allModels.find((model) => model.is_default)?.model_id ||
-      allModels[0]?.model_id
-
-    if (!generalModelId) {
-      return null
-    }
-
-    return [
-      generalModelId,
-      defaultModels.small_fast ?? null,
-      defaultModels.visual ?? null,
-      defaultModels.compact ?? null,
-    ]
-  }
-
   const handleBuildWithPrompt = async () => {
-    const prompt = createPrompt.trim()
-    if (!prompt || isStartingTask) return
+    const rawPrompt = createPrompt
+    const prompt = rawPrompt.trim()
+    if (!prompt || activeTaskCreateAttemptRef.current !== null) return
+
+    const attempt = ++taskCreateCounterRef.current
+    activeTaskCreateAttemptRef.current = attempt
+    const revision = draftRevisionRef.current
+    const isCurrent = () => isMountedRef.current && activeTaskCreateAttemptRef.current === attempt
 
     setIsStartingTask(true)
     try {
-      dispatch({ type: "RESET_STATE" })
-      const llmIds = await resolveTaskLlmIds()
-      if (!llmIds) {
-        toast.error(t("chatPage.input.noModelAlert"))
+      let task = null
+
+      try {
+        const selection = await resolveTaskLlmSelection()
+        if (!isCurrent()) return
+
+        if (selection.kind === "no_model") {
+          toast.error(t("chatPage.input.noModelAlert"))
+          return
+        }
+        if (selection.kind === "operational_error") throw selection.error
+
+        const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            title: normalizeTaskPromptTitle(rawPrompt),
+            description: prompt,
+            llm_ids: selection.llmIds,
+          }),
+        })
+
+        if (!isCurrent()) return
+        const parsed = await parseApiResponse(taskResponse)
+        if (!isCurrent()) return
+
+        task = taskResponse.ok ? parseTaskCreateCore(parsed.data) : null
+        if (!task) throw new Error("Task create response is invalid")
+      } catch (error) {
+        if (isCurrent()) {
+          console.error("Failed to start task from build modal:", error)
+          toast.error(t("builds.list.createModal.startTaskFailed"))
+        }
         return
       }
 
-      const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          title: prompt,
-          description: prompt,
-          llm_ids: llmIds,
-        }),
-      })
+      if (!isCurrent() || !task) return
 
-      if (!taskResponse.ok) {
-        throw new Error("Failed to create task")
+      try {
+        if (!isCurrent()) return
+        dispatch({ type: "RESET_STATE" })
+
+        if (!isCurrent()) return
+        setPendingMessage({
+          message: prompt,
+          files: [],
+          targetTaskId: task.taskId,
+        })
+
+        if (!isCurrent()) return
+        dispatch({ type: "TRIGGER_TASK_UPDATE" })
+
+        if (!isCurrent()) return
+        setTaskId(task.taskId)
+
+        if (!isCurrent()) return
+        setIsCreateModalOpen(false)
+
+        if (!isCurrent()) return
+        if (draftRevisionRef.current === revision) {
+          draftRevisionRef.current += 1
+          setCreatePrompt("")
+        }
+      } catch (error) {
+        if (isCurrent()) console.error("Failed to commit task creation:", error)
       }
-
-      const taskData = await taskResponse.json()
-      if (!isTaskCreateResponse(taskData)) {
-        throw new Error("Task create response is missing task_id")
-      }
-
-      setPendingMessage({
-        message: prompt,
-        files: [],
-        targetTaskId: taskData.task_id,
-      })
-      dispatch({ type: "TRIGGER_TASK_UPDATE" })
-      setTaskId(taskData.task_id)
-      setIsCreateModalOpen(false)
-      setCreatePrompt("")
-    } catch (error) {
-      console.error("Failed to start task from build modal:", error)
-      toast.error(t("builds.list.createModal.startTaskFailed"))
-      setIsCreateModalOpen(true)
-      setCreatePrompt(prompt)
     } finally {
-      setIsStartingTask(false)
+      if (isCurrent()) {
+        activeTaskCreateAttemptRef.current = null
+        setIsStartingTask(false)
+      }
     }
   }
 
+  const handleCreateModalOpenChange = (open: boolean) => {
+    if (!open) {
+      activeTaskCreateAttemptRef.current = null
+      setIsStartingTask(false)
+    }
+    setIsCreateModalOpen(open)
+  }
+
   const handleManualCreate = () => {
+    handleCreateModalOpenChange(false)
     router.push("/build/new")
-    setIsCreateModalOpen(false)
   }
 
   const createPromptVoiceInputLabel =
@@ -458,11 +448,6 @@ function BuildsPageContent() {
     if (createPromptVoiceInput.status === "idle") {
       createPromptVoiceInput.startRecording(createPromptRef.current)
     }
-  }
-
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString)
-    return date.toLocaleDateString()
   }
 
   return (
@@ -530,7 +515,15 @@ function BuildsPageContent() {
             {/* List */}
             {filteredAgents.length > 0 ? (
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                {filteredAgents.map((agent) => (
+                {filteredAgents.map((agent) => {
+                  const resolvedLogoUrl = resolveAgentLogoUrl(agent.logo_url, getApiUrl())
+                  const createdDate = formatDisplayDate(agent.created_at, locale, {
+                    year: "numeric", month: "numeric", day: "numeric",
+                  })
+                  const updatedDate = formatDisplayDate(agent.updated_at, locale, {
+                    year: "numeric", month: "numeric", day: "numeric",
+                  })
+                  return (
                   <div
                     key={agent.id}
                     className="group relative flex flex-col justify-between space-y-4 rounded-xl border bg-card p-6 shadow-sm transition-all cursor-pointer hover:shadow-md hover:border-primary/50"
@@ -540,8 +533,8 @@ function BuildsPageContent() {
                       <div className="space-y-4">
                         <div className="flex items-start gap-4">
                           <div className="h-10 w-10 shrink-0 rounded-lg bg-primary/10 flex items-center justify-center text-primary overflow-hidden">
-                            {agent.logo_url ? (
-                              <img src={`${getApiUrl()}${agent.logo_url}`} alt={agent.name} className="h-full w-full object-cover" />
+                            {resolvedLogoUrl ? (
+                              <img src={resolvedLogoUrl} alt={agent.name} className="h-full w-full object-cover" />
                             ) : (
                               <Bot className="h-6 w-6" />
                             )}
@@ -606,9 +599,9 @@ function BuildsPageContent() {
                                       onClick={(e) => {
                                         e.stopPropagation()
                                         if (agent.status === 'published') {
-                                          handleUnpublish(agent.id)
+                                          void handlePublication(agent.id, "unpublish")
                                         } else {
-                                          handlePublish(agent.id)
+                                          void handlePublication(agent.id, "publish")
                                         }
                                       }}
                                     >
@@ -646,14 +639,18 @@ function BuildsPageContent() {
 
                     <div className="space-y-4 pt-2">
                       <div className="space-y-1.5">
-                        <div className="flex items-center text-xs text-muted-foreground">
-                          <Calendar className="h-3.5 w-3.5 mr-1.5" />
-                          {t('builds.card.createdAt')}: {formatDate(agent.created_at)}
-                        </div>
-                        <div className="flex items-center text-xs text-muted-foreground">
-                          <Clock className="h-3.5 w-3.5 mr-1.5" />
-                          {t('builds.card.updatedAt')}: {formatDate(agent.updated_at || agent.created_at)}
-                        </div>
+                        {createdDate && (
+                          <div className="flex items-center text-xs text-muted-foreground">
+                            <Calendar className="h-3.5 w-3.5 mr-1.5" />
+                            {t('builds.card.createdAt')}: {createdDate}
+                          </div>
+                        )}
+                        {updatedDate && (
+                          <div className="flex items-center text-xs text-muted-foreground">
+                            <Clock className="h-3.5 w-3.5 mr-1.5" />
+                            {t('builds.card.updatedAt')}: {updatedDate}
+                          </div>
+                        )}
                       </div>
                       <div className="space-y-4" onClick={(e) => e.stopPropagation()}>
                         <BuildAgentCardExtension agentId={agent.id} />
@@ -725,7 +722,8 @@ function BuildsPageContent() {
                       </div>
                     </div>
                   </div>
-                ))}
+                  )
+                })}
               </div>
             ) : (
               <div className="flex flex-col items-center justify-center h-[400px] text-center space-y-4 border rounded-lg bg-muted/10 border-dashed">
@@ -778,7 +776,7 @@ function BuildsPageContent() {
         onOpenChange={(open) => { if (!open) setTriggersAgent(null) }}
       />
 
-      <Dialog open={isCreateModalOpen} onOpenChange={setIsCreateModalOpen}>
+      <Dialog open={isCreateModalOpen} onOpenChange={handleCreateModalOpenChange}>
         <DialogContent className="sm:max-w-[550px] gap-0 p-0 overflow-hidden bg-background shadow-lg rounded-xl">
           <DialogHeader className="px-6 py-5 border-b pr-10">
             <DialogTitle className="flex items-start sm:items-center gap-2 text-xl font-semibold">
@@ -809,7 +807,7 @@ function BuildsPageContent() {
                   ref={createPromptRef}
                   data-voice-input="false"
                   value={createPrompt}
-                  onChange={(e) => setCreatePrompt(e.target.value)}
+                  onChange={(e) => { draftRevisionRef.current += 1; setCreatePrompt(e.target.value) }}
                   placeholder={t("builds.list.createModal.placeholder")}
                   className="min-h-[100px] flex-1 resize-none border-0 shadow-none focus-visible:ring-0"
                   onKeyDown={(e) => {

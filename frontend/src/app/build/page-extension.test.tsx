@@ -49,6 +49,7 @@ vi.mock("next/link", () => ({
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     t: (key: string) => key,
+    locale: "en",
   }),
 }))
 
