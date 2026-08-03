@@ -22,7 +22,7 @@ from ...config import (
     get_task_lease_ttl_seconds,
 )
 from ...core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
-from ..models.task import Task, TaskStatus, TraceEvent
+from ..models.task import Task, TaskStatus, TraceEvent, task_status_predicate
 from .db_runtime import (
     await_task_settlement,
     cancel_and_drain_async_task,
@@ -268,7 +268,7 @@ def _expired_task_lease_candidates_query(
             Task.last_checkpoint_event_id,
         )
         .filter(
-            Task.status == TaskStatus.RUNNING,
+            task_status_predicate.eq(TaskStatus.RUNNING),
             Task.lease_expires_at.is_not(None),
             Task.lease_expires_at < cutoff,
         )
@@ -376,7 +376,7 @@ def recover_expired_task_lease_no_commit(
         raise ValueError("expired task leases can only recover to PAUSED or FAILED")
 
     values: dict[str, Any] = {
-        "status": status,
+        "status": task_status_predicate.value(status),
         "runner_id": None,
         "lease_expires_at": None,
         "last_heartbeat_at": recovered_at,
@@ -391,7 +391,7 @@ def recover_expired_task_lease_no_commit(
         update(Task)
         .where(
             Task.id == candidate.task_id,
-            Task.status == TaskStatus.RUNNING,
+            task_status_predicate.eq(TaskStatus.RUNNING),
             _nullable_match(Task.runner_id, candidate.runner_id),
             _nullable_match(Task.run_id, candidate.run_id),
             Task.lease_expires_at == candidate.lease_expires_at,
@@ -462,7 +462,7 @@ def acquire_task_lease_no_commit(
     current_version = func.coalesce(Task.state_version, 0)
     running_control_state = control_state_for_status(TaskStatus.RUNNING).value
     values: dict[str, Any] = {
-        "status": TaskStatus.RUNNING,
+        "status": task_status_predicate.value(TaskStatus.RUNNING),
         "runner_id": runner,
         "last_heartbeat_at": now,
         "lease_expires_at": expires_at,
@@ -470,7 +470,7 @@ def acquire_task_lease_no_commit(
             candidate_run_id
             if new_run
             else case(
-                (Task.status != TaskStatus.RUNNING, candidate_run_id),
+                (task_status_predicate.ne(TaskStatus.RUNNING), candidate_run_id),
                 else_=func.coalesce(Task.run_id, candidate_run_id),
             )
         ),
@@ -478,7 +478,7 @@ def acquire_task_lease_no_commit(
         "state_version": case(
             (
                 or_(
-                    Task.status != TaskStatus.RUNNING,
+                    task_status_predicate.ne(TaskStatus.RUNNING),
                     Task.control_state != running_control_state,
                 ),
                 current_version + 1,
@@ -494,7 +494,7 @@ def acquire_task_lease_no_commit(
         values["last_checkpoint_event_id"] = case(
             (
                 or_(
-                    Task.status != TaskStatus.RUNNING,
+                    task_status_predicate.ne(TaskStatus.RUNNING),
                     Task.run_id.is_(None),
                 ),
                 None,
@@ -507,7 +507,7 @@ def acquire_task_lease_no_commit(
         .where(Task.id == task_id)
         .where(
             or_(
-                Task.status != TaskStatus.RUNNING,
+                task_status_predicate.ne(TaskStatus.RUNNING),
                 Task.runner_id == runner,
                 Task.runner_id.is_(None),
                 Task.lease_expires_at.is_(None),
@@ -517,7 +517,7 @@ def acquire_task_lease_no_commit(
         .values(**values)
     )
     if new_run:
-        stmt = stmt.where(Task.status != TaskStatus.RUNNING)
+        stmt = stmt.where(task_status_predicate.ne(TaskStatus.RUNNING))
     if expected_run_id is not None:
         stmt = stmt.where(Task.run_id == expected_run_id)
     result = db.execute(
@@ -578,7 +578,7 @@ def _refresh_task_lease_no_commit(
         update(Task)
         .where(Task.id == lease.task_id)
         .where(Task.runner_id == lease.runner_id)
-        .where(Task.status == TaskStatus.RUNNING)
+        .where(task_status_predicate.eq(TaskStatus.RUNNING))
         .values(last_heartbeat_at=now, lease_expires_at=expires_at)
     )
     if lease.run_id is not None:
@@ -695,14 +695,17 @@ def release_task_lease_no_commit(
         .where(Task.id == lease.task_id)
         .where(Task.runner_id == lease.runner_id)
         .values(
-            status=status,
+            status=task_status_predicate.value(status),
             runner_id=None,
             lease_expires_at=None,
             last_heartbeat_at=utc_now(),
             control_state=control_state,
             state_version=case(
                 (
-                    or_(Task.status != status, Task.control_state != control_state),
+                    or_(
+                        task_status_predicate.ne(status),
+                        Task.control_state != control_state,
+                    ),
                     current_version + 1,
                 ),
                 else_=current_version,
@@ -737,9 +740,9 @@ def fail_and_release_task_lease_no_commit(
         .where(Task.id == lease.task_id)
         .where(Task.runner_id == lease.runner_id)
         .where(Task.run_id == lease.run_id)
-        .where(Task.status == TaskStatus.RUNNING)
+        .where(task_status_predicate.eq(TaskStatus.RUNNING))
         .values(
-            status=TaskStatus.FAILED,
+            status=task_status_predicate.value(TaskStatus.FAILED),
             runner_id=None,
             lease_expires_at=None,
             last_heartbeat_at=utc_now(),
@@ -772,14 +775,17 @@ def release_current_runner_task_lease(
         .where(Task.id == task_id)
         .where(Task.runner_id == runner)
         .values(
-            status=status,
+            status=task_status_predicate.value(status),
             runner_id=None,
             lease_expires_at=None,
             last_heartbeat_at=utc_now(),
             control_state=control_state,
             state_version=case(
                 (
-                    or_(Task.status != status, Task.control_state != control_state),
+                    or_(
+                        task_status_predicate.ne(status),
+                        Task.control_state != control_state,
+                    ),
                     current_version + 1,
                 ),
                 else_=current_version,
