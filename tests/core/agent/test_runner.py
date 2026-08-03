@@ -14,7 +14,10 @@ from xagent.core.agent import (
     PatternRuntime,
     TraceEventCallback,
 )
-from xagent.core.agent.checkpoint import CheckpointUnavailableError
+from xagent.core.agent.checkpoint import (
+    CheckpointCorruptError,
+    CheckpointUnavailableError,
+)
 from xagent.core.agent.runner import AgentRunner
 from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
@@ -306,6 +309,17 @@ async def test_runner_treats_canonical_empty_checkpoint_as_authoritative() -> No
 
     assert context is None
     assert checkpoint_store.legacy_reads == 0
+
+
+class ContextlessCheckpointStore:
+    """Returns a recognized checkpoint payload that carries no context.
+
+    Every production checkpoint writer persists a ``context`` dict; a
+    stored payload without one is malformed. The runner must classify it
+    as corrupt rather than silently building fresh state on resume."""
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+        return {"type": "checkpoint", "execution_id": execution_id}
 
 
 class UnavailableCheckpointStore:
@@ -1353,3 +1367,46 @@ def test_resolve_compact_threshold_default_env_override(monkeypatch) -> None:
 def test_resolve_compact_threshold_missing_llm() -> None:
     agent = Agent(name="t", patterns=[FakePattern({})], llm=None)
     assert AgentRunner(agent=agent)._resolve_compact_threshold() == 32000
+
+
+@pytest.mark.asyncio
+async def test_run_resume_raises_corrupt_on_contextless_checkpoint() -> None:
+    runner = AgentRunner(
+        agent=Agent(name="checkpoint-reader", patterns=[], llm=None),
+        tracer=ContextlessCheckpointStore(),
+    )
+    build_context_calls: list[Any] = []
+    original_build_context = runner._build_context
+
+    async def spy_build_context(*args: Any, **kwargs: Any) -> Any:
+        build_context_calls.append((args, kwargs))
+        return await original_build_context(*args, **kwargs)
+
+    runner._build_context = spy_build_context  # type: ignore[method-assign]
+
+    with pytest.raises(CheckpointCorruptError):
+        await runner.run(
+            task=None,
+            execution_id="exec-resume-contextless",
+            resume=True,
+        )
+
+    assert build_context_calls == []
+    assert runner.context_manager.get_context("exec-resume-contextless") is None
+
+
+@pytest.mark.asyncio
+async def test_inject_user_message_raises_corrupt_on_contextless_checkpoint() -> None:
+    """A found checkpoint without a context dict is malformed, not absent:
+    returning ``None`` here would be indistinguishable from "no checkpoint"
+    and the caller would defer forever against a row that can never resume."""
+    runner = AgentRunner(
+        agent=Agent(name="checkpoint-reader", patterns=[], llm=None),
+        tracer=ContextlessCheckpointStore(),
+    )
+
+    with pytest.raises(CheckpointCorruptError):
+        await runner.inject_user_message(
+            "exec-inject-contextless",
+            message="hello",
+        )

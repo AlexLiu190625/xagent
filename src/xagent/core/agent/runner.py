@@ -16,7 +16,7 @@ from ..task_runtime import (
     normalize_input_modalities,
 )
 from ..workspace import WorkspaceManager
-from .checkpoint import read_latest_checkpoint_payload
+from .checkpoint import CheckpointCorruptError, read_latest_checkpoint_payload
 from .context import ContextManager, ExecutionContext
 from .result import extract_assistant_message
 from .runtime import ExecutionInterrupted, PatternRuntime, load_pattern_checkpoint
@@ -82,6 +82,14 @@ class AgentRunner:
         checkpoint = checkpoint or (
             await self._load_latest_checkpoint(execution_id) if resume else None
         )
+        if (
+            resume
+            and checkpoint is not None
+            and not isinstance(checkpoint.get("context"), dict)
+        ):
+            raise CheckpointCorruptError(
+                "Resume checkpoint exists but carries no execution context."
+            )
         if task is None:
             task = self._resolve_task(
                 task=task,
@@ -363,11 +371,12 @@ class AgentRunner:
         cold_start_checkpoint: dict[str, Any] | None = None
         if context is None:
             checkpoint = await self._load_latest_checkpoint(execution_id)
-            if not (
-                isinstance(checkpoint, dict)
-                and isinstance(checkpoint.get("context"), dict)
-            ):
+            if checkpoint is None:
                 return None
+            if not isinstance(checkpoint.get("context"), dict):
+                raise CheckpointCorruptError(
+                    "Stored checkpoint carries no execution context to restore."
+                )
             cold_start_checkpoint = checkpoint
             context = ExecutionContext.from_dict(checkpoint["context"])
             self.context_manager.set_context(context)
