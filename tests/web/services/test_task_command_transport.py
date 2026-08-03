@@ -1942,8 +1942,16 @@ def test_task_foreign_key_violation_is_reported_as_a_missing_task(
     task_id = int(task.id)
 
     real_flush = db_session.flush
+    flush_calls = 0
 
     def flush_raising_fk_error(*args, **kwargs):
+        # stage_task_command's owner pre-flush is a real, harmless no-op on
+        # this clean session -- let it through so only the attributable
+        # command-insert flush is intercepted below.
+        nonlocal flush_calls
+        flush_calls += 1
+        if flush_calls == 1:
+            return real_flush(*args, **kwargs)
         db_session.flush = real_flush
         # Delete the task so the post-rollback recheck sees it as absent, the
         # way a concurrent delete would.
@@ -1979,8 +1987,16 @@ def test_actor_foreign_key_failure_is_not_reported_as_a_missing_task(
     task_id = int(task.id)
 
     real_flush = db_session.flush
+    flush_calls = 0
 
     def flush_raising_fk_error(*args, **kwargs):
+        # stage_task_command's owner pre-flush is a real, harmless no-op on
+        # this clean session -- let it through so only the attributable
+        # command-insert flush is intercepted below.
+        nonlocal flush_calls
+        flush_calls += 1
+        if flush_calls == 1:
+            return real_flush(*args, **kwargs)
         db_session.flush = real_flush
         raise IntegrityError("INSERT", {}, Exception("FOREIGN KEY constraint failed"))
 

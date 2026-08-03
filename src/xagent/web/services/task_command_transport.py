@@ -88,6 +88,55 @@ class EnqueuedTaskCommand:
 
 
 @dataclass(frozen=True)
+class StagedTaskCommand:
+    """A command row added to a caller-owned session, not yet committed.
+
+    ``staged_db_id`` is deliberately not named ``command_id`` -- unlike
+    ``EnqueuedTaskCommand.command_id``, this id is only guaranteed to exist in
+    the database once the caller commits the session it was staged on. Code
+    that dispatches or notifies by id must never accept a StagedTaskCommand.
+    """
+
+    staged_db_id: int
+    client_command_id: str
+    created: bool
+    payload_matches: bool
+    status: str
+
+
+class TaskCommandOwnerStateError(RuntimeError):
+    """The caller's own pending writes failed to flush before staging began.
+
+    Deliberately not an IntegrityError subclass: the wrapper's
+    ``except IntegrityError`` classifies conflicts on the command insert
+    itself, and must not also catch a failure that has nothing to do with
+    that insert. After this is raised, the session is unusable -- the caller
+    must roll back before issuing any further statement on it.
+    """
+
+
+class TaskCommandConflictKind(enum.Enum):
+    RACED_DUPLICATE = "raced_duplicate"
+    TASK_MISSING = "task_missing"
+    UNRELATED = "unrelated"
+
+
+@dataclass(frozen=True)
+class RacedTaskCommandProjection:
+    """Immutable snapshot of the row that won a duplicate-insert race."""
+
+    command_db_id: int
+    status: str
+    payload_matches: bool
+
+
+@dataclass(frozen=True)
+class TaskCommandConflictClassification:
+    kind: TaskCommandConflictKind
+    raced: RacedTaskCommandProjection | None = None
+
+
+@dataclass(frozen=True)
 class ClaimedTaskCommand:
     id: int
     task_id: int
@@ -160,7 +209,7 @@ def _matches_existing(
     )
 
 
-def enqueue_task_command(
+def stage_task_command(
     db: Session,
     *,
     task_id: int,
@@ -168,18 +217,51 @@ def enqueue_task_command(
     command_id: str,
     kind: TaskCommandKind,
     payload: dict[str, Any],
-) -> EnqueuedTaskCommand:
-    """Commit an idempotent command and return only after it is durable."""
+) -> StagedTaskCommand:
+    """Add an idempotent command row to the session without ending its transaction.
+
+    Never calls ``db.commit()``, ``db.rollback()``, or the dispatcher notify --
+    the caller owns the transaction boundary and decides what durability means
+    for its own writes alongside this command. Statement order is load-bearing:
+
+    1. Reject a malformed command_id before touching the database at all.
+    2. Flush the caller's own pending writes first, so a conflict there is
+       reported as TaskCommandOwnerStateError rather than folded into the
+       IntegrityError this function raises for a duplicate command insert.
+    3. Read the task through a single Core select rather than the ORM. This
+       both closes the window a separate existence check and a separate
+       snapshot read would leave between them, and -- unlike an ORM query --
+       is not served from the identity map, so it observes a caller's own
+       uncommitted CAS-style update to the same row instead of a stale cached
+       instance.
+    4. Check for an existing command with this (task_id, command_id) before
+       adding a new row, so a repeated call is idempotent without relying on
+       the unique constraint to reject it.
+    5. Add and flush the new row last, so any remaining IntegrityError is
+       attributable to the command insert itself.
+    """
 
     normalized_id = command_id.strip()
     if COMMAND_ID_PATTERN.fullmatch(normalized_id) is None:
         raise ValueError("command_id must be 1-64 URL-safe characters")
     resolved_task_id = int(task_id)
+
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        raise TaskCommandOwnerStateError(
+            "caller's pending writes failed to flush before command staging"
+        ) from exc
+
     # A task snapshot a caller loaded earlier would widen the concurrent-delete
     # window across everything it did in between, so existence is re-checked
     # here, by query, before inserting a command that references the row.
-    task = db.query(Task).filter(Task.id == resolved_task_id).first()
-    if task is None:
+    snapshot = db.execute(
+        select(Task.status, Task.runner_id, Task.run_id).where(
+            Task.id == resolved_task_id
+        )
+    ).one_or_none()
+    if snapshot is None:
         raise TaskCommandTaskMissing(f"Task {task_id} not found")
 
     existing = (
@@ -197,8 +279,8 @@ def enqueue_task_command(
             kind=kind,
             payload=payload,
         )
-        return EnqueuedTaskCommand(
-            command_id=int(existing.id),
+        return StagedTaskCommand(
+            staged_db_id=int(existing.id),
             client_command_id=normalized_id,
             created=False,
             payload_matches=matches,
@@ -206,8 +288,8 @@ def enqueue_task_command(
         )
 
     active_runner_id = (
-        task.runner_id
-        if task.status == TaskStatus.RUNNING and task.runner_id is not None
+        snapshot.runner_id
+        if snapshot.status == TaskStatus.RUNNING and snapshot.runner_id is not None
         else None
     )
     command = TaskExecutionCommand(
@@ -216,54 +298,133 @@ def enqueue_task_command(
         command_id=normalized_id,
         kind=kind.value,
         payload=payload,
-        target_run_id=task.run_id,
+        target_run_id=snapshot.run_id,
         target_runner_id=active_runner_id,
         status=COMMAND_PENDING,
     )
     db.add(command)
-    try:
-        db.flush()
-        command_db_id = int(command.id)
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raced = (
-            db.query(TaskExecutionCommand)
-            .filter(
-                TaskExecutionCommand.task_id == resolved_task_id,
-                TaskExecutionCommand.command_id == normalized_id,
-            )
-            .one_or_none()
+    db.flush()
+    return StagedTaskCommand(
+        staged_db_id=int(command.id),
+        client_command_id=normalized_id,
+        created=True,
+        payload_matches=True,
+        status=COMMAND_PENDING,
+    )
+
+
+def classify_task_command_conflict(
+    db: Session,
+    *,
+    task_id: int,
+    command_id: str,
+    actor_user_id: int | None,
+    kind: TaskCommandKind,
+    payload: dict[str, Any],
+) -> TaskCommandConflictClassification:
+    """Classify an IntegrityError from staging a command insert.
+
+    Call only after the caller has rolled back the transaction the failed
+    stage happened on -- this queries post-rollback state to tell apart a
+    duplicate command_id that won the race (RACED_DUPLICATE, carrying a
+    frozen projection of the winning row computed in this same query so the
+    caller does not need a second, possibly inconsistent, read), a task
+    deleted concurrently with the insert (TASK_MISSING), and a conflict on
+    neither -- the row references two foreign keys, so absence of a duplicate
+    does not prove the task caused it: a concurrently deleted actor fails the
+    users FK while the task is still present (UNRELATED).
+    """
+
+    resolved_task_id = int(task_id)
+    normalized_id = command_id.strip()
+    raced = (
+        db.query(TaskExecutionCommand)
+        .filter(
+            TaskExecutionCommand.task_id == resolved_task_id,
+            TaskExecutionCommand.command_id == normalized_id,
         )
-        if raced is None:
-            # No duplicate command exists, so this was not an idempotency race.
-            # The row references two foreign keys, so absence of a duplicate
-            # does not prove the task caused it: a concurrently deleted actor
-            # fails the users FK while the task is still present. Only report a
-            # missing task when the task really is gone; otherwise preserve the
-            # original failure so callers cannot mistake an actor problem for
-            # missing-task recovery.
-            if db.query(Task.id).filter(Task.id == resolved_task_id).scalar() is None:
-                raise TaskCommandTaskMissing(f"Task {task_id} not found") from None
-            raise
+        .one_or_none()
+    )
+    if raced is not None:
         matches = _matches_existing(
             raced,
             actor_user_id=actor_user_id,
             kind=kind,
             payload=payload,
         )
+        return TaskCommandConflictClassification(
+            kind=TaskCommandConflictKind.RACED_DUPLICATE,
+            raced=RacedTaskCommandProjection(
+                command_db_id=int(raced.id),
+                status=str(raced.status),
+                payload_matches=matches,
+            ),
+        )
+    if db.query(Task.id).filter(Task.id == resolved_task_id).scalar() is None:
+        return TaskCommandConflictClassification(
+            kind=TaskCommandConflictKind.TASK_MISSING
+        )
+    return TaskCommandConflictClassification(kind=TaskCommandConflictKind.UNRELATED)
+
+
+def enqueue_task_command(
+    db: Session,
+    *,
+    task_id: int,
+    actor_user_id: int | None,
+    command_id: str,
+    kind: TaskCommandKind,
+    payload: dict[str, Any],
+) -> EnqueuedTaskCommand:
+    """Commit an idempotent command and return only after it is durable."""
+
+    try:
+        staged = stage_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=actor_user_id,
+            command_id=command_id,
+            kind=kind,
+            payload=payload,
+        )
+    except IntegrityError:
+        db.rollback()
+        classification = classify_task_command_conflict(
+            db,
+            task_id=task_id,
+            command_id=command_id,
+            actor_user_id=actor_user_id,
+            kind=kind,
+            payload=payload,
+        )
+        if classification.kind is TaskCommandConflictKind.RACED_DUPLICATE:
+            raced = classification.raced
+            assert raced is not None
+            return EnqueuedTaskCommand(
+                command_id=raced.command_db_id,
+                client_command_id=command_id.strip(),
+                created=False,
+                payload_matches=raced.payload_matches,
+                status=raced.status,
+            )
+        if classification.kind is TaskCommandConflictKind.TASK_MISSING:
+            raise TaskCommandTaskMissing(f"Task {task_id} not found") from None
+        raise
+
+    if not staged.created:
         return EnqueuedTaskCommand(
-            command_id=int(raced.id),
-            client_command_id=normalized_id,
+            command_id=staged.staged_db_id,
+            client_command_id=staged.client_command_id,
             created=False,
-            payload_matches=matches,
-            status=str(raced.status),
+            payload_matches=staged.payload_matches,
+            status=staged.status,
         )
 
+    db.commit()
     notify_task_command_dispatcher()
     return EnqueuedTaskCommand(
-        command_id=command_db_id,
-        client_command_id=normalized_id,
+        command_id=staged.staged_db_id,
+        client_command_id=staged.client_command_id,
         created=True,
         payload_matches=True,
         status=COMMAND_PENDING,
