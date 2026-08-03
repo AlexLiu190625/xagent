@@ -131,6 +131,7 @@ from ..services.task_command_transport import (
     TaskCommandDeferred,
     TaskCommandKind,
     TaskCommandRejected,
+    TaskCommandTaskMissing,
     dispatch_task_command_promptly,
     enqueue_task_command,
     task_has_live_foreign_runner,
@@ -4864,14 +4865,22 @@ def _enqueue_websocket_task_command_sync(
                         else DELIVERY_COMPLETED
                     ),
                 )
-        result = enqueue_task_command(
-            db,
-            task_id=task_id,
-            actor_user_id=actor_user_id,
-            command_id=command_id,
-            kind=kind,
-            payload=payload,
-        )
+        try:
+            result = enqueue_task_command(
+                db,
+                task_id=task_id,
+                actor_user_id=actor_user_id,
+                command_id=command_id,
+                kind=kind,
+                payload=payload,
+            )
+        except TaskCommandTaskMissing:
+            # The row was deleted after the check above, so route this through
+            # the same sentinel as a task that was already gone. Otherwise the
+            # caller rejects the delivery instead of creating a replacement.
+            if allow_missing_task:
+                return None
+            raise
         return result
 
 

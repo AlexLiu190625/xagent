@@ -954,6 +954,17 @@ class Tracer:
         """Add a trace handler."""
         self.handlers.append(handler)
 
+    def remove_handler(self, handler: TraceHandler) -> None:
+        """Remove a trace handler; a no-op when it is not registered.
+
+        Rebinds instead of mutating in place: dispatch loops may be suspended
+        mid-iteration on an awaited handler, and an in-place removal would
+        shift the remaining handlers left and silently skip the next one.
+        Identity comparison, because removal targets a specific registration,
+        not anything that compares equal to it.
+        """
+        self.handlers = [h for h in self.handlers if h is not handler]
+
     async def trace_event(
         self,
         event_type: TraceEventType,
@@ -982,7 +993,9 @@ class Tracer:
             f"Notifying {len(self.handlers)} handlers for event {event_type.value}"
         )
         handler_errors: List[Exception] = []
-        for i, handler in enumerate(self.handlers):
+        # Snapshot: a handler removed mid-dispatch must not shift its
+        # successors out of this iteration.
+        for i, handler in enumerate(list(self.handlers)):
             try:
                 logger.info(f"Calling handler {i}: {type(handler).__name__}")
                 await handler.handle_event(event)
@@ -1016,7 +1029,7 @@ class Tracer:
         execution_id: str,
     ) -> Optional[Dict[str, Any]]:
         """Load the latest checkpoint from the first handler that supports it."""
-        for handler in self.handlers:
+        for handler in list(self.handlers):
             method = getattr(handler, "load_latest_checkpoint", None)
             if not callable(method):
                 continue

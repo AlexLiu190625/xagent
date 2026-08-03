@@ -1,5 +1,7 @@
 import html
+import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
@@ -10,6 +12,8 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
     from ....core.agent.service import AgentService
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -262,3 +266,51 @@ def _extract_local_file_id(target: str) -> str | None:
             return unquote(path[len(prefix) :].strip("/")) or None
 
     return None
+
+
+class CancelledDelivery(Exception):
+    """Raised when a delivery completed after its execution was cancelled.
+
+    The message was already sent, so the caller must stop the remaining output
+    sequence. ``deliver_cancellation_safe`` has already removed it.
+    """
+
+
+async def deliver_cancellation_safe(
+    send: "Callable[[], Awaitable[Any]]",
+    *,
+    is_cancelled: "Callable[[], bool]",
+    delete: "Callable[[Any], Awaitable[None]] | None" = None,
+    description: str = "Telegram delivery",
+) -> Any:
+    """Send something only while the execution is still current.
+
+    A send is an awaited round trip, so ``/stop``, ``/new``, or ``/switch`` can
+    land while it is in flight. Checking only before the call would leave that
+    output visible in a conversation the user has already left, so the latch is
+    re-checked afterwards and a late success is compensated by deleting it.
+
+    Returns the send result, or None when the send was skipped. Raises
+    CancelledDelivery when the send succeeded but was compensated, so callers
+    abandon the rest of the output sequence.
+    """
+
+    if is_cancelled():
+        return None
+
+    result = await send()
+
+    if not is_cancelled():
+        return result
+
+    if delete is not None:
+        try:
+            await delete(result)
+        except Exception:
+            # A message that cannot be removed (for example older than
+            # Telegram's delete window) is logged rather than raised: the
+            # caller still needs to stop the remaining output.
+            logger.debug(
+                "Failed to remove %s after cancellation", description, exc_info=True
+            )
+    raise CancelledDelivery(description)

@@ -143,6 +143,10 @@ class Task(Base):  # type: ignore
         Integer, ForeignKey("user_channels.id", ondelete="SET NULL"), nullable=True
     )
     channel_name = Column(String(100), nullable=True)
+    # External Telegram sender that owns this channel task. A channel may allow
+    # multiple Telegram accounts, so channel_id alone is not an authorization
+    # boundary for conversation history.
+    telegram_user_id = Column(String(32), nullable=True, index=True)
 
     # Token usage statistics
     input_tokens = Column(Integer, default=0)

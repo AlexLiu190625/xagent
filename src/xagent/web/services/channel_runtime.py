@@ -48,6 +48,8 @@ from .workforce_runtime import sync_workforce_run_status
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_TASK_LIST_LIMIT = 50
+
 
 class ChannelConfigurationError(RuntimeError):
     """The configured channel has no resolvable owner."""
@@ -137,6 +139,21 @@ class ChannelOutputFile:
     filename: str
     storage_path: str
     mime_type: str
+
+
+@dataclass(frozen=True)
+class TelegramChannelTaskSnapshot:
+    """Detached Telegram task metadata safe to render outside a Session."""
+
+    task_id: int
+    title: str
+    status: str
+    created_at: Any
+    updated_at: Any
+    # The agent this task is bound to, or None for the default assistant.
+    # A switch must adopt it: prepare_channel_task() discards a task whose
+    # agent_id does not match the caller's selection.
+    agent_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -251,7 +268,14 @@ def _load_channel_owner_sync(
     if channel_id is None:
         raise ChannelConfigurationError("Channel owner is not configured")
 
-    channel = db.query(UserChannel).filter(UserChannel.id == int(channel_id)).first()
+    channel = (
+        db.query(UserChannel)
+        .filter(
+            UserChannel.id == int(channel_id),
+            UserChannel.is_active.is_(True),
+        )
+        .first()
+    )
     if channel is None:
         raise ChannelConfigurationError("Channel owner is not configured")
 
@@ -261,9 +285,210 @@ def _load_channel_owner_sync(
         raise ChannelConfigurationError("Channel owner is not configured")
 
     allowed_users = channel.config.get("allowed_users")
-    if allowed_users is not None and external_user_id not in allowed_users:
-        raise ChannelAuthorizationError("Channel sender is not authorized")
+    if allowed_users is not None:
+        # config is an unconstrained JSON dict, so the allowlist may be a bare
+        # string. Iterating one yields its characters, which would authorize
+        # "1" and deny the intended "101" -- treat it as a single entry.
+        if isinstance(allowed_users, str):
+            allowed_users = [allowed_users]
+        elif isinstance(allowed_users, dict):
+            # Pre-PR the `in` check matched dict keys; keep that working
+            # rather than locking out a channel configured that way.
+            allowed_users = list(allowed_users)
+        elif not isinstance(allowed_users, (list, tuple, set)):
+            raise ChannelConfigurationError(
+                "Channel allowed_users must be a list of sender ids"
+            )
+        # Ids may be numeric in config while sender ids are always strings.
+        allowed_user_ids = {str(value) for value in allowed_users}
+        if external_user_id not in allowed_user_ids:
+            raise ChannelAuthorizationError("Channel sender is not authorized")
     return ChannelOwnerSnapshot(user_id=owner_id)
+
+
+def _claim_legacy_active_telegram_task_sync(
+    db: Any,
+    *,
+    channel: UserChannel,
+    owner_id: int,
+    external_user_id: str,
+    active_task_id: int | None,
+) -> bool:
+    """Claim the legacy active task whose per-sender mapping proves ownership."""
+
+    if active_task_id is None or active_task_id <= 0:
+        return False
+    active_task = (
+        db.query(Task)
+        .filter(
+            Task.id == active_task_id,
+            Task.user_id == owner_id,
+            Task.channel_id == channel.id,
+            Task.telegram_user_id.is_(None),
+        )
+        .first()
+    )
+    if active_task is None:
+        return False
+    active_task.telegram_user_id = external_user_id
+    return True
+
+
+def _resolve_telegram_sender_scope_sync(
+    db: Any,
+    *,
+    channel_id: int | None,
+    external_user_id: str,
+    active_task_id: int | None,
+) -> tuple[int, UserChannel]:
+    """Authorize the sender and settle any legacy claim before task queries.
+
+    Shared by the list and single-task loaders, which differ only in the query
+    they run afterwards. Returns the owner id and the resolved channel.
+
+    This is a *write* path: a pre-migration task whose ownership the sender's
+    active-task mapping proves is stamped and committed here. Read-only-looking
+    callers such as /list still need it, because without the stamp the sender's
+    own history stays invisible to every subsequent query -- so the write is
+    what makes the read correct.
+    """
+
+    owner = _load_channel_owner_sync(
+        db,
+        channel_id=channel_id,
+        external_user_id=external_user_id,
+    )
+    channel = (
+        db.query(UserChannel)
+        .filter(
+            UserChannel.id == channel_id,
+            UserChannel.channel_type == "telegram",
+            UserChannel.is_active.is_(True),
+        )
+        .first()
+    )
+    if channel is None:
+        raise ChannelConfigurationError("Telegram channel is not configured")
+
+    claimed_legacy_task = _claim_legacy_active_telegram_task_sync(
+        db,
+        channel=channel,
+        owner_id=owner.user_id,
+        external_user_id=external_user_id,
+        active_task_id=active_task_id,
+    )
+    if claimed_legacy_task:
+        db.commit()
+    return owner.user_id, channel
+
+
+def _telegram_task_snapshot(task: Task) -> TelegramChannelTaskSnapshot:
+    return TelegramChannelTaskSnapshot(
+        task_id=int(task.id),
+        title=str(task.title or "Untitled Task"),
+        status=str(getattr(task.status, "value", task.status) or "unknown"),
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+        agent_id=int(task.agent_id) if task.agent_id is not None else None,
+    )
+
+
+def _load_telegram_channel_tasks_sync(
+    *,
+    channel_id: int | None,
+    external_user_id: str,
+    active_task_id: int | None,
+) -> tuple[TelegramChannelTaskSnapshot, ...]:
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        # Writes: claims the legacy task the mapping proves, so the sender's
+        # pre-migration history becomes visible to the query below.
+        owner_id, channel = _resolve_telegram_sender_scope_sync(
+            db,
+            channel_id=channel_id,
+            external_user_id=external_user_id,
+            active_task_id=active_task_id,
+        )
+        rows = (
+            db.query(Task)
+            .filter(
+                Task.user_id == owner_id,
+                Task.channel_id == channel.id,
+                Task.telegram_user_id == external_user_id,
+                Task.is_visible.is_(True),
+            )
+            .order_by(Task.updated_at.desc(), Task.created_at.desc(), Task.id.desc())
+            .limit(TELEGRAM_TASK_LIST_LIMIT)
+            .all()
+        )
+        return tuple(_telegram_task_snapshot(task) for task in rows)
+
+
+async def load_telegram_channel_tasks(
+    *,
+    channel_id: int | None,
+    external_user_id: str,
+    active_task_id: int | None,
+) -> tuple[TelegramChannelTaskSnapshot, ...]:
+    """List one Telegram sender's visible tasks without leaking ORM state."""
+
+    return await run_db_io_cancellation_safe(
+        lambda: _load_telegram_channel_tasks_sync(
+            channel_id=channel_id,
+            external_user_id=external_user_id,
+            active_task_id=active_task_id,
+        )
+    )
+
+
+def _load_telegram_channel_task_sync(
+    *,
+    channel_id: int | None,
+    external_user_id: str,
+    task_id: int,
+    active_task_id: int | None,
+) -> TelegramChannelTaskSnapshot | None:
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        # Writes: claims the legacy task the mapping proves, so the sender's
+        # pre-migration history becomes visible to the query below.
+        owner_id, channel = _resolve_telegram_sender_scope_sync(
+            db,
+            channel_id=channel_id,
+            external_user_id=external_user_id,
+            active_task_id=active_task_id,
+        )
+        task = (
+            db.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.user_id == owner_id,
+                Task.channel_id == channel.id,
+                Task.telegram_user_id == external_user_id,
+                Task.is_visible.is_(True),
+            )
+            .first()
+        )
+        return _telegram_task_snapshot(task) if task is not None else None
+
+
+async def load_telegram_channel_task(
+    *,
+    channel_id: int | None,
+    external_user_id: str,
+    task_id: int,
+    active_task_id: int | None,
+) -> TelegramChannelTaskSnapshot | None:
+    """Resolve a switch target inside the Telegram sender boundary."""
+
+    return await run_db_io_cancellation_safe(
+        lambda: _load_telegram_channel_task_sync(
+            channel_id=channel_id,
+            external_user_id=external_user_id,
+            task_id=task_id,
+            active_task_id=active_task_id,
+        )
+    )
 
 
 def _authorize_channel_sender_sync(
@@ -400,6 +625,9 @@ def _prepare_channel_task_sync(
                 external_user_id=external_user_id,
             )
             owner_id = owner.user_id
+            channel = db.query(UserChannel).filter(UserChannel.id == channel_id).first()
+            if channel is None:
+                raise ChannelConfigurationError("Channel owner is not configured")
             if (
                 expected_owner_user_id is not None
                 and owner_id != expected_owner_user_id
@@ -408,13 +636,46 @@ def _prepare_channel_task_sync(
                     "Channel owner changed during sender authorization"
                 )
 
+            is_telegram = str(channel.channel_type) == "telegram"
+            if is_telegram:
+                claimed_legacy_task = _claim_legacy_active_telegram_task_sync(
+                    db,
+                    channel=channel,
+                    owner_id=owner_id,
+                    external_user_id=external_user_id,
+                    active_task_id=active_task_id,
+                )
+                if claimed_legacy_task:
+                    # Sessions run with autoflush=False, so the resume query
+                    # below cannot see the pending sender stamp without this
+                    # flush and would abandon the legacy task for a new one.
+                    # Flush rather than commit: the claim must stay atomic with
+                    # this turn's task creation so both roll back together.
+                    db.flush()
+
             task = None
             if active_task_id is not None and active_task_id != -1:
-                task = (
-                    db.query(Task)
-                    .filter(Task.id == active_task_id, Task.user_id == owner_id)
-                    .first()
+                query = db.query(Task).filter(
+                    Task.id == active_task_id,
+                    Task.user_id == owner_id,
                 )
+                if is_telegram:
+                    query = query.filter(
+                        Task.channel_id == channel_id,
+                        Task.telegram_user_id == external_user_id,
+                        # Same visibility boundary as /list and /switch: a task
+                        # hidden in the web UI must stop resuming here too,
+                        # rather than silently continuing to execute.
+                        #
+                        # Deliberately Telegram-only: it pairs with the
+                        # sender-scoped /list + /switch surface that only
+                        # Telegram has. Extending it to Feishu would change
+                        # Feishu's resume behavior for hidden tasks in a
+                        # Telegram feature change; do that consciously with the
+                        # generic channel identity work, not here.
+                        Task.is_visible.is_(True),
+                    )
+                task = query.first()
 
             # Revalidate the requested selection on every turn, not only for
             # new tasks. A conversation may only continue when its task binding
@@ -455,6 +716,7 @@ def _prepare_channel_task_sync(
                     ),
                     channel_id=channel_id,
                     channel_name=channel_name,
+                    telegram_user_id=external_user_id if is_telegram else None,
                     agent_id=task_agent_id,
                 )
                 selected_refs = prepare_connector_runtime_selection_snapshot(

@@ -136,6 +136,10 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
         def add_handler(self, handler: object) -> None:
             self.handlers.append(handler)
 
+        def remove_handler(self, handler: object) -> None:
+            if handler in self.handlers:
+                self.handlers.remove(handler)
+
     agent_service = SimpleNamespace(
         tracer=FakeTracer(),
         set_conversation_history=lambda _messages: None,
@@ -271,6 +275,10 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
 
         def add_handler(self, handler: object) -> None:
             self.handlers.append(handler)
+
+        def remove_handler(self, handler: object) -> None:
+            if handler in self.handlers:
+                self.handlers.remove(handler)
 
     agent_service = SimpleNamespace(
         tracer=FakeTracer(),

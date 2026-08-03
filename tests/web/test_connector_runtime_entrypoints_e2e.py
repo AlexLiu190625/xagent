@@ -227,9 +227,11 @@ def _telegram_voice_error_bot(
     bot.user_stop_events = {}
     bot.user_active_executions = {}
     bot.user_conversation_generations = {}
+    bot.user_active_trace_handlers = {}
+    bot.user_switch_locks = {}
     bot.selected_agents = {}
-    bot._save_selected_agents = lambda: None
-    bot._save_active_tasks = lambda: None
+    bot._save_selected_agents = lambda: True
+    bot._save_active_tasks = lambda: True
     bot._clear_user_stop_request = lambda _user_id: None
     bot._consume_user_stop_request = lambda _user_id: False
     bot._resolve_voice_asr_model_isolated = lambda _user_id: asr_model
@@ -396,6 +398,10 @@ class _FakeTracer:
 
     def add_handler(self, handler: Any) -> None:
         self.handlers.append(handler)
+
+    def remove_handler(self, handler: Any) -> None:
+        if handler in self.handlers:
+            self.handlers.remove(handler)
 
 
 class _FakeAgentService:
@@ -750,7 +756,7 @@ async def test_feishu_new_task_fallback_snapshots_empty(
         bot.channel_name = "Feishu test"
         bot.active_tasks = {}
         bot.api_client = object()
-        bot._save_active_tasks = lambda: None
+        bot._save_active_tasks = lambda: True
 
         async def _send_text(_chat_id: str, _text: str) -> None:
             return None
@@ -846,7 +852,7 @@ async def test_feishu_existing_task_commits_registered_attachment_before_executi
     bot.channel_name = "Feishu attachment test"
     bot.active_tasks = {"open-id-existing": str(task_id)}
     bot.api_client = object()
-    bot._save_active_tasks = lambda: None
+    bot._save_active_tasks = lambda: True
 
     async def _send_text(_chat_id: str, _text: str) -> None:
         return None
@@ -952,9 +958,11 @@ async def test_telegram_new_task_fallback_snapshots_empty(
         bot.user_stop_events = {}
         bot.user_active_executions = {}
         bot.user_conversation_generations = {}
+        bot.user_active_trace_handlers = {}
+        bot.user_switch_locks = {}
         bot.selected_agents = {}
-        bot._save_selected_agents = lambda: None
-        bot._save_active_tasks = lambda: None
+        bot._save_selected_agents = lambda: True
+        bot._save_active_tasks = lambda: True
         bot._clear_user_stop_request = lambda _user_id: None
         bot._consume_user_stop_request = lambda _user_id: False
 
@@ -988,6 +996,7 @@ async def test_telegram_new_task_fallback_snapshots_empty(
             .one_or_none()
         )
         assert task is not None
+        assert task.telegram_user_id == "123"
         assert task.connector_runtime_selected_refs == []
         assert _context_row_count(int(task.id)) == 0
         persisted_turns = (
@@ -1060,9 +1069,11 @@ async def test_telegram_voice_is_transcribed_as_prompt_and_kept_as_input_file(
         bot.user_stop_events = {}
         bot.user_active_executions = {}
         bot.user_conversation_generations = {}
+        bot.user_active_trace_handlers = {}
+        bot.user_switch_locks = {}
         bot.selected_agents = {}
-        bot._save_selected_agents = lambda: None
-        bot._save_active_tasks = lambda: None
+        bot._save_selected_agents = lambda: True
+        bot._save_active_tasks = lambda: True
         bot._clear_user_stop_request = lambda _user_id: None
         bot._consume_user_stop_request = lambda _user_id: False
         bot._resolve_voice_asr_model_isolated = lambda _user_id: asr_model

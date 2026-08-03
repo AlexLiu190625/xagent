@@ -118,6 +118,7 @@ async def test_send_output_files_uploads_documents(tmp_path) -> None:
             user_id=7,
             task_id=423,
             reply_to=reply,  # type: ignore[arg-type]
+            is_cancelled=lambda: False,
         )
 
     assert failed_refs == []
@@ -195,6 +196,35 @@ async def test_telegram_trace_handler_ignores_events_for_other_tasks() -> None:
         )
     )
 
+    assert sent_texts == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_telegram_trace_handler_never_resumes_updates() -> None:
+    sent_texts: list[str] = []
+
+    class CapturingTelegramTraceHandler(TelegramTraceHandler):
+        async def _update_message(self, text: str, final: bool = False) -> None:
+            sent_texts.append(text)
+
+    handler = CapturingTelegramTraceHandler(
+        task_id=421,
+        bot=object(),
+        chat_id=123,
+        message_id=456,  # type: ignore[arg-type]
+    )
+    handler.cancel()
+
+    await handler.handle_event(
+        TraceEvent(
+            ACTION_START_TOOL,
+            task_id="421",
+            step_id="step-1",
+            data={"tool_name": "browser_navigate"},
+        )
+    )
+
+    assert handler.cancelled is True
     assert sent_texts == []
 
 

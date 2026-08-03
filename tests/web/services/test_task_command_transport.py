@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
@@ -41,6 +42,7 @@ from xagent.web.services.task_command_transport import (
     TaskCommandDeferred,
     TaskCommandKind,
     TaskCommandRejected,
+    TaskCommandTaskMissing,
     _claim_heartbeat,
     claim_task_command,
     defer_task_command,
@@ -1841,3 +1843,155 @@ async def test_prompt_dispatch_observes_late_task_failure(monkeypatch, caplog) -
         raise AssertionError("late prompt dispatch failure was not observed")
 
     assert "late dispatch failure" in caplog.text
+
+
+def test_enqueue_detects_a_task_deleted_after_the_caller_loaded_it(
+    db_session,
+) -> None:
+    """A caller's earlier snapshot must not let a deleted task be enqueued."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+    # The task id was validated earlier -- as the websocket transport does
+    # between its permission check and this enqueue -- and the row is gone by
+    # the time the command is written.
+    db_session.query(Task).filter(Task.id == task_id).delete()
+    db_session.commit()
+
+    with pytest.raises(ValueError, match=f"Task {task_id} not found"):
+        enqueue_task_command(
+            db_session,
+            task_id=task_id,
+            actor_user_id=int(user.id),
+            command_id="pause-after-delete",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+
+    assert db_session.query(TaskExecutionCommand).count() == 0
+
+
+def test_websocket_enqueue_returns_none_when_the_task_vanishes_mid_enqueue(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """allow_missing_task routes a mid-enqueue delete to the recovery sentinel.
+
+    The task exists at the permission check but is gone by the time the command
+    is written. The caller must get None so it creates a replacement task rather
+    than rejecting the delivery.
+    """
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+
+    def raise_missing(*_args, **_kwargs):
+        raise TaskCommandTaskMissing(f"Task {task_id} not found")
+
+    monkeypatch.setattr(websocket_api, "enqueue_task_command", raise_missing)
+
+    result = websocket_api._enqueue_websocket_task_command_sync(
+        task_id=task_id,
+        actor_user_id=int(user.id),
+        actor_is_admin=False,
+        command_id="pause-vanished",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+        allow_missing_task=True,
+    )
+
+    assert result is None
+
+
+def test_websocket_enqueue_reraises_missing_task_when_recovery_is_not_allowed(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without allow_missing_task the delivery must be rejected, not silently
+    swallowed as if the command had been accepted."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+
+    def raise_missing(*_args, **_kwargs):
+        raise TaskCommandTaskMissing(f"Task {task_id} not found")
+
+    monkeypatch.setattr(websocket_api, "enqueue_task_command", raise_missing)
+
+    with pytest.raises(TaskCommandTaskMissing):
+        websocket_api._enqueue_websocket_task_command_sync(
+            task_id=task_id,
+            actor_user_id=int(user.id),
+            actor_is_admin=False,
+            command_id="pause-vanished-strict",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+            allow_missing_task=False,
+        )
+
+
+def test_task_foreign_key_violation_is_reported_as_a_missing_task(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the task really is gone, an IntegrityError with no duplicate row is
+    a task FK failure. It must surface as a missing task so callers reach their
+    recovery path, rather than raising NoResultFound from the duplicate lookup."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+
+    real_flush = db_session.flush
+
+    def flush_raising_fk_error(*args, **kwargs):
+        db_session.flush = real_flush
+        # Delete the task so the post-rollback recheck sees it as absent, the
+        # way a concurrent delete would.
+        db_session.rollback()
+        db_session.query(Task).filter(Task.id == task_id).delete()
+        db_session.commit()
+        raise IntegrityError("INSERT", {}, Exception("FOREIGN KEY constraint failed"))
+
+    monkeypatch.setattr(db_session, "flush", flush_raising_fk_error)
+
+    with pytest.raises(ValueError, match=f"Task {task_id} not found"):
+        enqueue_task_command(
+            db_session,
+            task_id=task_id,
+            actor_user_id=int(user.id),
+            command_id="pause-fk",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+
+
+def test_actor_foreign_key_failure_is_not_reported_as_a_missing_task(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The row references both tasks and users. An IntegrityError with no
+    duplicate command does not prove the task caused it: a concurrently deleted
+    actor fails the users FK while the task is still present. That must not be
+    translated into missing-task recovery, which would continue with a cached
+    principal instead of reloading the actor."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+
+    real_flush = db_session.flush
+
+    def flush_raising_fk_error(*args, **kwargs):
+        db_session.flush = real_flush
+        raise IntegrityError("INSERT", {}, Exception("FOREIGN KEY constraint failed"))
+
+    monkeypatch.setattr(db_session, "flush", flush_raising_fk_error)
+
+    with pytest.raises(IntegrityError):
+        enqueue_task_command(
+            db_session,
+            task_id=task_id,
+            actor_user_id=int(user.id),
+            command_id="pause-actor-fk",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )

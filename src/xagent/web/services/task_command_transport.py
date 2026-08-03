@@ -56,6 +56,16 @@ class TaskCommandKind(str, enum.Enum):
     CANCEL = "cancel"
 
 
+class TaskCommandTaskMissing(ValueError):
+    """The target task no longer exists.
+
+    Raised when the row is absent, including when a concurrent delete lands
+    between the existence check and the insert. Callers that tolerate a missing
+    task treat this as the missing-task sentinel rather than a rejection, so a
+    deleted task can be replaced instead of losing the message.
+    """
+
+
 class TaskCommandDeferred(RuntimeError):
     """The command is durable but its downstream handoff is still pending."""
 
@@ -164,14 +174,18 @@ def enqueue_task_command(
     normalized_id = command_id.strip()
     if COMMAND_ID_PATTERN.fullmatch(normalized_id) is None:
         raise ValueError("command_id must be 1-64 URL-safe characters")
-    task = db.query(Task).filter(Task.id == int(task_id)).first()
+    resolved_task_id = int(task_id)
+    # A task snapshot a caller loaded earlier would widen the concurrent-delete
+    # window across everything it did in between, so existence is re-checked
+    # here, by query, before inserting a command that references the row.
+    task = db.query(Task).filter(Task.id == resolved_task_id).first()
     if task is None:
-        raise ValueError(f"Task {task_id} not found")
+        raise TaskCommandTaskMissing(f"Task {task_id} not found")
 
     existing = (
         db.query(TaskExecutionCommand)
         .filter(
-            TaskExecutionCommand.task_id == int(task_id),
+            TaskExecutionCommand.task_id == resolved_task_id,
             TaskExecutionCommand.command_id == normalized_id,
         )
         .first()
@@ -197,7 +211,7 @@ def enqueue_task_command(
         else None
     )
     command = TaskExecutionCommand(
-        task_id=int(task_id),
+        task_id=resolved_task_id,
         actor_user_id=actor_user_id,
         command_id=normalized_id,
         kind=kind.value,
@@ -208,18 +222,30 @@ def enqueue_task_command(
     )
     db.add(command)
     try:
+        db.flush()
+        command_db_id = int(command.id)
         db.commit()
-        db.refresh(command)
     except IntegrityError:
         db.rollback()
         raced = (
             db.query(TaskExecutionCommand)
             .filter(
-                TaskExecutionCommand.task_id == int(task_id),
+                TaskExecutionCommand.task_id == resolved_task_id,
                 TaskExecutionCommand.command_id == normalized_id,
             )
-            .one()
+            .one_or_none()
         )
+        if raced is None:
+            # No duplicate command exists, so this was not an idempotency race.
+            # The row references two foreign keys, so absence of a duplicate
+            # does not prove the task caused it: a concurrently deleted actor
+            # fails the users FK while the task is still present. Only report a
+            # missing task when the task really is gone; otherwise preserve the
+            # original failure so callers cannot mistake an actor problem for
+            # missing-task recovery.
+            if db.query(Task.id).filter(Task.id == resolved_task_id).scalar() is None:
+                raise TaskCommandTaskMissing(f"Task {task_id} not found") from None
+            raise
         matches = _matches_existing(
             raced,
             actor_user_id=actor_user_id,
@@ -236,7 +262,7 @@ def enqueue_task_command(
 
     notify_task_command_dispatcher()
     return EnqueuedTaskCommand(
-        command_id=int(command.id),
+        command_id=command_db_id,
         client_command_id=normalized_id,
         created=True,
         payload_matches=True,

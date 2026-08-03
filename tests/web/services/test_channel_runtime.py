@@ -787,6 +787,290 @@ async def test_prepare_channel_task_continues_task_when_selection_still_valid(
 
 
 @pytest.mark.asyncio
+async def test_numeric_allowed_users_authorizes_the_matching_sender(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """allowed_users is arbitrary JSON, so its ids may be numeric.
+
+    External sender ids are always strings, so an untyped comparison denied
+    every sender for a numeric config. Membership is compared as strings --
+    which widens authorization for numeric configs -- but a non-matching
+    sender must still be denied.
+    """
+
+    engine, SessionLocal, user_id, _ = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+
+    with SessionLocal() as db:
+        channel = UserChannel(
+            user_id=user_id,
+            channel_type="telegram",
+            channel_name="Numeric allowlist",
+            config={"allowed_users": [123, 456]},
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        channel_id = int(channel.id)
+
+    snapshot = await channel_runtime.authorize_channel_sender(
+        channel_id=channel_id,
+        external_user_id="123",
+    )
+    assert snapshot.user_id == user_id
+
+    with pytest.raises(channel_runtime.ChannelAuthorizationError):
+        await channel_runtime.authorize_channel_sender(
+            channel_id=channel_id,
+            external_user_id="789",
+        )
+
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_dict_allowed_users_still_authorizes_by_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Pre-PR, `in` on a dict config matched keys; that must keep working.
+
+    Hard-failing would lock out a channel configured as {"id": "label"} via
+    the API, a regression the type guard must not introduce.
+    """
+
+    engine, SessionLocal, user_id, _ = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+
+    with SessionLocal() as db:
+        channel = UserChannel(
+            user_id=user_id,
+            channel_type="telegram",
+            channel_name="Dict allowlist",
+            config={"allowed_users": {"123": "alice"}},
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        channel_id = int(channel.id)
+
+    snapshot = await channel_runtime.authorize_channel_sender(
+        channel_id=channel_id,
+        external_user_id="123",
+    )
+    assert snapshot.user_id == user_id
+
+    with pytest.raises(channel_runtime.ChannelAuthorizationError):
+        await channel_runtime.authorize_channel_sender(
+            channel_id=channel_id,
+            external_user_id="alice",
+        )
+
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bare_string_allowed_users_is_not_matched_per_character(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """config is unconstrained JSON, so allowed_users may be a bare string.
+
+    Iterating one yields its characters, which would authorize "1" and deny the
+    intended "101". It must be treated as a single-entry allowlist.
+    """
+
+    engine, SessionLocal, user_id, _ = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+
+    with SessionLocal() as db:
+        channel = UserChannel(
+            user_id=user_id,
+            channel_type="telegram",
+            channel_name="Bare string allowlist",
+            config={"allowed_users": "101"},
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        channel_id = int(channel.id)
+
+    snapshot = await channel_runtime.authorize_channel_sender(
+        channel_id=channel_id,
+        external_user_id="101",
+    )
+    assert snapshot.user_id == user_id
+
+    # A single character of the configured id must not authorize anyone.
+    with pytest.raises(channel_runtime.ChannelAuthorizationError):
+        await channel_runtime.authorize_channel_sender(
+            channel_id=channel_id,
+            external_user_id="1",
+        )
+
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_closing_a_running_claim_would_fail_the_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    """ManagedTaskLease.close() is not status-neutral on a RUNNING task.
+
+    prepare_channel_task commits the claim as RUNNING, and close() maps RUNNING
+    to FAILED. Any caller that means "release without changing the status" must
+    finalize explicitly instead. Pins the behaviour the Telegram fence relies on.
+    """
+
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    prepared = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=None,
+        text="hello",
+        channel_name="Telegram",
+    )
+    assert prepared is not None
+    with SessionLocal() as db:
+        assert (
+            db.query(Task).filter(Task.id == prepared.task_id).one().status
+            == TaskStatus.RUNNING
+        )
+
+    await prepared.managed_lease.close()
+
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == prepared.task_id).one()
+        assert task.status == TaskStatus.FAILED
+
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_deactivated_feishu_channel_stops_authorizing_senders(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The is_active gate is channel-agnostic and applies to Feishu too.
+
+    Feishu's bot turns ChannelConfigurationError into a config-error reply, so
+    this is a deliberate behavior change rather than a crash.
+    """
+
+    engine, SessionLocal, user_id, _ = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+
+    with SessionLocal() as db:
+        feishu = UserChannel(
+            user_id=user_id,
+            channel_type="feishu",
+            channel_name="Feishu",
+            config={"allowed_users": ["open-id-1"]},
+            is_active=True,
+        )
+        db.add(feishu)
+        db.commit()
+        feishu_channel_id = int(feishu.id)
+
+    snapshot = await channel_runtime.authorize_channel_sender(
+        channel_id=feishu_channel_id,
+        external_user_id="open-id-1",
+    )
+    assert snapshot.user_id == user_id
+
+    with SessionLocal() as db:
+        db.query(UserChannel).filter(UserChannel.id == feishu_channel_id).update(
+            {"is_active": False}
+        )
+        db.commit()
+
+    with pytest.raises(channel_runtime.ChannelConfigurationError):
+        await channel_runtime.authorize_channel_sender(
+            channel_id=feishu_channel_id,
+            external_user_id="open-id-1",
+        )
+
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_prepare_channel_task_resumes_claimed_legacy_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    """A pre-migration task must be resumed, not abandoned for a fresh one.
+
+    The legacy claim stamps ``telegram_user_id`` on the ORM object only. Sessions
+    run with ``autoflush=False``, so the resume query that filters on that column
+    cannot see the pending UPDATE unless the claim is flushed first.
+    """
+
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    # A task that predates the migration: owned by this channel, no sender stamp.
+    with SessionLocal() as db:
+        legacy = Task(
+            user_id=user_id,
+            title="Legacy conversation",
+            status=TaskStatus.COMPLETED,
+            channel_id=channel_id,
+            telegram_user_id=None,
+        )
+        db.add(legacy)
+        db.commit()
+        legacy_task_id = int(legacy.id)
+
+    resumed = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=legacy_task_id,
+        text="hello again",
+        channel_name="Telegram",
+    )
+
+    assert resumed is not None
+    assert resumed.task_id == legacy_task_id
+    assert resumed.is_new_task is False
+
+    with SessionLocal() as db:
+        claimed = db.query(Task).filter(Task.id == legacy_task_id).one()
+        assert claimed.telegram_user_id == "telegram-user"
+        assert db.query(Task).count() == 1
+
+    assert await resumed.managed_lease.finalize_result(status=TaskStatus.COMPLETED)
+    engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_prepare_channel_task_starts_new_task_when_binding_drifts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

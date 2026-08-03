@@ -213,7 +213,7 @@ class FeishuBotInstance:
                 except ChannelConfigurationError:
                     await self._send_text(
                         chat_id,
-                        "Configuration error: Cannot find the owner of this bot.",
+                        "This bot is inactive or not correctly configured.",
                     )
                     return
 
@@ -251,7 +251,7 @@ class FeishuBotInstance:
             except ChannelConfigurationError:
                 await self._send_text(
                     chat_id,
-                    "Configuration error: Cannot find the owner of this bot.",
+                    "This bot is inactive or not correctly configured.",
                 )
                 return
 
@@ -369,11 +369,8 @@ class FeishuBotInstance:
                         task_lease_heartbeat_task=managed_lease.heartbeat_task,
                     )
             finally:
-                if (
-                    fs_handler is not None
-                    and fs_handler in agent_service.tracer.handlers
-                ):
-                    agent_service.tracer.handlers.remove(fs_handler)
+                if fs_handler is not None:
+                    agent_service.tracer.remove_handler(fs_handler)
 
             projection = project_execution_result_for_channel(result)
             if not await managed_lease.finalize_result(
