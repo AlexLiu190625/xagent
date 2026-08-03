@@ -1600,3 +1600,262 @@ def test_convert_trace_checkpoint_messages_continues_after_row_error(
         )
     finally:
         db.close()
+
+
+def test_load_checkpoint_query_failure_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    def broken_get_db() -> Iterator[Session]:
+        raise RuntimeError("pool checkout failed")
+        yield  # pragma: no cover - unreachable, keeps this a generator
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", broken_get_db)
+    clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    try:
+        handler = DatabaseTraceHandler(999999)
+        with pytest.raises(CheckpointUnavailableError):
+            handler._sync_load_latest_checkpoint("exec-query-failure")
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+
+
+@pytest.mark.asyncio
+async def test_load_checkpoint_async_wrapper_propagates_query_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The async wrapper must not collapse a read failure back to ``None``."""
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        clear_degradation,
+    )
+
+    def broken_get_db() -> Iterator[Session]:
+        raise RuntimeError("pool checkout failed")
+        yield  # pragma: no cover - unreachable, keeps this a generator
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", broken_get_db)
+    clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    try:
+        handler = DatabaseTraceHandler(999999)
+        with pytest.raises(CheckpointUnavailableError):
+            await handler.load_latest_checkpoint("exec-query-failure-async")
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+
+
+def test_load_checkpoint_zero_rows_returns_none_and_clears_stale_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+        register_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        # A prior transient failure left the signal active; a query that
+        # completes successfully -- even with zero matching rows -- must
+        # clear it, not just a query that finds a checkpoint.
+        register_degradation(CHECKPOINT_LOAD_UNAVAILABLE, "stale from a prior failure")
+        try:
+            loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-empty"
+            )
+            assert loaded is None
+            assert CHECKPOINT_LOAD_UNAVAILABLE not in active_degradations()
+        finally:
+            clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_all_rows_undecodable_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every matching row permanently undecodable, set exhausted -> corrupt."""
+    from xagent.core.agent.checkpoint import CheckpointCorruptError
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        for offset, event_id in enumerate(["corrupt-old", "corrupt-new"]):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=event_id,
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=offset),
+                    data=_checkpoint_data(
+                        "exec-corrupt",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{event_id}"]),
+                            "refs": [f"sha256:missing-{event_id}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        with pytest.raises(CheckpointCorruptError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint("exec-corrupt")
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_generic_decode_failure_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient failure on every row must not be reported as corrupt."""
+    from unittest.mock import patch
+
+    import xagent.web.services.trace_message_storage as tms
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        encoded = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data(
+                "exec-transient", [{"role": "user", "content": "needs prefetch"}]
+            ),
+        )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="needs-prefetch",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data=encoded,
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        with patch.object(
+            tms,
+            "_load_trace_blob_lookup",
+            side_effect=RuntimeError("transient db error"),
+        ):
+            with pytest.raises(CheckpointUnavailableError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "exec-transient"
+                )
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_undecodable_window_full_raises_unavailable_not_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full scan window can't prove the candidate set is exhausted."""
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.api.trace_handlers import CHECKPOINT_ROW_SCAN_LIMIT
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        for i in range(CHECKPOINT_ROW_SCAN_LIMIT):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"window-full-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=i),
+                    data=_checkpoint_data(
+                        "exec-window-full",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        with pytest.raises(CheckpointUnavailableError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-window-full"
+            )
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_readable_type_without_snapshot_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row that claims to be a checkpoint but carries no payload is corrupt,
+    not absent -- it must not be silently treated as "no checkpoint"."""
+    from xagent.core.agent.checkpoint import CheckpointCorruptError
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="no-snapshot",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data={
+                    "checkpoint_type": CHECKPOINT_TYPE,
+                    "execution_id": "exec-no-snapshot",
+                },
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        with pytest.raises(CheckpointCorruptError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-no-snapshot"
+            )
+    finally:
+        db.close()

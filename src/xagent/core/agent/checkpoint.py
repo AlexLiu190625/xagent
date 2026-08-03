@@ -44,6 +44,46 @@ class CheckpointPersistenceError(RuntimeError):
     """Raised when a checkpoint cannot be durably persisted."""
 
 
+class CheckpointReadError(RuntimeError):
+    """Base for checkpoint read failures that must not collapse to absence.
+
+    ``None`` from a checkpoint reader means "queried successfully, nothing
+    found" — an authoritative fact callers may act on (e.g. build a fresh
+    context). Anything that prevented that determination raises one of the
+    subclasses below instead, so a transient or refused read can never be
+    mistaken for a checkpoint that genuinely does not exist.
+    """
+
+
+class CheckpointUnavailableError(CheckpointReadError):
+    """Raised when a checkpoint read could not be completed.
+
+    Covers query failures (session checkout, transient DB errors) and
+    decode failures that cannot be proven to be permanent corruption
+    because the candidate row window was exhausted before ruling it out.
+    """
+
+
+class CheckpointCorruptError(CheckpointReadError):
+    """Raised when matching checkpoint rows exist but none are usable.
+
+    Distinct from ``CheckpointUnavailableError``: the read completed and
+    the candidate set was proven exhausted, but every row is permanently
+    undecodable or shaped without a payload. This is a terminal state, not
+    a retryable one.
+    """
+
+
+class CheckpointAccessRefusedError(CheckpointReadError):
+    """Raised when a reader is not authoritative for the requested partition.
+
+    The checkpoint may exist, but this reader's partition (run binding,
+    build scope) is not the one allowed to observe it right now. Distinct
+    from absence: callers must not treat a refusal as "no checkpoint" and
+    fall back to building fresh state.
+    """
+
+
 async def read_latest_checkpoint_payload(
     reader: Any,
     execution_id: str,
