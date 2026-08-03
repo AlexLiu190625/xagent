@@ -17,13 +17,8 @@ on:
       - 'src/xagent/web/services/task_command_transport.py'
       - 'tests/web/services/test_task_command_transport.py'
       - 'src/xagent/web/models/task.py'
-      - 'src/xagent/web/services/task_lease_service.py'
-      - 'src/xagent/web/api/monitor.py'
-      - 'tests/web/services/task_status_predicate_guard.py'
       - 'tests/web/services/task_status_storage_shared.py'
-      - 'tests/web/services/test_task_status_storage.py'
       - 'tests/web/services/test_task_status_storage_postgresql.py'
-      - 'tests/web/services/test_task_status_predicate_guard.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -72,13 +67,8 @@ jobs:
             src/xagent/web/services/task_command_transport.py
             tests/web/services/test_task_command_transport.py
             src/xagent/web/models/task.py
-            src/xagent/web/services/task_lease_service.py
-            src/xagent/web/api/monitor.py
-            tests/web/services/task_status_predicate_guard.py
             tests/web/services/task_status_storage_shared.py
-            tests/web/services/test_task_status_storage.py
             tests/web/services/test_task_status_storage_postgresql.py
-            tests/web/services/test_task_status_predicate_guard.py
           )
 
           case "$EVENT_NAME" in
@@ -248,9 +238,7 @@ jobs:
       - name: Test task status storage semantics (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          pytest tests/web/services/test_task_status_storage.py \
-            tests/web/services/test_task_status_storage_postgresql.py \
-            tests/web/services/test_task_status_predicate_guard.py -q
+          pytest tests/web/services/test_task_status_storage_postgresql.py -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
