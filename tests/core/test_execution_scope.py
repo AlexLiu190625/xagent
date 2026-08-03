@@ -2378,3 +2378,28 @@ class TestAuthorityMismatchNamesItsRemediation:
         remediation = [r for r in records if EXECUTION_SCOPE_AGENT_CONFIG_KEY in r]
         assert remediation, records
         assert "every turn" in remediation[0].lower()
+
+
+class TestPersistedAgentConfigRejectsADecodedScope:
+    """The override takes the task's raw ``agent_config``. An already-decoded
+    scope is not a Mapping, so decoding it would yield "no snapshot" -- which
+    on the abstention and no-resolver branches is indistinguishable from an
+    authoritative unscoped answer. It has to be refused, not dropped."""
+
+    def test_passing_a_scope_is_a_contract_error_not_a_silent_miss(self):
+        with pytest.raises(ExecutionScopeResolverContractError):
+            resolve_execution_scope(
+                "1", persisted_agent_config=ExecutionScope(sandbox_key_suffix="s")
+            )
+
+    def test_raw_agent_config_still_resolves(self):
+        scope = ExecutionScope(sandbox_key_suffix="s")
+        assert (
+            resolve_execution_scope(
+                "1",
+                persisted_agent_config={
+                    EXECUTION_SCOPE_AGENT_CONFIG_KEY: scope.to_dict()
+                },
+            )
+            == scope
+        )

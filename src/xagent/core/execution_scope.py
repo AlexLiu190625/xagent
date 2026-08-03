@@ -1351,6 +1351,17 @@ def _load_execution_scope_snapshot(
             if _execution_scope_snapshot_loader is not None
             else None
         )
+    if isinstance(persisted_agent_config, ExecutionScope):
+        # An already-decoded scope would not be a Mapping, so the decode below
+        # would read it as "this task carries no snapshot" -- which on the
+        # branches that must fail closed is indistinguishable from an
+        # authoritative unscoped answer. Refuse it instead of silently
+        # dropping the caller's value.
+        raise ExecutionScopeResolverContractError(
+            "persisted_agent_config takes the task's raw agent_config mapping, "
+            "not an already-decoded ExecutionScope; the snapshot inside it is "
+            "decoded here so each resolution branch keeps its own tolerance"
+        )
     return execution_scope_from_agent_config(
         cast(Optional[Mapping[str, Any]], persisted_agent_config)
     )

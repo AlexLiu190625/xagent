@@ -344,7 +344,7 @@ def test_resolve_fails_closed_on_registered_scope_authority_mismatch(
 ) -> None:
     """A turn face: the resolved scope selects the namespace files are read
     back from, and this call passes the persisted snapshot it already read
-    in its own Session explicitly via ``persisted_snapshot``, so a
+    in its own Session explicitly via ``persisted_agent_config``, so a
     disagreement between the registered resolver and that snapshot must
     propagate ``ExecutionScopeAuthorityError`` instead of being downgraded,
     and no file may be materialized on the mismatched path."""
