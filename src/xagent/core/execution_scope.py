@@ -1669,10 +1669,20 @@ def resolve_execution_scope(
         if name in _EXECUTION_SCOPE_NAMESPACE_FIELDS
     }
     if namespace_diff:
+        # Names the remediation, not just the fault: this mismatch is stable,
+        # so every turn of this task fails the same way until the persisted
+        # snapshot is removed or corrected. Without the recovery spelled out
+        # here, the only signal an operator gets is a repeating failure with
+        # no stated way out, and the snapshot lives in a column no request
+        # path offers to clear.
         logger.error(
-            "Execution scope authority mismatch for task %s: %s",
+            "Execution scope authority mismatch for task %s: %s. Every turn of "
+            "this task fails until the persisted snapshot agrees with the "
+            "resolver: clear the %r key from this task's agent_config to let "
+            "the resolver's answer stand alone, or correct it to match.",
             task_id,
             diff,
+            EXECUTION_SCOPE_AGENT_CONFIG_KEY,
         )
         # mismatched_fields carries only namespace_diff, not the full diff:
         # this error reaches task.error_message and a client-facing event

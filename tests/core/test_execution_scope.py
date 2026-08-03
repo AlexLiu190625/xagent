@@ -21,6 +21,7 @@ from contextlib import contextmanager
 import pytest
 
 from xagent.core.execution_scope import (
+    EXECUTION_SCOPE_AGENT_CONFIG_KEY,
     EXECUTION_SCOPE_SHAPE_VERSION,
     DeferToSnapshot,
     ExecutionScope,
@@ -2353,3 +2354,27 @@ class TestScopeFingerprintFieldCoverage:
         assert scope_fingerprint(default_mount) == scope_fingerprint(
             explicit_full_mount
         )
+
+
+class TestAuthorityMismatchNamesItsRemediation:
+    """The mismatch is stable, so every turn of the task fails the same way
+    until the persisted snapshot is removed or corrected. The operator-facing
+    log has to say that, because the snapshot sits in a column no request path
+    offers to clear and a bare repeating failure states no way out."""
+
+    def test_error_log_names_the_key_to_clear(self):
+        resolver_scope = ExecutionScope(sandbox_key_suffix="from-resolver")
+        snapshot_scope = ExecutionScope(sandbox_key_suffix="from-snapshot")
+        set_execution_scope_resolver(
+            lambda task_id: resolver_scope,
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: snapshot_scope)
+
+        with scope_log_records() as records:
+            with pytest.raises(ExecutionScopeAuthorityError):
+                resolve_execution_scope("1")
+
+        remediation = [r for r in records if EXECUTION_SCOPE_AGENT_CONFIG_KEY in r]
+        assert remediation, records
+        assert "every turn" in remediation[0].lower()
