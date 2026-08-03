@@ -250,6 +250,47 @@ def _nullable_match(column: Any, value: Any) -> Any:
     return column.is_(None) if value is None else column == value
 
 
+def lease_run_id_case(candidate_run_id: str) -> Any:
+    """SET run_id for a lease acquisition: keep the existing run unless the
+    row is not RUNNING."""
+    return case(
+        (task_status_predicate.ne(TaskStatus.RUNNING), candidate_run_id),
+        else_=func.coalesce(Task.run_id, candidate_run_id),
+    )
+
+
+def lease_state_version_case(
+    status: TaskStatus, control_state: str, current_version: Any
+) -> Any:
+    """SET state_version: bump only when this write actually changes the
+    row's (status, control_state) pair."""
+    return case(
+        (
+            or_(
+                task_status_predicate.ne(status),
+                Task.control_state != control_state,
+            ),
+            current_version + 1,
+        ),
+        else_=current_version,
+    )
+
+
+def lease_checkpoint_event_id_case() -> Any:
+    """SET last_checkpoint_event_id: clear it when the row is not a live
+    RUNNING row with a run id."""
+    return case(
+        (
+            or_(
+                task_status_predicate.ne(TaskStatus.RUNNING),
+                Task.run_id.is_(None),
+            ),
+            None,
+        ),
+        else_=Task.last_checkpoint_event_id,
+    )
+
+
 def _expired_task_lease_candidates_query(
     db: Session,
     *,
@@ -467,23 +508,11 @@ def acquire_task_lease_no_commit(
         "last_heartbeat_at": now,
         "lease_expires_at": expires_at,
         "run_id": (
-            candidate_run_id
-            if new_run
-            else case(
-                (task_status_predicate.ne(TaskStatus.RUNNING), candidate_run_id),
-                else_=func.coalesce(Task.run_id, candidate_run_id),
-            )
+            candidate_run_id if new_run else lease_run_id_case(candidate_run_id)
         ),
         "control_state": running_control_state,
-        "state_version": case(
-            (
-                or_(
-                    task_status_predicate.ne(TaskStatus.RUNNING),
-                    Task.control_state != running_control_state,
-                ),
-                current_version + 1,
-            ),
-            else_=current_version,
+        "state_version": lease_state_version_case(
+            TaskStatus.RUNNING, running_control_state, current_version
         ),
     }
     if new_run:
@@ -491,16 +520,7 @@ def acquire_task_lease_no_commit(
         values["output"] = None
         values["error_message"] = None
     elif expected_run_id is None:
-        values["last_checkpoint_event_id"] = case(
-            (
-                or_(
-                    task_status_predicate.ne(TaskStatus.RUNNING),
-                    Task.run_id.is_(None),
-                ),
-                None,
-            ),
-            else_=Task.last_checkpoint_event_id,
-        )
+        values["last_checkpoint_event_id"] = lease_checkpoint_event_id_case()
 
     stmt = (
         update(Task)
@@ -700,15 +720,8 @@ def release_task_lease_no_commit(
             lease_expires_at=None,
             last_heartbeat_at=utc_now(),
             control_state=control_state,
-            state_version=case(
-                (
-                    or_(
-                        task_status_predicate.ne(status),
-                        Task.control_state != control_state,
-                    ),
-                    current_version + 1,
-                ),
-                else_=current_version,
+            state_version=lease_state_version_case(
+                status, control_state, current_version
             ),
         )
     )
@@ -780,15 +793,8 @@ def release_current_runner_task_lease(
             lease_expires_at=None,
             last_heartbeat_at=utc_now(),
             control_state=control_state,
-            state_version=case(
-                (
-                    or_(
-                        task_status_predicate.ne(status),
-                        Task.control_state != control_state,
-                    ),
-                    current_version + 1,
-                ),
-                else_=current_version,
+            state_version=lease_state_version_case(
+                status, control_state, current_version
             ),
         )
     )

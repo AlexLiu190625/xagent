@@ -19,6 +19,9 @@ sentinel.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 from sqlalchemy import Column, Integer, String, case, func, or_, text, update
 from sqlalchemy.orm import declarative_base
@@ -31,7 +34,13 @@ from tests.web.services.task_status_storage_shared import (
 )
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus, task_status_predicate
+from xagent.web.services import task_lease_service
 from xagent.web.services.task_execution_controller import control_state_for_status
+from xagent.web.services.task_lease_service import (
+    lease_checkpoint_event_id_case,
+    lease_run_id_case,
+    lease_state_version_case,
+)
 
 
 @pytest.fixture()
@@ -360,173 +369,140 @@ def test_predicate_is_not_null_matches_raw_comparison() -> None:
 
 def test_predicate_in_rejects_none_with_a_descriptive_error() -> None:
     with pytest.raises(TypeError, match="wrap a single member in a list"):
-        task_status_predicate.in_(None)
+        task_status_predicate.in_(None)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="wrap a single member in a list"):
-        task_status_predicate.not_in(None)
+        task_status_predicate.not_in(None)  # type: ignore[arg-type]
 
 
-# --- Full-statement equivalence for the 5 UPDATE SET-case sites -----------
-# These 5 are case() expressions inside .values(), not WHERE clauses; the
-# equivalence check must diff the complete compiled UPDATE, not just an
-# isolated boolean expression, since the case()'s THEN/ELSE wiring is part
-# of what "equivalent" means here.
+# --- Full-statement equivalence for the 3 UPDATE SET-case builders --------
+# lease_run_id_case / lease_state_version_case / lease_checkpoint_event_id_case
+# are imported straight from task_lease_service.py -- these tests are a
+# deliberate second consumer of the production expression, not a hand-copied
+# reimplementation of it. Each diffs the complete compiled UPDATE, not an
+# isolated boolean expression, since the case()'s THEN/ELSE wiring is part of
+# what "equivalent" means here.
 
 
-def _acquire_lease_run_id_case(status_expr):
+def test_lease_run_id_case_matches_raw_comparison() -> None:
+    """acquire_task_lease_no_commit's run_id SET case."""
     candidate_run_id = "candidate-run-id"
-    return case(
-        (status_expr, candidate_run_id),
-        else_=func.coalesce(Task.run_id, candidate_run_id),
-    )
-
-
-def test_set_case_run_id_site_matches_raw_comparison() -> None:
-    """task_lease_service.py:472-475 (acquire_task_lease_no_commit)."""
-    stmt_raw = (
-        update(Task)
-        .where(Task.id == 1)
-        .values(run_id=_acquire_lease_run_id_case(Task.status != TaskStatus.RUNNING))
-    )
-    stmt_bound = (
-        update(Task)
-        .where(Task.id == 1)
-        .values(
-            run_id=_acquire_lease_run_id_case(
-                task_status_predicate.ne(TaskStatus.RUNNING)
-            )
-        )
-    )
-    assert _compiled(stmt_raw) == _compiled(stmt_bound)
-
-
-def _acquire_lease_state_version_case(status_expr, running_control_state):
-    current_version = func.coalesce(Task.state_version, 0)
-    return case(
-        (
-            or_(status_expr, Task.control_state != running_control_state),
-            current_version + 1,
-        ),
-        else_=current_version,
-    )
-
-
-def test_set_case_state_version_site_matches_raw_comparison() -> None:
-    """task_lease_service.py:478-487 (acquire_task_lease_no_commit)."""
-    running_control_state = control_state_for_status(TaskStatus.RUNNING).value
     stmt_raw = (
         update(Task)
         .where(Task.id == 1)
         .values(
-            state_version=_acquire_lease_state_version_case(
-                Task.status != TaskStatus.RUNNING, running_control_state
+            run_id=case(
+                (Task.status != TaskStatus.RUNNING, candidate_run_id),
+                else_=func.coalesce(Task.run_id, candidate_run_id),
             )
         )
     )
     stmt_bound = (
         update(Task)
         .where(Task.id == 1)
-        .values(
-            state_version=_acquire_lease_state_version_case(
-                task_status_predicate.ne(TaskStatus.RUNNING), running_control_state
-            )
-        )
+        .values(run_id=lease_run_id_case(candidate_run_id))
     )
     assert _compiled(stmt_raw) == _compiled(stmt_bound)
 
 
-def _acquire_lease_checkpoint_case(status_expr):
-    return case(
-        (or_(status_expr, Task.run_id.is_(None)), None),
-        else_=Task.last_checkpoint_event_id,
-    )
-
-
-def test_set_case_checkpoint_site_matches_raw_comparison() -> None:
-    """task_lease_service.py:494-503 (acquire_task_lease_no_commit)."""
-    stmt_raw = (
-        update(Task)
-        .where(Task.id == 1)
-        .values(
-            last_checkpoint_event_id=_acquire_lease_checkpoint_case(
-                Task.status != TaskStatus.RUNNING
-            )
-        )
-    )
-    stmt_bound = (
-        update(Task)
-        .where(Task.id == 1)
-        .values(
-            last_checkpoint_event_id=_acquire_lease_checkpoint_case(
-                task_status_predicate.ne(TaskStatus.RUNNING)
-            )
-        )
-    )
-    assert _compiled(stmt_raw) == _compiled(stmt_bound)
-
-
-def _release_lease_state_version_case(status_expr, control_state):
-    current_version = func.coalesce(Task.state_version, 0)
-    return case(
-        (
-            or_(status_expr, Task.control_state != control_state),
-            current_version + 1,
-        ),
-        else_=current_version,
-    )
-
-
-def test_set_case_release_lease_site_matches_raw_comparison() -> None:
-    """task_lease_service.py:703-709 (release_task_lease_no_commit) --
-    the ne() side takes a runtime TaskStatus parameter, not a constant.
+@pytest.mark.parametrize(
+    "status",
+    [TaskStatus.RUNNING, TaskStatus.PAUSED, TaskStatus.FAILED, TaskStatus.COMPLETED],
+)
+def test_lease_state_version_case_matches_raw_comparison(status) -> None:
+    """The state_version SET case shared by acquire_task_lease_no_commit and
+    both release sites (release_task_lease_no_commit,
+    release_current_runner_task_lease) -- one row per (status, control_state)
+    pair actually reachable in production: RUNNING for the acquire site,
+    PAUSED/FAILED/COMPLETED for the two release sites.
     """
-    for status in (TaskStatus.PAUSED, TaskStatus.FAILED, TaskStatus.COMPLETED):
-        control_state = control_state_for_status(status).value
-        stmt_raw = (
-            update(Task)
-            .where(Task.id == 1)
-            .values(
-                state_version=_release_lease_state_version_case(
-                    Task.status != status, control_state
-                )
+    control_state = control_state_for_status(status).value
+    current_version = func.coalesce(Task.state_version, 0)
+    stmt_raw = (
+        update(Task)
+        .where(Task.id == 1)
+        .values(
+            state_version=case(
+                (
+                    or_(
+                        Task.status != status,
+                        Task.control_state != control_state,
+                    ),
+                    current_version + 1,
+                ),
+                else_=current_version,
             )
         )
-        stmt_bound = (
-            update(Task)
-            .where(Task.id == 1)
-            .values(
-                state_version=_release_lease_state_version_case(
-                    task_status_predicate.ne(status), control_state
-                )
+    )
+    stmt_bound = (
+        update(Task)
+        .where(Task.id == 1)
+        .values(
+            state_version=lease_state_version_case(
+                status, control_state, current_version
             )
         )
-        assert _compiled(stmt_raw) == _compiled(stmt_bound)
+    )
+    assert _compiled(stmt_raw) == _compiled(stmt_bound)
 
 
-def test_set_case_release_current_runner_site_matches_raw_comparison() -> None:
-    """task_lease_service.py:780-786 (release_current_runner_task_lease) --
-    identical shape to the previous site, different call site.
+def test_lease_checkpoint_event_id_case_matches_raw_comparison() -> None:
+    """acquire_task_lease_no_commit's last_checkpoint_event_id SET case."""
+    stmt_raw = (
+        update(Task)
+        .where(Task.id == 1)
+        .values(
+            last_checkpoint_event_id=case(
+                (
+                    or_(Task.status != TaskStatus.RUNNING, Task.run_id.is_(None)),
+                    None,
+                ),
+                else_=Task.last_checkpoint_event_id,
+            )
+        )
+    )
+    stmt_bound = (
+        update(Task)
+        .where(Task.id == 1)
+        .values(last_checkpoint_event_id=lease_checkpoint_event_id_case())
+    )
+    assert _compiled(stmt_raw) == _compiled(stmt_bound)
+
+
+def test_lease_case_builders_are_the_only_case_calls_in_the_lease_service() -> None:
+    """Without this, someone can inline a fourth case() back into a
+    statement and the imported-builder tests above stay green while
+    production drifts -- the same failure mode this recoupling closes, one
+    level up.
     """
-    for status in (TaskStatus.PAUSED, TaskStatus.FAILED, TaskStatus.COMPLETED):
-        control_state = control_state_for_status(status).value
-        stmt_raw = (
-            update(Task)
-            .where(Task.id == 1)
-            .values(
-                state_version=_release_lease_state_version_case(
-                    Task.status != status, control_state
-                )
-            )
-        )
-        stmt_bound = (
-            update(Task)
-            .where(Task.id == 1)
-            .values(
-                state_version=_release_lease_state_version_case(
-                    task_status_predicate.ne(status), control_state
-                )
-            )
-        )
-        assert _compiled(stmt_raw) == _compiled(stmt_bound)
+    builder_names = {
+        "lease_run_id_case",
+        "lease_state_version_case",
+        "lease_checkpoint_event_id_case",
+    }
+    source = Path(task_lease_service.__file__).read_text()
+    tree = ast.parse(source)
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def _enclosing_function(node: ast.AST) -> str | None:
+        current = parents.get(node)
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return current.name
+            current = parents.get(current)
+        return None
+
+    stray = [
+        (_enclosing_function(node), node.lineno)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "case"
+        and _enclosing_function(node) not in builder_names
+    ]
+    assert stray == [], f"case() called outside the three lease builders: {stray}"
 
 
 # --- WHERE-clause equivalence for the 6 WHERE sites (constants, not case) -
