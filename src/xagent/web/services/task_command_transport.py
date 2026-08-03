@@ -239,6 +239,15 @@ def stage_task_command(
        the unique constraint to reject it.
     5. Add and flush the new row last, so any remaining IntegrityError is
        attributable to the command insert itself.
+
+    On every exit path -- a created row, an idempotent hit, or
+    TaskCommandTaskMissing -- this call must be the last write a caller
+    issues before it commits, with no I/O or other slow work in between.
+    Returning leaves the caller holding a write lock (database-wide on
+    SQLite) over its pre-flushed writes, and over the new command row on the
+    created path, until its transaction ends; anything slow placed after
+    this call stalls every concurrent writer, the dispatcher's claim
+    included.
     """
 
     normalized_id = command_id.strip()
@@ -333,6 +342,13 @@ def classify_task_command_conflict(
     neither -- the row references two foreign keys, so absence of a duplicate
     does not prove the task caused it: a concurrently deleted actor fails the
     users FK while the task is still present (UNRELATED).
+
+    RACED_DUPLICATE means the command survived the race, not that the
+    caller's work did: the rollback that had to precede this call also undid
+    whatever else the caller had written. A caller that had such writes must
+    redo them rather than report success. A caller with nothing else pending
+    -- enqueue_task_command is one -- has nothing to redo and reports the
+    raced row as created=False.
     """
 
     resolved_task_id = int(task_id)

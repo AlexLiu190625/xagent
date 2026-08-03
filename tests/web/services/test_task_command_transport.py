@@ -2536,8 +2536,8 @@ def test_owner_holding_a_flushed_command_blocks_a_concurrent_claim(
 ) -> None:
     """Staging is the last write before the owner's commit, so the row it
     flushes stays under SQLite's writer lock for the rest of the owner's
-    transaction -- no longer the microseconds a bare insert-and-commit would
-    hold it for. SQLite's writer lock is database-wide, so a concurrent claim
+    transaction -- far longer than the microseconds an insert that committed
+    itself holds it for. SQLite's writer lock is database-wide, so a concurrent claim
     of a different, already-committed command must still wait out
     busy_timeout and fail with OperationalError rather than hang."""
 
