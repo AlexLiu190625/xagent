@@ -305,6 +305,18 @@ async def test_agent_tool_normal_child_result_unchanged(monkeypatch):
     assert result == {"response": "all good"}
 
 
+def test_classifier_leaves_statusless_results_untouched():
+    """Absent status/success is inert even when output is missing or empty.
+
+    The missing-output branch fires only on an explicit completed status;
+    a result carrying neither status nor usable output stays unclassified
+    rather than being reinterpreted as a failure.
+    """
+
+    assert mod._classify_delegated_child_failure({}) is None
+    assert mod._classify_delegated_child_failure({"output": ""}) is None
+
+
 @pytest.mark.asyncio
 async def test_agent_tool_catchall_does_not_rewrap_classified_failure(monkeypatch):
     """The classified failure must return before the catch-all can touch it.
@@ -670,9 +682,9 @@ def _real_delegated_agent_tool(monkeypatch, tmp_path, llm) -> AgentTool:
 async def test_agent_tool_real_pausing_child_fails_closed(monkeypatch, tmp_path):
     """A real ReAct child that asks the user a question fails closed end to end.
 
-    Closes the loop the reviewer flagged: the classifier must work against
-    the actual shape ``AgentExecutionAdapter._normalize_result`` produces
-    from a real pattern run, not just against hand-built dicts.
+    The classifier must work against the actual shape
+    ``AgentExecutionAdapter._normalize_result`` produces from a real pattern
+    run, not just against hand-built dicts.
     """
 
     llm = _StubSingleCallLLM(
