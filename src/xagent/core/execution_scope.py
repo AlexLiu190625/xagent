@@ -199,7 +199,7 @@ def _coerce_snapshot_version(raw_version: Any) -> int:
     directly, and a row persisted before ``execution_scope`` was reserved at
     the request boundary (``CLIENT_RESERVED_AGENT_CONFIG_KEYS``,
     ``xagent.web.services.task_runtime``) still carries whatever a request
-    seeded at the time. Exactly one value means "authentic snapshot written
+    seeded at the time (issue #1135). Exactly one value means "authentic snapshot written
     before this field existed": ``0``, what an absent key decodes to.
     That marker carries real trust -- the *older* half of
     ``_validate_execution_scope_snapshot_candidate``'s asymmetric gate is
@@ -780,9 +780,12 @@ class DeferToSnapshot:
     ``session_factory`` (``TaskRuntimeContext.session_factory``,
     ``xagent.core.task_runtime``) and can write this column directly, and a
     row persisted before the request-body refusal existed still carries
-    whatever a request seeded at the time. No resolver in this repository
-    sets ``snapshot_defines_namespace=True``, and none should until the
-    snapshot is server-owned end to end.
+    whatever a request seeded at the time -- those rows are not disarmed by
+    that refusal and cannot be judged from the column itself, since a value
+    stored then could name any version or marker (issue #1135 owns clearing
+    them). No resolver in this repository sets
+    ``snapshot_defines_namespace=True``, and none should until the snapshot is
+    server-owned end to end.
     The flag exists so the abstention shape a workforce sub-task needs is
     expressible and reviewable; it is inert until something opts in.
 
