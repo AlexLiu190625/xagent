@@ -58,6 +58,11 @@ _PUBLIC_METADATA_STATUS_RESERVE_BYTES = 2 * 1024
 # extension names one task actually bound to. Reusing the existing JSON column
 # keeps the per-task binding record migration-free.
 TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY = "runtime_extension_bindings"
+# Reserved ``tasks.agent_config`` key holding the server-validated list of
+# uploaded file ids bound to one task. ``chat.py``'s ``_build_task_agent_config``
+# owns the value it substitutes; this constant names the key so the sanitizer
+# and that boundary refer to the same string.
+SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # Keys in ``tasks.agent_config`` that only the server may write. Task-create
 # request bodies carry a free-form ``agent_config`` dict that endpoints copy
 # wholesale, so anything the server later reads back as authoritative has to
@@ -97,10 +102,26 @@ TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY = "runtime_extension_bindings"
 # ``tests/web/test_execution_scope_delegation.py::
 # TestWorkforceTaskConfigSnapshot::test_scope_persisted_when_active`` asserts
 # the server-written scope lands.
+#
+# ``selected_file_ids`` qualifies for the same reason and passes both checks.
+# It was declared server-owned when it was introduced -- ``chat.py``'s
+# ``_build_task_agent_config`` drops the client value and substitutes a list
+# validated against ``UploadedFile.user_id`` and ``task_id IS NULL`` -- but
+# that enforcement was local to one boundary, so the widget and share
+# task-create paths, which never set the key themselves, persisted whatever a
+# request body carried. Both readers (``chat.py``'s turn file materialization
+# and ``websocket.py``'s file-ref echo) re-check ownership in the query, so a
+# forged id could only name a file the publisher already owns and only if the
+# caller knew its uuid4 -- narrower than ``execution_scope``, where naming a
+# namespace is enough. Reserving it moves one invariant to one owner. The
+# ``pop`` in ``_build_task_agent_config`` stays: that boundary substitutes a
+# recomputed list rather than only dropping the client's, and keeping it means
+# the substitution does not depend on this set's contents.
 CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
         EXECUTION_SCOPE_AGENT_CONFIG_KEY,
+        SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
     }
 )
 logger = logging.getLogger(__name__)

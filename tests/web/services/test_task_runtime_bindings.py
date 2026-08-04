@@ -15,6 +15,7 @@ from xagent.core.execution_scope import (
 from xagent.core.task_runtime import TaskRuntimeContext, TaskRuntimeContribution
 from xagent.web.services.task_runtime import (
     CLIENT_RESERVED_AGENT_CONFIG_KEYS,
+    SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
     TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
     TaskRuntimeExtensionError,
     agent_config_with_task_extension_bindings,
@@ -273,7 +274,7 @@ def test_the_reserved_key_set_has_exactly_the_audited_members() -> None:
     which requests get stripped at every task-create boundary.
     """
     assert CLIENT_RESERVED_AGENT_CONFIG_KEYS == frozenset(
-        {"runtime_extension_bindings", "execution_scope"}
+        {"runtime_extension_bindings", "execution_scope", "selected_file_ids"}
     )
 
 
@@ -287,3 +288,20 @@ def test_agent_builder_preview_keys_are_not_reserved() -> None:
     assert {"is_preview", "preview_agent_id"}.isdisjoint(
         CLIENT_RESERVED_AGENT_CONFIG_KEYS
     )
+
+
+def test_selected_file_ids_is_reserved_so_a_request_cannot_name_files() -> None:
+    """The bound file list is server-validated: the chat boundary substitutes a
+    list filtered by owner and unbound-task before persisting it, and both
+    readers re-check ownership in their own query. Reserving the key moves that
+    enforcement to the one place every boundary shares, so the widget and share
+    paths -- which never set the key themselves -- stop persisting whatever a
+    request body carried.
+    """
+    assert SELECTED_FILE_IDS_AGENT_CONFIG_KEY in CLIENT_RESERVED_AGENT_CONFIG_KEYS
+
+    sanitized = sanitize_client_agent_config(
+        {SELECTED_FILE_IDS_AGENT_CONFIG_KEY: ["forged-file-id"], "keep": 1}
+    )
+
+    assert sanitized == {"keep": 1}
