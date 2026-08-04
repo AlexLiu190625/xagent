@@ -152,7 +152,11 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null
 }
 
-function getAgentUpdateErrorMessage(error: unknown, fallback: string): string {
+// Safe error-message path for the builder's response-body error branches:
+// only displayable strings may reach toast.error; objects and arrays are
+// reduced to their readable messages and anything else falls back to the
+// caller's localized message.
+function getBuilderErrorMessage(error: unknown, fallback: string): string {
   if (!isJsonRecord(error)) return fallback
 
   const detail = error.detail
@@ -1574,7 +1578,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       } else {
         const error: unknown = await response.json().catch(() => null)
         toast.error(
-          getAgentUpdateErrorMessage(error, t("builds.editor.error.unknown"))
+          getBuilderErrorMessage(error, t("builds.editor.error.unknown"))
         )
       }
     } catch (error) {
@@ -1602,8 +1606,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         })
         toast.success(t("builds.editor.success.published"))
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.publication.publishFailed"))
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(error, t("builds.publication.publishFailed"))
+        )
       }
     } catch (error) {
       console.error("Failed to publish agent:", error)
@@ -1630,8 +1636,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         })
         toast.success(t("builds.editor.success.unpublished"))
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.publication.unpublishFailed"))
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(error, t("builds.publication.unpublishFailed"))
+        )
       }
     } catch (error) {
       console.error("Failed to unpublish agent:", error)
@@ -1659,8 +1667,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           navPendingRef.current = true
         }
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.publication.publishFailed"))
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(error, t("builds.publication.publishFailed"))
+        )
       }
     } catch (error) {
       console.error("Failed to publish agent:", error)
@@ -1706,8 +1716,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         setInstructions(data.optimized_instructions)
         toast.success(t("builds.configForm.instructions.optimizeSuccess"))
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.configForm.instructions.optimizeError"))
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(
+            error,
+            t("builds.configForm.instructions.optimizeError")
+          )
+        )
       }
     } catch (error) {
       console.error("Failed to optimize instructions:", error)
