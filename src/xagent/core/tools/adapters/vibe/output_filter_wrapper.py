@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 
 from pydantic import BaseModel
 
+from ....agent.result import normalize_tool_failure_code
 from ...user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
@@ -56,6 +57,24 @@ def _is_classified_tool_failure(result: Any) -> bool:
         and result.get("is_error") is True
         and result.get("success") is False
     )
+
+
+_MAX_RESTORED_STATUS_CHARS = 64
+
+
+def _restorable_status(value: Any) -> bool:
+    """Return whether a classified failure's ``status`` may bypass filtering.
+
+    The restore writes classification keys back verbatim so the envelope
+    survives field-count truncation, and any wrapped tool returning
+    ``success=False``/``is_error=True`` reaches that branch — so the
+    verbatim write is bounded to a short plain string. Every classified
+    status in the tree is far under the cap: ``"error"`` from the delegation
+    classifier and ``UnavailableMCPTool``, and ``"waiting_for_user"`` from
+    the waiting branch above.
+    """
+
+    return type(value) is str and len(value) <= _MAX_RESTORED_STATUS_CHARS
 
 
 def _accepts_kwarg(func: Any, name: str) -> bool:
@@ -261,9 +280,19 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
             return filtered
 
         if _is_classified_tool_failure(result):
-            for key in ("success", "is_error", "status", "failure_code"):
-                if key in result:
-                    filtered[key] = result[key]
+            # ``success``/``is_error`` were matched by identity above, so
+            # they are literally ``False``/``True``; the two caller-supplied
+            # classification values are re-checked before bypassing the
+            # filter.
+            filtered["success"] = result["success"]
+            filtered["is_error"] = result["is_error"]
+            if _restorable_status(result.get("status")):
+                filtered["status"] = result["status"]
+            normalized_failure_code = normalize_tool_failure_code(
+                result.get("failure_code")
+            )
+            if normalized_failure_code is not None:
+                filtered["failure_code"] = normalized_failure_code
             for key in ("error", "output", "response"):
                 if key in result:
                     filtered[key] = self._filter.filter(result[key], self._target.name)

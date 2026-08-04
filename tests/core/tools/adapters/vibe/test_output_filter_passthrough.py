@@ -245,6 +245,51 @@ async def test_unavailable_mcp_failure_restores_classification_under_truncation(
 
 
 @pytest.mark.asyncio
+async def test_classified_failure_restore_rejects_malformed_envelope() -> None:
+    """The classified-failure restore must not let a tool smuggle raw values.
+
+    Any wrapped tool returning ``success=False``/``is_error=True`` takes the
+    restore branch, so a misbehaving or compromised tool must not be able to
+    write an oversized ``status`` or an arbitrary ``failure_code`` object
+    past the filter through it. Both must fall back to whatever ordinary
+    filtering already produced for them.
+    """
+    from xagent.core.tools.adapters.vibe.output_filter import (
+        DEFAULT_TRUNCATION_MESSAGE,
+    )
+
+    class _Unserializable:
+        def __str__(self) -> str:
+            return "unserializable-failure-code"
+
+    bad_failure_code = _Unserializable()
+    oversized_status = "x" * 100_000
+
+    class MalformedTool:
+        name = "malformed"
+        description = "Returns a malformed classified failure envelope."
+        tags: list[str] = []
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "success": False,
+                "is_error": True,
+                "status": oversized_status,
+                "failure_code": bad_failure_code,
+                "error": "boom",
+            }
+
+    result = await _wrap(MalformedTool()).run_json_async({})
+
+    assert result["success"] is False
+    assert result["is_error"] is True
+    assert result["status"] != oversized_status
+    assert len(result["status"]) <= 1_000 + len(DEFAULT_TRUNCATION_MESSAGE)
+    assert result["failure_code"] is not bad_failure_code
+    assert isinstance(result["failure_code"], str)
+
+
+@pytest.mark.asyncio
 async def test_teardown_forwards_execution_status_when_supported() -> None:
     class StatusAwareTool:
         name = "status-aware"
