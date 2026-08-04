@@ -2015,16 +2015,88 @@ def test_load_checkpoint_scan_exhausts_multiple_batches_raises_corrupt(
         db.close()
 
 
+def test_load_checkpoint_scan_stops_at_max_page_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With history pruning disabled, a backlog large enough to keep paging
+    past the cap must stop and fail unavailable instead of scanning the
+    matching set to exhaustion query by query."""
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        # 4 undecodable rows with a page size of 2 and a page cap of 2 means
+        # both pages come back full (no short page to prove exhaustion), so
+        # the loop must hit the cap on the 3rd iteration instead of issuing
+        # a 3rd query.
+        for i in range(4):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"max-page-cap-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=i),
+                    data=_checkpoint_data(
+                        "exec-max-page-cap",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+        )
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.CHECKPOINT_SCAN_MAX_PAGES", 2
+        )
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        with pytest.raises(CheckpointUnavailableError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-max-page-cap"
+            )
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
+
+
 def test_load_checkpoint_generic_failure_mid_scan_raises_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A generic (transient) failure on one row anywhere in a multi-batch
     scan is conservatively unavailable, even if every other row in the scan
-    is a confirmed permanent decode failure."""
+    is a confirmed permanent decode failure. The final raise must also
+    register the degradation signal -- the intervening successful page
+    fetches clear it, so nothing else re-raises it before this raise site
+    does."""
     from unittest.mock import patch
 
     import xagent.web.services.trace_message_storage as tms
     from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
 
     SessionLocal = _session_factory()
     db = SessionLocal()
@@ -2091,12 +2163,15 @@ def test_load_checkpoint_generic_failure_mid_scan_raises_unavailable(
                 raise RuntimeError("transient db error")
             return original_lookup(db, task_id=task_id, data_items=data_items)
 
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
         with patch.object(tms, "_load_trace_blob_lookup", side_effect=_flaky_lookup):
             with pytest.raises(CheckpointUnavailableError):
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "exec-mid-scan-failure"
                 )
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
     finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
         db.close()
 
 

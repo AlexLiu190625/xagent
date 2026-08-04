@@ -56,6 +56,14 @@ logger = logging.getLogger(__name__)
 # examine before ruling on unavailable vs. corrupt.
 CHECKPOINT_ROW_SCAN_LIMIT = 100
 
+# Operational bound on the scan loop. With history pruning disabled
+# (XAGENT_CHECKPOINT_HISTORY_LIMIT=0) and a large backlog of matching rows,
+# the loop would otherwise issue one query per CHECKPOINT_ROW_SCAN_LIMIT
+# rows before proving the matching set exhausted. This caps that cost: a
+# scan that reaches the cap without a resolution is treated as unavailable
+# rather than continuing indefinitely.
+CHECKPOINT_SCAN_MAX_PAGES = 50
+
 
 def _checkpoint_execution_id_predicate(execution_id: str) -> Any:
     """SQL mirror of ``checkpoint_execution_id()``: root wins, then the flat
@@ -223,7 +231,24 @@ class DatabaseTraceHandler(BaseTraceHandler):
             saw_undecodable_row = False
             saw_any_row = False
             offset = 0
+            page_count = 0
             while True:
+                page_count += 1
+                if page_count > CHECKPOINT_SCAN_MAX_PAGES:
+                    # The matching set is not proven exhausted, but scanning
+                    # further is not bounded work anymore -- treat it the
+                    # same as any other read that could not be completed.
+                    register_degradation(
+                        CHECKPOINT_LOAD_UNAVAILABLE,
+                        f"task {self.task_id}: checkpoint scan reached the "
+                        f"{CHECKPOINT_SCAN_MAX_PAGES}-page cap without "
+                        "resolving",
+                    )
+                    raise CheckpointUnavailableError(
+                        f"task {self.task_id}: checkpoint scan exceeded "
+                        f"{CHECKPOINT_SCAN_MAX_PAGES} pages without "
+                        "resolving"
+                    )
                 try:
                     rows = (
                         ordered_query.offset(offset)
@@ -318,6 +343,12 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # conservatively unavailable -- retryable. Only a fully scanned
             # set that is exclusively permanent decode failures is corrupt.
             if saw_generic_failure:
+                register_degradation(
+                    CHECKPOINT_LOAD_UNAVAILABLE,
+                    f"task {self.task_id}: checkpoint scan exhausted the "
+                    "matching set with a generic decode failure among the "
+                    "candidate rows",
+                )
                 raise CheckpointUnavailableError(
                     f"task {self.task_id}: checkpoint read could not be "
                     "completed for all candidate rows"
