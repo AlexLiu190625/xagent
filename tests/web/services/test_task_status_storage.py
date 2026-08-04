@@ -534,11 +534,7 @@ def test_where_eq_matches_raw_comparison() -> None:
     _refresh_task_lease_no_commit, and fail_and_release_task_lease_no_commit
     (all in task_lease_service.py) -- are, verbatim, the same
     task_status_predicate.eq(TaskStatus.RUNNING) call; there is no per-site
-    expression left to differentiate once that is true. Each site's AST
-    shape is already covered with zero exemptions allowed by
-    test_task_lease_service_and_monitor_have_no_raw_status_comparisons in
-    test_task_status_predicate_guard.py; this is the one compiled-SQL
-    equivalence claim behind that proof.
+    expression left to differentiate once that is true.
     """
     raw = Task.status == TaskStatus.RUNNING
     bound = task_status_predicate.eq(TaskStatus.RUNNING)
