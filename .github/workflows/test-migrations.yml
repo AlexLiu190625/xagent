@@ -16,6 +16,9 @@ on:
       - 'tests/web/services/test_runtime_key_transition_postgres.py'
       - 'src/xagent/web/services/task_command_transport.py'
       - 'tests/web/services/test_task_command_transport.py'
+      - 'src/xagent/web/models/task.py'
+      - 'tests/web/services/task_status_storage_shared.py'
+      - 'tests/web/services/test_task_status_storage_postgresql.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -63,6 +66,9 @@ jobs:
             tests/web/services/test_runtime_key_transition_postgres.py
             src/xagent/web/services/task_command_transport.py
             tests/web/services/test_task_command_transport.py
+            src/xagent/web/models/task.py
+            tests/web/services/task_status_storage_shared.py
+            tests/web/services/test_task_status_storage_postgresql.py
           )
 
           case "$EVENT_NAME" in
@@ -226,6 +232,13 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_task_command_transport.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task status storage semantics (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_status_storage_postgresql.py -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

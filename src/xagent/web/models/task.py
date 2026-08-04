@@ -1,5 +1,5 @@
 import enum
-from typing import Any
+from typing import Any, Collection
 
 from sqlalchemy import (
     JSON,
@@ -85,7 +85,18 @@ class Task(Base):  # type: ignore
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String(200), nullable=False)
     description = Column(Text)
-    status: Any = Column(Enum(TaskStatus), default=TaskStatus.PENDING)
+    # sqlalchemy.Enum(TaskStatus) with no values_callable persists member
+    # *names* (e.g. "WAITING_FOR_USER"), not member values
+    # ("waiting_for_user"). validate_strings=True rejects a raw string that
+    # is not one of those names at bind time (StatementError/LookupError,
+    # symmetric on SQLite and PostgreSQL); it is a second-layer guard behind
+    # TaskStatusPredicate below and does not change the DDL. It does not
+    # cover raw-SQL writes that bypass the ORM/Core bind path -- those stay
+    # covered by the storage-layer sentinels in
+    # tests/web/services/test_task_status_storage.py.
+    status: Any = Column(
+        Enum(TaskStatus, validate_strings=True), default=TaskStatus.PENDING
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -253,6 +264,98 @@ class Task(Base):  # type: ignore
 
     def __repr__(self) -> str:
         return f"<Task(id={self.id}, title='{self.title}', status='{self.status}')>"
+
+
+def _require_task_status(status: Any) -> TaskStatus:
+    if not isinstance(status, TaskStatus):
+        raise TypeError(f"expected TaskStatus, got {type(status).__name__}")
+    return status
+
+
+def _require_task_status_members(
+    statuses: Collection[TaskStatus],
+) -> tuple[TaskStatus, ...]:
+    if statuses is None or isinstance(statuses, (TaskStatus, str)):
+        raise TypeError(
+            "expected a collection of TaskStatus members, got "
+            f"{type(statuses).__name__}; wrap a single member in a list"
+        )
+    members = tuple(statuses)
+    if not members:
+        raise ValueError("task status predicate requires at least one TaskStatus")
+    for status in members:
+        _require_task_status(status)
+    return members
+
+
+class TaskStatusPredicate:
+    """Typed entry points for every SQL predicate and write value against
+    ``Task.status``.
+
+    The column stores ``TaskStatus`` member names, not member values (see
+    the ``status`` column comment). A raw string literal reaching an
+    ORM/Core comparison or write fails at bind time with ``StatementError``
+    wrapping ``LookupError`` (see the column comment above for why that
+    holds on both backends); raw ``text()`` SQL bypasses that bind layer
+    and is covered instead by the storage-layer sentinels in
+    ``tests/web/services/test_task_status_storage.py``.
+
+    A typed ``TaskStatus`` member compared directly against ``Task.status``
+    is legitimate and common in this codebase; it compiles to exactly what
+    the methods below compile to (pinned by the equivalence tests in
+    ``test_task_status_storage.py``). The methods below are the required
+    entry point for value-sourced or dynamic statuses -- anything that is
+    not a literal ``TaskStatus`` member in the source -- because they turn
+    a non-``TaskStatus`` input into a construction-time ``TypeError``
+    instead of a query-time failure. What is actually enforced repo-wide is
+    narrower still: the literal-predicate scan in
+    ``tests/web/services/test_task_status_literal_predicates.py`` bans a
+    raw string literal placed beside ``Task.status``; adoption of the
+    methods below at the safe-but-unconverted typed sites above is not
+    enforced and is not claimed.
+    """
+
+    @staticmethod
+    def eq(status: TaskStatus) -> Any:
+        """``Task.status == status``."""
+        _require_task_status(status)
+        return Task.status == status
+
+    @staticmethod
+    def ne(status: TaskStatus) -> Any:
+        """``Task.status != status``."""
+        _require_task_status(status)
+        return Task.status != status
+
+    @staticmethod
+    def in_(statuses: Collection[TaskStatus]) -> Any:
+        """``Task.status IN (...)``; a single member compiles to ``==``."""
+        members = _require_task_status_members(statuses)
+        if len(members) == 1:
+            return Task.status == members[0]
+        return Task.status.in_(members)
+
+    @staticmethod
+    def not_in(statuses: Collection[TaskStatus]) -> Any:
+        """``Task.status NOT IN (...)``; a single member compiles to ``!=``."""
+        members = _require_task_status_members(statuses)
+        if len(members) == 1:
+            return Task.status != members[0]
+        return Task.status.notin_(members)
+
+    @staticmethod
+    def value(status: TaskStatus) -> TaskStatus:
+        """Validate one status before it is passed to ``.values(status=...)``.
+
+        Every call site today already passes a typed ``TaskStatus``, so this
+        check does no runtime work under a type-checked call graph; it exists
+        for callers whose status is dynamically sourced, and to give guarded
+        write sites a compliant expression to wrap.
+        """
+        return _require_task_status(status)
+
+
+task_status_predicate = TaskStatusPredicate()
 
 
 class TaskConnectorRuntimeContext(Base):  # type: ignore

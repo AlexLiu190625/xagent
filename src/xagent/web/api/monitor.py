@@ -543,7 +543,7 @@ async def get_dashboard_stats(
 ) -> Dict[str, Any]:
     """Get dashboard statistics"""
     try:
-        from ..models.task import Task, TraceEvent
+        from ..models.task import Task, TaskStatus, TraceEvent, task_status_predicate
 
         # Build filter conditions based on user permissions
         task_filter = []
@@ -561,7 +561,7 @@ async def get_dashboard_stats(
             db.query(Task)
             .filter(
                 Task.updated_at >= recent_active_time,
-                Task.status.in_(["RUNNING", "PENDING"]),
+                task_status_predicate.in_([TaskStatus.RUNNING, TaskStatus.PENDING]),
                 *task_filter,
             )
             .count()
