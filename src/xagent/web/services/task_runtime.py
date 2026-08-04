@@ -22,6 +22,7 @@ from ...config import (
     get_task_runtime_hook_max_workers,
     get_task_runtime_hook_queue_timeout_seconds,
 )
+from ...core.execution_scope import EXECUTION_SCOPE_AGENT_CONFIG_KEY
 from ...core.task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
     MAX_TASK_RUNTIME_EXTENSIONS,
@@ -62,12 +63,31 @@ TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY = "runtime_extension_bindings"
 # wholesale, so anything the server later reads back as authoritative has to be
 # stripped from that copy first -- otherwise a client can pre-seed it.
 #
-# Only the binding record is listed today. Other reserved keys on this column
-# (``execution_scope``, ``a2a_context_id``, ``auth_mode``, ``guest_id``) are
-# pass-through by long-standing behavior and are tracked separately; add them
-# here once that change is in scope and every boundary picks it up at once.
+# ``execution_scope`` is listed because the scope it carries is read back as the
+# authority over where a task's bytes land -- sandbox mount, durable storage
+# prefix, workspace directory, memory dimensions. No provenance marker can make
+# that value trustworthy once it is in the column, because the marker would sit
+# in the same client-writable field as the value it vouches for, so the only
+# place to refuse it is here. The one server-side writer
+# (``build_workforce_task_config``) is on a path that never copies a request
+# dict, so stripping the key cannot reach a server-assigned value.
+#
+# Other reserved keys on this column are still pass-through by long-standing
+# behavior and are tracked separately: ``a2a_context_id``, ``auth_mode``,
+# ``guest_id``, ``share_agent_id``, ``share_workforce_id``,
+# ``widget_workforce_id``, ``widget_agent_id``, ``workforce_run_id``,
+# ``a2a_state``, ``trigger_id``, ``trigger_run_id``, ``trigger_type``,
+# ``trigger_test`` and ``is_preview``. That list is the inventory, not a
+# sample: a set holding a few of them implies a protection the rest do not
+# have. Adding any of them needs one check this key did not -- whether an
+# out-of-repo caller sends it in a request body -- because unlike
+# ``execution_scope`` their writers sit next to the sanitizer rather than off
+# its path.
 CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
-    {TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY}
+    {
+        TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
+        EXECUTION_SCOPE_AGENT_CONFIG_KEY,
+    }
 )
 logger = logging.getLogger(__name__)
 

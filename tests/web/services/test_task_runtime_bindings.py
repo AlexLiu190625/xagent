@@ -8,6 +8,11 @@ from typing import Any
 
 import pytest
 
+from xagent.core.execution_scope import (
+    EXECUTION_SCOPE_AGENT_CONFIG_KEY,
+    ExecutionScope,
+    execution_scope_from_agent_config,
+)
 from xagent.core.task_runtime import TaskRuntimeContext, TaskRuntimeContribution
 from xagent.web.services.task_runtime import (
     CLIENT_RESERVED_AGENT_CONFIG_KEYS,
@@ -231,3 +236,39 @@ async def test_delete_reports_bindings_whose_provider_is_no_longer_registered(
     assert unreleased == ("ghost_ext",)
     assert healthy.deleted == [42]
     assert any("ghost_ext" in record.getMessage() for record in caplog.records)
+
+
+def test_execution_scope_is_reserved_so_a_request_cannot_choose_a_namespace() -> None:
+    """The persisted scope decides where a task's bytes land -- sandbox mount,
+    durable storage prefix, workspace directory, memory dimensions -- and it is
+    read back as the authority over all four. A request body that could seed it
+    would choose them, so the key is refused at the boundary rather than judged
+    afterwards: nothing carried in the same client-writable field can establish
+    that the value came from the server.
+    """
+    assert EXECUTION_SCOPE_AGENT_CONFIG_KEY in CLIENT_RESERVED_AGENT_CONFIG_KEYS
+
+    forged = {
+        "sandbox_key_suffix": "victim",
+        "workspace_segments": ["victim"],
+        "memory_dimensions": {"tenant": "victim"},
+    }
+    sanitized = sanitize_client_agent_config(
+        {EXECUTION_SCOPE_AGENT_CONFIG_KEY: forged, "keep": 1}
+    )
+
+    assert sanitized == {"keep": 1}
+    # The column value a task is created with therefore carries no scope, so the
+    # registered loader reports "no candidate" and the resolver answers alone.
+    assert execution_scope_from_agent_config(sanitized) is None
+
+
+def test_a_server_written_scope_still_reaches_the_column() -> None:
+    """Stripping happens on the client copy only. The one server-side writer
+    lands its value on a path that never copies a request dict, so reserving the
+    key must not make a server-assigned scope unreadable.
+    """
+    scope = ExecutionScope(workspace_segments=("clients", "7"))
+    server_config = {EXECUTION_SCOPE_AGENT_CONFIG_KEY: scope.to_dict()}
+
+    assert execution_scope_from_agent_config(server_config) == scope
