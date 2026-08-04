@@ -3730,6 +3730,18 @@ async def execute_resume_background(
                                     task_id,
                                     exc_info=True,
                                 )
+                        else:
+                            logger.warning(
+                                "task_id=%s component=resume restore to prior "
+                                "status %s affected no rows; the task row no "
+                                "longer matches this lease fence (runner_id=%s "
+                                "run_id=%s), so another releaser now owns its "
+                                "status",
+                                task_id,
+                                restore_lease_to_prior_status.value,
+                                lease.runner_id,
+                                lease.run_id,
+                            )
                 elif (
                     lease is not None
                     and not lease_released
