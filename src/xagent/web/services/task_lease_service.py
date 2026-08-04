@@ -378,10 +378,10 @@ def lease_state_version_case(
     )
 
 
-def _checkpoint_pointer_retention_predicate() -> Any:
+def _checkpoint_pointer_clearing_predicate() -> Any:
     """WHERE condition shared by both checkpoint-pointer SET case() builders:
     true when the row is not a live RUNNING row with a run id, i.e. when
-    both pointer columns must be cleared instead of retained.
+    both pointer columns must be cleared.
 
     Extracted so the legacy and exact-row builders below can never drift
     apart on which rows clear their pointer -- a per-builder copy would let
@@ -400,7 +400,7 @@ def lease_checkpoint_event_id_case() -> Any:
     """SET last_checkpoint_event_id: clear it when the row is not a live
     RUNNING row with a run id."""
     return case(
-        (_checkpoint_pointer_retention_predicate(), None),
+        (_checkpoint_pointer_clearing_predicate(), None),
         else_=Task.last_checkpoint_event_id,
     )
 
@@ -410,7 +410,7 @@ def lease_checkpoint_trace_event_id_case() -> Any:
     lease_checkpoint_event_id_case's clearing condition exactly, so the two
     pointer columns are always set or cleared together."""
     return case(
-        (_checkpoint_pointer_retention_predicate(), None),
+        (_checkpoint_pointer_clearing_predicate(), None),
         else_=Task.last_checkpoint_trace_event_id,
     )
 

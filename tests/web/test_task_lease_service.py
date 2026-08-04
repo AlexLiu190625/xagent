@@ -1187,7 +1187,7 @@ def test_lease_checkpoint_pointer_case_predicates_match() -> None:
     """lease_checkpoint_event_id_case and lease_checkpoint_trace_event_id_case
     must clear their column under exactly the same condition.
 
-    Both builders share _checkpoint_pointer_retention_predicate(), so this
+    Both builders share _checkpoint_pointer_clearing_predicate(), so this
     passes by construction today; the assertion is what actually enforces
     it -- a future edit that inlines a diverging predicate into one builder
     would otherwise pass every other test here (each builder's own column

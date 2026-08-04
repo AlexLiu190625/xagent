@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Barrier
 
 import pytest
-from sqlalchemy import create_engine, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Query, Session, sessionmaker
 
+from tests.web.services.checkpoint_anchor_shared import build_upgraded_sqlite_engine
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import (
@@ -49,8 +48,6 @@ from xagent.web.services.task_lease_service import (
     resolve_checkpoint_recovery,
     utc_now,
 )
-
-ANCHOR_FK_NAME = "fk_tasks_last_checkpoint_trace_event_id"
 
 
 @pytest.fixture()
@@ -174,42 +171,12 @@ def sqlite_no_anchor_fk_session(tmp_path):
     table rebuild, so this asymmetric shape -- not the fresh create_all
     schema every other fixture in this module uses -- is the only one on
     which ``last_checkpoint_trace_event_id`` can point at a row that no
-    longer exists. Mirrors
+    longer exists. The rebuild trick lives in checkpoint_anchor_shared.py,
+    shared with
     tests/web/services/test_task_deletion_checkpoint_pointer.py's
-    sqlite_upgraded_session for the same reason, kept as a separate
-    module-local copy rather than a shared import so this module's
-    fixtures stay self-contained.
+    sqlite_upgraded_session, which needs the identical shape.
     """
-    engine = create_engine(f"sqlite:///{tmp_path / 'lease-recovery-no-fk.db'}")
-    for constraint in Base.metadata.tables["tasks"].constraints:
-        if getattr(constraint, "name", None) == ANCHOR_FK_NAME:
-            constraint._create_rule = None
-            break
-    else:
-        raise AssertionError(f"{ANCHOR_FK_NAME} constraint not found on tasks")
-    Base.metadata.create_all(bind=engine)
-
-    with engine.begin() as conn:
-        original_sql = conn.execute(
-            text(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
-            )
-        ).scalar_one()
-        stripped_sql, count = re.subn(
-            r",\s*CONSTRAINT "
-            + re.escape(ANCHOR_FK_NAME)
-            + r" FOREIGN KEY\([^)]*\) REFERENCES [^,]*",
-            "",
-            original_sql,
-        )
-        assert count == 1, (
-            f"expected exactly one {ANCHOR_FK_NAME} clause in the tasks DDL"
-        )
-        conn.execute(text("ALTER TABLE tasks RENAME TO tasks_old"))
-        conn.execute(text(stripped_sql))
-        conn.execute(text("INSERT INTO tasks SELECT * FROM tasks_old"))
-        conn.execute(text("DROP TABLE tasks_old"))
-
+    engine = build_upgraded_sqlite_engine(tmp_path / "lease-recovery-no-fk.db")
     session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     session = session_factory()
     yield session

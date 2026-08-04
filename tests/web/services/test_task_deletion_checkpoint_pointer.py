@@ -21,13 +21,19 @@ history, which has no DB-level FK for the checkpoint pointer column at all
 from __future__ import annotations
 
 import os
-import re
 from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import Query, Session, sessionmaker
 
+from tests.web.services.checkpoint_anchor_shared import (
+    CHECKPOINT_ANCHOR_FK_NAME as FK_NAME,
+)
+from tests.web.services.checkpoint_anchor_shared import (
+    build_upgraded_sqlite_engine,
+    reset_checkpoint_anchor_fk_create_rule,
+)
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
 from xagent.web.api.admin_users import _purge_user_task_rows
 from xagent.web.models.database import Base
@@ -35,35 +41,6 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task import TraceEvent as DatabaseTraceEvent
 from xagent.web.models.user import User
 from xagent.web.services.task_deletion import purge_task_rows
-
-FK_NAME = "fk_tasks_last_checkpoint_trace_event_id"
-
-
-def _reset_anchor_fk_create_rule() -> None:
-    """Work around a cross-dialect SQLAlchemy DDL-compiler quirk before
-    every Base.metadata.create_all() call in this module.
-
-    The anchor FK is use_alter=True (required for tasks/trace_events'
-    constraint cycle -- see the model). The first create_all() against a
-    dialect that supports ALTER (PostgreSQL) permanently caches a
-    "defer this to ALTER" decision on the constraint's shared, dialect-
-    agnostic _create_rule attribute. A later create_all() against SQLite
-    (which never attempts the ALTER, since that dialect doesn't support it
-    for constraints) then honors the same cached decision and silently
-    omits the constraint from CREATE TABLE entirely -- it is never created
-    inline or via ALTER. Only a live process that create_all()s against
-    both dialects hits this (this module's postgres_session fixture and
-    its SQLite fixtures do, in one pytest run); a real deployment binds one
-    dialect for its whole lifetime and never triggers it. Resetting the
-    rule before each create_all() call in this module makes every fixture's
-    result independent of what dialect (if any) create_all() targeted
-    earlier in the process.
-    """
-    for constraint in Base.metadata.tables["tasks"].constraints:
-        if getattr(constraint, "name", None) == FK_NAME:
-            constraint._create_rule = None
-            return
-    raise AssertionError(f"{FK_NAME} constraint not found on tasks")
 
 
 def _seed_task_with_anchored_checkpoint(session: Session, *, username: str) -> int:
@@ -110,39 +87,13 @@ def sqlite_fk_on_session(tmp_path):
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
 
-    _reset_anchor_fk_create_rule()
+    reset_checkpoint_anchor_fk_create_rule()
     Base.metadata.create_all(bind=engine)
     session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     session = session_factory()
     yield session
     session.close()
     engine.dispose()
-
-
-_ANCHOR_FK_CLAUSE = re.compile(
-    r",\s*CONSTRAINT " + re.escape(FK_NAME) + r" FOREIGN KEY\([^)]*\) REFERENCES [^,]*"
-)
-
-
-def _drop_anchor_fk_from_create_table_sql(create_table_sql: str) -> str:
-    """Strip the anchor column's named FK clause from a CREATE TABLE
-    statement, leaving the column itself and every other clause untouched.
-
-    Reflects the actual on-disk DDL as text rather than reusing any of
-    ``Task.__table__``'s Python objects: the model's ``last_checkpoint_
-    trace_event_id`` Column carries a ``use_alter=True`` ForeignKey shared
-    with that one Table/MetaData, and building a second Table from a copy
-    of that Column (tried first, and reverted) rebinds the shared
-    ForeignKeyConstraint's ``.table`` reference -- corrupting DDL generation
-    for the real model in every test that runs afterward in the same
-    process. Pure text surgery on a throwaway table's DDL has no such
-    shared state to corrupt.
-    """
-    stripped, count = _ANCHOR_FK_CLAUSE.subn("", create_table_sql)
-    assert count == 1, (
-        f"expected exactly one {FK_NAME} clause in the tasks DDL, found {count}"
-    )
-    return stripped
 
 
 @pytest.fixture
@@ -154,30 +105,12 @@ def sqlite_upgraded_session(tmp_path):
     ``tasks``/``trace_events`` are create_all-only in production (see
     fab71cf4b1ad_add_sdk_fields_to_tasks.py's guard) and never created by a
     migration, so running the real Alembic history against an empty
-    database leaves them absent rather than reproducing this state. Instead,
-    the full schema is created normally via create_all, and ``tasks`` is
-    then rebuilt (SQLite's standard rename/recreate/copy/drop procedure,
-    matching how a real deployment's DB tooling would strip a constraint)
-    from its own DDL with just the anchor column's FK clause removed --
-    exactly what the migration's ``add_column`` (without
-    ``create_foreign_key``, which is PostgreSQL-only) produces.
+    database leaves them absent rather than reproducing this state. The
+    actual rebuild trick lives in checkpoint_anchor_shared.py, shared with
+    test_task_lease_recovery.py's sqlite_no_anchor_fk_session, which needs
+    the identical shape.
     """
-    engine = create_engine(f"sqlite:///{tmp_path / 'upgraded.db'}")
-    _reset_anchor_fk_create_rule()
-    Base.metadata.create_all(bind=engine)
-
-    with engine.begin() as conn:
-        original_sql = conn.execute(
-            text(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
-            )
-        ).scalar_one()
-        rebuilt_sql = _drop_anchor_fk_from_create_table_sql(original_sql)
-        conn.execute(text("ALTER TABLE tasks RENAME TO tasks_old"))
-        conn.execute(text(rebuilt_sql))
-        conn.execute(text("INSERT INTO tasks SELECT * FROM tasks_old"))
-        conn.execute(text("DROP TABLE tasks_old"))
-
+    engine = build_upgraded_sqlite_engine(tmp_path / "upgraded.db")
     session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     session = session_factory()
     yield session
@@ -200,7 +133,7 @@ def postgres_session():
     with engine.begin() as conn:
         conn.execute(text("DROP SCHEMA public CASCADE"))
         conn.execute(text("CREATE SCHEMA public"))
-    _reset_anchor_fk_create_rule()
+    reset_checkpoint_anchor_fk_create_rule()
     Base.metadata.create_all(bind=engine)
     session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     session = session_factory()
