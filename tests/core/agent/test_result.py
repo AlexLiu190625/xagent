@@ -17,6 +17,7 @@ class _FailureCodeStringSubclass(str):
     ("value", "expected"),
     [
         ("oauth_token_required", "oauth_token_required"),
+        ("unsupported_nested_interaction", "unsupported_nested_interaction"),
         ("other_valid_code", None),
         (" oauth_token_required", None),
         ("OAUTH_TOKEN_REQUIRED", None),
@@ -27,6 +28,13 @@ class _FailureCodeStringSubclass(str):
 )
 def test_normalize_tool_failure_code_uses_exact_allowlist(value, expected):
     assert normalize_tool_failure_code(value) == expected
+
+
+def test_unsupported_nested_interaction_is_a_recognized_failure_code():
+    assert (
+        normalize_tool_failure_code("unsupported_nested_interaction")
+        == "unsupported_nested_interaction"
+    )
 
 
 def test_classified_tool_failure_accepts_only_allowlisted_plain_string():

@@ -968,6 +968,55 @@ async def test_on_tool_end_emits_only_allowlisted_top_level_failure_code(
 
 
 @pytest.mark.asyncio
+async def test_on_tool_end_classifies_nested_wait_failure_and_stops_parent_success() -> (
+    None
+):
+    """A classified nested-wait failure must reach trace data and fail the turn.
+
+    This is the runtime-level half of the AgentTool nested-wait fix: the
+    parent pattern decides success purely from the result shape, so the
+    classified failure dict (not an exception) must be enough to route
+    through ``on_tool_error`` and carry ``failure_code`` into the emitted
+    trace event.
+    """
+
+    class CapturingTracer:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> None:
+            self.events.append(
+                {
+                    "type": getattr(event_type, "value", str(event_type)),
+                    "data": kwargs.get("data") or {},
+                }
+            )
+
+    tracer = CapturingTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="task-nested-wait")
+    result = {
+        "success": False,
+        "is_error": True,
+        "status": "error",
+        "failure_code": "unsupported_nested_interaction",
+        "error": "Nested agent calls cannot forward interactive prompts.",
+        "output": "Nested agent calls cannot forward interactive prompts.",
+        "response": "Nested agent calls cannot forward interactive prompts.",
+    }
+
+    await runtime.on_tool_end(
+        tool_call={"name": "delegated_agent", "id": "call-nested"},
+        result=result,
+    )
+
+    assert [event["type"] for event in tracer.events] == ["action_error_tool"]
+    event_data = tracer.events[0]["data"]
+    assert event_data["failure_code"] == "unsupported_nested_interaction"
+    assert event_data["result"] == result
+    assert runtime._tool_result_success(result) is False
+
+
+@pytest.mark.asyncio
 async def test_concurrent_tool_calls_all_count() -> None:
     """A concurrent batch (asyncio.gather) increments the shared counter once per tool.
 

@@ -35,6 +35,22 @@ _INTERACTION_DISPLAY_KEYS = frozenset(
 )
 
 
+def _is_classified_tool_failure(result: Any) -> bool:
+    """Return whether ``result`` is a classified structured tool failure.
+
+    Matches the shared classified-failure contract (success/is_error/status,
+    optionally failure_code) rather than any dict a tool happens to return
+    with an ``is_error`` key — an MCP-style ``{"content": [...], "is_error":
+    True}`` result has no ``success`` key at all and is left untouched here.
+    """
+
+    return (
+        isinstance(result, dict)
+        and result.get("is_error") is True
+        and result.get("success") is False
+    )
+
+
 def _accepts_kwarg(func: Any, name: str) -> bool:
     """Return whether ``func`` accepts ``name`` as a keyword argument."""
 
@@ -216,23 +232,36 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         return wrapped_func_async
 
     def _filter_result(self, result: Any) -> Any:
-        """Filter output without dropping the user-interaction control envelope."""
+        """Filter output without dropping a control or classification envelope."""
 
         filtered = self._filter.filter(result, self._target.name)
-        if not tool_result_waits_for_user(result) or not isinstance(filtered, dict):
+        if not isinstance(filtered, dict) or not isinstance(result, dict):
             return filtered
 
-        filtered["status"] = WAITING_FOR_USER_STATUS
-        assert isinstance(result, dict)
-        for key in ("interaction_id", "message_type"):
-            if key in result:
-                filtered[key] = result[key]
-        if "message" in result:
-            filtered["message"] = self._filter.filter(
-                result["message"], self._target.name
-            )
-        if "interactions" in result:
-            filtered["interactions"] = self._filter_interactions(result["interactions"])
+        if tool_result_waits_for_user(result):
+            filtered["status"] = WAITING_FOR_USER_STATUS
+            for key in ("interaction_id", "message_type"):
+                if key in result:
+                    filtered[key] = result[key]
+            if "message" in result:
+                filtered["message"] = self._filter.filter(
+                    result["message"], self._target.name
+                )
+            if "interactions" in result:
+                filtered["interactions"] = self._filter_interactions(
+                    result["interactions"]
+                )
+            return filtered
+
+        if _is_classified_tool_failure(result):
+            for key in ("success", "is_error", "status", "failure_code"):
+                if key in result:
+                    filtered[key] = result[key]
+            for key in ("error", "output", "response"):
+                if key in result:
+                    filtered[key] = self._filter.filter(result[key], self._target.name)
+            return filtered
+
         return filtered
 
     def _filter_interactions(self, interactions: Any) -> Any:

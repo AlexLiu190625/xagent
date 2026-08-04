@@ -4,7 +4,9 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-TOOL_FAILURE_CODES = frozenset({"oauth_token_required"})
+TOOL_FAILURE_CODES = frozenset(
+    {"oauth_token_required", "unsupported_nested_interaction"}
+)
 
 
 def normalize_tool_failure_code(value: Any) -> str | None:
@@ -15,7 +17,15 @@ def normalize_tool_failure_code(value: Any) -> str | None:
 
 @dataclass(frozen=True)
 class ClassifiedToolFailure:
-    """Safe classified failure outcome shared across core runtime boundaries."""
+    """Sentinel an OAuth token resolver returns when it cannot refresh a token.
+
+    Its only current consumer is the delegated-authorization retry path in
+    the MCP adapter, which treats any instance as an OAuth failure regardless
+    of the carried code. ``failure_code`` must still be one of
+    ``TOOL_FAILURE_CODES``, but adding a non-OAuth code to that allowlist does
+    not make this class a valid carrier for it — a new consumer needs its own
+    check, not reuse of this type.
+    """
 
     failure_code: str
 

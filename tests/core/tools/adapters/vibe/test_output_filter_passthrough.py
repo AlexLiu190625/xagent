@@ -141,6 +141,48 @@ async def test_waiting_control_envelope_survives_field_filtering() -> None:
 
 
 @pytest.mark.asyncio
+async def test_classified_failure_survives_field_filtering() -> None:
+    """A classified tool failure must keep its classification keys.
+
+    Mirrors the waiting-envelope restore: field-count filtering could
+    otherwise drop ``failure_code``/``status``/``is_error`` behind a
+    "truncated" placeholder, silently turning a classified failure back into
+    an opaque result the parent classifier can no longer recognize.
+    """
+
+    class FailingTool:
+        name = "classified-failure"
+        description = "Returns a classified nested-wait failure."
+        tags: list[str] = []
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "success": False,
+                "is_error": True,
+                "status": "error",
+                "failure_code": "unsupported_nested_interaction",
+                "error": "Nested agent calls cannot forward interactive prompts.",
+                "output": "Nested agent calls cannot forward interactive prompts.",
+                "response": "Nested agent calls cannot forward interactive prompts.",
+            }
+
+    wrapper = OutputFilteredToolWrapper(
+        target_tool=FailingTool(),
+        max_chars=1_000,
+        max_fields=2,
+        max_recursion=3,
+    )
+
+    result = await wrapper.run_json_async({})
+
+    assert result["success"] is False
+    assert result["is_error"] is True
+    assert result["status"] == "error"
+    assert result["failure_code"] == "unsupported_nested_interaction"
+    assert result["error"] == "Nested agent calls cannot forward interactive prompts."
+
+
+@pytest.mark.asyncio
 async def test_teardown_forwards_execution_status_when_supported() -> None:
     class StatusAwareTool:
         name = "status-aware"
