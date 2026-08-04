@@ -447,15 +447,14 @@ async def test_agent_tool_classified_failure_still_traces_delegation_error(
 
 
 @pytest.mark.asyncio
-async def test_agent_tool_classified_failure_survives_file_bookkeeping_error(
-    monkeypatch, caplog
-):
-    """A DB error while registering the child's files must not erase the class.
+async def test_agent_tool_classified_failure_skips_file_registration(monkeypatch):
+    """The classified branch performs no file bookkeeping.
 
-    The classified failure carries the only signal this path exists to
-    deliver. Losing the file rows is acceptable — they were never advertised
-    as refs — but downgrading to the generic ``Error executing agent ...``
-    shape is not.
+    It cannot durably attach a failed child's artifacts to the parent task,
+    because it never opens a session or registers anything on this path. A
+    raising second session proves the branch never asks for one: if it did,
+    this test would blow up instead of asserting a clean single-session
+    count.
     """
 
     async def execute_task():
@@ -508,11 +507,11 @@ async def test_agent_tool_classified_failure_survives_file_bookkeeping_error(
 
     result = await tool.run_json_async({"task": "run"})
 
+    assert calls["n"] == 1
     assert result["failure_code"] == "unsupported_nested_interaction"
     assert result["status"] == "error"
-    assert not str(result["response"]).startswith("Error executing agent")
+    assert "file_outputs" not in result
     assert [status for status, _ in traced] == ["start", "error"]
-    assert "Failed to register delegated file outputs" in caplog.text
     assert tool_result_succeeded(result) is False
 
 

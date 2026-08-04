@@ -2246,25 +2246,17 @@ class AgentTool(AbstractBaseTool):
             # completed response.
             classified_failure = _classify_delegated_child_failure(result)
             if classified_failure is not None:
-                # Best-effort only: the child's files are registered so they
-                # are not orphaned, but a failure here must not turn the
-                # classified failure into the generic catch-all shape and
-                # lose ``failure_code``. The rows stay uncommitted in that
-                # case.
-                try:
-                    with tool_session_scope(self._session_factory) as db:
-                        self._parent_owned_file_outputs(
-                            result.get("file_outputs"), agent_service.workspace, db
-                        )
-                        db.commit()
-                except Exception:
-                    logger.warning(
-                        "Failed to register delegated file outputs for a "
-                        "classified failure of agent %s; continuing with the "
-                        "classified result",
-                        self._agent_id,
-                        exc_info=True,
-                    )
+                # The child's file outputs are deliberately NOT registered
+                # here. ``Workspace.register_file`` owns its own Session and
+                # commits before returning (workspace.py:815, 846), so a
+                # registration on this path would durably attach the failed
+                # child's artifacts to the parent task and list them through
+                # the task-scoped file endpoints as if the delegation had
+                # produced them. The bytes stay in the child's workspace
+                # directory, unregistered; nothing is deleted. Files the
+                # child registered itself through its own tools during the
+                # run are already committed and are out of this boundary's
+                # reach.
                 await self._trace_delegation(
                     "error",
                     execution_task_id=execution_task_id,
