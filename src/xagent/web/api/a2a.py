@@ -456,12 +456,15 @@ async def _resume_input_required_a2a_task(
         # Ownership was never transferred, so restore the exact prelease
         # to the prior input-required status exactly like the absent-
         # checkpoint fallback above, then translate the failure instead of
-        # letting it escape as a raw exception.
-        cleanup_task = asyncio.create_task(stop_and_restore_prelease())
-        if not await drain_async_task_cancellation_safe(cleanup_task):
-            raise TaskLeaseLostError(
-                f"Task {task_id} lease changed before A2A checkpoint-failure fallback"
-            ) from exc
+        # letting it escape as a raw exception. Same ownership_transferred/
+        # prelease_cleanup_done guard as the sibling except BaseException
+        # handler below, for symmetry.
+        if not ownership_transferred and not prelease_cleanup_done:
+            cleanup_task = asyncio.create_task(stop_and_restore_prelease())
+            if not await drain_async_task_cancellation_safe(cleanup_task):
+                raise TaskLeaseLostError(
+                    f"Task {task_id} lease changed before A2A checkpoint-failure fallback"
+                ) from exc
         if isinstance(exc, CheckpointCorruptError):
             raise a2a_error(
                 "unsupported_operation",
@@ -470,18 +473,19 @@ async def _resume_input_required_a2a_task(
                 details={"taskId": task_id},
             ) from exc
         if isinstance(exc, CheckpointAccessRefusedError):
-            if exc.reason == "lease_mismatch":
-                message = (
+            message = {
+                "lease_mismatch": (
                     "This task is currently owned by a different execution "
                     "and cannot accept a new message."
-                )
-            elif exc.reason == "superseded_legacy":
-                message = (
+                ),
+                "superseded_legacy": (
                     "This task's checkpoint history has been superseded by "
                     "a newer run and cannot accept a new message."
-                )
-            else:
-                message = "Task is currently running and cannot accept a new message."
+                ),
+            }.get(
+                exc.reason,
+                "Task is currently running and cannot accept a new message.",
+            )
             raise a2a_error(
                 "unsupported_operation",
                 message,

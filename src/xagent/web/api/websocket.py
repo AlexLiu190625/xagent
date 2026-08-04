@@ -220,6 +220,17 @@ def _task_status_uses_live_control(
     return status in {TaskStatus.WAITING_FOR_USER, TaskStatus.RUNNING}
 
 
+def _waiting_or_paused_event_fields(status: TaskStatus) -> tuple[str, str]:
+    """Event type and default message for a task settled at WAITING_FOR_USER
+    or PAUSED. Shared by the live-lease restore broadcast and the
+    historical-replay status reassertion so both present identical labels
+    for the same status."""
+
+    if status == TaskStatus.WAITING_FOR_USER:
+        return "task_waiting_for_user", "Task waiting for user response"
+    return "task_paused", "Task paused"
+
+
 # User-facing messages for turn rejections that are NOT transient. The
 # default "busy" message tells the user to retry, which is actively
 # misleading for workforce rejections where retrying can never succeed.
@@ -3693,17 +3704,8 @@ async def execute_resume_background(
                                 restored_snapshot = (
                                     await task_execution_controller.snapshot(task_id)
                                 )
-                                event_type = (
-                                    "task_waiting_for_user"
-                                    if restore_lease_to_prior_status
-                                    == TaskStatus.WAITING_FOR_USER
-                                    else "task_paused"
-                                )
-                                message = (
-                                    "Task waiting for user response"
-                                    if restore_lease_to_prior_status
-                                    == TaskStatus.WAITING_FOR_USER
-                                    else "Task paused"
+                                event_type, message = _waiting_or_paused_event_fields(
+                                    restore_lease_to_prior_status
                                 )
                                 await manager.broadcast_to_task(
                                     {
@@ -7068,10 +7070,8 @@ def _load_historical_stream_snapshot_sync(
             # state after replay so stale running trace events do not keep the UI in
             # a running state.
             if task.status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
-                event_type = (
-                    "task_waiting_for_user"
-                    if task.status == TaskStatus.WAITING_FOR_USER
-                    else "task_paused"
+                event_type, default_message = _waiting_or_paused_event_fields(
+                    task.status
                 )
                 question_message = None
                 question_interactions = None
@@ -7080,11 +7080,7 @@ def _load_historical_stream_snapshot_sync(
                         get_latest_waiting_question(db, task_id)
                     )
 
-                message = (
-                    question_message or "Task waiting for user response"
-                    if task.status == TaskStatus.WAITING_FOR_USER
-                    else "Task paused"
-                )
+                message = question_message or default_message
                 status_event = {
                     "type": event_type,
                     "task_id": task_id,

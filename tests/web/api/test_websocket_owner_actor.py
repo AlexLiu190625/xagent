@@ -39,6 +39,7 @@ from xagent.web.api.websocket import (
     _handle_chat_message_unserialized,
     _handle_pause_task_unserialized,
     _handle_resume_task_unserialized,
+    _waiting_or_paused_event_fields,
     background_task_manager,
     execute_resume_background,
     get_authenticated_user,
@@ -2869,6 +2870,21 @@ async def test_resume_background_settles_running_prior_status_on_checkpoint_unav
     assert len(failures) == 1
 
 
+def test_waiting_or_paused_event_fields_shared_by_both_call_sites() -> None:
+    """The live-lease restore broadcast and the historical-replay status
+    reassertion both compute their event type/message off this one helper;
+    pin its output so a change to either site's vocabulary is caught here
+    rather than only in one of the two integration tests."""
+    assert _waiting_or_paused_event_fields(TaskStatus.WAITING_FOR_USER) == (
+        "task_waiting_for_user",
+        "Task waiting for user response",
+    )
+    assert _waiting_or_paused_event_fields(TaskStatus.PAUSED) == (
+        "task_paused",
+        "Task paused",
+    )
+
+
 @pytest.mark.parametrize(
     ("prior_status", "expected_event_type"),
     [
@@ -2912,7 +2928,9 @@ async def test_resume_background_broadcasts_corrective_event_after_restore(
         if call.args[0].get("type") == expected_event_type
     ]
     assert len(corrective) == 1
+    assert corrective[0]["type"] == expected_event_type
     assert corrective[0]["status"] == prior_status.value
+    assert "state_version" in corrective[0]
     assert not any(
         call.args[0].get("type") == "task_error"
         for call in ws_manager.broadcast_to_task.call_args_list
