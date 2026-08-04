@@ -239,12 +239,9 @@ async def test_delete_reports_bindings_whose_provider_is_no_longer_registered(
 
 
 def test_execution_scope_is_reserved_so_a_request_cannot_choose_a_namespace() -> None:
-    """The persisted scope decides where a task's bytes land -- sandbox mount,
-    durable storage prefix, workspace directory, memory dimensions -- and it is
-    read back as the authority over all four. A request body that could seed it
-    would choose them, so the key is refused at the boundary rather than judged
-    afterwards: nothing carried in the same client-writable field can establish
-    that the value came from the server.
+    """A forged scope in a client dict is stripped, leaving no candidate for
+    resolution to read. Why the key is refused rather than judged afterwards is
+    on CLIENT_RESERVED_AGENT_CONFIG_KEYS.
     """
     assert EXECUTION_SCOPE_AGENT_CONFIG_KEY in CLIENT_RESERVED_AGENT_CONFIG_KEYS
 
