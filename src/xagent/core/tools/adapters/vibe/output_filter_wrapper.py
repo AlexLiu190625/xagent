@@ -38,10 +38,17 @@ _INTERACTION_DISPLAY_KEYS = frozenset(
 def _is_classified_tool_failure(result: Any) -> bool:
     """Return whether ``result`` is a classified structured tool failure.
 
-    Matches the shared classified-failure contract (success/is_error/status,
-    optionally failure_code) rather than any dict a tool happens to return
-    with an ``is_error`` key — an MCP-style ``{"content": [...], "is_error":
-    True}`` result has no ``success`` key at all and is left untouched here.
+    Matches on the ``success is False`` **and** ``is_error is True`` pair that
+    the shared classified-failure contract always carries, rather than on any
+    dict with an ``is_error`` key — a plain MCP error result
+    (``{"content": [...], "is_error": True}``) has no ``success`` key and is
+    left to ordinary recursive filtering.
+
+    Unavailable-MCP results do carry both keys and are matched deliberately:
+    they carry a ``failure_code``, and the restore below is purely additive,
+    so their ``content``/``reason`` fields keep whatever ordinary filtering
+    left them while the classification keys are guaranteed to survive
+    field-count truncation.
     """
 
     return (

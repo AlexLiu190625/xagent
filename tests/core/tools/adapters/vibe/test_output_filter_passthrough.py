@@ -180,6 +180,68 @@ async def test_classified_failure_survives_field_filtering() -> None:
     assert result["status"] == "error"
     assert result["failure_code"] == "unsupported_nested_interaction"
     assert result["error"] == "Nested agent calls cannot forward interactive prompts."
+    assert result["output"] == "Nested agent calls cannot forward interactive prompts."
+    assert (
+        result["response"] == "Nested agent calls cannot forward interactive prompts."
+    )
+
+
+@pytest.mark.asyncio
+async def test_unavailable_mcp_failure_keeps_content_and_reason() -> None:
+    """The classified-failure restore is additive; it strips nothing.
+
+    ``_run_unavailable`` is the one MCP builder that carries both ``success``
+    and ``is_error``, so it takes the classified branch. Its user-facing
+    ``content`` list and its ``reason`` must survive that branch unchanged.
+    """
+    from xagent.core.tools.adapters.vibe.mcp_adapter import UnavailableMCPTool
+
+    tool = UnavailableMCPTool(
+        server_name="github",
+        server_id=7,
+        failure_code="oauth_token_required",
+        reason="oauth_token_required",
+    )
+    result = await _wrap(tool).run_json_async({})
+
+    assert result["failure_code"] == "oauth_token_required"
+    assert result["reason"] == "oauth_token_required"
+    assert isinstance(result["content"], list) and result["content"]
+    assert "MCP server credentials are unavailable" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_unavailable_mcp_failure_restores_classification_under_truncation() -> (
+    None
+):
+    """Aggressive field-count truncation must not cost the classification.
+
+    At ``max_fields=4`` ordinary recursive filtering alone would already
+    drop ``failure_code``/``is_error``/``status`` behind a "truncated"
+    placeholder; the classified-failure restore is what keeps them, and this
+    pins that under the exact shape ``_run_unavailable`` produces.
+    """
+    from xagent.core.tools.adapters.vibe.mcp_adapter import UnavailableMCPTool
+
+    tool = UnavailableMCPTool(
+        server_name="github",
+        server_id=7,
+        failure_code="oauth_token_required",
+        reason="oauth_token_required",
+    )
+    wrapper = OutputFilteredToolWrapper(
+        target_tool=tool,
+        max_chars=1_000,
+        max_fields=4,
+        max_recursion=5,
+    )
+
+    result = await wrapper.run_json_async({})
+
+    assert result["failure_code"] == "oauth_token_required"
+    assert result["is_error"] is True
+    assert result["status"] == "error"
+    assert result["content"] is not None
 
 
 @pytest.mark.asyncio
