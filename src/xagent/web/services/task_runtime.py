@@ -67,6 +67,11 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # request bodies carry a free-form ``agent_config`` dict that endpoints copy
 # wholesale, so anything the server later reads back as authoritative has to
 # be stripped from that copy first -- otherwise a client can pre-seed it.
+# Refusal has to happen at that copy, not afterwards: a value already sitting
+# in this column cannot be judged trustworthy after the fact, because any
+# provenance marker vouching for it would live in the same client-writable
+# field as the value itself -- the copy point is the only place the
+# distinction between client-seeded and server-written still exists.
 #
 # This column's key space is not closed inside this repo: closed-source
 # distributions register providers at startup (see this module's docstring
@@ -84,11 +89,21 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # ``_trigger_execution_context`` (``services/triggers.py``), the a2a
 # create/backfill writers, and the workforce widget/share builders. One writer
 # passes *through* the sanitizer instead: ``websocket.py``'s
-# ``handle_build_preview_execution`` builds a server-owned config carrying
-# ``is_preview: True`` and ``preview_agent_id`` and hands it to
+# ``handle_build_preview_execution`` assembles a config from the WS message
+# (``instructions``, ``knowledge_bases``, ``skills``, ``tool_categories``, and
+# ``preview_agent_id`` all come from ``message_data.get(...)``; only
+# ``is_preview: True`` is a handler-set literal) and hands it to
 # ``TaskCreateRequest(agent_config=...)`` passed into ``create_task``, layered
-# below the sanitizer rather than above it -- reserving either key there would
-# silently strip it and break agent-builder preview.
+# below the sanitizer rather than above it. ``chat.py``'s ``create_task`` only
+# re-layers ``is_preview`` onto the sanitized dict when ``request.is_preview``
+# is ``True``; the WS handler never sets that field on ``TaskCreateRequest``
+# (``websocket.py``'s ``handle_build_preview_execution``), so it defaults to
+# ``False`` (:data:`xagent.web.schemas.chat.TaskCreateRequest.is_preview`) and
+# the re-layer never fires here. So reserving ``is_preview`` or
+# ``preview_agent_id`` would still silently strip them from this config with
+# nothing to restore them, breaking agent-builder preview. (Both readers of
+# ``preview_agent_id`` apply an ownership clause before trusting it, so it is
+# not itself exploitable.)
 #
 # Before adding a key here: (1) confirm no server writer reaches this column
 # *through* the sanitizer (the preview path above is the only known case);
@@ -100,8 +115,10 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # workspace directory, memory dimensions -- and its one server-side writer,
 # ``build_workforce_task_config``, is off the sanitizer path entirely.
 # ``tests/web/test_workforce_run_service.py::
-# test_create_workforce_run_propagates_execution_scope_to_worker`` asserts the
-# server-written scope lands in the persisted column.
+# test_create_workforce_run_propagates_execution_scope_to_worker`` demonstrates
+# that writer's scope reaching the column on that path -- a demonstration,
+# not a guard: the path is off the sanitizer by construction, so this test
+# cannot regress if this set changes.
 #
 # ``selected_file_ids`` qualifies for the same reason and passes both checks.
 # It was declared server-owned when it was introduced -- ``chat.py``'s

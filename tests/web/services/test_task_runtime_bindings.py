@@ -276,12 +276,13 @@ def test_the_reserved_key_set_has_exactly_the_audited_members() -> None:
 
 
 def test_agent_builder_preview_keys_are_not_reserved() -> None:
-    """``websocket.py``'s ``handle_build_preview_execution`` builds a
-    server-owned ``agent_config`` carrying ``is_preview`` and
-    ``preview_agent_id`` and passes it through ``create_task`` -- and
-    therefore through the sanitizer, layered below it rather than above.
-    Reserving either key here would strip it from that config and break
-    agent-builder preview.
+    """``websocket.py``'s ``handle_build_preview_execution`` assembles a
+    config from the WS message (``preview_agent_id`` included) and passes it
+    through ``create_task`` -- and therefore through the sanitizer, layered
+    below it rather than above. ``chat.py``'s re-layer of ``is_preview`` only
+    fires when ``TaskCreateRequest.is_preview`` is ``True``, which this WS
+    path never sets, so reserving either key here would strip it from that
+    config with nothing to restore it, breaking agent-builder preview.
     """
     assert {"is_preview", "preview_agent_id"}.isdisjoint(
         CLIENT_RESERVED_AGENT_CONFIG_KEYS
