@@ -1501,7 +1501,10 @@ _MISSING_CHILD_OUTPUT_MESSAGE = (
 
 # Recognized, not produced, here: ``AgentExecutionAdapter._normalize_result``
 # and this module's own post-run default substitute these when a run left no
-# text behind. A completed child carrying one of them answered nothing.
+# text of its own behind on the normalized fallback surface. A completed
+# child whose raw output equals one of these strings answered its task; only
+# the fallback surface treats them as a missing answer (see
+# ``_delegated_output_is_missing``).
 _MISSING_OUTPUT_PLACEHOLDERS = frozenset(
     {NO_OUTPUT_PLACEHOLDER, NO_RESPONSE_PLACEHOLDER}
 )
@@ -1533,26 +1536,33 @@ def _classified_failure(
     return failure
 
 
-def _delegated_output_is_missing(value: Any) -> bool:
+def _delegated_output_is_missing(value: Any, *, from_fallback: bool) -> bool:
     """Return whether a delegated child's output carries no usable answer.
 
-    Falsy values mean the child left nothing behind — the same test
-    ``AgentExecutionAdapter._normalize_result`` applies at
-    execution_adapter.py:362 before it backfills. Placeholder strings are
-    recognized, not produced, here: the execution layers substitute them
-    when a run produced no text of its own.
+    Falsy and whitespace-only values mean the child left nothing behind —
+    the same test ``AgentExecutionAdapter._normalize_result`` applies at
+    execution_adapter.py:362 before it backfills.
+
+    The placeholder strings are only meaningful on the normalized fallback
+    surface, where the execution layers substitute them for an absent answer
+    (execution_adapter.py:366). Raw pre-backfill content is the model's own
+    final answer, passed through verbatim (react.py:1673, 2605-2613), so a
+    child asked to reply with that exact text answered its task and must not
+    be classified as missing.
     """
 
     if not value:
         return True
     if isinstance(value, str):
         stripped = value.strip()
-        return stripped == "" or stripped in _MISSING_OUTPUT_PLACEHOLDERS
+        if not stripped:
+            return True
+        return from_fallback and stripped in _MISSING_OUTPUT_PLACEHOLDERS
     return False
 
 
-def _delegated_child_final_output(result: Mapping[str, Any]) -> Any:
-    """Return the child's own final output, before the adapter's backfill.
+def _delegated_child_final_output(result: Mapping[str, Any]) -> tuple[Any, bool]:
+    """Return the child's own final output and whether it is the fallback value.
 
     ``_normalize_result`` keeps the raw pattern result under
     ``agent_result`` (execution_adapter.py:375) and, when the pattern's own
@@ -1570,12 +1580,16 @@ def _delegated_child_final_output(result: Mapping[str, Any]) -> Any:
     Results without the raw envelope — hand-built dicts, and any producer
     that does not go through the adapter — fall back to the normalized
     ``output``.
+
+    The second element is ``True`` when the raw envelope was absent and the
+    normalized ``output`` was used instead. Only that surface may be judged
+    against the placeholder sentinels; raw content is a model answer.
     """
 
     agent_result = result.get("agent_result")
     if isinstance(agent_result, dict):
-        return agent_result.get("output", agent_result.get("response"))
-    return result.get("output")
+        return agent_result.get("output", agent_result.get("response")), False
+    return result.get("output"), True
 
 
 def _classify_delegated_child_failure(
@@ -1619,7 +1633,8 @@ def _classify_delegated_child_failure(
         return _classified_failure(message)
 
     if isinstance(status, str) and status.lower() == "completed":
-        if _delegated_output_is_missing(_delegated_child_final_output(result)):
+        final_output, from_fallback = _delegated_child_final_output(result)
+        if _delegated_output_is_missing(final_output, from_fallback=from_fallback):
             return _classified_failure(
                 _MISSING_CHILD_OUTPUT_MESSAGE,
                 failure_code="missing_delegated_output",

@@ -376,6 +376,29 @@ def test_classify_delegated_child_failure_falls_back_without_agent_result():
     assert classified["failure_code"] == "missing_delegated_output"
 
 
+def test_classify_delegated_child_failure_passes_raw_placeholder_text():
+    """A raw answer equal to a placeholder string is still a real answer.
+
+    The placeholder sentinels only apply to the normalized fallback surface;
+    raw pre-backfill content from ``agent_result`` is judged on emptiness
+    alone, so a child whose task was to reply with that exact text must not
+    be classified as missing.
+    """
+
+    result = {
+        "status": "completed",
+        "success": True,
+        "output": "No output provided",
+        "agent_result": {
+            "status": "completed",
+            "success": True,
+            "output": "No output provided",
+        },
+    }
+
+    assert mod._classify_delegated_child_failure(result) is None
+
+
 @pytest.mark.asyncio
 async def test_agent_tool_catchall_does_not_rewrap_classified_failure(monkeypatch):
     """The classified failure must return before the catch-all can touch it.
@@ -957,6 +980,40 @@ async def test_agent_tool_real_child_with_stale_assistant_preamble_fails_closed(
     assert result["failure_code"] == "missing_delegated_output"
     assert result["status"] == "error"
     assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_real_child_answering_with_placeholder_text_succeeds(
+    monkeypatch, tmp_path
+):
+    """A real child whose final answer equals a placeholder string succeeds.
+
+    The placeholder sentinels only apply to the normalized fallback surface,
+    not to the child's own raw final answer. A child asked to answer with
+    the literal text "No output provided" completed its task and must reach
+    the parent as a normal response, not be classified as missing.
+    """
+
+    llm = _StubSingleCallLLM(
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": json.dumps({"answer": "No output provided"}),
+                    },
+                }
+            ],
+            "done": False,
+        }
+    )
+    tool = _real_delegated_agent_tool(monkeypatch, tmp_path, llm)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result == {"response": "No output provided"}
 
 
 def _create_factory() -> tuple[sessionmaker, str]:
