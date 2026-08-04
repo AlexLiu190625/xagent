@@ -1,6 +1,7 @@
 import asyncio
 import os
 import tempfile
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import xagent.core.tools.adapters.vibe.agent_tool as mod
+import xagent.core.tools.adapters.vibe.db_session as db_session_module
 from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.tools.adapters.vibe.agent_tool import AgentTool
 from xagent.web.models.agent import Agent, AgentStatus
@@ -368,6 +370,76 @@ async def test_agent_tool_classified_failure_still_traces_delegation_error(
     assert [status for status, _ in traced] == ["start", "error"]
     assert traced[-1][1]["error"] == result["error"]
     assert traced[-1][1]["execution_task_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_classified_failure_survives_file_bookkeeping_error(
+    monkeypatch, caplog
+):
+    """A DB error while registering the child's files must not erase the class.
+
+    The classified failure carries the only signal this path exists to
+    deliver. Losing the file rows is acceptable — they were never advertised
+    as refs — but downgrading to the generic ``Error executing agent ...``
+    shape is not.
+    """
+
+    async def execute_task():
+        return {
+            "status": "waiting_for_user",
+            "output": "partial",
+            "file_outputs": [{"filename": "a.txt", "file_path": "a.txt"}],
+        }
+
+    _patch_delegated_runtime(
+        monkeypatch, execute_task, close_config=_SucceedingCloseConfig
+    )
+    tool = _delegated_agent_tool()
+    monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_kwargs: None)
+
+    traced = []
+
+    async def _record(status, **kwargs):
+        traced.append((status, kwargs))
+
+    monkeypatch.setattr(tool, "_trace_delegation", _record)
+
+    class _RaisingSession:
+        def query(self, *_args):
+            raise AssertionError("file bookkeeping must not query the DB here")
+
+        def commit(self):
+            raise RuntimeError("db down")
+
+        def close(self):
+            return None
+
+    real_scope = db_session_module.tool_session_scope
+    calls = {"n": 0}
+
+    @contextmanager
+    def _counting_scope(factory):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            with real_scope(factory) as db:
+                yield db
+        else:
+            db = _RaisingSession()
+            try:
+                yield db
+            finally:
+                db.close()
+
+    monkeypatch.setattr(db_session_module, "tool_session_scope", _counting_scope)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["failure_code"] == "unsupported_nested_interaction"
+    assert result["status"] == "error"
+    assert not str(result["response"]).startswith("Error executing agent")
+    assert [status for status, _ in traced] == ["start", "error"]
+    assert "Failed to register delegated file outputs" in caplog.text
+    assert tool_result_succeeded(result) is False
 
 
 def _create_factory() -> tuple[sessionmaker, str]:

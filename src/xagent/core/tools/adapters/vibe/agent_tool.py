@@ -2184,14 +2184,25 @@ class AgentTool(AbstractBaseTool):
             # completed response.
             classified_failure = _classify_delegated_child_failure(result)
             if classified_failure is not None:
-                # File outputs already written to disk by the child are still
-                # registered and committed so they are not orphaned, but the
-                # classified failure never advertises refs to them.
-                with tool_session_scope(self._session_factory) as db:
-                    self._parent_owned_file_outputs(
-                        result.get("file_outputs"), agent_service.workspace, db
+                # Best-effort only: the child's files are registered so they
+                # are not orphaned, but a failure here must not turn the
+                # classified failure into the generic catch-all shape and
+                # lose ``failure_code``. The rows stay uncommitted in that
+                # case.
+                try:
+                    with tool_session_scope(self._session_factory) as db:
+                        self._parent_owned_file_outputs(
+                            result.get("file_outputs"), agent_service.workspace, db
+                        )
+                        db.commit()
+                except Exception:
+                    logger.warning(
+                        "Failed to register delegated file outputs for a "
+                        "classified failure of agent %s; continuing with the "
+                        "classified result",
+                        self._agent_id,
+                        exc_info=True,
                     )
-                    db.commit()
                 await self._trace_delegation(
                     "error",
                     execution_task_id=execution_task_id,
