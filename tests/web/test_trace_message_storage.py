@@ -2410,6 +2410,7 @@ def test_checkpoint_read_for_missing_task_row_is_unavailable_not_refused(
     )
     from xagent.web.services.ops_signals import (
         CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
         clear_degradation,
     )
 
@@ -2425,6 +2426,7 @@ def test_checkpoint_read_for_missing_task_row_is_unavailable_not_refused(
         with pytest.raises(CheckpointUnavailableError) as missing_row:
             handler._sync_load_latest_checkpoint("exec-missing-task")
         assert not isinstance(missing_row.value, CheckpointAccessRefusedError)
+        assert CHECKPOINT_LOAD_UNAVAILABLE not in active_degradations()
     finally:
         clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
         db.close()

@@ -396,6 +396,10 @@ class DatabaseTraceHandler(BaseTraceHandler):
         if task_run is None:
             # The task row itself is gone -- an exceptional condition, not
             # a partition policy decision.
+            # No register_degradation: the signal is process-wide and is only
+            # cleared once a page query succeeds later in the read, which this
+            # branch never reaches -- one absent task would latch it for the
+            # whole process.
             raise CheckpointUnavailableError(
                 f"task {self.task_id}: task row is missing"
             )
