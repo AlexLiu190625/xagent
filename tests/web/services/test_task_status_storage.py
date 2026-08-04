@@ -506,6 +506,7 @@ _LEASE_CASE_BUILDER_NAMES = {
     "lease_run_id_case",
     "lease_state_version_case",
     "lease_checkpoint_event_id_case",
+    "lease_checkpoint_trace_event_id_case",
 }
 
 

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Barrier
 
 import pytest
+from sqlalchemy import create_engine, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Query, Session, sessionmaker
@@ -41,9 +43,14 @@ from xagent.web.services.task_lease_recovery import (
 )
 from xagent.web.services.task_lease_service import (
     TASK_RUN_ID_TRACE_FIELD,
+    CheckpointRecoveryVerdict,
+    TaskLeaseRecoveryCandidate,
     get_expired_task_lease_candidates,
+    resolve_checkpoint_recovery,
     utc_now,
 )
+
+ANCHOR_FK_NAME = "fk_tasks_last_checkpoint_trace_event_id"
 
 
 @pytest.fixture()
@@ -54,7 +61,20 @@ def db_session(tmp_path):
         yield db
     finally:
         db.close()
-        Base.metadata.drop_all(bind=get_engine())
+        # FK enforcement is on for this engine's connections (see
+        # apply_sqlite_concurrency_pragmas), and the checkpoint pointer's
+        # FK forms a cycle with trace_events.task_id -> tasks.id. A test
+        # that leaves a real cross-reference between the two tables (a
+        # populated last_checkpoint_trace_event_id) makes drop_all's table
+        # order irrelevant -- no order satisfies both directions of a
+        # populated cycle under enforcement. Dropping the tables is the
+        # only goal here, not preserving referential integrity of data
+        # about to be discarded, so enforcement is turned off for this one
+        # connection rather than for the fixture's tests.
+        engine = get_engine()
+        with engine.begin() as conn:
+            conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            Base.metadata.drop_all(bind=conn)
 
 
 def _create_user(db, *, suffix: str) -> User:
@@ -126,6 +146,75 @@ def _recover_expired_task(db, task: Task) -> TaskStatus | None:
         candidate,
         recovered_at=utc_now(),
     )
+
+
+def _candidate_for_task(task: Task) -> TaskLeaseRecoveryCandidate:
+    """Build the recovery candidate snapshot resolve_checkpoint_recovery
+    consumes, directly from a task's current column values -- for tests
+    that exercise checkpoint pointer resolution without going through the
+    full expired-lease scan query.
+    """
+    return TaskLeaseRecoveryCandidate(
+        task_id=int(task.id),
+        runner_id=task.runner_id,
+        run_id=task.run_id,
+        lease_expires_at=task.lease_expires_at,
+        state_version=int(task.state_version or 0),
+        last_checkpoint_event_id=task.last_checkpoint_event_id,
+        last_checkpoint_trace_event_id=task.last_checkpoint_trace_event_id,
+    )
+
+
+@pytest.fixture()
+def sqlite_no_anchor_fk_session(tmp_path):
+    """A SQLite database shaped like the checkpoint-anchor migration's ADD
+    COLUMN path applied to a table that already existed: full schema via
+    create_all, then ``tasks`` rebuilt without the checkpoint pointer's FK
+    clause. Alembic's SQLite batch mode cannot add that FK without a full
+    table rebuild, so this asymmetric shape -- not the fresh create_all
+    schema every other fixture in this module uses -- is the only one on
+    which ``last_checkpoint_trace_event_id`` can point at a row that no
+    longer exists. Mirrors
+    tests/web/services/test_task_deletion_checkpoint_pointer.py's
+    sqlite_upgraded_session for the same reason, kept as a separate
+    module-local copy rather than a shared import so this module's
+    fixtures stay self-contained.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'lease-recovery-no-fk.db'}")
+    for constraint in Base.metadata.tables["tasks"].constraints:
+        if getattr(constraint, "name", None) == ANCHOR_FK_NAME:
+            constraint._create_rule = None
+            break
+    else:
+        raise AssertionError(f"{ANCHOR_FK_NAME} constraint not found on tasks")
+    Base.metadata.create_all(bind=engine)
+
+    with engine.begin() as conn:
+        original_sql = conn.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+            )
+        ).scalar_one()
+        stripped_sql, count = re.subn(
+            r",\s*CONSTRAINT "
+            + re.escape(ANCHOR_FK_NAME)
+            + r" FOREIGN KEY\([^)]*\) REFERENCES [^,]*",
+            "",
+            original_sql,
+        )
+        assert count == 1, (
+            f"expected exactly one {ANCHOR_FK_NAME} clause in the tasks DDL"
+        )
+        conn.execute(text("ALTER TABLE tasks RENAME TO tasks_old"))
+        conn.execute(text(stripped_sql))
+        conn.execute(text("INSERT INTO tasks SELECT * FROM tasks_old"))
+        conn.execute(text("DROP TABLE tasks_old"))
+
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    session = session_factory()
+    yield session
+    session.close()
+    engine.dispose()
 
 
 def _attach_workforce_and_trigger(db, *, task: Task, user: User) -> tuple:
@@ -264,6 +353,10 @@ def test_recovery_rejects_checkpoint_without_current_run_provenance(
     else:
         data[TASK_RUN_ID_TRACE_FIELD] = checkpoint_run_id
     checkpoint.data = data
+    # Also anchor the PK pointer at the same row: the PK-first resolution
+    # path must reach the identical FAILED verdict the legacy scan does,
+    # not just the legacy path exercised when this column is unset.
+    task.last_checkpoint_trace_event_id = checkpoint.id
     db_session.commit()
 
     assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
@@ -301,9 +394,208 @@ def test_exact_checkpoint_pointer_is_not_limited_to_latest_one_hundred_events(
     assert _recover_expired_task(db_session, task) == TaskStatus.PAUSED
 
 
+def test_pk_anchor_resolves_without_a_usable_legacy_pointer(db_session) -> None:
+    """The exact-row pointer is resolved before the legacy scan runs at
+    all -- proven here by leaving the legacy event_id column unset, a
+    state a legacy-only scan could never resolve to anything.
+    """
+    user = _create_user(db_session, suffix="pk-priority")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="pk-priority",
+    )
+    checkpoint = TraceEvent(
+        task_id=task.id,
+        event_id="pk-priority-checkpoint",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: task.run_id,
+        },
+    )
+    db_session.add(checkpoint)
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = checkpoint.id
+    assert task.last_checkpoint_event_id is None
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery(db_session, candidate)
+        is CheckpointRecoveryVerdict.RECOVERABLE
+    )
+    assert _recover_expired_task(db_session, task) == TaskStatus.PAUSED
+
+
+def test_pk_anchor_validation_failure_does_not_fall_back_to_the_legacy_scan(
+    db_session,
+) -> None:
+    """A pointer that resolves to a row failing validation is corruption of
+    that exact row, not a cue to go search other rows -- even when the
+    legacy event_id column names a different, genuinely valid checkpoint
+    that a legacy-only scan would have accepted.
+    """
+    user = _create_user(db_session, suffix="pk-no-fallback")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="pk-no-fallback",
+    )
+    invalid_anchor = TraceEvent(
+        task_id=task.id,
+        build_id="agent_child",  # fails the build_id IS NULL check
+        event_id="pk-no-fallback-invalid",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: task.run_id,
+        },
+    )
+    valid_legacy_row = TraceEvent(
+        task_id=task.id,
+        event_id="pk-no-fallback-valid",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: task.run_id,
+        },
+    )
+    db_session.add_all([invalid_anchor, valid_legacy_row])
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = invalid_anchor.id
+    task.last_checkpoint_event_id = valid_legacy_row.event_id
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery(db_session, candidate)
+        is CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    )
+    assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
+
+
+def test_dangling_pk_pointer_falls_back_to_the_legacy_scan(
+    sqlite_no_anchor_fk_session,
+) -> None:
+    """A pointer whose row is gone is only reachable on a database upgraded
+    without this column's FK (the D1 asymmetry -- see the migration and
+    test_task_deletion_checkpoint_pointer.py). It is a compatibility-window
+    state, not corruption: recovery must fall back to the legacy scan
+    instead of failing the candidate outright.
+    """
+    session = sqlite_no_anchor_fk_session
+    user = User(
+        username="lease-recovery-dangling",
+        password_hash="hash",
+        is_admin=False,
+    )
+    session.add(user)
+    session.flush()
+    task = Task(
+        user_id=int(user.id),
+        title="dangling pointer",
+        description="lease recovery test",
+        status=TaskStatus.RUNNING,
+        execution_mode="auto",
+        runner_id="dead-runner-dangling",
+        run_id="run-dangling",
+        lease_expires_at=utc_now() - timedelta(seconds=5),
+        last_heartbeat_at=utc_now() - timedelta(seconds=10),
+        state_version=3,
+        control_state="running",
+    )
+    session.add(task)
+    session.flush()
+    legacy_checkpoint = TraceEvent(
+        task_id=task.id,
+        event_id="dangling-legacy-checkpoint",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: "run-dangling",
+        },
+    )
+    session.add(legacy_checkpoint)
+    session.flush()
+    task.last_checkpoint_event_id = legacy_checkpoint.event_id
+    # No DB-level FK on this schema form -- this id names no row.
+    task.last_checkpoint_trace_event_id = legacy_checkpoint.id + 999
+    session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery(session, candidate)
+        is CheckpointRecoveryVerdict.RECOVERABLE
+    )
+
+
+def test_ambiguous_legacy_checkpoint_skips_the_candidate_for_the_next_sweep(
+    db_session,
+) -> None:
+    """Two trace_events rows share the same legacy event_id within one
+    task's root partition -- the row's identity itself cannot be
+    determined from that string alone. This is not folded into FAILED:
+    the candidate is left untouched (lease and status unchanged, no
+    recovery statement executes) so a later sweep gets another chance to
+    resolve it, instead of permanently failing a task whose checkpoint may
+    in fact be readable once the ambiguity is gone.
+    """
+    user = _create_user(db_session, suffix="ambiguous")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="ambiguous",
+        with_checkpoint=True,
+    )
+    duplicate_checkpoint = TraceEvent(
+        task_id=task.id,
+        event_id=task.last_checkpoint_event_id,
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: task.run_id,
+        },
+    )
+    db_session.add(duplicate_checkpoint)
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery(db_session, candidate)
+        is CheckpointRecoveryVerdict.INDETERMINATE
+    )
+    assert _recover_expired_task(db_session, task) is None
+
+    db_session.expire_all()
+    persisted = db_session.get(Task, int(task.id))
+    assert persisted.status == TaskStatus.RUNNING
+    assert persisted.runner_id is not None
+    assert persisted.lease_expires_at is not None
+
+    # Nothing about the skip removed the candidate from the expired-lease
+    # scan -- a later sweep still selects it.
+    rescanned = get_expired_task_lease_candidates(
+        db_session,
+        cutoff=utc_now(),
+        limit=10,
+    )
+    assert any(c.task_id == int(task.id) for c in rescanned)
+
+
 @pytest.mark.parametrize(
     "replacement",
-    ["heartbeat", "runner", "run", "state_version", "checkpoint"],
+    ["heartbeat", "runner", "run", "state_version", "checkpoint", "checkpoint_pk"],
 )
 def test_recovery_candidate_cannot_overwrite_newer_task_state(
     db_session,
@@ -330,8 +622,28 @@ def test_recovery_candidate_cannot_overwrite_newer_task_state(
         task.run_id = "replacement-run"
     elif replacement == "state_version":
         task.state_version += 1
-    else:
+    elif replacement == "checkpoint":
         task.last_checkpoint_event_id = "new-checkpoint"
+    else:
+        # checkpoint_pk: only the exact-row pointer moves, the legacy string
+        # column is left alone -- a single-column drift the fence's
+        # conjunction over both pointer columns must still catch.
+        new_event = TraceEvent(
+            task_id=task.id,
+            event_id="new-checkpoint-pk",
+            event_type="system_update_general",
+            timestamp=utc_now(),
+            step_id=None,
+            parent_event_id=None,
+            data={
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "snapshot": {"type": "checkpoint"},
+                TASK_RUN_ID_TRACE_FIELD: task.run_id,
+            },
+        )
+        db_session.add(new_event)
+        db_session.flush()
+        task.last_checkpoint_trace_event_id = new_event.id
     db_session.commit()
 
     assert (
