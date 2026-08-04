@@ -968,16 +968,15 @@ async def test_on_tool_end_emits_only_allowlisted_top_level_failure_code(
 
 
 @pytest.mark.asyncio
-async def test_on_tool_end_classifies_nested_wait_failure_and_stops_parent_success() -> (
-    None
-):
-    """A classified nested-wait failure must reach trace data and fail the turn.
+async def test_on_tool_end_marks_classified_nested_wait_as_failed() -> None:
+    """A classified nested-wait failure must route through on_tool_error.
 
-    This is the runtime-level half of the AgentTool nested-wait fix: the
-    parent pattern decides success purely from the result shape, so the
-    classified failure dict (not an exception) must be enough to route
-    through ``on_tool_error`` and carry ``failure_code`` into the emitted
-    trace event.
+    The ReAct loop records ``status="failed"`` for this tool call and
+    continues (it does not stop the parent run — see
+    ``react.py:2787-2803``). This test covers the runtime half only: that a
+    classified failure dict, not an exception, is enough to route through
+    ``on_tool_error`` and carry ``failure_code`` into the emitted trace
+    event.
     """
 
     class CapturingTracer:
