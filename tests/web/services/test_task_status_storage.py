@@ -121,6 +121,29 @@ def test_storage_names_match_column_compilation() -> None:
             )
 
 
+def test_member_name_lower_equals_value() -> None:
+    """The control-state migration's LOWER(CAST(status AS VARCHAR)) form
+    (src/xagent/migrations/versions/20260711_add_task_execution_control_state.py,
+    lines 67-73) compares the column against each member's lowercased
+    *value* -- e.g. "running" -- which only matches the stored uppercase
+    *name* because name.lower() happens to equal value for every current
+    member. This pin fails the day a future member breaks that coincidence,
+    naming the mismatched member so the migration gets fixed instead of the
+    assertion.
+    """
+    mismatched = [
+        (status.name, status.name.lower(), status.value)
+        for status in TaskStatus
+        if status.name.lower() != status.value
+    ]
+    assert mismatched == [], (
+        "TaskStatus member(s) with name.lower() != value: "
+        f"{mismatched} -- this breaks the LOWER(CAST(status AS VARCHAR)) "
+        "comparison in "
+        "src/xagent/migrations/versions/20260711_add_task_execution_control_state.py"
+    )
+
+
 # --------------------------------------------------------------------------
 # Sentinel 2 (DB layer, raw text()): wrong-case / cast-form literals
 # --------------------------------------------------------------------------
@@ -486,6 +509,31 @@ _LEASE_CASE_BUILDER_NAMES = {
 }
 
 
+def _called_name(func: ast.expr) -> str | None:
+    """The callable name for a ``Call.func`` node: a bare ``case`` name, or
+    the attribute tail of a qualified call such as ``sa.case``."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _case_call_names(tree: ast.AST) -> set[str]:
+    """``case`` plus any module-local alias bound by a
+    ``from sqlalchemy[.x] import case as X`` import in the given tree."""
+    names = {"case"}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "").split(".")[0] == "sqlalchemy"
+        ):
+            for alias in node.names:
+                if alias.name == "case":
+                    names.add(alias.asname or alias.name)
+    return names
+
+
 def _stray_task_status_case_calls(
     source: str, builder_names: set[str]
 ) -> list[tuple[str | None, int]]:
@@ -493,6 +541,19 @@ def _stray_task_status_case_calls(
     the given builder functions. Scoped to Task.status specifically -- a
     case() built on an unrelated column is not this binding's concern and
     must not be flagged.
+
+    The callee is matched by name tail (via ``_called_name``), so both a
+    qualified call (``sa.case``) and a module-local
+    ``from sqlalchemy import case as X`` alias (resolved by
+    ``_case_call_names`` from imports in this same tree) are recognised,
+    not just a bare ``case`` reference. A hit is cleared when *any*
+    enclosing function scope -- not just the innermost -- is one of the
+    given builder names, so a helper nested inside a builder is not
+    flagged. Accepted false-positive surface: attribute-tail matching means
+    an unrelated ``anything.case(...)`` call is matched by name too; it
+    only gets reported if `_references_task_status` also fires for it,
+    which requires an unrelated ``.case()`` method that also touches
+    ``Task.status`` -- a shape that would deserve a look anyway.
     """
     tree = ast.parse(source)
     parents: dict[ast.AST, ast.AST] = {}
@@ -500,13 +561,14 @@ def _stray_task_status_case_calls(
         for child in ast.iter_child_nodes(node):
             parents[child] = node
 
-    def _enclosing_function(node: ast.AST) -> str | None:
+    def _enclosing_function_names(node: ast.AST) -> list[str]:
+        names: list[str] = []
         current = parents.get(node)
         while current is not None:
             if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                return current.name
+                names.append(current.name)
             current = parents.get(current)
-        return None
+        return names
 
     def _references_task_status(node: ast.Call) -> bool:
         return any(
@@ -517,15 +579,18 @@ def _stray_task_status_case_calls(
             for sub in ast.walk(node)
         )
 
-    return [
-        (_enclosing_function(node), node.lineno)
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "case"
-        and _enclosing_function(node) not in builder_names
-        and _references_task_status(node)
-    ]
+    case_names = _case_call_names(tree)
+    hits: list[tuple[str | None, int]] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and _called_name(node.func) in case_names):
+            continue
+        if not _references_task_status(node):
+            continue
+        enclosing = _enclosing_function_names(node)
+        if builder_names.intersection(enclosing):
+            continue
+        hits.append((enclosing[0] if enclosing else None, node.lineno))
+    return hits
 
 
 def test_lease_case_builders_are_the_only_case_calls_in_the_lease_service() -> None:
@@ -557,6 +622,76 @@ def some_unrelated_helper():
 """
     stray = _stray_task_status_case_calls(fixture, _LEASE_CASE_BUILDER_NAMES)
     assert stray == [], stray
+
+
+@pytest.mark.parametrize(
+    "case_id,fixture",
+    [
+        (
+            "qualified",
+            """
+import sqlalchemy as sa
+
+def h():
+    return sa.case((Task.status != "running", 1), else_=0)
+""",
+        ),
+        (
+            "aliased",
+            """
+from sqlalchemy import case as sql_case
+
+def h():
+    return sql_case((Task.status != "running", 1), else_=0)
+""",
+        ),
+    ],
+    ids=["qualified", "aliased"],
+)
+def test_lease_case_ban_flags_qualified_and_aliased_case_calls(
+    case_id, fixture
+) -> None:
+    """A qualified ``sa.case(...)`` and a
+    ``from sqlalchemy import case as sql_case`` alias must both be
+    recognised by the lease case() ban -- matching the bare ``case`` name
+    alone would still miss the aliased form.
+    """
+    stray = _stray_task_status_case_calls(fixture, _LEASE_CASE_BUILDER_NAMES)
+    assert stray == [("h", 5)], (case_id, stray)
+
+
+def test_lease_case_ban_allows_helpers_nested_in_the_lease_builders() -> None:
+    """A helper function nested *inside* one of the three lease builders
+    must not be flagged -- this requires checking every enclosing scope,
+    not just the innermost one.
+    """
+    fixture = """
+from sqlalchemy import case
+
+def lease_run_id_case(candidate_run_id):
+    def _helper():
+        return case((Task.status != "RUNNING", 1), else_=0)
+    return _helper()
+"""
+    stray = _stray_task_status_case_calls(fixture, _LEASE_CASE_BUILDER_NAMES)
+    assert stray == [], stray
+
+
+def test_lease_case_ban_flags_helpers_nested_outside_the_lease_builders() -> None:
+    """A helper nested inside a *non*-builder function must still be
+    flagged -- without this, "check all enclosing scopes" could be
+    implemented as "never flag anything nested" and stay green.
+    """
+    fixture = """
+from sqlalchemy import case
+
+def some_helper():
+    def _inner():
+        return case((Task.status != "RUNNING", 1), else_=0)
+    return _inner()
+"""
+    stray = _stray_task_status_case_calls(fixture, _LEASE_CASE_BUILDER_NAMES)
+    assert stray == [("_inner", 6)], stray
 
 
 # --- WHERE-clause equivalence for the 6 WHERE sites (constants, not case) -

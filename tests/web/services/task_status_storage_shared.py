@@ -35,12 +35,14 @@ TASK_STATUS_STORAGE_NAMES: dict[TaskStatus, str] = {
 }
 
 # A plausible near-miss of the existing LOWER(CAST(status AS VARCHAR)) form
-# used by migrations/versions/20260711_add_task_execution_control_state.py:
+# used by
+# src/xagent/migrations/versions/20260711_add_task_execution_control_state.py:
 # CAST without LOWER(). The migration's own form is safe today only because
-# every current TaskStatus member's name.lower() equals its value; a bare
-# CAST comparison against the lowercase value is a silent trap for any
-# future member where that coincidence breaks; it fails now for the same
-# reason. Zero rows, no exception, on both backends.
+# every current TaskStatus member's name.lower() equals its value --
+# test_member_name_lower_equals_value in test_task_status_storage.py pins
+# that invariant. A bare CAST comparison against the lowercase value is a
+# silent trap for any future member where that coincidence breaks; it fails
+# now for the same reason. Zero rows, no exception, on both backends.
 CAST_WITHOUT_LOWER_ZERO_MATCH_SQL = (
     "SELECT id FROM tasks WHERE CAST(status AS VARCHAR) = :value"
 )
