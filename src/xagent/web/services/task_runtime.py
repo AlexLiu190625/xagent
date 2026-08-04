@@ -60,29 +60,43 @@ _PUBLIC_METADATA_STATUS_RESERVE_BYTES = 2 * 1024
 TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY = "runtime_extension_bindings"
 # Keys in ``tasks.agent_config`` that only the server may write. Task-create
 # request bodies carry a free-form ``agent_config`` dict that endpoints copy
-# wholesale, so anything the server later reads back as authoritative has to be
-# stripped from that copy first -- otherwise a client can pre-seed it.
+# wholesale, so anything the server later reads back as authoritative has to
+# be stripped from that copy first -- otherwise a client can pre-seed it.
 #
-# ``execution_scope`` is listed because the scope it carries is read back as the
-# authority over where a task's bytes land -- sandbox mount, durable storage
-# prefix, workspace directory, memory dimensions. No provenance marker can make
-# that value trustworthy once it is in the column, because the marker would sit
-# in the same client-writable field as the value it vouches for, so the only
-# place to refuse it is here. The one server-side writer
-# (``build_workforce_task_config``) is on a path that never copies a request
-# dict, so stripping the key cannot reach a server-assigned value.
+# This column's key space is not closed inside this repo: closed-source
+# distributions register providers at startup (see this module's docstring
+# above), and those providers get a ``session_factory``
+# (``xagent.core.task_runtime.TaskRuntimeContext.session_factory``) they can
+# use to write this column directly. An inventory of every reserved key here
+# would only be a claim a future reader trusts instead of re-deriving, so this
+# comment holds none -- the enumeration is #1095's job.
 #
-# Other reserved keys on this column are still pass-through by long-standing
-# behavior and are tracked separately: ``a2a_context_id``, ``auth_mode``,
-# ``guest_id``, ``share_agent_id``, ``share_workforce_id``,
-# ``widget_workforce_id``, ``widget_agent_id``, ``workforce_run_id``,
-# ``a2a_state``, ``trigger_id``, ``trigger_run_id``, ``trigger_type``,
-# ``trigger_test`` and ``is_preview``. That list is the inventory, not a
-# sample: a set holding a few of them implies a protection the rest do not
-# have. Adding any of them needs one check this key did not -- whether an
-# out-of-repo caller sends it in a request body -- because unlike
-# ``execution_scope`` their writers sit next to the sanitizer rather than off
-# its path.
+# Most server writers layer on top of an already-sanitized dict (all three
+# ``sanitize_client_agent_config`` call sites -- ``public_chat_access.py:931``,
+# ``:1079``, ``chat.py:164`` -- sanitize then layer) or build ``agent_config``
+# off this path entirely: ``build_workforce_task_config``,
+# ``_trigger_execution_context`` (``services/triggers.py``), the a2a
+# create/backfill writers, and the workforce widget/share builders. One writer
+# passes *through* the sanitizer instead: ``websocket.py``'s build-preview
+# handler builds a server-owned config carrying ``is_preview: True`` and
+# ``preview_agent_id`` (``websocket.py:8419-8425``) and hands it to
+# ``TaskCreateRequest(agent_config=...)`` passed into ``create_task``
+# (``websocket.py:8447-8466``), layered below the sanitizer rather than above
+# it -- reserving either key there would silently strip it and break
+# agent-builder preview.
+#
+# Before adding a key here: (1) confirm no server writer reaches this column
+# *through* the sanitizer (the preview path above is the only known case);
+# (2) confirm no out-of-repo caller legitimately sends it in a request body
+# (#1095 tracks this).
+#
+# ``execution_scope`` qualifies today: it is read back as the authority over
+# where a task's bytes land -- sandbox mount, durable storage prefix,
+# workspace directory, memory dimensions -- and its one server-side writer,
+# ``build_workforce_task_config``, is off the sanitizer path entirely.
+# ``tests/web/test_execution_scope_delegation.py::
+# TestWorkforceTaskConfigSnapshot::test_scope_persisted_when_active`` asserts
+# the server-written scope lands.
 CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
