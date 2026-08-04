@@ -2477,6 +2477,14 @@ class TelegramChannelManager:
         self.bots: Dict[str, TelegramBotInstance] = {}
         self._bot_stop_tasks: Dict[str, asyncio.Task[None]] = {}
         self.enabled = True  # Always enabled, we load dynamically
+        # Channel CRUD endpoints fire sync as a background task, so two syncs
+        # can interleave. _stop_bot_for_token awaits the shutdown drain and
+        # only removes the bot from self.bots afterwards, so a second sync
+        # entering that window sees a token that is still present but already
+        # being torn down: it skips starting it, the first sync completes the
+        # removal, and a re-enabled channel ends up neither running nor
+        # tracked until some later sync happens to run.
+        self._sync_lock = asyncio.Lock()
 
     async def start(self) -> None:
         await self._sync_bots_async()
@@ -2487,46 +2495,47 @@ class TelegramChannelManager:
             await self._stop_bot_for_token(token)
 
     async def _sync_bots_async(self) -> None:
-        active_tokens = set()
-        channel_info_by_token: Dict[str, Dict] = {}
+        async with self._sync_lock:
+            active_tokens = set()
+            channel_info_by_token: Dict[str, Dict] = {}
 
-        try:
-            channels = await load_active_channel_configs(
-                channel_type="telegram",
-                required_config_keys=("bot_token",),
+            try:
+                channels = await load_active_channel_configs(
+                    channel_type="telegram",
+                    required_config_keys=("bot_token",),
+                )
+                for ch in channels:
+                    token = ch.config_value("bot_token")
+                    if token:
+                        active_tokens.add(token)
+                        channel_info_by_token[token] = {
+                            "id": ch.channel_id,
+                            "name": ch.channel_name,
+                        }
+            except Exception as e:
+                logger.error(f"Failed to load user channels for sync: {e}")
+                return  # Don't try to sync if we failed to load from db
+
+            current_tokens = set(self.bots.keys())
+
+            logger.info(
+                f"Syncing telegram bots. Current active in db: {len(active_tokens)}, currently running: {len(current_tokens)}"
             )
-            for ch in channels:
-                token = ch.config_value("bot_token")
-                if token:
-                    active_tokens.add(token)
-                    channel_info_by_token[token] = {
-                        "id": ch.channel_id,
-                        "name": ch.channel_name,
-                    }
-        except Exception as e:
-            logger.error(f"Failed to load user channels for sync: {e}")
-            return  # Don't try to sync if we failed to load from db
 
-        current_tokens = set(self.bots.keys())
+            # Stop bots that are no longer active
+            for token in current_tokens - active_tokens:
+                await self._stop_bot_for_token(token)
 
-        logger.info(
-            f"Syncing telegram bots. Current active in db: {len(active_tokens)}, currently running: {len(current_tokens)}"
-        )
-
-        # Stop bots that are no longer active
-        for token in current_tokens - active_tokens:
-            await self._stop_bot_for_token(token)
-
-        # Start bots that are newly active
-        for token in active_tokens - current_tokens:
-            channel_info = channel_info_by_token.get(token, {})
-            ch_id = channel_info.get("id")
-            ch_name = channel_info.get("name")
-            await self._start_bot_for_token(
-                token,
-                int(ch_id) if ch_id is not None else None,
-                str(ch_name) if ch_name is not None else None,
-            )
+            # Start bots that are newly active
+            for token in active_tokens - current_tokens:
+                channel_info = channel_info_by_token.get(token, {})
+                ch_id = channel_info.get("id")
+                ch_name = channel_info.get("name")
+                await self._start_bot_for_token(
+                    token,
+                    int(ch_id) if ch_id is not None else None,
+                    str(ch_name) if ch_name is not None else None,
+                )
 
     async def _start_bot_for_token(
         self,

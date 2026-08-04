@@ -732,6 +732,14 @@ class FeishuChannelManager:
     def __init__(self) -> None:
         self.bots: Dict[str, FeishuBotInstance] = {}
         self._bot_stop_tasks: Dict[str, asyncio.Task[None]] = {}
+        # Channel CRUD endpoints fire sync as a background task, so two syncs
+        # can interleave. _stop_bot_for_appid awaits the shutdown drain and
+        # only removes the bot from self.bots afterwards, so a second sync
+        # entering that window sees an app_id that is still present but
+        # already being torn down: it skips starting it, the first sync
+        # completes the removal, and a re-enabled channel ends up neither
+        # running nor tracked until some later sync happens to run.
+        self._sync_lock = asyncio.Lock()
 
     async def start(self) -> None:
         await self._sync_bots_async()
@@ -741,38 +749,39 @@ class FeishuChannelManager:
             await self._stop_bot_for_appid(app_id)
 
     async def _sync_bots_async(self) -> None:
-        active_app_ids = set()
-        channel_info_by_appid: Dict[str, Dict] = {}
+        async with self._sync_lock:
+            active_app_ids = set()
+            channel_info_by_appid: Dict[str, Dict] = {}
 
-        try:
-            channels = await load_active_channel_configs(
-                channel_type="feishu",
-                required_config_keys=("app_id", "app_secret"),
-            )
-            for ch in channels:
-                app_id = ch.config_value("app_id")
-                app_secret = ch.config_value("app_secret")
-                if app_id and app_secret:
-                    active_app_ids.add(app_id)
-                    channel_info_by_appid[app_id] = {
-                        "app_secret": app_secret,
-                        "id": ch.channel_id,
-                        "name": ch.channel_name,
-                    }
-        except Exception as e:
-            logger.error(f"Failed to load feishu channels for sync: {e}")
-            return
+            try:
+                channels = await load_active_channel_configs(
+                    channel_type="feishu",
+                    required_config_keys=("app_id", "app_secret"),
+                )
+                for ch in channels:
+                    app_id = ch.config_value("app_id")
+                    app_secret = ch.config_value("app_secret")
+                    if app_id and app_secret:
+                        active_app_ids.add(app_id)
+                        channel_info_by_appid[app_id] = {
+                            "app_secret": app_secret,
+                            "id": ch.channel_id,
+                            "name": ch.channel_name,
+                        }
+            except Exception as e:
+                logger.error(f"Failed to load feishu channels for sync: {e}")
+                return
 
-        current_app_ids = set(self.bots.keys())
+            current_app_ids = set(self.bots.keys())
 
-        for app_id in current_app_ids - active_app_ids:
-            await self._stop_bot_for_appid(app_id)
+            for app_id in current_app_ids - active_app_ids:
+                await self._stop_bot_for_appid(app_id)
 
-        for app_id in active_app_ids - current_app_ids:
-            info = channel_info_by_appid[app_id]
-            await self._start_bot_for_appid(
-                app_id, info["app_secret"], info["id"], info["name"]
-            )
+            for app_id in active_app_ids - current_app_ids:
+                info = channel_info_by_appid[app_id]
+                await self._start_bot_for_appid(
+                    app_id, info["app_secret"], info["id"], info["name"]
+                )
 
     async def _start_bot_for_appid(
         self, app_id: str, app_secret: str, channel_id: int, channel_name: str
