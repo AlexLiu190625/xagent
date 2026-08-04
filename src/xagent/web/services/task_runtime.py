@@ -59,9 +59,11 @@ _PUBLIC_METADATA_STATUS_RESERVE_BYTES = 2 * 1024
 # keeps the per-task binding record migration-free.
 TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY = "runtime_extension_bindings"
 # Reserved ``tasks.agent_config`` key holding the server-validated list of
-# uploaded file ids bound to one task. ``chat.py``'s ``_build_task_agent_config``
-# owns the value it substitutes; this constant names the key so the sanitizer
-# and that boundary refer to the same string.
+# uploaded file ids bound to one task. Two writers own the value they
+# substitute here -- ``chat.py``'s ``_build_task_agent_config`` and
+# ``workforce_snapshot.py``'s ``build_workforce_task_config`` -- this
+# constant names the key so the sanitizer and both boundaries refer to the
+# same string.
 SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # Keys in ``tasks.agent_config`` that only the server may write. Task-create
 # request bodies carry a free-form ``agent_config`` dict that endpoints copy
@@ -85,10 +87,13 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # ``sanitize_client_agent_config`` call sites -- ``public_chat_access.py``'s
 # ``create_public_chat_task`` and ``create_share_chat_task``, and ``chat.py``'s
 # ``_build_task_agent_config`` -- sanitize then layer) or build ``agent_config``
-# off this path entirely: ``build_workforce_task_config``,
-# ``_trigger_execution_context`` (``services/triggers.py``), the a2a
-# create/backfill writers, and the workforce widget/share builders. One writer
-# passes *through* the sanitizer instead: ``websocket.py``'s
+# off this path entirely -- e.g. ``build_workforce_task_config``
+# (``workforce_snapshot.py``) and ``_attach_workforce_task_to_trigger_run``
+# (``services/triggers.py``, via ``_trigger_execution_context``). An
+# enumeration of every off-path writer here would go stale the same way an
+# inventory of reserved keys would (see above), so this comment names
+# examples rather than claiming completeness. Exactly one writer passes
+# *through* the sanitizer instead: ``websocket.py``'s
 # ``handle_build_preview_execution`` assembles a config from the WS message
 # (``instructions``, ``knowledge_bases``, ``skills``, ``tool_categories``, and
 # ``preview_agent_id`` all come from ``message_data.get(...)``; only
@@ -110,7 +115,15 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # Before adding a key here: (1) confirm no server writer reaches this column
 # *through* the sanitizer (the preview path above is the only known case);
 # (2) confirm no out-of-repo caller legitimately sends it in a request body
-# (#1095 tracks this).
+# (#1095 tracks this); (3) confirm no ``extra_agent_config=`` caller can win a
+# collision against this key through ``_merge_agent_config``
+# (``services/workforce_runs.py``), which returns
+# ``{**extra_agent_config, **task_config}`` with no sanitizing of its own --
+# safe today only because every ``extra_agent_config=`` caller passes a
+# server literal, and the built config wins only where it actually sets the
+# key, which for the two keys below is conditional
+# (``workforce_snapshot.py``'s ``build_workforce_task_config``). That the
+# strip is call-site opt-in rather than structural is #1134.
 #
 # ``execution_scope`` qualifies today: it is read back as the authority over
 # where a task's bytes land -- sandbox mount, durable storage prefix,
