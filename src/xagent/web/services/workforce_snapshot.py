@@ -20,6 +20,7 @@ from xagent.web.models.agent import (
 from xagent.web.models.user import User
 
 from ..models.workforce import Workforce, WorkforceAgent
+from .task_runtime import SELECTED_FILE_IDS_AGENT_CONFIG_KEY
 from .workforce_access import (
     ensure_workforce_access,
     ensure_workforce_agent_run_access,
@@ -531,7 +532,7 @@ def build_workforce_task_config(
     if workforce_run_id is not None:
         config["workforce_run_id"] = workforce_run_id
     if selected_file_ids:
-        config["selected_file_ids"] = selected_file_ids
+        config[SELECTED_FILE_IDS_AGENT_CONFIG_KEY] = selected_file_ids
     # Workforce runs create fresh Task rows whose ids the embedder's scope
     # resolver cannot map. Persist the creating context's ExecutionScope
     # snapshot into agent_config (no schema migration); resolve_execution_scope
