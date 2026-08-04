@@ -130,8 +130,13 @@ def _stub_begin_turn(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _stub(**_kwargs: Any) -> SimpleNamespace:
         return SimpleNamespace(background_task=None)
 
+    # ``schedule_claimed_create_turn`` is what the workforce create path
+    # reaches, not ``begin_turn``: stubbing the latter is inert, the real turn
+    # still starts, and its background task then races test-DB teardown.
     monkeypatch.setattr(
-        workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub
+        workforce_runs_service.TaskTurnOrchestrator,
+        "schedule_claimed_create_turn",
+        _stub,
     )
 
 

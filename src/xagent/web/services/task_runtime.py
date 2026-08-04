@@ -101,9 +101,11 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # ``False`` (:data:`xagent.web.schemas.chat.TaskCreateRequest.is_preview`) and
 # the re-layer never fires here. So reserving ``is_preview`` or
 # ``preview_agent_id`` would still silently strip them from this config with
-# nothing to restore them, breaking agent-builder preview. (Both readers of
-# ``preview_agent_id`` apply an ownership clause before trusting it, so it is
-# not itself exploitable.)
+# nothing to restore them, breaking agent-builder preview. That it cannot be
+# reserved is not a statement that it is safe: three of its readers resolve it
+# through an ownership-scoped query, but the SSH tools' ``_agent_id_from_task``
+# reads it with no such check and uses it to pick which targets a task may
+# reach, so the answer for that key has to be reader-side (issue #1136).
 #
 # Before adding a key here: (1) confirm no server writer reaches this column
 # *through* the sanitizer (the preview path above is the only known case);

@@ -199,9 +199,11 @@ def _coerce_snapshot_version(raw_version: Any) -> int:
     directly, and a row persisted before ``execution_scope`` was reserved at
     the request boundary (``CLIENT_RESERVED_AGENT_CONFIG_KEYS``,
     ``xagent.web.services.task_runtime``) still carries whatever a request
-    seeded at the time (issue #1135). Exactly one value means "authentic snapshot written
-    before this field existed": ``0``, what an absent key decodes to.
-    That marker carries real trust -- the *older* half of
+    seeded at the time (issue #1135). One value is the pre-versioning shape
+    sentinel: ``0``, what an absent key decodes to. It says nothing about who
+    wrote the snapshot -- omitting the field produces the same value, so it is
+    a statement about shape, not provenance. It still decides handling -- the
+    *older* half of
     ``_validate_execution_scope_snapshot_candidate``'s asymmetric gate is
     relaxed on the ``snapshot_defines_namespace=True`` branch, where such a
     snapshot's namespace fields are then used verbatim -- so a value that
