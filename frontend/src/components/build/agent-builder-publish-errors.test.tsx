@@ -4,9 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 // Issue #969: the non-update builder actions (publish, unpublish, publish from
 // the creation success dialog, optimize instructions) must never pass a raw
-// `detail` payload to toast.error. Each action renders only displayable
-// strings, keeps its own localized fallback for unreadable or malformed
-// responses, and leaves the builder mounted after the failure.
+// `detail` payload to toast.error. sonner is mocked here, so each case asserts
+// two things: the exact string handed to the toaster is displayable, and the
+// builder is still mounted afterwards.
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
@@ -114,7 +114,15 @@ vi.mock("@/hooks/use-file-mention", () => ({
 vi.mock("@/components/ui/multi-select", () => ({
   MultiSelect: () => <div data-testid="multi-select" />,
 }))
-vi.mock("@/components/ui/select", () => ({ Select: () => null }))
+// The model Select is the only place `modelConfig.general` reaches the DOM
+// (agent-builder.tsx renders it at the `models.length > 0` branch of the config
+// form). Mirroring the value onto data-value gives the create flow a readiness
+// signal it can wait on instead of retrying clicks.
+vi.mock("@/components/ui/select", () => ({
+  Select: ({ value }: { value?: string }) => (
+    <div data-testid="model-select" data-value={value ?? ""} />
+  ),
+}))
 vi.mock("@/components/build/build-file-preview-sheet", () => ({
   BuildFilePreviewSheet: () => null,
 }))
@@ -154,7 +162,17 @@ function agentResponse(status: "draft" | "published") {
 // instead of handing the raw payload to the toaster.
 const FALLBACK = "__ACTION_FALLBACK__"
 
-const ERROR_CASES = [
+type ErrorCase = {
+  name: string
+  body: string | null
+  expected: string
+  // Default to a FastAPI validation failure; a case overrides these when the
+  // transport shape itself is part of the fixture.
+  status?: number
+  contentType?: string
+}
+
+const ERROR_CASES: ErrorCase[] = [
   {
     name: "a plain string detail",
     body: JSON.stringify({ detail: " Action failed with string detail " }),
@@ -164,6 +182,19 @@ const ERROR_CASES = [
     name: "a structured detail message",
     body: JSON.stringify({ detail: { message: "Action failed", context: [] } }),
     expected: "Action failed",
+  },
+  {
+    name: "a structured detail msg",
+    body: JSON.stringify({ detail: { msg: "  Action failed with detail msg  " } }),
+    expected: "Action failed with detail msg",
+  },
+  {
+    name: "a detail msg alongside a top-level message",
+    body: JSON.stringify({
+      detail: { msg: "Detail wins" },
+      message: "Top-level loses",
+    }),
+    expected: "Detail wins",
   },
   {
     name: "a detail object without a readable message",
@@ -188,6 +219,11 @@ const ERROR_CASES = [
     expected: FALLBACK,
   },
   {
+    name: "a bare top-level message",
+    body: JSON.stringify({ message: "  Top-level failure  " }),
+    expected: "Top-level failure",
+  },
+  {
     name: "an empty response body",
     body: null,
     expected: FALLBACK,
@@ -196,76 +232,99 @@ const ERROR_CASES = [
     name: "a non-JSON response body",
     body: "<html>Bad Gateway</html>",
     expected: FALLBACK,
+    status: 502,
+    contentType: "text/html",
   },
-] as const
+]
 
-function errorResponse(body: string | null) {
-  return new Response(body, {
-    status: 422,
-    headers: { "Content-Type": "application/json" },
+// The one model the create flow resolves to, both as the available-model list
+// entry and as the user's general default.
+const DEFAULT_MODEL = {
+  id: 10,
+  model_id: "test/model",
+  model_name: "Test Model",
+  model_provider: "test",
+  category: "llm",
+}
+
+function jsonResponse(payload: unknown, status = 200) {
+  return new Response(JSON.stringify(payload), { status })
+}
+
+function errorResponse(errorCase: ErrorCase) {
+  return new Response(errorCase.body, {
+    status: errorCase.status ?? 422,
+    headers: { "Content-Type": errorCase.contentType ?? "application/json" },
   })
+}
+
+type ApiOverride = (
+  url: string,
+  opts?: { method?: string }
+) => Promise<Response> | null
+
+// Mount-time API surface every suite needs to resolve before the builder
+// settles. `overrides` is consulted first and returns null to fall through, so
+// a suite only states what it actually changes.
+function installBaseApiMocks(overrides: ApiOverride) {
+  apiRequestMock.mockImplementation((url: string, opts?: { method?: string }) => {
+    const override = overrides(url, opts)
+    if (override) return override
+    if (url.endsWith("/api/kb/collections"))
+      return Promise.resolve(jsonResponse({ collections: [] }))
+    if (url.endsWith("/api/skills/")) return Promise.resolve(jsonResponse([]))
+    if (url.endsWith("/api/tools/available"))
+      return Promise.resolve(jsonResponse({ tools: [] }))
+    if (url.endsWith("/api/models/?category=llm"))
+      return Promise.resolve(jsonResponse([]))
+    if (url.includes(`/api/agents/${AGENT_ID}/triggers`))
+      return Promise.resolve(jsonResponse([]))
+    if (url.includes("/api/mcp/servers")) return Promise.resolve(jsonResponse([]))
+    return Promise.resolve(jsonResponse({}))
+  })
+}
+
+// The transport-failure suite injects its rejection by wrapping the installed
+// implementation, so it needs a failing path that never matches.
+const NO_FAILING_RESPONSE: ErrorCase = {
+  name: "unused",
+  body: null,
+  expected: FALLBACK,
 }
 
 function installEditModeApi(
   status: "draft" | "published",
   failingPath: string,
-  failingBody: string | null
+  failingCase: ErrorCase
 ) {
-  apiRequestMock.mockImplementation((url: string, opts?: { method?: string }) => {
+  installBaseApiMocks((url, opts) => {
     if (opts?.method === "POST" && url.endsWith(failingPath))
-      return Promise.resolve(errorResponse(failingBody))
-    if (url.endsWith("/api/kb/collections"))
-      return Promise.resolve(new Response(JSON.stringify({ collections: [] }), { status: 200 }))
-    if (url.endsWith("/api/skills/"))
-      return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
-    if (url.endsWith("/api/tools/available"))
-      return Promise.resolve(new Response(JSON.stringify({ tools: [] }), { status: 200 }))
-    if (url.endsWith("/api/models/?category=llm"))
-      return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
+      return Promise.resolve(errorResponse(failingCase))
     if (url.endsWith("/api/models/user-default"))
-      return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
-    if (url.includes(`/api/agents/${AGENT_ID}/triggers`))
-      return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
+      return Promise.resolve(jsonResponse([]))
     if (url.endsWith(`/api/agents/${AGENT_ID}`))
-      return Promise.resolve(
-        new Response(JSON.stringify(agentResponse(status)), { status: 200 })
-      )
-    if (url.includes("/api/mcp/servers"))
-      return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
-    return Promise.resolve(new Response(JSON.stringify({}), { status: 200 }))
+      return Promise.resolve(jsonResponse(agentResponse(status)))
+    return null
   })
 }
 
 // Create-mode mock for the success-dialog publish path: agent creation
 // succeeds (which opens the dialog), publish fails with the payload under test.
-function installCreateModeApi(failingBody: string | null) {
-  apiRequestMock.mockImplementation((url: string, opts?: { method?: string }) => {
+// The model list and the user default both resolve to DEFAULT_MODEL, so the
+// builder reaches a creatable state without any model interaction.
+function installCreateModeApi(failingCase: ErrorCase) {
+  installBaseApiMocks((url, opts) => {
     if (opts?.method === "POST" && url.endsWith(`/api/agents/${AGENT_ID}/publish`))
-      return Promise.resolve(errorResponse(failingBody))
+      return Promise.resolve(errorResponse(failingCase))
     if (opts?.method === "POST" && url.endsWith("/api/agents"))
-      return Promise.resolve(
-        new Response(JSON.stringify(agentResponse("draft")), { status: 200 })
-      )
-    if (url.includes(`/api/agents/${AGENT_ID}/triggers`))
-      return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
-    if (url.endsWith("/api/kb/collections"))
-      return Promise.resolve(new Response(JSON.stringify({ collections: [] }), { status: 200 }))
-    if (url.endsWith("/api/skills/"))
-      return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
-    if (url.endsWith("/api/tools/available"))
-      return Promise.resolve(new Response(JSON.stringify({ tools: [] }), { status: 200 }))
+      return Promise.resolve(jsonResponse(agentResponse("draft")))
     if (url.endsWith("/api/models/?category=llm"))
-      return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
+      return Promise.resolve(jsonResponse([DEFAULT_MODEL]))
     if (url.endsWith("/api/models/user-default"))
       return Promise.resolve(
-        new Response(
-          JSON.stringify([{ config_type: "general", model: { id: 10 } }]),
-          { status: 200 }
-        )
+        jsonResponse([{ config_type: "general", model: { id: DEFAULT_MODEL.id } }])
       )
-    if (url.includes("/api/mcp/servers"))
-      return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
-    return Promise.resolve(new Response(JSON.stringify({}), { status: 200 }))
+    return null
   })
 }
 
@@ -277,9 +336,11 @@ async function waitForLoadedBuilder() {
   )
 }
 
+// Exactly one error toast per failure: a second call would mean the action ran
+// twice, or that a validation toast leaked in before the action under test.
 async function expectToast(expected: string) {
   await waitFor(() => {
-    expect(toastErrorMock).toHaveBeenCalled()
+    expect(toastErrorMock).toHaveBeenCalledTimes(1)
     expect(toastErrorMock.mock.calls.at(-1)?.[0]).toBe(expected)
   })
 }
@@ -292,29 +353,59 @@ beforeEach(() => {
 
 afterEach(() => cleanup())
 
-describe("AgentBuilder publish error handling (issue #969)", () => {
-  it.each(ERROR_CASES)(
-    "handles $name without unmounting the builder",
-    async ({ body, expected }) => {
-      installEditModeApi("draft", `/api/agents/${AGENT_ID}/publish`, body)
-      render(<AgentBuilder agentId={AGENT_ID} />)
-      await waitForLoadedBuilder()
+// The three edit-mode actions differ only in which agent status they load,
+// which POST fails, which control triggers them and which localized fallback
+// they own.
+const EDIT_MODE_ACTIONS = [
+  {
+    actionName: "publish",
+    status: "draft",
+    failingPath: `/api/agents/${AGENT_ID}/publish`,
+    clickText: "builds.editor.header.publish",
+    fallbackKey: "builds.publication.publishFailed",
+  },
+  {
+    actionName: "unpublish",
+    status: "published",
+    failingPath: `/api/agents/${AGENT_ID}/unpublish`,
+    clickText: "builds.editor.header.unpublish",
+    fallbackKey: "builds.publication.unpublishFailed",
+  },
+  {
+    actionName: "optimize instructions",
+    status: "draft",
+    failingPath: "/api/agents/optimize-instructions",
+    clickText: "builds.configForm.instructions.optimize",
+    fallbackKey: "builds.configForm.instructions.optimizeError",
+  },
+] as const
 
-      fireEvent.click(screen.getByText("builds.editor.header.publish"))
+describe.each(EDIT_MODE_ACTIONS)(
+  "AgentBuilder $actionName error handling (issue #969)",
+  ({ status, failingPath, clickText, fallbackKey }) => {
+    it.each(ERROR_CASES)(
+      "surfaces a displayable message for $name",
+      async (errorCase) => {
+        installEditModeApi(status, failingPath, errorCase)
+        render(<AgentBuilder agentId={AGENT_ID} />)
+        await waitForLoadedBuilder()
 
-      await expectToast(
-        expected === FALLBACK ? "builds.publication.publishFailed" : expected
-      )
-      expect(screen.getByDisplayValue("Existing Agent")).toBeInTheDocument()
-    }
-  )
-})
+        fireEvent.click(screen.getByText(clickText))
+
+        await expectToast(
+          errorCase.expected === FALLBACK ? fallbackKey : errorCase.expected
+        )
+        expect(screen.getByDisplayValue("Existing Agent")).toBeInTheDocument()
+      }
+    )
+  }
+)
 
 describe("AgentBuilder network failure handling (issue #969)", () => {
   it("uses the generic fallback when the publish request itself rejects", async () => {
     // A transport-level rejection must not be swallowed by the response-body
     // parsing path: it hits the outer catch and shows the generic fallback.
-    installEditModeApi("draft", "__no_failing_path__", null)
+    installEditModeApi("draft", "__no_failing_path__", NO_FAILING_RESPONSE)
     const base = apiRequestMock.getMockImplementation()!
     apiRequestMock.mockImplementation((url: string, opts?: { method?: string }) => {
       if (opts?.method === "POST" && url.endsWith(`/api/agents/${AGENT_ID}/publish`))
@@ -331,49 +422,13 @@ describe("AgentBuilder network failure handling (issue #969)", () => {
   })
 })
 
-describe("AgentBuilder unpublish error handling (issue #969)", () => {
-  it.each(ERROR_CASES)(
-    "handles $name without unmounting the builder",
-    async ({ body, expected }) => {
-      installEditModeApi("published", `/api/agents/${AGENT_ID}/unpublish`, body)
-      render(<AgentBuilder agentId={AGENT_ID} />)
-      await waitForLoadedBuilder()
-
-      fireEvent.click(screen.getByText("builds.editor.header.unpublish"))
-
-      await expectToast(
-        expected === FALLBACK ? "builds.publication.unpublishFailed" : expected
-      )
-      expect(screen.getByDisplayValue("Existing Agent")).toBeInTheDocument()
-    }
-  )
-})
-
-describe("AgentBuilder optimize instructions error handling (issue #969)", () => {
-  it.each(ERROR_CASES)(
-    "handles $name without unmounting the builder",
-    async ({ body, expected }) => {
-      installEditModeApi("draft", "/api/agents/optimize-instructions", body)
-      render(<AgentBuilder agentId={AGENT_ID} />)
-      await waitForLoadedBuilder()
-
-      fireEvent.click(screen.getByText("builds.configForm.instructions.optimize"))
-
-      await expectToast(
-        expected === FALLBACK
-          ? "builds.configForm.instructions.optimizeError"
-          : expected
-      )
-      expect(screen.getByDisplayValue("Existing Agent")).toBeInTheDocument()
-    }
-  )
-})
-
+// Kept separate from the edit-mode table: this path has to create the agent
+// first, so it shares no setup with the three header actions.
 describe("AgentBuilder success-dialog publish error handling (issue #969)", () => {
   it.each(ERROR_CASES)(
-    "handles $name without unmounting the builder",
-    async ({ body, expected }) => {
-      installCreateModeApi(body)
+    "surfaces a displayable message for $name",
+    async (errorCase) => {
+      installCreateModeApi(errorCase)
       render(<AgentBuilder />)
 
       const nameInput = await screen.findByPlaceholderText(
@@ -387,22 +442,28 @@ describe("AgentBuilder success-dialog publish error handling (issue #969)", () =
       editor.textContent = "You are a new agent."
       fireEvent.input(editor)
 
-      // The default model arrives asynchronously from /api/models/user-default;
-      // retry the create click until validation passes and the dialog opens.
-      // After creation the header shows its own (disabled) publish button, so
-      // scope the click to the success dialog.
-      await waitFor(() => {
-        if (!screen.queryByRole("dialog")) {
-          fireEvent.click(screen.getByText("builds.editor.header.create"))
-        }
-        expect(screen.getByRole("dialog")).toBeInTheDocument()
-      })
-      fireEvent.click(
-        within(screen.getByRole("dialog")).getByText("builds.editor.header.publish")
+      // Creation is rejected while the general model is unset, and that value
+      // only lands once /api/models/user-default has been applied. The model
+      // Select mirrors it into data-value, so waiting for the id here ensures
+      // the state is committed before the one create click below.
+      await waitFor(() =>
+        expect(screen.getByTestId("model-select")).toHaveAttribute(
+          "data-value",
+          String(DEFAULT_MODEL.id)
+        )
       )
 
+      fireEvent.click(screen.getByText("builds.editor.header.create"))
+
+      // After creation the header keeps its own publish button, so scope the
+      // click to the success dialog.
+      const dialog = await screen.findByRole("dialog")
+      fireEvent.click(within(dialog).getByText("builds.editor.header.publish"))
+
       await expectToast(
-        expected === FALLBACK ? "builds.publication.publishFailed" : expected
+        errorCase.expected === FALLBACK
+          ? "builds.publication.publishFailed"
+          : errorCase.expected
       )
       // The background form is aria-hidden behind the dialog overlay, so
       // assert survival via the dialog staying mounted after the failure.

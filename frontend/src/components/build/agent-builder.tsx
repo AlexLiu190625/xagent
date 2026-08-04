@@ -152,19 +152,21 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null
 }
 
-// Safe error-message path for the builder's response-body error branches:
-// only displayable strings may reach toast.error; objects and arrays are
-// reduced to their readable messages and anything else falls back to the
-// caller's localized message.
-function getBuilderErrorMessage(error: unknown, fallback: string): string {
-  if (!isJsonRecord(error)) return fallback
+// Reduces a parsed error response body to a string that is safe to render.
+// Accepts, in order: a string `detail`, the readable message of an object
+// `detail`, the joined readable messages of an array `detail`, and a top-level
+// `message`. Anything else — including a body that failed to parse — yields the
+// supplied fallback, so an object or an array can never reach toast.error.
+function getBuilderErrorMessage(body: unknown, fallback: string): string {
+  if (!isJsonRecord(body)) return fallback
 
-  const detail = error.detail
+  const detail = body.detail
   const detailMessage = readNonEmptyString(detail)
   if (detailMessage) return detailMessage
 
   if (isJsonRecord(detail)) {
-    const message = readNonEmptyString(detail.message)
+    const message =
+      readNonEmptyString(detail.msg) ?? readNonEmptyString(detail.message)
     if (message) return message
   }
 
@@ -180,7 +182,7 @@ function getBuilderErrorMessage(error: unknown, fallback: string): string {
     if (messages.length > 0) return messages.join("; ")
   }
 
-  return readNonEmptyString(error.message) ?? fallback
+  return readNonEmptyString(body.message) ?? fallback
 }
 
 // One-time reveal of auto-generated webhook secrets. Rendered both inside the
