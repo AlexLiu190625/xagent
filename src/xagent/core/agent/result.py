@@ -31,9 +31,10 @@ class ClassifiedToolFailure:
 
     Its only current consumer is the delegated-authorization retry path in
     the MCP adapter, which treats any instance as an OAuth failure regardless
-    of the carried code. ``failure_code`` is validated against the OAuth-only
-    set, not the wider runtime allowlist: a new public failure code becomes
-    surfaceable by the runtime without becoming carriable by this type.
+    of the carried code. ``failure_code`` is validated against the exact
+    ``"oauth_token_required"`` literal, not the wider runtime allowlist: a
+    new public failure code becomes surfaceable by the runtime without
+    becoming carriable by this type.
     """
 
     failure_code: str

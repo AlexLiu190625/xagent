@@ -288,6 +288,35 @@ async def test_classified_failure_restore_rejects_malformed_envelope() -> None:
     assert result["failure_code"] is not bad_failure_code
     assert isinstance(result["failure_code"], str)
 
+    class _LyingStatus(str):
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        def __hash__(self) -> int:
+            return hash(str(self))
+
+    lying_status = _LyingStatus("x" * 100_000)
+
+    class LyingStatusTool:
+        name = "lying-status"
+        description = "Returns a str-subclass status that lies about equality."
+        tags: list[str] = []
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "success": False,
+                "is_error": True,
+                "status": lying_status,
+                "error": "boom",
+            }
+
+    lying_result = await _wrap(LyingStatusTool()).run_json_async({})
+
+    assert lying_result["success"] is False
+    assert lying_result["is_error"] is True
+    assert lying_result["status"] is not lying_status
+    assert len(lying_result["status"]) <= 1_000 + len(DEFAULT_TRUNCATION_MESSAGE)
+
 
 @pytest.mark.asyncio
 async def test_teardown_forwards_execution_status_when_supported() -> None:

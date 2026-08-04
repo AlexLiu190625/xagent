@@ -59,24 +59,6 @@ def _is_classified_tool_failure(result: Any) -> bool:
     )
 
 
-_MAX_RESTORED_STATUS_CHARS = 64
-
-
-def _restorable_status(value: Any) -> bool:
-    """Return whether a classified failure's ``status`` may bypass filtering.
-
-    The restore writes classification keys back verbatim so the envelope
-    survives field-count truncation, and any wrapped tool returning
-    ``success=False``/``is_error=True`` reaches that branch — so the
-    verbatim write is bounded to a short plain string. Every classified
-    status in the tree is far under the cap: ``"error"`` from the delegation
-    classifier and ``UnavailableMCPTool``, and ``"waiting_for_user"`` from
-    the waiting branch above.
-    """
-
-    return type(value) is str and len(value) <= _MAX_RESTORED_STATUS_CHARS
-
-
 def _accepts_kwarg(func: Any, name: str) -> bool:
     """Return whether ``func`` accepts ``name`` as a keyword argument."""
 
@@ -283,11 +265,17 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
             # ``success``/``is_error`` were matched by identity above, so
             # they are literally ``False``/``True``; the two caller-supplied
             # classification values are re-checked before bypassing the
-            # filter.
+            # filter. Only ``"error"`` can reach this branch for ``status``:
+            # both producers of the ``success=False``/``is_error=True`` pair
+            # hardcode it (agent_tool._classified_failure,
+            # mcp_adapter._run_unavailable), and a waiting result is handled
+            # above. Exact plain-string match keeps a ``str`` subclass from
+            # writing itself back unfiltered.
             filtered["success"] = result["success"]
             filtered["is_error"] = result["is_error"]
-            if _restorable_status(result.get("status")):
-                filtered["status"] = result["status"]
+            status = result.get("status")
+            if type(status) is str and status == "error":
+                filtered["status"] = status
             normalized_failure_code = normalize_tool_failure_code(
                 result.get("failure_code")
             )
