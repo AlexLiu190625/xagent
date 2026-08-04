@@ -2,10 +2,14 @@
 
 sqlalchemy.Enum(TaskStatus) with no values_callable persists the enum
 member *name* (e.g. "WAITING_FOR_USER"), not its value
-("waiting_for_user"). A raw string literal built from the value silently
-matches zero rows here on SQLite (see test_wrong_case_literal_query below);
-on PostgreSQL the same literal raises instead (pinned in the PostgreSQL
-half of this suite, test_task_status_storage_postgresql.py).
+("waiting_for_user"). An ORM- or Core-built comparison or write against a
+raw value string fails at bind time with StatementError wrapping
+LookupError, symmetrically on both backends (pinned by Sentinel 3 below).
+Zero-rows-on-SQLite/raises-on-PostgreSQL still happens, but only for raw
+text() SQL that bypasses that bind layer: SQLite silently matches zero
+rows (see test_wrong_case_literal_query_zero_hits_sqlite below) and
+PostgreSQL raises DataError instead (pinned in the PostgreSQL half of this
+suite, test_task_status_storage_postgresql.py).
 
 task_status_predicate (xagent.web.models.task) is the one typed entry point
 for every SQL predicate/write against this column. These tests pin: (1)

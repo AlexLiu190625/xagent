@@ -293,13 +293,26 @@ class TaskStatusPredicate:
     ``Task.status``.
 
     The column stores ``TaskStatus`` member names, not member values (see
-    the ``status`` column comment). A raw string literal built from the
-    member value silently matches zero rows on SQLite and raises an invalid
-    enum label error on PostgreSQL. Every WHERE/SET-case comparison and
-    every ``.values(status=...)`` write must go through one of the methods
-    below instead of comparing or assigning ``Task.status`` directly, so a
-    non-``TaskStatus`` input fails at construction time (``TypeError``)
-    instead of silently miscompiling at query time.
+    the ``status`` column comment). A raw string literal reaching an
+    ORM/Core comparison or write fails at bind time with ``StatementError``
+    wrapping ``LookupError`` (see the column comment above for why that
+    holds on both backends); raw ``text()`` SQL bypasses that bind layer
+    and is covered instead by the storage-layer sentinels in
+    ``tests/web/services/test_task_status_storage.py``.
+
+    A typed ``TaskStatus`` member compared directly against ``Task.status``
+    is legitimate and common in this codebase; it compiles to exactly what
+    the methods below compile to (pinned by the equivalence tests in
+    ``test_task_status_storage.py``). The methods below are the required
+    entry point for value-sourced or dynamic statuses -- anything that is
+    not a literal ``TaskStatus`` member in the source -- because they turn
+    a non-``TaskStatus`` input into a construction-time ``TypeError``
+    instead of a query-time failure. What is actually enforced repo-wide is
+    narrower still: the literal-predicate scan in
+    ``tests/web/services/test_task_status_literal_predicates.py`` bans a
+    raw string literal placed beside ``Task.status``; adoption of the
+    methods below at the safe-but-unconverted typed sites above is not
+    enforced and is not claimed.
     """
 
     @staticmethod

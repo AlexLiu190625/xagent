@@ -6,9 +6,9 @@ XAGENT_TEST_POSTGRES_URL). See that SQLite file's module docstring for the
 storage-format background; this file exists because PostgreSQL and SQLite
 fail differently for the same misuse:
 
-- A raw value-cased literal WHERE clause matches zero rows on SQLite; on
-  PostgreSQL the native ENUM type rejects the literal outright
-  (DataError / InvalidTextRepresentation).
+- A raw text() SQL query with a value-cased literal WHERE clause matches
+  zero rows on SQLite; on PostgreSQL the native ENUM type rejects the
+  literal outright (DataError / InvalidTextRepresentation).
 - Once that error happens, PostgreSQL marks the transaction failed and
   every further statement on the same connection raises
   InFailedSqlTransaction until a rollback -- each sentinel below that

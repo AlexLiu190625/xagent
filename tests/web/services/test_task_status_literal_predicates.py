@@ -2,9 +2,11 @@
 
 xagent.web.models.task.task_status_predicate is the one typed entry point
 for every SQL predicate against Task.status; the column stores enum member
-*names*, not values (see that module), so a hand-written string literal
-placed beside Task.status silently miscompiles -- it matches zero rows on
-SQLite and raises an invalid enum label error on PostgreSQL.
+*names*, not values (see that module). A hand-written string literal
+placed beside Task.status reaches an ORM/Core comparison, which fails at
+bind time with StatementError wrapping LookupError, symmetrically on
+SQLite and PostgreSQL; the zero-row outcome this check exists to prevent
+survives only for raw text() SQL that bypasses that bind layer.
 
 Scope note: this is a narrow, mechanical check for that one mistake shape
 (a string literal appearing directly in source next to a Task.status
