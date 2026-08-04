@@ -1288,7 +1288,9 @@ def finish_turn(
       - ``status == RUNNING`` + we own lease or it's expired: flip to
         FAILED, set placeholder ``error_message``, clear stale
         ``output``
-      - other statuses (PAUSED / WAITING_FOR_USER): leave alone
+      - other statuses (PAUSED / WAITING_FOR_USER): control status and
+        ``output`` are preserved; the lease release clears any stale
+        ``error_message`` left by an earlier failed attempt
     """
     from ..models.chat_message import TaskChatMessage
     from .workforce_runtime import sync_workforce_run_status

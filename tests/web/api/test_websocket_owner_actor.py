@@ -2903,6 +2903,9 @@ async def test_resume_background_broadcasts_corrective_event_after_restore(
     event vocabulary the historical-replay path uses for PAUSED/WAITING_FOR_USER."""
     owner = _user(db_session, "restore-broadcast-owner")
     task = _task(db_session, owner.id, status=prior_status)
+    task.error_message = "earlier attempt failed"
+    task.output = "prior turn answer"
+    db_session.commit()
     agent = MagicMock(
         resume_execution_by_id=AsyncMock(
             side_effect=CheckpointUnavailableError("checkpoint query failed")
@@ -2921,6 +2924,8 @@ async def test_resume_background_broadcasts_corrective_event_after_restore(
     db_session.expire_all()
     db_session.refresh(task)
     assert task.status == prior_status
+    assert task.error_message is None  # named: restore clears stale error
+    assert task.output == "prior turn answer"  # named: restore preserves output
 
     corrective = [
         call.args[0]

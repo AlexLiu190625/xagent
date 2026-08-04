@@ -779,6 +779,7 @@ async def test_a2a_handover_restores_input_required_on_unreadable_checkpoint() -
             source="a2a",
             is_visible=False,
             agent_config={"a2a_context_id": "ctx-handover"},
+            error_message="stale a2a failure",
         )
         db.add(task)
         db.commit()
