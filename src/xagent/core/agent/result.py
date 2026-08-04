@@ -12,8 +12,6 @@ TOOL_FAILURE_CODES = frozenset(
     }
 )
 
-_OAUTH_FAILURE_CODES = frozenset({"oauth_token_required"})
-
 # Placeholder outputs the execution layers substitute when a run produced no
 # text of its own. They are recognized, not produced, by the delegation
 # classifier: a child that returns one of these completed without answering.
@@ -25,12 +23,6 @@ def normalize_tool_failure_code(value: Any) -> str | None:
     """Return an exact public tool failure code when it is allowlisted."""
 
     return value if type(value) is str and value in TOOL_FAILURE_CODES else None
-
-
-def normalize_oauth_failure_code(value: Any) -> str | None:
-    """Return an exact OAuth failure code carried by ``ClassifiedToolFailure``."""
-
-    return value if type(value) is str and value in _OAUTH_FAILURE_CODES else None
 
 
 @dataclass(frozen=True)
@@ -47,7 +39,12 @@ class ClassifiedToolFailure:
     failure_code: str
 
     def __post_init__(self) -> None:
-        if normalize_oauth_failure_code(self.failure_code) is None:
+        # Exact plain-string match: a ``str`` subclass is a trust-boundary
+        # input, not an allowlisted code.
+        if (
+            type(self.failure_code) is not str
+            or self.failure_code != "oauth_token_required"
+        ):
             raise ValueError("invalid tool failure code")
 
 

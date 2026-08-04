@@ -30,11 +30,7 @@ from typing import (
 import httpx
 
 from ...config import get_uploads_dir
-from ...core.agent.result import (
-    ClassifiedToolFailure,
-    normalize_oauth_failure_code,
-    normalize_tool_failure_code,
-)
+from ...core.agent.result import ClassifiedToolFailure, normalize_tool_failure_code
 from ...core.tools.adapters.vibe.config import (
     BaseToolConfig,
     MCPConfigLoadError,
@@ -406,7 +402,9 @@ def _extract_oauth_token_resolver_failure_code(exc: Exception) -> str | None:
         raw_failure_code = getattr(exc, "oauth_token_resolver_failure_code", None)
     except Exception:
         return None
-    return normalize_oauth_failure_code(raw_failure_code)
+    if type(raw_failure_code) is not str or raw_failure_code != "oauth_token_required":
+        return None
+    return raw_failure_code
 
 
 def _normalize_oauth_expires_at(expires_at: datetime | None) -> datetime | None:

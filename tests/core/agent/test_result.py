@@ -39,6 +39,11 @@ def test_classified_tool_failure_accepts_only_allowlisted_plain_string():
     with pytest.raises(ValueError, match="invalid tool failure code"):
         ClassifiedToolFailure(failure_code="other_valid_code")
 
+    with pytest.raises(ValueError, match="invalid tool failure code"):
+        ClassifiedToolFailure(
+            failure_code=_FailureCodeStringSubclass("oauth_token_required")
+        )
+
 
 @pytest.mark.parametrize(
     "code", ["unsupported_nested_interaction", "missing_delegated_output"]
