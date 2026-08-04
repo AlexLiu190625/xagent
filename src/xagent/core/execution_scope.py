@@ -192,10 +192,15 @@ def _coerce_scope_mapping(value: Any, *, field_name: str) -> dict[str, Any]:
 def _coerce_snapshot_version(raw_version: Any) -> int:
     """Read ``from_dict``'s ``version`` field, or reject it as malformed.
 
-    ``version`` reaches here from a snapshot that can originate in a client-
-    supplied ``Task.agent_config`` (see :data:`EXECUTION_SCOPE_AGENT_CONFIG_KEY`),
-    so it is untrusted input, and exactly one value means "authentic snapshot
-    written before this field existed": ``0``, what an absent key decodes to.
+    ``version`` reaches here from a snapshot that remains untrusted input: a
+    runtime-extension provider holding a ``session_factory``
+    (:data:`xagent.core.task_runtime.TaskRuntimeContext.session_factory`) can
+    write ``Task.agent_config`` (see :data:`EXECUTION_SCOPE_AGENT_CONFIG_KEY`)
+    directly, and a row persisted before ``execution_scope`` was reserved at
+    the request boundary (``CLIENT_RESERVED_AGENT_CONFIG_KEYS``,
+    ``xagent.web.services.task_runtime``) still carries whatever a request
+    seeded at the time. Exactly one value means "authentic snapshot written
+    before this field existed": ``0``, what an absent key decodes to.
     That marker carries real trust -- the *older* half of
     ``_validate_execution_scope_snapshot_candidate``'s asymmetric gate is
     relaxed on the ``snapshot_defines_namespace=True`` branch, where such a

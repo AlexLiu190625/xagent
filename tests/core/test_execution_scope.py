@@ -1494,11 +1494,14 @@ class TestSnapshotCandidateAuthority:
         self, field_name, fallback_kwargs, snapshot_kwargs
     ):
         """A snapshot that is *wider* than the resolver's mandatory fallback
-        on any namespace field must fail the turn: the snapshot is
-        client-influenceable (an ``execution_scope`` key inside a
-        client-supplied ``agent_config``), so an unchecked snapshot here
-        would let a caller widen its own namespace past the resolver's own
-        most conservative answer."""
+        on any namespace field must fail the turn: the snapshot remains
+        untrusted input even though request bodies can no longer seed it --
+        a runtime-extension provider holding a ``session_factory`` can write
+        ``Task.agent_config`` directly, and a row persisted before
+        ``execution_scope`` was reserved at the request boundary still
+        carries whatever a request seeded at the time -- so an unchecked
+        snapshot here would let a caller widen its own namespace past the
+        resolver's own most conservative answer."""
         fallback = ExecutionScope(**fallback_kwargs)
         snapshot = ExecutionScope(**snapshot_kwargs)
         self._register(
