@@ -26,6 +26,11 @@ import pytest
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from tests.shared.execution_scope import register_scope_resolver
+from xagent.core.agent.checkpoint import (
+    CheckpointAccessRefusedError,
+    CheckpointCorruptError,
+    CheckpointUnavailableError,
+)
 from xagent.core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
@@ -1096,6 +1101,504 @@ async def test_resume_pool_timeout_does_not_start_secondary_db_cleanup(caplog) -
     assert "component=resume" in caplog.text
     assert "retaining lease for TTL recovery" in caplog.text
     assert not any(
+        call.args[0].get("type") == "task_error"
+        for call in ws_manager.broadcast_to_task.call_args_list
+    )
+
+
+def test_acquire_resume_lease_reports_prior_status_before_claiming() -> None:
+    """The real acquire must fill the prior-status box on the claim path.
+
+    Every restore-to-prior test below patches this function with a fake
+    that mirrors the out parameter, so nothing else would notice if the
+    production function stopped populating it -- the resume path would
+    just silently fall back to the terminal FAILED branch. Pin the real
+    function against its own contract, and pin that the status recorded
+    is the pre-acquisition one rather than the RUNNING the claim writes.
+    """
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    task = SimpleNamespace(id=42, user_id=1, status=TaskStatus.WAITING_FOR_USER)
+    query = MagicMock()
+    query.filter.return_value = query
+    query.first.return_value = task
+    db = MagicMock()
+    db.query.return_value = query
+    session_context = MagicMock()
+    session_context.__enter__.return_value = db
+    session_context.__exit__.return_value = False
+    session_factory = MagicMock(return_value=session_context)
+
+    prior_status_box: list[TaskStatus] = []
+    with (
+        patch(
+            "xagent.web.api.websocket.get_session_local",
+            return_value=session_factory,
+        ),
+        patch(
+            "xagent.web.api.websocket.acquire_task_lease_no_commit",
+            return_value=lease,
+        ),
+        patch("xagent.web.api.websocket.sync_workforce_run_status"),
+    ):
+        acquired = _acquire_resume_task_lease(
+            42,
+            1,
+            "run-a",
+            prior_status_out=prior_status_box,
+        )
+
+    assert acquired is lease
+    assert prior_status_box == [TaskStatus.WAITING_FOR_USER]
+
+
+def test_acquire_resume_lease_reports_prior_status_when_claim_is_lost() -> None:
+    """A lost claim must not leave the box holding a fabricated status."""
+    task = SimpleNamespace(id=42, user_id=1, status=TaskStatus.PAUSED)
+    query = MagicMock()
+    query.filter.return_value = query
+    query.first.return_value = task
+    db = MagicMock()
+    db.query.return_value = query
+    session_context = MagicMock()
+    session_context.__enter__.return_value = db
+    session_context.__exit__.return_value = False
+    session_factory = MagicMock(return_value=session_context)
+
+    prior_status_box: list[TaskStatus] = []
+    with (
+        patch(
+            "xagent.web.api.websocket.get_session_local",
+            return_value=session_factory,
+        ),
+        patch(
+            "xagent.web.api.websocket.acquire_task_lease_no_commit",
+            return_value=None,
+        ),
+    ):
+        acquired = _acquire_resume_task_lease(
+            42,
+            1,
+            "run-a",
+            prior_status_out=prior_status_box,
+        )
+
+    assert acquired is None
+    # Recorded, but the caller only consults it when a lease was claimed,
+    # so a lost claim can never restore a status it does not own.
+    assert prior_status_box == [TaskStatus.PAUSED]
+
+
+@pytest.mark.asyncio
+async def test_resume_background_restores_prior_status_for_preacquired_lease() -> None:
+    """A resume that adopts someone else's lease owes the same restore.
+
+    The A2A input-required flow claims the lease itself and hands it over,
+    so this entry never runs the acquisition that captures the status. If
+    the handover does not carry it, a checkpoint the resume cannot read
+    downgrades a still-resumable task to a terminal FAILED on that path
+    while the self-acquiring path recovers it.
+    """
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    heartbeat_stop = asyncio.Event()
+    heartbeat_task: asyncio.Task[Any] = asyncio.create_task(asyncio.sleep(0))
+    settle = MagicMock()
+    restore = MagicMock(return_value=True)
+
+    class FakeTracker:
+        quota_interrupt_reason = None
+
+        def __init__(self, *, task_id: int, **kwargs: Any) -> None:
+            self.complete_tracking = AsyncMock()
+            self.stop_periodic_updates = AsyncMock()
+
+        async def start_tracking(self) -> None:
+            return None
+
+        async def interrupt_reason_for_quota(self) -> None:
+            return None
+
+    agent_service = MagicMock()
+    agent_service.resume_execution_by_id = AsyncMock(
+        side_effect=CheckpointUnavailableError("checkpoint query failed")
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with _Patches(
+        [
+            patch("xagent.web.api.websocket._settle_resumed_task_lease", settle),
+            patch(
+                "xagent.web.api.websocket._restore_resumed_task_lease_to_prior_status",
+                restore,
+            ),
+            patch(
+                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                new=AsyncMock(),
+            ),
+            patch("xagent.web.api.websocket.manager", ws_manager),
+            patch(
+                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+            ),
+            patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
+        ]
+    ):
+        await execute_resume_background(
+            task_id=42,
+            agent_service=agent_service,
+            task_owner_user_id=1,
+            expected_run_id="run-a",
+            resolved_execution_scope=None,
+            preacquired_lease=lease,
+            preacquired_heartbeat_stop=heartbeat_stop,
+            preacquired_heartbeat_task=heartbeat_task,
+            preacquired_prior_status=TaskStatus.WAITING_FOR_USER,
+        )
+
+    settle.assert_not_called()
+    restore.assert_called_once()
+    assert restore.call_args.kwargs["status"] == TaskStatus.WAITING_FOR_USER
+    assert not any(
+        call.args[0].get("type") == "task_error"
+        for call in ws_manager.broadcast_to_task.call_args_list
+    )
+
+
+def _fake_acquire_with_prior_status(lease: TaskLease, prior_status: TaskStatus):
+    """Mirror ``_acquire_resume_task_lease``'s prior-status side channel."""
+
+    def _acquire(
+        task_id_arg: int,
+        task_owner_user_id_arg: int | None,
+        expected_run_id_arg: str | None,
+        *,
+        prior_status_out: list[Any] | None = None,
+    ) -> TaskLease:
+        if prior_status_out is not None:
+            prior_status_out.append(prior_status)
+        return lease
+
+    return _acquire
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "read_error",
+    [
+        CheckpointUnavailableError("checkpoint store unavailable"),
+        CheckpointAccessRefusedError("partition refused"),
+    ],
+)
+async def test_resume_background_restores_prior_status_on_checkpoint_read_failure(
+    read_error: Exception,
+) -> None:
+    """A retryable checkpoint read failure during resume (not a pool
+    timeout) must restore the task to whatever it was before this attempt
+    claimed the lease, not fall through to the generic terminal FAILED
+    path. Unavailable and refused reads share the restore branch."""
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    settle = MagicMock()
+    restore = MagicMock(return_value=True)
+    mark_delivery = MagicMock()
+
+    class FakeTracker:
+        quota_interrupt_reason = None
+
+        def __init__(self, *, task_id: int, **kwargs: Any) -> None:
+            self.complete_tracking = AsyncMock()
+            self.stop_periodic_updates = AsyncMock()
+
+        async def start_tracking(self) -> None:
+            return None
+
+        async def interrupt_reason_for_quota(self) -> None:
+            return None
+
+    agent_service = MagicMock()
+    agent_service.resume_execution_by_id = AsyncMock(side_effect=read_error)
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with _Patches(
+        [
+            patch(
+                "xagent.web.api.websocket._acquire_resume_task_lease",
+                side_effect=_fake_acquire_with_prior_status(
+                    lease, TaskStatus.WAITING_FOR_USER
+                ),
+            ),
+            patch("xagent.web.api.websocket._settle_resumed_task_lease", settle),
+            patch(
+                "xagent.web.api.websocket._restore_resumed_task_lease_to_prior_status",
+                restore,
+            ),
+            patch(
+                "xagent.web.api.websocket.mark_user_message_delivery_sync",
+                mark_delivery,
+            ),
+            patch(
+                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                new=AsyncMock(),
+            ),
+            patch(
+                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                new=AsyncMock(),
+            ),
+            patch("xagent.web.api.websocket.manager", ws_manager),
+            patch(
+                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+            ),
+            patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
+        ]
+    ):
+        await execute_resume_background(
+            task_id=42,
+            agent_service=agent_service,
+            task_owner_user_id=1,
+            delivery_turn_id="resume-turn",
+            expected_run_id="run-a",
+            resolved_execution_scope=None,
+        )
+
+    settle.assert_not_called()
+    restore.assert_called_once()
+    _, restore_kwargs = restore.call_args
+    assert restore.call_args.args[0] == lease
+    assert restore_kwargs["status"] == TaskStatus.WAITING_FOR_USER
+    # Retryable, not a rejected/failed delivery: the client should retry
+    # with a fresh id once the task is back to waiting.
+    mark_delivery.assert_called_once()
+    assert not any(
+        call.args[0].get("type") == "task_error"
+        for call in ws_manager.broadcast_to_task.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_background_restore_broadcast_failure_does_not_affect_restore() -> (
+    None
+):
+    """The corrective post-restore broadcast is best-effort: a failure there
+    must not undo the already-committed restore or escape the call."""
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    settle = MagicMock()
+    restore = MagicMock(return_value=True)
+    mark_delivery = MagicMock()
+
+    class FakeTracker:
+        quota_interrupt_reason = None
+
+        def __init__(self, *, task_id: int, **kwargs: Any) -> None:
+            self.complete_tracking = AsyncMock()
+            self.stop_periodic_updates = AsyncMock()
+
+        async def start_tracking(self) -> None:
+            return None
+
+        async def interrupt_reason_for_quota(self) -> None:
+            return None
+
+    agent_service = MagicMock()
+    agent_service.resume_execution_by_id = AsyncMock(
+        side_effect=CheckpointUnavailableError("checkpoint query failed")
+    )
+
+    async def _broadcast(payload: dict, *_args: Any, **_kwargs: Any) -> None:
+        if payload.get("type") in {"task_waiting_for_user", "task_paused"}:
+            raise RuntimeError("broadcast down")
+
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock(side_effect=_broadcast))
+
+    with _Patches(
+        [
+            patch(
+                "xagent.web.api.websocket._acquire_resume_task_lease",
+                side_effect=_fake_acquire_with_prior_status(
+                    lease, TaskStatus.WAITING_FOR_USER
+                ),
+            ),
+            patch("xagent.web.api.websocket._settle_resumed_task_lease", settle),
+            patch(
+                "xagent.web.api.websocket._restore_resumed_task_lease_to_prior_status",
+                restore,
+            ),
+            patch(
+                "xagent.web.api.websocket.mark_user_message_delivery_sync",
+                mark_delivery,
+            ),
+            patch(
+                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                new=AsyncMock(),
+            ),
+            patch(
+                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                new=AsyncMock(),
+            ),
+            patch("xagent.web.api.websocket.manager", ws_manager),
+            patch(
+                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+            ),
+            patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
+        ]
+    ):
+        # Must not raise even though the corrective broadcast fails.
+        await execute_resume_background(
+            task_id=42,
+            agent_service=agent_service,
+            task_owner_user_id=1,
+            delivery_turn_id="resume-turn",
+            expected_run_id="run-a",
+            resolved_execution_scope=None,
+        )
+
+    settle.assert_not_called()
+    restore.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_resume_background_checkpoint_unavailable_from_pool_timeout_keeps_lease() -> (
+    None
+):
+    """When the unavailable read is itself pool exhaustion, the existing
+    pool-timeout recovery (retain the lease for TTL reaping) wins over the
+    new restore-to-prior path -- ``is_database_pool_timeout`` must see
+    through the ``CheckpointUnavailableError`` wrapper via its cause chain."""
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    settle = MagicMock()
+    restore = MagicMock(return_value=True)
+
+    def _raise_wrapped_pool_timeout(*args: Any, **kwargs: Any) -> Any:
+        try:
+            raise SQLAlchemyTimeoutError("pool exhausted")
+        except SQLAlchemyTimeoutError as exc:
+            raise CheckpointUnavailableError("checkpoint query failed") from exc
+
+    class FakeTracker:
+        quota_interrupt_reason = None
+
+        def __init__(self, *, task_id: int, **kwargs: Any) -> None:
+            self.complete_tracking = AsyncMock()
+            self.stop_periodic_updates = AsyncMock()
+
+        async def start_tracking(self) -> None:
+            return None
+
+        async def interrupt_reason_for_quota(self) -> None:
+            return None
+
+    agent_service = MagicMock()
+    agent_service.resume_execution_by_id = AsyncMock(
+        side_effect=_raise_wrapped_pool_timeout
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with _Patches(
+        [
+            patch(
+                "xagent.web.api.websocket._acquire_resume_task_lease",
+                side_effect=_fake_acquire_with_prior_status(
+                    lease, TaskStatus.WAITING_FOR_USER
+                ),
+            ),
+            patch("xagent.web.api.websocket._settle_resumed_task_lease", settle),
+            patch(
+                "xagent.web.api.websocket._restore_resumed_task_lease_to_prior_status",
+                restore,
+            ),
+            patch(
+                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                new=AsyncMock(),
+            ),
+            patch(
+                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                new=AsyncMock(),
+            ),
+            patch("xagent.web.api.websocket.manager", ws_manager),
+            patch(
+                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+            ),
+            patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
+        ]
+    ):
+        await execute_resume_background(
+            task_id=42,
+            agent_service=agent_service,
+            task_owner_user_id=1,
+            expected_run_id="run-a",
+            resolved_execution_scope=None,
+        )
+
+    settle.assert_not_called()
+    restore.assert_not_called()
+    assert not any(
+        call.args[0].get("type") == "task_error"
+        for call in ws_manager.broadcast_to_task.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_background_marks_failed_on_checkpoint_corrupt() -> None:
+    """Corrupt is a terminal state, not a retryable one -- it must fall
+    through to the ordinary FAILED settlement, not the restore path."""
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    settle = MagicMock(return_value=True)
+    restore = MagicMock()
+
+    class FakeTracker:
+        quota_interrupt_reason = None
+
+        def __init__(self, *, task_id: int, **kwargs: Any) -> None:
+            self.complete_tracking = AsyncMock()
+            self.stop_periodic_updates = AsyncMock()
+
+        async def start_tracking(self) -> None:
+            return None
+
+        async def interrupt_reason_for_quota(self) -> None:
+            return None
+
+    agent_service = MagicMock()
+    agent_service.resume_execution_by_id = AsyncMock(
+        side_effect=CheckpointCorruptError("all matching rows undecodable")
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with _Patches(
+        [
+            patch(
+                "xagent.web.api.websocket._acquire_resume_task_lease",
+                side_effect=_fake_acquire_with_prior_status(
+                    lease, TaskStatus.WAITING_FOR_USER
+                ),
+            ),
+            patch("xagent.web.api.websocket._settle_resumed_task_lease", settle),
+            patch(
+                "xagent.web.api.websocket._restore_resumed_task_lease_to_prior_status",
+                restore,
+            ),
+            patch(
+                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                new=AsyncMock(),
+            ),
+            patch(
+                "xagent.web.api.websocket.stop_task_lease_heartbeat",
+                new=AsyncMock(),
+            ),
+            patch("xagent.web.api.websocket.manager", ws_manager),
+            patch(
+                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+            ),
+            patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
+        ]
+    ):
+        await execute_resume_background(
+            task_id=42,
+            agent_service=agent_service,
+            task_owner_user_id=1,
+            expected_run_id="run-a",
+            resolved_execution_scope=None,
+        )
+
+    restore.assert_not_called()
+    settle.assert_called_once()
+    assert any(
         call.args[0].get("type") == "task_error"
         for call in ws_manager.broadcast_to_task.call_args_list
     )

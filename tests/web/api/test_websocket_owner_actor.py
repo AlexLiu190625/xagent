@@ -24,6 +24,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from tests.shared.execution_scope import register_scope_resolver
+from xagent.core.agent.checkpoint import (
+    CheckpointAccessRefusedError,
+    CheckpointCorruptError,
+    CheckpointUnavailableError,
+)
 from xagent.core.execution_scope import (
     ExecutionScope,
 )
@@ -34,6 +39,7 @@ from xagent.web.api.websocket import (
     _handle_chat_message_unserialized,
     _handle_pause_task_unserialized,
     _handle_resume_task_unserialized,
+    _waiting_or_paused_event_fields,
     background_task_manager,
     execute_resume_background,
     get_authenticated_user,
@@ -1391,6 +1397,155 @@ async def test_deferred_chat_message_is_acked_after_durable_command_commit(
 
 
 @pytest.mark.asyncio
+async def test_live_lease_injection_degrades_to_deferred_on_checkpoint_unavailable(
+    db_session,
+) -> None:
+    """A checkpoint read failure during live injection must fold into the
+    same posted=False deferred-delivery path as no exact lease at all --
+    not a raw exception and not a rejection."""
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "unavailable-runner"
+    task.run_id = "unavailable-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(
+        side_effect=CheckpointUnavailableError("checkpoint query failed")
+    )
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    resume_bg = AsyncMock()
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+    websocket = MagicMock()
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await handle_chat_message(
+            websocket,
+            int(task.id),
+            {
+                "message": "Wait for the checkpoint",
+                "client_message_id": "unavailable-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+        for _ in range(100):
+            db_session.expire_all()
+            stored_command = (
+                db_session.query(TaskExecutionCommand)
+                .filter_by(task_id=int(task.id), command_id="unavailable-turn-1")
+                .one()
+            )
+            if (
+                stored_command.status == "pending"
+                and int(stored_command.attempt_count or 0) >= 1
+                and resume_bg.await_count == 1
+            ):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("deferred command claim was not released in time")
+
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
+    assert accepted[0]["client_message_id"] == "unavailable-turn-1"
+    assert stored_command.status == "pending"
+    assert not any(
+        call.args[0].get("type") == "message_rejected"
+        for call in ws_manager.send_personal_message.call_args_list
+    )
+    kwargs = resume_bg.call_args.kwargs
+    assert kwargs["delivery_already_dispatched"] is False
+    assert kwargs["delivery_websocket"] is None
+    assert kwargs["delivery_client_message_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        CheckpointCorruptError("all matching rows undecodable"),
+        CheckpointAccessRefusedError("active lease is not bound to this reader"),
+    ],
+)
+async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
+    db_session,
+    error: Exception,
+) -> None:
+    """Corrupt/refused are not retryable by deferring -- reject the claimed
+    delivery outright instead of scheduling a resume attempt."""
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "rejected-runner"
+    task.run_id = "rejected-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(side_effect=error)
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    resume_bg = AsyncMock()
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Wait for the checkpoint",
+                "client_message_id": "rejected-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    resume_bg.assert_not_awaited()
+    bg_mgr.release_resume_reservation.assert_called_once_with(int(task.id))
+    rejected = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["client_message_id"] == "rejected-turn-1"
+    assert rejected[0]["rejection_outcome"] == "not_accepted"
+    db_session.expire_all()
+    stored = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == "rejected-turn-1")
+        .one()
+    )
+    assert stored.delivery_status == DELIVERY_FAILED
+
+
+@pytest.mark.asyncio
 async def test_resume_registration_failure_keeps_injected_delivery_pending(
     db_session,
 ) -> None:
@@ -2669,6 +2824,122 @@ async def test_execute_resume_background_persists_missing_checkpoint_failure(
     ]
     assert len(failures) == 1
     assert failures[0]["task"]["status"] == TaskStatus.FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_resume_background_settles_running_prior_status_on_checkpoint_unavailable(
+    db_session,
+) -> None:
+    """A RUNNING prior status is never a valid restore target.
+
+    ``release_task_lease_no_commit`` refuses to release a lease back to
+    RUNNING. A resume that steals an abandoned lease from a task whose row
+    was still RUNNING (no active runner, expired TTL) must therefore fall
+    through to the ordinary settle/FAILED path on a checkpoint read failure,
+    not attempt a "restore to prior status" that can only dead-end with the
+    lease stuck unreleased until TTL recovery.
+    """
+    owner = _user(db_session, "running-prior-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    assert task.runner_id is None
+    assert task.lease_expires_at is None
+    agent = MagicMock(
+        resume_execution_by_id=AsyncMock(
+            side_effect=CheckpointUnavailableError("checkpoint query failed")
+        ),
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        _register_current_resume(int(task.id))
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+        )
+
+    db_session.expire_all()
+    db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.runner_id is None
+    failures = [
+        call.args[0]
+        for call in ws_manager.broadcast_to_task.call_args_list
+        if call.args[0].get("type") == "task_error"
+    ]
+    assert len(failures) == 1
+
+
+def test_waiting_or_paused_event_fields_shared_by_both_call_sites() -> None:
+    """The live-lease restore broadcast and the historical-replay status
+    reassertion both compute their event type/message off this one helper;
+    pin its output so a change to either site's vocabulary is caught here
+    rather than only in one of the two integration tests."""
+    assert _waiting_or_paused_event_fields(TaskStatus.WAITING_FOR_USER) == (
+        "task_waiting_for_user",
+        "Task waiting for user response",
+    )
+    assert _waiting_or_paused_event_fields(TaskStatus.PAUSED) == (
+        "task_paused",
+        "Task paused",
+    )
+
+
+@pytest.mark.parametrize(
+    ("prior_status", "expected_event_type"),
+    [
+        (TaskStatus.PAUSED, "task_paused"),
+        (TaskStatus.WAITING_FOR_USER, "task_waiting_for_user"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_resume_background_broadcasts_corrective_event_after_restore(
+    db_session,
+    prior_status: TaskStatus,
+    expected_event_type: str,
+) -> None:
+    """After a checkpoint-unavailable restore, clients that saw the optimistic
+    RUNNING transition need the prior status re-asserted -- reusing the same
+    event vocabulary the historical-replay path uses for PAUSED/WAITING_FOR_USER."""
+    owner = _user(db_session, "restore-broadcast-owner")
+    task = _task(db_session, owner.id, status=prior_status)
+    task.error_message = "earlier attempt failed"
+    task.output = "prior turn answer"
+    db_session.commit()
+    agent = MagicMock(
+        resume_execution_by_id=AsyncMock(
+            side_effect=CheckpointUnavailableError("checkpoint query failed")
+        ),
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        _register_current_resume(int(task.id))
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+        )
+
+    db_session.expire_all()
+    db_session.refresh(task)
+    assert task.status == prior_status
+    assert task.error_message is None  # named: restore clears stale error
+    assert task.output == "prior turn answer"  # named: restore preserves output
+
+    corrective = [
+        call.args[0]
+        for call in ws_manager.broadcast_to_task.call_args_list
+        if call.args[0].get("type") == expected_event_type
+    ]
+    assert len(corrective) == 1
+    assert corrective[0]["type"] == expected_event_type
+    assert corrective[0]["status"] == prior_status.value
+    assert "state_version" in corrective[0]
+    assert not any(
+        call.args[0].get("type") == "task_error"
+        for call in ws_manager.broadcast_to_task.call_args_list
+    )
 
 
 @pytest.mark.parametrize(

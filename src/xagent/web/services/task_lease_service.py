@@ -683,6 +683,11 @@ def validate_preacquired_task_lease_isolated(
     return states.get(_task_lease_key(lease), TaskLeaseRefreshState.LOST)
 
 
+_NON_TERMINAL_RELEASE_STATUSES = frozenset(
+    {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}
+)
+
+
 def release_task_lease(
     db: Session,
     lease: TaskLease | None,
@@ -703,27 +708,38 @@ def release_task_lease_no_commit(
     *,
     status: TaskStatus,
 ) -> bool:
-    """Stage release of one exact lease; the caller owns commit/rollback."""
+    """Stage release of one exact lease; the caller owns commit/rollback.
+
+    Releasing to a non-terminal resting state also clears ``error_message``:
+    the row is healthy again, and a message left by an earlier failed attempt
+    would otherwise keep surfacing to clients. ``output`` is left alone --
+    only terminal transitions own it (see
+    ``fail_and_release_task_lease_no_commit`` and the FAILED branch of
+    ``recover_expired_task_lease_no_commit``).
+    """
     if status == TaskStatus.RUNNING:
         raise ValueError("Cannot release a task lease with RUNNING status")
     if lease is None:
         return False
     control_state = control_state_for_status(status).value
     current_version = func.coalesce(Task.state_version, 0)
+    values: dict[str, Any] = {
+        "status": task_status_predicate.value(status),
+        "runner_id": None,
+        "lease_expires_at": None,
+        "last_heartbeat_at": utc_now(),
+        "control_state": control_state,
+        "state_version": lease_state_version_case(
+            status, control_state, current_version
+        ),
+    }
+    if status in _NON_TERMINAL_RELEASE_STATUSES:
+        values["error_message"] = None
     stmt = (
         update(Task)
         .where(Task.id == lease.task_id)
         .where(Task.runner_id == lease.runner_id)
-        .values(
-            status=task_status_predicate.value(status),
-            runner_id=None,
-            lease_expires_at=None,
-            last_heartbeat_at=utc_now(),
-            control_state=control_state,
-            state_version=lease_state_version_case(
-                status, control_state, current_version
-            ),
-        )
+        .values(**values)
     )
     if lease.run_id is not None:
         stmt = stmt.where(Task.run_id == lease.run_id)

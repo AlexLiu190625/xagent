@@ -44,6 +44,60 @@ class CheckpointPersistenceError(RuntimeError):
     """Raised when a checkpoint cannot be durably persisted."""
 
 
+class CheckpointReadError(RuntimeError):
+    """Base for checkpoint read failures that must not collapse to absence.
+
+    ``None`` from a checkpoint reader means "queried successfully, nothing
+    found" — an authoritative fact callers may act on (e.g. build a fresh
+    context). Anything that prevented that determination raises one of the
+    subclasses below instead, so a transient or refused read can never be
+    mistaken for a checkpoint that genuinely does not exist.
+    """
+
+
+class CheckpointUnavailableError(CheckpointReadError):
+    """Raised when a checkpoint read could not be completed.
+
+    Covers infrastructure failures only: session checkout, query
+    execution, and generic per-row decode errors such as a failed blob
+    prefetch. Rows that decode as permanently unreadable are classified
+    by the corrupt error once the matching set is exhausted.
+    """
+
+
+class CheckpointCorruptError(CheckpointReadError):
+    """Raised when matching checkpoint rows exist but none are usable.
+
+    Distinct from ``CheckpointUnavailableError``: the read completed and
+    the candidate set was proven exhausted, but every row is permanently
+    undecodable or shaped without a payload. This is a terminal state, not
+    a retryable one.
+    """
+
+
+class CheckpointAccessRefusedError(CheckpointReadError):
+    """Raised when a reader is not authoritative for the requested partition.
+
+    The checkpoint may exist, but this reader's partition (run binding,
+    build scope) is not the one allowed to observe it right now. Distinct
+    from absence: callers must not treat a refusal as "no checkpoint" and
+    fall back to building fresh state.
+
+    ``reason`` discriminates *why* the read was refused, so consumers can
+    report an accurate message instead of one generic sentence for every
+    case: ``"lease_mismatch"`` (an active lease exists but is not bound to
+    this reader), ``"active_run"`` (a different run is in progress under
+    its own lease), or ``"superseded_legacy"`` (a tagged run has already
+    superseded the untagged/legacy partition this reader is confined to).
+    Defaults to ``"active_run"``, the most common case, so existing call
+    sites that do not pass ``reason`` keep working unchanged.
+    """
+
+    def __init__(self, message: str, *, reason: str = "active_run") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 async def read_latest_checkpoint_payload(
     reader: Any,
     execution_id: str,
@@ -179,22 +233,44 @@ class TraceCheckpointStore:
             "snapshot": dict(payload),
         }
 
+    def _validate_snapshot(self, container: dict[str, Any]) -> dict[str, Any]:
+        """Return the readable checkpoint's snapshot, or raise if absent.
+
+        A container whose ``checkpoint_type`` is readable but that carries no
+        ``snapshot`` dict claims to be a checkpoint while holding no payload
+        -- corrupt, not absent.
+        """
+        snapshot = container.get("snapshot")
+        if isinstance(snapshot, dict):
+            return dict(snapshot)
+        raise CheckpointCorruptError(
+            "Checkpoint payload has a readable checkpoint_type but no snapshot."
+        )
+
     def _unwrap_checkpoint_payload(self, payload: Any) -> dict[str, Any] | None:
-        if not isinstance(payload, dict):
+        # ``None`` is the reader's authoritative "no checkpoint" -- pass it
+        # through unchanged. Anything else that isn't a recognized shape is
+        # corrupt, not absent: a caller must not treat a malformed payload
+        # as "build fresh state".
+        if payload is None:
             return None
+        if not isinstance(payload, dict):
+            raise CheckpointCorruptError(
+                "Checkpoint reader returned a non-dict, non-None payload."
+            )
         if payload.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES:
-            snapshot = payload.get("snapshot")
-            return dict(snapshot) if isinstance(snapshot, dict) else None
+            return self._validate_snapshot(payload)
         data = payload.get("data")
         if (
             isinstance(data, dict)
             and data.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES
         ):
-            snapshot = data.get("snapshot")
-            return dict(snapshot) if isinstance(snapshot, dict) else None
+            return self._validate_snapshot(data)
         if payload.get("type") == "checkpoint" or "context" in payload:
             return dict(payload)
-        return None
+        raise CheckpointCorruptError(
+            "Checkpoint payload shape is not recognized by any reader."
+        )
 
     def _execution_id(self, payload: dict[str, Any]) -> str:
         execution_id = payload.get("execution_id")

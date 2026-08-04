@@ -12,7 +12,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool, StaticPool
 
-from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE, CHECKPOINT_TYPE
+from xagent.core.agent.checkpoint import (
+    CHECKPOINT_EVENT_TYPE,
+    CHECKPOINT_TYPE,
+    CheckpointAccessRefusedError,
+)
 from xagent.core.agent.trace import (
     TraceAction,
     TraceCategory,
@@ -1145,12 +1149,15 @@ def test_database_trace_handler_unbound_legacy_load_fails_closed_after_tagged_ru
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        assert (
+        # A tagged run has positive proof a checkpoint exists in a partition
+        # this unbound legacy reader is not authoritative for. That is a
+        # refusal, not the "queried successfully, found nothing" fact that
+        # ``None`` reserves.
+        with pytest.raises(CheckpointAccessRefusedError) as excinfo:
             DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             )
-            is None
-        )
+        assert excinfo.value.reason == "superseded_legacy"
     finally:
         db.close()
 
@@ -1218,12 +1225,95 @@ def test_database_trace_handler_unbound_root_load_fails_closed_for_active_run(
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
     try:
-        assert (
+        # An active run is in progress under a different lease; this unbound
+        # legacy reader is refused, not told the checkpoint is absent.
+        with pytest.raises(CheckpointAccessRefusedError) as excinfo:
             DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                 "shared-execution"
             )
-            is None
+        assert excinfo.value.reason == "active_run"
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_load_refuses_lease_bound_to_another_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound lease for a different task id is not this reader's partition
+    -- distinct from ``active_run``/``superseded_legacy``: the read itself
+    is contaminated by a stray context, not a policy decision about this
+    task's own rows."""
+    SessionLocal, db, task = _create_trace_handler_test_task("lease-mismatch-load")
+    task_id = int(task.id)
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    try:
+        with (
+            bind_task_lease_context(TaskLease(task_id + 1, "runner-a", "run-a")),
+            pytest.raises(CheckpointAccessRefusedError) as excinfo,
+        ):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "shared-execution"
+            )
+        assert excinfo.value.reason == "lease_mismatch"
+    finally:
+        db.close()
+
+
+def test_partition_refusal_is_distinct_from_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused partition read must never be reported the same way as a
+    query that succeeded and genuinely found nothing."""
+    SessionLocal, db, task = _create_trace_handler_test_task("refusal-vs-absence")
+    task_id = int(task.id)
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="tagged-checkpoint",
+            execution_id="shared-execution",
+            label="tagged",
+            timestamp=datetime.now(timezone.utc),
+            run_id="run-a",
         )
+    )
+    db.commit()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    try:
+        # No lease bound, and a tagged run has positive proof a checkpoint
+        # exists: this legacy reader is not authoritative for that
+        # partition and must be refused, not told "absent".
+        with pytest.raises(CheckpointAccessRefusedError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "shared-execution"
+            )
+        # A reader that IS bound to the tagged run reads its own partition
+        # and, for an execution id with no matching row there, gets the
+        # authoritative "queried successfully, found nothing" result.
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            assert (
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "other-execution"
+                )
+                is None
+            )
     finally:
         db.close()
 

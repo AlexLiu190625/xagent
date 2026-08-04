@@ -13,6 +13,10 @@ from ...config import get_checkpoint_history_limit
 from ...core.agent.checkpoint import (
     CHECKPOINT_TYPE,
     READABLE_CHECKPOINT_TYPES,
+    CheckpointAccessRefusedError,
+    CheckpointCorruptError,
+    CheckpointReadError,
+    CheckpointUnavailableError,
     checkpoint_execution_id,
 )
 from ...core.agent.trace import BaseTraceHandler
@@ -26,6 +30,7 @@ from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.tool_config import ToolUsage
 from ...web.services.ops_signals import (
     CHECKPOINT_DECODE_FALLBACK,
+    CHECKPOINT_LOAD_UNAVAILABLE,
     clear_degradation,
     register_degradation,
 )
@@ -42,6 +47,47 @@ from ...web.services.trace_message_storage import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Page size for one batch of the checkpoint read scan. A read does not stop
+# at the first page: it keeps paging through the matching set (see
+# _sync_load_latest_checkpoint below) until a readable row is found or the
+# set is proven exhausted (a page shorter than this). The constant only
+# bounds the cost of one query, not how many candidate rows a read may
+# examine before ruling on unavailable vs. corrupt.
+CHECKPOINT_ROW_SCAN_LIMIT = 100
+
+# Operational bound on the scan loop. With history pruning disabled
+# (XAGENT_CHECKPOINT_HISTORY_LIMIT=0) and a large backlog of matching rows,
+# the loop would otherwise issue one query per CHECKPOINT_ROW_SCAN_LIMIT
+# rows before proving the matching set exhausted. This caps that cost: a
+# scan that reaches the cap without a resolution is treated as unavailable
+# rather than continuing indefinitely.
+CHECKPOINT_SCAN_MAX_PAGES = 50
+
+
+def _checkpoint_execution_id_predicate(execution_id: str) -> Any:
+    """SQL mirror of ``checkpoint_execution_id()``: root wins, then the flat
+    field, then the snapshot's own id -- so legacy rows that only set one of
+    them are not skipped. The read query and history pruning must agree on
+    which rows belong to one execution, or pruning could drop a row the read
+    path still considers current (or vice versa); both consume this one
+    predicate rather than keeping independently maintained copies in sync by
+    hand.
+    """
+    return (
+        func.coalesce(
+            func.nullif(
+                DatabaseTraceEvent.data["root_execution_id"].as_string(),
+                "",
+            ),
+            func.nullif(
+                DatabaseTraceEvent.data["execution_id"].as_string(),
+                "",
+            ),
+            DatabaseTraceEvent.data["snapshot"]["execution_id"].as_string(),
+        )
+        == execution_id
+    )
 
 
 def _convert_float_to_datetime(timestamp: Any) -> datetime:
@@ -105,35 +151,70 @@ class DatabaseTraceHandler(BaseTraceHandler):
     async def load_latest_checkpoint(
         self, execution_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Load the latest agent checkpoint persisted as a trace event."""
-        try:
-            return await asyncio.to_thread(
-                self._sync_load_latest_checkpoint,
-                execution_id,
-            )
-        except Exception as e:
-            logger.warning(
-                "Failed to load latest checkpoint for task %s execution %s: %s",
-                self.task_id,
-                execution_id,
-                e,
-            )
-            return None
+        """Load the latest agent checkpoint persisted as a trace event.
+
+        ``None`` means the query completed and found nothing -- an
+        authoritative fact. Anything that prevented that determination
+        (query failure, refused partition, undecodable rows) is translated
+        to a ``CheckpointReadError`` subclass inside the sync worker below
+        and propagates through here unchanged; it must never collapse back
+        to ``None``, or a transient failure would be indistinguishable from
+        "no checkpoint" to every caller up the stack.
+        """
+        return await asyncio.to_thread(
+            self._sync_load_latest_checkpoint,
+            execution_id,
+        )
 
     def _sync_load_latest_checkpoint(
         self,
         execution_id: str,
     ) -> Optional[Dict[str, Any]]:
-        db = next(get_db())
+        try:
+            db = next(get_db())
+        except Exception as exc:
+            register_degradation(
+                CHECKPOINT_LOAD_UNAVAILABLE,
+                f"task {self.task_id}: checkpoint session checkout failed",
+            )
+            raise CheckpointUnavailableError(
+                f"task {self.task_id}: could not open a database session "
+                "to read the checkpoint"
+            ) from exc
         try:
             query = db.query(DatabaseTraceEvent).filter(
                 DatabaseTraceEvent.task_id == self.task_id,
                 DatabaseTraceEvent.event_type == "system_update_general",
+                DatabaseTraceEvent.data["checkpoint_type"]
+                .as_string()
+                .in_(sorted(READABLE_CHECKPOINT_TYPES)),
+                # The page size below bounds this predicate's matching set,
+                # not an unfiltered row scan, so a page shorter than it
+                # proves the matching set exhausted (see the scan loop
+                # below), and a zero-row first page is authoritative.
+                _checkpoint_execution_id_predicate(str(execution_id)),
             )
             if self.build_id is None:
-                allowed, run_id = self._root_checkpoint_read_partition(db)
-                if not allowed:
-                    return None
+                try:
+                    run_id = self._root_checkpoint_read_partition(db)
+                except CheckpointReadError:
+                    # Already a partition verdict (refused, or the task row
+                    # is missing); it carries its own classification.
+                    raise
+                except Exception as exc:
+                    # Resolving the partition is part of the read. A DB
+                    # failure here leaves the partition unknown, so the read
+                    # could not be completed -- same translation the main
+                    # query below gets, or the failure would escape the
+                    # contract as a raw driver exception no consumer catches.
+                    register_degradation(
+                        CHECKPOINT_LOAD_UNAVAILABLE,
+                        f"task {self.task_id}: checkpoint partition resolution failed",
+                    )
+                    raise CheckpointUnavailableError(
+                        f"task {self.task_id}: could not resolve the "
+                        "checkpoint read partition"
+                    ) from exc
                 query = query.filter(
                     DatabaseTraceEvent.build_id.is_(None),
                     self._checkpoint_run_partition_filter(run_id),
@@ -141,58 +222,148 @@ class DatabaseTraceHandler(BaseTraceHandler):
             else:
                 query = query.filter(DatabaseTraceEvent.build_id == self.build_id)
 
-            rows = (
-                query.order_by(
-                    DatabaseTraceEvent.timestamp.desc(),
-                    DatabaseTraceEvent.id.desc(),
-                )
-                .limit(100)
-                .all()
+            ordered_query = query.order_by(
+                DatabaseTraceEvent.timestamp.desc(),
+                DatabaseTraceEvent.id.desc(),
             )
-            for row in rows:
-                data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
-                if data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES:
-                    continue
-                if checkpoint_execution_id(data) != str(execution_id):
-                    continue
-                try:
-                    data = decode_trace_event_data(
-                        db,
-                        task_id=self.task_id,
-                        data=data,
-                        strict=True,
-                    )
-                except CheckpointMessageDecodeError as exc:
-                    logger.warning(
-                        "Skipping unreadable checkpoint trace event %s for task %s: %s",
-                        row.event_id,
-                        self.task_id,
-                        exc,
-                    )
-                    continue
-                except Exception:
-                    # E.g. a transient DB error from the blob prefetch. Fall
-                    # back to an older readable checkpoint instead of letting
-                    # the error abort loading for the whole task. Surface the
-                    # degradation on /health so a systemic decode failure is
-                    # observable instead of only a per-row warning log; the
-                    # signal self-clears on the next successful decode.
+
+            saw_generic_failure = False
+            saw_undecodable_row = False
+            saw_any_row = False
+            offset = 0
+            page_count = 0
+            while True:
+                page_count += 1
+                if page_count > CHECKPOINT_SCAN_MAX_PAGES:
+                    # The matching set is not proven exhausted, but scanning
+                    # further is not bounded work anymore -- treat it the
+                    # same as any other read that could not be completed.
                     register_degradation(
-                        CHECKPOINT_DECODE_FALLBACK,
-                        f"task {self.task_id}: checkpoint decode failed, "
-                        f"fell back past event {row.event_id}",
+                        CHECKPOINT_LOAD_UNAVAILABLE,
+                        f"task {self.task_id}: checkpoint scan reached the "
+                        f"{CHECKPOINT_SCAN_MAX_PAGES}-page cap without "
+                        "resolving",
                     )
-                    logger.warning(
-                        "Skipping checkpoint trace event %s for task %s after "
-                        "decode failure",
-                        row.event_id,
-                        self.task_id,
-                        exc_info=True,
+                    raise CheckpointUnavailableError(
+                        f"task {self.task_id}: checkpoint scan exceeded "
+                        f"{CHECKPOINT_SCAN_MAX_PAGES} pages without "
+                        "resolving"
                     )
-                    continue
-                clear_degradation(CHECKPOINT_DECODE_FALLBACK)
-                snapshot = data.get("snapshot")
-                return dict(snapshot) if isinstance(snapshot, dict) else None
+                try:
+                    rows = (
+                        ordered_query.offset(offset)
+                        .limit(CHECKPOINT_ROW_SCAN_LIMIT)
+                        .all()
+                    )
+                except Exception as exc:
+                    register_degradation(
+                        CHECKPOINT_LOAD_UNAVAILABLE,
+                        f"task {self.task_id}: checkpoint query failed",
+                    )
+                    raise CheckpointUnavailableError(
+                        f"task {self.task_id}: checkpoint query failed"
+                    ) from exc
+                # This page succeeded -- whatever the decode loop below
+                # concludes about the rows it found, the read infrastructure
+                # is healthy again.
+                clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+                if not rows:
+                    break
+                saw_any_row = True
+
+                for row in rows:
+                    data: Dict[str, Any] = (
+                        row.data if isinstance(row.data, dict) else {}
+                    )
+                    try:
+                        data = decode_trace_event_data(
+                            db,
+                            task_id=self.task_id,
+                            data=data,
+                            strict=True,
+                        )
+                    except CheckpointMessageDecodeError as exc:
+                        saw_undecodable_row = True
+                        logger.warning(
+                            "Skipping unreadable checkpoint trace event %s "
+                            "for task %s: %s",
+                            row.event_id,
+                            self.task_id,
+                            exc,
+                        )
+                        continue
+                    except Exception:
+                        # E.g. a transient DB error from the blob prefetch.
+                        # Fall back to an older readable checkpoint instead
+                        # of letting the error abort loading for the whole
+                        # task. Surface the degradation on /health so a
+                        # systemic decode failure is observable instead of
+                        # only a per-row warning log; the signal self-clears
+                        # on the next successful decode.
+                        saw_generic_failure = True
+                        register_degradation(
+                            CHECKPOINT_DECODE_FALLBACK,
+                            f"task {self.task_id}: checkpoint decode failed, "
+                            f"fell back past event {row.event_id}",
+                        )
+                        logger.warning(
+                            "Skipping checkpoint trace event %s for task %s "
+                            "after decode failure",
+                            row.event_id,
+                            self.task_id,
+                            exc_info=True,
+                        )
+                        continue
+                    clear_degradation(CHECKPOINT_DECODE_FALLBACK)
+                    snapshot = data.get("snapshot")
+                    if not isinstance(snapshot, dict):
+                        # The row claims to be a checkpoint but carries no
+                        # payload: a permanent failure for this row, the same
+                        # class as an undecodable one. Per-row failures never
+                        # abort the scan -- an older row may still carry a
+                        # usable checkpoint -- and the verdict for the whole
+                        # matching set is decided once, after exhaustion.
+                        saw_undecodable_row = True
+                        logger.warning(
+                            "Skipping checkpoint trace event %s for task %s: "
+                            "readable checkpoint_type but no snapshot",
+                            row.event_id,
+                            self.task_id,
+                        )
+                        continue
+                    return dict(snapshot)
+
+                if len(rows) < CHECKPOINT_ROW_SCAN_LIMIT:
+                    # A short page proves the matching set is exhausted --
+                    # no further rows exist beyond this one.
+                    break
+                # OFFSET paging over (timestamp DESC, id DESC): a row inserted
+                # mid-scan shifts later pages by one. Root reads are fenced to a
+                # single run partition, which excludes concurrent writers there;
+                # build-scoped histories are append-only per build.
+                offset += CHECKPOINT_ROW_SCAN_LIMIT
+
+            if not saw_any_row:
+                return None
+            # The matching set is exhausted and every candidate row failed.
+            # A generic (transient) failure anywhere in the scan is
+            # conservatively unavailable -- retryable. Only a fully scanned
+            # set that is exclusively permanent decode failures is corrupt.
+            if saw_generic_failure:
+                register_degradation(
+                    CHECKPOINT_LOAD_UNAVAILABLE,
+                    f"task {self.task_id}: checkpoint scan exhausted the "
+                    "matching set with a generic decode failure among the "
+                    "candidate rows",
+                )
+                raise CheckpointUnavailableError(
+                    f"task {self.task_id}: checkpoint read could not be "
+                    "completed for all candidate rows"
+                )
+            if saw_undecodable_row:
+                raise CheckpointCorruptError(
+                    f"task {self.task_id}: all matching checkpoint rows are undecodable"
+                )
             return None
         finally:
             db.close()
@@ -200,24 +371,44 @@ class DatabaseTraceHandler(BaseTraceHandler):
     def _root_checkpoint_read_partition(
         self,
         db: Session,
-    ) -> tuple[bool, str | None]:
-        """Resolve the only root-task run partition safe for this reader.
+    ) -> str | None:
+        """Resolve the run partition this reader may read, or refuse.
 
         Exact executions read only checkpoints tagged with their bound run.
-        Legacy callers can read only untagged rows, and only while the task has
-        no active run. Build-scoped checkpoints retain their historical
-        build-only partitioning and do not call this helper.
+        Legacy callers can read only untagged rows, and only while the task
+        has no active run and no run has ever been tagged. Build-scoped
+        checkpoints retain their historical build-only partitioning and do
+        not call this helper. A refusal means the checkpoint may exist but
+        this reader is not authoritative for it right now -- distinct from
+        a query that completed and found nothing.
         """
 
         lease = current_task_lease()
         if lease is not None:
             if lease.task_id != self.task_id or lease.run_id is None:
-                return False, None
-            return True, lease.run_id
+                raise CheckpointAccessRefusedError(
+                    f"task {self.task_id}: active lease is not bound to this reader",
+                    reason="lease_mismatch",
+                )
+            return lease.run_id
 
         task_run = db.query(Task.run_id).filter(Task.id == self.task_id).one_or_none()
-        if task_run is None or task_run[0] is not None:
-            return False, None
+        if task_run is None:
+            # The task row itself is gone -- an exceptional condition, not
+            # a partition policy decision.
+            # No register_degradation: the signal is process-wide and is only
+            # cleared once a page query succeeds later in the read, which this
+            # branch never reaches -- one absent task would latch it for the
+            # whole process.
+            raise CheckpointUnavailableError(
+                f"task {self.task_id}: task row is missing"
+            )
+        if task_run[0] is not None:
+            raise CheckpointAccessRefusedError(
+                f"task {self.task_id}: an active run is in progress under "
+                "a different lease",
+                reason="active_run",
+            )
         tagged_checkpoint_exists = (
             db.query(DatabaseTraceEvent.id)
             .filter(
@@ -235,8 +426,14 @@ class DatabaseTraceHandler(BaseTraceHandler):
             is not None
         )
         if tagged_checkpoint_exists:
-            return False, None
-        return True, None
+            # Positive proof a checkpoint exists in a partition this legacy
+            # reader is not allowed to read -- a refusal, not an absence.
+            raise CheckpointAccessRefusedError(
+                f"task {self.task_id}: a tagged run has already superseded "
+                "legacy checkpoints",
+                reason="superseded_legacy",
+            )
+        return None
 
     @staticmethod
     def _checkpoint_run_partition_filter(run_id: str | None) -> Any:
@@ -449,21 +646,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     DatabaseTraceEvent.data["checkpoint_type"]
                     .as_string()
                     .in_(sorted(READABLE_CHECKPOINT_TYPES)),
-                    # SQL mirror of checkpoint_execution_id(): root wins,
-                    # then the flat field, then the snapshot's own id, so
-                    # legacy rows that only set one of them are not skipped.
-                    func.coalesce(
-                        func.nullif(
-                            DatabaseTraceEvent.data["root_execution_id"].as_string(),
-                            "",
-                        ),
-                        func.nullif(
-                            DatabaseTraceEvent.data["execution_id"].as_string(),
-                            "",
-                        ),
-                        DatabaseTraceEvent.data["snapshot"]["execution_id"].as_string(),
-                    )
-                    == execution_id,
+                    _checkpoint_execution_id_predicate(execution_id),
                 )
                 .order_by(
                     DatabaseTraceEvent.timestamp.desc(),

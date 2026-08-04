@@ -415,6 +415,62 @@ def test_release_task_lease_refuses_ownerless_running_state(db_session) -> None:
     assert task.lease_expires_at is not None
 
 
+@pytest.mark.parametrize(
+    "status",
+    [TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER],
+)
+def test_release_to_non_terminal_status_clears_stale_error_message(
+    db_session, status
+) -> None:
+    task = _create_task(db_session)
+    lease = acquire_task_lease(db_session, int(task.id), runner_id="runner-a")
+    assert lease is not None
+    task.error_message = "earlier failure"
+    task.output = "prior answer"
+    db_session.commit()
+
+    changed = task_lease_service.release_task_lease_no_commit(
+        db_session,
+        lease,
+        status=status,
+    )
+    db_session.commit()
+
+    assert changed is True
+    db_session.refresh(task)
+    assert task.status == status
+    assert task.error_message is None
+    assert task.output == "prior answer"
+
+
+@pytest.mark.parametrize(
+    "status",
+    [TaskStatus.COMPLETED, TaskStatus.FAILED],
+)
+def test_release_to_terminal_status_leaves_content_fields_alone(
+    db_session, status
+) -> None:
+    task = _create_task(db_session)
+    lease = acquire_task_lease(db_session, int(task.id), runner_id="runner-a")
+    assert lease is not None
+    task.error_message = "earlier failure"
+    task.output = "prior answer"
+    db_session.commit()
+
+    changed = task_lease_service.release_task_lease_no_commit(
+        db_session,
+        lease,
+        status=status,
+    )
+    db_session.commit()
+
+    assert changed is True
+    db_session.refresh(task)
+    assert task.status == status
+    assert task.error_message == "earlier failure"
+    assert task.output == "prior answer"
+
+
 @pytest.mark.asyncio
 async def test_lease_heartbeat_keeps_loop_responsive_during_pool_checkout(
     queue_pool_runtime_db,

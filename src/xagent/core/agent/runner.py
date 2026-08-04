@@ -16,7 +16,7 @@ from ..task_runtime import (
     normalize_input_modalities,
 )
 from ..workspace import WorkspaceManager
-from .checkpoint import read_latest_checkpoint_payload
+from .checkpoint import CheckpointCorruptError, read_latest_checkpoint_payload
 from .context import ContextManager, ExecutionContext
 from .result import extract_assistant_message
 from .runtime import ExecutionInterrupted, PatternRuntime, load_pattern_checkpoint
@@ -82,6 +82,14 @@ class AgentRunner:
         checkpoint = checkpoint or (
             await self._load_latest_checkpoint(execution_id) if resume else None
         )
+        if (
+            resume
+            and checkpoint is not None
+            and not isinstance(checkpoint.get("context"), dict)
+        ):
+            raise CheckpointCorruptError(
+                "Resume checkpoint exists but carries no execution context."
+            )
         if task is None:
             task = self._resolve_task(
                 task=task,
@@ -360,13 +368,16 @@ class AgentRunner:
         reason: str | None = None,
     ) -> ExecutionContext | None:
         context = self.context_manager.get_context(execution_id)
+        cold_start_checkpoint: dict[str, Any] | None = None
         if context is None:
             checkpoint = await self._load_latest_checkpoint(execution_id)
-            if not (
-                isinstance(checkpoint, dict)
-                and isinstance(checkpoint.get("context"), dict)
-            ):
+            if checkpoint is None:
                 return None
+            if not isinstance(checkpoint.get("context"), dict):
+                raise CheckpointCorruptError(
+                    "Stored checkpoint carries no execution context to restore."
+                )
+            cold_start_checkpoint = checkpoint
             context = ExecutionContext.from_dict(checkpoint["context"])
             self.context_manager.set_context(context)
 
@@ -407,6 +418,23 @@ class AgentRunner:
                     self.pause(execution_id, reason=reason or "new user message")
                 return context
 
+        # Resolve the checkpoint-merge baseline before any context mutation
+        # below (add_user_message, pending marker) so a failed read leaves
+        # zero residue instead of an in-memory message that was never
+        # durably confirmed -- a retry after the failure must actually
+        # persist, not find a ghost confirmation from the rejected attempt.
+        # A live runtime's cached checkpoint wins over a fresh read; the
+        # cold-start read above (if this call triggered one) is reused
+        # instead of reading the same window twice.
+        control = self._active_controls.get(execution_id)
+        checkpoint_baseline: dict[str, Any] | None
+        if control is not None and control.runtime.last_checkpoint is not None:
+            checkpoint_baseline = control.runtime.last_checkpoint
+        elif cold_start_checkpoint is not None:
+            checkpoint_baseline = cold_start_checkpoint
+        else:
+            checkpoint_baseline = await self._load_latest_checkpoint(execution_id)
+
         # Attach files + display text to the new Message so they survive
         # checkpoint round-trips: Message.metadata is serialized by
         # ExecutionContext. The on_user_message_posted callback reads
@@ -436,6 +464,7 @@ class AgentRunner:
             execution_id=execution_id,
             context=context,
             label="user_message_injected",
+            baseline=checkpoint_baseline,
         )
         # Snapshot the watermark BEFORE the callback so we can detect a
         # change (see comment below) and persist it.
@@ -477,10 +506,16 @@ class AgentRunner:
                     execution_id=execution_id,
                     context=context,
                     label="user_message_trace_watermark",
+                    baseline=checkpoint_baseline,
                 )
             except Exception:
-                # Preserve the pending marker for resume catch-up when the
-                # trace watermark cannot be persisted after acceptance.
+                # Declared swallow point: the message was already durably
+                # accepted by the injection checkpoint above, so a failure
+                # here (including a checkpoint read/write error) only
+                # costs the watermark re-persist and must not turn an
+                # accepted message into a rejected delivery. Preserve the
+                # pending marker for resume catch-up when the trace
+                # watermark cannot be persisted after acceptance.
                 logger.warning(
                     "user-message watermark checkpoint failed after injection for %s",
                     execution_id,
@@ -967,16 +1002,11 @@ class AgentRunner:
         execution_id: str,
         context: ExecutionContext,
         label: str,
+        baseline: dict[str, Any] | None,
     ) -> None:
         if self.tracer is None:
             return
 
-        control = self._active_controls.get(execution_id)
-        baseline = (
-            control.runtime.last_checkpoint
-            if control is not None and control.runtime.last_checkpoint is not None
-            else await self._load_latest_checkpoint(execution_id)
-        )
         payload = dict(baseline or {})
         payload.update(
             {
