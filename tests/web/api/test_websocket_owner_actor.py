@@ -1535,6 +1535,13 @@ async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
     assert len(rejected) == 1
     assert rejected[0]["client_message_id"] == "rejected-turn-1"
     assert rejected[0]["rejection_outcome"] == "not_accepted"
+    db_session.expire_all()
+    stored = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == "rejected-turn-1")
+        .one()
+    )
+    assert stored.delivery_status == DELIVERY_FAILED
 
 
 @pytest.mark.asyncio

@@ -5933,14 +5933,17 @@ async def _handle_chat_message_unserialized(
                                 # that is not the retryable-by-deferring
                                 # unavailable case must reject the claimed
                                 # delivery rather than escape this handler
-                                # and orphan it.
+                                # and orphan it. Use finish_delivery_failure,
+                                # not finish_delivery, so the row is actually
+                                # persisted DELIVERY_FAILED -- otherwise it
+                                # stays DELIVERY_PENDING forever and a retry
+                                # with the same client_message_id loops on
+                                # "still being applied".
                                 background_task_manager.release_resume_reservation(
                                     task_id
                                 )
-                                await finish_delivery(
-                                    False,
-                                    "The task's saved progress could not be read.",
-                                    rejection_outcome="not_accepted",
+                                await finish_delivery_failure(
+                                    "The task's saved progress could not be read."
                                 )
                                 return
                     delivery_injected = posted
