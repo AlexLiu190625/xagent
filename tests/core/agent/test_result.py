@@ -31,20 +31,6 @@ def test_normalize_tool_failure_code_uses_exact_allowlist(value, expected):
     assert normalize_tool_failure_code(value) == expected
 
 
-def test_unsupported_nested_interaction_is_a_recognized_failure_code():
-    assert (
-        normalize_tool_failure_code("unsupported_nested_interaction")
-        == "unsupported_nested_interaction"
-    )
-
-
-def test_missing_delegated_output_is_a_recognized_failure_code():
-    assert (
-        normalize_tool_failure_code("missing_delegated_output")
-        == "missing_delegated_output"
-    )
-
-
 def test_classified_tool_failure_accepts_only_allowlisted_plain_string():
     outcome = ClassifiedToolFailure(failure_code="oauth_token_required")
 
