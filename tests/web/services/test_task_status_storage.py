@@ -475,18 +475,21 @@ def test_lease_checkpoint_event_id_case_matches_raw_comparison() -> None:
     assert _compiled(stmt_raw) == _compiled(stmt_bound)
 
 
-def test_lease_case_builders_are_the_only_case_calls_in_the_lease_service() -> None:
-    """Without this, someone can inline a fourth case() back into a
-    statement and the imported-builder tests above stay green while
-    production drifts -- the same failure mode this recoupling closes, one
-    level up.
+_LEASE_CASE_BUILDER_NAMES = {
+    "lease_run_id_case",
+    "lease_state_version_case",
+    "lease_checkpoint_event_id_case",
+}
+
+
+def _stray_task_status_case_calls(
+    source: str, builder_names: set[str]
+) -> list[tuple[str | None, int]]:
+    """``case()`` calls whose subtree references ``Task.status``, outside
+    the given builder functions. Scoped to Task.status specifically -- a
+    case() built on an unrelated column is not this binding's concern and
+    must not be flagged.
     """
-    builder_names = {
-        "lease_run_id_case",
-        "lease_state_version_case",
-        "lease_checkpoint_event_id_case",
-    }
-    source = Path(task_lease_service.__file__).read_text()
     tree = ast.parse(source)
     parents: dict[ast.AST, ast.AST] = {}
     for node in ast.walk(tree):
@@ -501,15 +504,55 @@ def test_lease_case_builders_are_the_only_case_calls_in_the_lease_service() -> N
             current = parents.get(current)
         return None
 
-    stray = [
+    def _references_task_status(node: ast.Call) -> bool:
+        return any(
+            isinstance(sub, ast.Attribute)
+            and sub.attr == "status"
+            and isinstance(sub.value, ast.Name)
+            and sub.value.id == "Task"
+            for sub in ast.walk(node)
+        )
+
+    return [
         (_enclosing_function(node), node.lineno)
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "case"
         and _enclosing_function(node) not in builder_names
+        and _references_task_status(node)
     ]
-    assert stray == [], f"case() called outside the three lease builders: {stray}"
+
+
+def test_lease_case_builders_are_the_only_case_calls_in_the_lease_service() -> None:
+    """Without this, someone can inline a fourth Task.status-referencing
+    case() back into a statement and the imported-builder tests above stay
+    green while production drifts -- the same failure mode this recoupling
+    closes, one level up. Scoped to case() calls that reference
+    Task.status: a future case() built on an unrelated column is not this
+    binding's concern and must not fail this test (see the negative-control
+    test below).
+    """
+    source = Path(task_lease_service.__file__).read_text()
+    stray = _stray_task_status_case_calls(source, _LEASE_CASE_BUILDER_NAMES)
+    assert stray == [], (
+        f"case() referencing Task.status called outside the three lease "
+        f"builders: {stray}"
+    )
+
+
+def test_lease_case_ban_ignores_case_calls_on_unrelated_columns() -> None:
+    """Negative control: a case() outside the three builders that never
+    touches Task.status must not be flagged by the check above.
+    """
+    fixture = """
+from sqlalchemy import case
+
+def some_unrelated_helper():
+    return case((Task.runner_id == "x", 1), else_=0)
+"""
+    stray = _stray_task_status_case_calls(fixture, _LEASE_CASE_BUILDER_NAMES)
+    assert stray == [], stray
 
 
 # --- WHERE-clause equivalence for the 6 WHERE sites (constants, not case) -
