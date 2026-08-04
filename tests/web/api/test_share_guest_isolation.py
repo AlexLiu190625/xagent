@@ -13,6 +13,7 @@ rejection of legacy tokens that predate the ``guest_id`` claim.
 
 from __future__ import annotations
 
+import asyncio
 import io
 from types import SimpleNamespace
 from typing import Any
@@ -33,7 +34,7 @@ from xagent.web.api.public_chat_access import (
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task
 from xagent.web.models.user import User
-from xagent.web.services import workforce_runs as workforce_runs_service
+from xagent.web.services import task_orchestrator as task_orchestrator_service
 from xagent.web.services.task_runtime import (
     SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
     TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
@@ -126,18 +127,25 @@ def _authenticate_share_guest(share_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
-def _stub_begin_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _stub(**_kwargs: Any) -> SimpleNamespace:
-        return SimpleNamespace(background_task=None)
+def _patch_schedule_bg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace the leaf that starts a real background turn with a no-op task.
 
-    # ``schedule_claimed_create_turn`` is what the workforce create path
-    # reaches, not ``begin_turn``: stubbing the latter is inert, the real turn
-    # still starts, and its background task then races test-DB teardown.
-    monkeypatch.setattr(
-        workforce_runs_service.TaskTurnOrchestrator,
-        "schedule_claimed_create_turn",
-        _stub,
-    )
+    The workforce guest create path reaches
+    ``TaskTurnOrchestrator.schedule_claimed_create_turn`` ->
+    ``schedule_claimed_turn`` -> ``_schedule_bg``. Patching only that leaf
+    keeps the claim-to-schedule handoff real -- a raise anywhere in it still
+    fails the test -- while leaving no live background task for
+    ``public_chat_access.py`` to drop un-awaited, which would otherwise race
+    ``Base.metadata.drop_all`` in ``conftest.py``.
+    """
+
+    def fake_schedule_bg(**_kwargs: Any) -> "asyncio.Task[None]":
+        async def noop() -> None:
+            return None
+
+        return asyncio.create_task(noop())
+
+    monkeypatch.setattr(task_orchestrator_service, "_schedule_bg", fake_schedule_bg)
 
 
 def _upload_to_task(headers: dict[str, str], task_id: int) -> Any:
@@ -411,7 +419,7 @@ def test_workforce_share_guest_cannot_touch_other_guests_task(
     token = _enable_workforce_share(workforce_id)
     guest_a = _authenticate_share_guest(token)
     guest_b = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    _patch_schedule_bg(monkeypatch)
 
     created = client.post(
         "/api/share/chat/task/create",
@@ -444,7 +452,7 @@ def test_workforce_share_task_without_guest_id_is_denied(
     workforce_id = _create_workforce("PreMig WF")
     token = _enable_workforce_share(workforce_id)
     guest = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    _patch_schedule_bg(monkeypatch)
 
     created = client.post(
         "/api/share/chat/task/create",
@@ -480,7 +488,7 @@ def test_workforce_share_task_create_discards_forged_agent_config(
     workforce_id = _create_workforce("Forged Config Share WF")
     token = _enable_workforce_share(workforce_id)
     guest = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    _patch_schedule_bg(monkeypatch)
 
     created = client.post(
         "/api/share/chat/task/create",

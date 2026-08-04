@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -23,6 +22,7 @@ from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
+from xagent.web.services import task_orchestrator as task_orchestrator_service
 from xagent.web.services import workforce_runs as workforce_runs_service
 
 from .conftest import (
@@ -115,18 +115,25 @@ def _authenticate_share_guest(share_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
-def _stub_begin_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _stub(**_kwargs: Any) -> SimpleNamespace:
-        return SimpleNamespace(background_task=None)
+def _patch_schedule_bg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace the leaf that starts a real background turn with a no-op task.
 
-    # ``schedule_claimed_create_turn`` is what the workforce create path
-    # reaches, not ``begin_turn``: stubbing the latter is inert, the real turn
-    # still starts, and its background task then races test-DB teardown.
-    monkeypatch.setattr(
-        workforce_runs_service.TaskTurnOrchestrator,
-        "schedule_claimed_create_turn",
-        _stub,
-    )
+    The workforce guest create path reaches
+    ``TaskTurnOrchestrator.schedule_claimed_create_turn`` ->
+    ``schedule_claimed_turn`` -> ``_schedule_bg``. Patching only that leaf
+    keeps the claim-to-schedule handoff real -- a raise anywhere in it still
+    fails the test -- while leaving no live background task for
+    ``public_chat_access.py`` to drop un-awaited, which would otherwise race
+    ``Base.metadata.drop_all`` in ``conftest.py``.
+    """
+
+    def fake_schedule_bg(**_kwargs: Any) -> "asyncio.Task[None]":
+        async def noop() -> None:
+            return None
+
+        return asyncio.create_task(noop())
+
+    monkeypatch.setattr(task_orchestrator_service, "_schedule_bg", fake_schedule_bg)
 
 
 # ===== Share-link management endpoints =====
@@ -433,7 +440,7 @@ def test_share_task_create_starts_workforce_run(
     workforce_id = _create_workforce("Guest Run Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    _patch_schedule_bg(monkeypatch)
 
     response = client.post(
         "/api/share/chat/task/create",
@@ -484,7 +491,7 @@ def test_share_task_create_rejects_foreign_agent_id(
     workforce_id = _create_workforce("Foreign Agent Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    _patch_schedule_bg(monkeypatch)
 
     other_agent_id = _create_published_agent(_user_id(), "Unrelated Agent")
     response = client.post(
@@ -508,7 +515,7 @@ async def test_share_guest_cannot_touch_internal_run_task(
     workforce_id = _create_workforce("Scoping Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    _patch_schedule_bg(monkeypatch)
 
     # An owner-initiated (internal) run of the same workforce.
     db = _direct_db_session()
@@ -537,7 +544,7 @@ def test_share_guest_can_upload_to_own_shared_task(
     workforce_id = _create_workforce("Upload Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    _patch_schedule_bg(monkeypatch)
 
     created = client.post(
         "/api/share/chat/task/create",
@@ -564,7 +571,7 @@ def test_workforce_share_first_turn_attachments_reach_run(
     workforce_id = _create_workforce("First Turn File Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    _patch_schedule_bg(monkeypatch)
 
     # 1) Task-less upload is allowed for workforce guests (no task exists yet).
     upload = client.post(
@@ -690,7 +697,7 @@ def test_agent_share_guest_cannot_access_workforce_task(
     workforce_id = _create_workforce("Cross Guest Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    _patch_schedule_bg(monkeypatch)
 
     created = client.post(
         "/api/share/chat/task/create",
