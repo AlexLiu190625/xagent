@@ -35,6 +35,7 @@ from xagent.web.models.task import Task
 from xagent.web.models.user import User
 from xagent.web.services import workforce_runs as workforce_runs_service
 from xagent.web.services.task_runtime import (
+    SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
     TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
     task_extension_bindings_from_agent_config,
 )
@@ -354,7 +355,8 @@ def test_agent_share_task_create_drops_forged_runtime_extension_bindings() -> No
 def test_agent_share_task_create_drops_forged_execution_scope() -> None:
     """A share guest cannot pre-seed the scope snapshot that governs where a
     task's bytes land -- sandbox mount, storage prefix, workspace directory,
-    memory dimensions -- by naming it in the request body's ``agent_config``.
+    memory dimensions -- or the bound file list, by naming either in the
+    request body's ``agent_config``.
     """
     assert _create_published_agent("Scope Agent", "scope-agent-tok")
     guest = _authenticate_share_guest("scope-agent-tok")
@@ -371,6 +373,7 @@ def test_agent_share_task_create_drops_forged_execution_scope() -> None:
                     "workspace_segments": ["victim"],
                     "memory_dimensions": {"tenant": "victim"},
                 },
+                SELECTED_FILE_IDS_AGENT_CONFIG_KEY: ["victim-file-id"],
                 "keep_me": "client value",
             },
         },
@@ -383,6 +386,7 @@ def test_agent_share_task_create_drops_forged_execution_scope() -> None:
         task = db.query(Task).filter(Task.id == task_id).one()
         assert EXECUTION_SCOPE_AGENT_CONFIG_KEY not in task.agent_config
         assert execution_scope_from_agent_config(task.agent_config) is None
+        assert SELECTED_FILE_IDS_AGENT_CONFIG_KEY not in task.agent_config
         assert task.agent_config.get("keep_me") == "client value"
         assert task.agent_config.get("auth_mode") == "share"
         assert task.agent_config.get("guest_id") == _share_guest_id(

@@ -18,6 +18,7 @@ from xagent.web.models.task import Task
 from xagent.web.models.user import User
 from xagent.web.schemas.chat import TaskCreateRequest
 from xagent.web.services.task_runtime import (
+    SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
     TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
     agent_config_with_task_extension_bindings,
     register_task_extension,
@@ -168,7 +169,11 @@ async def test_task_create_binding_record_ignores_forged_entries(
 async def test_task_create_drops_a_client_forged_execution_scope() -> None:
     """A request cannot pre-seed the scope snapshot that governs where a
     task's bytes land -- sandbox mount, storage prefix, workspace directory,
-    memory dimensions -- by naming it in the request body's ``agent_config``.
+    memory dimensions -- or name a file id for the bound file list, by
+    putting either in the request body's ``agent_config``. This boundary
+    substitutes a server-validated file list rather than only dropping the
+    client's, so a request that carries no ``files`` of its own persists no
+    ``selected_file_ids`` key at all; either way, a forged id never survives.
     """
 
     _admin_headers()
@@ -186,6 +191,7 @@ async def test_task_create_drops_a_client_forged_execution_scope() -> None:
                         "workspace_segments": ["victim"],
                         "memory_dimensions": {"tenant": "victim"},
                     },
+                    SELECTED_FILE_IDS_AGENT_CONFIG_KEY: ["victim-file-id"],
                     "keep_me": "client value",
                 },
             ),
@@ -198,6 +204,9 @@ async def test_task_create_drops_a_client_forged_execution_scope() -> None:
         task = db.query(Task).filter(Task.id == task_id).one()
         assert EXECUTION_SCOPE_AGENT_CONFIG_KEY not in task.agent_config
         assert execution_scope_from_agent_config(task.agent_config) is None
+        assert "victim-file-id" not in (
+            task.agent_config.get(SELECTED_FILE_IDS_AGENT_CONFIG_KEY) or []
+        )
         assert task.agent_config.get("keep_me") == "client value"
     finally:
         db.close()

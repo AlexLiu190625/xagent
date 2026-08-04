@@ -279,11 +279,12 @@ def test_the_reserved_key_set_has_exactly_the_audited_members() -> None:
 
 
 def test_agent_builder_preview_keys_are_not_reserved() -> None:
-    """``src/xagent/web/api/websocket.py:8447-8466`` builds a server-owned
-    ``agent_config`` carrying ``is_preview`` and ``preview_agent_id`` and
-    passes it through ``create_task`` -- and therefore through the sanitizer,
-    layered below it rather than above. Reserving either key here would strip
-    it from that config and break agent-builder preview.
+    """``websocket.py``'s ``handle_build_preview_execution`` builds a
+    server-owned ``agent_config`` carrying ``is_preview`` and
+    ``preview_agent_id`` and passes it through ``create_task`` -- and
+    therefore through the sanitizer, layered below it rather than above.
+    Reserving either key here would strip it from that config and break
+    agent-builder preview.
     """
     assert {"is_preview", "preview_agent_id"}.isdisjoint(
         CLIENT_RESERVED_AGENT_CONFIG_KEYS

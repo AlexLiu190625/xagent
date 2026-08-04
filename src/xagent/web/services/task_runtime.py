@@ -77,18 +77,18 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # comment holds none -- the enumeration is #1095's job.
 #
 # Most server writers layer on top of an already-sanitized dict (all three
-# ``sanitize_client_agent_config`` call sites -- ``public_chat_access.py:931``,
-# ``:1079``, ``chat.py:164`` -- sanitize then layer) or build ``agent_config``
+# ``sanitize_client_agent_config`` call sites -- ``public_chat_access.py``'s
+# ``create_public_chat_task`` and ``create_share_chat_task``, and ``chat.py``'s
+# ``_build_task_agent_config`` -- sanitize then layer) or build ``agent_config``
 # off this path entirely: ``build_workforce_task_config``,
 # ``_trigger_execution_context`` (``services/triggers.py``), the a2a
 # create/backfill writers, and the workforce widget/share builders. One writer
-# passes *through* the sanitizer instead: ``websocket.py``'s build-preview
-# handler builds a server-owned config carrying ``is_preview: True`` and
-# ``preview_agent_id`` (``websocket.py:8419-8425``) and hands it to
-# ``TaskCreateRequest(agent_config=...)`` passed into ``create_task``
-# (``websocket.py:8447-8466``), layered below the sanitizer rather than above
-# it -- reserving either key there would silently strip it and break
-# agent-builder preview.
+# passes *through* the sanitizer instead: ``websocket.py``'s
+# ``handle_build_preview_execution`` builds a server-owned config carrying
+# ``is_preview: True`` and ``preview_agent_id`` and hands it to
+# ``TaskCreateRequest(agent_config=...)`` passed into ``create_task``, layered
+# below the sanitizer rather than above it -- reserving either key there would
+# silently strip it and break agent-builder preview.
 #
 # Before adding a key here: (1) confirm no server writer reaches this column
 # *through* the sanitizer (the preview path above is the only known case);
@@ -99,9 +99,9 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # where a task's bytes land -- sandbox mount, durable storage prefix,
 # workspace directory, memory dimensions -- and its one server-side writer,
 # ``build_workforce_task_config``, is off the sanitizer path entirely.
-# ``tests/web/test_execution_scope_delegation.py::
-# TestWorkforceTaskConfigSnapshot::test_scope_persisted_when_active`` asserts
-# the server-written scope lands.
+# ``tests/web/test_workforce_run_service.py::
+# test_create_workforce_run_propagates_execution_scope_to_worker`` asserts the
+# server-written scope lands in the persisted column.
 #
 # ``selected_file_ids`` qualifies for the same reason and passes both checks.
 # It was declared server-owned when it was introduced -- ``chat.py``'s
