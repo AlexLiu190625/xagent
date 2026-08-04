@@ -1526,6 +1526,32 @@ _MISSING_OUTPUT_PLACEHOLDERS = frozenset(
 )
 
 
+def _classified_failure(
+    message: str, failure_code: Optional[str] = None
+) -> dict[str, Any]:
+    """Build the shared classified tool-failure envelope.
+
+    Key order is contract, not style: ``OutputValueFilter`` truncates dicts
+    by insertion order (output_filter.py:131-142), so the classification
+    keys must be inserted first for the envelope to survive a small field
+    budget. Every field is built fresh; the source child result is never
+    splatted in, since it carries live objects (``agent_result``,
+    ``context``) that must not leak into trace data or model observation.
+    """
+
+    failure: dict[str, Any] = {
+        "success": False,
+        "is_error": True,
+        "status": "error",
+    }
+    if failure_code is not None:
+        failure["failure_code"] = failure_code
+    failure["error"] = message
+    failure["output"] = message
+    failure["response"] = message
+    return failure
+
+
 def _classify_delegated_child_failure(
     result: Mapping[str, Any],
 ) -> Optional[dict[str, Any]]:
@@ -1536,10 +1562,6 @@ def _classify_delegated_child_failure(
     ``None`` when the child result should follow the normal happy path
     (including results that carry neither ``status`` nor ``success`` at all —
     that absence must be inert, not treated as failure).
-
-    Every field here is built fresh into a new dict; the source result is
-    never splatted in, since it may carry live objects (e.g. ``agent_result``,
-    ``context``) that must not leak into trace data or model observation.
 
     The wait check runs first and uses the shared
     ``tool_result_waits_for_user`` predicate, so a whitespace- or
@@ -1553,15 +1575,10 @@ def _classify_delegated_child_failure(
     status = result.get("status")
 
     if tool_result_waits_for_user(result):
-        return {
-            "success": False,
-            "is_error": True,
-            "status": "error",
-            "failure_code": "unsupported_nested_interaction",
-            "error": _NESTED_WAIT_UNSUPPORTED_MESSAGE,
-            "output": _NESTED_WAIT_UNSUPPORTED_MESSAGE,
-            "response": _NESTED_WAIT_UNSUPPORTED_MESSAGE,
-        }
+        return _classified_failure(
+            _NESTED_WAIT_UNSUPPORTED_MESSAGE,
+            failure_code="unsupported_nested_interaction",
+        )
 
     status_is_incomplete = isinstance(status, str) and status.lower() != "completed"
     if result.get("success") is False or status_is_incomplete:
@@ -1573,14 +1590,7 @@ def _classify_delegated_child_failure(
             message = output_text
         else:
             message = _GENERIC_CHILD_FAILURE_MESSAGE
-        return {
-            "success": False,
-            "is_error": True,
-            "status": "error",
-            "error": message,
-            "output": message,
-            "response": message,
-        }
+        return _classified_failure(message)
 
     if isinstance(status, str) and status.lower() == "completed":
         output_value = result.get("output")
@@ -1590,15 +1600,10 @@ def _classify_delegated_child_failure(
             or stripped == ""
             or stripped in _MISSING_OUTPUT_PLACEHOLDERS
         ):
-            return {
-                "success": False,
-                "is_error": True,
-                "status": "error",
-                "failure_code": "missing_delegated_output",
-                "error": _MISSING_CHILD_OUTPUT_MESSAGE,
-                "output": _MISSING_CHILD_OUTPUT_MESSAGE,
-                "response": _MISSING_CHILD_OUTPUT_MESSAGE,
-            }
+            return _classified_failure(
+                _MISSING_CHILD_OUTPUT_MESSAGE,
+                failure_code="missing_delegated_output",
+            )
 
     return None
 
@@ -2281,14 +2286,7 @@ class AgentTool(AbstractBaseTool):
             await self._trace_delegation(
                 "error", execution_task_id=execution_task_id, error=error_msg
             )
-            return {
-                "success": False,
-                "is_error": True,
-                "status": "error",
-                "error": error_msg,
-                "response": error_msg,
-                "output": error_msg,
-            }
+            return _classified_failure(error_msg)
 
 
 def load_published_agent_tool_records(
