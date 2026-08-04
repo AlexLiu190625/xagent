@@ -158,6 +158,7 @@ from ..services.task_lease_service import (
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
 )
+from ..services.task_runtime import SELECTED_FILE_IDS_AGENT_CONFIG_KEY
 from ..services.uploaded_file_store import (
     StagedUploadedFile,
     SupersededObjectCleanupClaim,
@@ -571,7 +572,7 @@ def _selected_file_ids_from_task_config(task: Any) -> list[str]:
     if not isinstance(agent_config, dict):
         return []
 
-    raw_file_ids = agent_config.get("selected_file_ids")
+    raw_file_ids = agent_config.get(SELECTED_FILE_IDS_AGENT_CONFIG_KEY)
     if not isinstance(raw_file_ids, list):
         return []
 

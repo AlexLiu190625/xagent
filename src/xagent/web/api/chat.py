@@ -808,7 +808,7 @@ def _selected_file_ids_from_agent_config(
 ) -> list[str]:
     if not isinstance(agent_config, dict):
         return []
-    raw_file_ids = agent_config.get("selected_file_ids")
+    raw_file_ids = agent_config.get(SELECTED_FILE_IDS_AGENT_CONFIG_KEY)
     if not isinstance(raw_file_ids, list):
         return []
     return [
