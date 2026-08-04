@@ -317,6 +317,65 @@ def test_classifier_leaves_statusless_results_untouched():
     assert mod._classify_delegated_child_failure({"output": ""}) is None
 
 
+def test_classify_delegated_child_failure_reads_raw_output_over_backfill():
+    """The classifier reads the child's own raw answer, not the backfilled one.
+
+    A completed result whose normalized ``output`` was backfilled from an
+    earlier assistant message must still classify as missing when the raw
+    ``agent_result`` carries no answer of its own.
+    """
+
+    result = {
+        "status": "completed",
+        "success": True,
+        "output": "stale preamble",
+        "agent_result": {
+            "status": "completed",
+            "success": True,
+            "output": "",
+            "response": "",
+        },
+    }
+
+    classified = mod._classify_delegated_child_failure(result)
+
+    assert classified is not None
+    assert classified["failure_code"] == "missing_delegated_output"
+
+
+def test_classify_delegated_child_failure_passes_real_raw_output():
+    """A real raw output passes even when the normalized layer agrees with it."""
+
+    result = {
+        "status": "completed",
+        "success": True,
+        "output": "real answer",
+        "agent_result": {
+            "status": "completed",
+            "success": True,
+            "output": "real answer",
+        },
+    }
+
+    assert mod._classify_delegated_child_failure(result) is None
+
+
+def test_classify_delegated_child_failure_falls_back_without_agent_result():
+    """Absent ``agent_result`` degrades to the normalized-output check, both ways."""
+
+    assert (
+        mod._classify_delegated_child_failure(
+            {"status": "completed", "success": True, "output": "all good"}
+        )
+        is None
+    )
+    classified = mod._classify_delegated_child_failure(
+        {"status": "completed", "success": True, "output": ""}
+    )
+    assert classified is not None
+    assert classified["failure_code"] == "missing_delegated_output"
+
+
 @pytest.mark.asyncio
 async def test_agent_tool_catchall_does_not_rewrap_classified_failure(monkeypatch):
     """The classified failure must return before the catch-all can touch it.
@@ -719,17 +778,57 @@ async def test_agent_tool_real_child_with_empty_final_answer_fails_closed(
 ):
     """A real ReAct child that answers with an empty ``final_answer`` fails closed.
 
-    Also the drift detector for the placeholder constants: if
-    ``NO_OUTPUT_PLACEHOLDER``/``NO_RESPONSE_PLACEHOLDER`` ever move, both the
-    producing side (``execution_adapter``) and the recognizing side
-    (``agent_tool``'s classifier) move together because they import the same
-    constants, so this test stays green; a reintroduced literal on either
-    side would go red here.
+    The classifier reads the child's raw ``""`` final answer directly, so
+    this scenario never touches the placeholder constants at all; it is
+    ``test_agent_tool_completed_child_without_usable_output_fails_closed``'s
+    parametrized rows (which do exercise the literal placeholder strings)
+    that serve as the drift detector for ``NO_OUTPUT_PLACEHOLDER`` /
+    ``NO_RESPONSE_PLACEHOLDER``.
     """
 
     llm = _StubSingleCallLLM(
         {
             "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": json.dumps({"answer": ""}),
+                    },
+                }
+            ],
+            "done": False,
+        }
+    )
+    tool = _real_delegated_agent_tool(monkeypatch, tmp_path, llm)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["failure_code"] == "missing_delegated_output"
+    assert result["status"] == "error"
+    assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_real_child_with_stale_assistant_preamble_fails_closed(
+    monkeypatch, tmp_path
+):
+    """A completed child with an empty final answer fails closed even when
+    the adapter backfilled a non-empty earlier assistant message as output.
+
+    The single LLM turn carries both a reasoning preamble (assistant
+    ``content``) and an empty ``final_answer``. ``AgentExecutionAdapter``
+    backfills the normalized ``output`` from that preamble via
+    ``_latest_assistant_message`` because the pattern's own answer is falsy
+    (execution_adapter.py:362-363, 399-409) — without reading the raw
+    ``agent_result`` envelope, the classifier would see a non-empty
+    ``output`` and let this reach the parent as a completed response.
+    """
+
+    llm = _StubSingleCallLLM(
+        {
+            "content": "Let me look into that for you.",
             "tool_calls": [
                 {
                     "id": "call_1",

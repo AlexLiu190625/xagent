@@ -1552,6 +1552,51 @@ def _classified_failure(
     return failure
 
 
+def _delegated_output_is_missing(value: Any) -> bool:
+    """Return whether a delegated child's output carries no usable answer.
+
+    Falsy values mean the child left nothing behind — the same test
+    ``AgentExecutionAdapter._normalize_result`` applies at
+    execution_adapter.py:362 before it backfills. Placeholder strings are
+    recognized, not produced, here: the execution layers substitute them
+    when a run produced no text of its own.
+    """
+
+    if not value:
+        return True
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped == "" or stripped in _MISSING_OUTPUT_PLACEHOLDERS
+    return False
+
+
+def _delegated_child_final_output(result: Mapping[str, Any]) -> Any:
+    """Return the child's own final output, before the adapter's backfill.
+
+    ``_normalize_result`` keeps the raw pattern result under
+    ``agent_result`` (execution_adapter.py:375) and, when the pattern's own
+    output is falsy, replaces the normalized ``output`` with the last
+    non-empty assistant message (execution_adapter.py:362-363, 399-409).
+    That backfill can resurrect a mid-run preamble as if it were the answer,
+    so an empty final answer would otherwise read as a completed response.
+
+    Only ``output``/``response`` are read: both are answer surfaces the
+    patterns set from their final answer (react.py:2605-2613,
+    auto.py:573-581, dag.py:1224-1232). ``error`` is not consulted — on a
+    completed result it is a diagnostic, not an answer. Nothing else is read
+    from the raw result; it also carries live objects such as ``context``.
+
+    Results without the raw envelope — hand-built dicts, and any producer
+    that does not go through the adapter — fall back to the normalized
+    ``output``.
+    """
+
+    agent_result = result.get("agent_result")
+    if isinstance(agent_result, dict):
+        return agent_result.get("output", agent_result.get("response"))
+    return result.get("output")
+
+
 def _classify_delegated_child_failure(
     result: Mapping[str, Any],
 ) -> Optional[dict[str, Any]]:
@@ -1593,13 +1638,7 @@ def _classify_delegated_child_failure(
         return _classified_failure(message)
 
     if isinstance(status, str) and status.lower() == "completed":
-        output_value = result.get("output")
-        stripped = output_value.strip() if isinstance(output_value, str) else None
-        if (
-            output_value is None
-            or stripped == ""
-            or stripped in _MISSING_OUTPUT_PLACEHOLDERS
-        ):
+        if _delegated_output_is_missing(_delegated_child_final_output(result)):
             return _classified_failure(
                 _MISSING_CHILD_OUTPUT_MESSAGE,
                 failure_code="missing_delegated_output",

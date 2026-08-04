@@ -360,6 +360,11 @@ class AgentExecutionAdapter:
         else:
             output = result.get("output", result.get("response", result.get("error")))
             if not output:
+                # This backfill and the raw ``agent_result`` preserved below
+                # must stay distinguishable: the delegated-child classifier
+                # in ``agent_tool.py`` reads the pre-backfill answer from
+                # ``agent_result`` specifically so a backfilled preamble
+                # cannot be mistaken for a real final answer.
                 output = self._latest_assistant_message(result.get("context"))
         normalized = {
             "status": status,
