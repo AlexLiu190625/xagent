@@ -24,6 +24,7 @@ from .....web.tools.config import WebToolConfig
 from ....tracing import create_agent_tracer
 from ....utils.type_check import ensure_list
 from ...core.document_search import find_missing_knowledge_bases
+from ...user_interaction import tool_result_waits_for_user
 from .agent_tool_names import gen_agent_tool_name, parse_agent_tool_id
 from .base import (
     AGENT_CONFIG_UNASSIGNABLE_CATEGORIES,
@@ -1501,8 +1502,6 @@ class ListAgentsTool(AbstractBaseTool):
             ).model_dump()
 
 
-_COMPLETED_CHILD_STATUSES = frozenset({"completed"})
-
 _NESTED_WAIT_UNSUPPORTED_MESSAGE = (
     "This delegated agent paused to ask the user a question. Nested agent "
     "calls cannot forward that interactive prompt, so the delegated task "
@@ -1526,10 +1525,19 @@ def _classify_delegated_child_failure(
     Every field here is built fresh into a new dict; the source result is
     never splatted in, since it may carry live objects (e.g. ``agent_result``,
     ``context``) that must not leak into trace data or model observation.
+
+    The wait check runs first and uses the shared
+    ``tool_result_waits_for_user`` predicate, so a whitespace- or
+    case-variant of ``waiting_for_user`` still classifies as the
+    unsupported-nested-interaction failure rather than falling through to
+    the generic branch.
     """
+    if not isinstance(result, dict):
+        return None
+
     status = result.get("status")
 
-    if status == "waiting_for_user":
+    if tool_result_waits_for_user(result):
         return {
             "success": False,
             "is_error": True,
@@ -1540,9 +1548,7 @@ def _classify_delegated_child_failure(
             "response": _NESTED_WAIT_UNSUPPORTED_MESSAGE,
         }
 
-    status_is_incomplete = (
-        isinstance(status, str) and status.lower() not in _COMPLETED_CHILD_STATUSES
-    )
+    status_is_incomplete = isinstance(status, str) and status.lower() != "completed"
     if result.get("success") is False or status_is_incomplete:
         error_text = result.get("error")
         output_text = result.get("output")

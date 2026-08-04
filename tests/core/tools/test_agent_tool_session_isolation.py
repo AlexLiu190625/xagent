@@ -442,6 +442,31 @@ async def test_agent_tool_classified_failure_survives_file_bookkeeping_error(
     assert tool_result_succeeded(result) is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["  waiting_for_user ", "WAITING_FOR_USER"])
+async def test_agent_tool_normalizes_waiting_status_variants(monkeypatch, status):
+    """Whitespace/case variants of the wait status must still classify.
+
+    The classifier now runs on the shared ``tool_result_waits_for_user``
+    predicate instead of an exact string compare, so a child that reports
+    its status with incidental whitespace or casing still fails closed as
+    the unsupported-nested-interaction case rather than the generic one.
+    """
+
+    async def execute_task():
+        return {"status": status, "output": "partial"}
+
+    _patch_delegated_runtime(
+        monkeypatch, execute_task, close_config=_SucceedingCloseConfig
+    )
+    tool = _delegated_agent_tool()
+    monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_kwargs: None)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["failure_code"] == "unsupported_nested_interaction"
+
+
 def _create_factory() -> tuple[sessionmaker, str]:
     temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     temp_db.close()
