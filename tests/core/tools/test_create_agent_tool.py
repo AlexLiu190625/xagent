@@ -119,6 +119,28 @@ def test_agent_tool_child_tracer_persists_and_broadcasts() -> None:
     )
 
 
+def test_delegation_trace_data_caps_error_text() -> None:
+    """The error text in delegation trace data must be capped like output is.
+
+    Both fields share one constant so the two caps cannot drift apart; an
+    uncapped error could otherwise carry an unbounded amount of child text
+    into trace storage.
+    """
+    tool = AgentTool(
+        agent_id=17,
+        agent_name="Video Generation Agent",
+        agent_description="Generate approved scenes.",
+        session_factory=None,
+        user_id=1,
+    )
+
+    long_error = "e" * 5000
+    data = tool._build_delegation_trace_data("error", error=long_error)
+
+    assert len(data["error"]) == 2000
+    assert data["error"] == long_error[:2000]
+
+
 @pytest.fixture
 def mock_workspace_db():
     yield

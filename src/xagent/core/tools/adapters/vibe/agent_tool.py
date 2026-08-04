@@ -1503,6 +1503,8 @@ class ListAgentsTool(AbstractBaseTool):
             ).model_dump()
 
 
+_DELEGATION_TRACE_TEXT_LIMIT = 2000
+
 _NESTED_WAIT_UNSUPPORTED_MESSAGE = (
     "This delegated agent paused to ask the user a question. Nested agent "
     "calls cannot forward that interactive prompt, so the delegated task "
@@ -1762,10 +1764,10 @@ class AgentTool(AbstractBaseTool):
         if execution_task_id:
             data["worker_task_id"] = execution_task_id
         if output is not None:
-            data["output"] = output[:2000]
+            data["output"] = output[:_DELEGATION_TRACE_TEXT_LIMIT]
             data["output_length"] = len(output)
         if error is not None:
-            data["error"] = error
+            data["error"] = error[:_DELEGATION_TRACE_TEXT_LIMIT]
         if file_outputs:
             data["file_outputs"] = file_outputs
         return data
