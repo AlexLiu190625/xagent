@@ -21,10 +21,14 @@ what the assertions actually depend on.
 Boundary of that guarantee, so it is explicit for the next reader: revalidation
 fires only on *inbound* messages. A revoked guest that simply stops sending
 keeps receiving outbound and broadcast frames on its open socket — "dropped on
-the next message" is the whole contract, not "dropped when revoked". Nor does
-this cover connect-time revocation, which the endpoint reports as a generic
-``4001`` (pre-accept, so uvicorn discards the real code and reason) and which an
-existing test in ``test_public_chat_websocket_db_boundary.py`` pins.
+the next message" is the whole contract, not "dropped when revoked".
+
+Connect-time revocation — the guest reloads the page after being revoked and
+reconnects, the far more common sequence — is covered by
+``test_widget_ws_reconnect_after_revocation_reports_4003`` below. Since #1057 the
+widget endpoint accepts the handshake before auth (like the share path), so that
+denial is a post-accept ``4003`` carrying the real reason rather than the generic
+pre-accept ``4001`` uvicorn used to collapse into a bare HTTP 403.
 """
 
 from __future__ import annotations
@@ -340,6 +344,35 @@ def test_widget_ws_closes_4003_when_widget_is_revoked_mid_session(
         revoke()
 
         ws.send_text(json.dumps({"type": "chat", "message": "still there?"}))
+        denied = _drain_until_disconnect(ws)
+
+    assert denied.code == 4003
+    assert denied.reason == "Widget is unavailable"
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("channel", ["agent", "workforce"])
+@pytest.mark.parametrize("revocation", ["disable", "rotate", "unpublish"])
+def test_widget_ws_reconnect_after_revocation_reports_4003(
+    monkeypatch: pytest.MonkeyPatch,
+    channel: str,
+    revocation: str,
+) -> None:
+    """Connect-time counterpart of the mid-session test above: a revoked guest
+    reloads the page and reconnects, so the ``ensure_widget_*_available`` denial
+    happens at connect-time auth and surfaces as a post-accept ``4003`` (see the
+    module docstring for the accept-first rationale). All three revocation levers
+    are covered, mirroring the mid-session case.
+    """
+    guest = _build_guest(channel, monkeypatch)
+    revoke: Callable[[], None] = getattr(guest, revocation)
+    revoke()
+
+    url = f"/api/widget/chat/ws/{guest.task_id}?token={guest.token}"
+    # Accept-first (#1057): the connection upgrades, then connect-time auth
+    # rejects it, so the denial surfaces at receive rather than at
+    # context-manager entry (a pre-accept close would raise on the ``with``).
+    with client.websocket_connect(url) as ws:
         denied = _drain_until_disconnect(ws)
 
     assert denied.code == 4003

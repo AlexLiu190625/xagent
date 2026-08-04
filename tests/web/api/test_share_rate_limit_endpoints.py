@@ -438,29 +438,25 @@ async def test_widget_ws_turn_gate_does_not_gate_interventions(
 def test_widget_ws_connect_over_limit_is_refused_pre_accept(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Over-limit widget WS connection attempts are refused pre-accept with
-    4008 (#1056), mirroring the share gate. The widget endpoint already closes
-    pre-accept on auth failure, so a garbage token lets this test tell the two
-    refusals apart by close code: 4001 while the budget admits, 4008 once it
-    trips. That distinction is TestClient-only — both closes are pre-accept,
-    and in production uvicorn collapses either into a bare HTTP 403 (the
-    browser sees code=1006, reason=""), unlike the share test where the
-    admitted attempt's denial is post-accept and genuinely reaches the client.
-    The codes here pin server-side gate ordering, not client-observable
-    behaviour."""
+    """Over-limit widget WS connection attempts are refused before the
+    handshake is accepted (#1056), mirroring the share gate. Since #1057 the
+    widget endpoint also accepts before auth, so a garbage token's denial is a
+    post-accept 4003 (it surfaces at receive) while the connect-gate rejection
+    stays pre-accept (it surfaces at context-manager entry) — that asymmetry is
+    what pins the gate ordering, exactly as on the share path."""
     from starlette.websockets import WebSocketDisconnect
 
     monkeypatch.setenv("XAGENT_WIDGET_WS_CONNECT_IP_RATE_LIMIT", "1/minute")
     reset_share_rate_limiter()
 
     url = "/api/widget/chat/ws/1?token=garbage"
-    # First attempt is admitted by the connect gate, then auth rejects it.
-    with pytest.raises(WebSocketDisconnect) as first:
-        with client.websocket_connect(url):
-            pass
-    assert first.value.code == 4001
+    # First attempt is admitted: it upgrades, then auth rejects it post-accept.
+    with client.websocket_connect(url) as ws:
+        with pytest.raises(WebSocketDisconnect) as first:
+            ws.receive_text()
+    assert first.value.code == 4003
 
-    # Second attempt from the same caller trips the budget.
+    # Second attempt from the same caller trips the budget pre-accept.
     with pytest.raises(WebSocketDisconnect) as denied:
         with client.websocket_connect(url):
             pass

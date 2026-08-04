@@ -281,16 +281,21 @@ async def test_public_access_websocket_preserves_auth_close_codes(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("endpoint_kind", ["public", "share"])
-async def test_public_access_websocket_initial_auth_failure_stays_4001(
+async def test_public_access_websocket_initial_http_auth_failure_maps_to_4003(
     monkeypatch: pytest.MonkeyPatch,
     endpoint_kind: str,
 ) -> None:
+    # Both endpoints map an auth-time HTTPException to a 4003 (#973 for share,
+    # #1057 for widget): the connect-time analogue of the per-message
+    # revalidation 4003, and the common sequence for a revoked widget guest who
+    # reloads the page and reconnects rather than staying on a live socket.
     websocket = _SingleMessageWebSocket({"type": "chat", "message": "hello"})
     authorize = AsyncMock(
-        side_effect=HTTPException(status_code=401, detail="Invalid token")
+        side_effect=HTTPException(status_code=403, detail="Widget is unavailable")
     )
     connection_manager = MagicMock()
     connection_manager.connect = AsyncMock()
+    connection_manager.register_connection = MagicMock()
     connection_manager.disconnect = MagicMock()
     monkeypatch.setattr(public_chat_access, "manager", connection_manager)
 
@@ -320,18 +325,69 @@ async def test_public_access_websocket_initial_auth_failure_stays_4001(
             token="share-token",
         )
 
+    websocket.accept.assert_awaited_once()
+    websocket.close.assert_awaited_once_with(
+        code=4003,
+        reason="Widget is unavailable",
+    )
+    # Rejected before registration: neither the async accept-and-register helper
+    # nor the register-only path runs, so the socket never joins task broadcasts.
+    connection_manager.connect.assert_not_awaited()
+    connection_manager.register_connection.assert_not_called()
+    connection_manager.disconnect.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint_kind", ["public", "share"])
+async def test_public_access_websocket_initial_non_http_failure_stays_4001(
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint_kind: str,
+) -> None:
+    # A non-HTTP failure at connect-time auth (an infra error, not an access
+    # denial) carries no reason the recovery flow keys on, so both endpoints
+    # keep the generic 4001 rather than dressing it up as a 4003 access denial.
+    websocket = _SingleMessageWebSocket({"type": "chat", "message": "hello"})
+    authorize = AsyncMock(side_effect=RuntimeError("database is down"))
+    connection_manager = MagicMock()
+    connection_manager.connect = AsyncMock()
+    connection_manager.register_connection = MagicMock()
+    connection_manager.disconnect = MagicMock()
+    monkeypatch.setattr(public_chat_access, "manager", connection_manager)
+
     if endpoint_kind == "public":
-        websocket.close.assert_awaited_once_with(
-            code=4001,
-            reason="Authentication required",
+        monkeypatch.setattr(
+            public_chat_access,
+            "_authorize_public_chat_websocket",
+            authorize,
+            raising=False,
+        )
+        await public_chat_access.public_chat_websocket_endpoint(
+            websocket=websocket,
+            task_id=42,
+            token="widget-token",
+            expected_auth_mode="widget",
         )
     else:
-        # The share endpoint accepts before auth and maps an auth-time
-        # HTTPException to a 4003 close carrying the real reason, so the frontend
-        # recovery flow can act on it (#973). Only non-HTTP failures stay 4001.
-        websocket.close.assert_awaited_once_with(
-            code=4003,
-            reason="Invalid token",
+        monkeypatch.setattr(
+            public_chat_access,
+            "_authorize_share_chat_websocket",
+            authorize,
+            raising=False,
         )
+        await public_chat_access.share_chat_websocket_endpoint(
+            websocket=websocket,
+            task_id=42,
+            token="share-token",
+        )
+
+    # accept() runs unconditionally before the try/except that yields both the
+    # 4003 and 4001 outcomes, so pin it here too: a regression moving accept into
+    # only the HTTPException branch would slip past a 4001-only assertion.
+    websocket.accept.assert_awaited_once()
+    websocket.close.assert_awaited_once_with(
+        code=4001,
+        reason="Authentication required",
+    )
     connection_manager.connect.assert_not_awaited()
+    connection_manager.register_connection.assert_not_called()
     connection_manager.disconnect.assert_not_called()

@@ -1261,28 +1261,40 @@ async def public_chat_websocket_endpoint(
     """Serve widget websocket chat with per-message revalidation."""
     # Handshake budget (#1056): mirror of the share connect gate — a widget
     # key is embedded in a public page, so connection attempts are anonymous
-    # and need a per-IP ceiling. This endpoint closes pre-accept on auth
-    # failure below (uvicorn collapses that into a plain HTTP 403), so the
-    # pre-accept refusal here is consistent with its existing behaviour and
-    # is the cheapest rejection: no upgrade is performed at all. The IP is
-    # captured once — it cannot change for the lifetime of the socket — and
-    # reused by the per-turn gate in the loop below.
+    # and need a per-IP ceiling. Checked *pre-accept* on purpose: an over-limit
+    # probe is refused as a plain HTTP 403 with no upgrade performed at all,
+    # which is the cheapest rejection — and unlike the auth denials below, a
+    # rate-limited connect carries no reason the frontend recovery flow needs
+    # to read. The IP is captured once — it cannot change for the lifetime of
+    # the socket — and reused by the per-turn gate in the loop below.
     remote_ip = remote_ip_from_request(websocket)
     if not get_share_rate_limiter().allow_widget_ws_connect(remote_ip):
         await websocket.close(code=4008, reason="Too many connection attempts")
         return
 
+    # Accept the handshake *before* the auth/access checks (#1057), matching the
+    # share path. uvicorn only preserves a close code + reason for a *post-accept*
+    # close; a pre-accept ``websocket.close()`` collapses into a bare HTTP 403
+    # (browser sees onclose code=1006, reason=""), discarding the denial. Accepting
+    # first makes the 4003 below a real close whose reason reaches the widget
+    # client, so a returning guest whose widget was revoked can tell an access
+    # denial apart from a transport failure and recover.
+    await websocket.accept()
     try:
         principal = await _authorize_public_chat_websocket(
             token=token,
             task_id=task_id,
             expected_auth_mode=expected_auth_mode,
         )
+    except HTTPException as exc:
+        await websocket.close(code=4003, reason=_ws_close_reason(exc.detail))
+        return
     except Exception:
         await websocket.close(code=4001, reason="Authentication required")
         return
 
-    await manager.connect(websocket, task_id)
+    # Already accepted above; register the live socket without re-accepting.
+    manager.register_connection(websocket, task_id)
 
     try:
         await handle_status_request(websocket, task_id, principal)
