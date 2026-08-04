@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from sqlalchemy import func, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from ...config import get_checkpoint_history_limit
@@ -222,7 +222,9 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         f"task {self.task_id}: could not resolve the "
                         "checkpoint read partition"
                     ) from exc
-                anchored = self._load_pk_anchored_checkpoint(db, run_id)
+                anchored = self._load_pk_anchored_checkpoint(
+                    db, run_id, str(execution_id)
+                )
                 if anchored is not _NO_TRACE_EVENT_ANCHOR:
                     return anchored  # type: ignore[return-value]
                 query = query.filter(
@@ -454,6 +456,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
         self,
         db: Session,
         run_id: str | None,
+        execution_id: str,
     ) -> Dict[str, Any] | object:
         """Resolve the checkpoint through the task's exact-row pointer.
 
@@ -468,6 +471,15 @@ class DatabaseTraceHandler(BaseTraceHandler):
         classified the same way the scan classifies an exhausted,
         all-undecodable candidate set, since this pointer is the only
         candidate.
+
+        The execution-identity check here is verification, not the legacy
+        scan's filtering: that scan excludes non-matching rows from its
+        candidate set via ``_checkpoint_execution_id_predicate`` before it
+        ever sees them, but the pointer names one row unconditionally, so
+        the row's own claimed identity (if it has one) has to be checked
+        against the caller's after the fact. A row with no execution
+        identity at all -- legacy rows written before the field existed --
+        still passes, matching the legacy scan's coalescing default of "".
         """
         pointer = (
             db.query(Task.last_checkpoint_trace_event_id)
@@ -494,12 +506,14 @@ class DatabaseTraceHandler(BaseTraceHandler):
         partition_matches = (
             run_field == run_id if run_id is not None else run_field is None
         )
+        row_execution_id = checkpoint_execution_id(row_data)
         if (
             row.task_id != self.task_id
             or row.event_type != "system_update_general"
             or row.build_id is not None
             or row_data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES
             or not partition_matches
+            or (row_execution_id and row_execution_id != execution_id)
         ):
             raise CheckpointCorruptError(
                 f"task {self.task_id}: checkpoint pointer {pointer_id} does "
@@ -811,15 +825,18 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 self.task_id,
                 execution_id,
             )
-        except IntegrityError:
+        except (IntegrityError, OperationalError):
             # PostgreSQL enforces the anchor FK, so a race that lets a
             # candidate row become the active anchor between selection and
-            # delete surfaces here as a restrict violation (including a
-            # serialization failure under stricter isolation levels). A
-            # database upgraded through Alembic on SQLite has no DB-level FK
-            # for this column and cannot raise this; a freshly created
+            # delete surfaces here as a restrict violation (IntegrityError).
+            # A database upgraded through Alembic on SQLite has no DB-level
+            # FK for this column and cannot raise this; a freshly created
             # SQLite database (create_all, e.g. tests) does have the FK and
-            # can.
+            # can. Under stricter isolation levels the same race can instead
+            # surface as psycopg2's SerializationFailure or DeadlockDetected,
+            # both of which SQLAlchemy wraps in OperationalError, not
+            # IntegrityError -- catch both so this retention path degrades
+            # the same way regardless of which one the database raises.
             db.rollback()
             register_degradation(
                 CHECKPOINT_PRUNE_INTEGRITY_ERROR,

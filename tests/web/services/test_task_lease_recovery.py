@@ -481,6 +481,94 @@ def test_pk_anchor_validation_failure_does_not_fall_back_to_the_legacy_scan(
     assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
 
 
+_RECOVERY_SINGLE_FAULT_FIELDS = [
+    "task_id",
+    "event_type",
+    "build_id",
+    "checkpoint_type",
+    "run_id",
+]
+
+
+def _mutate_recovery_row_field(
+    field: str,
+    row_kwargs: dict,
+    data: dict,
+    other_task_id: int,
+) -> None:
+    """Corrupt exactly one field _checkpoint_row_matches_candidate checks
+    on the PK-anchored recovery path, leaving every other field --
+    including the run field -- valid."""
+    if field == "task_id":
+        row_kwargs["task_id"] = other_task_id
+    elif field == "event_type":
+        row_kwargs["event_type"] = "agent_progress"
+    elif field == "build_id":
+        row_kwargs["build_id"] = "agent_child"
+    elif field == "checkpoint_type":
+        data["checkpoint_type"] = "not_a_readable_checkpoint_type"
+    elif field == "run_id":
+        data[TASK_RUN_ID_TRACE_FIELD] = "some-other-run"
+    else:
+        raise AssertionError(f"unknown single-fault field {field}")
+
+
+@pytest.mark.parametrize("field", _RECOVERY_SINGLE_FAULT_FIELDS)
+def test_pk_anchor_single_fault_is_not_recoverable(db_session, field: str) -> None:
+    """Each conjunct _checkpoint_row_matches_candidate checks must
+    independently be load-bearing on the PK-anchored recovery path: a row
+    wrong in exactly one field (every other field, including the run
+    field, valid) must still resolve NOT_RECOVERABLE (the candidate fails
+    the lease). test_pk_anchor_validation_failure_does_not_fall_back_to_
+    the_legacy_scan above only proves build_id does real work; task_id and
+    event_type have no such proof, because the legacy scan's own query
+    already filters both -- they are redundant there and only load-bearing
+    on this PK path, which loads a row by raw primary key with no such
+    filter. This test kills each conjunct independently.
+    """
+    user = _create_user(db_session, suffix=f"pk-single-fault-{field}")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix=f"pk-single-fault-{field}",
+    )
+    other_task = Task(
+        user_id=int(user.id),
+        title="Other task",
+        description="lease recovery test",
+        status=TaskStatus.PENDING,
+    )
+    db_session.add(other_task)
+    db_session.flush()
+    other_task_id = int(other_task.id)
+
+    row_kwargs: dict = dict(
+        task_id=task.id,
+        event_id=f"pk-single-fault-{field}",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+    )
+    data: dict = {
+        "checkpoint_type": CHECKPOINT_TYPE,
+        "snapshot": {"type": "checkpoint"},
+        TASK_RUN_ID_TRACE_FIELD: task.run_id,
+    }
+    _mutate_recovery_row_field(field, row_kwargs, data, other_task_id)
+
+    row = TraceEvent(data=data, **row_kwargs)
+    db_session.add(row)
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = row.id
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery(db_session, candidate)
+        is CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    )
+    assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
+
+
 def test_dangling_pk_pointer_falls_back_to_the_legacy_scan(
     sqlite_no_anchor_fk_session,
 ) -> None:

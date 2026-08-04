@@ -6,9 +6,11 @@ import time
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any, Dict
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool, StaticPool
 
@@ -1312,6 +1314,174 @@ def test_database_trace_handler_load_pk_anchor_mismatch_raises_corrupt(
         db.close()
 
 
+_PK_ANCHOR_SINGLE_FAULT_FIELDS = [
+    "task_id",
+    "event_type",
+    "build_id",
+    "checkpoint_type",
+    "run_partition",
+    "execution_id",
+]
+
+
+def _mutate_pk_anchor_field(
+    field: str,
+    row_kwargs: Dict[str, Any],
+    data: Dict[str, Any],
+    other_task_id: int,
+) -> None:
+    """Corrupt exactly one field the PK-anchored validation checks, leaving
+    every other field -- including the run field -- valid, so a passing
+    case can only be explained by that one conjunct doing nothing."""
+    if field == "task_id":
+        row_kwargs["task_id"] = other_task_id
+    elif field == "event_type":
+        row_kwargs["event_type"] = "agent_progress"
+    elif field == "build_id":
+        row_kwargs["build_id"] = "agent_123_wrongscope"
+    elif field == "checkpoint_type":
+        data["checkpoint_type"] = "not_a_readable_checkpoint_type"
+    elif field == "run_partition":
+        data[TASK_RUN_ID_TRACE_FIELD] = "run-b"
+    elif field == "execution_id":
+        data["execution_id"] = "other-execution"
+    else:
+        raise AssertionError(f"unknown single-fault field {field}")
+
+
+@pytest.mark.parametrize("field", _PK_ANCHOR_SINGLE_FAULT_FIELDS)
+def test_database_trace_handler_load_pk_anchor_single_fault_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    """Each conjunct of the PK-anchored validation must independently be
+    load-bearing: a row wrong in exactly one field (every other field,
+    including the run partition, valid) must still raise
+    CheckpointCorruptError. The older
+    test_database_trace_handler_load_pk_anchor_mismatch_raises_corrupt
+    above violates build_id and the run partition at the same time, so it
+    cannot prove any single conjunct is doing real work -- deleting either
+    check there still leaves the other to raise. This test kills each
+    conjunct independently.
+    """
+    SessionLocal, db, task = _create_trace_handler_test_task(
+        f"pk-anchor-single-fault-{field}"
+    )
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+
+    other_task = Task(
+        user_id=int(task.user_id),
+        title="Other task",
+        description="Other task",
+        status=TaskStatus.PENDING,
+    )
+    db.add(other_task)
+    db.commit()
+    db.refresh(other_task)
+    other_task_id = int(other_task.id)
+
+    row_kwargs: Dict[str, Any] = dict(
+        task_id=task_id,
+        build_id=None,
+        event_id="pk-anchor-single-fault",
+        event_type="system_update_general",
+        timestamp=datetime.now(timezone.utc),
+    )
+    data: Dict[str, Any] = {
+        "checkpoint_type": CHECKPOINT_TYPE,
+        "execution_id": "shared-execution",
+        TASK_RUN_ID_TRACE_FIELD: "run-a",
+        "snapshot": {"label": "single-fault"},
+    }
+    _mutate_pk_anchor_field(field, row_kwargs, data, other_task_id)
+
+    row = DatabaseTraceEvent(data=data, **row_kwargs)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    task.last_checkpoint_trace_event_id = row.id
+    db.commit()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            with pytest.raises(CheckpointCorruptError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "shared-execution"
+                )
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_load_pk_anchor_without_execution_identity_loads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The execution-identity conjunct is verification, not filtering: a
+    row that carries no execution identity at all -- a legacy row written
+    before root_execution_id/execution_id/snapshot.execution_id existed --
+    must still load rather than being treated as a mismatch. Pairs with
+    the "execution_id" case of
+    test_database_trace_handler_load_pk_anchor_single_fault_raises_corrupt,
+    which covers the opposite: an execution identity that is present and
+    wrong.
+    """
+    SessionLocal, db, task = _create_trace_handler_test_task(
+        "pk-anchor-no-execution-identity"
+    )
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+
+    row = DatabaseTraceEvent(
+        task_id=task_id,
+        build_id=None,
+        event_id="pk-anchor-no-execution-identity",
+        event_type="system_update_general",
+        timestamp=datetime.now(timezone.utc),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            TASK_RUN_ID_TRACE_FIELD: "run-a",
+            "snapshot": {"label": "no-execution-identity"},
+        },
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    task.last_checkpoint_trace_event_id = row.id
+    db.commit()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "shared-execution"
+            ) == {"label": "no-execution-identity"}
+    finally:
+        db.close()
+
+
 def test_database_trace_handler_load_dangling_pk_anchor_falls_back_with_telemetry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1759,14 +1929,31 @@ def test_database_trace_handler_prune_excludes_the_anchored_row(
         db.close()
 
 
-def test_database_trace_handler_prune_registers_degradation_on_integrity_error(
+@pytest.mark.parametrize(
+    "injected_exception",
+    [
+        pytest.param(
+            IntegrityError("DELETE", {}, Exception("restrict violation")),
+            id="integrity_error",
+        ),
+        pytest.param(
+            OperationalError("DELETE", {}, Exception("serialization failure")),
+            id="operational_error",
+        ),
+    ],
+)
+def test_database_trace_handler_prune_registers_degradation_on_delete_error(
     monkeypatch: pytest.MonkeyPatch,
+    injected_exception: Exception,
 ) -> None:
-    """Synthetic IntegrityError injection: the delete step is replaced to
-    raise, isolating the except-IntegrityError branch from needing genuine
-    FK enforcement (which only PostgreSQL, or a freshly create_all'd SQLite
-    database, provides for this column)."""
-    from sqlalchemy.exc import IntegrityError
+    """Synthetic delete-failure injection: the delete step is replaced to
+    raise, isolating the except-(IntegrityError, OperationalError) branch
+    from needing genuine FK enforcement (which only PostgreSQL, or a
+    freshly create_all'd SQLite database, provides for this column) or a
+    genuine serialization conflict. Both exception classes are covered
+    because PostgreSQL's restrict-violation and its SerializationFailure /
+    DeadlockDetected surface through different SQLAlchemy wrapper classes
+    (IntegrityError vs. OperationalError) for the same retention race."""
     from sqlalchemy.orm import Query
 
     from xagent.web.services.ops_signals import (
@@ -1803,7 +1990,7 @@ def test_database_trace_handler_prune_registers_degradation_on_integrity_error(
     )
 
     def failing_delete(self: Query, *args: object, **kwargs: object) -> int:
-        raise IntegrityError("DELETE", {}, Exception("restrict violation"))
+        raise injected_exception
 
     monkeypatch.setattr(Query, "delete", failing_delete)
 
