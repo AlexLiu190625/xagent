@@ -27,6 +27,11 @@ from sqlalchemy.engine import Engine
 
 from xagent.web.models.database import Base
 
+# Imported for its side effect: registering the tasks table (and its anchor
+# constraint) on Base.metadata, so this module works no matter which test
+# module imports it first.
+from xagent.web.models.task import Task  # noqa: F401
+
 CHECKPOINT_ANCHOR_FK_NAME = "fk_tasks_last_checkpoint_trace_event_id"
 
 _ANCHOR_FK_CLAUSE = re.compile(
