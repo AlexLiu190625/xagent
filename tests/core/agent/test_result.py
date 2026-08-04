@@ -46,6 +46,15 @@ def test_classified_tool_failure_accepts_only_allowlisted_plain_string():
         ClassifiedToolFailure(failure_code="other_valid_code")
 
 
+@pytest.mark.parametrize("code", ["unsupported_nested_interaction"])
+def test_classified_tool_failure_rejects_non_oauth_runtime_codes(code):
+    """The runtime allowlist must not widen the OAuth sentinel's validator."""
+
+    assert normalize_tool_failure_code(code) == code
+    with pytest.raises(ValueError, match="invalid tool failure code"):
+        ClassifiedToolFailure(failure_code=code)
+
+
 @pytest.mark.parametrize(
     "result",
     [

@@ -8,11 +8,19 @@ TOOL_FAILURE_CODES = frozenset(
     {"oauth_token_required", "unsupported_nested_interaction"}
 )
 
+_OAUTH_FAILURE_CODES = frozenset({"oauth_token_required"})
+
 
 def normalize_tool_failure_code(value: Any) -> str | None:
     """Return an exact public tool failure code when it is allowlisted."""
 
     return value if type(value) is str and value in TOOL_FAILURE_CODES else None
+
+
+def normalize_oauth_failure_code(value: Any) -> str | None:
+    """Return an exact OAuth failure code carried by ``ClassifiedToolFailure``."""
+
+    return value if type(value) is str and value in _OAUTH_FAILURE_CODES else None
 
 
 @dataclass(frozen=True)
@@ -21,16 +29,15 @@ class ClassifiedToolFailure:
 
     Its only current consumer is the delegated-authorization retry path in
     the MCP adapter, which treats any instance as an OAuth failure regardless
-    of the carried code. ``failure_code`` must still be one of
-    ``TOOL_FAILURE_CODES``, but adding a non-OAuth code to that allowlist does
-    not make this class a valid carrier for it — a new consumer needs its own
-    check, not reuse of this type.
+    of the carried code. ``failure_code`` is validated against the OAuth-only
+    set, not the wider runtime allowlist: a new public failure code becomes
+    surfaceable by the runtime without becoming carriable by this type.
     """
 
     failure_code: str
 
     def __post_init__(self) -> None:
-        if normalize_tool_failure_code(self.failure_code) is None:
+        if normalize_oauth_failure_code(self.failure_code) is None:
             raise ValueError("invalid tool failure code")
 
 
