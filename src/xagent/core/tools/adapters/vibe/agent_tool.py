@@ -2086,9 +2086,7 @@ class AgentTool(AbstractBaseTool):
                 if not agent:
                     error_msg = f"Error: Agent {self._agent_id} not found"
                     await self._trace_delegation("error", error=error_msg)
-                    return AgentToolResult(response=error_msg).model_dump(
-                        exclude_none=True
-                    )
+                    return _classified_failure(error_msg)
 
                 # Generate unique task ID for this execution
                 execution_task_id = f"agent_{self._agent_id}_{uuid4().hex[:8]}"
@@ -2124,7 +2122,7 @@ class AgentTool(AbstractBaseTool):
                 await self._trace_delegation(
                     "error", execution_task_id=execution_task_id, error=error_msg
                 )
-                return AgentToolResult(response=error_msg).model_dump(exclude_none=True)
+                return _classified_failure(error_msg)
 
             # ---- Phase 2: build the child config with the FACTORY (no live
             # parent session) and run the sub-agent. ----
