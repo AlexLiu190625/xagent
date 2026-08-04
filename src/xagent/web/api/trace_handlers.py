@@ -635,7 +635,12 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 # this the exact-row anchor column would be built from an
                 # unassigned id and silently written NULL.
                 db.flush()
-                assert trace_event.id is not None
+                if trace_event.id is None:
+                    raise RuntimeError(
+                        f"Task {self.task_id} checkpoint {event.id} row has no "
+                        "primary key after flush; refusing to write a NULL "
+                        "checkpoint anchor"
+                    )
                 pointer_update = db.execute(
                     update(Task)
                     .where(
