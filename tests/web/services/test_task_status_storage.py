@@ -374,18 +374,6 @@ def test_predicate_value_passes_through_a_valid_status() -> None:
     assert task_status_predicate.value(TaskStatus.FAILED) is TaskStatus.FAILED
 
 
-def test_predicate_is_null_matches_raw_comparison() -> None:
-    raw = Task.status.is_(None)
-    bound = task_status_predicate.is_null()
-    assert _compiled(raw) == _compiled(bound) == "tasks.status IS NULL"
-
-
-def test_predicate_is_not_null_matches_raw_comparison() -> None:
-    raw = Task.status.is_not(None)
-    bound = task_status_predicate.is_not_null()
-    assert _compiled(raw) == _compiled(bound) == "tasks.status IS NOT NULL"
-
-
 def test_predicate_in_rejects_none_with_a_descriptive_error() -> None:
     with pytest.raises(TypeError, match="wrap a single member in a list"):
         task_status_predicate.in_(None)  # type: ignore[arg-type]

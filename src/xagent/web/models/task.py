@@ -295,11 +295,11 @@ class TaskStatusPredicate:
     The column stores ``TaskStatus`` member names, not member values (see
     the ``status`` column comment). A raw string literal built from the
     member value silently matches zero rows on SQLite and raises an invalid
-    enum label error on PostgreSQL. Every WHERE/SET-case comparison, every
-    null check, and every ``.values(status=...)`` write must go through one
-    of the methods below instead of comparing or assigning ``Task.status``
-    directly, so a non-``TaskStatus`` input fails at construction time
-    (``TypeError``) instead of silently miscompiling at query time.
+    enum label error on PostgreSQL. Every WHERE/SET-case comparison and
+    every ``.values(status=...)`` write must go through one of the methods
+    below instead of comparing or assigning ``Task.status`` directly, so a
+    non-``TaskStatus`` input fails at construction time (``TypeError``)
+    instead of silently miscompiling at query time.
     """
 
     @staticmethod
@@ -329,16 +329,6 @@ class TaskStatusPredicate:
         if len(members) == 1:
             return Task.status != members[0]
         return Task.status.notin_(members)
-
-    @staticmethod
-    def is_null() -> Any:
-        """``Task.status IS NULL``."""
-        return Task.status.is_(None)
-
-    @staticmethod
-    def is_not_null() -> Any:
-        """``Task.status IS NOT NULL``."""
-        return Task.status.is_not(None)
 
     @staticmethod
     def value(status: TaskStatus) -> TaskStatus:
