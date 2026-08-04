@@ -2213,6 +2213,56 @@ def test_load_checkpoint_readable_type_without_snapshot_raises_corrupt(
         db.close()
 
 
+def test_load_checkpoint_snapshotless_newest_row_does_not_shadow_older_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newest row with a readable checkpoint_type but no snapshot is a
+    per-row permanent failure, not a verdict on the matching set: the scan
+    falls through to the older valid row and returns its snapshot."""
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="shadowing-no-snapshot",
+                event_type="system_update_general",
+                timestamp=now + timedelta(seconds=10),
+                data={
+                    "checkpoint_type": CHECKPOINT_TYPE,
+                    "execution_id": "exec-shadowed",
+                },
+            )
+        )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="shadowing-valid-older",
+                event_type="system_update_general",
+                timestamp=now,
+                data=_checkpoint_data(
+                    "exec-shadowed", [{"role": "user", "content": "hello"}]
+                ),
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+            "exec-shadowed"
+        )
+        assert loaded is not None
+        assert loaded["context"]["messages"] == [{"role": "user", "content": "hello"}]
+    finally:
+        db.close()
+
+
 def test_checkpoint_read_failure_preserves_pool_timeout_cause_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

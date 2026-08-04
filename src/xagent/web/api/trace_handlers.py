@@ -318,12 +318,19 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     snapshot = data.get("snapshot")
                     if not isinstance(snapshot, dict):
                         # The row claims to be a checkpoint but carries no
-                        # payload -- corrupt, not absent.
-                        raise CheckpointCorruptError(
-                            f"task {self.task_id}: checkpoint row "
-                            f"{row.event_id} has a readable checkpoint_type "
-                            "but no snapshot"
+                        # payload: a permanent failure for this row, the same
+                        # class as an undecodable one. Per-row failures never
+                        # abort the scan -- an older row may still carry a
+                        # usable checkpoint -- and the verdict for the whole
+                        # matching set is decided once, after exhaustion.
+                        saw_undecodable_row = True
+                        logger.warning(
+                            "Skipping checkpoint trace event %s for task %s: "
+                            "readable checkpoint_type but no snapshot",
+                            row.event_id,
+                            self.task_id,
                         )
+                        continue
                     return dict(snapshot)
 
                 if len(rows) < CHECKPOINT_ROW_SCAN_LIMIT:
