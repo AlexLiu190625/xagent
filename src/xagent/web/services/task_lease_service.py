@@ -240,6 +240,14 @@ def _checkpoint_row_matches_candidate(
     checks are redundant there, but the PK path loads a row by raw primary
     key with no such filter, so it needs the full set. A mismatch here is
     corruption of the row the pointer names, not a cue to search elsewhere.
+
+    A ``False`` here always resolves the candidate to NOT_RECOVERABLE
+    (lease recovery fails the task). The checkpoint reader's own PK-anchor
+    validation (``_load_pk_anchored_checkpoint`` in ``trace_handlers.py``)
+    checks the same kind of row mismatch but calls it corrupt
+    (``CheckpointCorruptError``) instead -- two call sites judging the same
+    condition through different vocabularies for their own callers, not an
+    inconsistency to reconcile.
     """
 
     if (
