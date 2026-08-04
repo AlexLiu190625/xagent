@@ -28,12 +28,13 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.web.models import database as database_module
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.trigger import (
     AgentTrigger,
     TriggerRun,
@@ -93,7 +94,20 @@ def db_session(tmp_path):
         yield db
     finally:
         db.close()
-        Base.metadata.drop_all(bind=get_engine())
+        # FK enforcement is on for this engine's connections (see
+        # apply_sqlite_concurrency_pragmas), and the checkpoint pointer's
+        # FK forms a cycle with trace_events.task_id -> tasks.id. A test
+        # that leaves a real cross-reference between the two tables (a
+        # populated last_checkpoint_trace_event_id) makes drop_all's table
+        # order irrelevant -- no order satisfies both directions of a
+        # populated cycle under enforcement. Dropping the tables is the
+        # only goal here, not preserving referential integrity of data
+        # about to be discarded, so enforcement is turned off for this one
+        # connection rather than for the fixture's tests.
+        engine = get_engine()
+        with engine.begin() as conn:
+            conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            Base.metadata.drop_all(bind=conn)
 
 
 @pytest.fixture()
@@ -358,6 +372,16 @@ async def test_begin_turn_claim_replaces_stale_lease_and_checkpoint_pointer(
     task.runner_id = "dead-runner-from-crash"
     task.lease_expires_at = utc_now() + timedelta(hours=1)
     task.last_checkpoint_event_id = "previous-run-checkpoint"
+    stale_checkpoint = TraceEvent(
+        task_id=task.id,
+        event_id="previous-run-checkpoint",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={"checkpoint_type": CHECKPOINT_TYPE, "snapshot": {"type": "checkpoint"}},
+    )
+    db_session.add(stale_checkpoint)
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = stale_checkpoint.id
     db_session.commit()
 
     await TaskTurnOrchestrator.begin_turn(
@@ -373,6 +397,11 @@ async def test_begin_turn_claim_replaces_stale_lease_and_checkpoint_pointer(
     assert task.runner_id == get_runner_id()
     assert task.lease_expires_at is not None
     assert task.last_checkpoint_event_id is None
+    # Both pointer columns clear together on a turn claim -- see
+    # lease_checkpoint_trace_event_id_case's docstring in task_lease_service
+    # for why a single column left behind would desync the recovery CAS
+    # fence.
+    assert task.last_checkpoint_trace_event_id is None
 
 
 @pytest.mark.asyncio
