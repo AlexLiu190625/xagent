@@ -21,6 +21,7 @@ from .....web.services.model_service import (
 # so the nested sub-agent's config is constructed via the module attribute
 # (which also keeps it patchable in tests).
 from .....web.tools.config import WebToolConfig
+from ....agent.result import NO_OUTPUT_PLACEHOLDER, NO_RESPONSE_PLACEHOLDER
 from ....tracing import create_agent_tracer
 from ....utils.type_check import ensure_list
 from ...core.document_search import find_missing_knowledge_bases
@@ -1510,6 +1511,18 @@ _NESTED_WAIT_UNSUPPORTED_MESSAGE = (
 
 _GENERIC_CHILD_FAILURE_MESSAGE = "The delegated agent did not complete successfully."
 
+_MISSING_CHILD_OUTPUT_MESSAGE = (
+    "The delegated agent reported completion without returning any usable "
+    "output, so there is no answer from it to use."
+)
+
+# Recognized, not produced, here: ``AgentExecutionAdapter._normalize_result``
+# and this module's own post-run default substitute these when a run left no
+# text behind. A completed child carrying one of them answered nothing.
+_MISSING_OUTPUT_PLACEHOLDERS = frozenset(
+    {NO_OUTPUT_PLACEHOLDER, NO_RESPONSE_PLACEHOLDER}
+)
+
 
 def _classify_delegated_child_failure(
     result: Mapping[str, Any],
@@ -1566,6 +1579,24 @@ def _classify_delegated_child_failure(
             "output": message,
             "response": message,
         }
+
+    if isinstance(status, str) and status.lower() == "completed":
+        output_value = result.get("output")
+        stripped = output_value.strip() if isinstance(output_value, str) else None
+        if (
+            output_value is None
+            or stripped == ""
+            or stripped in _MISSING_OUTPUT_PLACEHOLDERS
+        ):
+            return {
+                "success": False,
+                "is_error": True,
+                "status": "error",
+                "failure_code": "missing_delegated_output",
+                "error": _MISSING_CHILD_OUTPUT_MESSAGE,
+                "output": _MISSING_CHILD_OUTPUT_MESSAGE,
+                "response": _MISSING_CHILD_OUTPUT_MESSAGE,
+            }
 
     return None
 
@@ -2221,7 +2252,7 @@ class AgentTool(AbstractBaseTool):
             # session, so this owned session commits before closing to make
             # the parent-owned file records durable (the parent session used
             # to carry these to the request-level commit).
-            output = result.get("output", "No response generated")
+            output = result.get("output", NO_RESPONSE_PLACEHOLDER)
             with tool_session_scope(self._session_factory) as db:
                 file_outputs = self._parent_owned_file_outputs(
                     result.get("file_outputs"), agent_service.workspace, db

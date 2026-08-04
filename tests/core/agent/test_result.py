@@ -18,6 +18,7 @@ class _FailureCodeStringSubclass(str):
     [
         ("oauth_token_required", "oauth_token_required"),
         ("unsupported_nested_interaction", "unsupported_nested_interaction"),
+        ("missing_delegated_output", "missing_delegated_output"),
         ("other_valid_code", None),
         (" oauth_token_required", None),
         ("OAUTH_TOKEN_REQUIRED", None),
@@ -37,6 +38,13 @@ def test_unsupported_nested_interaction_is_a_recognized_failure_code():
     )
 
 
+def test_missing_delegated_output_is_a_recognized_failure_code():
+    assert (
+        normalize_tool_failure_code("missing_delegated_output")
+        == "missing_delegated_output"
+    )
+
+
 def test_classified_tool_failure_accepts_only_allowlisted_plain_string():
     outcome = ClassifiedToolFailure(failure_code="oauth_token_required")
 
@@ -46,7 +54,9 @@ def test_classified_tool_failure_accepts_only_allowlisted_plain_string():
         ClassifiedToolFailure(failure_code="other_valid_code")
 
 
-@pytest.mark.parametrize("code", ["unsupported_nested_interaction"])
+@pytest.mark.parametrize(
+    "code", ["unsupported_nested_interaction", "missing_delegated_output"]
+)
 def test_classified_tool_failure_rejects_non_oauth_runtime_codes(code):
     """The runtime allowlist must not widen the OAuth sentinel's validator."""
 

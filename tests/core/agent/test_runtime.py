@@ -1017,6 +1017,52 @@ async def test_on_tool_end_classifies_nested_wait_failure_and_stops_parent_succe
 
 
 @pytest.mark.asyncio
+async def test_on_tool_end_carries_missing_output_failure_code() -> None:
+    """The missing-delegated-output code must propagate into trace data too.
+
+    Same runtime-level contract as the nested-wait case: a classified failure
+    dict is enough, no exception required, to carry a new allowlisted
+    failure_code into the emitted trace event.
+    """
+
+    class CapturingTracer:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> None:
+            self.events.append(
+                {
+                    "type": getattr(event_type, "value", str(event_type)),
+                    "data": kwargs.get("data") or {},
+                }
+            )
+
+    tracer = CapturingTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="task-missing-output")
+    result = {
+        "success": False,
+        "is_error": True,
+        "status": "error",
+        "failure_code": "missing_delegated_output",
+        "error": "The delegated agent reported completion without returning "
+        "any usable output, so there is no answer from it to use.",
+        "output": "The delegated agent reported completion without returning "
+        "any usable output, so there is no answer from it to use.",
+        "response": "The delegated agent reported completion without "
+        "returning any usable output, so there is no answer from it to use.",
+    }
+
+    await runtime.on_tool_end(
+        tool_call={"name": "delegated_agent", "id": "call-missing-output"},
+        result=result,
+    )
+
+    assert [event["type"] for event in tracer.events] == ["action_error_tool"]
+    event_data = tracer.events[0]["data"]
+    assert event_data["failure_code"] == "missing_delegated_output"
+
+
+@pytest.mark.asyncio
 async def test_concurrent_tool_calls_all_count() -> None:
     """A concurrent batch (asyncio.gather) increments the shared counter once per tool.
 

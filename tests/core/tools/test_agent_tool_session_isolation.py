@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import tempfile
 from contextlib import contextmanager
@@ -285,7 +286,9 @@ async def test_agent_tool_normal_child_result_unchanged(monkeypatch):
     """A plain completed child result must keep its exact legacy shape.
 
     This also pins the "absent status/success is inert" rule: fakes that omit
-    both fields (as this one does) must stay on the happy path.
+    both fields (as this one does) must stay on the happy path. The
+    missing-output branch is also gated on an explicit completed status, so
+    it does not disturb this case either.
     """
 
     async def execute_task():
@@ -465,6 +468,275 @@ async def test_agent_tool_normalizes_waiting_status_variants(monkeypatch, status
     result = await tool.run_json_async({"task": "run"})
 
     assert result["failure_code"] == "unsupported_nested_interaction"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "child_output",
+    ["", "   ", "No output provided", "No response generated"],
+)
+async def test_agent_tool_completed_child_without_usable_output_fails_closed(
+    monkeypatch, child_output
+):
+    """A completed child that answered nothing must not surface as a success.
+
+    Covers both a genuinely empty/whitespace answer and the two placeholder
+    strings the execution layers substitute when a run produced no text of
+    its own — a child that returns one of those completed without
+    answering, and the parent must not launder that into a plain response.
+    """
+
+    async def execute_task():
+        return {"status": "completed", "success": True, "output": child_output}
+
+    _patch_delegated_runtime(
+        monkeypatch, execute_task, close_config=_SucceedingCloseConfig
+    )
+    tool = _delegated_agent_tool()
+    monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_kwargs: None)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["failure_code"] == "missing_delegated_output"
+    assert result["status"] == "error"
+    assert result["success"] is False
+    assert tool_result_succeeded(result) is False
+    assert list(result.keys()) == [
+        "success",
+        "is_error",
+        "status",
+        "failure_code",
+        "error",
+        "output",
+        "response",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_completed_child_with_output_key_absent_fails_closed(
+    monkeypatch,
+):
+    """A completed child that omits ``output`` entirely must also fail closed.
+
+    Without this branch, an absent ``output`` key would fall through to the
+    ``"No response generated"`` default at the happy-path return and be
+    laundered into a success.
+    """
+
+    async def execute_task():
+        return {"status": "completed", "success": True}
+
+    _patch_delegated_runtime(
+        monkeypatch, execute_task, close_config=_SucceedingCloseConfig
+    )
+    tool = _delegated_agent_tool()
+    monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_kwargs: None)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["failure_code"] == "missing_delegated_output"
+    assert result["status"] == "error"
+    assert result["success"] is False
+    assert tool_result_succeeded(result) is False
+    assert list(result.keys()) == [
+        "success",
+        "is_error",
+        "status",
+        "failure_code",
+        "error",
+        "output",
+        "response",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_realistic_completed_child_result_unchanged(monkeypatch):
+    """A completed child with a real answer keeps the plain happy-path shape."""
+
+    async def execute_task():
+        return {"status": "completed", "success": True, "output": "all good"}
+
+    _patch_delegated_runtime(
+        monkeypatch, execute_task, close_config=_SucceedingCloseConfig
+    )
+    tool = _delegated_agent_tool()
+    monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_kwargs: None)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result == {"response": "all good"}
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_waiting_child_without_output_stays_nested_interaction(
+    monkeypatch,
+):
+    """The wait check must run before the missing-output check.
+
+    A waiting child that also happens to carry no ``output`` must still
+    classify as the unsupported-nested-interaction failure, not the
+    missing-output one — the wait status is the more specific diagnosis.
+    """
+
+    async def execute_task():
+        return {"status": "waiting_for_user", "success": True}
+
+    _patch_delegated_runtime(
+        monkeypatch, execute_task, close_config=_SucceedingCloseConfig
+    )
+    tool = _delegated_agent_tool()
+    monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_kwargs: None)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["failure_code"] == "unsupported_nested_interaction"
+
+
+class _StubSingleCallLLM:
+    """Minimal LLM stub returning one fixed tool call from ``chat()``.
+
+    Each scenario below only needs a single LLM turn: both the
+    ``ask_user_question`` and the empty ``final_answer`` control tools end
+    the ReAct loop immediately once handled, so no follow-up response is
+    ever requested.
+    """
+
+    model_name = "stub-model"
+
+    def __init__(self, response: dict[str, object]) -> None:
+        self._response = response
+        self.calls = 0
+
+    async def chat(self, **_kwargs: object) -> dict[str, object]:
+        self.calls += 1
+        return dict(self._response)
+
+
+def _real_delegated_agent_tool(monkeypatch, tmp_path, llm) -> AgentTool:
+    """Build an ``AgentTool`` that runs a real ``AgentService``/``ReActPattern``.
+
+    Unlike ``_patch_delegated_runtime`` (which fakes ``AgentService``
+    entirely), this drives the real execution stack so the classifier is
+    exercised against the real ``_normalize_result`` output shape, not a
+    hand-built stand-in for it. Three seams are still faked to keep the test
+    hermetic and fast: the child's tool config (no MCP/DB-backed tool
+    building), model resolution (returns the stub LLM), and tool discovery
+    (skips the Node/parser-dependent tool build that makes ``tests/core/tools``
+    flaky in this environment).
+    """
+    import xagent.core.tools.adapters.vibe.agent_model_resolution as resolution
+    import xagent.core.tools.adapters.vibe.factory as factory_module
+
+    monkeypatch.setattr(
+        mod, "WebToolConfig", lambda **_kwargs: _SucceedingCloseConfig()
+    )
+    monkeypatch.setattr(
+        resolution,
+        "resolve_agent_model_llms",
+        lambda *_args: (llm, None, None, None),
+    )
+
+    async def _no_tools(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(factory_module.ToolFactory, "create_all_tools", _no_tools)
+
+    tool = AgentTool(
+        agent_id=1,
+        agent_name="Delegated",
+        agent_description="d",
+        session_factory=lambda: _DelegatedSession(
+            SimpleNamespace(
+                id=1,
+                name="Delegated",
+                instructions=None,
+                knowledge_bases=None,
+                skills=None,
+                tool_categories=[],
+                models={"general": 1},
+                execution_mode=None,
+            )
+        ),
+        user_id=1,
+        tool_name="delegated",
+        tool_description="d",
+        workspace_base_dir=str(tmp_path),
+    )
+    monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_kwargs: None)
+    return tool
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_real_pausing_child_fails_closed(monkeypatch, tmp_path):
+    """A real ReAct child that asks the user a question fails closed end to end.
+
+    Closes the loop the reviewer flagged: the classifier must work against
+    the actual shape ``AgentExecutionAdapter._normalize_result`` produces
+    from a real pattern run, not just against hand-built dicts.
+    """
+
+    llm = _StubSingleCallLLM(
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "ask_user_question",
+                        "arguments": json.dumps(
+                            {"message": "Which format do you want?"}
+                        ),
+                    },
+                }
+            ],
+            "done": False,
+        }
+    )
+    tool = _real_delegated_agent_tool(monkeypatch, tmp_path, llm)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["failure_code"] == "unsupported_nested_interaction"
+    assert result["status"] == "error"
+    assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_real_child_with_empty_final_answer_fails_closed(
+    monkeypatch, tmp_path
+):
+    """A real ReAct child that answers with an empty ``final_answer`` fails closed.
+
+    Also the drift detector for the placeholder constants: if
+    ``NO_OUTPUT_PLACEHOLDER``/``NO_RESPONSE_PLACEHOLDER`` ever move, both the
+    producing side (``execution_adapter``) and the recognizing side
+    (``agent_tool``'s classifier) move together because they import the same
+    constants, so this test stays green; a reintroduced literal on either
+    side would go red here.
+    """
+
+    llm = _StubSingleCallLLM(
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": json.dumps({"answer": ""}),
+                    },
+                }
+            ],
+            "done": False,
+        }
+    )
+    tool = _real_delegated_agent_tool(monkeypatch, tmp_path, llm)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["failure_code"] == "missing_delegated_output"
+    assert result["status"] == "error"
+    assert result["success"] is False
 
 
 def _create_factory() -> tuple[sessionmaker, str]:

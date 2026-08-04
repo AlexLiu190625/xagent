@@ -5,10 +5,20 @@ from dataclasses import dataclass
 from typing import Any
 
 TOOL_FAILURE_CODES = frozenset(
-    {"oauth_token_required", "unsupported_nested_interaction"}
+    {
+        "oauth_token_required",
+        "unsupported_nested_interaction",
+        "missing_delegated_output",
+    }
 )
 
 _OAUTH_FAILURE_CODES = frozenset({"oauth_token_required"})
+
+# Placeholder outputs the execution layers substitute when a run produced no
+# text of its own. They are recognized, not produced, by the delegation
+# classifier: a child that returns one of these completed without answering.
+NO_OUTPUT_PLACEHOLDER = "No output provided"
+NO_RESPONSE_PLACEHOLDER = "No response generated"
 
 
 def normalize_tool_failure_code(value: Any) -> str | None:

@@ -12,6 +12,7 @@ from ..task_runtime import (
 from .agent import Agent
 from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
 from .registry import ExecutionRegistry
+from .result import NO_OUTPUT_PLACEHOLDER
 from .runner import AgentRunner
 from .tracing import TraceEventCallback
 
@@ -362,7 +363,7 @@ class AgentExecutionAdapter:
                 output = self._latest_assistant_message(result.get("context"))
         normalized = {
             "status": status,
-            "output": output or "No output provided",
+            "output": output or NO_OUTPUT_PLACEHOLDER,
             "success": result.get("success", False),
             "error": result.get("error"),
             "metadata": {
