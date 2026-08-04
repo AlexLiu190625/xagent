@@ -152,15 +152,21 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null
 }
 
-function getAgentUpdateErrorMessage(error: unknown, fallback: string): string {
-  if (!isJsonRecord(error)) return fallback
+// Reduces a parsed error response body to a string that is safe to render.
+// Accepts, in order: a string `detail`, the readable message of an object
+// `detail`, the joined readable messages of an array `detail`, and a top-level
+// `message`. Anything else — including a body that failed to parse — yields the
+// supplied fallback, so an object or an array can never reach toast.error.
+function getBuilderErrorMessage(body: unknown, fallback: string): string {
+  if (!isJsonRecord(body)) return fallback
 
-  const detail = error.detail
+  const detail = body.detail
   const detailMessage = readNonEmptyString(detail)
   if (detailMessage) return detailMessage
 
   if (isJsonRecord(detail)) {
-    const message = readNonEmptyString(detail.message)
+    const message =
+      readNonEmptyString(detail.msg) ?? readNonEmptyString(detail.message)
     if (message) return message
   }
 
@@ -176,7 +182,7 @@ function getAgentUpdateErrorMessage(error: unknown, fallback: string): string {
     if (messages.length > 0) return messages.join("; ")
   }
 
-  return readNonEmptyString(error.message) ?? fallback
+  return readNonEmptyString(body.message) ?? fallback
 }
 
 // One-time reveal of auto-generated webhook secrets. Rendered both inside the
@@ -1574,7 +1580,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       } else {
         const error: unknown = await response.json().catch(() => null)
         toast.error(
-          getAgentUpdateErrorMessage(error, t("builds.editor.error.unknown"))
+          getBuilderErrorMessage(error, t("builds.editor.error.unknown"))
         )
       }
     } catch (error) {
@@ -1602,8 +1608,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         })
         toast.success(t("builds.editor.success.published"))
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.publication.publishFailed"))
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(error, t("builds.publication.publishFailed"))
+        )
       }
     } catch (error) {
       console.error("Failed to publish agent:", error)
@@ -1630,8 +1638,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         })
         toast.success(t("builds.editor.success.unpublished"))
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.publication.unpublishFailed"))
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(error, t("builds.publication.unpublishFailed"))
+        )
       }
     } catch (error) {
       console.error("Failed to unpublish agent:", error)
@@ -1659,8 +1669,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           navPendingRef.current = true
         }
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.publication.publishFailed"))
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(error, t("builds.publication.publishFailed"))
+        )
       }
     } catch (error) {
       console.error("Failed to publish agent:", error)
@@ -1706,8 +1718,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         setInstructions(data.optimized_instructions)
         toast.success(t("builds.configForm.instructions.optimizeSuccess"))
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.configForm.instructions.optimizeError"))
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(
+            error,
+            t("builds.configForm.instructions.optimizeError")
+          )
+        )
       }
     } catch (error) {
       console.error("Failed to optimize instructions:", error)
