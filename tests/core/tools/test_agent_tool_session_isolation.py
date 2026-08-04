@@ -232,6 +232,16 @@ async def test_agent_tool_or_precedence_disagreement_classifies_as_generic_failu
     assert result["is_error"] is True
     assert result["status"] == "error"
     assert "failure_code" not in result
+    # Exact key list: the classified dict must be freshly constructed, never a
+    # mutated copy of the child result carrying live objects into trace data.
+    assert list(result.keys()) == [
+        "success",
+        "is_error",
+        "status",
+        "error",
+        "output",
+        "response",
+    ]
     assert tool_result_succeeded(result) is False
 
 
