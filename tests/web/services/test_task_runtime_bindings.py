@@ -10,7 +10,6 @@ import pytest
 
 from xagent.core.execution_scope import (
     EXECUTION_SCOPE_AGENT_CONFIG_KEY,
-    ExecutionScope,
     execution_scope_from_agent_config,
 )
 from xagent.core.task_runtime import TaskRuntimeContext, TaskRuntimeContribution
@@ -263,12 +262,28 @@ def test_execution_scope_is_reserved_so_a_request_cannot_choose_a_namespace() ->
     assert execution_scope_from_agent_config(sanitized) is None
 
 
-def test_a_server_written_scope_still_reaches_the_column() -> None:
-    """Stripping happens on the client copy only. The one server-side writer
-    lands its value on a path that never copies a request dict, so reserving the
-    key must not make a server-assigned scope unreadable.
+def test_the_reserved_key_set_has_exactly_the_audited_members() -> None:
+    """Pin the reserved set to literal strings, not the constants that name
+    them. ``test_sanitize_drops_reserved_keys_and_keeps_client_keys`` builds
+    its forged input by iterating ``CLIENT_RESERVED_AGENT_CONFIG_KEYS``, so it
+    cannot detect a wrongly-added member -- whatever the set holds, that
+    test's forged payload holds too. This test covers that direction instead.
+    Literals are deliberate for a second reason: comparing against them also
+    fails if either constant's *value* changes, which would silently move
+    which requests get stripped at every task-create boundary.
     """
-    scope = ExecutionScope(workspace_segments=("clients", "7"))
-    server_config = {EXECUTION_SCOPE_AGENT_CONFIG_KEY: scope.to_dict()}
+    assert CLIENT_RESERVED_AGENT_CONFIG_KEYS == frozenset(
+        {"runtime_extension_bindings", "execution_scope"}
+    )
 
-    assert execution_scope_from_agent_config(server_config) == scope
+
+def test_agent_builder_preview_keys_are_not_reserved() -> None:
+    """``src/xagent/web/api/websocket.py:8447-8466`` builds a server-owned
+    ``agent_config`` carrying ``is_preview`` and ``preview_agent_id`` and
+    passes it through ``create_task`` -- and therefore through the sanitizer,
+    layered below it rather than above. Reserving either key here would strip
+    it from that config and break agent-builder preview.
+    """
+    assert {"is_preview", "preview_agent_id"}.isdisjoint(
+        CLIENT_RESERVED_AGENT_CONFIG_KEYS
+    )

@@ -7,6 +7,10 @@ import logging
 import pytest
 from fastapi import HTTPException
 
+from xagent.core.execution_scope import (
+    EXECUTION_SCOPE_AGENT_CONFIG_KEY,
+    execution_scope_from_agent_config,
+)
 from xagent.core.task_runtime import TaskRuntimeContribution
 from xagent.web.api.admin_users import delete_user
 from xagent.web.api.chat import create_task, delete_task
@@ -66,7 +70,7 @@ def _register(name: str, provider: _Provider, registered: list[str]) -> _Provide
     return provider
 
 
-# ===== the binding record is server-owned, never client-supplied =====
+# ===== reserved agent_config keys are server-owned, never client-supplied =====
 
 
 @pytest.mark.asyncio
@@ -156,6 +160,45 @@ async def test_task_create_binding_record_ignores_forged_entries(
             "victim_ext",
         )
         assert other.deleted_task_ids == []
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_task_create_drops_a_client_forged_execution_scope() -> None:
+    """A request cannot pre-seed the scope snapshot that governs where a
+    task's bytes land -- sandbox mount, storage prefix, workspace directory,
+    memory dimensions -- by naming it in the request body's ``agent_config``.
+    """
+
+    _admin_headers()
+    _register_second_user("scope-owner", "scopepass1")
+    db = _direct_db_session()
+    try:
+        owner = db.query(User).filter(User.username == "scope-owner").one()
+        created = await create_task(
+            TaskCreateRequest(
+                title="forged scope",
+                description="forged scope",
+                agent_config={
+                    EXECUTION_SCOPE_AGENT_CONFIG_KEY: {
+                        "sandbox_key_suffix": "victim",
+                        "workspace_segments": ["victim"],
+                        "memory_dimensions": {"tenant": "victim"},
+                    },
+                    "keep_me": "client value",
+                },
+            ),
+            db=db,
+            user=owner,
+        )
+        task_id = int(created.task_id)
+
+        db.expire_all()
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert EXECUTION_SCOPE_AGENT_CONFIG_KEY not in task.agent_config
+        assert execution_scope_from_agent_config(task.agent_config) is None
+        assert task.agent_config.get("keep_me") == "client value"
     finally:
         db.close()
 

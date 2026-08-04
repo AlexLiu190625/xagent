@@ -14,6 +14,10 @@ from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
 from xagent.config import get_uploads_dir
+from xagent.core.execution_scope import (
+    EXECUTION_SCOPE_AGENT_CONFIG_KEY,
+    execution_scope_from_agent_config,
+)
 from xagent.web.api import agents as agents_api
 from xagent.web.api.public_chat_access import create_public_chat_access_token
 from xagent.web.api.widget import (
@@ -1786,6 +1790,57 @@ def test_widget_task_create_drops_forged_runtime_extension_bindings() -> None:
         assert task_extension_bindings_from_agent_config(task.agent_config) == ()
         # Only the reserved key goes; ordinary client config and the
         # server-owned keys layered on top both survive.
+        assert task.agent_config.get("keep_me") == "client value"
+        assert task.agent_config.get("auth_mode") == "widget"
+        assert task.agent_config.get("guest_id") == "guest-1"
+    finally:
+        db.close()
+
+
+def test_widget_task_create_drops_forged_execution_scope() -> None:
+    """A widget guest cannot pre-seed the scope snapshot that governs where a
+    task's bytes land -- sandbox mount, storage prefix, workspace directory,
+    memory dimensions -- by naming it in the request body's ``agent_config``.
+    """
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Widget Scope Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["example.com"],
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+
+    create_task_response = client.post(
+        "/api/widget/chat/task/create",
+        json={
+            "title": "forged scope",
+            "description": "forged scope",
+            "agent_id": agent_id,
+            "agent_config": {
+                EXECUTION_SCOPE_AGENT_CONFIG_KEY: {
+                    "sandbox_key_suffix": "victim",
+                    "workspace_segments": ["victim"],
+                    "memory_dimensions": {"tenant": "victim"},
+                },
+                "keep_me": "client value",
+            },
+        },
+        headers=guest_headers,
+    )
+    assert create_task_response.status_code == 200, create_task_response.text
+
+    db = _direct_db_session()
+    try:
+        task = (
+            db.query(Task)
+            .filter(Task.id == create_task_response.json()["task_id"])
+            .one()
+        )
+        assert EXECUTION_SCOPE_AGENT_CONFIG_KEY not in task.agent_config
+        assert execution_scope_from_agent_config(task.agent_config) is None
         assert task.agent_config.get("keep_me") == "client value"
         assert task.agent_config.get("auth_mode") == "widget"
         assert task.agent_config.get("guest_id") == "guest-1"
