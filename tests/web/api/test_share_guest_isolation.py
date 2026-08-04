@@ -462,6 +462,55 @@ def test_workforce_share_task_without_guest_id_is_denied(
     assert _upload_to_task(guest, task_id).status_code == 403
 
 
+def test_workforce_share_task_create_discards_forged_agent_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Widget-workforce mirror of ``test_widget_task_create_discards_forged_agent_config``:
+    ``_create_workforce_share_chat_task`` never reads
+    ``TaskCreateRequest.agent_config`` -- ``create_workforce_run`` only sees
+    the handler's own ``extra_agent_config`` (``auth_mode``,
+    ``share_workforce_id``, ``guest_id``). A forged reserved key in the
+    request body must not survive into the persisted config, and neither
+    should an ordinary client key."""
+    workforce_id = _create_workforce("Forged Config Share WF")
+    token = _enable_workforce_share(workforce_id)
+    guest = _authenticate_share_guest(token)
+    _stub_begin_turn(monkeypatch)
+
+    created = client.post(
+        "/api/share/chat/task/create",
+        headers=guest,
+        json={
+            "title": "forged",
+            "description": "forged",
+            "agent_config": {
+                EXECUTION_SCOPE_AGENT_CONFIG_KEY: {
+                    "sandbox_key_suffix": "victim",
+                    "workspace_segments": ["victim"],
+                    "memory_dimensions": {"tenant": "victim"},
+                },
+                SELECTED_FILE_IDS_AGENT_CONFIG_KEY: ["victim-file-id"],
+                "keep_me": "client value",
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task_id"])
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert EXECUTION_SCOPE_AGENT_CONFIG_KEY not in task.agent_config
+        assert SELECTED_FILE_IDS_AGENT_CONFIG_KEY not in task.agent_config
+        assert "keep_me" not in task.agent_config
+        assert task.agent_config.get("auth_mode") == "share"
+        assert task.agent_config.get("guest_id") == _share_guest_id(
+            guest["Authorization"]
+        )
+    finally:
+        db.close()
+
+
 # ===== fail-closed on legacy tokens without a guest_id claim =====
 
 
