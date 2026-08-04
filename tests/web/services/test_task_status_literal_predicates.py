@@ -234,6 +234,11 @@ def test_scan_flags_every_comparison_method(case_id: str, source: str) -> None:
     assert len(violations) == 1, (case_id, violations)
 
 
+def test_every_banned_method_has_a_capability_case() -> None:
+    covered = {case_id for case_id, _ in _COMPARISON_METHOD_CASES}
+    assert _COMPARISON_METHODS <= covered, sorted(_COMPARISON_METHODS - covered)
+
+
 def test_fixtures_are_syntactically_valid() -> None:
     ast.parse(_FIXTURE_VIOLATIONS)
     ast.parse(_FIXTURE_NEGATIVE_CONTROLS)

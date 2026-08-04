@@ -649,7 +649,7 @@ def h():
     ids=["qualified", "aliased"],
 )
 def test_lease_case_ban_flags_qualified_and_aliased_case_calls(
-    case_id, fixture
+    case_id: str, fixture: str
 ) -> None:
     """A qualified ``sa.case(...)`` and a
     ``from sqlalchemy import case as sql_case`` alias must both be
