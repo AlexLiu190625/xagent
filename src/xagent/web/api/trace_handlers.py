@@ -31,6 +31,8 @@ from ...web.models.tool_config import ToolUsage
 from ...web.services.ops_signals import (
     CHECKPOINT_DECODE_FALLBACK,
     CHECKPOINT_LOAD_UNAVAILABLE,
+    CHECKPOINT_PK_ANCHOR_DANGLING,
+    CHECKPOINT_PRUNE_INTEGRITY_ERROR,
     clear_degradation,
     register_degradation,
 )
@@ -63,6 +65,11 @@ CHECKPOINT_ROW_SCAN_LIMIT = 100
 # scan that reaches the cap without a resolution is treated as unavailable
 # rather than continuing indefinitely.
 CHECKPOINT_SCAN_MAX_PAGES = 50
+
+# Sentinel distinguishing "no PK anchor to try" (unset pointer, or a pointer
+# whose row is gone) from a resolved snapshot, which may legitimately be an
+# empty dict. Falling back to the legacy scan is only correct for the former.
+_NO_TRACE_EVENT_ANCHOR = object()
 
 
 def _checkpoint_execution_id_predicate(execution_id: str) -> Any:
@@ -215,6 +222,9 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         f"task {self.task_id}: could not resolve the "
                         "checkpoint read partition"
                     ) from exc
+                anchored = self._load_pk_anchored_checkpoint(db, run_id)
+                if anchored is not _NO_TRACE_EVENT_ANCHOR:
+                    return anchored  # type: ignore[return-value]
                 query = query.filter(
                     DatabaseTraceEvent.build_id.is_(None),
                     self._checkpoint_run_partition_filter(run_id),
@@ -440,6 +450,93 @@ class DatabaseTraceHandler(BaseTraceHandler):
         run_field = DatabaseTraceEvent.data[TASK_RUN_ID_TRACE_FIELD].as_string()
         return run_field == run_id if run_id is not None else run_field.is_(None)
 
+    def _load_pk_anchored_checkpoint(
+        self,
+        db: Session,
+        run_id: str | None,
+    ) -> Dict[str, Any] | object:
+        """Resolve the checkpoint through the task's exact-row pointer.
+
+        Returns ``_NO_TRACE_EVENT_ANCHOR`` when there is nothing to anchor
+        on: the pointer is unset, or it names a row that no longer exists
+        (only possible on a database upgraded through Alembic rather than
+        created fresh, since that path has no DB-level FK -- see the
+        migration that adds this column). Both cases fall back to the
+        legacy scan. Once a target row is found, though, it is
+        authoritative: a validation mismatch raises rather than falling
+        back to search other rows, and a decode failure on that row is
+        classified the same way the scan classifies an exhausted,
+        all-undecodable candidate set, since this pointer is the only
+        candidate.
+        """
+        pointer = (
+            db.query(Task.last_checkpoint_trace_event_id)
+            .filter(Task.id == self.task_id)
+            .one_or_none()
+        )
+        if pointer is None or pointer[0] is None:
+            return _NO_TRACE_EVENT_ANCHOR
+
+        pointer_id = pointer[0]
+        row = db.get(DatabaseTraceEvent, pointer_id)
+        if row is None:
+            register_degradation(
+                CHECKPOINT_PK_ANCHOR_DANGLING,
+                f"task {self.task_id}: checkpoint pointer {pointer_id} has "
+                "no matching trace_events row; falling back to the legacy "
+                "scan",
+            )
+            return _NO_TRACE_EVENT_ANCHOR
+        clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
+
+        row_data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
+        run_field = row_data.get(TASK_RUN_ID_TRACE_FIELD)
+        partition_matches = (
+            run_field == run_id if run_id is not None else run_field is None
+        )
+        if (
+            row.task_id != self.task_id
+            or row.event_type != "system_update_general"
+            or row.build_id is not None
+            or row_data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES
+            or not partition_matches
+        ):
+            raise CheckpointCorruptError(
+                f"task {self.task_id}: checkpoint pointer {pointer_id} does "
+                "not match the row it anchors"
+            )
+
+        try:
+            decoded = decode_trace_event_data(
+                db,
+                task_id=self.task_id,
+                data=dict(row_data),
+                strict=True,
+            )
+        except CheckpointMessageDecodeError as exc:
+            raise CheckpointCorruptError(
+                f"task {self.task_id}: checkpoint pointer {pointer_id} row "
+                "is undecodable"
+            ) from exc
+        except Exception as exc:
+            register_degradation(
+                CHECKPOINT_LOAD_UNAVAILABLE,
+                f"task {self.task_id}: checkpoint pointer {pointer_id} decode failed",
+            )
+            raise CheckpointUnavailableError(
+                f"task {self.task_id}: checkpoint pointer {pointer_id} "
+                "could not be decoded"
+            ) from exc
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+
+        snapshot = decoded.get("snapshot") if isinstance(decoded, dict) else None
+        if not isinstance(snapshot, dict):
+            raise CheckpointCorruptError(
+                f"task {self.task_id}: checkpoint pointer {pointer_id} has "
+                "a readable checkpoint_type but no snapshot"
+            )
+        return dict(snapshot)
+
     def _sync_save_to_database(self, event: CoreTraceEvent) -> None:
         """Synchronous database save operation (runs in thread pool)."""
         # Create database session
@@ -518,6 +615,13 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 and self.build_id is None
                 and checkpoint_lease is not None
             ):
+                # Flush the pending insert so trace_event.id (the row's
+                # primary key) is assigned before the pointer UPDATE below
+                # reads it. autoflush is off for this session, so without
+                # this the exact-row anchor column would be built from an
+                # unassigned id and silently written NULL.
+                db.flush()
+                assert trace_event.id is not None
                 pointer_update = db.execute(
                     update(Task)
                     .where(
@@ -526,14 +630,33 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         Task.runner_id == checkpoint_lease.runner_id,
                         Task.run_id == checkpoint_lease.run_id,
                     )
-                    .values(last_checkpoint_event_id=str(event.id))
+                    .values(
+                        last_checkpoint_event_id=str(event.id),
+                        last_checkpoint_trace_event_id=trace_event.id,
+                    )
                     .execution_options(synchronize_session=False)
                 )
                 if int(getattr(pointer_update, "rowcount", 0) or 0) != 1:
-                    raise RuntimeError(
-                        f"Task {self.task_id} lease changed before checkpoint "
-                        f"{event.id} could be persisted"
+                    task_still_exists = (
+                        db.query(Task.id).filter(Task.id == self.task_id).first()
+                        is not None
                     )
+                    if not task_still_exists:
+                        # The task row is gone, not merely leased elsewhere --
+                        # the same outcome the trace_events.task_id FK would
+                        # produce for the row itself. Skip quietly rather
+                        # than raising a "lease changed" error that isn't
+                        # what happened.
+                        logger.debug(
+                            "Skip checkpoint pointer update for missing task %s: %s",
+                            self.task_id,
+                            event.id,
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"Task {self.task_id} lease changed before checkpoint "
+                            f"{event.id} could be persisted"
+                        )
 
             # Update tool usage statistics if this is a tool execution event
             if event_type_str == "tool_execution_end":
@@ -637,11 +760,27 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         run_id if isinstance(run_id, str) and run_id else None
                     )
                 )
+            # Exclude the row this task's exact-row pointer currently
+            # references, whatever its position in the retention ranking.
+            # For the steady-state writer this is structurally unreachable
+            # -- the pointer always names the row just written, which ranks
+            # ahead of the offset -- but it guards the backfill-vs-prune
+            # window and future back-pointing anchors that may point at an
+            # older row.
+            anchor = (
+                db.query(Task.last_checkpoint_trace_event_id)
+                .filter(Task.id == self.task_id)
+                .one_or_none()
+            )
+            anchor_id = anchor[0] if anchor is not None else None
+            candidate_filters = list(partition_filters)
+            if anchor_id is not None:
+                candidate_filters.append(DatabaseTraceEvent.id != anchor_id)
             stale_rows = (
                 db.query(DatabaseTraceEvent.id)
                 .filter(
                     DatabaseTraceEvent.task_id == self.task_id,
-                    *partition_filters,
+                    *candidate_filters,
                     DatabaseTraceEvent.event_type == "system_update_general",
                     DatabaseTraceEvent.data["checkpoint_type"]
                     .as_string()
@@ -665,11 +804,31 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     DatabaseTraceEvent.id.in_(chunk)
                 ).delete(synchronize_session=False)
             db.commit()
+            clear_degradation(CHECKPOINT_PRUNE_INTEGRITY_ERROR)
             logger.debug(
                 "Pruned %d checkpoint rows for task %s execution %s",
                 len(stale_ids),
                 self.task_id,
                 execution_id,
+            )
+        except IntegrityError:
+            # PostgreSQL enforces the anchor FK, so a race that lets a
+            # candidate row become the active anchor between selection and
+            # delete surfaces here as a restrict violation (including a
+            # serialization failure under stricter isolation levels). A
+            # database upgraded through Alembic on SQLite has no DB-level FK
+            # for this column and cannot raise this; a freshly created
+            # SQLite database (create_all, e.g. tests) does have the FK and
+            # can.
+            db.rollback()
+            register_degradation(
+                CHECKPOINT_PRUNE_INTEGRITY_ERROR,
+                f"task {self.task_id}: checkpoint prune hit an integrity error",
+            )
+            logger.warning(
+                "Checkpoint prune hit an integrity error for task %s",
+                self.task_id,
+                exc_info=True,
             )
         except Exception:
             db.rollback()

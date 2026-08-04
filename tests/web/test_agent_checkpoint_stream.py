@@ -16,6 +16,7 @@ from xagent.core.agent.checkpoint import (
     CHECKPOINT_EVENT_TYPE,
     CHECKPOINT_TYPE,
     CheckpointAccessRefusedError,
+    CheckpointCorruptError,
 )
 from xagent.core.agent.trace import (
     TraceAction,
@@ -840,6 +841,25 @@ def test_database_trace_handler_tags_and_points_to_current_run_checkpoint() -> N
         row = db.query(DatabaseTraceEvent).filter_by(task_id=int(task.id)).one()
         assert row.data[TASK_RUN_ID_TRACE_FIELD] == "run-a"
         assert task.last_checkpoint_event_id == str(event.id)
+        # Dual write: the exact-row anchor points at the same row the
+        # legacy string column names.
+        assert task.last_checkpoint_trace_event_id == row.id
+        # Mixed-version invariant: exactly one row in the task's root
+        # partition carries the legacy event_id the pointer names, so an
+        # old reader still resolving through the string column stays
+        # unambiguous.
+        matching = (
+            db.query(DatabaseTraceEvent)
+            .filter(
+                DatabaseTraceEvent.task_id == int(task.id),
+                DatabaseTraceEvent.build_id.is_(None),
+                DatabaseTraceEvent.event_type == "system_update_general",
+                DatabaseTraceEvent.event_id == task.last_checkpoint_event_id,
+            )
+            .all()
+        )
+        assert len(matching) == 1
+        assert matching[0].id == row.id
     finally:
         db.close()
 
@@ -879,7 +899,46 @@ def test_database_trace_handler_rejects_stale_checkpoint(
         db.expire_all()
         persisted = db.get(Task, int(task.id))
         assert persisted.last_checkpoint_event_id is None
+        assert persisted.last_checkpoint_trace_event_id is None
         assert db.query(DatabaseTraceEvent).filter_by(task_id=int(task.id)).count() == 0
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_pointer_update_skips_silently_when_task_is_gone() -> (
+    None
+):
+    """A 0-row pointer UPDATE has two distinct causes: the lease moved (an
+    error worth raising), or the task row itself is gone. This test's
+    in-memory engine has no FK pragma enabled, so deleting the task row
+    does not fail the trace_event insert -- it reaches the pointer UPDATE
+    against a task_id that matches nothing, the same state a deployment
+    without FK enforcement on this legacy column would reach."""
+    _, db, task = _create_trace_handler_test_task("task-gone-checkpoint")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    lease = TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a")
+    event = TraceEvent(
+        CHECKPOINT_EVENT_TYPE,
+        task_id=str(task_id),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "execution_id": str(task_id),
+            "snapshot": {"label": "orphaned"},
+        },
+    )
+
+    db.query(Task).filter(Task.id == task_id).delete(synchronize_session=False)
+    db.commit()
+
+    try:
+        with bind_task_lease_context(lease):
+            # Must not raise "lease changed" -- the task is gone, not leased
+            # elsewhere.
+            DatabaseTraceHandler(task_id)._save_trace_event(db, event)
     finally:
         db.close()
 
@@ -1109,6 +1168,200 @@ def test_database_trace_handler_bound_run_does_not_fallback_to_legacy_checkpoint
                 is None
             )
     finally:
+        db.close()
+
+
+def test_database_trace_handler_load_without_pk_anchor_uses_legacy_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract for the mixed-data window: with the pointer unset, the read
+    path is exactly the pre-existing legacy scan."""
+    SessionLocal, db, task = _create_trace_handler_test_task("no-pk-anchor-load")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    assert task.last_checkpoint_trace_event_id is None
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="legacy-checkpoint",
+            execution_id="shared-execution",
+            label="legacy-only",
+            timestamp=datetime.now(timezone.utc),
+            run_id="run-a",
+        )
+    )
+    db.commit()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "shared-execution"
+            ) == {"label": "legacy-only"}
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_load_uses_pk_anchor_over_newer_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once set, the pointer is authoritative -- even over a row the legacy
+    scan (newest timestamp first) would otherwise pick instead."""
+    SessionLocal, db, task = _create_trace_handler_test_task("pk-anchor-load")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    now = datetime.now(timezone.utc)
+    anchored_row = _checkpoint_trace_row(
+        task_id=task_id,
+        event_id="anchored-checkpoint",
+        execution_id="shared-execution",
+        label="anchored",
+        timestamp=now,
+        run_id="run-a",
+    )
+    db.add(anchored_row)
+    db.commit()
+    db.refresh(anchored_row)
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="newer-checkpoint",
+            execution_id="shared-execution",
+            label="newer",
+            timestamp=now + timedelta(seconds=1),
+            run_id="run-a",
+        )
+    )
+    task.last_checkpoint_trace_event_id = anchored_row.id
+    db.commit()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "shared-execution"
+            ) == {"label": "anchored"}
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_load_pk_anchor_mismatch_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The anchor is never allowed to fall back to a different row once its
+    target is found: a validation mismatch (here, a build-scoped row wired
+    to the root pointer) is corruption, not absence."""
+    SessionLocal, db, task = _create_trace_handler_test_task("pk-anchor-mismatch")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    mismatched_row = _checkpoint_trace_row(
+        task_id=task_id,
+        event_id="build-scoped-checkpoint",
+        execution_id="shared-execution",
+        label="build-scoped",
+        timestamp=datetime.now(timezone.utc),
+        build_id="agent_123_abcd1234",
+    )
+    db.add(mismatched_row)
+    db.commit()
+    db.refresh(mismatched_row)
+    task.last_checkpoint_trace_event_id = mismatched_row.id
+    db.commit()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            with pytest.raises(CheckpointCorruptError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "shared-execution"
+                )
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_load_dangling_pk_anchor_falls_back_with_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pointer whose row no longer exists is only reachable on a database
+    upgraded without the DB-level FK for this column (see the migration).
+    The compatibility-window response is a legacy fallback plus a
+    self-clearing degradation signal, not a corruption verdict."""
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_PK_ANCHOR_DANGLING,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal, db, task = _create_trace_handler_test_task("pk-anchor-dangling")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="legacy-checkpoint",
+            execution_id="shared-execution",
+            label="legacy-fallback",
+            timestamp=datetime.now(timezone.utc),
+            run_id="run-a",
+        )
+    )
+    task.last_checkpoint_trace_event_id = 999999999
+    db.commit()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "shared-execution"
+            ) == {"label": "legacy-fallback"}
+        assert CHECKPOINT_PK_ANCHOR_DANGLING in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
         db.close()
 
 
@@ -1443,6 +1696,129 @@ def test_database_trace_handler_prunes_legacy_partition_without_tagged_runs(
             for row in db.query(DatabaseTraceEvent).filter_by(task_id=task_id).all()
         } == {"legacy-new", "tagged-run"}
     finally:
+        db.close()
+
+
+def test_database_trace_handler_prune_excludes_the_anchored_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Synthetic: the task's pointer is wired to an older row that the
+    retention ranking would otherwise prune. Nothing in today's
+    steady-state writer produces this -- the pointer always names the row
+    just written, which ranks newest -- but a future back-pointing anchor
+    (or a backfilled pointer) could, so prune must never delete the row a
+    pointer references regardless of its rank."""
+    _, db, task = _create_trace_handler_test_task("anchor-protected-prune")
+    task_id = int(task.id)
+    now = datetime.now(timezone.utc)
+    old_row = _checkpoint_trace_row(
+        task_id=task_id,
+        event_id="anchored-old",
+        execution_id="shared-execution",
+        label="anchored-old",
+        timestamp=now,
+        run_id="run-a",
+    )
+    db.add(old_row)
+    db.commit()
+    db.refresh(old_row)
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="run-a-new",
+            execution_id="shared-execution",
+            label="run-a-new",
+            timestamp=now + timedelta(seconds=1),
+            run_id="run-a",
+        )
+    )
+    # Synthetic: wire the pointer to the older row, which the retention
+    # ranking (newest first, limit=1) would otherwise prune.
+    task.last_checkpoint_trace_event_id = old_row.id
+    db.commit()
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        lambda: 1,
+    )
+
+    try:
+        DatabaseTraceHandler(task_id)._prune_checkpoint_history(
+            db,
+            {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "execution_id": "shared-execution",
+                TASK_RUN_ID_TRACE_FIELD: "run-a",
+            },
+        )
+
+        assert {
+            row.event_id
+            for row in db.query(DatabaseTraceEvent).filter_by(task_id=task_id).all()
+        } == {"anchored-old", "run-a-new"}
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_prune_registers_degradation_on_integrity_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Synthetic IntegrityError injection: the delete step is replaced to
+    raise, isolating the except-IntegrityError branch from needing genuine
+    FK enforcement (which only PostgreSQL, or a freshly create_all'd SQLite
+    database, provides for this column)."""
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import Query
+
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_PRUNE_INTEGRITY_ERROR,
+        active_degradations,
+        clear_degradation,
+    )
+
+    _, db, task = _create_trace_handler_test_task("prune-integrity-error")
+    task_id = int(task.id)
+    now = datetime.now(timezone.utc)
+    db.add_all(
+        [
+            _checkpoint_trace_row(
+                task_id=task_id,
+                event_id="old",
+                execution_id="shared-execution",
+                label="old",
+                timestamp=now,
+            ),
+            _checkpoint_trace_row(
+                task_id=task_id,
+                event_id="new",
+                execution_id="shared-execution",
+                label="new",
+                timestamp=now + timedelta(seconds=1),
+            ),
+        ]
+    )
+    db.commit()
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        lambda: 1,
+    )
+
+    def failing_delete(self: Query, *args: object, **kwargs: object) -> int:
+        raise IntegrityError("DELETE", {}, Exception("restrict violation"))
+
+    monkeypatch.setattr(Query, "delete", failing_delete)
+
+    clear_degradation(CHECKPOINT_PRUNE_INTEGRITY_ERROR)
+    try:
+        # Must not raise -- a prune failure can never break the checkpoint
+        # write it follows.
+        DatabaseTraceHandler(task_id)._prune_checkpoint_history(
+            db,
+            {"checkpoint_type": CHECKPOINT_TYPE, "execution_id": "shared-execution"},
+        )
+        assert CHECKPOINT_PRUNE_INTEGRITY_ERROR in active_degradations()
+        assert db.query(DatabaseTraceEvent).filter_by(task_id=task_id).count() == 2
+    finally:
+        clear_degradation(CHECKPOINT_PRUNE_INTEGRITY_ERROR)
         db.close()
 
 
