@@ -752,6 +752,80 @@ def test_checkpoint_resume_schedule_failure_exactly_restores_waiting_task() -> N
         db.close()
 
 
+@pytest.mark.asyncio
+async def test_a2a_handover_restores_input_required_on_unreadable_checkpoint() -> None:
+    """The A2A handover carries the pre-claim status into the resume.
+
+    The prelease claims the task out of WAITING_FOR_USER and commits RUNNING
+    before handing the lease to ``execute_resume_background``, which therefore
+    never runs the acquisition that captures a prior status. The status travels
+    only as the ``preacquired_prior_status`` kwarg, so drive the real path
+    across the handover: a checkpoint the resume cannot read must land the row
+    back on WAITING_FOR_USER under its original run, not on a terminal FAILED.
+    """
+    from xagent.web.api import websocket as websocket_api
+
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="waiting on handover",
+            status=TaskStatus.WAITING_FOR_USER,
+            control_state=TaskControlState.WAITING_FOR_USER.value,
+            run_id="run-handover",
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-handover"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        snapshot = A2ATaskSnapshot.from_task(task)
+    finally:
+        db.close()
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_service.resume_execution_by_id = AsyncMock(
+        side_effect=CheckpointUnavailableError("checkpoint store unavailable")
+    )
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+
+    with patch(
+        "xagent.web.api.chat.get_agent_manager",
+        return_value=agent_manager,
+    ):
+        assert await a2a_api._resume_input_required_a2a_task(
+            agent_id=agent_id,
+            task_owner_user_id=owner_id,
+            task=snapshot,
+            text="follow up after handover",
+            message_id="msg-handover",
+        )
+        # Ownership transferred synchronously: the scheduled resume has not run
+        # yet, so its registration is still the one this handover created.
+        resume_task = websocket_api.background_task_manager.resume_tasks[task_id]
+        await asyncio.wait_for(resume_task, timeout=30)
+
+    agent_service.resume_execution_by_id.assert_awaited_once()
+    db = _direct_db_session()
+    try:
+        restored = db.query(Task).filter(Task.id == task_id).one()
+        assert restored.status == TaskStatus.WAITING_FOR_USER
+        assert restored.control_state == TaskControlState.WAITING_FOR_USER.value
+        assert restored.run_id == "run-handover"
+        assert restored.runner_id is None
+        assert restored.lease_expires_at is None
+        assert restored.error_message is None
+    finally:
+        db.close()
+
+
 def test_recovered_paused_checkpoint_resumes_without_transcript_fallback() -> None:
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()
