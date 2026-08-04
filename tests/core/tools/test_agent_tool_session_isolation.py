@@ -399,6 +399,22 @@ def test_classify_delegated_child_failure_passes_raw_placeholder_text():
     assert mod._classify_delegated_child_failure(result) is None
 
 
+def test_agent_tool_result_declares_every_classified_failure_key():
+    """The declared return contract covers the failure envelope.
+
+    ``AgentTool.return_type()`` is ``AgentToolResult``; a consumer that
+    model-validates and re-dumps a classified failure must not be able to
+    silently strip the classification keys. Every key ``_classified_failure``
+    can emit must be a subset of the model's declared fields.
+    """
+
+    plain = mod._classified_failure("boom")
+    with_code = mod._classified_failure("boom", failure_code="missing_delegated_output")
+
+    assert set(plain) <= set(mod.AgentToolResult.model_fields)
+    assert set(with_code) <= set(mod.AgentToolResult.model_fields)
+
+
 @pytest.mark.asyncio
 async def test_agent_tool_catchall_does_not_rewrap_classified_failure(monkeypatch):
     """The classified failure must return before the catch-all can touch it.
