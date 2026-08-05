@@ -908,16 +908,25 @@ def test_database_trace_handler_rejects_stale_checkpoint(
         db.close()
 
 
-def test_database_trace_handler_pointer_update_skips_silently_when_task_is_gone() -> (
-    None
-):
+@pytest.mark.parametrize("require_persisted", [False, True])
+def test_database_trace_handler_pointer_update_skips_silently_when_task_is_gone(
+    require_persisted: bool,
+) -> None:
     """A 0-row pointer UPDATE has two distinct causes: the lease moved (an
     error worth raising), or the task row itself is gone. This test's
     in-memory engine has no FK pragma enabled, so deleting the task row
     does not fail the trace_event insert -- it reaches the pointer UPDATE
     against a task_id that matches nothing, the same state a deployment
-    without FK enforcement on this legacy column would reach."""
-    _, db, task = _create_trace_handler_test_task("task-gone-checkpoint")
+    without FK enforcement on this legacy column would reach.
+
+    The task-gone branch is classified exactly as the trace_events.task_id
+    FK violation is classified: always zero residue, quiet for a
+    best-effort event, loud for a require_persisted one. Reporting success
+    for an event that was dropped is what the FK path has never done.
+    """
+    _, db, task = _create_trace_handler_test_task(
+        f"task-gone-checkpoint-{require_persisted}"
+    )
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
     task.run_id = "run-a"
@@ -932,6 +941,7 @@ def test_database_trace_handler_pointer_update_skips_silently_when_task_is_gone(
             "execution_id": str(task_id),
             "snapshot": {"label": "orphaned"},
         },
+        require_persisted=require_persisted,
     )
 
     db.query(Task).filter(Task.id == task_id).delete(synchronize_session=False)
@@ -939,9 +949,16 @@ def test_database_trace_handler_pointer_update_skips_silently_when_task_is_gone(
 
     try:
         with bind_task_lease_context(lease):
-            # Must not raise "lease changed" -- the task is gone, not leased
-            # elsewhere.
-            DatabaseTraceHandler(task_id)._save_trace_event(db, event)
+            if require_persisted:
+                with pytest.raises(RuntimeError, match="no longer exists"):
+                    DatabaseTraceHandler(task_id)._save_trace_event(db, event)
+            else:
+                # Must not raise "lease changed" -- the task is gone, not
+                # leased elsewhere.
+                DatabaseTraceHandler(task_id)._save_trace_event(db, event)
+
+        # Either way the staged row is discarded, not committed as an orphan.
+        assert db.query(DatabaseTraceEvent).filter_by(task_id=task_id).count() == 0
     finally:
         db.close()
 

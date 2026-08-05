@@ -743,20 +743,34 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     )
                     if not task_still_exists:
                         # The task row is gone, not merely leased elsewhere --
-                        # the same outcome the trace_events.task_id FK would
-                        # produce for the row itself. Skip quietly rather
-                        # than raising a "lease changed" error that isn't
-                        # what happened.
+                        # the same outcome the trace_events.task_id FK
+                        # produces for the row itself wherever that FK is
+                        # enforced. Discard the staged row so this path
+                        # leaves nothing behind, then classify it exactly as
+                        # that FK violation is classified below: a required
+                        # event still fails loudly, a best-effort event is
+                        # dropped quietly.
+                        db.rollback()
+                        if getattr(event, "require_persisted", False):
+                            logger.error(
+                                "Required trace event references missing task %s: %s",
+                                self.task_id,
+                                event.id,
+                            )
+                            raise RuntimeError(
+                                f"Task {self.task_id} no longer exists; "
+                                f"checkpoint {event.id} was not persisted"
+                            )
                         logger.debug(
                             "Skip checkpoint pointer update for missing task %s: %s",
                             self.task_id,
                             event.id,
                         )
-                    else:
-                        raise RuntimeError(
-                            f"Task {self.task_id} lease changed before checkpoint "
-                            f"{event.id} could be persisted"
-                        )
+                        return
+                    raise RuntimeError(
+                        f"Task {self.task_id} lease changed before checkpoint "
+                        f"{event.id} could be persisted"
+                    )
 
             # Update tool usage statistics if this is a tool execution event
             if event_type_str == "tool_execution_end":
