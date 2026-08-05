@@ -21,6 +21,7 @@ history, which has no DB-level FK for the checkpoint pointer column at all
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import pytest
@@ -68,6 +69,51 @@ def _seed_task_with_anchored_checkpoint(session: Session, *, username: str) -> i
     task.last_checkpoint_trace_event_id = event_row.id
     session.commit()
     return int(task.id)
+
+
+@contextmanager
+def _recorded_statements(engine):
+    """Record every statement this engine executes, in order.
+
+    The alembic-upgraded form has no DB-level FK for the pointer column, so
+    a reversed NULL-first cannot fail loudly here. Asserting the final
+    persisted pointer is NULL catches *removing* the NULL-first step but not
+    *moving* it after the trace_events delete, because the update still runs
+    before the assertion either way. Statement order is the only direct
+    evidence of the ordering itself.
+    """
+    seen: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
+        seen.append(" ".join(statement.split()))
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        yield seen
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+
+def _index_of(seen, predicate, what):  # type: ignore[no-untyped-def]
+    for index, statement in enumerate(seen):
+        if predicate(statement):
+            return index
+    raise AssertionError(f"{what} never executed; recorded: {seen}")
+
+
+def _assert_pointer_nulled_before_trace_events_deleted(seen) -> None:  # type: ignore[no-untyped-def]
+    null_first = _index_of(
+        seen,
+        lambda s: s.startswith("UPDATE tasks")
+        and "last_checkpoint_trace_event_id" in s,
+        "pointer NULL update",
+    )
+    trace_delete = _index_of(
+        seen,
+        lambda s: s.startswith("DELETE FROM trace_events"),
+        "trace_events delete",
+    )
+    assert null_first < trace_delete, seen
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +270,9 @@ def test_purge_task_rows_nulls_pointer_before_the_task_delete_flushes(
     session = sqlite_upgraded_session
     task_id = _seed_task_with_anchored_checkpoint(session, username="u1")
 
-    assert purge_task_rows(session, task_id=task_id) is True
+    with _recorded_statements(session.get_bind()) as seen:
+        assert purge_task_rows(session, task_id=task_id) is True
+    _assert_pointer_nulled_before_trace_events_deleted(seen)
 
     pointer = session.execute(
         text("SELECT last_checkpoint_trace_event_id FROM tasks WHERE id = :id"),
@@ -302,7 +350,9 @@ def test_purge_user_task_rows_nulls_pointer_before_trace_events_are_gone(
 
     monkeypatch.setattr(Query, "delete", guarded_delete)
 
-    _purge_user_task_rows(session, user_id=user_id)
+    with _recorded_statements(session.get_bind()) as seen:
+        _purge_user_task_rows(session, user_id=user_id)
+    _assert_pointer_nulled_before_trace_events_deleted(seen)
 
     pointer = session.execute(
         text("SELECT last_checkpoint_trace_event_id FROM tasks WHERE id = :id"),

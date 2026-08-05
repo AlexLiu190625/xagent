@@ -3185,3 +3185,45 @@ def test_database_trace_handler_prune_with_nothing_stale_clears_the_integrity_si
     finally:
         clear_degradation(CHECKPOINT_PRUNE_INTEGRITY_ERROR)
         db.close()
+
+
+def test_database_trace_handler_flush_without_primary_key_refuses_to_write_the_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard that replaced a bare assert. A no-op flush (rather than a
+    raising one) is what exercises it: a raising flush would land in the
+    generic handler instead and prove nothing about the guard."""
+    _, db, task = _create_trace_handler_test_task("flush-without-pk")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    lease = TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a")
+    event = TraceEvent(
+        CHECKPOINT_EVENT_TYPE,
+        task_id=str(task_id),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "execution_id": str(task_id),
+            "snapshot": {"label": "unflushed"},
+        },
+    )
+
+    monkeypatch.setattr(Session, "flush", lambda self, *a, **k: None)
+
+    try:
+        with (
+            bind_task_lease_context(lease),
+            pytest.raises(
+                RuntimeError, match="refusing to write a NULL checkpoint anchor"
+            ),
+        ):
+            DatabaseTraceHandler(task_id)._save_trace_event(db, event)
+
+        db.expire_all()
+        persisted = db.get(Task, task_id)
+        assert persisted.last_checkpoint_trace_event_id is None
+        assert db.query(DatabaseTraceEvent).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
