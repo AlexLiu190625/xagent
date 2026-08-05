@@ -398,6 +398,76 @@ class TestDowngradeSqlite:
         assert COLUMN in columns
 
 
+class TestDowngradeSqliteOverCreateAllSchema:
+    """Downgrade over the schema shape a fresh install actually has.
+
+    Production never builds ``tasks`` through a migration: a new database is
+    created by ``Base.metadata.create_all()`` and then stamped at head (see
+    src/xagent/db/migration.py). On SQLite that renders this column's foreign
+    key inline in ``CREATE TABLE tasks`` even though the model declares it
+    ``use_alter=True``, and SQLite refuses to drop a column an inline foreign
+    key names. TestDowngradeSqlite above builds from _pre_migration_metadata(),
+    which carries no such constraint, so it cannot reach this shape.
+    """
+
+    @pytest.fixture
+    def create_all_engine(self, tmp_path: Path):
+        from tests.web.services.checkpoint_anchor_shared import (
+            reset_checkpoint_anchor_fk_create_rule,
+        )
+        from xagent.web.models.database import Base
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'create-all.db'}")
+        # Mandatory. The PostgreSQL tests in this file create_all against a
+        # dialect that supports ALTER, which permanently caches a "defer to
+        # ALTER" decision on this constraint's shared _create_rule; a later
+        # SQLite create_all then omits the constraint entirely and this
+        # fixture would assert nothing.
+        reset_checkpoint_anchor_fk_create_rule()
+        Base.metadata.create_all(bind=engine)
+        command.stamp(_alembic_config(engine), TARGET_REVISION)
+        assert FK_NAME in {
+            fk["name"] for fk in inspect(engine).get_foreign_keys("tasks")
+        }
+        yield engine
+        engine.dispose()
+
+    def test_downgrade_over_a_create_all_schema_drops_the_column(
+        self, create_all_engine
+    ) -> None:
+        _downgrade(create_all_engine)
+
+        inspector = inspect(create_all_engine)
+        assert COLUMN not in {c["name"] for c in inspector.get_columns("tasks")}
+        assert FK_NAME not in {fk["name"] for fk in inspector.get_foreign_keys("tasks")}
+
+    def test_downgrade_over_a_create_all_schema_preserves_task_rows(
+        self, create_all_engine
+    ) -> None:
+        with create_all_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO users (id, username, password_hash, is_admin) "
+                    "VALUES (1, 'u', 'h', 0)"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO tasks (id, user_id, title, status, state_version, "
+                    "control_state, is_visible, last_checkpoint_event_id) VALUES "
+                    "(1, 1, 'T', 'PENDING', 0, 'idle', 1, 'evt-1')"
+                )
+            )
+
+        _downgrade(create_all_engine)
+
+        with create_all_engine.begin() as conn:
+            value = conn.execute(
+                text("SELECT last_checkpoint_event_id FROM tasks WHERE id = 1")
+            ).scalar_one()
+        assert value == "evt-1"
+
+
 def _postgres_url() -> str | None:
     return os.getenv("XAGENT_TEST_POSTGRES_URL") or os.getenv(
         "POSTGRES_TEST_DATABASE_URL"

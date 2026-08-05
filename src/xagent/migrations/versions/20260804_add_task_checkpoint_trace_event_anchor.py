@@ -14,6 +14,14 @@ the row it names, but only where that resolution is unambiguous: zero or
 multiple matching trace_events rows leave the new column NULL rather than
 guessing or aborting the migration.
 
+On PostgreSQL ``create_foreign_key`` takes an ACCESS EXCLUSIVE lock on
+``tasks`` and validates every existing row before returning, and the
+backfill's correlated subquery matches ``trace_events`` on
+``(task_id, event_id)`` where only ``task_id`` is indexed. On a large
+deployment both steps should be scheduled with that lock window in mind; a
+``NOT VALID`` constraint followed by a separate ``VALIDATE CONSTRAINT``
+would move the validation out of the lock window if that becomes necessary.
+
 Revision ID: 20260804_add_task_checkpoint_trace_event_anchor
 Revises: 20260729_add_gmail_audience_grace
 Create Date: 2026-08-04
@@ -108,8 +116,21 @@ def downgrade() -> None:
     bind = op.get_bind()
     is_postgresql = bind.dialect.name == "postgresql"
 
-    if is_postgresql and FK_NAME in _fk_names():
-        op.drop_constraint(FK_NAME, TABLE, type_="foreignkey")
+    if COLUMN not in _columns():
+        return
 
-    if COLUMN in _columns():
+    if is_postgresql:
+        if FK_NAME in _fk_names():
+            op.drop_constraint(FK_NAME, TABLE, type_="foreignkey")
         op.drop_column(TABLE, COLUMN)
+    else:
+        # SQLite renders this column's foreign key inline in CREATE TABLE
+        # even under use_alter=True (a fresh install builds tasks with
+        # create_all, not a migration), and refuses to drop a column an
+        # inline foreign key names. A full table rebuild removes both
+        # together; nothing else can. The migration connection already runs
+        # with SQLite foreign keys off for exactly this reason -- see
+        # _migration_connection in src/xagent/db/migration.py -- and
+        # re-checks for new violations afterwards.
+        with op.batch_alter_table(TABLE, recreate="always") as batch_op:
+            batch_op.drop_column(COLUMN)
