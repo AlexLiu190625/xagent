@@ -213,11 +213,11 @@ jobs:
         env:
           DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
-      - name: Test Gmail provisioning row-lock contention (Postgres-only)
+      - name: Test Gmail provisioning Postgres-only behavior
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pip install pytest-asyncio
-          pytest tests/web/services/test_gmail_provisioning.py -k contend -q
+          pytest tests/web/services/test_gmail_provisioning.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

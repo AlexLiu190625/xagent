@@ -255,6 +255,10 @@ def _referenced_gmail_oauth_account_ids(
         AgentTrigger.config["oauth_account_id"].as_string(),
         String,
     )
+    # No DISTINCT here: the projection selects the ``json`` config column, and
+    # PostgreSQL has no equality operator for ``json``, so SELECT DISTINCT
+    # fails there while passing on SQLite. Duplicate rows are harmless because
+    # the loop below accumulates into a set.
     candidate_rows = (
         db.query(AgentTrigger.config, AgentTrigger.resource_id)
         .filter(
@@ -265,7 +269,6 @@ def _referenced_gmail_oauth_account_ids(
                 func.lower(AgentTrigger.resource_id).in_(account_ids_by_email),
             ),
         )
-        .distinct()
         .all()
     )
 
