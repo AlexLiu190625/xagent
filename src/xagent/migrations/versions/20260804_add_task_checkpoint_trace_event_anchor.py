@@ -31,6 +31,7 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 TABLE = "tasks"
+TRACE_TABLE = "trace_events"
 COLUMN = "last_checkpoint_trace_event_id"
 LEGACY_COLUMN = "last_checkpoint_event_id"
 FK_NAME = "fk_tasks_last_checkpoint_trace_event_id"
@@ -57,9 +58,9 @@ BACKFILL_SQL = sa.text(
 )
 
 
-def _table_exists() -> bool:
+def _table_exists(name: str = TABLE) -> bool:
     inspector = sa.inspect(op.get_bind())
-    return inspector.has_table(TABLE)
+    return inspector.has_table(name)
 
 
 def _columns() -> set[str]:
@@ -85,11 +86,14 @@ def upgrade() -> None:
     if COLUMN not in _columns():
         op.add_column(TABLE, sa.Column(COLUMN, sa.Integer(), nullable=True))
 
+    if not _table_exists(TRACE_TABLE):
+        return
+
     if is_postgresql and FK_NAME not in _fk_names():
         op.create_foreign_key(
             FK_NAME,
             TABLE,
-            "trace_events",
+            TRACE_TABLE,
             [COLUMN],
             ["id"],
         )

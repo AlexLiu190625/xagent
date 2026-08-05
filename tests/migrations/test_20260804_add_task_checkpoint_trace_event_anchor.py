@@ -140,6 +140,22 @@ def sqlite_engine(tmp_path: Path) -> sa.engine.Engine:
     return engine
 
 
+@pytest.fixture
+def sqlite_engine_without_trace_events(tmp_path: Path) -> sa.engine.Engine:
+    """A database carrying ``tasks`` but no ``trace_events`` at all.
+
+    This is the shape tests/migration/test_migration.py's automatic-upgrade
+    tests build: they stamp an old revision and hand-create only the table
+    the revisions under test touch, then run the rest of the history through
+    ``try_upgrade_db``. Every step this migration derives from
+    ``trace_events`` has to stay off in that shape.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'no-trace-events.db'}")
+    _pre_migration_metadata().tables["tasks"].create(bind=engine)
+    _stamp_parent_revision(engine)
+    return engine
+
+
 def _alembic_config(engine: sa.engine.Engine):
     # create_alembic_config() stores str(engine.url), which SQLAlchemy
     # masks to "***" for display -- fine for logging, fatal for a real
@@ -274,6 +290,39 @@ class TestUpgradeSqlite:
                 text(f"SELECT {COLUMN} FROM tasks WHERE id = 1")
             ).scalar_one()
         assert value == 100
+
+    def test_adds_the_column_without_a_trace_events_table(
+        self, sqlite_engine_without_trace_events: sa.engine.Engine
+    ) -> None:
+        """The column is this migration's own schema change and does not
+        depend on trace_events, so it is still added; the backfill, which
+        reads trace_events, is skipped instead of raising "no such table"."""
+        engine = sqlite_engine_without_trace_events
+        with engine.begin() as conn:
+            _insert_task(conn, task_id=1, last_checkpoint_event_id="evt-1")
+
+        _upgrade(engine)
+
+        columns = {c["name"] for c in inspect(engine).get_columns("tasks")}
+        assert COLUMN in columns
+        with engine.begin() as conn:
+            value = conn.execute(
+                text(f"SELECT {COLUMN} FROM tasks WHERE id = 1")
+            ).scalar_one()
+        assert value is None
+
+    def test_downgrade_without_a_trace_events_table(
+        self, sqlite_engine_without_trace_events: sa.engine.Engine
+    ) -> None:
+        """Downgrade reads nothing from trace_events -- it drops a column
+        and, on PostgreSQL only, a constraint reflected off tasks -- so it
+        needs no trace_events guard of its own."""
+        engine = sqlite_engine_without_trace_events
+        _upgrade(engine)
+        _downgrade(engine)
+
+        columns = {c["name"] for c in inspect(engine).get_columns("tasks")}
+        assert COLUMN not in columns
 
     def test_rerun_does_not_clobber_a_resolved_pointer(
         self, sqlite_engine: sa.engine.Engine
