@@ -19,6 +19,7 @@ from xagent.core.agent.checkpoint import (
     CHECKPOINT_TYPE,
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
+    CheckpointUnavailableError,
 )
 from xagent.core.agent.trace import (
     TraceAction,
@@ -2731,3 +2732,222 @@ async def test_historical_replay_dedupes_file_only_turns_by_turn_id(
         (event["data"].get("turn_id"), event["data"].get("files"))
         for event in user_message_events
     ] == [("turn-file", attachments)]
+
+
+_BROKEN_ANCHOR_LABEL = "anchored-broken"
+
+
+def _unidentified_checkpoint_row(
+    *,
+    task_id: int,
+    label: str,
+    timestamp: datetime,
+    run_id: str,
+) -> DatabaseTraceEvent:
+    """A checkpoint row carrying no execution identity at all.
+
+    The pointer anchors it (checkpoint_execution_id() returns "" and the
+    anchor's identity conjunct short-circuits), but the legacy scan excludes
+    it: its coalesce(nullif(...)) predicate is NULL and NULL = :execution_id
+    is never true. This is the shape that makes the anchor's payload verdict
+    load-bearing -- without it seeding the scan's accumulators, an unreadable
+    checkpoint would come back as "no checkpoint".
+    """
+    return DatabaseTraceEvent(
+        task_id=task_id,
+        build_id=None,
+        event_id=f"unidentified-{label}",
+        event_type="system_update_general",
+        timestamp=timestamp,
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            TASK_RUN_ID_TRACE_FIELD: run_id,
+            "snapshot": {"label": label},
+        },
+    )
+
+
+def _decode_failing_on(label: str, exception: Exception):
+    """Decode stub that fails for exactly one row, identified by its label.
+
+    Injected rather than built from a genuinely broken blob because these
+    tests pin the anchor's *classification* of a decode failure, and the
+    generic (non-CheckpointMessageDecodeError) branch has no data-level
+    trigger at all.
+    """
+
+    def fake_decode(db, *, task_id, data, strict=False, verify_blob_hashes=True):
+        snapshot = data.get("snapshot") if isinstance(data, dict) else None
+        if isinstance(snapshot, dict) and snapshot.get("label") == label:
+            raise exception
+        return data
+
+    return fake_decode
+
+
+def _bind_checkpoint_read_session(
+    monkeypatch: pytest.MonkeyPatch,
+    SessionLocal,
+) -> None:
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+
+def test_database_trace_handler_load_pk_anchor_undecodable_payload_falls_back_to_older_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retention guarantee _prune_checkpoint_history documents: older
+    rows are kept so an unreadable latest can fall back. The anchor's
+    identity stays authoritative, but its payload does not."""
+    from xagent.web.services.trace_message_storage import CheckpointMessageDecodeError
+
+    SessionLocal, db, task = _create_trace_handler_test_task("anchor-undecodable-older")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    now = datetime.now(timezone.utc)
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="older",
+            execution_id="shared-execution",
+            label="older-readable",
+            timestamp=now,
+            run_id="run-a",
+        )
+    )
+    broken = _checkpoint_trace_row(
+        task_id=task_id,
+        event_id="broken",
+        execution_id="shared-execution",
+        label=_BROKEN_ANCHOR_LABEL,
+        timestamp=now + timedelta(seconds=1),
+        run_id="run-a",
+    )
+    db.add(broken)
+    db.commit()
+    db.refresh(broken)
+    task.last_checkpoint_trace_event_id = broken.id
+    db.commit()
+
+    _bind_checkpoint_read_session(monkeypatch, SessionLocal)
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.decode_trace_event_data",
+        _decode_failing_on(
+            _BROKEN_ANCHOR_LABEL, CheckpointMessageDecodeError("blob is gone")
+        ),
+    )
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "shared-execution"
+            ) == {"label": "older-readable"}
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_load_pk_anchor_undecodable_payload_without_older_row_is_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The anchored row is the only checkpoint and the scan cannot even see
+    it (no execution identity). The deferral must still resolve to corrupt,
+    never to ``None`` -- an unreadable checkpoint is not an absent one."""
+    from xagent.web.services.trace_message_storage import CheckpointMessageDecodeError
+
+    SessionLocal, db, task = _create_trace_handler_test_task("anchor-undecodable-only")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    broken = _unidentified_checkpoint_row(
+        task_id=task_id,
+        label=_BROKEN_ANCHOR_LABEL,
+        timestamp=datetime.now(timezone.utc),
+        run_id="run-a",
+    )
+    db.add(broken)
+    db.commit()
+    db.refresh(broken)
+    task.last_checkpoint_trace_event_id = broken.id
+    db.commit()
+
+    _bind_checkpoint_read_session(monkeypatch, SessionLocal)
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.decode_trace_event_data",
+        _decode_failing_on(
+            _BROKEN_ANCHOR_LABEL, CheckpointMessageDecodeError("blob is gone")
+        ),
+    )
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            with pytest.raises(CheckpointCorruptError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "shared-execution"
+                )
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_load_pk_anchor_generic_decode_failure_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient (non-decode-class) failure on the anchored row is
+    retryable, not terminal: unavailable, so a2a maps it to 503 rather than
+    the terminal 400 a corrupt verdict earns."""
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_DECODE_FALLBACK,
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal, db, task = _create_trace_handler_test_task("anchor-generic-only")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    broken = _unidentified_checkpoint_row(
+        task_id=task_id,
+        label=_BROKEN_ANCHOR_LABEL,
+        timestamp=datetime.now(timezone.utc),
+        run_id="run-a",
+    )
+    db.add(broken)
+    db.commit()
+    db.refresh(broken)
+    task.last_checkpoint_trace_event_id = broken.id
+    db.commit()
+
+    _bind_checkpoint_read_session(monkeypatch, SessionLocal)
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.decode_trace_event_data",
+        _decode_failing_on(_BROKEN_ANCHOR_LABEL, RuntimeError("blob prefetch failed")),
+    )
+
+    clear_degradation(CHECKPOINT_DECODE_FALLBACK)
+    clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            with pytest.raises(CheckpointUnavailableError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "shared-execution"
+                )
+        active = active_degradations()
+        assert CHECKPOINT_DECODE_FALLBACK in active
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active
+    finally:
+        clear_degradation(CHECKPOINT_DECODE_FALLBACK)
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()

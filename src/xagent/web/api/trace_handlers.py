@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -66,10 +67,24 @@ CHECKPOINT_ROW_SCAN_LIMIT = 100
 # rather than continuing indefinitely.
 CHECKPOINT_SCAN_MAX_PAGES = 50
 
-# Sentinel distinguishing "no PK anchor to try" (unset pointer, or a pointer
-# whose row is gone) from a resolved snapshot, which may legitimately be an
-# empty dict. Falling back to the legacy scan is only correct for the former.
-_NO_TRACE_EVENT_ANCHOR = object()
+
+@dataclass(frozen=True)
+class _AnchorFallback:
+    """Why the PK anchor deferred to the legacy scan.
+
+    Distinguishes "no PK anchor to try" from a resolved snapshot, which may
+    legitimately be an empty dict. An unset or dangling pointer defers with
+    nothing to carry. A correctly identified anchor row whose payload could
+    not be read defers *and* hands the scan the same verdict flag the scan
+    would have set for that row itself: the scan's candidate filter can
+    legitimately exclude that row (a row carrying no execution identity is
+    anchored but not scanned, see _load_pk_anchored_checkpoint), and an
+    excluded row must never let an unreadable checkpoint become "no
+    checkpoint".
+    """
+
+    undecodable: bool = False
+    generic_failure: bool = False
 
 
 def _checkpoint_execution_id_predicate(execution_id: str) -> Any:
@@ -201,6 +216,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 # below), and a zero-row first page is authoritative.
                 _checkpoint_execution_id_predicate(str(execution_id)),
             )
+            anchored_fallback = _AnchorFallback()
             if self.build_id is None:
                 try:
                     run_id = self._root_checkpoint_read_partition(db)
@@ -225,8 +241,9 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 anchored = self._load_pk_anchored_checkpoint(
                     db, run_id, str(execution_id)
                 )
-                if anchored is not _NO_TRACE_EVENT_ANCHOR:
-                    return anchored  # type: ignore[return-value]
+                if not isinstance(anchored, _AnchorFallback):
+                    return anchored
+                anchored_fallback = anchored
                 query = query.filter(
                     DatabaseTraceEvent.build_id.is_(None),
                     self._checkpoint_run_partition_filter(run_id),
@@ -239,9 +256,11 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 DatabaseTraceEvent.id.desc(),
             )
 
-            saw_generic_failure = False
-            saw_undecodable_row = False
-            saw_any_row = False
+            saw_generic_failure = anchored_fallback.generic_failure
+            saw_undecodable_row = anchored_fallback.undecodable
+            saw_any_row = (
+                anchored_fallback.undecodable or anchored_fallback.generic_failure
+            )
             offset = 0
             page_count = 0
             while True:
@@ -457,29 +476,44 @@ class DatabaseTraceHandler(BaseTraceHandler):
         db: Session,
         run_id: str | None,
         execution_id: str,
-    ) -> Dict[str, Any] | object:
+    ) -> Dict[str, Any] | _AnchorFallback:
         """Resolve the checkpoint through the task's exact-row pointer.
 
-        Returns ``_NO_TRACE_EVENT_ANCHOR`` when there is nothing to anchor
-        on: the pointer is unset, or it names a row that no longer exists
-        (only possible on a database upgraded through Alembic rather than
-        created fresh, since that path has no DB-level FK -- see the
-        migration that adds this column). Both cases fall back to the
-        legacy scan. Once a target row is found, though, it is
-        authoritative: a validation mismatch raises rather than falling
-        back to search other rows, and a decode failure on that row is
-        classified the same way the scan classifies an exhausted,
-        all-undecodable candidate set, since this pointer is the only
-        candidate.
+        Returns an ``_AnchorFallback`` when the read defers to the legacy
+        scan. An empty one means there was nothing to anchor on: the
+        pointer is unset, or it names a row that no longer exists (only
+        possible on a database upgraded through Alembic rather than created
+        fresh, since that path has no DB-level FK -- see the migration that
+        adds this column).
+
+        Once a target row is found, its *identity* is authoritative: a
+        validation mismatch raises rather than falling back to search other
+        rows. Its *payload* is not. A row that is correctly identified but
+        whose payload cannot be read defers to the scan as well, so the
+        older rows history pruning deliberately retains can still answer
+        the read (see _prune_checkpoint_history). That fallback carries the
+        row's own verdict flag on the returned ``_AnchorFallback``, because
+        the scan may legitimately exclude the very row the pointer named,
+        and a scan that then finds nothing must not report "no checkpoint"
+        for a checkpoint that exists and is unreadable.
 
         The execution-identity check here is verification, not the legacy
         scan's filtering: that scan excludes non-matching rows from its
         candidate set via ``_checkpoint_execution_id_predicate`` before it
         ever sees them, but the pointer names one row unconditionally, so
         the row's own claimed identity (if it has one) has to be checked
-        against the caller's after the fact. A row with no execution
-        identity at all -- legacy rows written before the field existed --
-        still passes, matching the legacy scan's coalescing default of "".
+        against the caller's after the fact. A row carrying no execution
+        identity at all passes this check, because
+        ``checkpoint_execution_id()`` returns "" for it and the conjunct
+        short-circuits. The legacy scan does the opposite: its
+        ``coalesce(nullif(...))`` predicate yields NULL for such a row and
+        ``NULL = :execution_id`` is never true, so the scan drops it from
+        the candidate set. The anchor path is deliberately the more
+        permissive of the two -- a pointer that names a row is a stronger
+        identity claim than a JSON field match, and the rows without the
+        field are legacy rows written before it existed, exactly the rows
+        the migration's backfill anchors. Nothing depends on the two
+        agreeing: web's ``execution_id`` is the task id.
         """
         pointer = (
             db.query(Task.last_checkpoint_trace_event_id)
@@ -487,7 +521,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
             .one_or_none()
         )
         if pointer is None or pointer[0] is None:
-            return _NO_TRACE_EVENT_ANCHOR
+            return _AnchorFallback()
 
         pointer_id = pointer[0]
         row = db.get(DatabaseTraceEvent, pointer_id)
@@ -498,7 +532,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 "no matching trace_events row; falling back to the legacy "
                 "scan",
             )
-            return _NO_TRACE_EVENT_ANCHOR
+            return _AnchorFallback()
         clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
 
         row_data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
@@ -528,27 +562,49 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 strict=True,
             )
         except CheckpointMessageDecodeError as exc:
-            raise CheckpointCorruptError(
-                f"task {self.task_id}: checkpoint pointer {pointer_id} row "
-                "is undecodable"
-            ) from exc
-        except Exception as exc:
-            register_degradation(
-                CHECKPOINT_LOAD_UNAVAILABLE,
-                f"task {self.task_id}: checkpoint pointer {pointer_id} decode failed",
+            # Permanent per-row failure, classified exactly as the scan
+            # classifies one: log, no signal, and defer -- an older row may
+            # still carry a usable checkpoint.
+            logger.warning(
+                "Checkpoint pointer %s row for task %s is undecodable; "
+                "falling back to the legacy scan: %s",
+                pointer_id,
+                self.task_id,
+                exc,
             )
-            raise CheckpointUnavailableError(
-                f"task {self.task_id}: checkpoint pointer {pointer_id} "
-                "could not be decoded"
-            ) from exc
+            return _AnchorFallback(undecodable=True)
+        except Exception:
+            # E.g. a transient DB error from the blob prefetch: the same
+            # generic case the scan registers CHECKPOINT_DECODE_FALLBACK
+            # for. CHECKPOINT_LOAD_UNAVAILABLE belongs to the exhausted-set
+            # verdict, not to one row.
+            register_degradation(
+                CHECKPOINT_DECODE_FALLBACK,
+                f"task {self.task_id}: checkpoint decode failed, fell back "
+                f"past pointer {pointer_id}",
+            )
+            logger.warning(
+                "Checkpoint pointer %s row for task %s failed to decode; "
+                "falling back to the legacy scan",
+                pointer_id,
+                self.task_id,
+                exc_info=True,
+            )
+            return _AnchorFallback(generic_failure=True)
         clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
 
         snapshot = decoded.get("snapshot") if isinstance(decoded, dict) else None
         if not isinstance(snapshot, dict):
-            raise CheckpointCorruptError(
-                f"task {self.task_id}: checkpoint pointer {pointer_id} has "
-                "a readable checkpoint_type but no snapshot"
+            # Readable checkpoint_type but no payload: the same permanent
+            # per-row class as an undecodable row, and deferred the same way.
+            logger.warning(
+                "Checkpoint pointer %s row for task %s has a readable "
+                "checkpoint_type but no snapshot; falling back to the "
+                "legacy scan",
+                pointer_id,
+                self.task_id,
             )
+            return _AnchorFallback(undecodable=True)
         return dict(snapshot)
 
     def _sync_save_to_database(self, event: CoreTraceEvent) -> None:
