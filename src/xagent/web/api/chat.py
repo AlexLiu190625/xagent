@@ -2746,8 +2746,12 @@ class AgentServiceManager:
         agent = self._agents.get(task_id)
         if agent is None:
             return
-        tool_config = agent.tool_config
-        if tool_config is None:
+        # getattr/hasattr, not direct access: pause/resume off-turn builds
+        # store agents whose config is a DefaultToolConfig (no
+        # set_execution_scope), and the cached-return path this runs on must
+        # not blow up into the reconstruct fallback for them.
+        tool_config = getattr(agent, "tool_config", None)
+        if tool_config is None or not hasattr(tool_config, "set_execution_scope"):
             return
         if tool_config.set_execution_scope(scope):
             logger.info(
