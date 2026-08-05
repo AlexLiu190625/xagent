@@ -3093,6 +3093,49 @@ def test_database_trace_handler_healthy_anchor_read_clears_the_dangling_signal(
         db.close()
 
 
+def test_database_trace_handler_anchorless_read_clears_the_dangling_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The clear must sit before the pointer lookup, not after a row resolves.
+
+    A process where no task carries an anchor never resolves a pointer to a
+    row, so a clear placed on the resolved-row path would leave a previously
+    latched dangling signal set forever. An anchored read attempt with an
+    unset pointer must clear it too."""
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_PK_ANCHOR_DANGLING,
+        active_degradations,
+        clear_degradation,
+        register_degradation,
+    )
+
+    SessionLocal, db, task = _create_trace_handler_test_task("anchorless-clears")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    assert task.last_checkpoint_trace_event_id is None
+
+    _bind_checkpoint_read_session(monkeypatch, SessionLocal)
+
+    register_degradation(
+        CHECKPOINT_PK_ANCHOR_DANGLING, "left over from another task's read"
+    )
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            assert (
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "shared-execution"
+                )
+                is None
+            )
+        assert CHECKPOINT_PK_ANCHOR_DANGLING not in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
+        db.close()
+
+
 def test_database_trace_handler_prune_retains_exactly_the_limit_when_the_anchor_is_in_range(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

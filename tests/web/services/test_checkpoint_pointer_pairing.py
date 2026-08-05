@@ -5,12 +5,20 @@
 and dual-cleared across six mutation sites in five modules, and the recovery
 CAS fence conjoins both. A statement that sets one without the other makes
 that fence unmatchable, so recovery would stop working rather than fail
-loudly. Nothing but this check keeps the pair together once the call sites
-drift apart during the compatibility window.
+loudly. This check is the primary guard keeping the pair together once the
+call sites drift apart during the compatibility window.
 
 Reads are deliberately out of scope: several call sites legitimately name
 exactly one column when resolving or querying it. Only mutation carriers are
 matched -- dict-literal keys, call keywords, and subscript assignments.
+
+Known limit: pairing is judged per statement block, because the lease claim
+writes the pair through two sibling subscript assignments. The block union
+therefore accepts two sibling statements that each write one column against
+*different* targets -- a shape no current site uses. All six real sites
+write both columns through one carrier (or two sibling assignments into the
+same dict), so the blind spot has no live instance; it is recorded here so a
+future reviewer does not mistake the guard for a per-statement check.
 """
 
 from __future__ import annotations
