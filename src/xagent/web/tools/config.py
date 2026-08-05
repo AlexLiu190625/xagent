@@ -1573,6 +1573,27 @@ class WebToolConfig(BaseToolConfig):
         self._pending_runtime_policy = None
         return True
 
+    def set_execution_scope(self, scope: Optional[Any]) -> bool:
+        """Switch the per-turn execution scope for a reused tool config.
+
+        ``WebToolConfig`` is cached with ``AgentService`` by task. The scope is
+        per-turn state exactly like the connector runtime turn id: an embedder
+        resolver may return a scope carrying turn-varying data that the base
+        namespace fingerprint does not cover, and a cached config must not keep
+        serving the first turn's object to the OAuth resolver hook.
+        Namespace-affecting changes never reach here -- the caller evicts on a
+        fingerprint change before this runs.
+        """
+        if self._execution_scope == scope and type(self._execution_scope) is type(
+            scope
+        ):
+            return False
+        self._execution_scope = scope
+        self._cached_mcp_configs = None
+        self._factory_runtime_snapshot = None
+        self._pending_runtime_policy = None
+        return True
+
     def _parse_numeric_task_id(self) -> Optional[int]:
         task_id = self._task_id
         if not isinstance(task_id, str) or not task_id:

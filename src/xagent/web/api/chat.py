@@ -2227,6 +2227,7 @@ class AgentServiceManager:
                             self._sync_connector_runtime_turn(
                                 task_id, connector_runtime_turn_id
                             )
+                            self._sync_execution_scope(task_id, scope)
                             return self._agents[task_id]
                     except (
                         HTTPException,
@@ -2693,6 +2694,7 @@ class AgentServiceManager:
         self._agent_owner_ids[task_id] = runtime_user_id
         self._agent_scope_fingerprints[task_id] = fingerprint
         self._sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
+        self._sync_execution_scope(task_id, scope)
         return self._agents[task_id]
 
     def _sync_connector_runtime_turn(
@@ -2737,6 +2739,21 @@ class AgentServiceManager:
                 task_id,
                 connector_runtime_turn_id,
             )
+
+    def _sync_execution_scope(
+        self, task_id: int, scope: Optional[ExecutionScope]
+    ) -> None:
+        agent = self._agents.get(task_id)
+        if agent is None:
+            return
+        tool_config = getattr(agent, "tool_config", None)
+        if tool_config is None or not hasattr(tool_config, "set_execution_scope"):
+            return
+        if tool_config.set_execution_scope(scope):
+            logger.info(
+                "Refreshing tools for task %s: execution scope advanced", task_id
+            )
+            agent.invalidate_tools()
 
     def remove_agent(self, task_id: int, user_id: Optional[int] = None) -> None:
         """Remove AgentService instance for completed task"""
