@@ -2,6 +2,9 @@ import { apiRequest } from "@/lib/api-wrapper"
 import { resolveApiSnippetBaseUrl } from "@/lib/api-snippet-target"
 import { getApiUrl } from "@/lib/utils"
 
+export const DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK =
+  "Failed to load deployment configuration. Retry before copying deployment details."
+
 export interface DeploymentConfig {
   /**
    * Origin external API and widget clients should call. Hosting layers may
@@ -109,21 +112,6 @@ export function fetchDeploymentConfig(): Promise<DeploymentConfig> {
  */
 export function __resetDeploymentConfigCache(): void {
   deploymentConfigRequest = null
-}
-
-/**
- * Represent the known-safe local target after configuration loading failed.
- *
- * Callers keep `null` while loading so regional deployments cannot briefly
- * expose the canonical routing edge. Only a completed failure should use this
- * standalone-shaped value to restore the pre-configuration browser fallback.
- */
-export function browserDeploymentConfig(): DeploymentConfig {
-  return {
-    deployment_origin: null,
-    app_origin: null,
-    region: null,
-  }
 }
 
 /**

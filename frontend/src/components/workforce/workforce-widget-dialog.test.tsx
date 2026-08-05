@@ -83,7 +83,7 @@ describe("WorkforceWidgetDialog", () => {
     cleanup()
   })
 
-  it("keeps the standalone widget usable when config loading fails", async () => {
+  it("keeps widget copy disabled until config retry succeeds", async () => {
     apiRequestMock.mockRejectedValueOnce(new Error("deployment config unavailable"))
 
     render(
@@ -94,11 +94,10 @@ describe("WorkforceWidgetDialog", () => {
       />,
     )
 
-    expect(
-      await screen.findByText((content) =>
-        content.includes('src="https://cloud.example.test/widget.js"'),
-      ),
-    ).toBeInTheDocument()
+    expect(await screen.findByText("deployment_config.messages.load_failed")).toBeInTheDocument()
+    const copyButton = screen.getByTitle("workforces.widget.copy_btn")
+    expect(screen.getByText("…")).toBeInTheDocument()
+    expect(copyButton).toBeDisabled()
     expect(toastErrorMock).toHaveBeenCalledWith(
       "deployment_config.messages.load_failed",
     )
@@ -118,6 +117,7 @@ describe("WorkforceWidgetDialog", () => {
     expect(
       screen.queryByText("deployment_config.messages.load_failed"),
     ).not.toBeInTheDocument()
+    expect(copyButton).toBeEnabled()
   })
 
   it("builds the embed snippet from the advertised deployment origin", async () => {

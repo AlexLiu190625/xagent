@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState } from "react"
 import { Check, Copy, LayoutGrid } from "lucide-react"
-import { DeploymentConfigFallbackAlert } from "@/components/deployment/deployment-config-fallback-alert"
+import { DeploymentConfigErrorAlert } from "@/components/deployment/deployment-config-error-alert"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
@@ -14,7 +14,7 @@ import { toast } from "@/components/ui/sonner"
 import { copyToClipboard } from "@/lib/clipboard"
 import { getBrowserLocationOrigin } from "@/lib/browser-location"
 import {
-  browserDeploymentConfig,
+  DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK,
   fetchDeploymentConfig,
   resolveDeploymentOrigin,
   type DeploymentConfig,
@@ -75,11 +75,11 @@ export function WorkforceWidgetDialog({ workforce, open, onClose }: WorkforceWid
           setDeploymentConfigFailed(false)
         } else {
           console.error(targetsResult.reason)
-          setDeploymentConfig(browserDeploymentConfig())
+          setDeploymentConfig(null)
           setDeploymentConfigFailed(true)
           toast.error(
             t("deployment_config.messages.load_failed")
-            || "Failed to load deployment configuration; using this browser's origin.",
+            || DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK,
           )
         }
 
@@ -111,7 +111,7 @@ export function WorkforceWidgetDialog({ workforce, open, onClose }: WorkforceWid
       console.error(error)
       toast.error(
         t("deployment_config.messages.load_failed")
-        || "Failed to load deployment configuration; using this browser's origin.",
+        || DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK,
       )
     }
   }
@@ -217,7 +217,7 @@ export function WorkforceWidgetDialog({ workforce, open, onClose }: WorkforceWid
         </DialogHeader>
 
         {deploymentConfigFailed && (
-          <DeploymentConfigFallbackAlert onRetry={retryDeploymentConfig} />
+          <DeploymentConfigErrorAlert onRetry={retryDeploymentConfig} />
         )}
 
         {!isActive ? (
@@ -315,6 +315,7 @@ export function WorkforceWidgetDialog({ workforce, open, onClose }: WorkforceWid
                     size="icon"
                     className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity"
                     onClick={() => void handleCopySnippet()}
+                    disabled={!widgetKey || !widgetOrigin}
                     title={t("workforces.widget.copy_btn") || "Copy Snippet"}
                   >
                     {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}

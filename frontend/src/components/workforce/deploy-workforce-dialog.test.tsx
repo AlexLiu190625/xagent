@@ -1,3 +1,4 @@
+/// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
@@ -90,7 +91,7 @@ describe("DeployWorkforceDialog", () => {
     cleanup()
   })
 
-  it("restores the local API target when deployment config loading fails", async () => {
+  it("keeps API copy disabled until config retry succeeds", async () => {
     apiRequestMock.mockRejectedValueOnce(
       new Error("deployment config unavailable"),
     )
@@ -105,13 +106,14 @@ describe("DeployWorkforceDialog", () => {
       />,
     )
 
+    expect(await screen.findByText("deployment_config.messages.load_failed")).toBeInTheDocument()
+    const copyButton = screen.getByTitle("deploy_workforce.copy")
+    expect(copyButton).toBeDisabled()
     expect(
-      await screen.findByText((content) =>
-        content.includes(
-          "https://cloud.example.test/v1/workforces/42/runs",
-        ),
+      screen.queryByText((content) =>
+        content.includes("https://cloud.example.test/v1/workforces/42/runs"),
       ),
-    ).toBeInTheDocument()
+    ).not.toBeInTheDocument()
     expect(toastErrorMock).toHaveBeenCalledWith(
       "deployment_config.messages.load_failed",
     )
@@ -131,6 +133,7 @@ describe("DeployWorkforceDialog", () => {
     expect(
       screen.queryByText("deployment_config.messages.load_failed"),
     ).not.toBeInTheDocument()
+    expect(copyButton).toBeEnabled()
   })
 
   it("reports snippet clipboard failures", async () => {
@@ -146,7 +149,9 @@ describe("DeployWorkforceDialog", () => {
       />,
     )
 
-    screen.getByTitle("deploy_workforce.copy").click()
+    const copyButton = screen.getByTitle("deploy_workforce.copy")
+    await waitFor(() => expect(copyButton).toBeEnabled())
+    copyButton.click()
 
     await vi.waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(

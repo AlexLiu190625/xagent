@@ -3,7 +3,7 @@
 import React, { useEffect, useMemo, useState } from "react"
 import { Check, Copy, KeyRound, Loader2 } from "lucide-react"
 
-import { DeploymentConfigFallbackAlert } from "@/components/deployment/deployment-config-fallback-alert"
+import { DeploymentConfigErrorAlert } from "@/components/deployment/deployment-config-error-alert"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -16,9 +16,11 @@ import { Input } from "@/components/ui/input"
 import { toast } from "@/components/ui/sonner"
 import { useI18n } from "@/contexts/i18n-context"
 import { copyToClipboard } from "@/lib/clipboard"
-import { fetchDeploymentConfig } from "@/lib/deployment-config"
+import {
+  DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK,
+  fetchDeploymentConfig,
+} from "@/lib/deployment-config"
 import { getApiSnippetTarget } from "@/lib/api-snippet-base-url"
-import { getBrowserLocationOrigin } from "@/lib/browser-location"
 import {
   formatWorkforceApiSnippets,
   type ApiSnippetTab,
@@ -82,11 +84,11 @@ export function DeployWorkforceDialog({
       })
       .catch(() => {
         if (!cancelled) {
-          setApiTarget(getApiSnippetTarget(getBrowserLocationOrigin()))
+          setApiTarget({ baseUrl: "" })
           setDeploymentConfigFailed(true)
           toast.error(
             t("deployment_config.messages.load_failed")
-            || "Failed to load deployment configuration; using this browser's origin.",
+            || DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK,
           )
         }
       })
@@ -103,7 +105,7 @@ export function DeployWorkforceDialog({
     } catch {
       toast.error(
         t("deployment_config.messages.load_failed")
-        || "Failed to load deployment configuration; using this browser's origin.",
+        || DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK,
       )
     }
   }
@@ -138,6 +140,7 @@ export function DeployWorkforceDialog({
   )
 
   const handleCopySnippet = async () => {
+    if (!apiTarget.baseUrl) return
     const ok = await copyToClipboard(snippets[apiTab])
     if (ok) {
       setCopiedSnippet(true)
@@ -202,7 +205,7 @@ export function DeployWorkforceDialog({
         </DialogHeader>
 
         {deploymentConfigFailed && (
-          <DeploymentConfigFallbackAlert onRetry={retryDeploymentConfig} />
+          <DeploymentConfigErrorAlert onRetry={retryDeploymentConfig} />
         )}
 
         <div className="space-y-5">
@@ -226,13 +229,14 @@ export function DeployWorkforceDialog({
             </div>
             <div className="mt-3 bg-muted p-4 rounded-md text-xs font-mono relative group">
               <pre className="whitespace-pre-wrap break-all text-muted-foreground max-h-72 overflow-auto">
-                {snippets[apiTab]}
+                {apiTarget.baseUrl ? snippets[apiTab] : "…"}
               </pre>
               <Button
                 variant="secondary"
                 size="icon"
                 className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity"
                 onClick={handleCopySnippet}
+                disabled={!apiTarget.baseUrl}
                 title={t("deploy_workforce.copy") || "Copy"}
               >
                 {copiedSnippet ? (

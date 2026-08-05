@@ -84,7 +84,7 @@ describe("WorkforceShareDialog", () => {
     cleanup()
   })
 
-  it("keeps the standalone share link usable when config loading fails", async () => {
+  it("keeps share copy disabled until config retry succeeds", async () => {
     apiRequestMock.mockRejectedValueOnce(new Error("deployment config unavailable"))
 
     render(
@@ -95,11 +95,10 @@ describe("WorkforceShareDialog", () => {
       />,
     )
 
-    expect(
-      await screen.findByDisplayValue(
-        "https://cloud.example.test/share/regional-share",
-      ),
-    ).toBeInTheDocument()
+    expect(await screen.findByText("deployment_config.messages.load_failed")).toBeInTheDocument()
+    const copyButton = screen.getByRole("button", { name: "common.copy" })
+    expect(screen.getByRole("textbox")).toHaveValue("")
+    expect(copyButton).toBeDisabled()
     expect(toastErrorMock).toHaveBeenCalledWith(
       "deployment_config.messages.load_failed",
     )
@@ -117,6 +116,7 @@ describe("WorkforceShareDialog", () => {
     expect(
       screen.queryByText("deployment_config.messages.load_failed"),
     ).not.toBeInTheDocument()
+    expect(copyButton).toBeEnabled()
   })
 
   it("builds a canonical share link that bootstraps the owning region", async () => {

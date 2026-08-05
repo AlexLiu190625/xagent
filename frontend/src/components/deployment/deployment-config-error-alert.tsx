@@ -6,8 +6,9 @@ import { AlertTriangle, Loader2 } from "lucide-react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { useI18n } from "@/contexts/i18n-context"
+import { DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK } from "@/lib/deployment-config"
 
-interface DeploymentConfigFallbackAlertProps {
+interface DeploymentConfigErrorAlertProps {
   /**
    * Reload the runtime deployment configuration and update the owning dialog.
    * The alert remains mounted when the retry rejects, so degraded state is
@@ -17,15 +18,15 @@ interface DeploymentConfigFallbackAlertProps {
 }
 
 /**
- * Persistent warning for deployment dialogs using the browser-origin fallback.
+ * Persistent warning for deployment dialogs whose public target is unavailable.
  *
- * A toast is easy to miss and can leave a user copying a target that is wrong
- * for a regional deployment. This shared alert keeps that state visible and
- * gives every deployment surface the same explicit recovery action.
+ * A toast is easy to miss. This alert keeps the unavailable target visible.
+ * It also gives each deployment surface the same recovery action. Callers keep
+ * copy controls disabled until the retry supplies a verified target.
  */
-export function DeploymentConfigFallbackAlert({
+export function DeploymentConfigErrorAlert({
   onRetry,
-}: DeploymentConfigFallbackAlertProps) {
+}: DeploymentConfigErrorAlertProps) {
   const { t } = useI18n()
   const [isRetrying, setIsRetrying] = useState(false)
 
@@ -33,6 +34,9 @@ export function DeploymentConfigFallbackAlert({
     setIsRetrying(true)
     try {
       await onRetry()
+    } catch {
+      // The owner reports the request error and keeps the failure state set.
+      // This alert only restores its retry control after the request settles.
     } finally {
       setIsRetrying(false)
     }
@@ -44,7 +48,7 @@ export function DeploymentConfigFallbackAlert({
       <AlertDescription className="flex w-full items-center gap-3 text-amber-800">
         <span className="flex-1">
           {t("deployment_config.messages.load_failed")
-            || "Failed to load deployment configuration; using this browser's origin."}
+            || DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK}
         </span>
         <Button
           type="button"

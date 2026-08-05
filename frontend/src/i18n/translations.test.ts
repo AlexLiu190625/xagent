@@ -67,6 +67,12 @@ describe("translations", () => {
     assertTranslationTreeParity(translations.en, translations.zh)
   })
 
+  it("describes deployment configuration failure without a browser fallback", () => {
+    expect(translations.zh.deployment_config.messages.load_failed).toBe(
+      "部署配置加载失败。复制部署信息前请重试。",
+    )
+  })
+
   it("keeps MCP runtime translations non-empty", () => {
     assertTranslationLeavesNonEmpty(
       translations.en.tools.mcp.runtime,

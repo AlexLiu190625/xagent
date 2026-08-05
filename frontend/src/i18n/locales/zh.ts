@@ -3359,7 +3359,7 @@ const zh = {
       retry: "重试"
     },
     messages: {
-      load_failed: "部署配置加载失败，已改用当前浏览器地址。"
+      load_failed: "部署配置加载失败。复制部署信息前请重试。"
     }
   },
   deploy_agent: {

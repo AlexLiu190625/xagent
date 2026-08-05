@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState } from "react"
 import { Check, Copy, Share } from "lucide-react"
-import { DeploymentConfigFallbackAlert } from "@/components/deployment/deployment-config-fallback-alert"
+import { DeploymentConfigErrorAlert } from "@/components/deployment/deployment-config-error-alert"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
@@ -12,7 +12,7 @@ import { toast } from "@/components/ui/sonner"
 import { copyToClipboard } from "@/lib/clipboard"
 import { getBrowserLocationOrigin } from "@/lib/browser-location"
 import {
-  browserDeploymentConfig,
+  DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK,
   buildDeploymentShareUrl,
   fetchDeploymentConfig,
   type DeploymentConfig,
@@ -75,11 +75,11 @@ export function WorkforceShareDialog({ workforce, open, onClose }: WorkforceShar
           setDeploymentConfigFailed(false)
         } else {
           console.error(targetsResult.reason)
-          setDeploymentConfig(browserDeploymentConfig())
+          setDeploymentConfig(null)
           setDeploymentConfigFailed(true)
           toast.error(
             t("deployment_config.messages.load_failed")
-            || "Failed to load deployment configuration; using this browser's origin.",
+            || DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK,
           )
         }
 
@@ -111,7 +111,7 @@ export function WorkforceShareDialog({ workforce, open, onClose }: WorkforceShar
       console.error(error)
       toast.error(
         t("deployment_config.messages.load_failed")
-        || "Failed to load deployment configuration; using this browser's origin.",
+        || DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK,
       )
     }
   }
@@ -160,7 +160,7 @@ export function WorkforceShareDialog({ workforce, open, onClose }: WorkforceShar
         </DialogHeader>
 
         {deploymentConfigFailed && (
-          <DeploymentConfigFallbackAlert onRetry={retryDeploymentConfig} />
+          <DeploymentConfigErrorAlert onRetry={retryDeploymentConfig} />
         )}
 
         <div className="space-y-4 border rounded-lg p-4">
@@ -181,13 +181,13 @@ export function WorkforceShareDialog({ workforce, open, onClose }: WorkforceShar
             <div className="pt-2 text-sm text-muted-foreground">
               {t("common.loading") || "Loading..."}
             </div>
-          ) : shareEnabled && shareUrl ? (
+          ) : shareEnabled ? (
             <div className="space-y-4 pt-2">
               <div className="space-y-2">
                 <Label className="text-sm">{t("workforces.share_link.public_url") || "Public URL"}</Label>
                 <div className="flex gap-2">
                   <Input readOnly value={shareUrl} className="flex-1" />
-                  <Button variant="secondary" onClick={() => void handleCopy()} disabled={isUpdating}>
+                  <Button variant="secondary" onClick={() => void handleCopy()} disabled={isUpdating || !shareUrl}>
                     {copied ? <Check className="h-4 w-4 mr-1 text-green-500" /> : <Copy className="h-4 w-4 mr-1" />}
                     {t("common.copy") || "Copy"}
                   </Button>

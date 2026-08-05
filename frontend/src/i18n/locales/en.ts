@@ -3359,7 +3359,7 @@ Build when you need.`,
       retry: "Retry"
     },
     messages: {
-      load_failed: "Failed to load deployment configuration; using this browser's origin."
+      load_failed: "Failed to load deployment configuration. Retry before copying deployment details."
     }
   },
   deploy_agent: {
