@@ -515,16 +515,34 @@ class DatabaseTraceHandler(BaseTraceHandler):
         the migration's backfill anchors. Nothing depends on the two
         agreeing: web's ``execution_id`` is the task id.
         """
-        pointer = (
-            db.query(Task.last_checkpoint_trace_event_id)
-            .filter(Task.id == self.task_id)
-            .one_or_none()
-        )
+        try:
+            pointer = (
+                db.query(Task.last_checkpoint_trace_event_id)
+                .filter(Task.id == self.task_id)
+                .one_or_none()
+            )
+        except Exception as exc:
+            register_degradation(
+                CHECKPOINT_LOAD_UNAVAILABLE,
+                f"task {self.task_id}: checkpoint pointer lookup failed",
+            )
+            raise CheckpointUnavailableError(
+                f"task {self.task_id}: checkpoint pointer lookup failed"
+            ) from exc
         if pointer is None or pointer[0] is None:
             return _AnchorFallback()
 
         pointer_id = pointer[0]
-        row = db.get(DatabaseTraceEvent, pointer_id)
+        try:
+            row = db.get(DatabaseTraceEvent, pointer_id)
+        except Exception as exc:
+            register_degradation(
+                CHECKPOINT_LOAD_UNAVAILABLE,
+                f"task {self.task_id}: checkpoint pointer row fetch failed",
+            )
+            raise CheckpointUnavailableError(
+                f"task {self.task_id}: checkpoint pointer row fetch failed"
+            ) from exc
         if row is None:
             register_degradation(
                 CHECKPOINT_PK_ANCHOR_DANGLING,

@@ -11,7 +11,7 @@ from typing import Any, Dict
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Query, Session, sessionmaker
 from sqlalchemy.pool import QueuePool, StaticPool
 
 from xagent.core.agent.checkpoint import (
@@ -2949,5 +2949,78 @@ def test_database_trace_handler_load_pk_anchor_generic_decode_failure_is_unavail
         assert CHECKPOINT_LOAD_UNAVAILABLE in active
     finally:
         clear_degradation(CHECKPOINT_DECODE_FALLBACK)
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
+
+
+@pytest.mark.parametrize("failing_call", ["pointer_query", "row_fetch"])
+def test_database_trace_handler_load_pk_anchor_database_failure_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    failing_call: str,
+) -> None:
+    """_sync_load_latest_checkpoint promises every database touch is
+    translated into a CheckpointReadError subclass. Both of the anchor's own
+    database calls have to honour that, or a transient connection failure
+    escapes as a raw driver exception no caller catches."""
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal, db, task = _create_trace_handler_test_task(
+        f"anchor-db-{failing_call}"
+    )
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    row = _checkpoint_trace_row(
+        task_id=task_id,
+        event_id="anchored",
+        execution_id="shared-execution",
+        label="anchored",
+        timestamp=datetime.now(timezone.utc),
+        run_id="run-a",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    task.last_checkpoint_trace_event_id = row.id
+    db.commit()
+
+    _bind_checkpoint_read_session(monkeypatch, SessionLocal)
+
+    boom = OperationalError("SELECT", {}, Exception("connection reset"))
+    if failing_call == "pointer_query":
+        original_one_or_none = Query.one_or_none
+
+        def failing_one_or_none(self: Query):  # type: ignore[no-untyped-def]
+            descriptions = self.column_descriptions
+            if (
+                descriptions
+                and descriptions[0]["name"] == "last_checkpoint_trace_event_id"
+            ):
+                raise boom
+            return original_one_or_none(self)
+
+        monkeypatch.setattr(Query, "one_or_none", failing_one_or_none)
+    else:
+
+        def failing_get(self: Session, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+            raise boom
+
+        monkeypatch.setattr(Session, "get", failing_get)
+
+    clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            with pytest.raises(CheckpointUnavailableError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "shared-execution"
+                )
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
+    finally:
         clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
         db.close()
