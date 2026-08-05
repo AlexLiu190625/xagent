@@ -339,6 +339,76 @@ async def test_stable_scope_does_not_evict_between_turns() -> None:
     assert result is cached_agent
 
 
+class _ScopeTrackingToolConfig:
+    """Minimal ``WebToolConfig`` stand-in: records every scope it is handed
+    without exercising the real swap/cache-drop logic (that logic is pinned
+    separately in ``tests/web/tools/test_web_tool_config_session_factory.py``).
+    """
+
+    def __init__(self, scope: ExecutionScope) -> None:
+        self.scope = scope
+        self.set_calls: list[ExecutionScope] = []
+
+    def set_execution_scope(self, scope: ExecutionScope) -> bool:
+        self.set_calls.append(scope)
+        self.scope = scope
+        return True
+
+
+class _CachedAgentWithToolConfig:
+    def __init__(self, tool_config: _ScopeTrackingToolConfig) -> None:
+        self.tool_config = tool_config
+        self.invalidate_calls = 0
+
+    def invalidate_tools(self) -> None:
+        self.invalidate_calls += 1
+
+    def cleanup_workspace(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_cached_agent_service_is_resynced_with_the_turn_execution_scope() -> None:
+    """A same-fingerprint scope change keeps the cached AgentService (no
+    rebuild), but the resolved scope for THIS turn must still reach the
+    cached tool config -- otherwise a resolver that hands back a scope
+    object carrying turn-varying data outside the namespace fingerprint
+    (here: ``strict_memory_isolation``, which ``scope_fingerprint`` doesn't
+    cover) would leave the OAuth resolver hook reading the first turn's
+    scope object forever.
+
+    Also covers the ``connector_runtime_turn_id=None`` case: unlike
+    ``_sync_connector_runtime_turn``, the execution-scope resync must not be
+    gated on a turn id being present.
+    """
+    tool_config = _ScopeTrackingToolConfig(SCOPE_A)
+    cached_agent = _CachedAgentWithToolConfig(tool_config)
+    manager = AgentServiceManager()
+    manager._agents[42] = cached_agent
+    manager._agent_owner_ids[42] = 1
+    manager._agent_scope_fingerprints[42] = scope_fingerprint(SCOPE_A)
+
+    scope_b = ExecutionScope(
+        sandbox_key_suffix="tenant-a", strict_memory_isolation=True
+    )
+    assert scope_fingerprint(scope_b) == scope_fingerprint(SCOPE_A)
+    assert scope_b != SCOPE_A
+
+    result = await manager.get_agent_for_task(
+        task_id=42,
+        db=_build_db_mock(_make_task_row()),
+        user=_make_user(),
+        task_setup_snapshot=_build_snapshot(),
+        connector_runtime_turn_id=None,
+        resolved_execution_scope=scope_b,
+    )
+
+    assert result is cached_agent
+    assert tool_config.scope is scope_b
+    assert tool_config.set_calls == [scope_b]
+    assert cached_agent.invalidate_calls == 1
+
+
 @pytest.mark.asyncio
 async def test_resolver_scope_reaches_sandbox_key_on_build() -> None:
     """End-to-end through the resolver path: a fresh build under a scoped

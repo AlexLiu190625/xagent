@@ -1579,6 +1579,43 @@ class WebToolConfig(BaseToolConfig):
         self._pending_runtime_policy = None
         return True
 
+    def set_execution_scope(self, scope: Optional[Any]) -> bool:
+        """Switch the per-turn execution scope for a reused tool config.
+
+        ``WebToolConfig`` is cached with ``AgentService`` by task. The scope is
+        per-turn state exactly like the connector runtime turn id: an embedder
+        resolver may return a scope carrying turn-varying data that the base
+        namespace fingerprint does not cover, and a cached config must not keep
+        serving the first turn's object to the OAuth resolver hook.
+        Namespace-affecting changes never reach here -- the caller evicts on a
+        fingerprint change before this runs.
+
+        No-op only for the same object, or for two plain base
+        ``ExecutionScope`` instances comparing equal: the base class's
+        compared fields fully describe it, and the persisted-snapshot path
+        decodes a fresh equal instance every turn that must not force a tool
+        rebuild. A subclass instance always swaps (unless identical) --
+        subclasses may carry per-turn payload declared ``compare=False``, so
+        value equality cannot prove freshness for them, and two same-type
+        instances differing only in that payload compare equal.
+        """
+        from xagent.core.execution_scope import ExecutionScope
+
+        previous = self._execution_scope
+        if previous is scope:
+            return False
+        if (
+            type(previous) is ExecutionScope
+            and type(scope) is ExecutionScope
+            and previous == scope
+        ):
+            return False
+        self._execution_scope = scope
+        self._cached_mcp_configs = None
+        self._factory_runtime_snapshot = None
+        self._pending_runtime_policy = None
+        return True
+
     def _parse_numeric_task_id(self) -> Optional[int]:
         task_id = self._task_id
         if not isinstance(task_id, str) or not task_id:
