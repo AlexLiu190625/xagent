@@ -1,3 +1,4 @@
+import gzip
 from pathlib import Path
 
 import httpx
@@ -472,6 +473,126 @@ async def test_oauth_post_rejects_response_larger_than_streaming_limit():
             )
 
     assert exc.value.code == "response_too_large"
+
+
+@pytest.mark.asyncio
+async def test_oauth_post_rejects_compressed_response_without_decoding():
+    # The wire payload is tiny and its *decoded* size stays comfortably
+    # under max_response_bytes, so a decoded-size check alone would let this
+    # through. The rejection must come from the Content-Encoding check
+    # firing before any decompression happens -- if that check is removed,
+    # this response decodes cleanly under the cap and the call would
+    # succeed instead of raising, which is what proves the fix is load
+    # bearing (a decoded-size-only guard cannot catch this case).
+    payload = b"0" * (1024 * 1024)
+    compressed = gzip.compress(payload)
+    assert len(compressed) < len(payload) / 100
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=compressed,
+            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await oauth_post(
+                "https://auth.example.com/register",
+                client=client,
+                max_response_bytes=2 * 1024 * 1024,
+                json={"client_name": "Xagent"},
+            )
+
+    assert exc.value.code == "unsupported_response_encoding"
+
+
+@pytest.mark.asyncio
+async def test_oauth_post_refuses_encoded_body_before_reading_any_of_it():
+    # The ordering is the actual bomb defense: the refusal must fire from the
+    # headers alone, before a single body byte is pulled (and decompressed).
+    # A counting stream makes the guarantee mechanical -- if the encoding
+    # check moves after the read loop, reads becomes nonzero and this fails
+    # even though the decoded size would still be under the cap.
+    reads = {"count": 0}
+
+    class _CountingStream(httpx.AsyncByteStream):
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = chunks
+
+        async def __aiter__(self):
+            for chunk in self._chunks:
+                reads["count"] += 1
+                yield chunk
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=_CountingStream([gzip.compress(b"0" * 4096)]),
+            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await oauth_post(
+                "https://auth.example.com/register",
+                client=client,
+                max_response_bytes=1024 * 1024,
+                json={"client_name": "Xagent"},
+            )
+
+    assert exc.value.code == "unsupported_response_encoding"
+    assert reads["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_oauth_post_accepts_identity_encoded_response_under_limit():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b'{"client_id":"dynamic-client"}',
+            headers={
+                "Content-Encoding": "identity",
+                "Content-Type": "application/json",
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await oauth_post(
+            "https://auth.example.com/register",
+            client=client,
+            max_response_bytes=1024,
+            json={"client_name": "Xagent"},
+        )
+
+    assert response.json() == {"client_id": "dynamic-client"}
+
+
+@pytest.mark.asyncio
+async def test_oauth_post_bounded_requests_ask_for_identity_encoding():
+    # httpx advertises gzip/br/zstd by default; a compliant server honoring
+    # that would then be refused by the response-side encoding guard. A
+    # bounded read must therefore ask for identity itself -- the caller
+    # should not have to know to do it.
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            content=b'{"client_id":"dynamic-client"}',
+            headers={"Content-Type": "application/json"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await oauth_post(
+            "https://auth.example.com/register",
+            client=client,
+            max_response_bytes=1024,
+            json={"client_name": "Xagent"},
+        )
+
+    assert seen[0].headers["accept-encoding"] == "identity"
 
 
 @pytest.mark.asyncio

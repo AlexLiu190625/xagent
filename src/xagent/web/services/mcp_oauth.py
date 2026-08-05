@@ -266,6 +266,15 @@ async def oauth_post(
                 **request_kwargs,
             )
         else:
+            # A bounded read must not invite compression: httpx advertises
+            # gzip/br/zstd by default, and the Content-Encoding refusal below
+            # would then reject compliant servers that simply honored it.
+            # Force identity on the request so compliant servers send plain
+            # bytes; the response-side check stays as the hard guard against
+            # peers that compress anyway.
+            headers = httpx.Headers(request_kwargs.pop("headers", None))
+            headers["accept-encoding"] = "identity"
+            request_kwargs["headers"] = headers
             async with client.stream(
                 "POST",
                 url,
@@ -277,14 +286,26 @@ async def oauth_post(
                         "invalid_resource",
                         "OAuth token endpoint redirects are not supported",
                     )
+                # max_response_bytes bounds the decoded byte count, but
+                # aiter_bytes() yields httpx's auto-decompressed output, so a
+                # compressed body can inflate far past the cap before the
+                # check below ever sees it. Refuse encoded bodies outright
+                # instead of decompressing-then-measuring; callers that need
+                # compression must not pass max_response_bytes.
+                content_encoding = streamed_response.headers.get("content-encoding", "")
+                if content_encoding.strip().lower() not in {"", "identity"}:
+                    raise MCPOAuthDiscoveryError(
+                        "unsupported_response_encoding",
+                        "OAuth endpoint response used an unsupported content encoding",
+                    )
                 content = bytearray()
                 async for chunk in streamed_response.aiter_bytes():
-                    content.extend(chunk)
-                    if len(content) > max_response_bytes:
+                    if len(content) + len(chunk) > max_response_bytes:
                         raise MCPOAuthDiscoveryError(
                             "response_too_large",
                             "OAuth endpoint response exceeded the allowed size",
                         )
+                    content.extend(chunk)
                 response = httpx.Response(
                     streamed_response.status_code,
                     headers=[
@@ -371,6 +392,11 @@ async def register_mcp_oauth_public_client(
             raise MCPOAuthDiscoveryError(
                 "client_registration_failed",
                 "OAuth client registration response exceeded the allowed size",
+            ) from exc
+        if exc.code == "unsupported_response_encoding":
+            raise MCPOAuthDiscoveryError(
+                "client_registration_failed",
+                "OAuth client registration response used an unsupported content encoding",
             ) from exc
         raise
     except (httpx.HTTPError, ValueError) as exc:
