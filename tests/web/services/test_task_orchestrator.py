@@ -28,6 +28,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.db_teardown import drop_all_tables
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.web.models import database as database_module
@@ -94,20 +95,7 @@ def db_session(tmp_path):
         yield db
     finally:
         db.close()
-        # FK enforcement is on for this engine's connections (see
-        # apply_sqlite_concurrency_pragmas), and the checkpoint pointer's
-        # FK forms a cycle with trace_events.task_id -> tasks.id. A test
-        # that leaves a real cross-reference between the two tables (a
-        # populated last_checkpoint_trace_event_id) makes drop_all's table
-        # order irrelevant -- no order satisfies both directions of a
-        # populated cycle under enforcement. Dropping the tables is the
-        # only goal here, not preserving referential integrity of data
-        # about to be discarded, so enforcement is turned off for this one
-        # connection rather than for the fixture's tests.
-        engine = get_engine()
-        with engine.begin() as conn:
-            conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
-            Base.metadata.drop_all(bind=conn)
+        drop_all_tables(get_engine())
 
 
 @pytest.fixture()
