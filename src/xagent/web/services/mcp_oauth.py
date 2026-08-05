@@ -277,14 +277,26 @@ async def oauth_post(
                         "invalid_resource",
                         "OAuth token endpoint redirects are not supported",
                     )
+                # max_response_bytes bounds the decoded byte count, but
+                # aiter_bytes() yields httpx's auto-decompressed output, so a
+                # compressed body can inflate far past the cap before the
+                # check below ever sees it. Refuse encoded bodies outright
+                # instead of decompressing-then-measuring; callers that need
+                # compression must not pass max_response_bytes.
+                content_encoding = streamed_response.headers.get("content-encoding", "")
+                if content_encoding.strip().lower() not in {"", "identity"}:
+                    raise MCPOAuthDiscoveryError(
+                        "response_too_large",
+                        "OAuth endpoint response exceeded the allowed size",
+                    )
                 content = bytearray()
                 async for chunk in streamed_response.aiter_bytes():
-                    content.extend(chunk)
-                    if len(content) > max_response_bytes:
+                    if len(content) + len(chunk) > max_response_bytes:
                         raise MCPOAuthDiscoveryError(
                             "response_too_large",
                             "OAuth endpoint response exceeded the allowed size",
                         )
+                    content.extend(chunk)
                 response = httpx.Response(
                     streamed_response.status_code,
                     headers=[
