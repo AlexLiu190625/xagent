@@ -2746,8 +2746,8 @@ class AgentServiceManager:
         agent = self._agents.get(task_id)
         if agent is None:
             return
-        tool_config = getattr(agent, "tool_config", None)
-        if tool_config is None or not hasattr(tool_config, "set_execution_scope"):
+        tool_config = agent.tool_config
+        if tool_config is None:
             return
         if tool_config.set_execution_scope(scope):
             logger.info(

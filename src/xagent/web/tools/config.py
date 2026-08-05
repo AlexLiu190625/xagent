@@ -1583,9 +1583,25 @@ class WebToolConfig(BaseToolConfig):
         serving the first turn's object to the OAuth resolver hook.
         Namespace-affecting changes never reach here -- the caller evicts on a
         fingerprint change before this runs.
+
+        No-op only for the same object, or for two plain base
+        ``ExecutionScope`` instances comparing equal: the base class's
+        compared fields fully describe it, and the persisted-snapshot path
+        decodes a fresh equal instance every turn that must not force a tool
+        rebuild. A subclass instance always swaps (unless identical) --
+        subclasses may carry per-turn payload declared ``compare=False``, so
+        value equality cannot prove freshness for them, and two same-type
+        instances differing only in that payload compare equal.
         """
-        if self._execution_scope == scope and type(self._execution_scope) is type(
-            scope
+        from xagent.core.execution_scope import ExecutionScope
+
+        previous = self._execution_scope
+        if previous is scope:
+            return False
+        if (
+            type(previous) is ExecutionScope
+            and type(scope) is ExecutionScope
+            and previous == scope
         ):
             return False
         self._execution_scope = scope

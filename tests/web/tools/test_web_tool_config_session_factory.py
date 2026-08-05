@@ -2678,23 +2678,48 @@ class _ScopeWithTurnPayload(ExecutionScope):
         return hash((self.sandbox_key_suffix, self.workspace_segments))
 
 
+def _prime_scope_derived_caches(cfg: WebToolConfig) -> None:
+    cfg._cached_mcp_configs = [{"id": 1, "connector_runtime": {"context": {}}}]
+    cfg._factory_runtime_snapshot = object()
+    cfg._pending_runtime_policy = object()
+
+
+def _assert_scope_derived_caches_primed(cfg: WebToolConfig) -> None:
+    assert cfg._cached_mcp_configs is not None
+    assert cfg._factory_runtime_snapshot is not None
+    assert cfg._pending_runtime_policy is not None
+
+
+def _assert_scope_derived_caches_dropped(cfg: WebToolConfig) -> None:
+    assert cfg._cached_mcp_configs is None
+    assert cfg._factory_runtime_snapshot is None
+    assert cfg._pending_runtime_policy is None
+
+
 def test_set_execution_scope_swaps_the_scope_and_drops_scope_derived_caches():
     scope_a = ExecutionScope(sandbox_key_suffix="tenant-a")
     cfg = WebToolConfig(db=None, request=None, execution_scope=scope_a)
-    cfg._cached_mcp_configs = [{"id": 1, "connector_runtime": {"context": {}}}]
+    _prime_scope_derived_caches(cfg)
 
-    # Same scope object: no-op, scope-derived cache untouched.
+    # Same scope object: no-op, every scope-derived cache untouched.
     assert cfg.set_execution_scope(scope_a) is False
     assert cfg.get_execution_scope() is scope_a
-    assert cfg._cached_mcp_configs is not None
+    _assert_scope_derived_caches_primed(cfg)
+
+    # A fresh base-class instance comparing equal is also a no-op: the
+    # persisted-snapshot path decodes a fresh equal instance every turn and
+    # must not force a tool rebuild.
+    assert (
+        cfg.set_execution_scope(ExecutionScope(sandbox_key_suffix="tenant-a")) is False
+    )
+    assert cfg.get_execution_scope() is scope_a
+    _assert_scope_derived_caches_primed(cfg)
 
     # Different scope: swaps and drops every scope-derived cache.
     scope_b = ExecutionScope(sandbox_key_suffix="tenant-b")
     assert cfg.set_execution_scope(scope_b) is True
     assert cfg.get_execution_scope() is scope_b
-    assert cfg._cached_mcp_configs is None
-    assert cfg._factory_runtime_snapshot is None
-    assert cfg._pending_runtime_policy is None
+    _assert_scope_derived_caches_dropped(cfg)
 
     # Repeating the same scope is a no-op again, leaving state alone.
     cfg._cached_mcp_configs = ["sentinel"]
@@ -2715,6 +2740,28 @@ def test_set_execution_scope_swaps_the_scope_and_drops_scope_derived_caches():
     assert cfg.set_execution_scope(scope_b_with_turn_payload) is True
     assert cfg.get_execution_scope() is scope_b_with_turn_payload
     assert cfg._cached_mcp_configs is None
+
+
+def test_set_execution_scope_swaps_equal_same_subclass_instances():
+    # Two instances of the SAME subclass differing only in payload the
+    # subclass excludes from equality: successive turns of a resolver that
+    # returns a richer scope per turn. Value equality cannot prove freshness
+    # for a subclass, so the setter must swap.
+    turn_1 = _ScopeWithTurnPayload(sandbox_key_suffix="tenant-c", turn_marker="turn-1")
+    cfg = WebToolConfig(db=None, request=None, execution_scope=turn_1)
+    _prime_scope_derived_caches(cfg)
+
+    # The identical object stays a no-op even for a subclass.
+    assert cfg.set_execution_scope(turn_1) is False
+    _assert_scope_derived_caches_primed(cfg)
+
+    turn_2 = _ScopeWithTurnPayload(sandbox_key_suffix="tenant-c", turn_marker="turn-2")
+    assert turn_2 == turn_1
+    assert type(turn_2) is type(turn_1)
+
+    assert cfg.set_execution_scope(turn_2) is True
+    assert cfg.get_execution_scope() is turn_2
+    _assert_scope_derived_caches_dropped(cfg)
 
 
 def test_connector_runtime_view_resolution_errors_fail_closed(monkeypatch):
