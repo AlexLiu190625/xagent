@@ -712,6 +712,83 @@ async def test_a_clean_recovery_sweep_clears_the_ambiguity_signal(
         clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
 
 
+@pytest.mark.parametrize("batch_size", [1, 10])
+@pytest.mark.asyncio
+async def test_ambiguity_signal_survives_a_later_clean_candidate_in_the_same_sweep(
+    db_session,
+    batch_size: int,
+) -> None:
+    """A drain that hits an ambiguity and then a resolvable candidate still
+    reports the ambiguity once it finishes.
+
+    The clear belongs to the whole drain, not to a candidate or a page. At
+    either finer grain the clean candidate processed after the ambiguous one
+    would erase the signal before the sweep ends, and an ambiguity every
+    sweep re-hits could never stay visible. The two batch sizes separate
+    those grains: 10 puts both candidates in one page, 1 puts the clean one
+    in the page after the ambiguous one.
+    """
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LEGACY_POINTER_AMBIGUOUS,
+        active_degradations,
+        clear_degradation,
+    )
+
+    user = _create_user(db_session, suffix=f"ambiguous-then-clean-{batch_size}")
+    ambiguous = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix=f"ambiguous-then-clean-first-{batch_size}",
+        with_checkpoint=True,
+    )
+    db_session.add(
+        TraceEvent(
+            task_id=ambiguous.id,
+            event_id=ambiguous.last_checkpoint_event_id,
+            event_type="system_update_general",
+            timestamp=utc_now(),
+            data={
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "snapshot": {"type": "checkpoint"},
+                TASK_RUN_ID_TRACE_FIELD: ambiguous.run_id,
+            },
+        )
+    )
+    clean = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix=f"ambiguous-then-clean-second-{batch_size}",
+        with_checkpoint=True,
+    )
+    db_session.commit()
+
+    cutoff = utc_now()
+    # Pin the order the drain will see them in: this test is only meaningful
+    # for a clean candidate that comes *after* an ambiguous one.
+    scan_order = [
+        candidate.task_id
+        for candidate in get_expired_task_lease_candidates(
+            db_session, cutoff=cutoff, limit=10
+        )
+    ]
+    assert scan_order == [int(ambiguous.id), int(clean.id)]
+
+    clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
+    try:
+        await recover_expired_task_leases_until_cutoff(
+            cutoff=cutoff, batch_size=batch_size
+        )
+
+        assert CHECKPOINT_LEGACY_POINTER_AMBIGUOUS in active_degradations()
+        db_session.expire_all()
+        # The clean candidate really was processed after the ambiguous one,
+        # so the surviving signal is not merely an untouched sweep.
+        assert db_session.get(Task, int(clean.id)).status is TaskStatus.PAUSED
+        assert db_session.get(Task, int(ambiguous.id)).status is TaskStatus.RUNNING
+    finally:
+        clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
+
+
 @pytest.mark.parametrize(
     "replacement",
     ["heartbeat", "runner", "run", "state_version", "checkpoint", "checkpoint_pk"],
