@@ -19,11 +19,12 @@ This keeps the dependency edges obvious and avoids the "what's
 magically in scope?" question that pure-fixture conftests get.
 """
 
+import asyncio
 import logging
 import os
 import shutil
 import tempfile
-from typing import Iterator
+from typing import Any, Iterator
 
 import pytest
 from fastapi import FastAPI, Request
@@ -53,6 +54,7 @@ from xagent.web.api.widget import widget_router
 from xagent.web.api.workforces import router as workforces_router
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.services import task_orchestrator as task_orchestrator_service
 from xagent.web.services.a2a_protocol import (
     A2AApiError,
     a2a_api_error_handler,
@@ -340,3 +342,29 @@ def _install_one_slot_queue_pool(
         sessionmaker(autocommit=False, autoflush=False, bind=engine),
     )
     return engine
+
+
+def patch_schedule_bg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace the leaf that starts a real background turn with a no-op task.
+
+    The workforce guest create path reaches
+    ``TaskTurnOrchestrator.schedule_claimed_create_turn`` ->
+    ``schedule_claimed_turn`` -> ``_schedule_bg``. Patching only that leaf
+    keeps the claim-to-schedule handoff real -- a raise anywhere in it still
+    fails the test -- while leaving no live background task for
+    ``public_chat_access.py`` to drop un-awaited, which would otherwise race
+    ``Base.metadata.drop_all`` below.
+
+    Lives here rather than in each suite: three api/ suites need it, and while
+    each kept its own copy they drifted -- two stubbed a call the workforce
+    create path never makes, so the stub was inert and the background turn ran
+    anyway.
+    """
+
+    def fake_schedule_bg(**_kwargs: Any) -> "asyncio.Task[None]":
+        async def noop() -> None:
+            return None
+
+        return asyncio.create_task(noop())
+
+    monkeypatch.setattr(task_orchestrator_service, "_schedule_bg", fake_schedule_bg)

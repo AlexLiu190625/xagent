@@ -135,7 +135,7 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # not a guard: the path is off the sanitizer by construction, so this test
 # cannot regress if this set changes.
 #
-# ``selected_file_ids`` qualifies for the same reason and passes both checks.
+# ``selected_file_ids`` qualifies for the same reason and passes the checks above.
 # It was declared server-owned when it was introduced -- ``chat.py``'s
 # ``_build_task_agent_config`` drops the client value and substitutes a list
 # validated against ``UploadedFile.user_id`` and ``task_id IS NULL`` -- but
