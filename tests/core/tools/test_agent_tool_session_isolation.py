@@ -404,15 +404,20 @@ def test_agent_tool_result_declares_every_classified_failure_key():
 
     ``AgentTool.return_type()`` is ``AgentToolResult``; a consumer that
     model-validates and re-dumps a classified failure must not be able to
-    silently strip the classification keys. Every key ``_classified_failure``
-    can emit must be a subset of the model's declared fields.
+    silently strip the classification keys. Asserting the actual round trip
+    (not just field declaration) also guards against a future ``exclude``
+    or alias on a field, which would strip keys while still passing a
+    declared-fields subset check.
     """
 
     plain = mod._classified_failure("boom")
     with_code = mod._classified_failure("boom", failure_code="missing_delegated_output")
 
-    assert set(plain) <= set(mod.AgentToolResult.model_fields)
-    assert set(with_code) <= set(mod.AgentToolResult.model_fields)
+    for envelope in (plain, with_code):
+        round_tripped = mod.AgentToolResult.model_validate(envelope).model_dump(
+            exclude_none=True
+        )
+        assert round_tripped == envelope
 
 
 @pytest.mark.asyncio
