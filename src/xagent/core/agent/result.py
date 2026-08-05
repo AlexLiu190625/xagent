@@ -4,7 +4,19 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-TOOL_FAILURE_CODES = frozenset({"oauth_token_required"})
+TOOL_FAILURE_CODES = frozenset(
+    {
+        "oauth_token_required",
+        "unsupported_nested_interaction",
+        "missing_delegated_output",
+    }
+)
+
+# Placeholder outputs the execution layers substitute when a run produced no
+# text of its own. They are recognized, not produced, by the delegation
+# classifier: a child that returns one of these completed without answering.
+NO_OUTPUT_PLACEHOLDER = "No output provided"
+NO_RESPONSE_PLACEHOLDER = "No response generated"
 
 
 def normalize_tool_failure_code(value: Any) -> str | None:
@@ -13,14 +25,30 @@ def normalize_tool_failure_code(value: Any) -> str | None:
     return value if type(value) is str and value in TOOL_FAILURE_CODES else None
 
 
+def is_oauth_token_required_code(value: Any) -> bool:
+    """Return True iff value is the exact "oauth_token_required" plain string.
+
+    A str subclass is a trust-boundary input, not an allowlisted code.
+    """
+    return type(value) is str and value == "oauth_token_required"
+
+
 @dataclass(frozen=True)
 class ClassifiedToolFailure:
-    """Safe classified failure outcome shared across core runtime boundaries."""
+    """Sentinel an OAuth token resolver returns when it cannot refresh a token.
+
+    Its only current consumer is the delegated-authorization retry path in
+    the MCP adapter, which treats any instance as an OAuth failure regardless
+    of the carried code. ``failure_code`` is validated against the exact
+    ``"oauth_token_required"`` literal, not the wider runtime allowlist: a
+    new public failure code becomes surfaceable by the runtime without
+    becoming carriable by this type.
+    """
 
     failure_code: str
 
     def __post_init__(self) -> None:
-        if normalize_tool_failure_code(self.failure_code) is None:
+        if not is_oauth_token_required_code(self.failure_code):
             raise ValueError("invalid tool failure code")
 
 

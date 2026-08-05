@@ -119,6 +119,28 @@ def test_agent_tool_child_tracer_persists_and_broadcasts() -> None:
     )
 
 
+def test_delegation_trace_data_caps_error_text() -> None:
+    """The error text in delegation trace data must be capped like output is.
+
+    Both fields share one constant so the two caps cannot drift apart; an
+    uncapped error could otherwise carry an unbounded amount of child text
+    into trace storage.
+    """
+    tool = AgentTool(
+        agent_id=17,
+        agent_name="Video Generation Agent",
+        agent_description="Generate approved scenes.",
+        session_factory=None,
+        user_id=1,
+    )
+
+    long_error = "e" * 5000
+    data = tool._build_delegation_trace_data("error", error=long_error)
+
+    assert len(data["error"]) == 2000
+    assert data["error"] == long_error[:2000]
+
+
 @pytest.fixture
 def mock_workspace_db():
     yield
@@ -639,6 +661,149 @@ class TestCreateAgentTool:
                 assert db_handlers[0].metadata["parent_task_id"] == "77"
                 assert db_handlers[0].metadata["parent_db_task_id"] == 77
                 assert db_handlers[0].metadata["agent_id"] == agent.id
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_agent_tool_classified_failure_does_not_register_file_outputs(
+        self,
+    ) -> None:
+        db, db_path, SessionLocal = _create_session()
+        try:
+            user = User(
+                username="classified-failure-user", password_hash="x", is_admin=False
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            task = Task(id=77, user_id=user.id, title="Parent task")
+            db.add(task)
+            db.commit()
+
+            model = Model(
+                model_id="test-model-id",
+                category="llm",
+                model_provider="openai",
+                model_name="gpt-4",
+                api_key="test-api-key",
+                base_url="https://api.openai.com/v1",
+                temperature=0.7,
+                abilities=["chat"],
+            )
+            db.add(model)
+            db.commit()
+            db.refresh(model)
+
+            agent = Agent(
+                user_id=user.id,
+                name="File Worker",
+                description="Writes files",
+                instructions="Write a report.",
+                status=AgentStatus.PUBLISHED,
+                models={"general": model.id},
+            )
+            db.add(agent)
+            db.commit()
+            db.refresh(agent)
+
+            class ParentTracer:
+                def __init__(self) -> None:
+                    self.handlers = []
+                    self.events = []
+
+                async def trace_event(
+                    self, event_type, task_id=None, step_id=None, data=None
+                ):
+                    self.events.append(
+                        {
+                            "event_type": event_type.value,
+                            "task_id": task_id,
+                            "step_id": step_id,
+                            "data": data or {},
+                        }
+                    )
+
+            parent_tracer = ParentTracer()
+
+            with tempfile.TemporaryDirectory() as workspace_root:
+                worker_workspace = TaskWorkspace(
+                    id=f"agent_{agent.id}_abcd1234",
+                    base_dir=workspace_root,
+                    db_task_id=77,
+                )
+                output_path = worker_workspace.output_dir / "report.txt"
+                output_path.write_text("worker report", encoding="utf-8")
+
+                tool = AgentTool(
+                    agent_id=agent.id,
+                    agent_name=agent.name,
+                    agent_description=agent.description or "",
+                    session_factory=SessionLocal,
+                    user_id=user.id,
+                    task_id="77",
+                    parent_task_id="77",
+                    parent_tracer=parent_tracer,
+                    workspace_base_dir=workspace_root,
+                    runtime_metadata={"workforce_id": 1},
+                )
+
+                with (
+                    patch(
+                        "xagent.web.services.llm_utils.UserAwareModelStorage"
+                    ) as mock_storage_class,
+                    patch(
+                        "xagent.core.agent.service.AgentService"
+                    ) as mock_agent_service_class,
+                    patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+                ):
+                    mock_storage = Mock()
+                    mock_llm = Mock()
+                    mock_storage.get_llm_by_name_with_access.return_value = mock_llm
+                    mock_storage_class.return_value = mock_storage
+
+                    mock_agent_service = mock_agent_service_class.return_value
+                    mock_agent_service.workspace = worker_workspace
+                    mock_agent_service.execute_task = AsyncMock(
+                        return_value={
+                            "status": "waiting_for_user",
+                            "output": "partial",
+                            "file_outputs": [
+                                {
+                                    "file_path": str(output_path),
+                                    "relative_path": "output/report.txt",
+                                    "filename": "report.txt",
+                                }
+                            ],
+                        }
+                    )
+
+                    result = await tool.run_json_async({"task": "draft report"})
+
+                assert result["failure_code"] == "unsupported_nested_interaction"
+                assert "file_outputs" not in result
+
+                with SessionLocal() as verify_db:  # fresh session, not `db`
+                    assert (
+                        verify_db.query(UploadedFile)
+                        .filter(UploadedFile.task_id == 77)
+                        .count()
+                        == 0
+                    )
+                assert output_path.exists()
+                assert not (
+                    Path(workspace_root)
+                    / f"user_{user.id}"
+                    / "web_task_77"
+                    / "output"
+                    / "report.txt"
+                ).exists()
         finally:
             db.close()
             try:

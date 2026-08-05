@@ -2388,6 +2388,37 @@ async def test_remote_hook_refresh_unknown_failure_code_remains_unclassified(
 
 
 @pytest.mark.asyncio
+async def test_refresh_failure_ignores_non_oauth_runtime_failure_code(
+    db_session,
+):
+    """A runtime-allowlisted code that isn't OAuth-specific must not raise.
+
+    ``ClassifiedToolFailure`` now validates against the OAuth-only set, not
+    the wider runtime allowlist. A resolver that raises with a non-OAuth
+    runtime code (allowlisted for other consumers) must fall through to
+    ``None`` here rather than let a ``ValueError`` escape the handler.
+    """
+    db, user = db_session
+    _add_remote_server(db, user)
+
+    class RefreshFailure(RuntimeError):
+        oauth_token_resolver_failure_code = "unsupported_nested_interaction"
+
+    async def resolver(request: TokenRequest):
+        if request.refresh is None:
+            return ResolvedToken(
+                access_token="initial-token", generation="generation-1"
+            )
+        raise RefreshFailure("refresh-private-secret")
+
+    set_oauth_token_resolver_hook(resolver)
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+    refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
+
+    assert await refresh(_challenge()) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "refresh_result",
     [

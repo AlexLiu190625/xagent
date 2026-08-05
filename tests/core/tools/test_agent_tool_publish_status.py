@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.tools.adapters.vibe.agent_tool import (
     AgentTool,
     create_create_agent_tool,
@@ -399,6 +400,7 @@ async def test_agent_tool_execution_enforces_owner_visibility() -> None:
         result = await tool.run_json_async({"task": "run private worker"})
 
         assert result["response"] == f"Error: Agent {published_agent.id} not found"
+        assert tool_result_succeeded(result) is False
     finally:
         db.close()
         try:
@@ -445,6 +447,7 @@ async def test_agent_tool_execution_enforces_target_allowed_agent_ids() -> None:
         result = await tool.run_json_async({"task": "run blocked worker"})
 
         assert result["response"] == f"Error: Agent {blocked_agent.id} not found"
+        assert tool_result_succeeded(result) is False
     finally:
         db.close()
         try:
@@ -491,6 +494,7 @@ async def test_agent_tool_execution_allows_cross_user_only_with_target_allowlist
         assert (
             blocked_result["response"] == f"Error: Agent {published_agent.id} not found"
         )
+        assert tool_result_succeeded(blocked_result) is False
 
         allowed_tool = AgentTool(
             agent_id=published_agent.id,
@@ -507,6 +511,7 @@ async def test_agent_tool_execution_allows_cross_user_only_with_target_allowlist
         assert allowed_result["response"] == (
             f"Error: No valid model configured for agent {published_agent.name}"
         )
+        assert tool_result_succeeded(allowed_result) is False
     finally:
         db.close()
         try:
@@ -555,6 +560,7 @@ async def test_delegation_allowed_agent_ids_do_not_block_current_worker_executio
         assert result["response"] == (
             f"Error: No valid model configured for agent {worker.name}"
         )
+        assert tool_result_succeeded(result) is False
     finally:
         db.close()
         try:

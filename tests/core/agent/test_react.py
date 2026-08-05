@@ -239,6 +239,26 @@ class IsErrorResultTool:
         }
 
 
+class ClassifiedFailureResultTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = "classified_failure_result"
+            description = "Returns a classified delegated-agent failure."
+
+        self.metadata = Metadata()
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        return {
+            "success": False,
+            "is_error": True,
+            "status": "error",
+            "failure_code": "unsupported_nested_interaction",
+            "error": "Nested agent calls cannot forward interactive prompts.",
+            "output": "Nested agent calls cannot forward interactive prompts.",
+            "response": "Nested agent calls cannot forward interactive prompts.",
+        }
+
+
 class FakeAskUserTool:
     def __init__(self) -> None:
         class Metadata:
@@ -3843,6 +3863,66 @@ async def test_react_pattern_mcp_is_error_result_is_failed_without_failure_code(
     ]
     assert len(failure_events) == 1
     assert "failure_code" not in failure_events[0]["data"]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_classified_failure_preserves_failure_code() -> None:
+    """A classified delegated failure's ``failure_code`` survives end to end.
+
+    ``AgentTool`` returns a classified failure dict (see
+    ``_classified_failure`` in agent_tool.py) carrying a ``failure_code``.
+    A real ``ReActPattern`` run must preserve it on all three parent-level
+    surfaces: the tool ledger record, the tool message's ``raw_result``
+    metadata, and the ``action_error_tool`` trace event's data.
+    """
+    tracer = TraceEventRecorder()
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Use classified failure tool.",
+                "tool_calls": [
+                    {
+                        "id": "call_classified",
+                        "function": {
+                            "name": "classified_failure_result",
+                            "arguments": '{"value":3}',
+                        },
+                    }
+                ],
+            },
+            {"content": "Recovered after classified failure."},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(execution_id="classified-failure-result")
+    context.add_user_message("Recover")
+    runtime = PatternRuntime(tracer=tracer)
+
+    result = await pattern.run(
+        context=context,
+        tools=[ClassifiedFailureResultTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert pattern.tool_ledger["call_classified"].status == "failed"
+    assert (
+        pattern.tool_ledger["call_classified"].result["failure_code"]
+        == "unsupported_nested_interaction"
+    )
+
+    tool_message = context.get_messages_by_role("tool")[0]
+    assert (
+        tool_message.metadata["raw_result"]["failure_code"]
+        == "unsupported_nested_interaction"
+    )
+
+    failure_events = [
+        event for event in tracer.events if event["event_type"] == "action_error_tool"
+    ]
+    assert len(failure_events) == 1
+    assert failure_events[0]["data"]["failure_code"] == "unsupported_nested_interaction"
 
 
 @pytest.mark.asyncio

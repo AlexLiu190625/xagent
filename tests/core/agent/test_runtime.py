@@ -968,6 +968,100 @@ async def test_on_tool_end_emits_only_allowlisted_top_level_failure_code(
 
 
 @pytest.mark.asyncio
+async def test_on_tool_end_marks_classified_nested_wait_as_failed() -> None:
+    """A classified nested-wait failure must route through on_tool_error.
+
+    The ReAct loop records ``status="failed"`` for this tool call and
+    continues (it does not stop the parent run — see
+    ``react.py:2787-2803``). This test covers the runtime half only: that a
+    classified failure dict, not an exception, is enough to route through
+    ``on_tool_error`` and carry ``failure_code`` into the emitted trace
+    event.
+    """
+
+    class CapturingTracer:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> None:
+            self.events.append(
+                {
+                    "type": getattr(event_type, "value", str(event_type)),
+                    "data": kwargs.get("data") or {},
+                }
+            )
+
+    tracer = CapturingTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="task-nested-wait")
+    result = {
+        "success": False,
+        "is_error": True,
+        "status": "error",
+        "failure_code": "unsupported_nested_interaction",
+        "error": "Nested agent calls cannot forward interactive prompts.",
+        "output": "Nested agent calls cannot forward interactive prompts.",
+        "response": "Nested agent calls cannot forward interactive prompts.",
+    }
+
+    await runtime.on_tool_end(
+        tool_call={"name": "delegated_agent", "id": "call-nested"},
+        result=result,
+    )
+
+    assert [event["type"] for event in tracer.events] == ["action_error_tool"]
+    event_data = tracer.events[0]["data"]
+    assert event_data["failure_code"] == "unsupported_nested_interaction"
+    assert event_data["result"] == result
+    assert runtime._tool_result_success(result) is False
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_carries_missing_output_failure_code() -> None:
+    """The missing-delegated-output code must propagate into trace data too.
+
+    Same runtime-level contract as the nested-wait case: a classified failure
+    dict is enough, no exception required, to carry a new allowlisted
+    failure_code into the emitted trace event.
+    """
+
+    class CapturingTracer:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> None:
+            self.events.append(
+                {
+                    "type": getattr(event_type, "value", str(event_type)),
+                    "data": kwargs.get("data") or {},
+                }
+            )
+
+    tracer = CapturingTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="task-missing-output")
+    result = {
+        "success": False,
+        "is_error": True,
+        "status": "error",
+        "failure_code": "missing_delegated_output",
+        "error": "The delegated agent reported completion without returning "
+        "any usable output, so there is no answer from it to use.",
+        "output": "The delegated agent reported completion without returning "
+        "any usable output, so there is no answer from it to use.",
+        "response": "The delegated agent reported completion without "
+        "returning any usable output, so there is no answer from it to use.",
+    }
+
+    await runtime.on_tool_end(
+        tool_call={"name": "delegated_agent", "id": "call-missing-output"},
+        result=result,
+    )
+
+    assert [event["type"] for event in tracer.events] == ["action_error_tool"]
+    event_data = tracer.events[0]["data"]
+    assert event_data["failure_code"] == "missing_delegated_output"
+
+
+@pytest.mark.asyncio
 async def test_concurrent_tool_calls_all_count() -> None:
     """A concurrent batch (asyncio.gather) increments the shared counter once per tool.
 
