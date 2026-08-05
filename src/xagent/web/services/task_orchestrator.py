@@ -62,6 +62,7 @@ from ..models.task import Task, TaskStatus
 from .chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
     DELIVERY_PENDING,
     mark_user_message_delivery_sync,
 )
@@ -702,22 +703,137 @@ async def _schedule_committed_turn(
         # Claim commit + background scheduling already succeeded. A transient
         # delivery projection failure must not turn that success into an API
         # error or invite the caller to retry a turn that is already running.
-        if is_database_pool_timeout(delivery_error):
-            logger.error(
-                "task_id=%s component=turn-delivery database pool checkout timed "
-                "out after scheduling; leaving delivery pending for durable "
-                "recovery: %s",
-                task_id,
-                delivery_error,
-                exc_info=True,
-            )
-        else:
-            logger.exception(
-                "task_id=%s component=turn-delivery projection failed after "
-                "scheduling; leaving delivery pending for durable recovery",
-                task_id,
-            )
+        _log_delivery_projection_failure(
+            task_id,
+            component="turn-delivery",
+            error=delivery_error,
+            detail=" after scheduling",
+        )
     return handle
+
+
+def _log_delivery_projection_failure(
+    task_id: int,
+    *,
+    component: str,
+    error: Exception,
+    detail: str = "",
+) -> None:
+    """Log one swallowed delivery-projection failure without re-raising.
+
+    Pool checkout timeouts get their explicit marker — the committed row stays
+    reclaimable and the caller must not issue another checkout against the
+    exhausted pool. Anything else keeps its traceback via ``logger.exception``.
+    """
+
+    if is_database_pool_timeout(error):
+        logger.error(
+            "task_id=%s component=%s database pool checkout timed out%s; "
+            "leaving delivery pending for durable recovery: %s",
+            task_id,
+            component,
+            detail,
+            error,
+            exc_info=True,
+        )
+    else:
+        logger.exception(
+            "task_id=%s component=%s projection failed%s; "
+            "leaving delivery pending for durable recovery",
+            task_id,
+            component,
+            detail,
+        )
+
+
+def _reconcile_finalized_turn_delivery(
+    *,
+    task_id: int,
+    turn_id: str | None,
+    settlement_error: str | None,
+    execution_started: bool,
+) -> None:
+    """Close a terminally settled turn's delivery row (xorbitsai/xagent-saas#332).
+
+    A user-message delivery row is written ``pending`` with the turn claim and
+    projected to ``dispatched`` right after scheduling. That projection is
+    best-effort: a pool timeout or a transient DB error leaves the row
+    ``pending`` even though the turn ran. Nothing else on the orchestrator path
+    advances it, so the session WS dedup probe classifies every
+    same-``client_message_id`` retry as an in-flight ``PENDING`` and rejects it
+    forever.
+
+    Reconciling at finalize closes that window for every turn that reaches a
+    terminal lease settlement owned by its coroutine. The call is intentionally
+    skipped — leaving the row ``pending`` — when the coroutine is not the
+    authoritative closer: the lease went to another worker, settlement was
+    deferred to TTL recovery or raised, the settle was fenced out / superseded
+    (returned ``False``), or the pre-execution SETTLEMENT_READY short-circuit
+    fired. A hard process crash skips it too. Of those leftovers, only the
+    paused-task resume path has an in-repo consumer that re-posts the same
+    ``turn_id``; ``task_lease_recovery`` terminalizes the *task* but never
+    redrives the turn or touches delivery rows, so the deferral/crash cases
+    remain a narrower instance of the stuck-``pending`` window, not a solved
+    one.
+
+    Target selection is driven by what finalize actually knows, because the
+    downstream contract is asymmetric: the session WS probe answers a
+    ``failed`` row with ``retry_with_new_id`` — an invitation to re-send the
+    same content — so ``failed`` is only safe with positive evidence the
+    message was never consumed.
+
+    - ``settlement_error is None`` → ``completed``: the run returned without
+      raising. Note this does not certify success — ``execute_task_background``
+      may set ``task.status = FAILED`` internally and return normally, leaving
+      ``settlement_error`` unset — but both ``completed`` and ``dispatched``
+      read identically downstream ("delivered, do not retry"), so the
+      distinction has no client-visible effect.
+    - error and ``execution_started`` → ``dispatched``: the run may have
+      consumed the message (and produced side effects) before failing, so the
+      one certain fact is "no longer in flight". A retry invitation here would
+      double-execute the turn. The probe treats ``dispatched`` as delivered;
+      the turn's failure is surfaced through task status, not by reopening
+      delivery. This also removes the timing asymmetry with the post-schedule
+      projection: whichever best-effort write lands, the row converges on
+      ``dispatched``.
+    - error and not ``execution_started`` → ``failed``:
+      ``execute_task_background`` was never invoked (setup failed, or the run
+      was cancelled first), so the message was provably never consumed and a
+      fresh-id retry is safe. The accepted cost is that the ``failed`` row
+      remains visible in the transcript (no history-loading path filters on
+      ``delivery_status``), so a fresh-id resend can show the user's message
+      twice — a pre-existing property of every ``failed`` writer, tracked in
+      xorbitsai/xagent-saas#417, and strictly better than wedging the client
+      on a ``pending`` row forever.
+
+    The transition is monotonic — it never regresses — but only ``completed``
+    and ``failed`` are terminal: ``dispatched`` still has an outgoing edge to
+    ``completed``, which is how a turn that failed its projection but later
+    settles cleanly still closes. An already-terminal row, or a ``dispatched``
+    row on a later failure, is left untouched. The final delivery state is NOT
+    a proxy for the turn's outcome: it answers "may this client_message_id be
+    retried?", never "did the turn succeed?".
+    """
+
+    if turn_id is None:
+        return
+    if settlement_error is None:
+        target = DELIVERY_COMPLETED
+    elif execution_started:
+        target = DELIVERY_DISPATCHED
+    else:
+        target = DELIVERY_FAILED
+    try:
+        mark_user_message_delivery_sync(task_id, turn_id, target)
+    except Exception as delivery_error:
+        # Best-effort projection. Leaving the row for durable recovery is strictly
+        # better than amplifying pool exhaustion or masking the turn's outcome.
+        _log_delivery_projection_failure(
+            task_id,
+            component="turn-finalize-delivery",
+            error=delivery_error,
+            detail=f" (target={target})",
+        )
 
 
 def _turn_started_snapshot(
@@ -1544,6 +1660,12 @@ def _schedule_bg(
         settlement_error: str | None = None
         broadcast_error_message: str | None = None
         defer_settlement_to_ttl_recovery = False
+        skip_delivery_reconciliation = False
+        # Positive evidence for finalize's delivery target: once
+        # ``execute_task_background`` has been invoked, the run may have
+        # consumed the user message, so a failure must not be projected as a
+        # retryable ``failed`` delivery (it would invite a double execution).
+        execution_started = False
         cleanup_cancellation: asyncio.CancelledError | None = None
         try:
             # A cancellation can land after the worker commits but before the
@@ -1598,6 +1720,12 @@ def _schedule_bg(
                         )
                         return
                     if validation == TaskLeaseRefreshState.SETTLEMENT_READY:
+                        # The task reached a terminal/control state before this
+                        # delayed run executed anything. Settlement below is
+                        # still correct, but the turn body never ran, so the
+                        # delivery row must NOT be closed as ``completed`` —
+                        # leave it for the authoritative writer.
+                        skip_delivery_reconciliation = True
                         return
 
                 async def execute_owned_run() -> None:
@@ -1617,6 +1745,8 @@ def _schedule_bg(
                     scope = await run_db_io_cancellation_safe(
                         lambda: resolve_execution_scope(task_id)
                     )
+                    nonlocal execution_started
+                    execution_started = True
                     await execute_task_background(
                         task_id=task_id,
                         user_message=payload.transcript_message,
@@ -1685,6 +1815,7 @@ def _schedule_bg(
                         exc_info=True,
                     )
         finally:
+            turn_id = getattr(payload, "turn_id", None)
             if lease is not None:
                 try:
                     heartbeat_outcome = await stop_task_lease_heartbeat(
@@ -1714,6 +1845,7 @@ def _schedule_bg(
                     )
 
                 if not defer_settlement_to_ttl_recovery:
+                    lease_settled = False
                     try:
                         settled = await run_db_io_cancellation_safe(
                             lambda: settle_task_lease_isolated(
@@ -1721,6 +1853,15 @@ def _schedule_bg(
                                 error_message=settlement_error,
                             )
                         )
+                        # Gate on the returned value, not on "didn't raise":
+                        # ``settle_task_lease_isolated`` returns ``False``
+                        # without raising when the settlement was fenced out
+                        # (lease row gone or owned by a newer run) or when a
+                        # pre-existing terminal/control outcome was reconciled
+                        # instead of this coroutine's view. In both cases this
+                        # coroutine is no longer authoritative for the turn and
+                        # must not close its delivery row.
+                        lease_settled = bool(settled)
                         if settled and broadcast_error_message is not None:
                             try:
                                 await websocket_manager.broadcast_to_task(
@@ -1750,7 +1891,44 @@ def _schedule_bg(
                             settle_err,
                             exc_info=True,
                         )
-            turn_id = getattr(payload, "turn_id", None)
+
+                    # Only when this coroutine's own settlement committed is it
+                    # safe to close the delivery row (xorbitsai/xagent-saas#332):
+                    # a projection that never reached ``dispatched`` would
+                    # otherwise orphan the row at ``pending`` and reject every
+                    # same-id retry forever. Skipped whenever this coroutine is
+                    # not the authoritative closer: settle raised (lease retained
+                    # for TTL recovery), settle was fenced out / superseded
+                    # (returned ``False``), settlement was deferred, or the
+                    # pre-execution SETTLEMENT_READY short-circuit fired (the
+                    # turn body never ran, so ``completed`` would be a lie).
+                    # KNOWN GAP: rows skipped here stay ``pending`` permanently —
+                    # lease TTL recovery terminalizes the *task* only and nothing
+                    # in this tree redrives delivery rows. The skip is still
+                    # correct (a non-authoritative close is worse). Note the
+                    # deferral triggers correlate with this bug's own trigger:
+                    # post-schedule dispatch, setup/run and settle all draw from
+                    # the same DB pool, so one exhaustion event can both orphan
+                    # the row and defer the settlement that would have closed it.
+                    # Tracked in xorbitsai/xagent-saas#409.
+                    if lease_settled and not skip_delivery_reconciliation:
+                        try:
+                            await run_db_io_cancellation_safe(
+                                lambda: _reconcile_finalized_turn_delivery(
+                                    task_id=task_id,
+                                    turn_id=turn_id,
+                                    settlement_error=settlement_error,
+                                    execution_started=execution_started,
+                                )
+                            )
+                        except asyncio.CancelledError as exc:
+                            cleanup_cancellation = cleanup_cancellation or exc
+                        except Exception:
+                            logger.warning(
+                                "task %s finalize delivery reconciliation failed",
+                                task_id,
+                                exc_info=True,
+                            )
             try:
                 from .connector_runtime import pop_ephemeral_runtime_values
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from threading import Barrier, get_ident
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -43,9 +44,13 @@ from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services import task_orchestrator as task_orchestrator_module
 from xagent.web.services.chat_history_service import (
+    DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
     DELIVERY_PENDING,
+    claim_user_message_delivery,
+    inspect_user_message_delivery,
+    mark_user_message_delivery,
 )
 from xagent.web.services.connector_runtime import (
     get_ephemeral_runtime_values,
@@ -56,6 +61,7 @@ from xagent.web.services.task_execution_controller import task_execution_control
 from xagent.web.services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
+    TaskLeaseRefreshState,
     acquire_task_lease_isolated,
     get_runner_id,
 )
@@ -68,6 +74,7 @@ from xagent.web.services.task_orchestrator import (
     TurnKind,
     _begin_turn_atomic_sync,
     _ClaimedTurn,
+    _reconcile_finalized_turn_delivery,
     _schedule_bg,
     finish_turn,
     settle_task_lease_isolated,
@@ -2905,3 +2912,615 @@ async def test_schedule_bg_does_not_overwrite_terminal_status_from_execute(
         "the concrete-lease settlement overwrote a control status."
     )
     assert task.runner_id is None
+
+
+# ---------------------------------------------------------------------------
+# Finalize-time delivery reconciliation (#332)
+# ---------------------------------------------------------------------------
+
+
+def _claim_pending_delivery(db, *, task_id: int, user_id: int, turn_id: str) -> None:
+    """Create a committed ``pending`` delivery row, mirroring a turn claim."""
+
+    claim = claim_user_message_delivery(
+        db,
+        task_id,
+        user_id,
+        "hello there",
+        turn_id=turn_id,
+    )
+    assert claim.claimed is True
+    assert claim.pending is True
+
+
+def _delivery_status(db, turn_id: str) -> str | None:
+    db.expire_all()
+    row = (
+        db.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == turn_id)
+        .one_or_none()
+    )
+    return None if row is None else str(row.delivery_status)
+
+
+def test_reconcile_finalized_delivery_completes_orphaned_pending_on_success(
+    db_session,
+) -> None:
+    """A clean settlement advances an orphaned ``pending`` row to ``completed``."""
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id), status=TaskStatus.RUNNING)
+    _claim_pending_delivery(
+        db_session, task_id=int(task.id), user_id=int(user.id), turn_id="turn-ok"
+    )
+
+    _reconcile_finalized_turn_delivery(
+        task_id=int(task.id),
+        turn_id="turn-ok",
+        settlement_error=None,
+        execution_started=True,
+    )
+
+    assert _delivery_status(db_session, "turn-ok") == DELIVERY_COMPLETED
+
+
+def test_reconcile_finalized_delivery_fails_orphaned_pending_when_never_ran(
+    db_session,
+) -> None:
+    """A turn that provably never executed advances ``pending`` to ``failed``.
+
+    ``failed`` invites a fresh-id retry downstream, so it is only written with
+    positive evidence the message was never consumed
+    (``execution_started=False``). That is the row a same-``client_message_id``
+    retry needs: a usable terminal ack instead of an in-flight ``PENDING``
+    that is rejected forever.
+    """
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id), status=TaskStatus.RUNNING)
+    _claim_pending_delivery(
+        db_session, task_id=int(task.id), user_id=int(user.id), turn_id="turn-boom"
+    )
+
+    _reconcile_finalized_turn_delivery(
+        task_id=int(task.id),
+        turn_id="turn-boom",
+        settlement_error="setup/run error: RuntimeError: boom",
+        execution_started=False,
+    )
+
+    assert _delivery_status(db_session, "turn-boom") == DELIVERY_FAILED
+    # The probe's ``pending`` predicate — what rejected the retry forever — is
+    # now False, so the client can converge.
+    inspected = inspect_user_message_delivery(
+        db_session,
+        int(task.id),
+        "hello there",
+        attachments=None,
+        turn_id="turn-boom",
+    )
+    assert inspected is not None
+    assert inspected.pending is False
+    assert inspected.failed is True
+
+
+def test_reconcile_finalized_delivery_marks_dispatched_when_run_failed_after_start(
+    db_session,
+) -> None:
+    """A failure after execution began closes ``pending`` as ``dispatched``.
+
+    The run may have consumed the message (and produced side effects) before
+    failing, so writing ``failed`` would invite a fresh-id retry and a double
+    execution. ``dispatched`` converges the client without a resend; the
+    turn's failure is surfaced through task status.
+    """
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id), status=TaskStatus.RUNNING)
+    _claim_pending_delivery(
+        db_session, task_id=int(task.id), user_id=int(user.id), turn_id="turn-late"
+    )
+
+    _reconcile_finalized_turn_delivery(
+        task_id=int(task.id),
+        turn_id="turn-late",
+        settlement_error="setup/run error: RuntimeError: late boom",
+        execution_started=True,
+    )
+
+    assert _delivery_status(db_session, "turn-late") == DELIVERY_DISPATCHED
+
+
+def test_reconcile_finalized_delivery_noop_without_turn_id(db_session) -> None:
+    """A turn with no durable delivery row (no turn id) is a safe no-op."""
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id), status=TaskStatus.RUNNING)
+
+    # Must not raise even though there is nothing to reconcile.
+    _reconcile_finalized_turn_delivery(
+        task_id=int(task.id),
+        turn_id=None,
+        settlement_error=None,
+        execution_started=True,
+    )
+
+
+@pytest.mark.parametrize("execution_started", [True, False])
+def test_reconcile_finalized_delivery_does_not_regress_dispatched_on_error(
+    db_session,
+    execution_started,
+) -> None:
+    """``dispatched`` is terminal for dedup; a later failure must not regress it.
+
+    A normally dispatched turn already gave the client a usable ack. With
+    ``execution_started=True`` the ``dispatched`` target is idempotent; with
+    ``False`` the monotonic state machine rejects ``dispatched -> failed``.
+    Either way the row stays ``dispatched`` and the turn's failure is surfaced
+    through task status, not by reopening delivery.
+    """
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id), status=TaskStatus.RUNNING)
+    _claim_pending_delivery(
+        db_session, task_id=int(task.id), user_id=int(user.id), turn_id="turn-disp"
+    )
+    transition = mark_user_message_delivery(
+        db_session,
+        task_id=int(task.id),
+        turn_id="turn-disp",
+        status=DELIVERY_DISPATCHED,
+    )
+    assert transition.outcome == "updated"
+    db_session.commit()
+    db_session.expire_all()
+
+    _reconcile_finalized_turn_delivery(
+        task_id=int(task.id),
+        turn_id="turn-disp",
+        settlement_error="boom",
+        execution_started=execution_started,
+    )
+
+    assert _delivery_status(db_session, "turn-disp") == DELIVERY_DISPATCHED
+
+
+def test_reconcile_finalized_delivery_completes_dispatched_on_success(
+    db_session,
+) -> None:
+    """A clean settlement closes a ``dispatched`` row to ``completed``.
+
+    The orchestrator path never marked ``completed`` before; finalize now
+    closes the lifecycle to match the resume path.
+    """
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id), status=TaskStatus.RUNNING)
+    _claim_pending_delivery(
+        db_session, task_id=int(task.id), user_id=int(user.id), turn_id="turn-done"
+    )
+    mark_user_message_delivery(
+        db_session,
+        task_id=int(task.id),
+        turn_id="turn-done",
+        status=DELIVERY_DISPATCHED,
+    )
+    db_session.commit()
+
+    _reconcile_finalized_turn_delivery(
+        task_id=int(task.id),
+        turn_id="turn-done",
+        settlement_error=None,
+        execution_started=True,
+    )
+
+    assert _delivery_status(db_session, "turn-done") == DELIVERY_COMPLETED
+
+
+def test_reconcile_finalized_delivery_swallows_pool_timeout_leaving_pending(
+    db_session,
+    caplog,
+) -> None:
+    """A pool timeout leaves the row ``pending`` for durable recovery, no raise."""
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id), status=TaskStatus.RUNNING)
+    _claim_pending_delivery(
+        db_session, task_id=int(task.id), user_id=int(user.id), turn_id="turn-pool"
+    )
+
+    caplog.set_level(logging.ERROR, logger="xagent.web.services.task_orchestrator")
+    with patch(
+        "xagent.web.services.task_orchestrator.mark_user_message_delivery_sync",
+        side_effect=SQLAlchemyTimeoutError("finalize delivery pool exhausted"),
+    ):
+        _reconcile_finalized_turn_delivery(
+            task_id=int(task.id),
+            turn_id="turn-pool",
+            settlement_error=None,
+            execution_started=True,
+        )
+
+    assert _delivery_status(db_session, "turn-pool") == DELIVERY_PENDING
+    assert "component=turn-finalize-delivery" in caplog.text
+
+
+def _finalize_turn_fixture(db_session, *, turn_id: str):
+    """One RUNNING task with a committed lease and an orphaned ``pending`` row.
+
+    Mirrors the #332 failure state: the turn claim committed (task RUNNING,
+    lease owned, delivery ``pending``) but the ``dispatched`` projection never
+    landed.
+    """
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id), status=TaskStatus.RUNNING)
+    payload = TaskTurnPayload("hello there", turn_id=turn_id)
+    _claim_pending_delivery(
+        db_session, task_id=int(task.id), user_id=int(user.id), turn_id=turn_id
+    )
+    task.runner_id = "test-runner"
+    task.run_id = "run-a"
+    db_session.commit()
+    lease = TaskLease(task_id=int(task.id), runner_id="test-runner", run_id="run-a")
+    return user, task, payload, lease
+
+
+@contextmanager
+def _finalize_runner_patches(
+    fake_lease: TaskLease,
+    *,
+    execute=None,
+    settle=None,
+    mark_delivery=None,
+    validate=None,
+    snapshot=None,
+):
+    """Patch scaffolding for driving ``_schedule_bg``'s ``_runner`` end-to-end.
+
+    Only the agent runtime is faked by default; lease settlement and delivery
+    marking run for real against SQLite unless a stub is supplied.
+    """
+    from xagent.web.api.websocket import background_task_manager
+
+    patches = [
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=fake_lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            new=snapshot
+            if snapshot is not None
+            else MagicMock(return_value=MagicMock()),
+        ),
+        patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=execute if execute is not None else AsyncMock(),
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ]
+    if settle is not None:
+        patches.append(
+            patch(
+                "xagent.web.services.task_orchestrator.settle_task_lease_isolated",
+                settle,
+            )
+        )
+    if mark_delivery is not None:
+        patches.append(
+            patch(
+                "xagent.web.services.task_orchestrator.mark_user_message_delivery_sync",
+                mark_delivery,
+            )
+        )
+    if validate is not None:
+        patches.append(
+            patch(
+                "xagent.web.services.task_orchestrator."
+                "validate_preacquired_task_lease_isolated",
+                validate,
+            )
+        )
+    with ExitStack() as stack:
+        for entry in patches:
+            stack.enter_context(entry)
+        yield
+
+
+def _spawn_finalize_runner(task, user, payload, **schedule_kwargs):
+    return _schedule_bg(
+        task_id=int(task.id),
+        task_owner_user_id=int(user.id),
+        task_source=task.source,
+        payload=payload,
+        force_fresh=False,
+        context=None,
+        **schedule_kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_finalize_reconciles_orphaned_pending_delivery(
+    db_session,
+) -> None:
+    """End-to-end: a turn whose ``dispatched`` projection never landed still
+    finalizes its delivery row to ``completed`` when the run settles cleanly."""
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-ok"
+    )
+
+    with _finalize_runner_patches(lease):
+        await _spawn_finalize_runner(task, user, payload)
+
+    assert _delivery_status(db_session, "turn-e2e-ok") == DELIVERY_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_runner_finalize_reconciles_alongside_a_genuinely_completed_turn(
+    db_session,
+) -> None:
+    """A real success settles through ``finish_turn``'s COMPLETED branch and
+    closes the orphaned delivery row in the same finalize.
+
+    The sibling success test reaches ``completed`` delivery via
+    ``settlement_error is None`` while the task itself lands FAILED (its mocked
+    runtime never signals success), so it cannot catch a regression in
+    ``finish_turn``'s COMPLETED branch. Here the fake runtime commits
+    COMPLETED plus an assistant message — what that branch reads to write
+    ``output`` — so task terminalization and delivery reconciliation are
+    asserted together.
+    """
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-real-success"
+    )
+
+    async def succeeding_execute(*args, **kwargs):
+        with sessionmaker(bind=get_engine())() as inner:
+            row = inner.query(Task).filter(Task.id == task.id).one()
+            row.status = TaskStatus.COMPLETED
+            inner.add(
+                TaskChatMessage(
+                    task_id=int(task.id),
+                    user_id=int(user.id),
+                    role="assistant",
+                    content="here is your answer",
+                    message_type="chat_response",
+                )
+            )
+            inner.commit()
+
+    with _finalize_runner_patches(lease, execute=succeeding_execute):
+        await _spawn_finalize_runner(task, user, payload)
+
+    assert _delivery_status(db_session, "turn-e2e-real-success") == DELIVERY_COMPLETED
+    db_session.expire_all()
+    stored = db_session.query(Task).filter(Task.id == task.id).one()
+    assert stored.status == TaskStatus.COMPLETED
+    assert stored.output == "here is your answer"
+    assert stored.runner_id is None
+
+
+@pytest.mark.asyncio
+async def test_runner_finalize_leaves_pending_when_deferred_to_ttl_recovery(
+    db_session,
+) -> None:
+    """When settlement is deferred to TTL recovery (pool timeout), the delivery
+    row must stay ``pending`` — the turn may be re-run by the recovery path."""
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-defer"
+    )
+
+    async def pool_timeout_execute(*args, **kwargs):
+        raise SQLAlchemyTimeoutError("setup/run pool exhausted")
+
+    with _finalize_runner_patches(lease, execute=pool_timeout_execute):
+        await _spawn_finalize_runner(task, user, payload)
+
+    assert _delivery_status(db_session, "turn-e2e-defer") == DELIVERY_PENDING
+
+
+@pytest.mark.asyncio
+async def test_runner_finalize_leaves_pending_when_settlement_raises(
+    db_session,
+) -> None:
+    """If lease settlement itself raises, the lease is retained for TTL recovery
+    and the turn may re-run — so the delivery row must stay ``pending`` even
+    though the run completed. Guards the settle-failure branch, which does not
+    set ``defer_settlement_to_ttl_recovery``."""
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-settle-raise"
+    )
+
+    with _finalize_runner_patches(
+        lease, settle=MagicMock(side_effect=RuntimeError("settle boom"))
+    ):
+        await _spawn_finalize_runner(task, user, payload)
+
+    assert _delivery_status(db_session, "turn-e2e-settle-raise") == DELIVERY_PENDING
+
+
+@pytest.mark.asyncio
+async def test_runner_finalize_leaves_pending_when_settle_is_fenced_out(
+    db_session,
+) -> None:
+    """A fenced/superseded settlement must not close the delivery row.
+
+    ``settle_task_lease_isolated`` returns ``False`` *without raising* when the
+    lease row is gone or now owned by a different run. This stale coroutine is
+    no longer authoritative for the turn, so reconciliation must be skipped and
+    the ``pending`` row left to the authoritative owner."""
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-fenced"
+    )
+
+    with _finalize_runner_patches(lease, settle=MagicMock(return_value=False)):
+        await _spawn_finalize_runner(task, user, payload)
+
+    assert _delivery_status(db_session, "turn-e2e-fenced") == DELIVERY_PENDING
+
+
+@pytest.mark.asyncio
+async def test_runner_finalize_skips_reconcile_on_settlement_ready_short_circuit(
+    db_session,
+) -> None:
+    """Pre-execution SETTLEMENT_READY must not close the delivery row.
+
+    A delayed run whose pre-acquired lease validates as SETTLEMENT_READY
+    returns before the turn body executes. Settlement still runs (and here
+    genuinely settles the lease), but the turn never ran, so the delivery row
+    must not be reconciled to ``completed``."""
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-settle-ready"
+    )
+
+    with _finalize_runner_patches(
+        lease,
+        validate=MagicMock(return_value=TaskLeaseRefreshState.SETTLEMENT_READY),
+    ):
+        await _spawn_finalize_runner(
+            task, user, payload, task_lease=lease, run_id="run-a"
+        )
+
+    assert _delivery_status(db_session, "turn-e2e-settle-ready") == DELIVERY_PENDING
+
+
+@pytest.mark.asyncio
+async def test_runner_finalize_marks_dispatched_for_cancelled_turn(
+    db_session,
+) -> None:
+    """A turn cancelled during execution closes its delivery row to
+    ``dispatched``, not ``failed`` — execution had begun, so the message may
+    already have been consumed and a fresh-id retry could double-execute it."""
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-cancelled"
+    )
+
+    with _finalize_runner_patches(
+        lease, execute=AsyncMock(side_effect=asyncio.CancelledError())
+    ):
+        bg_task = _spawn_finalize_runner(task, user, payload)
+        with pytest.raises(asyncio.CancelledError):
+            await bg_task
+
+    assert _delivery_status(db_session, "turn-e2e-cancelled") == DELIVERY_DISPATCHED
+    db_session.expire_all()
+    stored = db_session.query(Task).filter(Task.id == task.id).one()
+    assert stored.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_runner_finalize_marks_dispatched_when_run_fails_after_start(
+    db_session,
+) -> None:
+    """The double-execution hazard: a run that failed *after* execution began
+    must close the orphaned ``pending`` row as ``dispatched`` (probe answers
+    MATCHES, no retry), never ``failed`` (probe would invite a fresh-id resend
+    of a message that already ran). This also pins the symmetry with the
+    post-schedule projection: whichever best-effort write lands, the row
+    converges on ``dispatched``."""
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-late-fail"
+    )
+
+    with _finalize_runner_patches(
+        lease,
+        execute=AsyncMock(side_effect=RuntimeError("late boom after side effects")),
+    ):
+        await _spawn_finalize_runner(task, user, payload)
+
+    assert _delivery_status(db_session, "turn-e2e-late-fail") == DELIVERY_DISPATCHED
+    db_session.expire_all()
+    stored = db_session.query(Task).filter(Task.id == task.id).one()
+    assert stored.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_runner_finalize_marks_failed_when_setup_fails_before_execute(
+    db_session,
+) -> None:
+    """A failure before ``execute_task_background`` is ever invoked is positive
+    evidence the message was never consumed, so the row closes as ``failed``
+    and a fresh-id retry is safe."""
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-pre-exec"
+    )
+
+    with _finalize_runner_patches(
+        lease,
+        snapshot=MagicMock(side_effect=RuntimeError("snapshot load exploded")),
+    ):
+        await _spawn_finalize_runner(task, user, payload)
+
+    assert _delivery_status(db_session, "turn-e2e-pre-exec") == DELIVERY_FAILED
+    db_session.expire_all()
+    stored = db_session.query(Task).filter(Task.id == task.id).one()
+    assert stored.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_runner_finalize_preserves_cancellation_from_reconcile(
+    db_session,
+) -> None:
+    """A ``CancelledError`` surfacing from the reconcile call site is recorded
+    as cleanup cancellation and re-raised after connector cleanup; the delivery
+    row stays ``pending``."""
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-cancel-reconcile"
+    )
+
+    with _finalize_runner_patches(
+        lease,
+        mark_delivery=MagicMock(side_effect=asyncio.CancelledError()),
+    ):
+        bg_task = _spawn_finalize_runner(task, user, payload)
+        with pytest.raises(asyncio.CancelledError):
+            await bg_task
+
+    assert _delivery_status(db_session, "turn-e2e-cancel-reconcile") == DELIVERY_PENDING
+    # The lease settlement itself committed before the reconcile cancellation.
+    db_session.expire_all()
+    stored = db_session.query(Task).filter(Task.id == task.id).one()
+    assert stored.runner_id is None
+
+
+@pytest.mark.parametrize(
+    "seeded_status, settlement_error, execution_started",
+    [
+        (DELIVERY_COMPLETED, None, True),
+        (DELIVERY_COMPLETED, "boom", True),
+        (DELIVERY_COMPLETED, "boom", False),
+        (DELIVERY_FAILED, None, True),
+    ],
+)
+def test_reconcile_finalized_delivery_noop_on_already_terminal_row(
+    db_session,
+    seeded_status,
+    settlement_error,
+    execution_started,
+) -> None:
+    """An already-terminal delivery row is never rewritten by reconciliation.
+
+    ``completed`` and ``failed`` are terminal in the monotonic state machine;
+    a later reconcile — idempotent or conflicting, under any target — must
+    leave them as-is."""
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id), status=TaskStatus.RUNNING)
+    _claim_pending_delivery(
+        db_session, task_id=int(task.id), user_id=int(user.id), turn_id="turn-term"
+    )
+    transition = mark_user_message_delivery(
+        db_session, task_id=int(task.id), turn_id="turn-term", status=seeded_status
+    )
+    assert transition.outcome == "updated"
+    db_session.commit()
+    db_session.expire_all()
+
+    _reconcile_finalized_turn_delivery(
+        task_id=int(task.id),
+        turn_id="turn-term",
+        settlement_error=settlement_error,
+        execution_started=execution_started,
+    )
+
+    assert _delivery_status(db_session, "turn-term") == seeded_status
