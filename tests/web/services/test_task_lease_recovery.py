@@ -635,6 +635,83 @@ def test_ambiguous_legacy_checkpoint_skips_the_candidate_for_the_next_sweep(
     assert any(c.task_id == int(task.id) for c in rescanned)
 
 
+def test_ambiguous_legacy_checkpoint_registers_a_degradation_signal(
+    db_session,
+) -> None:
+    """#1071 requires zero-or-multiple matches to fail closed *and* emit
+    telemetry. The verdict is only half of that: an ambiguity nothing can
+    resolve has to be visible to monitoring, not just to the log."""
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LEGACY_POINTER_AMBIGUOUS,
+        active_degradations,
+        clear_degradation,
+    )
+
+    user = _create_user(db_session, suffix="ambiguous-signal")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="ambiguous-signal",
+        with_checkpoint=True,
+    )
+    db_session.add(
+        TraceEvent(
+            task_id=task.id,
+            event_id=task.last_checkpoint_event_id,
+            event_type="system_update_general",
+            timestamp=utc_now(),
+            data={
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "snapshot": {"type": "checkpoint"},
+                TASK_RUN_ID_TRACE_FIELD: task.run_id,
+            },
+        )
+    )
+    db_session.commit()
+
+    clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
+    try:
+        candidate = _candidate_for_task(task)
+        assert (
+            resolve_checkpoint_recovery(db_session, candidate)
+            is CheckpointRecoveryVerdict.INDETERMINATE
+        )
+        assert CHECKPOINT_LEGACY_POINTER_AMBIGUOUS in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
+
+
+@pytest.mark.asyncio
+async def test_a_clean_recovery_sweep_clears_the_ambiguity_signal(
+    db_session,
+) -> None:
+    """One completed drain is the reporting unit: a sweep that finds no
+    ambiguity clears a signal an earlier sweep left set, so the signal
+    cannot latch on a resolved condition."""
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LEGACY_POINTER_AMBIGUOUS,
+        active_degradations,
+        clear_degradation,
+        register_degradation,
+    )
+
+    user = _create_user(db_session, suffix="clean-sweep")
+    _create_expired_task(db_session, user_id=int(user.id), suffix="clean-sweep")
+    db_session.commit()
+
+    register_degradation(
+        CHECKPOINT_LEGACY_POINTER_AMBIGUOUS, "left over from an earlier sweep"
+    )
+    try:
+        await recover_expired_task_leases_until_cutoff(
+            cutoff=utc_now(),
+            batch_size=10,
+        )
+        assert CHECKPOINT_LEGACY_POINTER_AMBIGUOUS not in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
+
+
 @pytest.mark.parametrize(
     "replacement",
     ["heartbeat", "runner", "run", "state_version", "checkpoint", "checkpoint_pk"],

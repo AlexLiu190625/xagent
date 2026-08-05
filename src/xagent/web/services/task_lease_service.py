@@ -31,6 +31,10 @@ from .db_runtime import (
     is_database_pool_timeout,
     run_db_io_cancellation_safe,
 )
+from .ops_signals import (
+    CHECKPOINT_LEGACY_POINTER_AMBIGUOUS,
+    register_degradation,
+)
 from .task_execution_controller import control_state_for_status
 
 logger = logging.getLogger(__name__)
@@ -300,6 +304,15 @@ def _resolve_legacy_checkpoint_recovery(
             "next sweep",
             candidate.task_id,
             candidate.last_checkpoint_event_id,
+        )
+        # An ambiguity nothing in this process can resolve: every later
+        # sweep re-selects the same candidate and re-hits it. A log line
+        # alone leaves that invisible to monitoring, so it rides /health
+        # until a sweep completes without seeing one.
+        register_degradation(
+            CHECKPOINT_LEGACY_POINTER_AMBIGUOUS,
+            f"task {candidate.task_id}: legacy checkpoint event_id "
+            f"{candidate.last_checkpoint_event_id} matches more than one row",
         )
         return CheckpointRecoveryVerdict.INDETERMINATE
     if row is None:

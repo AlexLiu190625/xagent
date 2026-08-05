@@ -3024,3 +3024,53 @@ def test_database_trace_handler_load_pk_anchor_database_failure_is_unavailable(
     finally:
         clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
         db.close()
+
+
+def test_database_trace_handler_healthy_anchor_read_clears_the_dangling_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ops_signals state is process-wide, so a dangling signal that only
+    clears when some pointer resolves to a row would stay set forever in a
+    process where no task has an anchor. Any anchored read that is not
+    itself dangling clears it."""
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_PK_ANCHOR_DANGLING,
+        active_degradations,
+        clear_degradation,
+        register_degradation,
+    )
+
+    SessionLocal, db, task = _create_trace_handler_test_task("anchor-clears-dangling")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    row = _checkpoint_trace_row(
+        task_id=task_id,
+        event_id="anchored",
+        execution_id="shared-execution",
+        label="anchored",
+        timestamp=datetime.now(timezone.utc),
+        run_id="run-a",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    task.last_checkpoint_trace_event_id = row.id
+    db.commit()
+
+    _bind_checkpoint_read_session(monkeypatch, SessionLocal)
+
+    register_degradation(
+        CHECKPOINT_PK_ANCHOR_DANGLING, "left over from another task's read"
+    )
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "shared-execution"
+            ) == {"label": "anchored"}
+        assert CHECKPOINT_PK_ANCHOR_DANGLING not in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
+        db.close()

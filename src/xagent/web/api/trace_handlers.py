@@ -515,6 +515,14 @@ class DatabaseTraceHandler(BaseTraceHandler):
         the migration's backfill anchors. Nothing depends on the two
         agreeing: web's ``execution_id`` is the task id.
         """
+        # Cleared before the pointer is even read, not only when one
+        # resolves to a row: the registry is process-wide, so a process
+        # where no task currently has an anchor would otherwise keep a
+        # stale dangling signal set forever. The coarseness is real and
+        # accepted -- one healthy task's read clears another task's
+        # dangling signal -- and is the same cross-task coarseness the
+        # signal already has in the registering direction.
+        clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
         try:
             pointer = (
                 db.query(Task.last_checkpoint_trace_event_id)
@@ -551,7 +559,6 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 "scan",
             )
             return _AnchorFallback()
-        clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
 
         row_data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
         run_field = row_data.get(TASK_RUN_ID_TRACE_FIELD)

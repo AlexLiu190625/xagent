@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from ..models.task import Task, TaskStatus
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
+from .ops_signals import CHECKPOINT_LEGACY_POINTER_AMBIGUOUS, clear_degradation
 from .task_lease_service import (
     CheckpointRecoveryVerdict,
     TaskLeaseRecoveryCandidate,
@@ -289,6 +290,14 @@ async def recover_expired_task_leases_until_cutoff(
 
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
+
+    # One drain is the unit this signal reports on: "the most recent
+    # completed sweep saw at least one ambiguous legacy pointer". Clearing
+    # per candidate would let a later clean candidate erase an earlier
+    # ambiguity inside the same sweep; clearing per page would let page 2
+    # erase what page 1 registered, since the cursor has already advanced
+    # past it. At either finer grain the signal could never stay set.
+    clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
 
     recovered = 0
     cursor: TaskLeaseRecoveryCursor | None = None
