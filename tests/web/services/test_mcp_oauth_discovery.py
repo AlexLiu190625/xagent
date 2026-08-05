@@ -504,7 +504,45 @@ async def test_oauth_post_rejects_compressed_response_without_decoding():
                 json={"client_name": "Xagent"},
             )
 
-    assert exc.value.code == "response_too_large"
+    assert exc.value.code == "unsupported_response_encoding"
+
+
+@pytest.mark.asyncio
+async def test_oauth_post_refuses_encoded_body_before_reading_any_of_it():
+    # The ordering is the actual bomb defense: the refusal must fire from the
+    # headers alone, before a single body byte is pulled (and decompressed).
+    # A counting stream makes the guarantee mechanical -- if the encoding
+    # check moves after the read loop, reads becomes nonzero and this fails
+    # even though the decoded size would still be under the cap.
+    reads = {"count": 0}
+
+    class _CountingStream(httpx.AsyncByteStream):
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = chunks
+
+        async def __aiter__(self):
+            for chunk in self._chunks:
+                reads["count"] += 1
+                yield chunk
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=_CountingStream([gzip.compress(b"0" * 4096)]),
+            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await oauth_post(
+                "https://auth.example.com/register",
+                client=client,
+                max_response_bytes=1024 * 1024,
+                json={"client_name": "Xagent"},
+            )
+
+    assert exc.value.code == "unsupported_response_encoding"
+    assert reads["count"] == 0
 
 
 @pytest.mark.asyncio

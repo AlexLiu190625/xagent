@@ -295,8 +295,8 @@ async def oauth_post(
                 content_encoding = streamed_response.headers.get("content-encoding", "")
                 if content_encoding.strip().lower() not in {"", "identity"}:
                     raise MCPOAuthDiscoveryError(
-                        "response_too_large",
-                        "OAuth endpoint response exceeded the allowed size",
+                        "unsupported_response_encoding",
+                        "OAuth endpoint response used an unsupported content encoding",
                     )
                 content = bytearray()
                 async for chunk in streamed_response.aiter_bytes():
@@ -392,6 +392,11 @@ async def register_mcp_oauth_public_client(
             raise MCPOAuthDiscoveryError(
                 "client_registration_failed",
                 "OAuth client registration response exceeded the allowed size",
+            ) from exc
+        if exc.code == "unsupported_response_encoding":
+            raise MCPOAuthDiscoveryError(
+                "client_registration_failed",
+                "OAuth client registration response used an unsupported content encoding",
             ) from exc
         raise
     except (httpx.HTTPError, ValueError) as exc:
