@@ -531,6 +531,33 @@ async def test_oauth_post_accepts_identity_encoded_response_under_limit():
 
 
 @pytest.mark.asyncio
+async def test_oauth_post_bounded_requests_ask_for_identity_encoding():
+    # httpx advertises gzip/br/zstd by default; a compliant server honoring
+    # that would then be refused by the response-side encoding guard. A
+    # bounded read must therefore ask for identity itself -- the caller
+    # should not have to know to do it.
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            content=b'{"client_id":"dynamic-client"}',
+            headers={"Content-Type": "application/json"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await oauth_post(
+            "https://auth.example.com/register",
+            client=client,
+            max_response_bytes=1024,
+            json={"client_name": "Xagent"},
+        )
+
+    assert seen[0].headers["accept-encoding"] == "identity"
+
+
+@pytest.mark.asyncio
 async def test_oauth_post_strips_framing_headers_from_buffered_response():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

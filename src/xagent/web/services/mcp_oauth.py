@@ -266,6 +266,15 @@ async def oauth_post(
                 **request_kwargs,
             )
         else:
+            # A bounded read must not invite compression: httpx advertises
+            # gzip/br/zstd by default, and the Content-Encoding refusal below
+            # would then reject compliant servers that simply honored it.
+            # Force identity on the request so compliant servers send plain
+            # bytes; the response-side check stays as the hard guard against
+            # peers that compress anyway.
+            headers = httpx.Headers(request_kwargs.pop("headers", None))
+            headers["accept-encoding"] = "identity"
+            request_kwargs["headers"] = headers
             async with client.stream(
                 "POST",
                 url,
