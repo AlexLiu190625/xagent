@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -23,6 +22,7 @@ from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
+from xagent.web.services import task_orchestrator as task_orchestrator_service
 from xagent.web.services import workforce_runs as workforce_runs_service
 
 from .conftest import (
@@ -30,6 +30,7 @@ from .conftest import (
     _direct_db_session,
     _register_second_user,
     client,
+    patch_schedule_bg,
 )
 
 pytestmark = pytest.mark.usefixtures("_test_db")
@@ -113,15 +114,6 @@ def _authenticate_share_guest(share_token: str) -> dict[str, str]:
     response = client.post("/api/share/auth", json={"share_token": share_token})
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
-
-
-def _stub_begin_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _stub(**_kwargs: Any) -> SimpleNamespace:
-        return SimpleNamespace(background_task=None)
-
-    monkeypatch.setattr(
-        workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub
-    )
 
 
 # ===== Share-link management endpoints =====
@@ -428,7 +420,7 @@ def test_share_task_create_starts_workforce_run(
     workforce_id = _create_workforce("Guest Run Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     response = client.post(
         "/api/share/chat/task/create",
@@ -479,7 +471,7 @@ def test_share_task_create_rejects_foreign_agent_id(
     workforce_id = _create_workforce("Foreign Agent Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     other_agent_id = _create_published_agent(_user_id(), "Unrelated Agent")
     response = client.post(
@@ -503,7 +495,7 @@ async def test_share_guest_cannot_touch_internal_run_task(
     workforce_id = _create_workforce("Scoping Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     # An owner-initiated (internal) run of the same workforce.
     db = _direct_db_session()
@@ -532,7 +524,7 @@ def test_share_guest_can_upload_to_own_shared_task(
     workforce_id = _create_workforce("Upload Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     created = client.post(
         "/api/share/chat/task/create",
@@ -559,7 +551,7 @@ def test_workforce_share_first_turn_attachments_reach_run(
     workforce_id = _create_workforce("First Turn File Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     # 1) Task-less upload is allowed for workforce guests (no task exists yet).
     upload = client.post(
@@ -685,7 +677,7 @@ def test_agent_share_guest_cannot_access_workforce_task(
     workforce_id = _create_workforce("Cross Guest Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     created = client.post(
         "/api/share/chat/task/create",
@@ -738,7 +730,6 @@ async def test_ws_append_syncs_workforce_run_back_to_running(
 
     from xagent.web.api.websocket import handle_chat_message
     from xagent.web.models.workforce import WorkforceAgent
-    from xagent.web.services import task_orchestrator as task_orchestrator_service
     from xagent.web.services.workforce_snapshot import build_workforce_snapshot
 
     workforce_id = _create_workforce("Append Sync Workforce")

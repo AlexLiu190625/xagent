@@ -8,9 +8,14 @@ from typing import Any
 
 import pytest
 
+from xagent.core.execution_scope import (
+    EXECUTION_SCOPE_AGENT_CONFIG_KEY,
+    execution_scope_from_agent_config,
+)
 from xagent.core.task_runtime import TaskRuntimeContext, TaskRuntimeContribution
 from xagent.web.services.task_runtime import (
     CLIENT_RESERVED_AGENT_CONFIG_KEYS,
+    SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
     TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
     TaskRuntimeExtensionError,
     agent_config_with_task_extension_bindings,
@@ -231,3 +236,71 @@ async def test_delete_reports_bindings_whose_provider_is_no_longer_registered(
     assert unreleased == ("ghost_ext",)
     assert healthy.deleted == [42]
     assert any("ghost_ext" in record.getMessage() for record in caplog.records)
+
+
+def test_execution_scope_is_reserved_so_a_request_cannot_choose_a_namespace() -> None:
+    """A forged scope in a client dict is stripped, leaving no candidate for
+    resolution to read. Why the key is refused rather than judged afterwards is
+    on CLIENT_RESERVED_AGENT_CONFIG_KEYS.
+    """
+    assert EXECUTION_SCOPE_AGENT_CONFIG_KEY in CLIENT_RESERVED_AGENT_CONFIG_KEYS
+
+    forged = {
+        "sandbox_key_suffix": "victim",
+        "workspace_segments": ["victim"],
+        "memory_dimensions": {"tenant": "victim"},
+    }
+    sanitized = sanitize_client_agent_config(
+        {EXECUTION_SCOPE_AGENT_CONFIG_KEY: forged, "keep": 1}
+    )
+
+    assert sanitized == {"keep": 1}
+    # The column value a task is created with therefore carries no scope, so the
+    # registered loader reports "no candidate" and the resolver answers alone.
+    assert execution_scope_from_agent_config(sanitized) is None
+
+
+def test_the_reserved_key_set_has_exactly_the_audited_members() -> None:
+    """Pin the reserved set to literal strings, not the constants that name
+    them. ``test_sanitize_drops_reserved_keys_and_keeps_client_keys`` builds
+    its forged input by iterating ``CLIENT_RESERVED_AGENT_CONFIG_KEYS``, so it
+    cannot detect a wrongly-added member -- whatever the set holds, that
+    test's forged payload holds too. This test covers that direction instead.
+    Literals are deliberate for a second reason: comparing against them also
+    fails if either constant's *value* changes, which would silently move
+    which requests get stripped at every task-create boundary.
+    """
+    assert CLIENT_RESERVED_AGENT_CONFIG_KEYS == frozenset(
+        {"runtime_extension_bindings", "execution_scope", "selected_file_ids"}
+    )
+
+
+def test_agent_builder_preview_keys_are_not_reserved() -> None:
+    """``websocket.py``'s ``handle_build_preview_execution`` assembles a
+    config from the WS message (``preview_agent_id`` included) and passes it
+    through ``create_task`` -- and therefore through the sanitizer, layered
+    below it rather than above. ``chat.py``'s re-layer of ``is_preview`` only
+    fires when ``TaskCreateRequest.is_preview`` is ``True``, which this WS
+    path never sets, so reserving either key here would strip it from that
+    config with nothing to restore it, breaking agent-builder preview.
+    """
+    assert {"is_preview", "preview_agent_id"}.isdisjoint(
+        CLIENT_RESERVED_AGENT_CONFIG_KEYS
+    )
+
+
+def test_selected_file_ids_is_reserved_so_a_request_cannot_name_files() -> None:
+    """The bound file list is server-validated: the chat boundary substitutes a
+    list filtered by owner and unbound-task before persisting it, and both
+    readers re-check ownership in their own query. Reserving the key moves that
+    enforcement to the one place every boundary shares, so the widget and share
+    paths -- which never set the key themselves -- stop persisting whatever a
+    request body carried.
+    """
+    assert SELECTED_FILE_IDS_AGENT_CONFIG_KEY in CLIENT_RESERVED_AGENT_CONFIG_KEYS
+
+    sanitized = sanitize_client_agent_config(
+        {SELECTED_FILE_IDS_AGENT_CONFIG_KEY: ["forged-file-id"], "keep": 1}
+    )
+
+    assert sanitized == {"keep": 1}

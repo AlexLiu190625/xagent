@@ -192,11 +192,18 @@ def _coerce_scope_mapping(value: Any, *, field_name: str) -> dict[str, Any]:
 def _coerce_snapshot_version(raw_version: Any) -> int:
     """Read ``from_dict``'s ``version`` field, or reject it as malformed.
 
-    ``version`` reaches here from a snapshot that can originate in a client-
-    supplied ``Task.agent_config`` (see :data:`EXECUTION_SCOPE_AGENT_CONFIG_KEY`),
-    so it is untrusted input, and exactly one value means "authentic snapshot
-    written before this field existed": ``0``, what an absent key decodes to.
-    That marker carries real trust -- the *older* half of
+    ``version`` reaches here from a snapshot that remains untrusted input: a
+    runtime-extension provider holding a ``session_factory``
+    (:data:`xagent.core.task_runtime.TaskRuntimeContext.session_factory`) can
+    write ``Task.agent_config`` (see :data:`EXECUTION_SCOPE_AGENT_CONFIG_KEY`)
+    directly, and a row persisted before ``execution_scope`` was reserved at
+    the request boundary (``CLIENT_RESERVED_AGENT_CONFIG_KEYS``,
+    ``xagent.web.services.task_runtime``) still carries whatever a request
+    seeded at the time (issue #1135). One value is the pre-versioning shape
+    sentinel: ``0``, what an absent key decodes to. It says nothing about who
+    wrote the snapshot -- omitting the field produces the same value, so it is
+    a statement about shape, not provenance. It still decides handling -- the
+    *older* half of
     ``_validate_execution_scope_snapshot_candidate``'s asymmetric gate is
     relaxed on the ``snapshot_defines_namespace=True`` branch, where such a
     snapshot's namespace fields are then used verbatim -- so a value that
@@ -759,15 +766,28 @@ class DeferToSnapshot:
     an already-resolved scope -- those are different trust tiers, and this
     contract cannot tell them apart at read time. It cannot be fixed here
     either: any provenance marker would live in the same client-writable
-    field as the snapshot it vouches for, so the fix belongs at the input
-    boundary, where that key stops being accepted from a request (tracked as
-    issue #1016).
+    field as the snapshot it vouches for. The actual fix is at the input
+    boundary instead: a task-create request body can no longer seed this key
+    at all -- ``execution_scope`` is one of
+    ``CLIENT_RESERVED_AGENT_CONFIG_KEYS`` (``xagent.web.services.task_runtime``),
+    stripped from every client-supplied ``agent_config`` before it reaches
+    ``Task.agent_config`` (issue #1016).
 
     That makes ``snapshot_defines_namespace=True`` unshippable for now, not
-    merely delicate: with the namespace taken verbatim, a request that can
-    write ``Task.agent_config`` chooses the namespace, and public widget and
-    share task creation copy that field wholesale. No resolver in this
-    repository sets it, and none should until the snapshot is server-owned.
+    merely delicate: with the namespace taken verbatim, any writer that can
+    put a client-seeded value into ``Task.agent_config`` chooses the
+    namespace. The request-body boundary now refuses ``execution_scope``, but
+    the column is not closed under that refusal: closed-source distributions
+    register runtime-extension providers that receive a raw
+    ``session_factory`` (``TaskRuntimeContext.session_factory``,
+    ``xagent.core.task_runtime``) and can write this column directly, and a
+    row persisted before the request-body refusal existed still carries
+    whatever a request seeded at the time -- those rows are not disarmed by
+    that refusal and cannot be judged from the column itself, since a value
+    stored then could name any version or marker (issue #1135 owns clearing
+    them). No resolver in this repository sets
+    ``snapshot_defines_namespace=True``, and none should until the snapshot is
+    server-owned end to end.
     The flag exists so the abstention shape a workforce sub-task needs is
     expressible and reviewable; it is inert until something opts in.
 
@@ -1253,13 +1273,17 @@ def _execution_scope_narrowing_violations(
 
     Used only on :func:`resolve_execution_scope`'s resolver-abstention
     branch, where the resolver has supplied a mandatory *fallback* instead
-    of an authoritative answer: a persisted snapshot is
-    client-influenceable (a client-supplied ``agent_config`` can carry an
-    ``execution_scope`` key that reaches the persisted snapshot -- see
-    :data:`EXECUTION_SCOPE_AGENT_CONFIG_KEY`), so an unchecked snapshot here
-    would let a caller widen its own namespace past the resolver's own most
-    conservative answer for the task. Returns an empty dict when ``snapshot``
-    narrows (or matches) ``fallback`` on every field below.
+    of an authoritative answer: a persisted snapshot remains untrusted input
+    -- a runtime-extension provider can write ``Task.agent_config`` directly
+    through its ``session_factory`` (``TaskRuntimeContext.session_factory``,
+    ``xagent.core.task_runtime``), bypassing every request-body sanitizer,
+    and a row persisted before ``execution_scope`` was reserved at the
+    request boundary (``CLIENT_RESERVED_AGENT_CONFIG_KEYS``,
+    ``xagent.web.services.task_runtime``) still carries whatever value a
+    request seeded at the time -- so an unchecked snapshot here would let a
+    caller widen its own namespace past the resolver's own most conservative
+    answer for the task. Returns an empty dict when ``snapshot`` narrows (or
+    matches) ``fallback`` on every field below.
 
     The governing rule, per field: narrowing can only extend scoping the
     fallback *already committed to*. If ``fallback``'s value for a field is
@@ -1512,12 +1536,14 @@ def resolve_execution_scope(
       - ``False`` (the default): the shape-version gate applies in both
         directions (the snapshot is about to be compared), and the snapshot
         is used only if it is a *narrowing* of the carrier's ``fallback``
-        (see :func:`_execution_scope_narrowing_violations`) -- a snapshot is
-        client-influenceable (a client-supplied ``agent_config`` can carry
-        an ``execution_scope`` key that reaches the persisted snapshot), so
-        an unchecked snapshot here would let a caller widen its own
-        namespace past the resolver's own conservative fallback. A
-        non-narrowing snapshot raises
+        (see :func:`_execution_scope_narrowing_violations`) -- a snapshot
+        remains untrusted input regardless of the request-body refusal at
+        task-create time: a runtime-extension provider can write
+        ``Task.agent_config`` directly through its ``session_factory``, and
+        a row persisted before that refusal existed still carries whatever a
+        request seeded at the time, so an unchecked snapshot here would let
+        a caller widen its own namespace past the resolver's own
+        conservative fallback. A non-narrowing snapshot raises
         :class:`ExecutionScopeAbstentionMismatchError` (a subclass of
         :class:`ExecutionScopeAuthorityError` -- see that class for why the
         distinction matters to :func:`resolve_execution_scope_off_turn`).

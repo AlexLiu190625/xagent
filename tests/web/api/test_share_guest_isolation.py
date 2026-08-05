@@ -21,6 +21,10 @@ import pytest
 from fastapi import HTTPException
 from starlette.websockets import WebSocketDisconnect
 
+from xagent.core.execution_scope import (
+    EXECUTION_SCOPE_AGENT_CONFIG_KEY,
+    execution_scope_from_agent_config,
+)
 from xagent.web.api.public_chat_access import (
     PublicChatAccessContext,
     create_public_chat_access_token,
@@ -29,8 +33,8 @@ from xagent.web.api.public_chat_access import (
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task
 from xagent.web.models.user import User
-from xagent.web.services import workforce_runs as workforce_runs_service
 from xagent.web.services.task_runtime import (
+    SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
     TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
     task_extension_bindings_from_agent_config,
 )
@@ -42,6 +46,7 @@ from .conftest import (
     _setup_admin,
     _share_guest_id,
     client,
+    patch_schedule_bg,
 )
 
 pytestmark = pytest.mark.usefixtures("_test_db")
@@ -119,15 +124,6 @@ def _authenticate_share_guest(share_token: str) -> dict[str, str]:
     response = client.post("/api/share/auth", json={"share_token": share_token})
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
-
-
-def _stub_begin_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _stub(**_kwargs: Any) -> SimpleNamespace:
-        return SimpleNamespace(background_task=None)
-
-    monkeypatch.setattr(
-        workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub
-    )
 
 
 def _upload_to_task(headers: dict[str, str], task_id: int) -> Any:
@@ -347,6 +343,50 @@ def test_agent_share_task_create_drops_forged_runtime_extension_bindings() -> No
         db.close()
 
 
+def test_agent_share_task_create_drops_forged_execution_scope() -> None:
+    """A share guest cannot pre-seed the scope snapshot that governs where a
+    task's bytes land -- sandbox mount, storage prefix, workspace directory,
+    memory dimensions -- or the bound file list, by naming either in the
+    request body's ``agent_config``.
+    """
+    assert _create_published_agent("Scope Agent", "scope-agent-tok")
+    guest = _authenticate_share_guest("scope-agent-tok")
+
+    created = client.post(
+        "/api/share/chat/task/create",
+        headers=guest,
+        json={
+            "title": "forged scope",
+            "description": "forged scope",
+            "agent_config": {
+                EXECUTION_SCOPE_AGENT_CONFIG_KEY: {
+                    "sandbox_key_suffix": "victim",
+                    "workspace_segments": ["victim"],
+                    "memory_dimensions": {"tenant": "victim"},
+                },
+                SELECTED_FILE_IDS_AGENT_CONFIG_KEY: ["victim-file-id"],
+                "keep_me": "client value",
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task_id"])
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert EXECUTION_SCOPE_AGENT_CONFIG_KEY not in task.agent_config
+        assert execution_scope_from_agent_config(task.agent_config) is None
+        assert SELECTED_FILE_IDS_AGENT_CONFIG_KEY not in task.agent_config
+        assert task.agent_config.get("keep_me") == "client value"
+        assert task.agent_config.get("auth_mode") == "share"
+        assert task.agent_config.get("guest_id") == _share_guest_id(
+            guest["Authorization"]
+        )
+    finally:
+        db.close()
+
+
 # ===== workforce-share cross-guest isolation =====
 
 
@@ -357,7 +397,7 @@ def test_workforce_share_guest_cannot_touch_other_guests_task(
     token = _enable_workforce_share(workforce_id)
     guest_a = _authenticate_share_guest(token)
     guest_b = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     created = client.post(
         "/api/share/chat/task/create",
@@ -390,7 +430,7 @@ def test_workforce_share_task_without_guest_id_is_denied(
     workforce_id = _create_workforce("PreMig WF")
     token = _enable_workforce_share(workforce_id)
     guest = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     created = client.post(
         "/api/share/chat/task/create",
@@ -411,6 +451,55 @@ def test_workforce_share_task_without_guest_id_is_denied(
         db.close()
 
     assert _upload_to_task(guest, task_id).status_code == 403
+
+
+def test_workforce_share_task_create_discards_forged_agent_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Widget-workforce mirror of ``test_widget_task_create_discards_forged_agent_config``:
+    ``_create_workforce_share_chat_task`` never reads
+    ``TaskCreateRequest.agent_config`` -- ``create_workforce_run`` only sees
+    the handler's own ``extra_agent_config`` (``auth_mode``,
+    ``share_workforce_id``, ``guest_id``). A forged reserved key in the
+    request body must not survive into the persisted config, and neither
+    should an ordinary client key."""
+    workforce_id = _create_workforce("Forged Config Share WF")
+    token = _enable_workforce_share(workforce_id)
+    guest = _authenticate_share_guest(token)
+    patch_schedule_bg(monkeypatch)
+
+    created = client.post(
+        "/api/share/chat/task/create",
+        headers=guest,
+        json={
+            "title": "forged",
+            "description": "forged",
+            "agent_config": {
+                EXECUTION_SCOPE_AGENT_CONFIG_KEY: {
+                    "sandbox_key_suffix": "victim",
+                    "workspace_segments": ["victim"],
+                    "memory_dimensions": {"tenant": "victim"},
+                },
+                SELECTED_FILE_IDS_AGENT_CONFIG_KEY: ["victim-file-id"],
+                "keep_me": "client value",
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task_id"])
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert EXECUTION_SCOPE_AGENT_CONFIG_KEY not in task.agent_config
+        assert SELECTED_FILE_IDS_AGENT_CONFIG_KEY not in task.agent_config
+        assert "keep_me" not in task.agent_config
+        assert task.agent_config.get("auth_mode") == "share"
+        assert task.agent_config.get("guest_id") == _share_guest_id(
+            guest["Authorization"]
+        )
+    finally:
+        db.close()
 
 
 # ===== fail-closed on legacy tokens without a guest_id claim =====

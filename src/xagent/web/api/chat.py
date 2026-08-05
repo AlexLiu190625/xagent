@@ -111,6 +111,7 @@ from ..services.task_lease_service import (
     stop_task_lease_heartbeat,
 )
 from ..services.task_runtime import (
+    SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
     TaskRuntimeExtensionError,
     agent_config_with_task_extension_bindings,
     build_task_runtime,
@@ -164,9 +165,9 @@ def _build_task_agent_config(
     task_agent_config: Dict[str, Any] = sanitize_client_agent_config(
         request_agent_config
     )
-    task_agent_config.pop("selected_file_ids", None)
+    task_agent_config.pop(SELECTED_FILE_IDS_AGENT_CONFIG_KEY, None)
     if selected_file_ids:
-        task_agent_config["selected_file_ids"] = selected_file_ids
+        task_agent_config[SELECTED_FILE_IDS_AGENT_CONFIG_KEY] = selected_file_ids
     return task_agent_config or None
 
 
@@ -807,7 +808,7 @@ def _selected_file_ids_from_agent_config(
 ) -> list[str]:
     if not isinstance(agent_config, dict):
         return []
-    raw_file_ids = agent_config.get("selected_file_ids")
+    raw_file_ids = agent_config.get(SELECTED_FILE_IDS_AGENT_CONFIG_KEY)
     if not isinstance(raw_file_ids, list):
         return []
     return [

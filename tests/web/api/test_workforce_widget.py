@@ -13,23 +13,24 @@ Builds on the share-link channel patterns (#947).
 from __future__ import annotations
 
 import io
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
+from xagent.core.execution_scope import EXECUTION_SCOPE_AGENT_CONFIG_KEY
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.task import Task
 from xagent.web.models.user import User
 from xagent.web.models.workforce import WorkforceRun
-from xagent.web.services import workforce_runs as workforce_runs_service
+from xagent.web.services.task_runtime import SELECTED_FILE_IDS_AGENT_CONFIG_KEY
 
 from .conftest import (
     _admin_headers,
     _direct_db_session,
     _register_second_user,
     client,
+    patch_schedule_bg,
 )
 
 pytestmark = pytest.mark.usefixtures("_test_db")
@@ -147,15 +148,6 @@ def _authenticate_widget_guest_by_key(
     )
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
-
-
-def _stub_begin_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _stub(**_kwargs: Any) -> SimpleNamespace:
-        return SimpleNamespace(background_task=None)
-
-    monkeypatch.setattr(
-        workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub
-    )
 
 
 # ===== Widget management endpoints =====
@@ -569,7 +561,7 @@ def test_widget_task_create_starts_workforce_run(
     workforce_id = _create_workforce("Guest Run Widget Workforce")
     key = _enable_widget(workforce_id)
     guest_headers = _authenticate_widget_guest_by_key(key)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     response = client.post(
         "/api/widget/chat/task/create",
@@ -611,7 +603,7 @@ def test_widget_task_create_rejects_foreign_agent_id(
     workforce_id = _create_workforce("Foreign Agent Widget Workforce")
     key = _enable_widget(workforce_id)
     guest_headers = _authenticate_widget_guest_by_key(key)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     foreign_agent_id = _create_published_agent(_user_id(), "Foreign Agent")
     response = client.post(
@@ -624,6 +616,52 @@ def test_widget_task_create_rejects_foreign_agent_id(
         },
     )
     assert response.status_code == 403, response.text
+
+
+def test_widget_task_create_discards_forged_agent_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_create_workforce_widget_chat_task`` never reads
+    ``TaskCreateRequest.agent_config`` -- ``create_workforce_run`` only sees
+    the handler's own ``extra_agent_config`` (``auth_mode``,
+    ``widget_workforce_id``, ``guest_id``). A forged reserved key in the
+    request body must not survive into the persisted config, and neither
+    should an ordinary client key."""
+    workforce_id = _create_workforce("Forged Config Widget Workforce")
+    key = _enable_widget(workforce_id)
+    guest_headers = _authenticate_widget_guest_by_key(key)
+    patch_schedule_bg(monkeypatch)
+
+    response = client.post(
+        "/api/widget/chat/task/create",
+        headers=guest_headers,
+        json={
+            "title": "forged",
+            "description": "forged",
+            "agent_config": {
+                EXECUTION_SCOPE_AGENT_CONFIG_KEY: {
+                    "sandbox_key_suffix": "victim",
+                    "workspace_segments": ["victim"],
+                    "memory_dimensions": {"tenant": "victim"},
+                },
+                SELECTED_FILE_IDS_AGENT_CONFIG_KEY: ["victim-file-id"],
+                "keep_me": "client value",
+            },
+        },
+    )
+    assert response.status_code == 200, response.text
+    task_id = int(response.json()["task_id"])
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert EXECUTION_SCOPE_AGENT_CONFIG_KEY not in task.agent_config
+        assert SELECTED_FILE_IDS_AGENT_CONFIG_KEY not in task.agent_config
+        assert "keep_me" not in task.agent_config
+        assert task.agent_config.get("auth_mode") == "widget"
+        assert int(task.agent_config.get("widget_workforce_id")) == workforce_id
+    finally:
+        db.close()
 
 
 # ===== Task-less opening-message upload =====
@@ -725,7 +763,7 @@ def test_widget_task_access_scoped_to_guest_and_workforce(
     guest of the same workforce, or any guest of a different workforce, is
     rejected (guest_id + widget_workforce_id scoping in
     ``_get_task_for_workforce_widget_context``)."""
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
     wf_a = _create_workforce("Scope Widget A")
     key_a = _enable_widget(wf_a)
     wf_b = _create_workforce("Scope Widget B")
