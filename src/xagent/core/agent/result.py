@@ -25,6 +25,14 @@ def normalize_tool_failure_code(value: Any) -> str | None:
     return value if type(value) is str and value in TOOL_FAILURE_CODES else None
 
 
+def is_oauth_token_required_code(value: Any) -> bool:
+    """Return True iff value is the exact "oauth_token_required" plain string.
+
+    A str subclass is a trust-boundary input, not an allowlisted code.
+    """
+    return type(value) is str and value == "oauth_token_required"
+
+
 @dataclass(frozen=True)
 class ClassifiedToolFailure:
     """Sentinel an OAuth token resolver returns when it cannot refresh a token.
@@ -40,12 +48,7 @@ class ClassifiedToolFailure:
     failure_code: str
 
     def __post_init__(self) -> None:
-        # Exact plain-string match: a ``str`` subclass is a trust-boundary
-        # input, not an allowlisted code.
-        if (
-            type(self.failure_code) is not str
-            or self.failure_code != "oauth_token_required"
-        ):
+        if not is_oauth_token_required_code(self.failure_code):
             raise ValueError("invalid tool failure code")
 
 

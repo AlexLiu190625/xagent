@@ -187,6 +187,61 @@ async def test_classified_failure_survives_field_filtering() -> None:
 
 
 @pytest.mark.asyncio
+async def test_classified_failure_restore_truncates_oversized_values() -> None:
+    """The classified-failure restore must still enforce the char budget.
+
+    Mirrors ``test_classified_failure_survives_field_filtering`` (same
+    ``max_fields=2``, so ordinary field-count filtering already collapses
+    ``error``/``output``/``response`` behind a "truncated" placeholder before
+    the classified-failure restore puts them back). That test's fields are
+    short enough to survive ``max_chars`` untouched, which would hide a
+    restore loop that copies the raw child value straight through instead of
+    re-running it through ``self._filter.filter``. This test's fields are
+    each 5000 characters against a ``max_chars=1_000`` budget, so the restore
+    loop's own truncation is what has to hold.
+    """
+    from xagent.core.tools.adapters.vibe.output_filter import (
+        DEFAULT_TRUNCATION_MESSAGE,
+    )
+
+    oversized = "x" * 5_000
+
+    class OversizedFailingTool:
+        name = "oversized-classified-failure"
+        description = "Returns a classified failure with oversized text fields."
+        tags: list[str] = []
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "success": False,
+                "is_error": True,
+                "status": "error",
+                "failure_code": "unsupported_nested_interaction",
+                "error": oversized,
+                "output": oversized,
+                "response": oversized,
+            }
+
+    max_chars = 1_000
+    wrapper = OutputFilteredToolWrapper(
+        target_tool=OversizedFailingTool(),
+        max_chars=max_chars,
+        max_fields=2,
+        max_recursion=3,
+    )
+
+    result = await wrapper.run_json_async({})
+
+    assert result["success"] is False
+    assert result["is_error"] is True
+    assert result["status"] == "error"
+    assert result["failure_code"] == "unsupported_nested_interaction"
+    for key in ("error", "output", "response"):
+        assert result[key] != oversized
+        assert len(result[key]) <= max_chars + len(DEFAULT_TRUNCATION_MESSAGE)
+
+
+@pytest.mark.asyncio
 async def test_unavailable_mcp_failure_keeps_content_and_reason() -> None:
     """The classified-failure restore is additive; it strips nothing.
 

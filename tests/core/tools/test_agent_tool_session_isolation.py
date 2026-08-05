@@ -282,6 +282,43 @@ async def test_agent_tool_interrupt_uses_error_text_over_placeholder_output(
 
 
 @pytest.mark.asyncio
+async def test_agent_tool_falls_back_to_output_when_error_is_empty(
+    monkeypatch,
+):
+    """The generic classified failure falls back to output when error is empty.
+
+    Mirrors ``test_agent_tool_interrupt_uses_error_text_over_placeholder_output``
+    above: that test pins ``error`` winning over ``output`` when both are
+    non-empty, this one pins the fallback direction — an empty ``error``
+    must not surface as the message, so the classifier reads ``output``
+    instead, and every message-shaped field in the envelope carries it.
+    """
+
+    async def execute_task():
+        return {
+            "status": "failed",
+            "success": False,
+            "error": "",
+            "output": "the child's own diagnostic text",
+        }
+
+    _patch_delegated_runtime(
+        monkeypatch, execute_task, close_config=_SucceedingCloseConfig
+    )
+    tool = _delegated_agent_tool()
+    monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_kwargs: None)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["success"] is False
+    assert "failure_code" not in result
+    assert result["error"] == "the child's own diagnostic text"
+    assert result["output"] == "the child's own diagnostic text"
+    assert result["response"] == "the child's own diagnostic text"
+    assert tool_result_succeeded(result) is False
+
+
+@pytest.mark.asyncio
 async def test_agent_tool_normal_child_result_unchanged(monkeypatch):
     """A plain completed child result must keep its exact legacy shape.
 
@@ -836,7 +873,9 @@ class _StubSingleCallLLM:
         return dict(self._response)
 
 
-def _real_delegated_agent_tool(monkeypatch, tmp_path, llm) -> AgentTool:
+def _real_delegated_agent_tool(
+    monkeypatch, tmp_path, llm, *, execution_mode: str | None = None
+) -> AgentTool:
     """Build an ``AgentTool`` that runs a real ``AgentService``/``ReActPattern``.
 
     Unlike ``_patch_delegated_runtime`` (which fakes ``AgentService``
@@ -847,6 +886,13 @@ def _real_delegated_agent_tool(monkeypatch, tmp_path, llm) -> AgentTool:
     building), model resolution (returns the stub LLM), and tool discovery
     (skips the Node/parser-dependent tool build that makes ``tests/core/tools``
     flaky in this environment).
+
+    ``execution_mode`` defaults to ``None`` (mapped to the ``react`` pattern,
+    ``max_iterations=200``) to match every existing caller. Passing
+    ``"flash"`` selects the ``single_call`` pattern instead
+    (``max_iterations=2``, ``execution_adapter.py:310-319``), letting a
+    scenario that must run out the clock reach ``max_iterations`` in two
+    turns instead of two hundred.
     """
     import xagent.core.tools.adapters.vibe.agent_model_resolution as resolution
     import xagent.core.tools.adapters.vibe.factory as factory_module
@@ -878,7 +924,7 @@ def _real_delegated_agent_tool(monkeypatch, tmp_path, llm) -> AgentTool:
                 skills=None,
                 tool_categories=[],
                 models={"general": 1},
-                execution_mode=None,
+                execution_mode=execution_mode,
             )
         ),
         user_id=1,
@@ -1035,6 +1081,58 @@ async def test_agent_tool_real_child_answering_with_placeholder_text_succeeds(
     result = await tool.run_json_async({"task": "run"})
 
     assert result == {"response": "No output provided"}
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_real_child_exhausting_iterations_classifies_as_generic_failure(
+    monkeypatch, tmp_path
+):
+    """A real ReAct child that never reaches a final answer fails closed generically.
+
+    The stub LLM always calls a tool name that doesn't exist in the (empty)
+    tool list handed to the child, so every turn's ``_execute_tool_safely``
+    converts the ``Tool not found`` lookup into a failed tool result
+    (react.py:2759-2764) and the pattern keeps looping. With
+    ``execution_mode="flash"`` the child runs the ``single_call`` pattern
+    (``max_iterations=2``, ``execution_adapter.py:310-319``), so it exhausts
+    its iteration budget after two turns and returns
+    ``PatternResult(success=False, error="ReActPattern reached max
+    iterations...", metadata={"status": "max_iterations"})``
+    (react.py:679-685) instead of pausing or completing.
+
+    That status is neither ``waiting_for_user`` nor ``completed``, so
+    ``_classify_delegated_child_failure`` takes its generic branch
+    (agent_tool.py:1647-1657): a classified failure with no ``failure_code``,
+    read against the real ``AgentExecutionAdapter._normalize_result`` output
+    shape rather than a hand-built stand-in for it.
+    """
+
+    llm = _StubSingleCallLLM(
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "tool_that_does_not_exist",
+                        "arguments": "{}",
+                    },
+                }
+            ],
+            "done": False,
+        }
+    )
+    tool = _real_delegated_agent_tool(
+        monkeypatch, tmp_path, llm, execution_mode="flash"
+    )
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["success"] is False
+    assert result["is_error"] is True
+    assert result["status"] == "error"
+    assert "failure_code" not in result
+    assert tool_result_succeeded(result) is False
 
 
 def _create_factory() -> tuple[sessionmaker, str]:
