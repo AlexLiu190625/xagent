@@ -3091,3 +3091,97 @@ def test_database_trace_handler_healthy_anchor_read_clears_the_dangling_signal(
     finally:
         clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
         db.close()
+
+
+def test_database_trace_handler_prune_retains_exactly_the_limit_when_the_anchor_is_in_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The steady state: the pointer names the row just written, which ranks
+    inside the retention window. Ranking before protecting makes the
+    documented retention count exact -- excluding the anchor from the
+    candidate set instead shifts every remaining row's OFFSET rank by one
+    and keeps limit + 1."""
+    _, db, task = _create_trace_handler_test_task("anchor-in-range-prune")
+    task_id = int(task.id)
+    now = datetime.now(timezone.utc)
+    rows = [
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id=event_id,
+            execution_id="shared-execution",
+            label=event_id,
+            timestamp=now + timedelta(seconds=offset),
+            run_id="run-a",
+        )
+        for offset, event_id in enumerate(["oldest", "middle", "newest"])
+    ]
+    db.add_all(rows)
+    db.commit()
+    db.refresh(rows[-1])
+    task.last_checkpoint_trace_event_id = rows[-1].id
+    db.commit()
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        lambda: 1,
+    )
+
+    try:
+        DatabaseTraceHandler(task_id)._prune_checkpoint_history(
+            db,
+            {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "execution_id": "shared-execution",
+                TASK_RUN_ID_TRACE_FIELD: "run-a",
+            },
+        )
+
+        assert {
+            row.event_id
+            for row in db.query(DatabaseTraceEvent).filter_by(task_id=task_id).all()
+        } == {"newest"}
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_prune_with_nothing_stale_clears_the_integrity_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A healthy steady state prunes nothing. If the clear sat after the
+    delete, that state could never retire a previously-latched signal, and
+    it would show up as permanent /health noise."""
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_PRUNE_INTEGRITY_ERROR,
+        active_degradations,
+        clear_degradation,
+        register_degradation,
+    )
+
+    _, db, task = _create_trace_handler_test_task("prune-nothing-stale")
+    task_id = int(task.id)
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="only",
+            execution_id="shared-execution",
+            label="only",
+            timestamp=datetime.now(timezone.utc),
+        )
+    )
+    db.commit()
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        lambda: 5,
+    )
+
+    register_degradation(
+        CHECKPOINT_PRUNE_INTEGRITY_ERROR, "left over from an earlier race"
+    )
+    try:
+        DatabaseTraceHandler(task_id)._prune_checkpoint_history(
+            db,
+            {"checkpoint_type": CHECKPOINT_TYPE, "execution_id": "shared-execution"},
+        )
+        assert CHECKPOINT_PRUNE_INTEGRITY_ERROR not in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_PRUNE_INTEGRITY_ERROR)
+        db.close()

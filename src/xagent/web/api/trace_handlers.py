@@ -853,6 +853,10 @@ class DatabaseTraceHandler(BaseTraceHandler):
         dedup, but a blob referenced only by pruned rows (e.g. a message
         later dropped by context compaction) is orphaned until whole-task
         deletion cleans it up.
+
+        Retention is exactly ``limit`` rows, with one exception: when the
+        task's exact-row pointer names a row that itself ranks outside the
+        window, protecting that row keeps ``limit + 1``.
         """
         limit = get_checkpoint_history_limit()
         if limit <= 0:
@@ -874,27 +878,17 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         run_id if isinstance(run_id, str) and run_id else None
                     )
                 )
-            # Exclude the row this task's exact-row pointer currently
-            # references, whatever its position in the retention ranking.
-            # For the steady-state writer this is structurally unreachable
-            # -- the pointer always names the row just written, which ranks
-            # ahead of the offset -- but it guards the backfill-vs-prune
-            # window and future back-pointing anchors that may point at an
-            # older row.
             anchor = (
                 db.query(Task.last_checkpoint_trace_event_id)
                 .filter(Task.id == self.task_id)
                 .one_or_none()
             )
             anchor_id = anchor[0] if anchor is not None else None
-            candidate_filters = list(partition_filters)
-            if anchor_id is not None:
-                candidate_filters.append(DatabaseTraceEvent.id != anchor_id)
             stale_rows = (
                 db.query(DatabaseTraceEvent.id)
                 .filter(
                     DatabaseTraceEvent.task_id == self.task_id,
-                    *candidate_filters,
+                    *partition_filters,
                     DatabaseTraceEvent.event_type == "system_update_general",
                     DatabaseTraceEvent.data["checkpoint_type"]
                     .as_string()
@@ -908,9 +902,24 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 .offset(limit)
                 .all()
             )
-            if not stale_rows:
+            # This query completing is the proof the retention path is
+            # healthy, whatever it found. Clearing only after a successful
+            # delete would leave a steady state with nothing to prune unable
+            # to clear the signal at all.
+            clear_degradation(CHECKPOINT_PRUNE_INTEGRITY_ERROR)
+            # Rank first, protect after. The row this task's exact-row
+            # pointer references is never deleted, whatever its position in
+            # the retention ranking; excluding it from the candidate set
+            # instead would shift every remaining row's OFFSET rank by one
+            # and retain limit + 1 rows whenever the anchor sits inside the
+            # window. For the steady-state writer the protection is
+            # structurally unreachable -- the pointer always names the row
+            # just written, which ranks ahead of the offset -- but it guards
+            # the backfill-vs-prune window and future back-pointing anchors
+            # that may point at an older row.
+            stale_ids = [row_id for (row_id,) in stale_rows if row_id != anchor_id]
+            if not stale_ids:
                 return
-            stale_ids = [row_id for (row_id,) in stale_rows]
             # Chunk the IN clause: a backlog from previously-disabled pruning
             # can exceed SQLite's bind-parameter limit in one statement.
             for chunk in chunks(stale_ids, SQL_IN_CLAUSE_CHUNK_SIZE):
@@ -918,7 +927,6 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     DatabaseTraceEvent.id.in_(chunk)
                 ).delete(synchronize_session=False)
             db.commit()
-            clear_degradation(CHECKPOINT_PRUNE_INTEGRITY_ERROR)
             logger.debug(
                 "Pruned %d checkpoint rows for task %s execution %s",
                 len(stale_ids),
