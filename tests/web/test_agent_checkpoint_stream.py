@@ -1287,51 +1287,6 @@ def test_database_trace_handler_load_uses_pk_anchor_over_newer_row(
         db.close()
 
 
-def test_database_trace_handler_load_pk_anchor_mismatch_raises_corrupt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The anchor is never allowed to fall back to a different row once its
-    target is found: a validation mismatch (here, a build-scoped row wired
-    to the root pointer) is corruption, not absence."""
-    SessionLocal, db, task = _create_trace_handler_test_task("pk-anchor-mismatch")
-    task.status = TaskStatus.RUNNING
-    task.runner_id = "runner-a"
-    task.run_id = "run-a"
-    db.commit()
-    task_id = int(task.id)
-    mismatched_row = _checkpoint_trace_row(
-        task_id=task_id,
-        event_id="build-scoped-checkpoint",
-        execution_id="shared-execution",
-        label="build-scoped",
-        timestamp=datetime.now(timezone.utc),
-        build_id="agent_123_abcd1234",
-    )
-    db.add(mismatched_row)
-    db.commit()
-    db.refresh(mismatched_row)
-    task.last_checkpoint_trace_event_id = mismatched_row.id
-    db.commit()
-
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
-
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
-
-    try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
-            with pytest.raises(CheckpointCorruptError):
-                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
-                    "shared-execution"
-                )
-    finally:
-        db.close()
-
-
 _PK_ANCHOR_SINGLE_FAULT_FIELDS = [
     "task_id",
     "event_type",
@@ -1375,12 +1330,9 @@ def test_database_trace_handler_load_pk_anchor_single_fault_raises_corrupt(
     """Each conjunct of the PK-anchored validation must independently be
     load-bearing: a row wrong in exactly one field (every other field,
     including the run partition, valid) must still raise
-    CheckpointCorruptError. The older
-    test_database_trace_handler_load_pk_anchor_mismatch_raises_corrupt
-    above violates build_id and the run partition at the same time, so it
-    cannot prove any single conjunct is doing real work -- deleting either
-    check there still leaves the other to raise. This test kills each
-    conjunct independently.
+    CheckpointCorruptError. A row that violates several conjuncts at once
+    proves nothing about any one of them -- deleting one check still leaves
+    the others to raise -- so every conjunct gets its own case here.
     """
     SessionLocal, db, task = _create_trace_handler_test_task(
         f"pk-anchor-single-fault-{field}"
@@ -1975,12 +1927,12 @@ def test_database_trace_handler_prune_registers_degradation_on_delete_error(
     from sqlalchemy.orm import Query
 
     from xagent.web.services.ops_signals import (
-        CHECKPOINT_PRUNE_INTEGRITY_ERROR,
+        CHECKPOINT_PRUNE_FAILED,
         active_degradations,
         clear_degradation,
     )
 
-    _, db, task = _create_trace_handler_test_task("prune-integrity-error")
+    _, db, task = _create_trace_handler_test_task("prune-failure")
     task_id = int(task.id)
     now = datetime.now(timezone.utc)
     db.add_all(
@@ -2012,7 +1964,7 @@ def test_database_trace_handler_prune_registers_degradation_on_delete_error(
 
     monkeypatch.setattr(Query, "delete", failing_delete)
 
-    clear_degradation(CHECKPOINT_PRUNE_INTEGRITY_ERROR)
+    clear_degradation(CHECKPOINT_PRUNE_FAILED)
     try:
         # Must not raise -- a prune failure can never break the checkpoint
         # write it follows.
@@ -2020,10 +1972,10 @@ def test_database_trace_handler_prune_registers_degradation_on_delete_error(
             db,
             {"checkpoint_type": CHECKPOINT_TYPE, "execution_id": "shared-execution"},
         )
-        assert CHECKPOINT_PRUNE_INTEGRITY_ERROR in active_degradations()
+        assert CHECKPOINT_PRUNE_FAILED in active_degradations()
         assert db.query(DatabaseTraceEvent).filter_by(task_id=task_id).count() == 2
     finally:
-        clear_degradation(CHECKPOINT_PRUNE_INTEGRITY_ERROR)
+        clear_degradation(CHECKPOINT_PRUNE_FAILED)
         db.close()
 
 
@@ -2970,6 +2922,78 @@ def test_database_trace_handler_load_pk_anchor_generic_decode_failure_is_unavail
         db.close()
 
 
+@pytest.mark.parametrize("decodes_a_row", [True, False])
+def test_database_trace_handler_decode_fallback_clears_after_a_successful_decode(
+    monkeypatch: pytest.MonkeyPatch,
+    decodes_a_row: bool,
+) -> None:
+    """The decode-fallback signal is process-wide and its clear is evidence
+    that a decode worked, so an anchored read that resolves its pointer and
+    decodes the row has to retire it: that read returns before the legacy
+    scan, and the scan holds the only other clear. Without this the signal
+    stays on /health for the life of the process as soon as the anchor
+    starts succeeding, which is the normal steady state.
+
+    The second case pins the clear to the decode rather than to the attempt.
+    A read with nothing to decode -- no pointer, no rows -- proves nothing
+    about the decode layer and must leave a set signal alone; a clear placed
+    at the top of the anchored read next to the dangling clear would retire
+    it there and report a false all-clear.
+    """
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_DECODE_FALLBACK,
+        active_degradations,
+        clear_degradation,
+        register_degradation,
+    )
+
+    SessionLocal, db, task = _create_trace_handler_test_task(
+        f"decode-fallback-clear-{decodes_a_row}"
+    )
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    expected: Dict[str, Any] | None = None
+    if decodes_a_row:
+        row = _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="anchored",
+            execution_id="shared-execution",
+            label="anchored",
+            timestamp=datetime.now(timezone.utc),
+            run_id="run-a",
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        task.last_checkpoint_trace_event_id = row.id
+        db.commit()
+        expected = {"label": "anchored"}
+
+    _bind_checkpoint_read_session(monkeypatch, SessionLocal)
+
+    register_degradation(
+        CHECKPOINT_DECODE_FALLBACK, "left over from an earlier fallback"
+    )
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            assert (
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "shared-execution"
+                )
+                == expected
+            )
+        if decodes_a_row:
+            assert CHECKPOINT_DECODE_FALLBACK not in active_degradations()
+        else:
+            assert CHECKPOINT_DECODE_FALLBACK in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_DECODE_FALLBACK)
+        db.close()
+
+
 @pytest.mark.parametrize("failing_call", ["pointer_query", "row_fetch"])
 def test_database_trace_handler_load_pk_anchor_database_failure_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
@@ -3043,13 +3067,20 @@ def test_database_trace_handler_load_pk_anchor_database_failure_is_unavailable(
         db.close()
 
 
-def test_database_trace_handler_healthy_anchor_read_clears_the_dangling_signal(
+@pytest.mark.parametrize("anchor_set", [True, False])
+def test_database_trace_handler_anchored_read_clears_the_dangling_signal(
     monkeypatch: pytest.MonkeyPatch,
+    anchor_set: bool,
 ) -> None:
-    """ops_signals state is process-wide, so a dangling signal that only
-    clears when some pointer resolves to a row would stay set forever in a
-    process where no task has an anchor. Any anchored read that is not
-    itself dangling clears it."""
+    """The clear must sit before the pointer lookup, not after a pointer
+    resolves to a row.
+
+    ops_signals state is process-wide, so a signal that only cleared once
+    some pointer resolved would stay set forever in a process where no task
+    carries an anchor. The anchorless case is the one that pins the
+    placement: move the clear below the pointer lookup and the anchored case
+    still passes while that one fails.
+    """
     from xagent.web.services.ops_signals import (
         CHECKPOINT_PK_ANCHOR_DANGLING,
         active_degradations,
@@ -3057,65 +3088,31 @@ def test_database_trace_handler_healthy_anchor_read_clears_the_dangling_signal(
         register_degradation,
     )
 
-    SessionLocal, db, task = _create_trace_handler_test_task("anchor-clears-dangling")
+    SessionLocal, db, task = _create_trace_handler_test_task(
+        f"anchor-clears-dangling-{anchor_set}"
+    )
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
-    row = _checkpoint_trace_row(
-        task_id=task_id,
-        event_id="anchored",
-        execution_id="shared-execution",
-        label="anchored",
-        timestamp=datetime.now(timezone.utc),
-        run_id="run-a",
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    task.last_checkpoint_trace_event_id = row.id
-    db.commit()
-
-    _bind_checkpoint_read_session(monkeypatch, SessionLocal)
-
-    register_degradation(
-        CHECKPOINT_PK_ANCHOR_DANGLING, "left over from another task's read"
-    )
-    try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
-            assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
-                "shared-execution"
-            ) == {"label": "anchored"}
-        assert CHECKPOINT_PK_ANCHOR_DANGLING not in active_degradations()
-    finally:
-        clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
-        db.close()
-
-
-def test_database_trace_handler_anchorless_read_clears_the_dangling_signal(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The clear must sit before the pointer lookup, not after a row resolves.
-
-    A process where no task carries an anchor never resolves a pointer to a
-    row, so a clear placed on the resolved-row path would leave a previously
-    latched dangling signal set forever. An anchored read attempt with an
-    unset pointer must clear it too."""
-    from xagent.web.services.ops_signals import (
-        CHECKPOINT_PK_ANCHOR_DANGLING,
-        active_degradations,
-        clear_degradation,
-        register_degradation,
-    )
-
-    SessionLocal, db, task = _create_trace_handler_test_task("anchorless-clears")
-    task.status = TaskStatus.RUNNING
-    task.runner_id = "runner-a"
-    task.run_id = "run-a"
-    db.commit()
-    task_id = int(task.id)
-    assert task.last_checkpoint_trace_event_id is None
+    expected: Dict[str, Any] | None = None
+    if anchor_set:
+        row = _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="anchored",
+            execution_id="shared-execution",
+            label="anchored",
+            timestamp=datetime.now(timezone.utc),
+            run_id="run-a",
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        task.last_checkpoint_trace_event_id = row.id
+        db.commit()
+        expected = {"label": "anchored"}
+    assert (task.last_checkpoint_trace_event_id is not None) is anchor_set
 
     _bind_checkpoint_read_session(monkeypatch, SessionLocal)
 
@@ -3128,7 +3125,7 @@ def test_database_trace_handler_anchorless_read_clears_the_dangling_signal(
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
                 )
-                is None
+                == expected
             )
         assert CHECKPOINT_PK_ANCHOR_DANGLING not in active_degradations()
     finally:
@@ -3186,14 +3183,14 @@ def test_database_trace_handler_prune_retains_exactly_the_limit_when_the_anchor_
         db.close()
 
 
-def test_database_trace_handler_prune_with_nothing_stale_clears_the_integrity_signal(
+def test_database_trace_handler_prune_with_nothing_stale_clears_the_failure_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A healthy steady state prunes nothing. If the clear sat after the
     delete, that state could never retire a previously-latched signal, and
     it would show up as permanent /health noise."""
     from xagent.web.services.ops_signals import (
-        CHECKPOINT_PRUNE_INTEGRITY_ERROR,
+        CHECKPOINT_PRUNE_FAILED,
         active_degradations,
         clear_degradation,
         register_degradation,
@@ -3216,17 +3213,15 @@ def test_database_trace_handler_prune_with_nothing_stale_clears_the_integrity_si
         lambda: 5,
     )
 
-    register_degradation(
-        CHECKPOINT_PRUNE_INTEGRITY_ERROR, "left over from an earlier race"
-    )
+    register_degradation(CHECKPOINT_PRUNE_FAILED, "left over from an earlier race")
     try:
         DatabaseTraceHandler(task_id)._prune_checkpoint_history(
             db,
             {"checkpoint_type": CHECKPOINT_TYPE, "execution_id": "shared-execution"},
         )
-        assert CHECKPOINT_PRUNE_INTEGRITY_ERROR not in active_degradations()
+        assert CHECKPOINT_PRUNE_FAILED not in active_degradations()
     finally:
-        clear_degradation(CHECKPOINT_PRUNE_INTEGRITY_ERROR)
+        clear_degradation(CHECKPOINT_PRUNE_FAILED)
         db.close()
 
 

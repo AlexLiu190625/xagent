@@ -33,7 +33,7 @@ from ...web.services.ops_signals import (
     CHECKPOINT_DECODE_FALLBACK,
     CHECKPOINT_LOAD_UNAVAILABLE,
     CHECKPOINT_PK_ANCHOR_DANGLING,
-    CHECKPOINT_PRUNE_INTEGRITY_ERROR,
+    CHECKPOINT_PRUNE_FAILED,
     clear_degradation,
     register_degradation,
 )
@@ -616,7 +616,18 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 exc_info=True,
             )
             return _AnchorFallback(generic_failure=True)
+        # The scan retires these two signals on two different facts: the
+        # load signal once a page query returns, the decode-fallback signal
+        # once a row decodes. An anchored read establishes both in one round
+        # trip, so both clears land here -- and here rather than at the top
+        # of this function, where the dangling clear sits, because that one
+        # reports on the pointer every attempt re-reads while these report
+        # that the read actually got through. An anchored read returns
+        # without ever entering the scan, so without these a decode-fallback
+        # signal set by one bad row could never retire in the steady state
+        # this anchor exists to produce.
         clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        clear_degradation(CHECKPOINT_DECODE_FALLBACK)
 
         snapshot = decoded.get("snapshot") if isinstance(decoded, dict) else None
         if not isinstance(snapshot, dict):
@@ -906,7 +917,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # healthy, whatever it found. Clearing only after a successful
             # delete would leave a steady state with nothing to prune unable
             # to clear the signal at all.
-            clear_degradation(CHECKPOINT_PRUNE_INTEGRITY_ERROR)
+            clear_degradation(CHECKPOINT_PRUNE_FAILED)
             # Rank first, protect after. The row this task's exact-row
             # pointer references is never deleted, whatever its position in
             # the retention ranking; excluding it from the candidate set
@@ -944,14 +955,20 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # surface as psycopg2's SerializationFailure or DeadlockDetected,
             # both of which SQLAlchemy wraps in OperationalError, not
             # IntegrityError -- catch both so this retention path degrades
-            # the same way regardless of which one the database raises.
+            # the same way regardless of which one the database raises. The
+            # signal is named for the outcome rather than for either cause:
+            # OperationalError also covers lock timeouts and dropped
+            # connections, /health publishes only the signal name, and the
+            # operator's response to all of them is the same -- retention
+            # stopped, rows are accumulating, read the logged traceback for
+            # which one it was.
             db.rollback()
             register_degradation(
-                CHECKPOINT_PRUNE_INTEGRITY_ERROR,
-                f"task {self.task_id}: checkpoint prune hit an integrity error",
+                CHECKPOINT_PRUNE_FAILED,
+                f"task {self.task_id}: checkpoint prune could not delete stale rows",
             )
             logger.warning(
-                "Checkpoint prune hit an integrity error for task %s",
+                "Checkpoint prune failed for task %s",
                 self.task_id,
                 exc_info=True,
             )

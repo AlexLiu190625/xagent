@@ -7,7 +7,13 @@ key; on SQLite the migration adds the column only -- ``ALTER TABLE ADD
 CONSTRAINT`` is not renderable through Alembic's SQLite batch mode without a
 full table rebuild, so an upgraded SQLite database has no DB-level FK here.
 A database built fresh through ``Base.metadata.create_all()`` (new installs,
-tests) gets the FK from the model directly, regardless of dialect.
+tests) gets the FK from the model directly, regardless of dialect. That
+divergence between fresh and upgraded SQLite databases is permanent under
+the current migration set: this revision is the head and no later revision
+reconciles the two shapes. On an upgraded SQLite database the pointer's
+delete protection is therefore the application-level clearing order in
+``task_deletion.py``, which nulls both pointer columns before deleting the
+task's ``trace_events`` rows -- not the database.
 
 Existing rows are backfilled by resolving the legacy string column against
 the row it names, but only where that resolution is unambiguous: zero or

@@ -23,7 +23,7 @@ CHECKPOINT_DECODE_FALLBACK = "checkpoint_decode_fallback"
 CHECKPOINT_LEGACY_POINTER_AMBIGUOUS = "checkpoint_legacy_pointer_ambiguous"
 CHECKPOINT_LOAD_UNAVAILABLE = "checkpoint_load_unavailable"
 CHECKPOINT_PK_ANCHOR_DANGLING = "checkpoint_pk_anchor_dangling"
-CHECKPOINT_PRUNE_INTEGRITY_ERROR = "checkpoint_prune_integrity_error"
+CHECKPOINT_PRUNE_FAILED = "checkpoint_prune_failed"
 
 _signals: dict[str, str] = {}
 _lock = threading.Lock()

@@ -62,6 +62,17 @@ def reset_checkpoint_anchor_fk_create_rule() -> None:
     """
     for constraint in Base.metadata.tables["tasks"].constraints:
         if getattr(constraint, "name", None) == CHECKPOINT_ANCHOR_FK_NAME:
+            # _create_rule is private SQLAlchemy state. If a release renames
+            # or drops it, assigning to the old name still succeeds, leaves
+            # the cached decision in place, and hollows out every fixture
+            # that calls this helper -- they would keep asserting against a
+            # schema that silently lost the constraint. Check first so that
+            # becomes a loud failure instead.
+            assert hasattr(constraint, "_create_rule"), (
+                "SQLAlchemy no longer exposes Constraint._create_rule; the "
+                "cross-dialect create_all() workaround in this helper needs "
+                "to be rewritten against the current attribute"
+            )
             constraint._create_rule = None
             return
     raise AssertionError(f"{CHECKPOINT_ANCHOR_FK_NAME} constraint not found on tasks")
