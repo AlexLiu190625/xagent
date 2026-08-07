@@ -1739,6 +1739,28 @@ class TestShareRateLimitConfig:
             "XAGENT_WIDGET_WS_TURN_RATE_LIMIT",
             "240/minute",
         ),
+        (
+            "get_widget_auth_rate_limit",
+            "XAGENT_WIDGET_AUTH_RATE_LIMIT",
+            "1200/minute",
+        ),
+        (
+            "get_widget_auth_ip_rate_limit",
+            "XAGENT_WIDGET_AUTH_IP_RATE_LIMIT",
+            "300/minute",
+        ),
+        (
+            "get_widget_task_create_rate_limit",
+            "XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT",
+            "240/minute",
+        ),
+        (
+            "get_widget_task_create_ip_rate_limit",
+            "XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT",
+            "60/minute",
+        ),
+        ("get_widget_run_quota", "XAGENT_WIDGET_RUN_QUOTA", "500/day"),
+        ("get_widget_run_ip_quota", "XAGENT_WIDGET_RUN_IP_QUOTA", "120/hour"),
     ]
 
     @pytest.mark.parametrize("func_name,env_var,default", _CASES)
