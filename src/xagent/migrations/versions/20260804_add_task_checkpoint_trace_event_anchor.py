@@ -8,17 +8,35 @@ CONSTRAINT`` is not renderable through Alembic's SQLite batch mode without a
 full table rebuild, so an upgraded SQLite database has no DB-level FK here.
 A database built fresh through ``Base.metadata.create_all()`` (new installs,
 tests) gets the FK from the model directly, regardless of dialect. That
-divergence between fresh and upgraded SQLite databases is permanent under
-the current migration set: this revision is the head and no later revision
-reconciles the two shapes. On an upgraded SQLite database the pointer's
-delete protection is therefore the application-level clearing order in
-``task_deletion.py``, which nulls both pointer columns before deleting the
-task's ``trace_events`` rows -- not the database.
+divergence between fresh and upgraded SQLite databases is permanent under the
+current migration set: no later revision reconciles the two shapes. On an
+upgraded SQLite database the pointer's delete protection is therefore the
+application-level clearing order in ``task_deletion.py``, which nulls both
+pointer columns before deleting the task's ``trace_events`` rows -- not the
+database.
 
 Existing rows are backfilled by resolving the legacy string column against
 the row it names, but only where that resolution is unambiguous: zero or
 multiple matching trace_events rows leave the new column NULL rather than
 guessing or aborting the migration.
+
+Both functions fork on ``context.as_sql``. Offline (``--sql``) generation runs
+against a MockConnection: nothing can be reflected, so the offline branch emits
+the DDL unconditionally instead of consulting the inspector, and the online
+branch keeps its existence guards. The two branches address different kinds of
+database and are each correct for their own.
+
+The offline SQLite downgrade drops the column directly rather than rebuilding
+the table. An offline script is generated for a database that this migration
+chain built, and on SQLite such a database carries no foreign key on this
+column -- as stated above, only a create_all-built database gets one, and those
+are already at the latest shape and never consume offline SQL. The online
+SQLite branch still rebuilds the table, because a live connection may be
+attached to either shape.
+
+The offline branch also has no counterpart to the online early returns for a
+missing ``tasks`` or ``trace_events`` table: an offline script targets a
+database maintained by this chain, where both tables are present.
 
 On PostgreSQL ``create_foreign_key`` takes an ACCESS EXCLUSIVE lock on
 ``tasks`` and validates every existing row before returning, and the
@@ -88,6 +106,18 @@ def _fk_names() -> set[str]:
 
 
 def upgrade() -> None:
+    context = op.get_context()
+
+    # Offline (--sql) generation runs against a MockConnection, so reflection
+    # is unavailable and every guard below would raise. Emit the
+    # unconditional DDL a migration-built database needs instead.
+    if context.as_sql:
+        op.add_column(TABLE, sa.Column(COLUMN, sa.Integer(), nullable=True))
+        if context.dialect.name == "postgresql":
+            op.create_foreign_key(FK_NAME, TABLE, TRACE_TABLE, [COLUMN], ["id"])
+        op.execute(BACKFILL_SQL)
+        return
+
     # tasks is created by Base.metadata.create_all() in production, not by
     # a migration in this repo; a from-scratch (bare) database has no tasks
     # table yet when migrations run, so this is a no-op there.
@@ -116,6 +146,18 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    context = op.get_context()
+
+    # An offline script targets a database this migration chain built, which
+    # on SQLite carries no foreign key on this column (see the module
+    # docstring) -- so a plain DROP COLUMN is enough, and batch mode is not
+    # available under --sql anyway. The online branch below still rebuilds.
+    if context.as_sql:
+        if context.dialect.name == "postgresql":
+            op.drop_constraint(FK_NAME, TABLE, type_="foreignkey")
+        op.drop_column(TABLE, COLUMN)
+        return
+
     if not _table_exists():
         return
 
