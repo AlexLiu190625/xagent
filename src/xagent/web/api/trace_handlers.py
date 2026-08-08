@@ -41,12 +41,12 @@ from ...web.services.task_lease_service import (
     TASK_RUN_ID_TRACE_FIELD,
     current_task_lease,
 )
+from ...web.services.trace_event_staging import stage_trace_event_row
 from ...web.services.trace_message_storage import (
     SQL_IN_CLAUSE_CHUNK_SIZE,
     CheckpointMessageDecodeError,
     chunks,
     decode_trace_event_data,
-    encode_checkpoint_data_for_storage,
 )
 
 logger = logging.getLogger(__name__)
@@ -687,32 +687,22 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 checkpoint_lease = (
                     current_task_lease() if self.build_id is None else None
                 )
-                if checkpoint_lease is not None:
-                    data = {
-                        **data,
-                        TASK_RUN_ID_TRACE_FIELD: checkpoint_lease.run_id,
-                    }
-                data = encode_checkpoint_data_for_storage(
-                    db,
-                    task_id=self.task_id,
-                    data=data,
-                )
             else:
                 checkpoint_lease = None
 
-            # Create trace event record
-            trace_event = DatabaseTraceEvent(
+            staged = stage_trace_event_row(
+                db,
                 task_id=self.task_id,
-                build_id=self.build_id,  # ← 添加 build_id
+                build_id=self.build_id,
                 event_id=str(event.id),
                 event_type=event_type_str,
                 timestamp=timestamp,
                 step_id=event.step_id,
                 parent_event_id=str(event.parent_id) if event.parent_id else None,
                 data=data,
+                checkpoint_lease=checkpoint_lease,
             )
-
-            db.add(trace_event)
+            data = staged.stored_data
 
             if (
                 event_type_str == "system_update_general"
@@ -721,18 +711,13 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 and self.build_id is None
                 and checkpoint_lease is not None
             ):
-                # Flush the pending insert so trace_event.id (the row's
-                # primary key) is assigned before the pointer UPDATE below
-                # reads it. autoflush is off for this session, so without
-                # this the exact-row anchor column would be built from an
-                # unassigned id and silently written NULL.
-                db.flush()
-                if trace_event.id is None:
-                    raise RuntimeError(
-                        f"Task {self.task_id} checkpoint {event.id} row has no "
-                        "primary key after flush; refusing to write a NULL "
-                        "checkpoint anchor"
-                    )
+                # The anchor's primary key was already flushed and
+                # NULL-checked inside stage_trace_event_row before it
+                # returned staged.anchor; consume it directly here. This
+                # guard is the same is_checkpoint / build_id / lease test
+                # stage_trace_event_row itself gates its flush on, so the
+                # anchor here is never None.
+                assert staged.anchor is not None
                 pointer_update = db.execute(
                     update(Task)
                     .where(
@@ -743,7 +728,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     )
                     .values(
                         last_checkpoint_event_id=str(event.id),
-                        last_checkpoint_trace_event_id=trace_event.id,
+                        last_checkpoint_trace_event_id=staged.anchor.trace_event_id,
                     )
                     .execution_options(synchronize_session=False)
                 )
@@ -869,6 +854,10 @@ class DatabaseTraceHandler(BaseTraceHandler):
         task's exact-row pointer names a row that itself ranks outside the
         window, protecting that row keeps ``limit + 1``.
         """
+        if db.new or db.dirty or db.deleted:
+            raise RuntimeError(
+                "checkpoint prune must not run with pending writes on the session"
+            )
         limit = get_checkpoint_history_limit()
         if limit <= 0:
             return
