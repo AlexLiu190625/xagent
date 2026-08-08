@@ -52,7 +52,10 @@ vi.mock('@/contexts/i18n-context', () => ({
 }))
 
 import { JsonRenderer, MarkdownRenderer } from '../markdown-renderer'
-import { AgentCardPresentationCapability } from '@/contexts/presentation-capabilities'
+import {
+  AgentCardPresentationCapability,
+  LinksOpenInNewTabCapability,
+} from '@/contexts/presentation-capabilities'
 import {
   getFilesDisabledPresentationFileLabel,
   projectFilesDisabledPresentation,
@@ -680,17 +683,67 @@ describe('MarkdownRenderer', () => {
     expect(await screen.findByTestId('excel-preview')).toHaveTextContent('WFk=')
   })
 
-  it('preserves standard relative markdown links and images', () => {
+  it('preserves standard relative markdown links and images, and does not open them in a new tab by default', () => {
     const content = '[relative doc](../doc.md)\n\n![relative image](./a.png)'
     render(<MarkdownRenderer content={content} />)
 
     const link = screen.getByText('relative doc')
     expect(link).toBeInTheDocument()
     expect(link).toHaveAttribute('href', '../doc.md')
+    expect(link).not.toHaveAttribute('target')
+    expect(link).not.toHaveAttribute('rel')
 
     const image = screen.getByAltText('relative image')
     expect(image).toBeInTheDocument()
     expect(image).toHaveAttribute('src', './a.png')
+  })
+
+  it('opens ordinary links in a new tab only when the LinksOpenInNewTab capability is enabled', () => {
+    render(
+      <LinksOpenInNewTabCapability.Provider value={true}>
+        <MarkdownRenderer content="[Google](https://www.google.com)" />
+      </LinksOpenInNewTabCapability.Provider>,
+    )
+
+    const link = screen.getByRole('link', { name: 'Google' })
+    expect(link).toHaveAttribute('target', '_blank')
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+  })
+
+  it('keeps in-page anchor links and mailto links in the current tab even when the capability is enabled', () => {
+    const content = [
+      '[Jump to section](#section)',
+      '[Email us](mailto:hello@example.com)',
+    ].join('\n\n')
+    render(
+      <LinksOpenInNewTabCapability.Provider value={true}>
+        <MarkdownRenderer content={content} />
+      </LinksOpenInNewTabCapability.Provider>,
+    )
+
+    for (const name of ['Jump to section', 'Email us']) {
+      const link = screen.getByRole('link', { name })
+      expect(link).not.toHaveAttribute('target')
+      expect(link).not.toHaveAttribute('rel')
+    }
+  })
+
+  it('neutralizes javascript: hrefs before the new-tab check ever sees them', () => {
+    render(<MarkdownRenderer content="[click me](javascript:alert(1))" />)
+
+    const link = screen.getByText('click me')
+    expect(link).not.toHaveAttribute('href')
+    expect(link).not.toHaveAttribute('target')
+    expect(link).not.toHaveAttribute('rel')
+  })
+
+  it('does not add target/rel to a link with an empty href', () => {
+    render(<MarkdownRenderer content="[x]()" />)
+
+    const link = screen.getByText('x')
+    expect(link).not.toHaveAttribute('href')
+    expect(link).not.toHaveAttribute('target')
+    expect(link).not.toHaveAttribute('rel')
   })
 
   it('uses authenticated preview fallback for non-uuid file: images', async () => {
