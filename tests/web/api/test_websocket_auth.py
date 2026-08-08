@@ -259,6 +259,60 @@ async def test_extensionless_close_failure_is_terminal_without_second_response(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control_signal", [asyncio.CancelledError, KeyboardInterrupt, SystemExit]
+)
+@pytest.mark.parametrize("terminal_operation", ["denial", "accept", "close"])
+async def test_terminal_send_process_control_propagates_without_marker_or_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    control_signal: type[BaseException],
+    terminal_operation: str,
+) -> None:
+    signal = control_signal()
+    websocket = MagicMock()
+    websocket.send_denial_response = AsyncMock()
+    websocket.accept = AsyncMock()
+    websocket.close = AsyncMock()
+
+    if terminal_operation == "denial":
+        websocket.scope = {"extensions": {"websocket.http.response": {}}}
+        websocket.send_denial_response.side_effect = signal
+    elif terminal_operation == "accept":
+        websocket.scope = {"extensions": {}}
+        websocket.accept.side_effect = signal
+    else:
+        websocket.scope = {"extensions": {}}
+        websocket.close.side_effect = signal
+
+    async def timeout(_operation: object) -> None:
+        raise TimeoutError("database pool")
+
+    monkeypatch.setattr(websocket_auth, "run_db_io_cancellation_safe", timeout)
+
+    with pytest.raises(control_signal) as raised:
+        await websocket_auth.get_authenticated_user(websocket, "signed-token")
+
+    assert raised.value is signal
+    assert not isinstance(
+        raised.value, websocket_auth._WebSocketAuthenticationTerminated
+    )
+    if terminal_operation == "denial":
+        websocket.send_denial_response.assert_awaited_once()
+        websocket.accept.assert_not_awaited()
+        websocket.close.assert_not_awaited()
+    elif terminal_operation == "accept":
+        websocket.send_denial_response.assert_not_awaited()
+        websocket.accept.assert_awaited_once()
+        websocket.close.assert_not_awaited()
+    else:
+        websocket.send_denial_response.assert_not_awaited()
+        websocket.accept.assert_awaited_once()
+        websocket.close.assert_awaited_once_with(
+            code=1011, reason="Internal server error"
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("control_signal", [KeyboardInterrupt, SystemExit])
 async def test_process_control_signals_are_not_translated(
     monkeypatch: pytest.MonkeyPatch,
