@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text
 
 
 def _load_migration_module():
@@ -60,16 +60,24 @@ def test_upgrade_inserts_granola(tmp_path):
         _create_table(connection)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-        assert "granola" in _app_ids(connection)
-        row = connection.execute(
-            text(
-                "SELECT transport, provider_name, launch_config FROM public_mcp_apps WHERE app_id='granola'"
+        # Full-row comparison through the migration's own typed table object:
+        # JSON columns deserialize and booleans come back as real bools, so
+        # the persisted row compares to ROW directly — no field is left
+        # unchecked at the DB level. ROW's content is itself pinned against
+        # the registry by test_seed_row_matches_registry, so deriving the
+        # expectation from it keeps identical coverage without a third
+        # hand-typed copy of the seed data.
+        row = (
+            connection.execute(
+                select(migration.PUBLIC_MCP_APPS_TABLE).where(
+                    migration.PUBLIC_MCP_APPS_TABLE.c.app_id == "granola"
+                )
             )
-        ).first()
-        assert row[0] == "streamable_http"
-        assert row[1] is None
-        assert "https://mcp.granola.ai/mcp" in str(row[2])
-        assert "mcp_oauth" in str(row[2])
+            .mappings()
+            .first()
+        )
+        assert row is not None
+        assert dict(row) == migration.ROW
 
 
 def test_upgrade_is_idempotent(tmp_path):
@@ -118,5 +126,18 @@ def test_downgrade_removes_granola(tmp_path):
         _create_table(connection)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
+        # A sentinel row unrelated to this migration must survive the
+        # downgrade — otherwise "granola" missing from _app_ids could
+        # equally mean the whole table was wiped, not just its own row.
+        # transport is set explicitly: the real column is NOT NULL with no
+        # server default, so the insert must not lean on the default this
+        # test's own _create_table happens to declare.
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, transport)"
+                " VALUES ('sentinel', 'Sentinel', 'oauth')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
             migration.downgrade()
-        assert "granola" not in _app_ids(connection)
+        assert _app_ids(connection) == {"sentinel"}
