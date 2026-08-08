@@ -197,6 +197,30 @@ def test_mixed_malformed_temporal_claims_are_rejected_before_any_user_query(
     assert db_session.info["user_query_count"] == 0
 
 
+@pytest.mark.parametrize(
+    "claims",
+    (
+        {"iat": [], "exp": "not-a-number"},
+        {"iat": float("inf"), "exp": "not-a-number"},
+    ),
+    ids=("type-error-before-value-error", "overflow-error-before-value-error"),
+)
+def test_mixed_temporal_claims_preserve_original_error_proof_after_value_error(
+    db_session: Session, claims: dict[str, object]
+) -> None:
+    """A dependency-handled temporal ValueError cannot replace the original error."""
+    token = _access_token(**claims)
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+
+    with pytest.raises(HTTPException) as raised:
+        get_current_user(credentials, db_session)
+
+    assert raised.value.status_code == 401
+    assert raised.value.detail == "Invalid token payload"
+    assert raised.value.headers == {"WWW-Authenticate": "Bearer"}
+    assert db_session.info["user_query_count"] == 0
+
+
 @pytest.mark.parametrize("claim", ("exp", "nbf", "iat"))
 def test_numeric_temporal_claims_keep_the_library_accepted_behavior(
     db_session: Session, claim: str
