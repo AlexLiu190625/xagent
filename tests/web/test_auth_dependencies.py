@@ -173,6 +173,30 @@ def test_malformed_temporal_claims_are_rejected_before_any_user_query(
     assert db_session.info["user_query_count"] == 0
 
 
+@pytest.mark.parametrize(
+    "claims",
+    (
+        {"iat": [], "exp": float("inf")},
+        {"iat": float("inf"), "exp": []},
+    ),
+    ids=("type-error-before-overflow-error", "overflow-error-before-type-error"),
+)
+def test_mixed_malformed_temporal_claims_are_rejected_before_any_user_query(
+    db_session: Session, claims: dict[str, object]
+) -> None:
+    """A later mixed temporal claim cannot defeat the original error proof."""
+    token = _access_token(**claims)
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+
+    with pytest.raises(HTTPException) as raised:
+        get_current_user(credentials, db_session)
+
+    assert raised.value.status_code == 401
+    assert raised.value.detail == "Invalid token payload"
+    assert raised.value.headers == {"WWW-Authenticate": "Bearer"}
+    assert db_session.info["user_query_count"] == 0
+
+
 @pytest.mark.parametrize("claim", ("exp", "nbf", "iat"))
 def test_numeric_temporal_claims_keep_the_library_accepted_behavior(
     db_session: Session, claim: str

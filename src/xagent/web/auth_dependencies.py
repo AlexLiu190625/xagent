@@ -54,7 +54,8 @@ def _has_matching_temporal_claim_conversion_failure(
         try:
             int(claims[claim_name])
         except (TypeError, OverflowError) as reproduced_error:
-            return type(reproduced_error) is type(original_error)
+            if type(reproduced_error) is type(original_error):
+                return True
     return False
 
 
