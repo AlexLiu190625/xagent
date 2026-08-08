@@ -69,7 +69,10 @@ class TaskLease:
       task row, so populating ``attempt_id`` from the same row would make any
       later ``task.lease_attempt_id != lease.attempt_id`` check compare a
       value against itself -- an always-passing fence, which is strictly
-      worse than an explicit None that callers can detect and skip.
+      worse than an explicit None that callers can detect and skip. Today
+      that snapshot only feeds checkpoint fencing via
+      ``bind_task_lease_context`` and never reaches a settlement path, so
+      the permanent None also has no behavioural cost.
 
     Consumers must therefore treat None as "cannot prove attempt identity"
     and fall back to whatever fence they already had, never as "matches".

@@ -1347,6 +1347,7 @@ def test_stale_running_task_with_checkpoint_becomes_paused(db_session) -> None:
     task = _create_task(db_session, status=TaskStatus.RUNNING)
     task.runner_id = "dead-runner"
     task.run_id = "checkpoint-run"
+    task.lease_attempt_id = "stale-attempt"
     task.lease_expires_at = utc_now() - timedelta(seconds=1)
     task.last_checkpoint_event_id = "checkpoint-1"
     checkpoint_event = TraceEvent(
@@ -1374,6 +1375,7 @@ def test_stale_running_task_with_checkpoint_becomes_paused(db_session) -> None:
     assert task.status == TaskStatus.PAUSED
     assert task.runner_id is None
     assert task.lease_expires_at is None
+    assert task.lease_attempt_id is None
 
 
 def test_stale_running_task_ignores_child_agent_checkpoint(db_session) -> None:
