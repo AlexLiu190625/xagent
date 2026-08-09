@@ -611,10 +611,15 @@ class TestOfflineSql:
 
     @pytest.mark.parametrize("dialect", ["sqlite", "postgresql"])
     @pytest.mark.parametrize("operation", ["upgrade", "downgrade"])
-    def test_offline_rendering_does_not_reflect(
+    def test_offline_sql_carries_no_bind_parameters(
         self, dialect: str, operation: str
     ) -> None:
-        """Regression guard for the whole point of the fork: any inspector
-        call on the offline bind raises, so a non-empty render proves no
-        guard was consulted."""
-        assert _offline_sql(dialect, operation).strip()
+        """An operator applies --sql output with a plain SQL client, so every
+        value has to be inlined. This renders without literal_binds on
+        purpose: a bind parameter that env.py would have inlined still shows
+        up here."""
+        sql = _offline_sql(dialect, operation)
+
+        assert "%(" not in sql
+        assert ":param" not in sql
+        assert "?" not in sql
