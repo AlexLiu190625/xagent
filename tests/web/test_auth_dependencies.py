@@ -152,6 +152,40 @@ def test_access_token_rejection_matrix_preserves_required_http_contract(
     assert raised.value.headers == headers
 
 
+REJECTED_ACCESS_TOKEN_CASES = (
+    pytest.param(
+        _access_token(exp=datetime.now(timezone.utc) - timedelta(minutes=5)),
+        id="expired",
+    ),
+    pytest.param(
+        jwt.encode(
+            {
+                "type": "access",
+                "sub": "existing-user",
+                "user_id": 1,
+                "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+            },
+            "different-signing-secret",
+            algorithm=JWT_ALGORITHM,
+        ),
+        id="invalid-signature",
+    ),
+    pytest.param(_access_token(type="refresh"), id="wrong-type"),
+    pytest.param(_access_token(sub=[]), id="invalid-claims"),
+    pytest.param(_access_token(sub="missing-user"), id="user-not-found"),
+)
+
+
+@pytest.mark.parametrize("token", REJECTED_ACCESS_TOKEN_CASES)
+def test_optional_auth_rejects_every_credential_reason(
+    db_session: Session, token: str
+) -> None:
+    """Optional authentication suppresses every typed credential rejection."""
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+
+    assert get_current_user_optional(credentials, db_session) is None
+
+
 @pytest.mark.parametrize("claim", ("exp", "nbf", "iat"))
 @pytest.mark.parametrize(
     "value",
