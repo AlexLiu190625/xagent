@@ -1,0 +1,377 @@
+"""The durable, authoritative record of a blocking task interaction request."""
+
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+)
+from sqlalchemy.sql import func
+
+from .database import Base
+
+
+class TaskInteractionRequest(Base):  # type: ignore
+    """One blocking interaction request raised by a task and its lifecycle to answer or expiry.
+
+    Zero production consumers as of this table's introduction: the primitive
+    that writes rows here (``stage_interaction_request`` / the
+    ``interaction_handoff`` context manager) and the code that reads them
+    land separately, so this class is model-only until those callers exist.
+
+    Active slot: ``UNIQUE(task_id, active_slot)`` caps a task at one
+    ``active`` row at a time. ``active_slot`` is ``1`` on that row and SQL
+    ``NULL`` on every ``answered`` / ``terminated`` row, relying on
+    NULL-distinct uniqueness so terminal rows can coexist without bound.
+    This table depends on PostgreSQL's default NULLS DISTINCT behavior --
+    do not add ``postgresql_nulls_not_distinct=True`` to
+    ``uq_task_interaction_active_slot``, or every terminal row after the
+    first would collide.
+
+    That cap reads as "one active slot per root Task" only because one
+    agent tree maps to exactly one ``tasks`` row today; the schema carries
+    no root concept of its own. If a root discriminator column is ever
+    added here it must be a ``NOT NULL`` sentinel -- an empty string, not a
+    nullable column -- because the same NULL-distinct behavior this
+    constraint relies on would otherwise void it entirely on the root
+    side, accepting a second active root row.
+
+    ``protocol_version`` is governed by two constraints:
+    ``ck_task_interaction_requests_protocol_version_floor`` (``>= 1``, every
+    row) and ``ck_task_interaction_requests_active_protocol`` (``= 1``,
+    active rows only). A terminated or answered row may carry a future
+    version by design -- that is what lets the protocol evolve without
+    forbidding a later version from ever being written as a historical row,
+    while still keeping anything that is not a version number at all out of
+    every row, and keeping the active slot pinned to the one version this
+    table currently knows how to interpret live.
+
+    RESTRICT-for-active: ``resume_trace_event_id`` is
+    ``ON DELETE SET NULL``, but ``ck_task_interaction_requests_active_anchor``
+    requires a non-NULL anchor on every ``active`` row, so a delete that
+    would SET NULL an active row's anchor is rejected by that CHECK instead
+    of going through. The error surface is a CHECK violation, not a foreign
+    key violation. A terminated row's anchor may still be cleared: the two
+    columns touched by ON DELETE SET NULL (``resume_trace_event_id`` and
+    ``responder_user_id``) are deliberately absent from every two-way paired
+    CHECK below, because a two-way pairing would make SET NULL fail the same
+    way on rows where clearing the FK is meant to succeed. Read together:
+    terminal rows let SET NULL through (a cleared anchor is acceptable
+    historical wear); active rows make SET NULL collide with a CHECK, which
+    behaves like RESTRICT.
+
+    ``JSON(none_as_null=True)`` is confined to this table, carried by both of
+    its JSON columns. ``response_payload`` uses it so a Python ``None`` lands
+    as SQL NULL instead of the JSON scalar ``null``: consumers must test "has
+    this request been answered" with SQL ``IS NULL``, never with
+    ``payload is None`` in Python, since a legitimate JSON ``null`` answer
+    value must still read as answered. ``request_payload`` uses it so its
+    ``NOT NULL`` constraint actually fires on a Python ``None`` -- without
+    the flag, serialization runs before binding and a Python ``None`` would
+    reach the column as the JSON text ``null``, which ``NOT NULL`` does not
+    reject.
+
+    ``terminal_reason`` vocabulary: each of the three members is spoken for
+    by exactly one intended writer, and none of those writers exists yet.
+    ``deadline_elapsed`` and ``run_superseded`` are the two reclaim
+    branches, arriving with the staging primitive; ``answered_via_legacy_resume``
+    arrives with the transitional close on the legacy answer path. It is
+    not the same outcome as ``answered`` -- that path recovers a free-text
+    chat message, not a protocol v1 structured response, and synthesizing a
+    payload for it would fabricate a contract the client never produced.
+    ``operator_cancelled`` and ``task_terminated`` have no writer yet and are
+    intentionally not in the vocabulary; the old name
+    ``superseded_by_legacy_resume`` must not come back.
+
+    ``origin``'s IN-list is a frozen superset of ``Task.source`` literals,
+    not a mirror: retiring a ``Task.source`` value must not narrow this
+    CHECK, or historical rows written with the retired value become
+    unrecreatable; adding a new ``Task.source`` value needs this CHECK
+    updated plus a migration. The staging primitive validates ``origin`` in
+    Python before INSERT -- the CHECK is the backstop, not the primary
+    validation.
+
+    Clock source for ``ck_task_interaction_requests_expiry_after_creation``:
+    ``created_at`` is bound by ``server_default=func.now()`` and never from
+    Python, matching every other ``created_at`` in this package. That is
+    PostgreSQL's transaction-start clock and SQLite's per-statement
+    ``CURRENT_TIMESTAMP``; both can only place ``created_at`` at or before
+    the row's real insert instant, never after, so the CHECK never rejects
+    a legitimately positive TTL. The price of that direction-safety is that
+    this CHECK only pins the *sign* of the TTL -- it is not a guarantee
+    that a stored row is unexpired, and each backend leaves a measured
+    slack. PostgreSQL compares real ``timestamptz(6)`` values, but
+    ``now()`` does not advance inside an open transaction, so an inversion
+    smaller than the writing transaction's age is admitted. SQLite stores
+    ``DateTime`` as text: ``CURRENT_TIMESTAMP`` writes
+    ``"YYYY-MM-DD HH:MM:SS"`` with no fractional part while a Python-bound
+    ``expires_at`` writes ``"YYYY-MM-DD HH:MM:SS.ffffff"``, and the
+    lexicographic comparison makes the shorter string a prefix of the
+    longer one -- exactly as if ``created_at`` were truncated down to the
+    second, so any ``expires_at`` inside the insert's own wall-clock second
+    is admitted, including a zero or negative TTL of up to one second.
+    Neither slack is reachable at the minute-scale TTLs this table exists
+    for: a 15-minute inversion is rejected on both backends. The writing
+    primitive must still reject a non-positive TTL in plain Python before
+    it reaches SQL -- the same division of labour as the deleted
+    run-partition CHECK below -- and that obligation must be settled
+    before any sub-second TTL ships.
+
+    ``expires_at`` must always be bound as an aware **UTC** datetime by the
+    caller -- that obligation is portable, not SQLite-specific. Neither
+    backend rejects a naive bind: SQLite stores the digits verbatim, and
+    PostgreSQL resolves a naive value against the session's ``TimeZone``
+    setting, landing on the right instant only because that setting
+    happens to be UTC. With a non-UTC session ``TimeZone``, PostgreSQL
+    silently stores the wrong instant instead of raising (verified against
+    a live PostgreSQL instance: the same naive value round-trips eight
+    hours off under a +08:00 session ``TimeZone``). SQLite has a second,
+    separate failure mode on top of that: ``DateTime(timezone=True)`` drops
+    tzinfo on bind entirely, so even an *aware*-but-non-UTC value (e.g.
+    ``+08:00``) is silently stored as local wall-clock time -- the CHECK
+    still passes, and the row is accepted with the wrong instant. That
+    aware-non-UTC corruption is SQLite-specific; the caller's UTC
+    obligation is not. PostgreSQL converts an aware non-UTC value correctly
+    (verified: a ``+08:00`` bind reads back as the UTC instant); only
+    SQLite drops the offset. That asymmetry is exactly what the two
+    suites' round-trip tests measure -- they assert different outcomes on
+    purpose.
+    ``expires_at`` is authoritative only for reclamation statements; readers
+    must never use it to hide a row that is otherwise still ``active``.
+
+    Constraint names are part of the contract with the follow-up migration:
+    model and migration are two implementations of the same invariant, and
+    they must carry identical names or the migration's downgrade has nothing
+    to drop by name (mirrors the naming discipline in
+    ``AgentTrigger.__table_args__``, trigger.py).
+
+    This table is a leaf -- nothing references it -- so its foreign keys do
+    not join the ``tasks`` <-> ``trace_events`` cycle that forces
+    ``last_checkpoint_trace_event_id`` (task.py) to be ``use_alter=True``.
+    ``create_all`` / ``drop_all`` for this table have been verified to run
+    cleanly on both SQLite and PostgreSQL without that flag.
+    """
+
+    __tablename__ = "task_interaction_requests"
+    __table_args__ = (
+        # Uniqueness is always UniqueConstraint, never a unique Index: both
+        # backends' get_unique_constraints() report it the same way.
+        UniqueConstraint(
+            "task_id", "active_slot", name="uq_task_interaction_active_slot"
+        ),
+        UniqueConstraint(
+            "task_id",
+            "run_id",
+            "request_idempotency_key",
+            name="uq_task_interaction_request_identity",
+        ),
+        Index("ix_task_interaction_requests_task_status", "task_id", "status"),
+        Index(
+            "ix_task_interaction_requests_resume_trace_event_id",
+            "resume_trace_event_id",
+        ),
+        # ---- vocabulary CHECKs: closed IN-lists ----
+        CheckConstraint(
+            "status IN ('active','answered','terminated')",
+            name="ck_task_interaction_requests_status",
+        ),
+        CheckConstraint(
+            "kind IN ('clarification')",
+            name="ck_task_interaction_requests_kind",
+        ),
+        CheckConstraint(
+            "origin IN ('internal','sdk','a2a','trigger','widget','shared_link')",
+            name="ck_task_interaction_requests_origin",
+        ),
+        CheckConstraint(
+            "resume_checkpoint_type IN ('agent_execution_checkpoint')",
+            name="ck_task_interaction_requests_resume_checkpoint_type",
+        ),
+        CheckConstraint(
+            "resume_locator_format IN ('trace_event_pk_v1')",
+            name="ck_task_interaction_requests_resume_locator_format",
+        ),
+        CheckConstraint(
+            "terminal_reason IS NULL OR terminal_reason IN "
+            "('deadline_elapsed','run_superseded','answered_via_legacy_resume')",
+            name="ck_task_interaction_requests_terminal_reason",
+        ),
+        # ---- numeric domain floor ----
+        # A different category from the slot-scoped "= 1" pin below: the
+        # floor rejects values that are not version numbers at all, on every
+        # row, while the slot CHECK keeps future versions out of the v1 slot
+        # without forbidding them as historical rows.
+        CheckConstraint(
+            "protocol_version >= 1",
+            name="ck_task_interaction_requests_protocol_version_floor",
+        ),
+        # ---- slot admission CHECKs: active_slot scoping ----
+        CheckConstraint(
+            "active_slot IS NULL OR active_slot = 1",
+            name="ck_task_interaction_requests_active_slot_value",
+        ),
+        CheckConstraint(
+            "(status = 'active') = (active_slot IS NOT NULL)",
+            name="ck_task_interaction_requests_active_slot_pairs_status",
+        ),
+        CheckConstraint(
+            "status <> 'active' OR resume_trace_event_id IS NOT NULL",
+            name="ck_task_interaction_requests_active_anchor",
+        ),
+        CheckConstraint(
+            "active_slot IS NULL OR protocol_version = 1",
+            name="ck_task_interaction_requests_active_protocol",
+        ),
+        # ---- paired CHECKs ----
+        # Whether a pair can be written both ways depends on whether either
+        # column in it can be unilaterally cleared by some FK's
+        # ON DELETE SET NULL. The only columns affected by SET NULL on this
+        # table are resume_trace_event_id and responder_user_id, and neither
+        # one enters a two-way pairing below. Every pair not subject to SET
+        # NULL is written as a single biconditional; the two SET NULL-
+        # affected columns are the only ones outside that form.
+        CheckConstraint(
+            "(status = 'terminated') = (terminal_reason IS NOT NULL)",
+            name="ck_task_interaction_requests_terminal_pairs_status",
+        ),
+        CheckConstraint(
+            "(status = 'terminated') = (terminated_at IS NOT NULL)",
+            name="ck_task_interaction_requests_terminated_at_pairs_status",
+        ),
+        CheckConstraint(
+            "(status = 'answered') = (response_payload IS NOT NULL)",
+            name="ck_task_interaction_requests_response_pairs_status",
+        ),
+        CheckConstraint(
+            "(status = 'answered') = (responded_at IS NOT NULL)",
+            name="ck_task_interaction_requests_responded_at_pairs_status",
+        ),
+        # Renamed from ck_task_interaction_requests_responder_identity_pairs_responded_at
+        # (66 chars): that name exceeds PostgreSQL's 63 character identifier
+        # limit and SQLAlchemy raises IdentifierError on create_all rather
+        # than truncating it. Semantics are unchanged; see
+        # test_no_constraint_name_exceeds_the_postgres_identifier_limit for
+        # the structural guard against this happening again.
+        CheckConstraint(
+            "(responded_at IS NULL) = (responder_identity IS NULL)",
+            name="ck_task_interaction_requests_responder_pairs_responded_at",
+        ),
+        CheckConstraint(
+            "expires_at > created_at",
+            name="ck_task_interaction_requests_expiry_after_creation",
+        ),
+        # ---- empty-string CHECKs ----
+        # NOT NULL alone does not stop an "or ''" write; on the one nullable
+        # column here, neither does its pairing CHECK -- '' satisfies
+        # "IS NOT NULL" while naming no one.
+        CheckConstraint(
+            "run_id <> ''", name="ck_task_interaction_requests_run_id_nonempty"
+        ),
+        CheckConstraint(
+            "resume_event_id <> ''",
+            name="ck_task_interaction_requests_resume_event_id_nonempty",
+        ),
+        CheckConstraint(
+            "resume_execution_id <> ''",
+            name="ck_task_interaction_requests_resume_execution_id_nonempty",
+        ),
+        CheckConstraint(
+            "resume_run_partition <> ''",
+            name="ck_task_interaction_requests_resume_run_partition_nonempty",
+        ),
+        CheckConstraint(
+            "request_idempotency_key <> ''",
+            name="ck_task_interaction_requests_request_idempotency_key_nonempty",
+        ),
+        CheckConstraint(
+            "responder_identity <> ''",
+            name="ck_task_interaction_requests_responder_identity_nonempty",
+        ),
+        # Deleted: ck_task_interaction_requests_run_partition_matches. Forcing
+        # run_id == resume_run_partition would turn the kind of corruption
+        # #1071 is meant to detect into a row that cannot be written at all,
+        # which would get misclassified downstream as a slot conflict
+        # instead of the corruption it actually is. The comparison instead
+        # happens in the primitive's plain-Python validation.
+    )
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(
+        Integer,
+        ForeignKey(
+            "tasks.id",
+            ondelete="CASCADE",
+            name="fk_task_interaction_requests_task_id",
+        ),
+        nullable=False,
+    )
+    run_id = Column(String(64), nullable=False)
+    kind = Column(String(32), nullable=False)
+    protocol_version = Column(Integer, nullable=False)
+    status = Column(String(32), nullable=False)
+    active_slot = Column(Integer, nullable=True)
+    # Frozen at ask time from task.source, falling back to "internal".
+    origin = Column(String(20), nullable=False)
+
+    # NOT NULL alone cannot stop a Python None: JSON serialization runs
+    # before binding, so None would land as the JSON text 'null'. none_as_null
+    # makes it a real SQL NULL, and the NOT NULL fires.
+    request_payload = Column(JSON(none_as_null=True), nullable=False)
+    # The flag is confined to this table and carried by both of its JSON
+    # columns (see class docstring): response_payload uses it to tell "no
+    # answer yet" from "answered with JSON null", request_payload uses it so
+    # NOT NULL actually fires.
+    response_payload = Column(JSON(none_as_null=True), nullable=True)
+
+    request_idempotency_key = Column(
+        String(64), nullable=False
+    )  # validated against COMMAND_ID_PATTERN by the first production writer
+
+    resume_trace_event_id = Column(
+        Integer,
+        ForeignKey(
+            "trace_events.id",
+            ondelete="SET NULL",
+            name="fk_task_interaction_requests_resume_trace_event_id",
+        ),
+        nullable=True,
+    )
+    resume_event_id = Column(String(255), nullable=False)
+    resume_execution_id = Column(String(255), nullable=False)
+    resume_locator_format = Column(String(32), nullable=False)
+    resume_checkpoint_type = Column(String(64), nullable=False)
+    resume_run_partition = Column(String(64), nullable=False)
+
+    responder_user_id = Column(
+        Integer,
+        ForeignKey(
+            "users.id",
+            ondelete="SET NULL",
+            name="fk_task_interaction_requests_responder_user_id",
+        ),
+        nullable=True,
+    )
+    # "user:{id}" / "guest:{guest_id}" -- the prefix is a namespace, not
+    # decoration.
+    responder_identity = Column(String(255), nullable=True)
+    terminal_reason = Column(String(32), nullable=True)
+
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    # Authoritative only for reclamation statements; readers must not hide a
+    # row based on this column (see class docstring).
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    responded_at = Column(DateTime(timezone=True), nullable=True)
+    terminated_at = Column(DateTime(timezone=True), nullable=True)
