@@ -175,6 +175,9 @@ async def test_operational_auth_failure_sends_sanitized_extension_denial(
     session = _BoundSQLiteSession(query_exception=timeout)
     monkeypatch.setattr(websocket_auth, "get_session_local", lambda: lambda: session)
     token = build_access_token()
+    monkeypatch.setattr(logging.root.manager, "disable", logging.NOTSET)
+    monkeypatch.setattr(websocket_auth.logger, "disabled", False)
+    monkeypatch.setattr(websocket_auth.logger, "propagate", True)
     caplog.set_level(logging.ERROR, logger=websocket_auth.__name__)
 
     with pytest.raises(websocket_auth._WebSocketAuthenticationTerminated) as raised:
