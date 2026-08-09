@@ -68,7 +68,11 @@ from ..sandbox_keys import (
 )
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.agent_access import list_accessible_published_agents
-from ..services.agent_team_scope import get_agent_team_scope, owned_agent_clause
+from ..services.agent_team_scope import (
+    get_agent_team_scope,
+    owned_agent_clause,
+    resolve_authorized_agent,
+)
 from ..services.chat_history_service import (
     get_latest_waiting_question,
     load_task_transcript,
@@ -1919,16 +1923,10 @@ class AgentServiceManager:
                 )
             elif agent_config and agent_config.get("preview_agent_id"):
                 preview_user_id = int(task.user_id)
-                current_agent = (
-                    db.query(Agent)
-                    .filter(
-                        Agent.id == agent_config["preview_agent_id"],
-                        owned_agent_clause(
-                            preview_user_id,
-                            get_agent_team_scope(db, preview_user_id),
-                        ),
-                    )
-                    .first()
+                current_agent = resolve_authorized_agent(
+                    db,
+                    preview_user_id,
+                    agent_config.get("preview_agent_id"),
                 )
                 if current_agent and current_agent.status == AgentStatus.PUBLISHED:
                     excluded_agent_id = int(current_agent.id)
@@ -2560,24 +2558,16 @@ class AgentServiceManager:
                     and agent_config
                     and agent_config.get("preview_agent_id")
                 ):
-                    from ..models.agent import AgentStatus
-
                     if task is None:
                         raise ValueError(
                             f"Task {task_id} missing while resolving preview agent"
                         )
                     preview_user_id = int(task.user_id)
                     assert db is not None
-                    current_agent = (
-                        db.query(Agent)
-                        .filter(
-                            Agent.id == agent_config["preview_agent_id"],
-                            owned_agent_clause(
-                                preview_user_id,
-                                get_agent_team_scope(db, preview_user_id),
-                            ),
-                        )
-                        .first()
+                    current_agent = resolve_authorized_agent(
+                        db,
+                        preview_user_id,
+                        agent_config.get("preview_agent_id"),
                     )
                     if current_agent and current_agent.status == AgentStatus.PUBLISHED:
                         excluded_agent_id = int(current_agent.id)

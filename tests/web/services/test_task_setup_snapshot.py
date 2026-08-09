@@ -474,6 +474,31 @@ def test_inline_published_preview_agent_is_excluded_in_snapshot(db_session) -> N
     assert snapshot.excluded_agent_id == int(preview_agent.id)
 
 
+def test_inline_preview_agent_with_noncanonical_id_is_not_excluded_in_snapshot(
+    db_session,
+) -> None:
+    user = _create_user(db_session)
+    preview_agent = _create_agent(db_session, user_id=int(user.id))
+    task = _create_task(
+        db_session,
+        user_id=int(user.id),
+        agent_config={
+            "instructions": "preview instructions",
+            "skills": [],
+            "knowledge_bases": [],
+            "tool_categories": [],
+            "preview_agent_id": f"0{int(preview_agent.id)}",
+        },
+    )
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.excluded_agent_id is None
+
+
 def test_agent_builder_published_sets_excluded_agent_id(db_session) -> None:
     """Task pointing at a PUBLISHED agent: excluded_agent_id matches
     agent.id, agent_config is populated, agent.status flows through."""
