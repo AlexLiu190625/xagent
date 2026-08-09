@@ -34,6 +34,7 @@ _team_agent_connector_validator = None
 _team_agent_knowledge_base_validator = None
 
 _MAX_POSTGRES_INTEGER = 2**31 - 1
+_MAX_POSTGRES_INTEGER_DECIMAL = str(_MAX_POSTGRES_INTEGER)
 _CANONICAL_AGENT_ID = re.compile(r"[1-9][0-9]*", re.ASCII)
 
 
@@ -149,6 +150,11 @@ def resolve_authorized_agent(
     if isinstance(candidate_id, int):
         agent_id = candidate_id
     elif isinstance(candidate_id, str) and _CANONICAL_AGENT_ID.fullmatch(candidate_id):
+        if len(candidate_id) > len(_MAX_POSTGRES_INTEGER_DECIMAL) or (
+            len(candidate_id) == len(_MAX_POSTGRES_INTEGER_DECIMAL)
+            and candidate_id > _MAX_POSTGRES_INTEGER_DECIMAL
+        ):
+            return None
         agent_id = int(candidate_id)
     else:
         return None

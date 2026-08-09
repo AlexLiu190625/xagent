@@ -501,6 +501,77 @@ async def test_create_ssh_tools_denies_cross_scope_preview_before_provider_targe
         set_ssh_target_provider_hook(None)
 
 
+@pytest.mark.parametrize(
+    ("case", "preview_candidate"),
+    [
+        ("cross-owner-direct", None),
+        ("malformed-preview", "abc"),
+        ("oversized-preview", "1" * 5000),
+        ("archived-direct", None),
+        ("denied-primary-no-preview-fallback", None),
+    ],
+)
+async def test_create_ssh_tools_denies_unresolved_task_agent_before_provider_targets(
+    task_db,
+    case,
+    preview_candidate,
+) -> None:
+    """Persisted task identity must be authorized before provider target access."""
+    from xagent.core.tools.adapters.vibe import ssh_tools
+    from xagent.web.services.ssh_runtime import set_ssh_target_provider_hook
+
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        if case == "cross-owner-direct":
+            other = _new_user(db, "other")
+            foreign = _new_agent(db, int(other.id), status=AgentStatus.PUBLISHED)
+            task = _new_task(db, int(owner.id), agent_id=int(foreign.id))
+        elif case in {"malformed-preview", "oversized-preview"}:
+            task = _new_task(
+                db,
+                int(owner.id),
+                agent_config={"preview_agent_id": preview_candidate},
+            )
+        elif case == "archived-direct":
+            archived = _new_agent(db, int(owner.id), status=AgentStatus.ARCHIVED)
+            task = _new_task(db, int(owner.id), agent_id=int(archived.id))
+        else:
+            other = _new_user(db, "other")
+            denied_primary = _new_agent(db, int(other.id), name="foreign")
+            owned_preview = _new_agent(db, int(owner.id), name="owned")
+            task = _new_task(
+                db,
+                int(owner.id),
+                agent_id=int(denied_primary.id),
+                agent_config={"preview_agent_id": int(owned_preview.id)},
+            )
+    finally:
+        db.close()
+
+    provider = _RecordingTargetProvider()
+    factory_calls: list[object] = []
+
+    def _factory(session_factory):
+        factory_calls.append(session_factory)
+        return provider
+
+    set_ssh_target_provider_hook(_factory)
+    config = SimpleNamespace(
+        get_session_factory=lambda: task_db,
+        get_user_id=lambda: int(owner.id),
+        get_task_id=lambda: f"web_task_{int(task.id)}",
+        get_workspace_config=lambda: None,
+    )
+    try:
+        assert await ssh_tools.create_ssh_tools(config) == []
+        assert factory_calls == [task_db]
+        assert provider.list_calls == 0
+        assert provider.resolve_calls == 0
+    finally:
+        set_ssh_target_provider_hook(None)
+
+
 async def test_create_ssh_tools_propagates_task_owner_scope_failure(task_db) -> None:
     from xagent.core.tools.adapters.vibe import ssh_tools
     from xagent.web.services.ssh_runtime import set_ssh_target_provider_hook

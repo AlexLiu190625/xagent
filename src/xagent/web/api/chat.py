@@ -2544,14 +2544,9 @@ class AgentServiceManager:
                         "will exclude from agent tools"
                     )
 
-                # Inline preview_agent_id case (#459 build-preview): the
-                # snapshot path doesn't cover this because it resolves
-                # excluded_agent_id only through ``task.agent_id``; the
-                # preview agent is referenced inside the inline
-                # ``agent_config`` dict on tasks with ``agent_id=None``.
-                # Run this in addition to (not instead of) the snapshot
-                # value above -- they're mutually exclusive by design
-                # (either task has an agent_id OR has inline preview).
+                # This inline preview_agent_id branch is only for the
+                # live-session path where ``snapshot is None``. The snapshot
+                # loader resolves the same inline config before this point.
                 if (
                     excluded_agent_id is None
                     and snapshot is None

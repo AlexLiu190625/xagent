@@ -115,6 +115,7 @@ class _RecordingSession:
         "\N{ARABIC-INDIC DIGIT ONE}",
         2**31,
         str(2**31),
+        "1" * 5000,
     ],
 )
 def test_resolve_authorized_agent_rejects_noncanonical_or_out_of_range_ids_before_query(
