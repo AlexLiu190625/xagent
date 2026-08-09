@@ -6,54 +6,22 @@ import asyncio
 import json
 import threading
 from dataclasses import is_dataclass
-from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import WebSocket
-from jose import jwt
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
+from tests.web.auth_token_cases import (
+    REJECTED_ACCESS_TOKEN_CASES,
+    WRONG_TYPE_ACCESS_TOKEN_CASE,
+    RejectedAccessTokenCase,
+    build_access_token,
+)
 from xagent.web.api import progress_ws
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api import websocket_auth
-from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
-
-
-def _access_token(**claims: object) -> str:
-    payload: dict[str, object] = {
-        "type": "access",
-        "sub": "existing-user",
-        "user_id": 1,
-        "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
-    }
-    payload.update(claims)
-    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
-
-
-REJECTED_WEBSOCKET_TOKEN_CASES = (
-    pytest.param(
-        _access_token(exp=datetime.now(timezone.utc) - timedelta(minutes=5)),
-        id="expired",
-    ),
-    pytest.param(
-        jwt.encode(
-            {
-                "type": "access",
-                "sub": "existing-user",
-                "user_id": 1,
-                "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
-            },
-            "different-signing-secret",
-            algorithm=JWT_ALGORITHM,
-        ),
-        id="invalid-signature",
-    ),
-    pytest.param(_access_token(type="refresh"), id="wrong-type"),
-    pytest.param(_access_token(sub=[]), id="invalid-claims"),
-    pytest.param(_access_token(sub="missing-user"), id="user-not-found"),
-)
 
 
 class _BoundSQLiteSession:
@@ -134,15 +102,15 @@ async def test_missing_token_returns_none_without_starting_database_work(
     run_db_io.assert_not_called()
 
 
-@pytest.mark.parametrize("token", REJECTED_WEBSOCKET_TOKEN_CASES)
+@pytest.mark.parametrize("case", REJECTED_ACCESS_TOKEN_CASES, ids=lambda case: case.id)
 def test_loader_rejects_every_credential_reason_inside_worker_session(
     monkeypatch: pytest.MonkeyPatch,
-    token: str,
+    case: RejectedAccessTokenCase,
 ) -> None:
     session = _BoundSQLiteSession()
     monkeypatch.setattr(websocket_auth, "get_session_local", lambda: lambda: session)
 
-    assert websocket_auth._load_websocket_principal_sync(token) is None
+    assert websocket_auth._load_websocket_principal_sync(case.build_token()) is None
     assert session.enter_count == 1
     assert session.exit_count == 1
 
@@ -202,7 +170,7 @@ async def test_operational_auth_failure_sends_sanitized_extension_denial(
     monkeypatch.setattr(websocket_auth, "get_session_local", lambda: lambda: session)
 
     with pytest.raises(websocket_auth._WebSocketAuthenticationTerminated) as raised:
-        await websocket_auth.get_authenticated_user(websocket, _access_token())
+        await websocket_auth.get_authenticated_user(websocket, build_access_token())
 
     assert raised.value.__cause__ is timeout
     assert session.enter_count == 1
@@ -477,7 +445,7 @@ async def test_main_endpoints_retain_invalid_credential_close_codes(
     monkeypatch.setattr(websocket_api, "manager", manager)
     monkeypatch.setattr(websocket_auth, "get_session_local", lambda: lambda: session)
 
-    await endpoint(*endpoint_args[:-1], _access_token(type="refresh"))  # type: ignore[operator]
+    await endpoint(*endpoint_args[:-1], WRONG_TYPE_ACCESS_TOKEN_CASE.build_token())  # type: ignore[operator]
 
     websocket.close.assert_awaited_once_with(
         code=4001, reason="Authentication required"
@@ -502,7 +470,7 @@ async def test_progress_retains_invalid_credential_close_code(
     monkeypatch.setattr(websocket_auth, "get_session_local", lambda: lambda: session)
 
     await progress_ws.progress_websocket_endpoint(
-        websocket, "task", _access_token(type="refresh")
+        websocket, "task", WRONG_TYPE_ACCESS_TOKEN_CASE.build_token()
     )
 
     websocket.close.assert_awaited_once_with(code=1008)

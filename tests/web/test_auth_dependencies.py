@@ -2,21 +2,24 @@
 
 import ast
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
-from jose import jwt
 from sqlalchemy import create_engine, event
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.auth_token_cases import (
+    REJECTED_ACCESS_TOKEN_CASES,
+    RejectedAccessTokenCase,
+)
+from tests.web.auth_token_cases import build_access_token as _access_token
 from xagent.web import auth_dependencies
-from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.auth_dependencies import (
     get_current_user,
     get_current_user_optional,
@@ -57,133 +60,67 @@ def db_session() -> Session:
         engine.dispose()
 
 
-def _access_token(**claims: object) -> str:
-    payload: dict[str, object] = {
-        "type": "access",
-        "sub": "existing-user",
-        "user_id": 1,
-        "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
-    }
-    payload.update(claims)
-    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
-
-
-@pytest.mark.parametrize(
-    ("token", "detail", "headers"),
-    [
-        (
-            _access_token(exp=datetime.now(timezone.utc) - timedelta(minutes=5)),
-            "Token expired",
-            {"WWW-Authenticate": "Bearer", "Error-Type": "TokenExpired"},
-        ),
-        (
-            jwt.encode(
-                {
-                    "type": "access",
-                    "sub": "existing-user",
-                    "user_id": 1,
-                    "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
-                },
-                "different-signing-secret",
-                algorithm=JWT_ALGORITHM,
-            ),
-            "Invalid token",
-            {"WWW-Authenticate": "Bearer", "Error-Type": "InvalidToken"},
-        ),
-        (
-            _access_token(type="refresh"),
-            "Invalid token type",
-            {"WWW-Authenticate": "Bearer"},
-        ),
-        (
-            _access_token(sub=None),
-            "Invalid token payload",
-            {"WWW-Authenticate": "Bearer"},
-        ),
-        (
-            _access_token(sub=123),
-            "Invalid token payload",
-            {"WWW-Authenticate": "Bearer"},
-        ),
-        (
-            _access_token(user_id=None),
-            "Invalid token payload",
-            {"WWW-Authenticate": "Bearer"},
-        ),
-        (
-            _access_token(user_id="1"),
-            "Invalid token payload",
-            {"WWW-Authenticate": "Bearer"},
-        ),
-        (
-            _access_token(user_id=True),
-            "Invalid token payload",
-            {"WWW-Authenticate": "Bearer"},
-        ),
-        (
-            _access_token(sub="missing-user"),
-            "User not found",
-            {"WWW-Authenticate": "Bearer"},
-        ),
-    ],
-    ids=(
-        "expired",
-        "invalid-signature",
-        "wrong-type",
-        "missing-sub",
-        "wrong-type-sub",
-        "missing-user-id",
-        "wrong-type-user-id",
-        "bool-user-id",
-        "missing-user",
-    ),
-)
+@pytest.mark.parametrize("case", REJECTED_ACCESS_TOKEN_CASES, ids=lambda case: case.id)
 def test_access_token_rejection_matrix_preserves_required_http_contract(
-    db_session: Session, token: str, detail: str, headers: dict[str, str]
+    db_session: Session, case: RejectedAccessTokenCase
 ) -> None:
     """Required HTTP auth exposes its established reason-specific rejection."""
-    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+    credentials = HTTPAuthorizationCredentials(
+        scheme="Bearer", credentials=case.build_token()
+    )
 
     with pytest.raises(HTTPException) as raised:
         get_current_user(credentials, db_session)
 
     assert raised.value.status_code == 401
-    assert raised.value.detail == detail
-    assert raised.value.headers == headers
+    assert raised.value.detail == case.expected_detail
+    assert raised.value.headers == case.expected_headers
 
 
-REJECTED_ACCESS_TOKEN_CASES = (
-    pytest.param(
-        _access_token(exp=datetime.now(timezone.utc) - timedelta(minutes=5)),
-        id="expired",
-    ),
-    pytest.param(
-        jwt.encode(
-            {
-                "type": "access",
-                "sub": "existing-user",
-                "user_id": 1,
-                "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
-            },
-            "different-signing-secret",
-            algorithm=JWT_ALGORITHM,
-        ),
-        id="invalid-signature",
-    ),
-    pytest.param(_access_token(type="refresh"), id="wrong-type"),
-    pytest.param(_access_token(sub=[]), id="invalid-claims"),
-    pytest.param(_access_token(sub="missing-user"), id="user-not-found"),
-)
-
-
-@pytest.mark.parametrize("token", REJECTED_ACCESS_TOKEN_CASES)
+@pytest.mark.parametrize("case", REJECTED_ACCESS_TOKEN_CASES, ids=lambda case: case.id)
 def test_optional_auth_rejects_every_credential_reason(
-    db_session: Session, token: str
+    db_session: Session, case: RejectedAccessTokenCase
 ) -> None:
     """Optional authentication suppresses every typed credential rejection."""
-    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+    credentials = HTTPAuthorizationCredentials(
+        scheme="Bearer", credentials=case.build_token()
+    )
 
     assert get_current_user_optional(credentials, db_session) is None
+
+
+@pytest.mark.parametrize(
+    "claims",
+    (
+        {"sub": None},
+        {"sub": 123},
+        {"user_id": None},
+        {"user_id": "1"},
+        {"user_id": True},
+    ),
+    ids=(
+        "missing-sub",
+        "wrong-type-sub",
+        "missing-user-id",
+        "wrong-type-user-id",
+        "bool-user-id",
+    ),
+)
+def test_malformed_identity_claim_shapes_are_rejected_before_any_user_query(
+    db_session: Session, claims: dict[str, object]
+) -> None:
+    """Identity claims with non-bindable types stay credential rejections."""
+    credentials = HTTPAuthorizationCredentials(
+        scheme="Bearer", credentials=_access_token(**claims)
+    )
+
+    with pytest.raises(HTTPException) as raised:
+        get_current_user(credentials, db_session)
+
+    assert raised.value.status_code == 401
+    assert raised.value.detail == "Invalid token payload"
+    assert raised.value.headers == {"WWW-Authenticate": "Bearer"}
+    assert db_session.info["user_query_count"] == 0
 
 
 @pytest.mark.parametrize("claim", ("exp", "nbf", "iat"))
