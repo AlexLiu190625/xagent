@@ -1114,10 +1114,6 @@ def _load_tool_runtime_policy_snapshot(
 class WebToolConfig(BaseToolConfig):
     """Web-specific tool configuration that loads from database."""
 
-    @staticmethod
-    def _coerce_user_id(value: Any) -> Optional[int]:
-        return value if isinstance(value, int) else None
-
     def __init__(
         self,
         db: Any,
