@@ -1,6 +1,7 @@
 """Authentication dependency contract tests."""
 
 import ast
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -520,23 +521,186 @@ def test_invalid_claims_read_the_bound_dialect_without_pool_checkout() -> None:
     assert raised.value.detail == "Invalid token payload"
 
 
-def test_auth_dependencies_have_no_broad_exception_handler() -> None:
-    """The shared authentication owner cannot collapse operational failures."""
-    source = Path(auth_dependencies.__file__).read_text(encoding="utf-8")
-    handlers = [
-        handler
-        for handler in ast.walk(ast.parse(source))
-        if isinstance(handler, ast.ExceptHandler)
-    ]
+def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
+    """Authentication consumers stay within the reviewed ownership topology."""
+    tracked = {
+        "_resolve_access_token_user",
+        "get_current_user",
+        "get_current_user_optional",
+        "get_user_from_token",
+        "get_user_from_websocket_token",
+        "get_authenticated_user",
+    }
+    auth_file = "web/auth_dependencies.py"
+    websocket_file = "web/api/websocket.py"
+    rejected = ("_AccessTokenRejected",)
+    terminated = ("_WebSocketAuthenticationTerminated",)
+    expected = (
+        (auth_file, "get_current_user", "_resolve_access_token_user", rejected),
+        (
+            auth_file,
+            "get_current_user_optional",
+            "_resolve_access_token_user",
+            rejected,
+        ),
+        (auth_file, "get_user_from_token", "_resolve_access_token_user", rejected),
+        (auth_file, "get_user_from_websocket_token", "get_user_from_token", ()),
+        (
+            "web/api/websocket_auth.py",
+            "_load_websocket_principal_sync",
+            "get_user_from_websocket_token",
+            (),
+        ),
+        (
+            websocket_file,
+            "websocket_chat_endpoint",
+            "get_authenticated_user",
+            terminated,
+        ),
+        (
+            websocket_file,
+            "websocket_builder_chat_endpoint",
+            "get_authenticated_user",
+            terminated,
+        ),
+        (
+            websocket_file,
+            "websocket_build_preview_endpoint",
+            "get_authenticated_user",
+            terminated,
+        ),
+        (
+            "web/api/progress_ws.py",
+            "progress_websocket_endpoint",
+            "get_authenticated_user",
+            terminated,
+        ),
+    )
+    modules = {"xagent.web.auth_dependencies", "xagent.web.api.websocket_auth"}
+    source_root = Path(auth_dependencies.__file__).parents[1]
+    actual: Counter[tuple[str, str, str, tuple[str, ...]]] = Counter()
+    lines: dict[tuple[str, str, str, tuple[str, ...]], list[int]] = {}
+    escapes: list[tuple[tuple[str, str, str, tuple[str, ...]], int]] = []
 
-    def catches_exception(handler: ast.ExceptHandler) -> bool:
-        if isinstance(handler.type, ast.Name):
-            return handler.type.id == "Exception"
-        if isinstance(handler.type, ast.Tuple):
-            return any(
-                isinstance(element, ast.Name) and element.id == "Exception"
-                for element in handler.type.elts
+    def handler_names(node: ast.expr | None) -> tuple[str, ...]:
+        if node is None:
+            return ("<bare>",)
+        if isinstance(node, ast.Tuple):
+            return tuple(name for item in node.elts for name in handler_names(item))
+        return (node.id if isinstance(node, ast.Name) else node.attr,)
+
+    def module_path(node: ast.expr, bases: dict[str, str]) -> str | None:
+        if isinstance(node, ast.Name):
+            return bases.get(node.id)
+        if isinstance(node, ast.Attribute):
+            base = module_path(node.value, bases)
+            return f"{base}.{node.attr}" if base else None
+        return None
+
+    for source_path in source_root.rglob("*.py"):
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        relative_path = source_path.relative_to(source_root).as_posix()
+        names = {
+            node.name
+            for node in tree.body
+            if relative_path == "web/auth_dependencies.py"
+            and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in tracked
+        }
+        bases: dict[str, str] = {}
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom):
+                leaf = (node.module or "").rsplit(".", 1)[-1]
+                for alias in node.names:
+                    if (
+                        leaf in {"auth_dependencies", "websocket_auth"}
+                        and alias.name in tracked
+                    ):
+                        if alias.asname:
+                            escapes.append(
+                                (
+                                    (relative_path, "<module>", alias.name, ()),
+                                    alias.lineno,
+                                )
+                            )
+                        else:
+                            names.add(alias.name)
+                    if node.module in {
+                        "xagent.web",
+                        "xagent.web.api",
+                    } and alias.name in {"auth_dependencies", "websocket_auth"}:
+                        bases[alias.asname or alias.name] = (
+                            f"{node.module}.{alias.name}"
+                        )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in modules:
+                        bases[alias.asname or alias.name.split(".")[0]] = (
+                            alias.name if alias.asname else alias.name.split(".")[0]
+                        )
+
+        for node in ast.walk(tree):
+            callee = (
+                node.id if isinstance(node, ast.Name) and node.id in names else None
             )
-        return False
+            if (
+                isinstance(node, ast.Attribute)
+                and module_path(node.value, bases) in modules
+                and node.attr in tracked
+            ):
+                callee = node.attr
+            if callee is None:
+                continue
+            chain = [node]
+            while parent := parents.get(chain[-1]):
+                chain.append(parent)
+            scope = (
+                ".".join(
+                    ancestor.name
+                    for ancestor in reversed(chain)
+                    if isinstance(
+                        ancestor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                    )
+                )
+                or "<module>"
+            )
+            catch_policy = ()
+            for child, ancestor in zip(chain, chain[1:]):
+                if (
+                    isinstance(ancestor, (ast.Try, ast.TryStar))
+                    and child in ancestor.body
+                ):
+                    catch_policy = tuple(
+                        name
+                        for handler in ancestor.handlers
+                        for name in handler_names(handler.type)
+                    )
+                    break
+            fact = (relative_path, scope, callee, catch_policy)
+            parent = parents.get(node)
+            safe_depends = (
+                callee == "get_current_user"
+                and isinstance(parent, ast.Call)
+                and isinstance(parent.func, ast.Name)
+                and parent.func.id == "Depends"
+                and bool(parent.args)
+                and parent.args[0] is node
+            )
+            if safe_depends:
+                continue
+            if isinstance(parent, ast.Call) and parent.func is node:
+                actual[fact] += 1
+                lines.setdefault(fact, []).append(node.lineno)
+            else:
+                escapes.append((fact, node.lineno))
 
-    assert not any(catches_exception(handler) for handler in handlers)
+    assert not escapes, f"unreviewed first-class callable escapes: {escapes}"
+    assert actual == Counter(expected), (
+        "authentication consumer facts differ: "
+        f"actual={actual}; expected={Counter(expected)}; lines={lines}"
+    )
