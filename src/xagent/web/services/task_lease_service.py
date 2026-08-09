@@ -76,6 +76,13 @@ class TaskLease:
 
     Consumers must therefore treat None as "cannot prove attempt identity"
     and fall back to whatever fence they already had, never as "matches".
+
+    The existing lease writers (refresh, release, fail-and-release) do not
+    fence on this column yet, deliberately: rejecting a stale attempt there
+    turns its refresh into a LOST classification and an active cancellation,
+    which is a behavior change that belongs to the first consumer of this
+    column, with its own tests. Until then the pre-existing
+    ``(runner_id, run_id)`` fences are the only guards on those paths.
     """
 
     task_id: int

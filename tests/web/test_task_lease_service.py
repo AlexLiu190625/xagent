@@ -1253,6 +1253,7 @@ def test_same_run_resume_lease_preserves_checkpoint_pointer(db_session) -> None:
         runner_id="resume-runner",
         expected_run_id="resumable-run",
     )
+    assert lease is not None
 
     assert lease == TaskLease(
         task_id=int(task.id),
