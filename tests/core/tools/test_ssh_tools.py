@@ -507,6 +507,7 @@ async def test_create_ssh_tools_denies_cross_scope_preview_before_provider_targe
         ("cross-owner-direct", None),
         ("malformed-preview", "abc"),
         ("oversized-preview", "1" * 5000),
+        ("nonexistent-preview", "2147483647"),
         ("archived-direct", None),
         ("denied-primary-no-preview-fallback", None),
     ],
@@ -527,7 +528,7 @@ async def test_create_ssh_tools_denies_unresolved_task_agent_before_provider_tar
             other = _new_user(db, "other")
             foreign = _new_agent(db, int(other.id), status=AgentStatus.PUBLISHED)
             task = _new_task(db, int(owner.id), agent_id=int(foreign.id))
-        elif case in {"malformed-preview", "oversized-preview"}:
+        elif case in {"malformed-preview", "oversized-preview", "nonexistent-preview"}:
             task = _new_task(
                 db,
                 int(owner.id),
