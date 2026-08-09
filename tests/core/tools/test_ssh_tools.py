@@ -9,12 +9,14 @@ from xagent.core.ssh import (
     BoundTargetInfo,
     PrincipalRef,
     ResolvedSshTarget,
+    SensitiveSshCredential,
     SshError,
     SshErrorCode,
     SshExecutionContext,
     SshSecretHandle,
 )
 from xagent.core.ssh.executor import SshExecuteOutcome
+from xagent.core.ssh.runner import SshRunResult
 from xagent.core.tools.adapters.vibe.ssh_tools import (
     SshDownloadTool,
     SshExecuteTool,
@@ -442,21 +444,153 @@ def test_agent_id_for_task_allows_team_admin_private_and_member_team_visible(
 
 
 class _RecordingTargetProvider(_Provider):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        *,
+        resolved=None,
+        targets=None,
+        credential=None,
+        events=None,
+    ) -> None:
+        super().__init__(resolved=resolved, targets=targets)
+        self._credential = credential
+        self._events = events
         self.list_calls = 0
         self.resolve_calls = 0
+        self.list_contexts = []
+        self.resolve_contexts = []
 
     async def resolve(self, context, target_alias):
         self.resolve_calls += 1
+        self.resolve_contexts.append(context)
+        if self._events is not None:
+            self._events.append(("resolve", context, target_alias))
         return await super().resolve(context, target_alias)
 
     async def list_bound_targets(self, context):
         self.list_calls += 1
-        return []
+        self.list_contexts.append(context)
+        if self._events is not None:
+            self._events.append(("list", context))
+        return await super().list_bound_targets(context)
 
     async def read_version(self, secret_handle):
-        raise NotImplementedError
+        if self._events is not None:
+            self._events.append(("read_version", secret_handle))
+        if self._credential is None:
+            raise NotImplementedError
+        return self._credential
+
+
+class _RecordingRunner:
+    def __init__(self, events) -> None:
+        self._events = events
+
+    async def execute(self, **kwargs) -> SshRunResult:
+        self._events.append(("run", kwargs["command"]))
+        return SshRunResult(exit_code=0, stdout="ok", stderr="", truncated=False)
+
+
+@pytest.mark.parametrize("status", [AgentStatus.DRAFT, AgentStatus.PUBLISHED])
+async def test_create_ssh_tools_propagates_authorized_preview_context_to_execute(
+    task_db,
+    monkeypatch,
+    status,
+) -> None:
+    from xagent.core.tools.adapters.vibe import ssh_tools
+    from xagent.web.services.ssh_runtime import set_ssh_target_provider_hook
+
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        _new_agent(db, int(owner.id), name="id-separator")
+        preview = _new_agent(db, int(owner.id), name="preview", status=status)
+        task = _new_task(
+            db,
+            int(owner.id),
+            agent_config={"preview_agent_id": int(preview.id)},
+        )
+        owner_id = int(owner.id)
+        preview_id = int(preview.id)
+        task_id = int(task.id)
+    finally:
+        db.close()
+    assert preview_id != owner_id
+
+    events: list[tuple] = []
+    provider = _RecordingTargetProvider(
+        resolved=_resolved(),
+        targets=[
+            BoundTargetInfo(
+                alias="prod",
+                display_name="Production",
+                capabilities=frozenset({"execute"}),
+            )
+        ],
+        credential=SensitiveSshCredential(b"KEY", "", "ssh-ed25519"),
+        events=events,
+    )
+
+    def _factory(session_factory):
+        events.append(("factory", session_factory))
+        return provider
+
+    runner = _RecordingRunner(events)
+    set_ssh_target_provider_hook(_factory)
+    monkeypatch.setattr(ssh_tools, "_make_ssh_sandbox_lease", lambda *_args: None)
+    monkeypatch.setattr(ssh_tools, "AsyncsshRunner", lambda: runner)
+    config = SimpleNamespace(
+        get_session_factory=lambda: task_db,
+        get_user_id=lambda: owner_id,
+        get_task_id=lambda: f"web_task_{task_id}",
+        get_workspace_config=lambda: None,
+    )
+    try:
+        tools = await ssh_tools.create_ssh_tools(config)
+        assert [tool.name for tool in tools] == [
+            "ssh_list_targets",
+            "ssh_execute",
+            "ssh_upload",
+            "ssh_download",
+        ]
+
+        expected_context = SshExecutionContext(
+            actor=ActorRef(actor_type="user", actor_id=str(owner_id)),
+            execution_principal=PrincipalRef(
+                principal_type="user", principal_id=str(owner_id)
+            ),
+            agent_id=preview_id,
+            task_id=task_id,
+            turn_id=None,
+            request_id=f"web_task_{task_id}",
+        )
+        assert provider.list_contexts == [expected_context]
+        assert events == [("factory", task_db), ("list", expected_context)]
+
+        execute_tool = next(tool for tool in tools if tool.name == "ssh_execute")
+        assert isinstance(execute_tool, SshExecuteTool)
+
+        async def _resolve_public(_hostname, _port):
+            return ["8.8.8.8"]
+
+        execute_tool._executor._resolver = _resolve_public
+        outcome = await execute_tool.run_json_async(
+            {"target": "prod", "command": "uptime"}
+        )
+
+        assert outcome["ok"] is True
+        assert outcome["stdout"] == "ok"
+        assert provider.resolve_contexts == [expected_context]
+        assert provider.resolve_contexts[0] is provider.list_contexts[0]
+        assert events == [
+            ("factory", task_db),
+            ("list", expected_context),
+            ("resolve", expected_context, "prod"),
+            ("read_version", _resolved().secret_handle),
+            ("run", "uptime"),
+        ]
+    finally:
+        set_ssh_target_provider_hook(None)
 
 
 async def test_create_ssh_tools_denies_cross_scope_preview_before_provider_targets(
