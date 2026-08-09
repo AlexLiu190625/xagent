@@ -70,10 +70,16 @@ class StagedTraceRow:
     module docstring); where it is set, it names a real row only after the
     caller's commit succeeds. ``anchor`` is ``None`` on every path except
     the root-checkpoint-with-a-live-lease path.
+
+    ``stored_data`` is the payload as written to the row: the caller's own
+    ``data``, unchanged except on the checkpoint paths, which merge the
+    run-id field and encode blobs. It carries whatever type the caller
+    passed, which is why it is not annotated more tightly than the
+    ``data`` parameter itself.
     """
 
     row_id: int | None
-    stored_data: dict[str, Any]
+    stored_data: Any
     anchor: StagedCheckpointAnchor | None
 
 
