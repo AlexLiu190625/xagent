@@ -651,7 +651,24 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
                             )
                         else:
                             names.add(alias.name)
-                    if node.module in {
+                    if node.level > 0 and alias.name in {
+                        "auth_dependencies",
+                        "websocket_auth",
+                    }:
+                        if alias.asname:
+                            escapes.append(
+                                (
+                                    (relative_path, "<module>", alias.name, ()),
+                                    alias.lineno,
+                                )
+                            )
+                        else:
+                            bases[alias.name] = (
+                                "xagent.web.auth_dependencies"
+                                if alias.name == "auth_dependencies"
+                                else "xagent.web.api.websocket_auth"
+                            )
+                    elif node.module in {
                         "xagent.web",
                         "xagent.web.api",
                     } and alias.name in {"auth_dependencies", "websocket_auth"}:
