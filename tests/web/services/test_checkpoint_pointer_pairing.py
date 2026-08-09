@@ -30,6 +30,16 @@ nothing further and is treated as already-inspected. Every other carrier
 parameter, ...) cannot be resolved statically, so it is counted as an
 opaque, and therefore unpaired, write.
 
+Because a plain ``dict.update(**name)`` is spelled the same way as a
+SQLAlchemy bulk ``.update(**name)``, an unrelated dict merge in one of
+these five modules is flagged too, even with no pointer column anywhere
+near it. That is deliberate: separating the two would mean trusting the
+receiver expression, and a real pointer write through a query object
+bound to a local name (``stmt.update(**vals)``) would then stop being
+flagged. A loud false positive on an unrelated merge is the better
+trade for a guard whose silent failure mode is "recovery stops working";
+write ``d.update(other)`` rather than ``d.update(**other)`` here.
+
 This resolution is by name, not dataflow: once a name has been bound to a
 dict literal anywhere in its function, every ``**`` of that name in that
 function is accepted, even if the name is later reassigned or mutated.

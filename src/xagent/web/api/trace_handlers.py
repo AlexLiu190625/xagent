@@ -704,20 +704,15 @@ class DatabaseTraceHandler(BaseTraceHandler):
             )
             data = staged.stored_data
 
-            if (
-                event_type_str == "system_update_general"
-                and isinstance(data, dict)
-                and data.get("checkpoint_type") == CHECKPOINT_TYPE
-                and self.build_id is None
-                and checkpoint_lease is not None
-            ):
-                # The anchor's primary key was already flushed and
-                # NULL-checked inside stage_trace_event_row before it
-                # returned staged.anchor; consume it directly here. This
-                # guard is the same is_checkpoint / build_id / lease test
-                # stage_trace_event_row itself gates its flush on, so the
-                # anchor here is never None.
-                assert staged.anchor is not None
+            if staged.anchor is not None and checkpoint_lease is not None:
+                # staged.anchor is set on exactly the path that needs this
+                # pointer UPDATE, so it is read here rather than re-derived.
+                # Re-deriving would test the post-encode payload rebound at
+                # the line above, not the pre-encode payload the flush
+                # decision was actually made from; the two agree today only
+                # because no encoder touches checkpoint_type. The lease is
+                # re-tested only to narrow it for the fence below -- it is
+                # never None when the anchor is set.
                 pointer_update = db.execute(
                     update(Task)
                     .where(
@@ -849,6 +844,14 @@ class DatabaseTraceHandler(BaseTraceHandler):
         dedup, but a blob referenced only by pruned rows (e.g. a message
         later dropped by context compaction) is orphaned until whole-task
         deletion cleans it up.
+
+        The entry guard below is a caller-contract check, not one of those
+        prune failures: it fires only when a caller hands this method a
+        session with uncommitted work, which the sole call site -- right
+        after the checkpoint commit -- never does. It raises outside the
+        degrade-and-log block deliberately, because that block's rollback
+        would discard the caller's pending writes and turn a misuse bug into
+        silent data loss.
 
         Retention is exactly ``limit`` rows, with one exception: when the
         task's exact-row pointer names a row that itself ranks outside the

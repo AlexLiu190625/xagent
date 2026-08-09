@@ -26,6 +26,7 @@ does not give.
 
 from __future__ import annotations
 
+import ast
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -469,13 +470,23 @@ def test_stage_trace_event_row_refuses_a_null_anchor_after_a_no_op_flush(
 
 
 def test_trace_event_staging_module_sends_no_notifications() -> None:
-    """No implicit notification is delivered as a zero-site fact
-    about this module's own source (there is nothing to move out), the
-    same way trace_handlers.py:_save_trace_event has zero notify/dispatch/
-    publish/broadcast sites today."""
-    source = Path(trace_event_staging.__file__).read_text()
-    for symbol in ("notify", "notification", "dispatch", "publish", "broadcast"):
-        assert symbol not in source, symbol
+    """No notification is delivered, asserted as a zero-site fact about this
+    module's imports and call targets rather than its prose: the substring
+    form also matched comments, which constrained how this module could be
+    documented."""
+    tree = ast.parse(Path(trace_event_staging.__file__).read_text())
+    roots = ("notify", "notification", "dispatch", "publish", "broadcast")
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update(a.name.split(".")[-1] for a in node.names)
+            names.update(a.asname for a in node.names if a.asname)
+    offenders = sorted(n for n in names if any(r in n.lower() for r in roots))
+    assert offenders == [], offenders
 
 
 # --------------------------------------------------------------------------
