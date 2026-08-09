@@ -25,6 +25,7 @@ from typing import (
     Mapping,
     Optional,
     TypeVar,
+    cast,
 )
 
 import httpx
@@ -1166,9 +1167,7 @@ class WebToolConfig(BaseToolConfig):
         self._db_factory = db_factory
         self._lazy_db = None
         self.request = request
-        self._user_id = (
-            user_id if user_id is not None else self._get_user_id_from_request(request)
-        )
+        self._user_id = user_id
         # Tri-state: an explicit ``is_admin`` (including ``False``) is
         # authoritative and is NOT OR-ed with the request's admin flag. This
         # is the privilege-isolation boundary: when the runtime builds a tool
@@ -1294,38 +1293,6 @@ class WebToolConfig(BaseToolConfig):
                 unique_dirs.append(dir_path)
                 seen.add(dir_path)
         return ",".join(unique_dirs)
-
-    def _get_user_id_from_request(self, request: Any) -> int:
-        """Extract user ID from request using JWT authentication."""
-        try:
-            from ..auth_dependencies import get_user_from_websocket_token
-
-            # Check if this is a FastAPI request with proper authentication
-            if hasattr(request, "headers") and hasattr(request, "query_params"):
-                # Try to extract user from Authorization header
-                auth_header = request.headers.get("authorization")
-                if auth_header:
-                    user = get_user_from_websocket_token(auth_header, self.db)
-                    if user is not None:
-                        user_id = self._coerce_user_id(getattr(user, "id", None))
-                        if user_id is not None:
-                            return user_id
-
-            # If request has a user attribute directly, use it
-            if hasattr(request, "user") and request.user:
-                user_id = self._coerce_user_id(getattr(request.user, "id", None))
-                if user_id is not None:
-                    return user_id
-
-            # If no authentication, this should raise an exception
-            raise ValueError("Authentication required")
-
-        except Exception as e:
-            logger = logging.getLogger(__name__)
-            logger.error(f"Failed to get user ID from request: {e}")
-            # Fallback to default user ID for backward compatibility
-            # In production, this should raise an exception instead
-            return 1
 
     def _get_is_admin_from_request(self, request: Any) -> bool:
         """Extract is_admin flag from the request user, defaulting to False.
@@ -2131,7 +2098,7 @@ class WebToolConfig(BaseToolConfig):
             policy_snapshot = await run_db_io_cancellation_safe(
                 lambda: _load_tool_runtime_policy_snapshot(
                     session_factory,
-                    int(self._user_id),
+                    int(cast(int, self._user_id)),
                 )
             )
 
@@ -3227,7 +3194,7 @@ class WebToolConfig(BaseToolConfig):
                     registration_generation=registration_generation,
                     resolved=remote_hook_token,
                     providers=remote_providers_to_resolve,
-                    user_id=int(self._user_id),
+                    user_id=int(cast(int, self._user_id)),
                     scope=self.get_execution_scope(),
                     resource=remote_configured_resource,
                     non_auth_connection=self._non_auth_mcp_connection(

@@ -7,6 +7,7 @@ silently widened to admin scope by the request.
 
 from types import SimpleNamespace
 
+from xagent.web import auth_dependencies
 from xagent.web.tools.config import WebToolConfig
 
 
@@ -45,6 +46,30 @@ def test_minimal_request_without_user_is_not_admin() -> None:
     non-admin without raising / logging a spurious warning."""
     cfg = WebToolConfig(db=None, request=SimpleNamespace(), user_id=5)
     assert cfg.is_admin() is False
+
+
+def test_identity_free_config_ignores_request_authentication(monkeypatch) -> None:
+    """Identity-free configuration must not derive a user from its request."""
+    token_helper_calls: list[tuple[object, object]] = []
+
+    def unexpected_token_helper(token: object, db: object) -> None:
+        token_helper_calls.append((token, db))
+        raise AssertionError("identity-free config must not authenticate a request")
+
+    request = SimpleNamespace(
+        headers={"authorization": "Bearer request-token"},
+        query_params={"token": "request-token"},
+        user=SimpleNamespace(id=77, is_admin=True),
+    )
+    database = object()
+    monkeypatch.setattr(
+        auth_dependencies, "get_user_from_websocket_token", unexpected_token_helper
+    )
+
+    cfg = WebToolConfig(db=database, request=request)
+
+    assert cfg.get_user_id() is None
+    assert token_helper_calls == []
 
 
 def test_skill_scope_context_does_not_retain_request_resources() -> None:
