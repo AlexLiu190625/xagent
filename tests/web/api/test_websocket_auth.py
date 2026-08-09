@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from dataclasses import is_dataclass
 from types import SimpleNamespace
@@ -163,14 +164,21 @@ async def test_cancellation_propagates_from_database_runner(
 @pytest.mark.asyncio
 async def test_operational_auth_failure_sends_sanitized_extension_denial(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     websocket, messages = _asgi_websocket(denial_extension=True)
+    route_template = "/ws/chat/{task_id}"
+    query_secret = "query-secret-value"
+    websocket.scope["route"] = SimpleNamespace(path=route_template)
+    websocket.scope["query_string"] = f"debug={query_secret}".encode()
     timeout = SQLAlchemyTimeoutError("database pool token=secret", None, None)
     session = _BoundSQLiteSession(query_exception=timeout)
     monkeypatch.setattr(websocket_auth, "get_session_local", lambda: lambda: session)
+    token = build_access_token()
+    caplog.set_level(logging.ERROR, logger=websocket_auth.__name__)
 
     with pytest.raises(websocket_auth._WebSocketAuthenticationTerminated) as raised:
-        await websocket_auth.get_authenticated_user(websocket, build_access_token())
+        await websocket_auth.get_authenticated_user(websocket, token)
 
     assert raised.value.__cause__ is timeout
     assert session.enter_count == 1
@@ -192,6 +200,19 @@ async def test_operational_auth_failure_sends_sanitized_extension_denial(
     serialized_messages = json.dumps(messages, default=lambda value: value.decode())
     assert "secret" not in serialized_messages
     assert "database pool" not in serialized_messages
+    infrastructure_records = [
+        record
+        for record in caplog.records
+        if record.name == websocket_auth.__name__
+        and "authentication infrastructure failure" in record.getMessage()
+    ]
+    assert len(infrastructure_records) == 1
+    log_record = infrastructure_records[0]
+    assert "transport=websocket" in log_record.getMessage()
+    assert f"route={route_template}" in log_record.getMessage()
+    rendered_log_data = f"{log_record.getMessage()} {log_record.args!r}"
+    assert token not in rendered_log_data
+    assert query_secret not in rendered_log_data
 
 
 @pytest.mark.asyncio

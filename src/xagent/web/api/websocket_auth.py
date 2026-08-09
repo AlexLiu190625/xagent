@@ -57,7 +57,12 @@ async def get_authenticated_user(
             lambda: _load_websocket_principal_sync(token)
         )
     except Exception as exc:
-        logger.exception("WebSocket authentication infrastructure failure")
+        route_template = getattr(websocket.scope.get("route"), "path", "<unresolved>")
+        logger.exception(
+            "WebSocket authentication infrastructure failure "
+            "transport=websocket route=%s",
+            route_template,
+        )
         try:
             if "websocket.http.response" in websocket.scope.get("extensions", {}):
                 await websocket.send_denial_response(
@@ -70,5 +75,9 @@ async def get_authenticated_user(
                 await websocket.accept()
                 await websocket.close(code=1011, reason="Internal server error")
         except Exception:
-            logger.exception("WebSocket authentication terminal response failure")
+            logger.exception(
+                "WebSocket authentication terminal response failure "
+                "transport=websocket route=%s",
+                route_template,
+            )
         raise _WebSocketAuthenticationTerminated() from exc
