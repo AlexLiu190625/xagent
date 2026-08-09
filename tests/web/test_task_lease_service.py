@@ -1597,3 +1597,22 @@ def test_release_current_runner_task_lease_clears_the_attempt_id(db_session) -> 
     assert changed is True
     db_session.refresh(task)
     assert task.lease_attempt_id is None
+
+
+def test_task_lease_snapshot_never_carries_an_attempt_id() -> None:
+    """The ambient snapshot rebuilt from a task row must keep attempt_id None
+    even when the row has one, so a later attempt check cannot compare a
+    value against itself and always pass."""
+    from types import SimpleNamespace
+
+    from xagent.web.api.websocket import _task_lease_snapshot
+
+    row = SimpleNamespace(
+        id=7,
+        runner_id="runner-a",
+        run_id="run-b",
+        lease_attempt_id="attempt-c",
+    )
+    lease = _task_lease_snapshot(row)
+    assert lease is not None
+    assert lease.attempt_id is None

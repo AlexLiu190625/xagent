@@ -3,7 +3,7 @@
 import importlib.util
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import sqlalchemy as sa
@@ -157,3 +157,54 @@ def test_offline_sql_carries_no_bind_parameters(dialect_name) -> None:
     for sql in (upgrade_sql, downgrade_sql):
         assert "%(" not in sql
         assert ":table_name" not in sql
+
+
+def test_target_schema_resolves_the_visible_tasks_relation() -> None:
+    """version_table_schema names only the Alembic version table and
+    current_schema() is merely the first search_path entry, so neither
+    identifies the relation the unqualified DDL resolves to."""
+
+    migration = _migration_module()
+    sql = str(migration.POSTGRES_VISIBLE_TABLE_SCHEMA_SQL)
+
+    assert "to_regclass" in sql
+    assert "pg_catalog.pg_namespace" in sql
+
+    # Non-PostgreSQL falls back to version_table_schema, and None keeps every
+    # operation on plain unqualified behaviour.
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        with patch.object(migration, "op", _operations(connection)):
+            assert migration._target_schema() is None
+
+
+def test_target_schema_uses_the_catalog_answer_on_postgresql() -> None:
+    """On PostgreSQL, ``_target_schema`` trusts the catalog lookup over
+    ``version_table_schema`` whenever the catalog resolves the relation, and
+    only falls back to the version table's configured schema when the
+    catalog has nothing to say (e.g. the relation is not visible yet)."""
+
+    migration = _migration_module()
+
+    resolving_op = MagicMock()
+    resolving_op.get_bind.return_value.dialect.name = "postgresql"
+    resolving_op.get_bind.return_value.execute.return_value.scalar.return_value = (
+        "tenant_x"
+    )
+
+    with patch.object(migration, "op", resolving_op):
+        assert migration._target_schema() == "tenant_x"
+
+    resolving_op.get_bind.return_value.execute.assert_called_once_with(
+        migration.POSTGRES_VISIBLE_TABLE_SCHEMA_SQL, {"table_name": TABLE}
+    )
+
+    empty_catalog_op = MagicMock()
+    empty_catalog_op.get_bind.return_value.dialect.name = "postgresql"
+    empty_catalog_op.get_bind.return_value.execute.return_value.scalar.return_value = (
+        None
+    )
+    empty_catalog_op.get_context.return_value.version_table_schema = "fallback_schema"
+
+    with patch.object(migration, "op", empty_catalog_op):
+        assert migration._target_schema() == "fallback_schema"
