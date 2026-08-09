@@ -13,6 +13,7 @@ _DEFAULT_LIFETIME = timedelta(minutes=5)
 def _build_access_token(
     claims: dict[str, object],
     *,
+    remove_claims: tuple[str, ...] = (),
     lifetime: timedelta = _DEFAULT_LIFETIME,
     signing_secret: str = JWT_SECRET_KEY,
 ) -> str:
@@ -23,12 +24,14 @@ def _build_access_token(
         "exp": datetime.now(timezone.utc) + lifetime,
     }
     payload.update(claims)
+    for claim in remove_claims:
+        payload.pop(claim, None)
     return jwt.encode(payload, signing_secret, algorithm=JWT_ALGORITHM)
 
 
-def build_access_token(**claims: object) -> str:
+def build_access_token(*, remove_claims: tuple[str, ...] = (), **claims: object) -> str:
     """Build an access token whose default expiry starts at call time."""
-    return _build_access_token(claims)
+    return _build_access_token(claims, remove_claims=remove_claims)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +42,7 @@ class RejectedAccessTokenCase:
     expected_detail: str
     expected_header_items: tuple[tuple[str, str], ...]
     claim_items: tuple[tuple[str, object], ...] = ()
+    remove_claims: tuple[str, ...] = ()
     lifetime: timedelta = _DEFAULT_LIFETIME
     signing_secret: str = JWT_SECRET_KEY
 
@@ -50,6 +54,7 @@ class RejectedAccessTokenCase:
         """Build this rejection token with expiry relative to current time."""
         return _build_access_token(
             dict(self.claim_items),
+            remove_claims=self.remove_claims,
             lifetime=self.lifetime,
             signing_secret=self.signing_secret,
         )

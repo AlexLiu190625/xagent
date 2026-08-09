@@ -90,28 +90,35 @@ def test_optional_auth_rejects_every_credential_reason(
 
 
 @pytest.mark.parametrize(
-    "claims",
+    ("claims", "remove_claims"),
     (
-        {"sub": None},
-        {"sub": 123},
-        {"user_id": None},
-        {"user_id": "1"},
-        {"user_id": True},
+        ({}, ("sub",)),
+        ({"sub": None}, ()),
+        ({"sub": 123}, ()),
+        ({}, ("user_id",)),
+        ({"user_id": None}, ()),
+        ({"user_id": "1"}, ()),
+        ({"user_id": True}, ()),
     ),
     ids=(
-        "missing-sub",
+        "absent-sub",
+        "null-sub",
         "wrong-type-sub",
-        "missing-user-id",
+        "absent-user-id",
+        "null-user-id",
         "wrong-type-user-id",
         "bool-user-id",
     ),
 )
 def test_malformed_identity_claim_shapes_are_rejected_before_any_user_query(
-    db_session: Session, claims: dict[str, object]
+    db_session: Session,
+    claims: dict[str, object],
+    remove_claims: tuple[str, ...],
 ) -> None:
     """Identity claims with non-bindable types stay credential rejections."""
     credentials = HTTPAuthorizationCredentials(
-        scheme="Bearer", credentials=_access_token(**claims)
+        scheme="Bearer",
+        credentials=_access_token(remove_claims=remove_claims, **claims),
     )
 
     with pytest.raises(HTTPException) as raised:
@@ -584,6 +591,49 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
             and node.name in tracked
         }
         bases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if node in tree.body:
+                continue
+            if isinstance(node, ast.ImportFrom):
+                leaf = (node.module or "").rsplit(".", 1)[-1]
+                for alias in node.names:
+                    tracked_symbol = (
+                        leaf in {"auth_dependencies", "websocket_auth"}
+                        and alias.name in tracked
+                    )
+                    tracked_module = alias.name in {
+                        "auth_dependencies",
+                        "websocket_auth",
+                    } and (
+                        node.level > 0
+                        or node.module in {"xagent.web", "xagent.web.api"}
+                    )
+                    if tracked_symbol or tracked_module:
+                        escapes.append(
+                            (
+                                (
+                                    relative_path,
+                                    "<local import>",
+                                    alias.name,
+                                    (),
+                                ),
+                                alias.lineno,
+                            )
+                        )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in modules:
+                        escapes.append(
+                            (
+                                (
+                                    relative_path,
+                                    "<local import>",
+                                    alias.name,
+                                    (),
+                                ),
+                                alias.lineno,
+                            )
+                        )
         for node in tree.body:
             if isinstance(node, ast.ImportFrom):
                 leaf = (node.module or "").rsplit(".", 1)[-1]
