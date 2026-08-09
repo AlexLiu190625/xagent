@@ -9,16 +9,16 @@ from jose import ExpiredSignatureError, JWTError, jwt
 from sqlalchemy.orm import Session
 
 from .auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+from .jwt_validation import (
+    has_matching_temporal_claim_conversion_failure,
+    is_exact_integer_bindable,
+)
 from .models.database import get_db
 from .models.user import User
 
 # JWT Bearer token authentication
 security = HTTPBearer()
-
-_SQLITE_INTEGER_MIN = -(2**63)
-_SQLITE_INTEGER_MAX = 2**63 - 1
-_POSTGRESQL_INTEGER_MIN = -(2**31)
-_POSTGRESQL_INTEGER_MAX = 2**31 - 1
+optional_security = HTTPBearer(auto_error=False)
 
 
 class _AccessTokenRejectionReason(Enum):
@@ -39,28 +39,6 @@ class _AccessTokenRejected(Exception):
         self.reason = reason
 
 
-def _has_matching_temporal_claim_conversion_failure(
-    token: str, original_error: TypeError | OverflowError
-) -> bool:
-    """Whether unverified temporal data proves the decoder's exact failure."""
-    try:
-        claims = jwt.get_unverified_claims(token)
-    except JWTError:
-        return False
-
-    for claim_name in ("exp", "nbf", "iat"):
-        if claim_name not in claims:
-            continue
-        try:
-            int(claims[claim_name])
-        except ValueError:
-            continue
-        except (TypeError, OverflowError) as reproduced_error:
-            if type(reproduced_error) is type(original_error):
-                return True
-    return False
-
-
 def _validate_access_token_claim_bindability(
     username: object, user_id: object, db: Session
 ) -> tuple[str, int]:
@@ -73,14 +51,10 @@ def _validate_access_token_claim_bindability(
         raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID_CLAIMS) from None
 
     dialect_name = db.get_bind().dialect.name
-    if dialect_name == "sqlite":
-        if not _SQLITE_INTEGER_MIN <= user_id <= _SQLITE_INTEGER_MAX:
-            raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID_CLAIMS)
-    elif dialect_name == "postgresql":
-        if "\x00" in username or not (
-            _POSTGRESQL_INTEGER_MIN <= user_id <= _POSTGRESQL_INTEGER_MAX
-        ):
-            raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID_CLAIMS)
+    if not is_exact_integer_bindable(user_id, dialect_name):
+        raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID_CLAIMS)
+    if dialect_name == "postgresql" and "\x00" in username:
+        raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID_CLAIMS)
 
     return username, user_id
 
@@ -99,11 +73,14 @@ def _resolve_access_token_user(token: str, db: Session) -> User:
     except JWTError:
         raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID) from None
     except (TypeError, OverflowError) as error:
-        if _has_matching_temporal_claim_conversion_failure(token, error):
+        if has_matching_temporal_claim_conversion_failure(token, error):
             raise _AccessTokenRejected(
                 _AccessTokenRejectionReason.INVALID_CLAIMS
             ) from None
         raise
+
+    if "sub" in payload and type(payload["sub"]) is not str:
+        raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID)
 
     if payload.get("type") != "access":
         raise _AccessTokenRejected(_AccessTokenRejectionReason.WRONG_TYPE)
@@ -180,7 +157,7 @@ def get_current_user(
 
 
 def get_current_user_optional(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
     db: Session = Depends(get_db),
 ) -> Optional[User]:
     """

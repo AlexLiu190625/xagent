@@ -114,6 +114,7 @@ def test_loader_rejects_every_credential_reason_inside_worker_session(
     assert websocket_auth._load_websocket_principal_sync(case.build_token()) is None
     assert session.enter_count == 1
     assert session.exit_count == 1
+    assert session.query_count == (1 if case.expected_detail == "User not found" else 0)
 
 
 @pytest.mark.asyncio
@@ -223,6 +224,7 @@ async def test_operational_auth_failure_without_extension_accepts_then_closes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     websocket, messages = _asgi_websocket(denial_extension=False)
+    websocket.scope["extensions"] = None
 
     async def timeout(_operation: object) -> None:
         raise TimeoutError("database pool token=secret")
@@ -433,9 +435,7 @@ async def test_progress_returns_after_shared_terminal_authentication(
     broadcaster = MagicMock()
     broadcaster.connect = AsyncMock()
     authenticated_user = AsyncMock(side_effect=_authentication_terminated)
-    monkeypatch.setattr(
-        progress_ws, "get_authenticated_user", authenticated_user, raising=False
-    )
+    monkeypatch.setattr(progress_ws, "get_authenticated_user", authenticated_user)
     monkeypatch.setattr(progress_ws, "progress_broadcaster", broadcaster)
 
     await progress_ws.progress_websocket_endpoint(websocket, "task", "signed-token")

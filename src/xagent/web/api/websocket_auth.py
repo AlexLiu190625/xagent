@@ -29,6 +29,44 @@ class _WebSocketAuthenticationTerminated(Exception):
     """Authentication already sent a terminal transport response."""
 
 
+async def send_websocket_authentication_infrastructure_failure(
+    websocket: WebSocket,
+    original_error: Exception,
+    *,
+    already_accepted: bool,
+) -> None:
+    """Send the shared sanitized response for an authentication outage."""
+    route_template = getattr(websocket.scope.get("route"), "path", "<unresolved>")
+    logger.error(
+        "WebSocket authentication infrastructure failure transport=websocket route=%s",
+        route_template,
+        exc_info=(
+            type(original_error),
+            original_error,
+            original_error.__traceback__,
+        ),
+    )
+    try:
+        if already_accepted:
+            await websocket.close(code=1011, reason="Internal server error")
+        elif "websocket.http.response" in (websocket.scope.get("extensions") or {}):
+            await websocket.send_denial_response(
+                JSONResponse(
+                    status_code=503,
+                    content={"detail": "Service temporarily unavailable"},
+                )
+            )
+        else:
+            await websocket.accept()
+            await websocket.close(code=1011, reason="Internal server error")
+    except Exception:
+        logger.exception(
+            "WebSocket authentication terminal response failure "
+            "transport=websocket route=%s",
+            route_template,
+        )
+
+
 def _load_websocket_principal_sync(token: str) -> WebSocketPrincipal | None:
     """Authenticate one token inside a worker-owned short Session."""
 
@@ -57,27 +95,9 @@ async def get_authenticated_user(
             lambda: _load_websocket_principal_sync(token)
         )
     except Exception as exc:
-        route_template = getattr(websocket.scope.get("route"), "path", "<unresolved>")
-        logger.exception(
-            "WebSocket authentication infrastructure failure "
-            "transport=websocket route=%s",
-            route_template,
+        await send_websocket_authentication_infrastructure_failure(
+            websocket,
+            exc,
+            already_accepted=False,
         )
-        try:
-            if "websocket.http.response" in websocket.scope.get("extensions", {}):
-                await websocket.send_denial_response(
-                    JSONResponse(
-                        status_code=503,
-                        content={"detail": "Service temporarily unavailable"},
-                    )
-                )
-            else:
-                await websocket.accept()
-                await websocket.close(code=1011, reason="Internal server error")
-        except Exception:
-            logger.exception(
-                "WebSocket authentication terminal response failure "
-                "transport=websocket route=%s",
-                route_template,
-            )
         raise _WebSocketAuthenticationTerminated() from exc

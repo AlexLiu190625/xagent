@@ -7,8 +7,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
@@ -93,8 +94,6 @@ def test_optional_auth_rejects_every_credential_reason(
     ("claims", "remove_claims"),
     (
         ({}, ("sub",)),
-        ({"sub": None}, ()),
-        ({"sub": 123}, ()),
         ({}, ("user_id",)),
         ({"user_id": None}, ()),
         ({"user_id": "1"}, ()),
@@ -102,8 +101,6 @@ def test_optional_auth_rejects_every_credential_reason(
     ),
     ids=(
         "absent-sub",
-        "null-sub",
-        "wrong-type-sub",
         "absent-user-id",
         "null-user-id",
         "wrong-type-user-id",
@@ -127,6 +124,26 @@ def test_malformed_identity_claim_shapes_are_rejected_before_any_user_query(
     assert raised.value.status_code == 401
     assert raised.value.detail == "Invalid token payload"
     assert raised.value.headers == {"WWW-Authenticate": "Bearer"}
+    assert db_session.info["user_query_count"] == 0
+
+
+@pytest.mark.parametrize("sub", (None, 123, True), ids=("null", "integer", "boolean"))
+def test_present_non_string_subject_preserves_invalid_token_http_contract(
+    db_session: Session, sub: object
+) -> None:
+    credentials = HTTPAuthorizationCredentials(
+        scheme="Bearer", credentials=_access_token(sub=sub)
+    )
+
+    with pytest.raises(HTTPException) as raised:
+        get_current_user(credentials, db_session)
+
+    assert raised.value.status_code == 401
+    assert raised.value.detail == "Invalid token"
+    assert raised.value.headers == {
+        "WWW-Authenticate": "Bearer",
+        "Error-Type": "InvalidToken",
+    }
     assert db_session.info["user_query_count"] == 0
 
 
@@ -305,9 +322,11 @@ class _DialectSession:
     def __init__(self, dialect_name: str, user: User | None = None) -> None:
         self._bind = SimpleNamespace(dialect=SimpleNamespace(name=dialect_name))
         self._user = user
+        self.bind_count = 0
         self.query_count = 0
 
     def get_bind(self) -> SimpleNamespace:
+        self.bind_count += 1
         return self._bind
 
     def query(self, _model: type[User]) -> "_DialectSession":
@@ -319,6 +338,19 @@ class _DialectSession:
 
     def first(self) -> User | None:
         return self._user
+
+
+def test_wrong_type_user_id_is_rejected_before_reading_database_binding() -> None:
+    db = _DialectSession("sqlite")
+    credentials = HTTPAuthorizationCredentials(
+        scheme="Bearer", credentials=_access_token(user_id="1")
+    )
+
+    with pytest.raises(HTTPException):
+        get_current_user(credentials, db)  # type: ignore[arg-type]
+
+    assert db.bind_count == 0
+    assert db.query_count == 0
 
 
 @pytest.mark.parametrize(
@@ -442,6 +474,42 @@ def test_token_adapter_propagates_real_queue_pool_checkout_timeout() -> None:
 def test_optional_direct_none_returns_none(db_session: Session) -> None:
     """The optional helper preserves its direct no-credential contract."""
     assert get_current_user_optional(None, db_session) is None
+
+
+@pytest.mark.parametrize(
+    "headers",
+    ({}, {"Authorization": "Bearer "}, {"Authorization": "Basic abc"}),
+    ids=("missing", "empty-bearer", "basic"),
+)
+def test_optional_dependency_treats_non_credentials_as_anonymous(
+    db_session: Session, headers: dict[str, str]
+) -> None:
+    app = FastAPI()
+
+    @app.get("/optional")
+    def optional_endpoint(
+        user: User | None = Depends(get_current_user_optional),
+    ) -> dict[str, int | None]:
+        return {"user_id": user.id if user is not None else None}
+
+    @app.get("/required")
+    def required_endpoint(user: User = Depends(get_current_user)) -> dict[str, int]:
+        return {"user_id": user.id}
+
+    app.dependency_overrides[auth_dependencies.get_db] = lambda: db_session
+
+    client = TestClient(app)
+    assert client.get("/optional", headers=headers).json() == {"user_id": None}
+    assert client.get("/required", headers=headers).status_code == 403
+
+
+@pytest.mark.parametrize("helper", (get_user_from_token, get_user_from_websocket_token))
+@pytest.mark.parametrize("token", ("", "not-a-jwt"), ids=("empty", "garbage"))
+def test_direct_token_helpers_reject_malformed_input_without_query(
+    db_session: Session, helper: object, token: str
+) -> None:
+    assert helper(token, db_session) is None  # type: ignore[operator]
+    assert db_session.info["user_query_count"] == 0
 
 
 @pytest.mark.parametrize(

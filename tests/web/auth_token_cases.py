@@ -85,7 +85,7 @@ REJECTED_ACCESS_TOKEN_CASES = (
         "invalid-claims",
         "Invalid token payload",
         _BEARER_HEADERS,
-        (("sub", ()),),
+        (("user_id", "1"),),
     ),
     RejectedAccessTokenCase(
         "user-not-found",

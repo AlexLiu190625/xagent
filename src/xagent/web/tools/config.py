@@ -1164,18 +1164,15 @@ class WebToolConfig(BaseToolConfig):
         self._lazy_db = None
         self.request = request
         self._user_id = user_id
-        # Tri-state: an explicit ``is_admin`` (including ``False``) is
-        # authoritative and is NOT OR-ed with the request's admin flag. This
-        # is the privilege-isolation boundary: when the runtime builds a tool
-        # config for a task owner (passing ``is_admin=bool(owner.is_admin)``),
-        # an admin *actor* on the request must not silently widen the config
-        # to admin scope. Only when ``is_admin`` is unset do we fall back to
-        # the request.
-        self._is_admin_value = (
-            bool(is_admin)
-            if is_admin is not None
-            else self._get_is_admin_from_request(request)
-        )
+        # No identity can carry administrative privilege. For identified
+        # configs, an explicit value remains authoritative; only an unset value
+        # may fall back to the authenticated request user.
+        if self._user_id is None:
+            self._is_admin_value = False
+        elif is_admin is not None:
+            self._is_admin_value = bool(is_admin)
+        else:
+            self._is_admin_value = self._get_is_admin_from_request(request)
         # Initialize workspace_config with base_dir and task_id if provided
         if workspace_config is None:
             workspace_config = {}
@@ -1433,6 +1430,9 @@ class WebToolConfig(BaseToolConfig):
 
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database."""
+        if self._user_id is None:
+            return []
+
         if not self._include_mcp_tools:
             return []
 
@@ -1447,6 +1447,12 @@ class WebToolConfig(BaseToolConfig):
         configs = await self._load_mcp_server_configs()
         self._store_mcp_config_cache_if_cacheable(configs)
         return configs
+
+    def _serialize_mcp_user_id(self) -> str:
+        """Return the explicit identity used to isolate an MCP config."""
+        if self._user_id is None:
+            raise RuntimeError("MCP configs require a user identity")
+        return str(self._user_id)
 
     def _mcp_config_cache_is_valid(self) -> bool:
         # MCP config caching is aware of hook-supplied token expiry only. The
@@ -2813,13 +2819,14 @@ class WebToolConfig(BaseToolConfig):
         normalized_failure_code = normalize_tool_failure_code(failure_code)
         if normalized_failure_code is not None:
             inner_config["failure_code"] = normalized_failure_code
+        serialized_user_id = self._serialize_mcp_user_id()
         return {
             "name": getattr(server, "name", ""),
             "transport": "unavailable",
             "description": getattr(server, "description", None),
             "config": inner_config,
-            "user_id": str(self._user_id),
-            "allow_users": [str(self._user_id)],
+            "user_id": serialized_user_id,
+            "allow_users": [serialized_user_id],
         }
 
     def _build_oauth_mcp_stdio_transport_config(
@@ -3294,8 +3301,9 @@ class WebToolConfig(BaseToolConfig):
         config["config"] = transport_config
 
         # Add user context for MCP tool isolation
-        config["user_id"] = str(self._user_id)
-        config["allow_users"] = [str(self._user_id)]  # Only allow current user
+        serialized_user_id = self._serialize_mcp_user_id()
+        config["user_id"] = serialized_user_id
+        config["allow_users"] = [serialized_user_id]  # Only allow current user
 
         logger.debug(f"Loaded MCP server config: {server.name} ({server.transport})")
         return config
