@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+import xagent.web.api.files as files_module
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.api.auth import hash_password
 from xagent.web.api.files import file_router
@@ -485,3 +486,118 @@ class TestAdminFileAccess:
         )
 
         assert response.status_code == 403
+
+    def test_public_preview_sets_no_store_cache_control(
+        self, test_db, temp_uploads_dir
+    ):
+        # The public route is loaded directly as <img>/<audio>/<video> src on
+        # share surfaces, which fetches automatically on render. Without this
+        # header the tokened URL and its bytes could land in browser disk
+        # cache and outlive the guest session.
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=85,
+            user_id=regular_user_id,
+            title="Cache header test",
+            description="public preview cache header test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.txt",
+            "media bytes",
+        )
+
+        client = TestClient(test_app)
+        response = client.get(f"/api/files/public/preview/{uploaded_file.file_id}")
+
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "private, no-store"
+
+    def test_public_preview_sets_no_store_cache_control_for_rasterized_svg(
+        self, test_db, temp_uploads_dir, monkeypatch, tmp_path
+    ):
+        # The SVG branch of _inline_preview_response returns a separate
+        # FileResponse for the rasterized PNG -- the header must reach that
+        # branch too, not just the generic pass-through one exercised above.
+        # rasterize_svg_bytes is stubbed to avoid a hard dependency on the
+        # native cairo library in this environment; the extra_headers
+        # plumbing under test doesn't depend on the rasterized output.
+        monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path))
+        monkeypatch.setattr(
+            files_module, "rasterize_svg_bytes", lambda svg_bytes: b"fake-png-bytes"
+        )
+
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=87,
+            user_id=regular_user_id,
+            title="SVG cache header test",
+            description="public preview cache header test for svg",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "icon.svg",
+            "<svg xmlns='http://www.w3.org/2000/svg'></svg>",
+        )
+
+        client = TestClient(test_app)
+        response = client.get(f"/api/files/public/preview/{uploaded_file.file_id}")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
+        assert response.headers["cache-control"] == "private, no-store"
+
+    def test_authenticated_preview_keeps_default_caching(
+        self, test_db, temp_uploads_dir
+    ):
+        # The authenticated in-app preview route must not get the public
+        # route's no-store override: chat images there rely on ordinary
+        # browser caching across repeated renders of the same message.
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=86,
+            user_id=regular_user_id,
+            title="Authenticated cache header test",
+            description="authenticated preview cache header test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.txt",
+            "media bytes",
+        )
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}", headers=user_headers
+        )
+
+        assert response.status_code == 200
+        # Starlette's FileResponse sets no Cache-Control by default; assert
+        # that exactly, not just "not the public value" -- a regression that
+        # set some other Cache-Control here would slip past a weaker check.
+        assert "cache-control" not in response.headers
