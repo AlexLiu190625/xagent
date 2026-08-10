@@ -18,6 +18,15 @@ mcp = FastMCP("hubspot-mcp")
 
 HUBSPOT_BASE_URL = "https://api.hubapi.com"
 DEFAULT_TIMEOUT_SECONDS = 30
+# A single association-listing call is scoped to one contact and capped at
+# max_results, so it isn't inherently slow on its own. Timeouts at the 30s
+# default were reported, though, during a bulk pull looping this call across
+# a large portal (~53k contacts); no latency beyond "exceeded 30s" was
+# measured, so 90s is a deliberate margin rather than a tuned value. Scoped
+# to this call path (rather than raising the shared default) so a slow or
+# degraded HubSpot API doesn't also make every other tool call hang for the
+# same longer window.
+ASSOCIATION_LISTING_TIMEOUT_SECONDS = 90
 
 DEFAULT_CONTACT_PROPERTIES = [
     "email",
@@ -78,6 +87,7 @@ def _request(
     *,
     params: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
+    timeout: float | tuple[float, float] | None = DEFAULT_TIMEOUT_SECONDS,
 ) -> Any:
     response = requests.request(
         method=method,
@@ -85,7 +95,7 @@ def _request(
         headers=_headers(),
         params=params,
         json=body,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     try:
         response.raise_for_status()
@@ -116,7 +126,9 @@ def _list_association_ids(path: str, max_results: int) -> tuple[list[Any], bool]
         }
         if after:
             params["after"] = after
-        page = _request("GET", path, params=params)
+        page = _request(
+            "GET", path, params=params, timeout=ASSOCIATION_LISTING_TIMEOUT_SECONDS
+        )
         results = page.get("results", [])
         ids.extend(item.get("id") for item in results)
         after = ((page.get("paging") or {}).get("next") or {}).get("after")
