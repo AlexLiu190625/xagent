@@ -6,7 +6,11 @@ silently widened to admin scope by the request.
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
+from xagent.web import auth_dependencies
 from xagent.web.tools.config import WebToolConfig
 
 
@@ -45,6 +49,84 @@ def test_minimal_request_without_user_is_not_admin() -> None:
     non-admin without raising / logging a spurious warning."""
     cfg = WebToolConfig(db=None, request=SimpleNamespace(), user_id=5)
     assert cfg.is_admin() is False
+
+
+def test_identity_free_config_ignores_request_authentication(monkeypatch) -> None:
+    """Identity-free configuration must not derive a user from its request."""
+    token_helper_calls: list[tuple[object, object]] = []
+
+    def unexpected_token_helper(token: object, db: object) -> None:
+        token_helper_calls.append((token, db))
+        raise AssertionError("identity-free config must not authenticate a request")
+
+    request = SimpleNamespace(
+        headers={"authorization": "Bearer request-token"},
+        query_params={"token": "request-token"},
+        user=SimpleNamespace(id=77, is_admin=True),
+    )
+    database = object()
+    monkeypatch.setattr(
+        auth_dependencies, "get_user_from_websocket_token", unexpected_token_helper
+    )
+
+    cfg = WebToolConfig(db=database, request=request)
+
+    assert cfg.get_user_id() is None
+    assert cfg.is_admin() is False
+    assert token_helper_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("builder", ["unavailable", "executable"])
+async def test_mcp_config_builders_require_an_explicit_user_identity(
+    builder: str,
+) -> None:
+    cfg = WebToolConfig(db=None, request=None, user_id=None)
+    server = SimpleNamespace(
+        id=1,
+        name="Example",
+        description=None,
+        transport="unsupported-test-transport",
+        managed="external",
+        concurrency_safe=False,
+        concurrent_tools=[],
+    )
+
+    with pytest.raises(RuntimeError, match="require a user identity"):
+        if builder == "unavailable":
+            cfg._build_unavailable_mcp_config(
+                server=server, reason="config_load_failed"
+            )
+        else:
+            await cfg._build_mcp_server_config(
+                server=server,
+                user_env_by_id={},
+                shared_env_by_id={},
+                env_source_by_id={},
+            )
+
+
+@pytest.mark.asyncio
+async def test_identity_free_mcp_load_returns_before_cache_or_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = WebToolConfig(db=object(), request=None, user_id=None, include_mcp_tools=True)
+    include_mcp_tools = MagicMock()
+    include_mcp_tools.__bool__.side_effect = AssertionError(
+        "include flag must not be read"
+    )
+    cfg._include_mcp_tools = include_mcp_tools
+    cfg._cached_mcp_configs = [{"user_id": "stale"}]
+    load = AsyncMock()
+    monkeypatch.setattr(cfg, "_load_mcp_server_configs", load)
+    monkeypatch.setattr(
+        cfg,
+        "_mcp_config_cache_is_valid",
+        MagicMock(side_effect=AssertionError("cache must not be read")),
+    )
+
+    assert await cfg.get_mcp_server_configs() == []
+    load.assert_not_awaited()
 
 
 def test_skill_scope_context_does_not_retain_request_resources() -> None:

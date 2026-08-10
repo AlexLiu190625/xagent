@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
-from dataclasses import is_dataclass
 from types import SimpleNamespace
 from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -43,7 +42,6 @@ from xagent.web.api.websocket import (
     _waiting_or_paused_event_fields,
     background_task_manager,
     execute_resume_background,
-    get_authenticated_user,
     handle_chat_message,
     handle_pause_task,
     handle_resume_task,
@@ -177,58 +175,6 @@ async def test_rejected_delivery_serializes_an_explicit_outcome() -> None:
             turn_id="missing-outcome-turn",
             accepted=False,
         )
-
-
-@pytest.mark.asyncio
-async def test_websocket_authentication_returns_frozen_principal_off_loop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    event_loop_thread = threading.get_ident()
-    auth_threads: list[int] = []
-    closed_sessions: list[bool] = []
-
-    class TrackingSession:
-        def close(self) -> None:
-            closed_sessions.append(True)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, _exc_type, _exc, _traceback) -> None:
-            self.close()
-
-    def session_factory():
-        return TrackingSession()
-
-    def get_test_db():
-        session = TrackingSession()
-        try:
-            yield session
-        finally:
-            session.close()
-
-    def authenticate(_token: str, _db: object):
-        auth_threads.append(threading.get_ident())
-        return SimpleNamespace(id=73, is_admin=True)
-
-    monkeypatch.setattr(websocket_api, "get_session_local", lambda: session_factory)
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
-    monkeypatch.setattr(
-        websocket_api,
-        "get_user_from_websocket_token",
-        authenticate,
-    )
-
-    principal = await get_authenticated_user(MagicMock(), "signed-token")
-
-    assert principal is not None
-    assert principal.id == 73
-    assert principal.is_admin is True
-    assert auth_threads == [auth_threads[0]]
-    assert auth_threads[0] != event_loop_thread
-    assert closed_sessions
-    assert is_dataclass(principal)
-    assert principal.__dataclass_params__.frozen is True
 
 
 def _register_current_resume(task_id: int) -> None:

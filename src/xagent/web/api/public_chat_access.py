@@ -8,15 +8,20 @@ import secrets
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum, auto
 from typing import Any, Callable, Protocol, TypeGuard, TypeVar
 
 from fastapi import Depends, HTTPException, Query, UploadFile, WebSocket
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import jwt
+from jose import JWTError, jwt
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+from ..jwt_validation import (
+    has_matching_temporal_claim_conversion_failure,
+    is_exact_integer_bindable,
+)
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.database import get_db, get_session_local, release_db_connection_if_clean
 from ..models.deployment import DeploymentOwnerType
@@ -50,6 +55,7 @@ from .websocket import (
     manager,
     send_message_delivery,
 )
+from .websocket_auth import send_websocket_authentication_infrastructure_failure
 
 logger = logging.getLogger(__name__)
 db_session_context = contextmanager(get_db)
@@ -145,6 +151,58 @@ def _is_strict_int(value: object) -> TypeGuard[int]:
     claim today; this keeps every id claim failing closed regardless.
     """
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+class _PublicTokenRejected(Exception):
+    """An expected widget/share credential rejection."""
+
+    def __init__(self, reason: "_PublicTokenRejectionReason") -> None:
+        super().__init__()
+        self.reason = reason
+
+
+class _PublicTokenRejectionReason(Enum):
+    INVALID_TOKEN = auto()
+    INVALID_CLAIMS = auto()
+    INVALID_ENTITY = auto()
+
+
+def _project_public_token_failure(
+    exc: Exception, *, invalid_detail: str
+) -> HTTPException | None:
+    """Project expected public-token failures while preserving operations."""
+    if isinstance(exc, HTTPException):
+        return exc
+    if isinstance(exc, _PublicTokenRejected):
+        logger.info("Public chat credential rejected reason=%s", exc.reason.name)
+        return HTTPException(status_code=401, detail=invalid_detail)
+    return None
+
+
+def _decode_public_token(token: str) -> dict[str, Any]:
+    """Verify one public token without folding decoder defects into credentials."""
+    if token.startswith("Bearer "):
+        token = token[7:]
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except JWTError:
+        raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_TOKEN) from None
+    except (TypeError, OverflowError) as exc:
+        if has_matching_temporal_claim_conversion_failure(token, exc):
+            raise _PublicTokenRejected(
+                _PublicTokenRejectionReason.INVALID_CLAIMS
+            ) from None
+        raise
+    if type(payload) is not dict:
+        raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_TOKEN)
+    return payload
+
+
+def _require_bindable_public_id(value: object, dialect_name: str) -> int:
+    """Return an exact query id accepted by the supported database dialect."""
+    if not is_exact_integer_bindable(value, dialect_name):
+        raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_CLAIMS)
+    return value
 
 
 def create_public_chat_access_token(data: dict[str, Any]) -> str:
@@ -293,12 +351,9 @@ def get_public_chat_user(
 ) -> PublicChatAccessContext:
     """Get public chat access context from a widget/share token."""
     try:
-        if token.startswith("Bearer "):
-            token = token[7:]
-
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        payload = _decode_public_token(token)
         if payload.get("type") != "widget":
-            raise ValueError("Invalid token type")
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_TOKEN)
 
         user_id = payload.get("user_id")
         channel_id = payload.get("channel_id")
@@ -311,7 +366,7 @@ def get_public_chat_user(
             raise HTTPException(status_code=403, detail="Access denied")
 
         if auth_mode != "widget":
-            raise ValueError("Invalid token payload")
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_TOKEN)
 
         # Defense in depth (#992): the same guard get_share_chat_user applies.
         # Without it the two widget branches below disagreed about a string
@@ -319,20 +374,49 @@ def get_public_chat_user(
         # comparison, while the workforce branch coerced it and admitted the
         # request. Establishing the type here is what lets both branches pass
         # ``user_id`` straight to their ``ensure_widget_*_available`` helper.
-        if not _is_strict_int(user_id) or not user_id or not guest_id:
-            raise ValueError("Invalid token payload")
+        if (
+            not _is_strict_int(user_id)
+            or not user_id
+            or not isinstance(guest_id, str)
+            or not guest_id
+        ):
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_CLAIMS)
+        if channel_id is not None and not _is_strict_int(channel_id):
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_CLAIMS)
+
+        if _is_strict_int(widget_workforce_id):
+            selected_agent_id = None
+            selected_workforce_id = widget_workforce_id
+        elif _is_strict_int(widget_agent_id):
+            selected_agent_id = widget_agent_id
+            selected_workforce_id = None
+        else:
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_ENTITY)
+
+        dialect_name = str(db.get_bind().dialect.name)
+        user_id = _require_bindable_public_id(user_id, dialect_name)
+        if channel_id is not None:
+            channel_id = _require_bindable_public_id(channel_id, dialect_name)
+        if selected_workforce_id is not None:
+            selected_workforce_id = _require_bindable_public_id(
+                selected_workforce_id, dialect_name
+            )
+        else:
+            selected_agent_id = _require_bindable_public_id(
+                selected_agent_id, dialect_name
+            )
 
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
-            raise ValueError("User not found")
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_CLAIMS)
 
-        if _is_strict_int(widget_workforce_id):
+        if selected_workforce_id is not None:
             # Workforce widget: re-validate the deployment on every use so
             # disabling the widget or rotating its key cuts off live guests,
             # mirroring the workforce share path.
             ensure_widget_workforce_available(
                 db,
-                widget_workforce_id,
+                selected_workforce_id,
                 user_id,
                 expected_widget_key=widget_key
                 if isinstance(widget_key, str) and widget_key
@@ -343,7 +427,7 @@ def get_public_chat_user(
                 channel_id=channel_id,
                 guest_id=guest_id,
                 auth_mode=auth_mode,
-                widget_workforce_id=widget_workforce_id,
+                widget_workforce_id=selected_workforce_id,
             )
 
         # Agent widget: re-validate against the live agent every request so
@@ -351,11 +435,11 @@ def get_public_chat_user(
         # tokens (mirrors the share path). The per-message WS revalidation
         # calls back through here, so live sessions drop on the next inbound
         # message too.
-        if not _is_strict_int(widget_agent_id):
-            raise ValueError("Invalid widget token payload")
+        if selected_agent_id is None:
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_ENTITY)
         ensure_widget_agent_available(
             db,
-            widget_agent_id,
+            selected_agent_id,
             user_id,
             expected_widget_key=widget_key
             if isinstance(widget_key, str) and widget_key
@@ -367,24 +451,23 @@ def get_public_chat_user(
             channel_id=channel_id,
             guest_id=guest_id,
             auth_mode=auth_mode,
-            widget_agent_id=widget_agent_id,
+            widget_agent_id=selected_agent_id,
         )
     except Exception as exc:
-        logger.error("Public chat token validation error: %s", exc)
-        if isinstance(exc, HTTPException):
-            raise exc
-        raise HTTPException(status_code=401, detail="Invalid widget token")
+        projected = _project_public_token_failure(
+            exc, invalid_detail="Invalid widget token"
+        )
+        if projected is not None:
+            raise projected from None
+        raise
 
 
 def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
     """Get share chat access context from a share token."""
     try:
-        if token.startswith("Bearer "):
-            token = token[7:]
-
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        payload = _decode_public_token(token)
         if payload.get("type") != "widget":
-            raise ValueError("Invalid token type")
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_TOKEN)
 
         user_id = payload.get("user_id")
         auth_mode = payload.get("auth_mode")
@@ -394,27 +477,47 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
         guest_id = payload.get("guest_id")
 
         if auth_mode != "share":
-            raise ValueError("Invalid token payload")
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_TOKEN)
         if not _is_strict_int(user_id):
-            raise ValueError("Invalid token payload")
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_CLAIMS)
         if not isinstance(share_token, str) or not share_token:
-            raise ValueError("Invalid share token payload")
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_CLAIMS)
         # Fail closed on tokens minted before per-guest isolation (#973): they
         # carry no guest_id, so they cannot be scoped to a single guest and are
         # rejected rather than silently granted the old no-isolation behavior.
         # A whitespace-only id is treated as absent (it could never match a
         # server-minted token_urlsafe value and must not pass as a real guest).
         if not isinstance(guest_id, str) or not guest_id.strip():
-            raise ValueError("Invalid share token payload")
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_CLAIMS)
+
+        if _is_strict_int(share_workforce_id):
+            selected_agent_id = None
+            selected_workforce_id = share_workforce_id
+        elif _is_strict_int(share_agent_id):
+            selected_agent_id = share_agent_id
+            selected_workforce_id = None
+        else:
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_ENTITY)
+
+        dialect_name = str(db.get_bind().dialect.name)
+        user_id = _require_bindable_public_id(user_id, dialect_name)
+        if selected_workforce_id is not None:
+            selected_workforce_id = _require_bindable_public_id(
+                selected_workforce_id, dialect_name
+            )
+        else:
+            selected_agent_id = _require_bindable_public_id(
+                selected_agent_id, dialect_name
+            )
 
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
-            raise ValueError("User not found")
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_CLAIMS)
 
-        if _is_strict_int(share_workforce_id):
+        if selected_workforce_id is not None:
             workforce = ensure_share_workforce_available(
                 db,
-                share_workforce_id,
+                selected_workforce_id,
                 user_id,
                 expected_share_token=share_token,
             )
@@ -425,12 +528,11 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
                 workforce=workforce,
             )
 
-        if not _is_strict_int(share_agent_id):
-            raise ValueError("Invalid share token payload")
-
+        if selected_agent_id is None:
+            raise _PublicTokenRejected(_PublicTokenRejectionReason.INVALID_ENTITY)
         agent = ensure_share_agent_available(
             db,
-            share_agent_id,
+            selected_agent_id,
             user_id,
             expected_share_token=share_token,
         )
@@ -438,10 +540,12 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
             user=user, share_token=share_token, guest_id=guest_id, agent=agent
         )
     except Exception as exc:
-        logger.error("Share chat token validation error: %s", exc)
-        if isinstance(exc, HTTPException):
-            raise exc
-        raise HTTPException(status_code=401, detail="Invalid share token")
+        projected = _project_public_token_failure(
+            exc, invalid_detail="Invalid share token"
+        )
+        if projected is not None:
+            raise projected from None
+        raise
 
 
 security = HTTPBearer()
@@ -1343,8 +1447,8 @@ async def public_chat_websocket_endpoint(
     except HTTPException as exc:
         await websocket.close(code=4003, reason=_ws_close_reason(exc.detail))
         return
-    except Exception:
-        await websocket.close(code=4001, reason="Authentication required")
+    except Exception as exc:
+        await send_websocket_authentication_infrastructure_failure(websocket, exc)
         return
 
     # Already accepted above; register the live socket without re-accepting.
@@ -1365,6 +1469,11 @@ async def public_chat_websocket_endpoint(
                 )
             except HTTPException as exc:
                 await websocket.close(code=4003, reason=_ws_close_reason(exc.detail))
+                return
+            except Exception as exc:
+                await send_websocket_authentication_infrastructure_failure(
+                    websocket, exc
+                )
                 return
 
             message_data["user_id"] = current_principal.id
@@ -1445,8 +1554,8 @@ async def share_chat_websocket_endpoint(
     except HTTPException as exc:
         await websocket.close(code=4003, reason=_ws_close_reason(exc.detail))
         return
-    except Exception:
-        await websocket.close(code=4001, reason="Authentication required")
+    except Exception as exc:
+        await send_websocket_authentication_infrastructure_failure(websocket, exc)
         return
 
     # Already accepted above; register the live socket without re-accepting.
@@ -1466,6 +1575,11 @@ async def share_chat_websocket_endpoint(
                 )
             except HTTPException as exc:
                 await websocket.close(code=4003, reason=_ws_close_reason(exc.detail))
+                return
+            except Exception as exc:
+                await send_websocket_authentication_infrastructure_failure(
+                    websocket, exc
+                )
                 return
 
             message_data["user_id"] = current_principal.id

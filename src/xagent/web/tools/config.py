@@ -25,6 +25,7 @@ from typing import (
     Mapping,
     Optional,
     TypeVar,
+    cast,
 )
 
 import httpx
@@ -1113,10 +1114,6 @@ def _load_tool_runtime_policy_snapshot(
 class WebToolConfig(BaseToolConfig):
     """Web-specific tool configuration that loads from database."""
 
-    @staticmethod
-    def _coerce_user_id(value: Any) -> Optional[int]:
-        return value if isinstance(value, int) else None
-
     def __init__(
         self,
         db: Any,
@@ -1166,21 +1163,16 @@ class WebToolConfig(BaseToolConfig):
         self._db_factory = db_factory
         self._lazy_db = None
         self.request = request
-        self._user_id = (
-            user_id if user_id is not None else self._get_user_id_from_request(request)
-        )
-        # Tri-state: an explicit ``is_admin`` (including ``False``) is
-        # authoritative and is NOT OR-ed with the request's admin flag. This
-        # is the privilege-isolation boundary: when the runtime builds a tool
-        # config for a task owner (passing ``is_admin=bool(owner.is_admin)``),
-        # an admin *actor* on the request must not silently widen the config
-        # to admin scope. Only when ``is_admin`` is unset do we fall back to
-        # the request.
-        self._is_admin_value = (
-            bool(is_admin)
-            if is_admin is not None
-            else self._get_is_admin_from_request(request)
-        )
+        self._user_id = user_id
+        # No identity can carry administrative privilege. For identified
+        # configs, an explicit value remains authoritative; only an unset value
+        # may fall back to the authenticated request user.
+        if self._user_id is None:
+            self._is_admin_value = False
+        elif is_admin is not None:
+            self._is_admin_value = bool(is_admin)
+        else:
+            self._is_admin_value = self._get_is_admin_from_request(request)
         # Initialize workspace_config with base_dir and task_id if provided
         if workspace_config is None:
             workspace_config = {}
@@ -1294,38 +1286,6 @@ class WebToolConfig(BaseToolConfig):
                 unique_dirs.append(dir_path)
                 seen.add(dir_path)
         return ",".join(unique_dirs)
-
-    def _get_user_id_from_request(self, request: Any) -> int:
-        """Extract user ID from request using JWT authentication."""
-        try:
-            from ..auth_dependencies import get_user_from_websocket_token
-
-            # Check if this is a FastAPI request with proper authentication
-            if hasattr(request, "headers") and hasattr(request, "query_params"):
-                # Try to extract user from Authorization header
-                auth_header = request.headers.get("authorization")
-                if auth_header:
-                    user = get_user_from_websocket_token(auth_header, self.db)
-                    if user is not None:
-                        user_id = self._coerce_user_id(getattr(user, "id", None))
-                        if user_id is not None:
-                            return user_id
-
-            # If request has a user attribute directly, use it
-            if hasattr(request, "user") and request.user:
-                user_id = self._coerce_user_id(getattr(request.user, "id", None))
-                if user_id is not None:
-                    return user_id
-
-            # If no authentication, this should raise an exception
-            raise ValueError("Authentication required")
-
-        except Exception as e:
-            logger = logging.getLogger(__name__)
-            logger.error(f"Failed to get user ID from request: {e}")
-            # Fallback to default user ID for backward compatibility
-            # In production, this should raise an exception instead
-            return 1
 
     def _get_is_admin_from_request(self, request: Any) -> bool:
         """Extract is_admin flag from the request user, defaulting to False.
@@ -1470,6 +1430,9 @@ class WebToolConfig(BaseToolConfig):
 
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database."""
+        if self._user_id is None:
+            return []
+
         if not self._include_mcp_tools:
             return []
 
@@ -1484,6 +1447,12 @@ class WebToolConfig(BaseToolConfig):
         configs = await self._load_mcp_server_configs()
         self._store_mcp_config_cache_if_cacheable(configs)
         return configs
+
+    def _serialize_mcp_user_id(self) -> str:
+        """Return the explicit identity used to isolate an MCP config."""
+        if self._user_id is None:
+            raise RuntimeError("MCP configs require a user identity")
+        return str(self._user_id)
 
     def _mcp_config_cache_is_valid(self) -> bool:
         # MCP config caching is aware of hook-supplied token expiry only. The
@@ -2131,7 +2100,7 @@ class WebToolConfig(BaseToolConfig):
             policy_snapshot = await run_db_io_cancellation_safe(
                 lambda: _load_tool_runtime_policy_snapshot(
                     session_factory,
-                    int(self._user_id),
+                    int(cast(int, self._user_id)),
                 )
             )
 
@@ -2850,13 +2819,14 @@ class WebToolConfig(BaseToolConfig):
         normalized_failure_code = normalize_tool_failure_code(failure_code)
         if normalized_failure_code is not None:
             inner_config["failure_code"] = normalized_failure_code
+        serialized_user_id = self._serialize_mcp_user_id()
         return {
             "name": getattr(server, "name", ""),
             "transport": "unavailable",
             "description": getattr(server, "description", None),
             "config": inner_config,
-            "user_id": str(self._user_id),
-            "allow_users": [str(self._user_id)],
+            "user_id": serialized_user_id,
+            "allow_users": [serialized_user_id],
         }
 
     def _build_oauth_mcp_stdio_transport_config(
@@ -3227,7 +3197,7 @@ class WebToolConfig(BaseToolConfig):
                     registration_generation=registration_generation,
                     resolved=remote_hook_token,
                     providers=remote_providers_to_resolve,
-                    user_id=int(self._user_id),
+                    user_id=int(cast(int, self._user_id)),
                     scope=self.get_execution_scope(),
                     resource=remote_configured_resource,
                     non_auth_connection=self._non_auth_mcp_connection(
@@ -3331,8 +3301,9 @@ class WebToolConfig(BaseToolConfig):
         config["config"] = transport_config
 
         # Add user context for MCP tool isolation
-        config["user_id"] = str(self._user_id)
-        config["allow_users"] = [str(self._user_id)]  # Only allow current user
+        serialized_user_id = self._serialize_mcp_user_id()
+        config["user_id"] = serialized_user_id
+        config["allow_users"] = [serialized_user_id]  # Only allow current user
 
         logger.debug(f"Loaded MCP server config: {server.name} ({server.transport})")
         return config
