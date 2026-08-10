@@ -43,8 +43,11 @@ class _FakeAgentService:
         pass
 
 
-def _make_task(db_session, *, agent_config: dict) -> Task:
-    user = User(username="share-quota-user", password_hash="h", is_admin=False)
+def _make_task(
+    db_session, *, agent_config: dict, username: str = "share-quota-user"
+) -> Task:
+    # ``username`` is unique, so a test creating two tasks must vary it.
+    user = User(username=username, password_hash="h", is_admin=False)
     db_session.add(user)
     db_session.commit()
     task = Task(
@@ -112,6 +115,102 @@ async def test_share_run_quota_skips_non_share_task(
     )
 
     assert result.get("error_code") != "share_run_quota_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_share_run_quota_blocks_workforce_share_task(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Share mirror of ``test_widget_run_quota_blocks_workforce_widget_task``:
+    the workforce share marker keys the quota too.
+
+    Built in the shape ``_create_workforce_share_chat_task`` now persists
+    (#1132) -- ``share_agent_id`` present and ``None`` beside the real
+    ``share_workforce_id`` -- so the chokepoint is exercised against what the
+    handler actually writes, not a hand-trimmed config.
+    """
+    monkeypatch.setenv("XAGENT_SHARE_RUN_QUOTA", "0/day")
+    reset_share_rate_limiter()
+
+    task = _make_task(
+        db_session,
+        agent_config={
+            "auth_mode": "share",
+            "guest_id": "wf-guest",
+            "share_workforce_id": 77,
+            "share_agent_id": None,
+        },
+    )
+
+    result = await AgentServiceManager().execute_task(
+        agent_service=_FakeAgentService(),
+        task="hello",
+        tracking_task_id=str(task.id),
+        db_session=db_session,
+        manage_task_lease=False,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "share_run_quota_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_share_run_quota_prefers_workforce_when_both_markers_are_set(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``entity_rate_limit_key`` prefers workforce when both markers are set.
+
+    Every stamping site in ``public_chat_access.py`` leans on this to argue a
+    stray agent id is inert on a workforce task and a stray workforce id would
+    hijack an agent task's bucket, but nothing pinned it on the share channel.
+
+    Discriminating setup: one slot, spent by a workforce-keyed run, then a
+    second run carrying *both* markers under a different guest (so only the
+    entity key varies -- the per-guest bucket defaults to 60/hour and cannot
+    be what refuses it). Keyed on workforce it is refused; keyed on the agent
+    it would find a fresh bucket and pass.
+    """
+    monkeypatch.setenv("XAGENT_SHARE_RUN_QUOTA", "1/day")
+    reset_share_rate_limiter()
+
+    first = _make_task(
+        db_session,
+        agent_config={
+            "auth_mode": "share",
+            "guest_id": "guest-first",
+            "share_workforce_id": 77,
+            "share_agent_id": None,
+        },
+    )
+    first_result = await AgentServiceManager().execute_task(
+        agent_service=_FakeAgentService(),
+        task="hello",
+        tracking_task_id=str(first.id),
+        db_session=db_session,
+        manage_task_lease=False,
+    )
+    assert first_result.get("error_code") != "share_run_quota_exceeded"
+
+    both = _make_task(
+        db_session,
+        username="share-quota-user-2",
+        agent_config={
+            "auth_mode": "share",
+            "guest_id": "guest-second",
+            "share_workforce_id": 77,
+            "share_agent_id": 4242,
+        },
+    )
+    both_result = await AgentServiceManager().execute_task(
+        agent_service=_FakeAgentService(),
+        task="hello",
+        tracking_task_id=str(both.id),
+        db_session=db_session,
+        manage_task_lease=False,
+    )
+
+    assert both_result["success"] is False
+    assert both_result["error_code"] == "share_run_quota_exceeded"
 
 
 @pytest.mark.asyncio

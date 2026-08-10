@@ -1047,6 +1047,15 @@ async def _create_workforce_share_chat_task(
         extra_agent_config={
             "auth_mode": "share",
             "share_workforce_id": int(workforce.id),
+            # Null the agent marker for symmetry with the agent path (#1132),
+            # mirroring the widget workforce branch: entity_rate_limit_key
+            # prefers workforce, so a stray agent id would be ignored anyway,
+            # but stamping both keeps the run-quota key unambiguous. Safe
+            # because the snapshot-built config never sets either marker --
+            # not because merge order is irrelevant: _merge_agent_config
+            # returns {**extra_agent_config, **task_config}, so the built
+            # config wins every collision and this dict loses.
+            "share_agent_id": None,
             # Per-guest isolation (#973). extra_agent_config is overlaid under
             # the snapshot-built config, which never sets guest_id, so this is
             # preserved; the run-critical workforce_run_id is added by the
@@ -1101,8 +1110,28 @@ async def create_share_chat_task(
     # on the validated access context (#973).
     agent_config = sanitize_client_agent_config(request.agent_config)
     agent_config["auth_mode"] = "share"
-    agent_config["share_agent_id"] = share_agent_id
     agent_config["guest_id"] = access_context.guest_id
+    # Stamp BOTH entity markers from the validated access context, writing the
+    # inapplicable one as None — the share-path counterpart of the widget
+    # stamping above (#1132). The share run quota keys off these at the
+    # execute_task chokepoint (chat.py) and entity_rate_limit_key prefers
+    # workforce, so a client-injected share_workforce_id must never survive to
+    # redirect an agent-share task's bucket onto a workforce. The sanitizer
+    # already strips both, but stamping explicitly keeps this correct
+    # independent of the sanitizer's reserved-key set.
+    #
+    # The workforce marker is a literal None because the dispatch above forces
+    # it: this branch runs only after the early return into
+    # _create_workforce_share_chat_task, so access_context.workforce is None
+    # here and a context read would yield the same value today. Preserving that
+    # guard is what keeps the literal honest. If it were ever removed, a
+    # context read would not be the safe fallback it looks like: this branch
+    # builds an *agent* task (agent_id=share_agent_id below), and
+    # entity_rate_limit_key prefers workforce whenever both markers are set, so
+    # a non-None workforce id here would charge an agent-share run to a
+    # workforce bucket — the misattribution this stamping exists to prevent.
+    agent_config["share_agent_id"] = share_agent_id
+    agent_config["share_workforce_id"] = None
 
     task_title = request.title or task_description or "Untitled Task"
     if task_title and len(task_title) > 50:

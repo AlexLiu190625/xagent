@@ -163,8 +163,10 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # (3) the widget/share workforce paths pass them as ``extra_agent_config=``
 # server literals, which ``_merge_agent_config`` places *under* the built
 # config, and the snapshot never sets these keys, so no client can win a
-# collision. The widget agent-create path additionally stamps both entity
-# markers explicitly (one as ``None``) as belt-and-suspenders.
+# collision. All four public task-create paths -- widget and share, agent and
+# workforce -- additionally stamp both of their channel's entity markers
+# explicitly (the inapplicable one as ``None``) as belt-and-suspenders, so
+# those boundaries stay correct even if this set changes (#1132).
 CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
