@@ -25,17 +25,23 @@ function exactLineCount(lines: string[], value: string) {
 
 function extractFrontendBuildJob(source: string) {
   source = source.replace(/\r\n/g, "\n")
-  const startMarker = "  frontend-build:\n"
-  const endMarker = "\n  ci-summary:\n"
+  const jobHeader = /^  (?:([A-Za-z_][A-Za-z0-9_-]*)|'([A-Za-z_][A-Za-z0-9_-]*)'|"([A-Za-z_][A-Za-z0-9_-]*)"):[ \t]*(?:#.*)?$/gm
+  const jobHeaders = Array.from(source.matchAll(jobHeader), (match) => ({
+    id: match[1] ?? match[2] ?? match[3] ?? "",
+    index: match.index!,
+  }))
+  const frontendHeaders = jobHeaders.filter(
+    ({ id }) => id === "frontend-build",
+  )
 
-  expect(source.split(startMarker)).toHaveLength(2)
-  expect(source.split(endMarker)).toHaveLength(2)
+  expect(frontendHeaders).toHaveLength(1)
 
-  const startIndex = source.indexOf(startMarker)
-  const endIndex = source.indexOf(endMarker)
-  expect(endIndex).toBeGreaterThan(startIndex)
+  const frontendHeader = frontendHeaders[0]!
+  const frontendHeaderIndex = jobHeaders.indexOf(frontendHeader)
+  const nextHeader = jobHeaders[frontendHeaderIndex + 1]
+  expect(nextHeader).toBeDefined()
 
-  return source.slice(startIndex, endIndex)
+  return source.slice(frontendHeader.index, nextHeader!.index)
 }
 
 describe("frontend CI test manifest", () => {
@@ -45,6 +51,57 @@ describe("frontend CI test manifest", () => {
 
     expect(extractFrontendBuildJob(crlfWorkflowSource)).toBe(
       extractFrontendBuildJob(workflowSource),
+    )
+  })
+
+  it.each([
+    [
+      "a renamed successor",
+      (source: string) =>
+        source.replace("\n  ci-summary:\n", "\n  post-frontend:\n"),
+    ],
+    [
+      "an inserted unquoted successor",
+      (source: string) =>
+        source.replace(
+          "\n  ci-summary:\n",
+          "\n  manifest-sibling:\n    continue-on-error: true\n\n  ci-summary:\n",
+        ),
+    ],
+    [
+      "an inserted single-quoted successor",
+      (source: string) =>
+        source.replace(
+          "\n  ci-summary:\n",
+          "\n  'manifest-sibling':\n    runs-on: ubuntu-latest\n\n  ci-summary:\n",
+        ),
+    ],
+    [
+      "an inserted double-quoted successor",
+      (source: string) =>
+        source.replace(
+          "\n  ci-summary:\n",
+          "\n  \"manifest-sibling\":\n    runs-on: ubuntu-latest\n\n  ci-summary:\n",
+        ),
+    ],
+  ])("keeps the frontend-build slice for %s", (_, updateSource) => {
+    const workflowSource = readFileSync(workflowPath, "utf8")
+    const frontendBuildJob = extractFrontendBuildJob(workflowSource)
+
+    expect(extractFrontendBuildJob(updateSource(workflowSource))).toBe(
+      frontendBuildJob,
+    )
+  })
+
+  it("keeps the frontend-build slice when e2e becomes its successor", () => {
+    const workflowSource = readFileSync(workflowPath, "utf8")
+    const frontendBuildJob = extractFrontendBuildJob(workflowSource)
+    const reorderedWorkflowSource = workflowSource
+      .replace(frontendBuildJob, "")
+      .replace("  e2e:\n", `${frontendBuildJob}  e2e:\n`)
+
+    expect(extractFrontendBuildJob(reorderedWorkflowSource)).toBe(
+      frontendBuildJob,
     )
   })
 
