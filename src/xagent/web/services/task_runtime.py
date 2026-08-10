@@ -263,17 +263,10 @@ def _get_task_runtime_hook_executor() -> ThreadPoolExecutor:
         return _task_runtime_hook_executor
 
 
-def register_task_extension(
+def _validate_task_extension_provider(
     name: str,
     provider: TaskRuntimeExtensionProvider,
-) -> None:
-    """Register one process-wide task runtime provider.
-
-    Registration is deliberately not idempotent: re-registering a name raises
-    so a second provider cannot silently shadow the first. Replacing a live
-    provider is an ``unregister_task_extension`` followed by a fresh register.
-    """
-
+) -> str:
     normalized = _normalize_extension_name(name)
     missing = [
         method
@@ -285,8 +278,41 @@ def register_task_extension(
             "Task runtime extension provider is missing callable method(s): "
             + ", ".join(missing)
         )
+    return normalized
+
+
+def register_task_extension(
+    name: str,
+    provider: TaskRuntimeExtensionProvider,
+) -> None:
+    """Register one process-wide task runtime provider.
+
+    Registration is deliberately not idempotent: re-registering a name raises
+    so a second provider cannot silently shadow the first. Replacing a live
+    provider is an ``unregister_task_extension`` followed by a fresh register.
+    """
+
+    normalized = _validate_task_extension_provider(name, provider)
     with _task_runtime_extensions_lock:
         if normalized in _task_runtime_extensions:
+            raise ValueError(
+                f"Task runtime extension '{normalized}' is already registered"
+            )
+        _task_runtime_extensions[normalized] = provider
+
+
+def _register_task_extension_idempotently(
+    name: str,
+    provider: TaskRuntimeExtensionProvider,
+) -> None:
+    """Register ``provider`` once while rejecting a different owner."""
+
+    normalized = _validate_task_extension_provider(name, provider)
+    with _task_runtime_extensions_lock:
+        existing = _task_runtime_extensions.get(normalized)
+        if existing is provider:
+            return
+        if existing is not None:
             raise ValueError(
                 f"Task runtime extension '{normalized}' is already registered"
             )
