@@ -107,10 +107,11 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # the re-layer never fires here. So reserving ``is_preview`` or
 # ``preview_agent_id`` would still silently strip them from this config with
 # nothing to restore them, breaking agent-builder preview. That it cannot be
-# reserved is not a statement that it is safe: three of its readers resolve it
-# through an ownership-scoped query, but the SSH tools' ``_agent_id_from_task``
-# reads it with no such check and uses it to pick which targets a task may
-# reach, so the answer for that key has to be reader-side (issue #1136).
+# reserved is not a statement that it is safe: every authorization-sensitive
+# reader must treat it as an untrusted persisted candidate and route it through
+# ``agent_team_scope.resolve_authorized_agent`` using the task owner. The SSH
+# reader also rejects archived agents before it constructs an execution
+# identity, so malformed or out-of-scope values cannot select SSH targets.
 #
 # Before adding a key here: (1) confirm no server writer reaches this column
 # *through* the sanitizer (the preview path above is the only known case);
