@@ -25,11 +25,27 @@ function exactLineCount(lines: string[], value: string) {
 
 function extractFrontendBuildJob(source: string) {
   source = source.replace(/\r\n/g, "\n")
-  const jobHeader = /^  (?:([A-Za-z_][A-Za-z0-9_-]*)|'([A-Za-z_][A-Za-z0-9_-]*)'|"([A-Za-z_][A-Za-z0-9_-]*)"):[ \t]*(?:#.*)?$/gm
-  const jobHeaders = Array.from(source.matchAll(jobHeader), (match) => ({
-    id: match[1] ?? match[2] ?? match[3] ?? "",
+  const yamlHeader =
+    /^( *)(?:([A-Za-z_][A-Za-z0-9_-]*)|'([A-Za-z_][A-Za-z0-9_-]*)'|"([A-Za-z_][A-Za-z0-9_-]*)"):/gm
+  const headers = Array.from(source.matchAll(yamlHeader), (match) => ({
+    indent: match[1]!.length,
+    id: match[2] ?? match[3] ?? match[4] ?? "",
     index: match.index!,
   }))
+  const topLevelHeaders = headers.filter(({ indent }) => indent === 0)
+  const jobsHeaders = topLevelHeaders.filter(({ id }) => id === "jobs")
+  expect(jobsHeaders).toHaveLength(1)
+
+  const jobsHeader = jobsHeaders[0]!
+  const nextTopLevelHeader = topLevelHeaders.find(
+    ({ index }) => index > jobsHeader.index,
+  )
+  const jobsEnd = nextTopLevelHeader?.index ?? source.length
+
+  const jobHeaders = headers.filter(
+    ({ indent, index }) =>
+      indent === 2 && index > jobsHeader.index && index < jobsEnd,
+  )
   const frontendHeaders = jobHeaders.filter(
     ({ id }) => id === "frontend-build",
   )
@@ -39,9 +55,9 @@ function extractFrontendBuildJob(source: string) {
   const frontendHeader = frontendHeaders[0]!
   const frontendHeaderIndex = jobHeaders.indexOf(frontendHeader)
   const nextHeader = jobHeaders[frontendHeaderIndex + 1]
-  expect(nextHeader).toBeDefined()
+  const endIndex = nextHeader?.index ?? jobsEnd
 
-  return source.slice(frontendHeader.index, nextHeader!.index)
+  return source.slice(frontendHeader.index, endIndex)
 }
 
 describe("frontend CI test manifest", () => {
@@ -103,6 +119,86 @@ describe("frontend CI test manifest", () => {
     expect(extractFrontendBuildJob(reorderedWorkflowSource)).toBe(
       frontendBuildJob,
     )
+  })
+
+  it("keeps the frontend-build slice when it is the final job at workflow EOF", () => {
+    const workflowSource = readFileSync(workflowPath, "utf8")
+    const frontendBuildJob = extractFrontendBuildJob(workflowSource)
+    const workflowWithoutFrontend = workflowSource.replace(frontendBuildJob, "")
+    const frontendAtEof = `${workflowWithoutFrontend.trimEnd()}\n\n${frontendBuildJob}`
+
+    expect(extractFrontendBuildJob(frontendAtEof)).toBe(frontendBuildJob)
+  })
+
+  it("stops the final frontend-build job before a later top-level workflow key", () => {
+    const workflowSource = readFileSync(workflowPath, "utf8")
+    const frontendBuildJob = extractFrontendBuildJob(workflowSource)
+    const workflowWithoutFrontend = workflowSource.replace(frontendBuildJob, "")
+    const frontendBeforePermissions = `${workflowWithoutFrontend.trimEnd()}\n\n${frontendBuildJob}`
+    const workflowWithPermissions = `${frontendBeforePermissions}permissions:\n  contents: read\n`
+
+    const extractedFrontendBuildJob = extractFrontendBuildJob(workflowWithPermissions)
+
+    expect(extractedFrontendBuildJob).toBe(frontendBuildJob)
+    expect(extractedFrontendBuildJob).not.toContain("permissions:")
+    expect(extractedFrontendBuildJob).not.toContain("contents: read")
+  })
+
+  it.each([
+    [
+      "an anchored successor",
+      (source: string) =>
+        source.replace(
+          "\n  ci-summary:\n",
+          "\n  manifest-anchor: &manifest_base\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo manifest anchor\n\n  manifest-alias: *manifest_base\n\n  ci-summary:\n",
+        ),
+    ],
+    [
+      "an aliased successor",
+      (source: string) =>
+        source
+          .replace(
+            "  prepare-deepdoc-cache:\n",
+            "  prepare-deepdoc-cache: &manifest_base\n",
+          )
+          .replace(
+            "\n  ci-summary:\n",
+            "\n  manifest-alias: *manifest_base\n\n  ci-summary:\n",
+          ),
+    ],
+  ])("stops before %s sibling job", (_, updateSource) => {
+    const workflowSource = readFileSync(workflowPath, "utf8")
+    const frontendBuildJob = extractFrontendBuildJob(workflowSource)
+    const transformedWorkflowSource = updateSource(workflowSource)
+
+    expect(transformedWorkflowSource).not.toBe(workflowSource)
+    expect(transformedWorkflowSource).toContain("&manifest_base")
+    expect(transformedWorkflowSource).toContain("*manifest_base")
+    expect(extractFrontendBuildJob(transformedWorkflowSource)).toBe(
+      frontendBuildJob,
+    )
+  })
+
+  it("rejects duplicate semantic workflow and frontend-build ownership across quoting forms", () => {
+    const workflowSource = readFileSync(workflowPath, "utf8")
+    const workflowWithDuplicateJobs = `${workflowSource.trimEnd()}\n'jobs':\n  fallback:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo duplicate jobs\n`
+    const workflowWithDuplicateFrontendBuild = workflowSource.replace(
+      "\n  ci-summary:\n",
+      "\n  'frontend-build':\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo duplicate frontend build\n\n  ci-summary:\n",
+    )
+
+    expect(() => extractFrontendBuildJob(workflowWithDuplicateJobs)).toThrow()
+    expect(() => extractFrontendBuildJob(workflowWithDuplicateFrontendBuild)).toThrow()
+  })
+
+  it.each([
+    ["an empty source", ""],
+    [
+      "a jobs mapping without frontend-build",
+      "name: Manifest fixture\njobs:\n  fallback:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo fallback\n",
+    ],
+  ])("rejects %s workflow ownership", (_, source) => {
+    expect(() => extractFrontendBuildJob(source)).toThrow()
   })
 
   it("keeps App Router discovery and required frontend CI lanes source-locked", () => {
