@@ -782,9 +782,17 @@ class MCPToolAdapter(AbstractBaseTool):
             "Retrying MCP tool %s after delegated authorization failure",
             self.mcp_tool.name,
         )
-        refreshed = refresh()
-        if inspect.isawaitable(refreshed):
-            refreshed = await refreshed
+        try:
+            refreshed = refresh()
+            if inspect.isawaitable(refreshed):
+                refreshed = await refreshed
+        except (BaseExceptionGroup, Exception) as refresh_exc:
+            logger.error(
+                "MCP tool %s delegated authorization refresh failed with %s",
+                self.mcp_tool.name,
+                type(refresh_exc).__name__,
+            )
+            return _delegated_authorization_failed_result()
         if not isinstance(refreshed, dict):
             return _delegated_authorization_failed_result()
         try:

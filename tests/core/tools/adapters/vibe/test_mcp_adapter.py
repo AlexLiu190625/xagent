@@ -1450,6 +1450,102 @@ async def test_delegated_authorization_401_refreshes_connection_once(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_delegated_authorization_401_refresh_classifies_team_hook_failure():
+    """The delegated (non-resolver) refresh branch calls the real per-tool-call
+    refresh callback -- ``_refresh_delegated_mcp_connection_from_snapshot``,
+    the function ``WebToolConfig`` binds into a connection's
+    ``_connector_runtime_refresh`` slot -- against a real, DB-backed team
+    hook that raises. Before this branch had its own try/except (mirroring
+    the sibling resolver-refresh branch at ``_retry_resolver_401``), the
+    raised exception propagated out of ``_retry_after_authorization_failure``
+    uncaught instead of surfacing as the same classified failure result the
+    resolver branch already returns.
+    """
+    from functools import partial
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from xagent.web.models import Base, MCPServer, Task, User
+    from xagent.web.services import connector_team_scope
+    from xagent.web.tools.config import _refresh_delegated_mcp_connection_from_snapshot
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine)
+
+    with session_factory() as seed_db:
+        owner = User(username="mcp-refresh-owner", password_hash="hash")
+        seed_db.add(owner)
+        seed_db.flush()
+        server = MCPServer(
+            name="team-refresh-probe",
+            managed="external",
+            transport="streamable_http",
+            url="https://mcp.example.test",
+        )
+        seed_db.add(server)
+        seed_db.flush()
+        task = Task(
+            user_id=owner.id,
+            title="mcp refresh probe task",
+            # Non-empty so ``load_connector_runtime_view`` proceeds past its
+            # early-return and reaches the team hook.
+            connector_runtime_selected_refs=[
+                {"connector_type": "mcp", "connector_id": int(server.id)}
+            ],
+        )
+        seed_db.add(task)
+        seed_db.commit()
+        owner_id = int(owner.id)
+        server_id = int(server.id)
+        task_id = int(task.id)
+
+    def _raising_team_hook(db, *, team_id):
+        raise RuntimeError("Bearer planted-refresh-secret-must-not-leak")
+
+    connector_team_scope.set_connector_team_hooks(team_visibility=_raising_team_hook)
+    try:
+        refresh = partial(
+            _refresh_delegated_mcp_connection_from_snapshot,
+            session_factory=session_factory,
+            task_id=task_id,
+            turn_id=None,
+            user_id=owner_id,
+            server_id=server_id,
+            connection_snapshot={},
+            runtime_bindings=[],
+            allow_delegated_authorization=True,
+            agent_team_id=101,
+        )
+        connection = {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "headers": {"Authorization": "Bearer expired-token"},
+            mcp_adapter_module._RUNTIME_CONNECTION_REFRESH_KEY: refresh,
+        }
+        adapter = MCPToolAdapter(
+            mcp_tool=_mcp_tool("list_clients"), connection=connection
+        )
+
+        result = await adapter._retry_after_authorization_failure(
+            _http_status_error(), {}, {}
+        )
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+    assert result is not None
+    assert result["is_error"] is True
+    assert "delegated authorization failed" in result["content"][0]["text"]
+    # The raw hook message never reaches the caller -- only the classified,
+    # public-safe failure text does.
+    assert "planted-refresh-secret-must-not-leak" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
 async def test_delegated_authorization_401_with_non_mapping_connection_does_not_crash(
     monkeypatch,
 ):

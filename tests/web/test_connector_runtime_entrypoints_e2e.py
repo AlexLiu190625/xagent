@@ -493,6 +493,57 @@ def test_web_chat_create_filters_runtime_declared_connectors_and_ignores_payload
     assert _context_row_count(int(task.id)) == 0
 
 
+def test_web_chat_create_surfaces_typed_503_without_leaking_hook_message(
+    e2e_db: None,
+) -> None:
+    """A team hook that raises while resolving the new task's connector
+    selection snapshot must surface here as a typed 503, with the hook's
+    raw message absent from the response body. Without the endpoint-side
+    ``ConnectorRuntimeError`` mapping, ``create_task``'s blanket
+    ``except Exception`` handler would return HTTP 500 with ``str(exc)`` as
+    the response ``detail`` -- which for the already-wrapped error is the
+    typed safe message, not the raw hook text, but with the wrong status.
+    """
+    from xagent.web.services import connector_team_scope
+
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        agent = _create_agent(
+            db, user, name="Raising Hook Web Chat Agent", tool_categories=["mcp"]
+        )
+        agent.team_id = 101
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+
+    def _raising_hook(db: Session, *, team_id: int) -> dict[str, set[int]]:
+        raise RuntimeError(
+            "Bearer planted-hook-secret-must-not-leak: password authentication "
+            "failed for 'svc'"
+        )
+
+    connector_team_scope.set_connector_team_hooks(team_visibility=_raising_hook)
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            headers=headers,
+            json={
+                "title": "raising hook web chat",
+                "description": "create task",
+                "agent_id": agent_id,
+            },
+        )
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+    assert response.status_code == 503, response.text
+    assert "planted-hook-secret-must-not-leak" not in response.text
+
+
 def test_web_chat_preview_placeholder_snapshot_is_empty_and_payload_is_ignored(
     e2e_db: None,
 ) -> None:

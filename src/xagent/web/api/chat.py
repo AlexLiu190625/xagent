@@ -45,6 +45,7 @@ from ...core.tools.adapters.vibe.config import (
     MCPFailurePolicy,
     RequiredMCPUnavailableError,
 )
+from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
 from ...sandbox import SandboxMountIntent
 from ..auth_dependencies import get_current_user
@@ -591,6 +592,7 @@ async def create_default_tools(
     mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
     mcp_load_summary_tracer: Optional[Any] = None,
     mcp_load_summary_trace_task_id: Optional[str] = None,
+    connector_team_id: Optional[int] = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -599,6 +601,11 @@ async def create_default_tools(
     can skip creators (and their internal DB / network I/O) for tool
     categories / MCP servers the agent does not need. ``None`` preserves
     the original "build everything" behavior for backward compat.
+
+    ``connector_team_id`` is the *governing agent's* owning team, never the
+    calling user's own team membership. It threads into ``WebToolConfig`` so
+    the connector-visibility team-scope hook (when installed) resolves that
+    team's connectors instead of the run owner's personal set only.
     """
     if not user:
         raise ValueError("User is required for tool creation")
@@ -663,6 +670,7 @@ async def create_default_tools(
         mcp_failure_policy=mcp_failure_policy,
         mcp_load_summary_tracer=mcp_load_summary_tracer,
         mcp_load_summary_trace_task_id=mcp_load_summary_trace_task_id,
+        connector_team_id=connector_team_id,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -1908,12 +1916,33 @@ class AgentServiceManager:
         if task_setup_snapshot is not None:
             workforce_runtime = task_setup_snapshot.workforce_runtime
             excluded_agent_id = task_setup_snapshot.excluded_agent_id
+            connector_team_id = (
+                task_setup_snapshot.agent.team_id
+                if task_setup_snapshot.agent is not None
+                else None
+            )
         else:
             if db is None:
                 raise ValueError("Database session or task snapshot is required")
             workforce_runtime = resolve_workforce_task_runtime(db, task)
             excluded_agent_id = None
             current_agent = _load_agent_for_task_runtime(db, task, workforce_runtime)
+            # Hardening, not a pinned invariant: this branch is not reachable
+            # from production today (the only caller always supplies a
+            # snapshot). Capture the team id before the exclusion branches
+            # below can reassign ``current_agent`` to an unpublished preview
+            # agent, so a future snapshot-less path cannot silently key the
+            # tool set on the preview agent's team instead of the governing
+            # agent's.
+            # Explicit int(...)/None-check here, unlike the two snapshot-branch
+            # sites above and below: current_agent is a live ORM row (its
+            # team_id is a Column), not the frozen AgentRuntimeFields snapshot
+            # those two already read as a typed Optional[int].
+            connector_team_id = (
+                int(current_agent.team_id)
+                if current_agent is not None and current_agent.team_id is not None
+                else None
+            )
             if current_agent and _is_published_agent(current_agent):
                 excluded_agent_id = int(current_agent.id)
                 logger.info(
@@ -2000,6 +2029,7 @@ class AgentServiceManager:
             mcp_failure_policy=_mcp_failure_policy_for_task_source(task.source),
             mcp_load_summary_tracer=parent_tracer,
             mcp_load_summary_trace_task_id=str(task_id),
+            connector_team_id=connector_team_id,
         )
 
     async def get_agent_for_task(
@@ -2637,6 +2667,11 @@ class AgentServiceManager:
                     ),
                     mcp_load_summary_tracer=tracer,
                     mcp_load_summary_trace_task_id=str(task_id),
+                    connector_team_id=(
+                        snapshot.agent.team_id
+                        if snapshot is not None and snapshot.agent is not None
+                        else None
+                    ),
                 )
 
                 with UserContext(runtime_user_id):
@@ -4075,6 +4110,10 @@ async def create_task(
 
     except HTTPException:
         raise
+    except ConnectorRuntimeError as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
     except Exception as e:
         logger.error(f"Create task failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

@@ -466,6 +466,73 @@ def test_trigger_test_run_mcp_setup_failure_marks_run_failed() -> None:
     assert private_detail not in str(final_state)
 
 
+def test_trigger_run_preparation_wraps_raising_team_hook_without_leaking_message() -> (
+    None
+):
+    """``_attach_task_to_trigger_run`` -> ``prepare_create_connector_runtime`` ->
+    ``_load_visible_runtime_connectors`` invokes the team-visibility hook, and
+    ``prepare_trigger_run``'s ``except Exception`` handler stores whatever
+    exception reaches it verbatim (``error_message = f"{type(exc).__name__}:
+    {exc}"``). The typed wrap at the hook call is what keeps a raising hook's
+    raw message out of that stored text: the hook's ``RuntimeError`` becomes a
+    ``ConnectorRuntimeError`` first, so the stored message is the typed,
+    public-safe one.
+    """
+    from xagent.web.models.trigger import AgentTrigger
+    from xagent.web.services import connector_team_scope
+    from xagent.web.services.triggers import (
+        TriggerRunPreparationError,
+        prepare_trigger_run,
+    )
+
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Raising team hook webhook"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.team_id = 101
+        db.commit()
+
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+
+        def _raising_hook(_db, *, team_id: int) -> dict[str, set[int]]:
+            raise RuntimeError(
+                "Bearer planted-hook-secret-must-not-leak: password authentication "
+                "failed for 'svc'"
+            )
+
+        connector_team_scope.set_connector_team_hooks(team_visibility=_raising_hook)
+        try:
+            with pytest.raises(TriggerRunPreparationError) as excinfo:
+                prepare_trigger_run(
+                    db,
+                    trigger=trigger,
+                    event_payload={"subject": "hello"},
+                    source_event_id="evt-raising-hook-1",
+                )
+        finally:
+            connector_team_scope.set_connector_team_hooks()
+
+        assert "planted-hook-secret-must-not-leak" not in str(excinfo.value)
+
+        run = db.query(TriggerRun).one()
+        assert str(run.status) == TriggerRunStatus.FAILED.value
+        assert run.task_id is None
+        assert run.error_message is not None
+        assert "planted-hook-secret-must-not-leak" not in run.error_message
+        assert "Connector team scope is unavailable." in run.error_message
+    finally:
+        db.close()
+
+
 def _signed_webhook_headers(
     secret: str, raw_body: bytes, *, event_id: str | None = None
 ) -> dict[str, str]:

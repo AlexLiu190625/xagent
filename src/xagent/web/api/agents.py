@@ -1657,6 +1657,11 @@ async def preview_agent(
             include_mcp_tools=should_load_mcp_server_configs(tool_selection_spec),
             task_id=preview_task_id,
             workspace_base_dir=str(get_uploads_dir() / "preview"),
+            # A preview request carries tool_categories, not an agent id, so
+            # there is no governing agent to key team connector visibility
+            # on. The live agent (once promoted) can still diverge from
+            # this preview for a team connector -- a known, accepted gap.
+            connector_team_id=None,
         )
 
         # Determine execution mode (default to "think")
