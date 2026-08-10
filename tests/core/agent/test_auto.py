@@ -1073,6 +1073,32 @@ async def test_auto_decision_prompt_exposes_execution_tool_names() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_decision_prompt_includes_grounding_rule() -> None:
+    llm = FakeLLM([decision_tool_response("react", "Needs an execution tool.")])
+    child = CapturingChildPattern()
+    pattern = AutoPattern(react_pattern=child)  # type: ignore[arg-type]
+    context = ExecutionContext()
+    context.add_user_message("Build a KPI report")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeSearchTool()],
+        llm=llm,
+        runtime=PatternRuntime(),
+    )
+
+    assert result["success"] is True
+    decision_prompt = llm.calls[0]["messages"][-1]["content"]
+    assert "quantitative data" in decision_prompt
+    assert "illustrative placeholders" in decision_prompt
+    assert "invented values" in decision_prompt
+    # Routes through the classification field so _normalize_decision's
+    # deterministic fallback catches it, not just the model's routing choice.
+    assert "set existing_context_sufficient=false and choose react" in decision_prompt
+    assert "use an appropriate tool" not in decision_prompt
+
+
+@pytest.mark.asyncio
 async def test_auto_pattern_interrupt_before_decision_skips_llm_call() -> None:
     llm = FakeLLM(
         [decision_tool_response("final_answer", "Should not be called.", answer="hi")]

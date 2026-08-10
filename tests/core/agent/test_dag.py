@@ -376,6 +376,19 @@ def build_plan(*steps: PlanStep) -> ExecutionPlan:
     return ExecutionPlan(steps=list(steps))
 
 
+def test_dag_completion_assessment_prompt_includes_grounding_rule() -> None:
+    pattern = DAGPattern(lambda **_: build_plan(PlanStep(id="answer", task="Answer")))
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Build a KPI report")
+
+    messages = pattern._completion_assessment_messages(context)
+
+    system_prompt = messages[0]["content"]
+    assert "quantitative data" in system_prompt
+    assert "illustrative placeholders" in system_prompt
+    assert "use an appropriate tool" not in system_prompt
+
+
 def test_dag_waiting_response_preserves_active_step_state() -> None:
     completed_step = PlanStep(id="collect", task="Collect inputs")
     completed_step.status = "completed"

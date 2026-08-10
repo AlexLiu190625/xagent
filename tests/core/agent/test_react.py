@@ -956,6 +956,7 @@ async def test_react_pattern_runs_tool_call_then_final_answer() -> None:
     assert "use this date when forming search queries" in system_prompt
     assert "not supported by the conversation" in system_prompt
     assert "available context is insufficient" in system_prompt
+    assert "quantitative data" in system_prompt
     assert "Do not write assistant text in the same response as a work tool call" in (
         system_prompt
     )
@@ -1123,6 +1124,13 @@ async def test_react_recovers_unavailable_forced_final_with_full_tool_set() -> N
         "Re-decide this turn using the complete current tool set"
         in llm.stream_calls[2]["messages"][0]["content"]
     )
+    # stream_calls[1] is the forced final-answer turn. Assert the no-tools
+    # grounding variant specifically: both branches carry the rule, so only the
+    # can_call_tools=False wording proves run() reached the forced branch.
+    forced_final_prompt = llm.stream_calls[1]["messages"][0]["content"]
+    assert "quantitative data" in forced_final_prompt
+    assert "invented values" in forced_final_prompt
+    assert "use an appropriate tool" not in forced_final_prompt
     recovery_starts = [
         event
         for event in tracer.events
@@ -1322,6 +1330,25 @@ def test_react_accepts_null_tool_calls_in_forced_final_response() -> None:
         {"content": "Done.", "tool_calls": None},
         force_final_answer=True,
     )
+
+
+def test_react_grounding_rule_present_in_both_answer_paths() -> None:
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Build a KPI report")
+
+    tool_prompt = pattern._messages_for_llm(
+        context, has_tools=True, tool_names=["calculator"]
+    )[0]["content"]
+    forced_prompt = pattern._messages_for_llm(
+        context, has_tools=True, force_final_answer=True, tool_names=["final_answer"]
+    )[0]["content"]
+
+    for prompt in (tool_prompt, forced_prompt):
+        assert "quantitative data" in prompt
+        assert "illustrative placeholders" in prompt
+    assert "use an appropriate tool to verify" in tool_prompt
+    assert "use an appropriate tool" not in forced_prompt
 
 
 @pytest.mark.asyncio
