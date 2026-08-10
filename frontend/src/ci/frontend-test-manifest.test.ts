@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
 import { describe, expect, it, vi } from "vitest"
 import vitestConfig from "../../vitest.config"
 
@@ -13,28 +15,45 @@ const pagesCommand =
 const appPagesCommand = "vitest run --config vitest.config.ts src/app"
 const homeBuildContractsCommand =
   "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts"
+const moduleDir = path.dirname(fileURLToPath(import.meta.url))
+const packageJsonPath = path.resolve(moduleDir, "../../package.json")
+const workflowPath = path.resolve(moduleDir, "../../../.github/workflows/ci.yml")
 
 function exactLineCount(lines: string[], value: string) {
   return lines.filter((line) => line === value).length
 }
 
+function extractFrontendBuildJob(source: string) {
+  source = source.replace(/\r\n/g, "\n")
+  const startMarker = "  frontend-build:\n"
+  const endMarker = "\n  ci-summary:\n"
+
+  expect(source.split(startMarker)).toHaveLength(2)
+  expect(source.split(endMarker)).toHaveLength(2)
+
+  const startIndex = source.indexOf(startMarker)
+  const endIndex = source.indexOf(endMarker)
+  expect(endIndex).toBeGreaterThan(startIndex)
+
+  return source.slice(startIndex, endIndex)
+}
+
 describe("frontend CI test manifest", () => {
+  it("extracts the same frontend-build job from LF and CRLF workflow text", () => {
+    const workflowSource = readFileSync(workflowPath, "utf8")
+    const crlfWorkflowSource = workflowSource.replace(/\r?\n/g, "\r\n")
+
+    expect(extractFrontendBuildJob(crlfWorkflowSource)).toBe(
+      extractFrontendBuildJob(workflowSource),
+    )
+  })
+
   it("keeps App Router discovery and required frontend CI lanes source-locked", () => {
-    const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
       scripts: Record<string, string>
     }
-    const workflowSource = readFileSync("../.github/workflows/ci.yml", "utf8")
-    const startMarker = "  frontend-build:\n"
-    const endMarker = "\n  ci-summary:\n"
-
-    expect(workflowSource.split(startMarker)).toHaveLength(2)
-    expect(workflowSource.split(endMarker)).toHaveLength(2)
-
-    const startIndex = workflowSource.indexOf(startMarker)
-    const endIndex = workflowSource.indexOf(endMarker)
-    expect(endIndex).toBeGreaterThan(startIndex)
-
-    const frontendBuildJob = workflowSource.slice(startIndex, endIndex)
+    const workflowSource = readFileSync(workflowPath, "utf8")
+    const frontendBuildJob = extractFrontendBuildJob(workflowSource)
     const frontendBuildLines = frontendBuildJob.split("\n").map((line) => line.trim())
 
     expect(packageJson.scripts["test:ci-manifest"]).toBe(manifestCommand)
