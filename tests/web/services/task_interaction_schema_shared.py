@@ -42,7 +42,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from itertools import count
+from typing import Any
 
+import sqlalchemy as sa
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -450,3 +452,173 @@ EXPECTED_NONUNIQUE_INDEXES: dict[str, tuple[str, ...]] = {
     "ix_task_interaction_requests_task_status": ("status", "task_id"),
     "ix_task_interaction_requests_resume_trace_event_id": ("resume_trace_event_id",),
 }
+
+
+# ---------------------------------------------------------------------------
+# create_all/migration parity: full name-and-expression inventory, used by
+# tests/migrations/test_task_interaction_requests_schema_parity.py. Placed
+# here rather than in a new module because the parity suite's expectations
+# are the same constraint inventory the EXPECTED_* literals above already
+# pin -- a second module would create a second place that fact lives.
+# ---------------------------------------------------------------------------
+
+TABLE_NAME = "task_interaction_requests"
+
+
+def _normalize_default(value: str | None) -> str | None:
+    """Normalize a reflected ``server_default`` for same-backend comparison.
+
+    Measured against a live engine of each dialect: SQLAlchemy's column
+    reflection already hands back the backend's rendered DEFAULT clause as
+    a plain string, never a wrapped expression object -- SQLite reflects
+    ``server_default=func.now()`` as the literal string
+    ``"CURRENT_TIMESTAMP"``, PostgreSQL as ``"now()"``. Both are stable,
+    backend-native renderings of the *same* ``func.now()`` on both sides of
+    a same-backend comparison (create_all vs. migration-built), so no
+    cross-dialect translation belongs here -- doing that would let a
+    same-backend default drift (e.g. the migration silently dropping
+    ``server_default`` while the model keeps it, since a defaultless column
+    reflects as ``None`` on every backend) go uncompared. The ``.strip()``
+    is defensive only, against incidental whitespace the two construction
+    paths might introduce while still emitting the same clause.
+    """
+    return value if value is None else value.strip()
+
+
+def reflect_full_inventory(engine: sa.engine.Engine) -> dict[str, Any]:
+    """Name-and-expression inventory of task_interaction_requests.
+
+    Both sides of a parity comparison must be reflected from the same
+    backend: PostgreSQL rewrites CHECK expressions on the way in
+    (`status::text = ANY (ARRAY[...])`) while SQLite stores them
+    verbatim, so the two backends' sqltext values are not comparable to
+    each other or to the model's literal. Comparing two schemas built on
+    the *same* backend keeps the rewrite on both sides, which is what
+    makes the difference attributable to the migration.
+
+    Index column order is preserved as reflected, not sorted: a
+    multi-column index's column order changes which queries it can serve,
+    so ``ix_task_interaction_requests_task_status`` declared as
+    ``(task_id, status)`` and one declared as ``(status, task_id)`` are
+    different objects a parity check must tell apart. UNIQUE constraints
+    are the deliberate exception -- uniqueness is enforced over the column
+    set regardless of declaration order, so ``unique`` below still sorts
+    column names; that sort is intentional, not an oversight, and must stay
+    paired with the comment on ``EXPECTED_UNIQUE_CONSTRAINTS`` above making
+    the same claim for the hand-written literal.
+
+    Column *position* is pinned too: ``columns`` below maps each name to
+    ``(position, type, nullable, default)``, not just the last three, with
+    position taken from enumerate() over get_columns()'s already-ordered
+    return. That order is the table's physical column order -- PostgreSQL's
+    ``attnum``, SQLite's ``cid`` -- so two schemas that declare the same
+    columns with the same types in a different order compare unequal here,
+    where a name-keyed dict without a position field would consider them
+    identical.
+    """
+    inspector = sa.inspect(engine)
+
+    checks: dict[str, str] = {
+        c["name"]: c["sqltext"] for c in inspector.get_check_constraints(TABLE_NAME)
+    }
+    # Sorted deliberately: UNIQUE constraint semantics do not depend on
+    # declaration order (see this function's docstring). Do not carry this
+    # sort over to the indexes below, where order is meaningful.
+    unique: dict[str, tuple[str, ...]] = {
+        c["name"]: tuple(sorted(c["column_names"]))
+        for c in inspector.get_unique_constraints(TABLE_NAME)
+    }
+    foreign_keys: dict[str, tuple[str, tuple[str, ...], str | None]] = {
+        f["name"]: (
+            f["referred_table"],
+            tuple(f["constrained_columns"]),
+            (f.get("options") or {}).get("ondelete"),
+        )
+        for f in inspector.get_foreign_keys(TABLE_NAME)
+    }
+    # constrained_columns' order does matter for a composite primary key,
+    # but this table's is single-column; kept as a tuple (not scalar) so a
+    # future composite PK would still be compared positionally. The name is
+    # backend-normalized already at the source: PostgreSQL always assigns
+    # "<table>_pkey" regardless of which construction path declared the
+    # constraint (measured: a column-level primary_key=True and an explicit
+    # PrimaryKeyConstraint("id") both reflect as "task_interaction_requests_pkey"
+    # on PostgreSQL), and SQLite reflects no name at all on either path
+    # (always None) -- so no extra normalization is needed here beyond
+    # reading the two fields reflection already gives back consistently.
+    pk_info = inspector.get_pk_constraint(TABLE_NAME)
+    primary_key: dict[str, tuple[tuple[str, ...], str | None]] = {
+        "pk": (
+            tuple(pk_info.get("constrained_columns") or ()),
+            pk_info.get("name"),
+        )
+    }
+    # PostgreSQL's get_indexes() also reports the backing index for each
+    # UNIQUE constraint (unique=True); SQLite's does not (see
+    # EXPECTED_NONUNIQUE_INDEXES above). Grouping by the unique flag first
+    # keeps a name collision on the unique-backed side from being misread
+    # as a problem with the plain indexes. Column order is preserved, not
+    # sorted -- see this function's docstring.
+    indexes: dict[str, dict[str, tuple[str, ...]]] = {"unique": {}, "nonunique": {}}
+    for idx in inspector.get_indexes(TABLE_NAME):
+        bucket = "unique" if idx["unique"] else "nonunique"
+        indexes[bucket][idx["name"]] = tuple(idx["column_names"])
+    columns: dict[str, tuple[int, str, bool, str | None]] = {
+        c["name"]: (
+            position,
+            str(c["type"]),
+            bool(c["nullable"]),
+            _normalize_default(c.get("default")),
+        )
+        for position, c in enumerate(inspector.get_columns(TABLE_NAME))
+    }
+
+    return {
+        "checks": checks,
+        "unique": unique,
+        "foreign_keys": foreign_keys,
+        "primary_key": primary_key,
+        "indexes": indexes,
+        "columns": columns,
+    }
+
+
+def _diff_map(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any] | None:
+    missing = sorted(set(left) - set(right))
+    extra = sorted(set(right) - set(left))
+    changed = {
+        name: (left[name], right[name])
+        for name in set(left) & set(right)
+        if left[name] != right[name]
+    }
+    if not missing and not extra and not changed:
+        return None
+    return {"missing": missing, "extra": extra, "changed": changed}
+
+
+def diff_full_inventory(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    """Dimension-by-dimension difference between two reflect_full_inventory()
+    results. Returns only the dimensions that actually differ, so two
+    identical inventories produce an empty dict -- callers assert
+    ``not diff_full_inventory(a, b)``.
+
+    Compares names *and* values (CHECK sqltext, FK target/ondelete, PK
+    columns/name, column type/nullable/server_default, index columns) in
+    the same pass: a name-only comparison would accept a constraint whose
+    predicate was silently weakened while keeping its name, which is
+    exactly the case test_expression_dimension_is_actually_compared exists
+    to guard against.
+    """
+    report: dict[str, Any] = {}
+    for dim in ("checks", "unique", "foreign_keys", "primary_key", "columns"):
+        diff = _diff_map(left[dim], right[dim])
+        if diff is not None:
+            report[dim] = diff
+    index_report: dict[str, Any] = {}
+    for bucket in ("unique", "nonunique"):
+        diff = _diff_map(left["indexes"][bucket], right["indexes"][bucket])
+        if diff is not None:
+            index_report[bucket] = diff
+    if index_report:
+        report["indexes"] = index_report
+    return report
