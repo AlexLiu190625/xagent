@@ -2544,32 +2544,6 @@ class AgentServiceManager:
                         "will exclude from agent tools"
                     )
 
-                # This inline preview_agent_id branch is only for the
-                # live-session path where ``snapshot is None``. The snapshot
-                # loader resolves the same inline config before this point.
-                if (
-                    excluded_agent_id is None
-                    and snapshot is None
-                    and agent_config
-                    and agent_config.get("preview_agent_id")
-                ):
-                    if task is None:
-                        raise ValueError(
-                            f"Task {task_id} missing while resolving preview agent"
-                        )
-                    preview_user_id = int(task.user_id)
-                    assert db is not None
-                    current_agent = resolve_authorized_agent(
-                        db,
-                        preview_user_id,
-                        agent_config.get("preview_agent_id"),
-                    )
-                    if current_agent and current_agent.status == AgentStatus.PUBLISHED:
-                        excluded_agent_id = int(current_agent.id)
-                        logger.info(
-                            f"Preview task {task_id} is for published agent {current_agent.id} ({current_agent.name}), will exclude from agent tools"
-                        )
-
                 workforce_runtime = (
                     snapshot.workforce_runtime
                     if snapshot is not None

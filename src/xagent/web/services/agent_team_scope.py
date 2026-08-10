@@ -34,8 +34,8 @@ _team_agent_connector_validator = None
 _team_agent_knowledge_base_validator = None
 
 _MAX_POSTGRES_INTEGER = 2**31 - 1
-_MAX_POSTGRES_INTEGER_DECIMAL = str(_MAX_POSTGRES_INTEGER)
-_CANONICAL_AGENT_ID = re.compile(r"[1-9][0-9]*", re.ASCII)
+_MAX_POSTGRES_INTEGER_DECIMAL_DIGITS = len(str(_MAX_POSTGRES_INTEGER))
+_CANONICAL_AGENT_ID = re.compile(r"[1-9][0-9]*")
 
 
 def set_agent_team_hooks(
@@ -144,16 +144,18 @@ def resolve_authorized_agent(
     Persisted task config is untrusted at every read boundary. Reject malformed
     values before constructing the SQL predicate, then reuse the same owner/team
     clause as all normal Agent reads.
+
+    Lifecycle status is caller-owned; each use case must apply its required status policy after resolution.
     """
     if isinstance(candidate_id, bool):
         return None
     if isinstance(candidate_id, int):
         agent_id = candidate_id
-    elif isinstance(candidate_id, str) and _CANONICAL_AGENT_ID.fullmatch(candidate_id):
-        if len(candidate_id) > len(_MAX_POSTGRES_INTEGER_DECIMAL) or (
-            len(candidate_id) == len(_MAX_POSTGRES_INTEGER_DECIMAL)
-            and candidate_id > _MAX_POSTGRES_INTEGER_DECIMAL
-        ):
+    elif isinstance(candidate_id, str):
+        # Bound untrusted text before regex scanning or integer conversion.
+        if len(candidate_id) > _MAX_POSTGRES_INTEGER_DECIMAL_DIGITS:
+            return None
+        if not _CANONICAL_AGENT_ID.fullmatch(candidate_id):
             return None
         agent_id = int(candidate_id)
     else:

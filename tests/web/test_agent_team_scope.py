@@ -115,7 +115,6 @@ class _RecordingSession:
         "\N{ARABIC-INDIC DIGIT ONE}",
         2**31,
         str(2**31),
-        "1" * 5000,
     ],
 )
 def test_resolve_authorized_agent_rejects_noncanonical_or_out_of_range_ids_before_query(
@@ -125,6 +124,23 @@ def test_resolve_authorized_agent_rejects_noncanonical_or_out_of_range_ids_befor
 
     assert (
         ats.resolve_authorized_agent(session, owner_user_id=7, candidate_id=candidate)
+        is None
+    )
+    assert session.query_calls == []
+
+
+def test_resolve_authorized_agent_rejects_overlong_string_before_regex_or_query(
+    monkeypatch,
+):
+    class _RegexSentinel:
+        def fullmatch(self, _candidate):
+            raise AssertionError("regex must not scan overlong candidate ids")
+
+    session = _RecordingSession()
+    monkeypatch.setattr(ats, "_CANONICAL_AGENT_ID", _RegexSentinel())
+
+    assert (
+        ats.resolve_authorized_agent(session, owner_user_id=7, candidate_id="1" * 5000)
         is None
     )
     assert session.query_calls == []
