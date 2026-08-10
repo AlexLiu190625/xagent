@@ -12,6 +12,18 @@ TOOL_FAILURE_CODES = frozenset(
     }
 )
 
+# Pseudo-tools that drive the run rather than retrieve evidence. They flow
+# through ``add_tool_result`` like real tools, so anything reasoning about
+# retrieved evidence has to exclude them: "re-running" one of these ends the
+# run or re-contacts the user instead of re-fetching a value.
+CONTROL_TOOL_NAMES = frozenset(
+    {
+        "final_answer",
+        "send_message",
+        "ask_user_question",
+    }
+)
+
 # Placeholder outputs the execution layers substitute when a run produced no
 # text of its own. They are recognized, not produced, by the delegation
 # classifier: a child that returns one of these completed without answering.

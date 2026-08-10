@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -26,6 +27,7 @@ from xagent.core.agent.language import (
     response_language_rules,
 )
 from xagent.core.agent.utils.context_builder import ContextBuilder
+from xagent.core.context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
 from xagent.web.user_isolated_memory import current_user_id
 
 
@@ -757,8 +759,350 @@ def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> Non
     assert "Used read_file" in ctx.messages[0].content
     assert "current execution state" in ctx.messages[0].content
     assert "do not repeat completed tool calls" in ctx.messages[0].content
+    assert "lost in compaction" in ctx.messages[0].content
+    assert "re-read or re-query the source" in ctx.messages[0].content
+    assert "Only re-run tools that read" in ctx.messages[0].content
+    assert "- read_file" in ctx.messages[0].content
+    assert result.metadata["dropped_tool_result_count"] == 1
     assert ctx.messages[1].role == "user"
     assert ctx.messages[1].content == "current request"
+
+
+def test_compact_with_llm_reports_dropped_tool_results_by_name() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Build a KPI report")
+    for index in range(3):
+        call_id = f"call-search-{index}"
+        ctx.add_assistant_message(
+            "",
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "web_search"},
+                }
+            ],
+        )
+        ctx.add_tool_result("web_search", {"output": f"rows {index}"}, call_id)
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-read", "type": "function", "function": {"name": "read_file"}}
+        ],
+    )
+    ctx.add_tool_result("read_file", {"output": "revenue 1234"}, "call-read")
+
+    result = ctx.compact_with_llm_response({"content": "Collected KPI inputs."})
+
+    notice = ctx.messages[0].content
+    assert "3 tool calls were dropped" not in notice
+    assert "4 tool calls were dropped" in notice
+    assert "- web_search x3" in notice
+    assert "- read_file" in notice
+    assert "unavailable rather than recalled" in notice
+    assert result.metadata["dropped_tool_result_count"] == 4
+    assert result.metadata["dropped_tool_results_by_name"] == {
+        "web_search": 3,
+        "read_file": 1,
+    }
+
+
+def test_compact_with_llm_omits_tool_notice_without_tool_results() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Say hello")
+    ctx.add_assistant_message("Hello.")
+
+    ctx.compact_with_llm_response({"content": "Greeted the user."})
+
+    assert "were dropped by this compaction" not in ctx.messages[0].content
+
+
+def test_compact_with_llm_excludes_superseded_tool_results_from_notice() -> None:
+    """A superseded observation lost its raw result before compaction ran.
+
+    ``ComputerTool`` stamps a supersedes scope on every result, so counting
+    superseded messages would report a whole browser session as dropped
+    evidence when only the newest observation actually carried any.
+    """
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Browse the dashboard")
+    for index in range(3):
+        call_id = f"call-{index}"
+        ctx.add_assistant_message(
+            "",
+            tool_calls=[
+                {"id": call_id, "type": "function", "function": {"name": "computer"}}
+            ],
+        )
+        ctx.add_tool_result(
+            "computer",
+            {"output": f"view {index}", SUPERSEDES_SCOPE_KEY: "computer:task-1"},
+            call_id,
+        )
+
+    result = ctx.compact_with_llm_response({"content": "Inspected the dashboard."})
+
+    notice = ctx.messages[0].content
+    assert "1 tool call were dropped" not in notice
+    assert "Raw observations from 1 tool call was dropped" in notice
+    assert "- computer x" not in notice
+    assert result.metadata["dropped_tool_result_count"] == 1
+    assert result.metadata["dropped_tool_results_by_name"] == {"computer": 1}
+
+
+def test_compact_with_llm_excludes_failed_tool_results_from_notice() -> None:
+    """A failed call produced no value, so it is not lost evidence.
+
+    Counting it would also let the model read a failure as an
+    already-completed call and skip the retry.
+    """
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Fetch the KPI rows")
+    for call_id, result_payload in (
+        ("call-fail", {"success": False, "error": "timeout"}),
+        ("call-cancel", {"success": False, "status": "cancelled"}),
+        ("call-error", {"status": "error", "message": "bad request"}),
+        ("call-ok", {"output": "revenue 1234"}),
+    ):
+        ctx.add_assistant_message(
+            "",
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "web_search"},
+                }
+            ],
+        )
+        ctx.add_tool_result("web_search", result_payload, call_id)
+
+    result = ctx.compact_with_llm_response({"content": "Fetched rows."})
+
+    notice = ctx.messages[0].content
+    assert "Raw observations from 1 tool call was dropped" in notice
+    # The old wording called every dropped call "completed", which a model
+    # could read as "this failure already succeeded, skip the retry".
+    assert "completed tool call(s) were dropped" not in notice
+    assert result.metadata["dropped_tool_result_count"] == 1
+
+
+def test_compact_with_llm_excludes_control_tools_from_notice() -> None:
+    """Re-running a control pseudo-tool re-contacts the user or ends the run."""
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Summarize and tell me")
+    for call_id, tool_name in (
+        ("call-send", "send_message"),
+        ("call-ask", "ask_user_question"),
+        ("call-skill", "load_skill"),
+        ("call-final", "final_answer"),
+        ("call-search", "web_search"),
+    ):
+        ctx.add_assistant_message(
+            "",
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": tool_name},
+                }
+            ],
+        )
+        ctx.add_tool_result(tool_name, {"output": "ok"}, call_id)
+
+    result = ctx.compact_with_llm_response({"content": "Answered."})
+
+    notice = ctx.messages[0].content
+    assert "Raw observations from 1 tool call was dropped" in notice
+    assert "- web_search" in notice
+    for control_name in ("send_message", "ask_user_question", "load_skill"):
+        assert control_name not in notice
+    assert result.metadata["dropped_tool_result_count"] == 1
+
+
+def test_compact_with_llm_names_tool_result_without_tool_name() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Run it")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[{"id": "call-1", "type": "function", "function": {"name": ""}}],
+    )
+    ctx.add_tool_result("   ", {"output": "rows"}, "call-1")
+
+    result = ctx.compact_with_llm_response({"content": "Ran it."})
+
+    assert "- unnamed tool" in ctx.messages[0].content
+    assert result.metadata["dropped_tool_results_by_name"] == {"unnamed tool": 1}
+
+
+def test_compact_with_llm_caps_and_clamps_dropped_tool_names() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Run many tools")
+    long_name = "mcp_" + ("x" * 200)
+    tool_names = [long_name] + [f"tool_{index:02d}" for index in range(25)]
+    for index, tool_name in enumerate(tool_names):
+        call_id = f"call-{index}"
+        ctx.add_assistant_message(
+            "",
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": tool_name},
+                }
+            ],
+        )
+        ctx.add_tool_result(tool_name, {"output": f"rows {index}"}, call_id)
+
+    result = ctx.compact_with_llm_response({"content": "Ran many tools."})
+
+    notice = ctx.messages[0].content
+    assert "additional distinct tool names omitted" in notice
+    assert long_name not in notice
+    assert len(notice) < 4000
+    assert result.metadata["dropped_tool_result_count"] == len(tool_names)
+
+
+def test_compact_with_llm_orders_ref_notice_before_tool_notice() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Look at the screenshot")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "generate_image"}}
+        ],
+    )
+    ctx.add_tool_result(
+        "generate_image",
+        {
+            "success": True,
+            CONTEXT_REFS_KEY: [
+                {
+                    "type": "image",
+                    "file_ref": {
+                        "file_id": "file-1",
+                        "filename": "chart.png",
+                        "mime_type": "image/png",
+                    },
+                }
+            ],
+        },
+        "call-1",
+    )
+
+    ctx.compact_with_llm_response({"content": "Generated a chart."})
+
+    notice = ctx.messages[0].content
+    assert "will not be automatically rematerialized" in notice
+    assert "dropped by this compaction" in notice
+    assert notice.index("will not be automatically rematerialized") < notice.index(
+        "dropped by this compaction"
+    )
+
+
+def test_compact_with_llm_ignores_hidden_tool_results_in_notice() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Check the file twice")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}}
+        ],
+    )
+    stale = ctx.add_tool_result("read_file", {"output": "stale"}, "call-1")
+    ctx.messages[ctx.messages.index(stale)] = replace(stale, hidden=True)
+
+    result = ctx.compact_with_llm_response({"content": "Read the file."})
+
+    assert "were dropped by this compaction" not in ctx.messages[0].content
+    assert result.metadata["dropped_tool_result_count"] == 0
+
+
+def test_compact_truncate_counts_dropped_tool_results() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.compact_config.max_messages = 4
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "web_search"}}
+        ],
+    )
+    ctx.add_tool_result("web_search", {"output": "dropped rows"}, "call-1")
+    for index in range(6):
+        ctx.add_user_message(f"tail-{index}")
+
+    result = ctx.compact_if_needed()
+
+    assert result.strategy == "truncate"
+    assert result.metadata["dropped_tool_result_count"] == 1
+
+
+def test_compact_truncate_counts_tool_result_excised_from_window_interior() -> None:
+    """The retained window is not always a suffix of the message list.
+
+    An assistant message whose tool calls were not all answered is sanitized
+    out of the window together with its tool messages, so a tool result can be
+    dropped from the *interior* of the window. Counting by prefix slice would
+    report zero here; only an identity diff sees the loss.
+    """
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.compact_config.max_messages = 5
+    ctx.add_user_message("u0")
+    ctx.add_user_message("u1")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "a1", "type": "function", "function": {"name": "web_search"}},
+            {"id": "a2", "type": "function", "function": {"name": "web_search"}},
+        ],
+    )
+    ctx.add_tool_result("web_search", {"output": "revenue rows"}, "a1")
+    ctx.add_user_message("u2")
+    ctx.add_user_message("u3")
+
+    result = ctx.compact_if_needed()
+
+    assert [message.content for message in ctx.messages] == ["u1", "u2", "u3"]
+    # messages[start:] would have been [tool, u2, u3]; the incomplete tool-call
+    # block is excised from inside it, so the prefix messages[:start] does not
+    # contain the dropped observation.
+    assert result.metadata["dropped_tool_result_count"] == 1
+    assert result.metadata["dropped_tool_results_by_name"] == {"web_search": 1}
+
+
+def test_compact_truncate_adds_no_in_prompt_notice() -> None:
+    """truncate keeps an exact message count; a notice would break that."""
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.compact_config.max_messages = 2
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "web_search"}}
+        ],
+    )
+    ctx.add_tool_result("web_search", {"output": "dropped rows"}, "call-1")
+    ctx.add_user_message("tail-0")
+    ctx.add_user_message("tail-1")
+
+    result = ctx.compact_if_needed()
+
+    assert result.metadata["dropped_tool_result_count"] == 1
+    assert len(ctx.messages) == 2
+    assert all(
+        "were dropped by this compaction" not in str(message.content)
+        for message in ctx.messages
+    )
 
 
 def test_compact_with_llm_preserves_waiting_for_user_response() -> None:
