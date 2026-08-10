@@ -13,13 +13,20 @@ const manifestCommand =
   "vitest run --config vitest.config.ts src/ci/frontend-test-manifest.test.ts"
 const pagesCommand =
   "vitest run --config vitest.config.ts src/components/pages src/ci/frontend-test-manifest.test.ts"
+const kbComponentsCommand =
+  "vitest run --config vitest.config.ts src/components/kb"
 const appPagesCommand = "vitest run --config vitest.config.ts src/app"
 const homeBuildContractsCommand =
   "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts"
+const ciSummaryCondition =
+  "always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)"
+const frontendSummaryCheckCommand =
+  "check_job \"frontend-build\" \"${{ needs['frontend-build'].result }}\""
 const requiredFrontendSteps = [
   { command: "npm run test:widget:coverage", shell: undefined },
   { command: "npm run test:ci-manifest", shell: "bash" },
   { command: "npm run test:pages", shell: "bash" },
+  { command: "npm run test:kb-components", shell: undefined },
   { command: "npm run test:app-pages", shell: undefined },
   { command: "npm run test:home-build-contracts", shell: undefined },
 ] as const
@@ -54,6 +61,57 @@ function assertNoDefaultShell(value: Record<string, unknown>, owner: string) {
   }
 }
 
+function assertCiSummaryContract(jobs: Record<string, unknown>) {
+  const ciSummary = jobs["ci-summary"]
+  requireRecord(ciSummary, "jobs.ci-summary")
+
+  if (!Array.isArray(ciSummary.needs)) {
+    throw new Error("jobs.ci-summary.needs must be an array")
+  }
+  if (ciSummary.needs.filter((job) => job === "frontend-build").length !== 1) {
+    throw new Error("jobs.ci-summary.needs must contain frontend-build exactly once")
+  }
+  if (ciSummary["continue-on-error"] !== undefined) {
+    throw new Error("jobs.ci-summary must not set continue-on-error")
+  }
+  if (ciSummary.if !== ciSummaryCondition) {
+    throw new Error("jobs.ci-summary has an unexpected if policy")
+  }
+  if (!Array.isArray(ciSummary.steps)) {
+    throw new Error("jobs.ci-summary.steps must be an array")
+  }
+
+  const matchingSteps = ciSummary.steps.filter((step) => {
+    requireRecord(step, "jobs.ci-summary.steps entry")
+    return step.name === "Check required jobs"
+  })
+  if (matchingSteps.length !== 1) {
+    throw new Error("Check required jobs must appear in exactly one ci-summary step")
+  }
+
+  const checkStep = matchingSteps[0]!
+  if (checkStep.shell !== "bash") {
+    throw new Error("Check required jobs must use bash")
+  }
+  if (checkStep.if !== undefined) {
+    throw new Error("Check required jobs must not set if")
+  }
+  if (checkStep["continue-on-error"] !== undefined) {
+    throw new Error("Check required jobs must not set continue-on-error")
+  }
+  const run = checkStep.run
+  if (typeof run !== "string") {
+    throw new Error("Check required jobs run must be a string")
+  }
+
+  const frontendCheckLines = run
+    .split(/\r?\n/)
+    .filter((line) => line === frontendSummaryCheckCommand)
+  if (frontendCheckLines.length !== 1) {
+    throw new Error("Check required jobs must check frontend-build exactly once")
+  }
+}
+
 function assertSemanticWorkflowManifest(source: string) {
   const document = parseDocument(source, {
     version: "1.2",
@@ -71,6 +129,7 @@ function assertSemanticWorkflowManifest(source: string) {
   const workflow = document.toJS({ maxAliasCount: 100 })
   requireRecord(workflow, "workflow root")
   requireRecord(workflow.jobs, "jobs")
+  assertCiSummaryContract(workflow.jobs)
   const frontendBuild = workflow.jobs["frontend-build"]
   requireRecord(frontendBuild, "jobs.frontend-build")
   if (!Array.isArray(frontendBuild.steps)) {
@@ -293,6 +352,19 @@ describe("frontend CI test manifest", () => {
     expect(() => assertSemanticWorkflowManifest(duplicate)).toThrow()
   })
 
+  it("rejects missing and duplicate KB directory steps", () => {
+    const workflowSource = readWorkflowSource()
+    const kbStep =
+      "\n      - name: Run knowledge base component tests\n        working-directory: ./frontend\n        run: npm run test:kb-components\n"
+    const missing = workflowSource.replace(kbStep, "")
+    const duplicate = workflowSource.replace(kbStep, kbStep.repeat(2))
+
+    expect(missing).not.toContain("run: npm run test:kb-components")
+    expect(duplicate.match(/run: npm run test:kb-components/g)).toHaveLength(2)
+    expect(() => assertSemanticWorkflowManifest(missing)).toThrow()
+    expect(() => assertSemanticWorkflowManifest(duplicate)).toThrow()
+  })
+
   it("rejects a required step with the wrong working directory", () => {
     const source = readWorkflowSource().replace(
       "      - name: Run App Router tests\n        working-directory: ./frontend\n",
@@ -359,6 +431,147 @@ describe("frontend CI test manifest", () => {
     expect(() => assertSemanticWorkflowManifest(source)).toThrow()
   })
 
+  it.each([
+    [
+      "a missing ci-summary",
+      (source: string) => source.replace(/\n  ci-summary:\n[\s\S]*$/, "\n"),
+    ],
+    [
+      "a non-mapping ci-summary",
+      (source: string) => source.replace(/\n  ci-summary:\n[\s\S]*$/, "\n  ci-summary: []\n"),
+    ],
+    [
+      "non-array ci-summary needs",
+      (source: string) =>
+        source.replace(
+          "    needs:\n      - prepare-deepdoc-cache\n",
+          "    needs: prepare-deepdoc-cache\n",
+        ),
+    ],
+  ])("rejects %s", (_, transform) => {
+    const source = transform(readWorkflowSource())
+
+    expect(source).not.toBe(readWorkflowSource())
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
+  })
+
+  it("rejects removing frontend-build from ci-summary.needs", () => {
+    const source = readWorkflowSource().replace("      - frontend-build\n", "")
+
+    expect(source).not.toContain("      - frontend-build\n")
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
+  })
+
+  it("rejects duplicate frontend-build entries in ci-summary.needs", () => {
+    const source = readWorkflowSource().replace(
+      "      - frontend-build\n",
+      "      - frontend-build\n      - frontend-build\n",
+    )
+
+    expect(source.match(/^      - frontend-build$/gm)).toHaveLength(2)
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
+  })
+
+  it("rejects ci-summary job-level continue-on-error", () => {
+    const source = readWorkflowSource().replace(
+      "  ci-summary:\n",
+      "  ci-summary:\n    continue-on-error: true\n",
+    )
+
+    expect(source).toContain("  ci-summary:\n    continue-on-error: true\n")
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
+  })
+
+  it.each([
+    [
+      "missing always()",
+      "if: github.event_name != 'pull_request' || github.event.pull_request.draft == false",
+    ],
+    ["a different condition", "if: always()"],
+  ])("rejects ci-summary with %s", (_, replacement) => {
+    const source = readWorkflowSource().replace(
+      "if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)",
+      replacement,
+    )
+
+    expect(source).toContain(`    ${replacement}\n`)
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
+  })
+
+  it("rejects missing and duplicate Check required jobs owner steps", () => {
+    const workflowSource = readWorkflowSource()
+    const missing = workflowSource.replace(
+      "      - name: Check required jobs\n",
+      "      - name: Renamed required jobs\n",
+    )
+    const duplicate = workflowSource.replace(
+      "      - name: Check required jobs\n",
+      `      - name: Check required jobs\n        shell: bash\n        run: |\n          ${frontendSummaryCheckCommand}\n\n      - name: Check required jobs\n`,
+    )
+
+    expect(missing).not.toContain("      - name: Check required jobs\n")
+    expect(duplicate.match(/name: Check required jobs/g)).toHaveLength(2)
+    expect(() => assertSemanticWorkflowManifest(missing)).toThrow(
+      "Check required jobs must appear in exactly one ci-summary step",
+    )
+    expect(() => assertSemanticWorkflowManifest(duplicate)).toThrow(
+      "Check required jobs must appear in exactly one ci-summary step",
+    )
+  })
+
+  it.each([
+    ["a non-bash shell", "      - name: Check required jobs\n        shell: sh\n"],
+    [
+      "a step-level condition",
+      "      - name: Check required jobs\n        shell: bash\n        if: success()\n",
+    ],
+    [
+      "step-level continue-on-error",
+      "      - name: Check required jobs\n        shell: bash\n        continue-on-error: true\n",
+    ],
+  ])("rejects the summary check step with %s", (_, replacement) => {
+    const source = readWorkflowSource().replace(
+      "      - name: Check required jobs\n        shell: bash\n        run: |\n",
+      `${replacement}        run: |\n`,
+    )
+
+    expect(source).not.toBe(readWorkflowSource())
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
+  })
+
+  it("rejects a missing, duplicate, or non-full-line frontend summary check", () => {
+    const workflowSource = readWorkflowSource()
+    const checkLine =
+      "check_job \"frontend-build\" \"${{ needs['frontend-build'].result }}\""
+    const indentedCheckLine = `          ${checkLine}\n`
+    const missing = workflowSource.replace(indentedCheckLine, "")
+    const duplicate = workflowSource.replace(indentedCheckLine, indentedCheckLine.repeat(2))
+    const embedded = workflowSource.replace(indentedCheckLine, `          echo '${checkLine}'\n`)
+
+    expect(missing).not.toContain(indentedCheckLine)
+    expect(duplicate.match(/check_job "frontend-build"/g)).toHaveLength(2)
+    expect(embedded).toContain(`          echo '${checkLine}'\n`)
+    expect(() => assertSemanticWorkflowManifest(missing)).toThrow()
+    expect(() => assertSemanticWorkflowManifest(duplicate)).toThrow()
+    expect(() => assertSemanticWorkflowManifest(embedded)).toThrow()
+  })
+
+  it("does not accept a frontend summary check decoy outside the owned step", () => {
+    const workflowSource = readWorkflowSource()
+    const checkLine =
+      "check_job \"frontend-build\" \"${{ needs['frontend-build'].result }}\""
+    const source = workflowSource
+      .replace(`          ${checkLine}\n`, "")
+      .replace(
+        '          exit "$failed"\n',
+        `          exit "$failed"\n\n      - name: Preserve frontend summary text outside owner\n        shell: bash\n        run: |\n          ${checkLine}\n`,
+      )
+
+    expect(source).toContain("      - name: Preserve frontend summary text outside owner\n")
+    expect(source.match(/check_job "frontend-build"/g)).toHaveLength(1)
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
+  })
+
   it("keeps package launchers and Vitest discovery contracts source-locked", () => {
     const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
       scripts: Record<string, string>
@@ -366,6 +579,7 @@ describe("frontend CI test manifest", () => {
 
     expect(packageJson.scripts["test:ci-manifest"]).toBe(manifestCommand)
     expect(packageJson.scripts["test:pages"]).toBe(pagesCommand)
+    expect(packageJson.scripts["test:kb-components"]).toBe(kbComponentsCommand)
     expect(packageJson.scripts["test:app-pages"]).toBe(appPagesCommand)
     expect(packageJson.scripts["test:home-build-contracts"]).toBe(homeBuildContractsCommand)
     expect(packageJson.scripts["test:home-build-pages"]).toBeUndefined()
