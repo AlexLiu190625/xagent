@@ -110,6 +110,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     showProcessView,
     onOpenExecutionPlan,
     contextBadges,
+    taskRuntimeExtensionMetadata,
   }: {
     content?: string | null
     interactionsActive?: boolean
@@ -120,6 +121,10 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     showProcessView?: boolean
     onOpenExecutionPlan?: () => void
     contextBadges?: Array<{ kind: string; label: string; detail: string }>
+    taskRuntimeExtensionMetadata?: {
+      bindings: string[]
+      publicMetadata: Record<string, Record<string, unknown>>
+    }
   }) => (
     <div
       data-testid="chat-message"
@@ -130,6 +135,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
       data-show-empty-status={showEmptyStatus ? "true" : "false"}
       data-show-process-view={showProcessView ? "true" : "false"}
       data-context-badges={JSON.stringify(contextBadges || [])}
+      data-runtime-extension-metadata={JSON.stringify(taskRuntimeExtensionMetadata || {})}
     >
       {content}
       {onOpenExecutionPlan && traceEvents?.some((event) => {
@@ -278,6 +284,33 @@ describe("TaskConversationPanel", () => {
     )
   })
 
+  it("passes bindings and public metadata through the message extension slot", () => {
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Inspect my browser",
+      timestamp: "2026-08-07T07:00:00Z",
+    }]
+    appState.currentTask = {
+      id: "42",
+      runtimeExtensionBindings: ["browser_relay"],
+    }
+    appState.taskRuntimeExtensions = {
+      browser_relay: { kind: "browser_relay", connected: true },
+    }
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getByTestId("chat-message")).toHaveAttribute(
+      "data-runtime-extension-metadata",
+      JSON.stringify({
+        bindings: ["browser_relay"],
+        publicMetadata: {
+          browser_relay: { kind: "browser_relay", connected: true },
+        },
+      }),
+    )
+  })
+
   it("restores the Computer use badge from the task's persisted binding", () => {
     appState.messages = [{
       id: "user-1",
@@ -331,6 +364,10 @@ describe("TaskConversationPanel", () => {
     expect(screen.getByTestId("chat-message")).toHaveAttribute(
       "data-context-badges",
       JSON.stringify([]),
+    )
+    expect(screen.getByTestId("chat-message")).toHaveAttribute(
+      "data-runtime-extension-metadata",
+      JSON.stringify({ bindings: [], publicMetadata: {} }),
     )
   })
 

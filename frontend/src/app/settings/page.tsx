@@ -17,6 +17,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { Select } from "@/components/ui/select"
 import { inspectAuthSession, updateAuthSessionUser } from "@/lib/auth-cache"
+import { TaskRuntimeSettingsExtension } from "@/lib/task-runtime-ui-extension"
 
 export default function SettingsPage() {
   const { user, session } = useAuth()
@@ -83,6 +84,8 @@ export default function SettingsPage() {
       </div>
 
       <div className="space-y-6">
+        <TaskRuntimeSettingsExtension />
+
         {/* Language Section */}
         <Card>
           <CardHeader>

@@ -15,6 +15,10 @@ import { normalizeTimestampMs } from "@/lib/time-utils";
 import { FileChip } from "./FileChip";
 import { ClarificationForm } from "./clarification-form";
 import { isStoppedTraceProcessStatus, resolveTraceProcessStatus } from "@/lib/trace-process-status";
+import {
+  TaskRuntimeMessageMetadataExtension,
+  type TaskRuntimeMessageMetadataExtensionProps,
+} from "@/lib/task-runtime-ui-extension";
 
 const MARKDOWN_FILE_REF_RE = /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
 const BACKTICK_FILE_REF_RE = /`([^`]+)`/g;
@@ -88,6 +92,7 @@ export interface ChatMessageProps {
     label: string;
     detail: string;
   }>;
+  taskRuntimeExtensionMetadata?: TaskRuntimeMessageMetadataExtensionProps;
 }
 
 function GeneratingIndicator({ latestTitle, taskStatus }: { latestTitle?: string, taskStatus?: string }) {
@@ -309,6 +314,7 @@ export function ChatMessage({
   onAgentExecutionClick,
   onSendInteraction,
   contextBadges,
+  taskRuntimeExtensionMetadata,
 }: ChatMessageProps) {
   const { t, tDynamic } = useI18n();
   const { filesDisabled, openFilePreview } = useApp();
@@ -526,6 +532,11 @@ export function ChatMessage({
                     </div>
                   ))}
                 </div>
+              )}
+              {isUser && taskRuntimeExtensionMetadata && (
+                <TaskRuntimeMessageMetadataExtension
+                  {...taskRuntimeExtensionMetadata}
+                />
               )}
               {!isUser && interactions && interactions.length > 0 && (
                 <div className="mt-4 border-t pt-4">

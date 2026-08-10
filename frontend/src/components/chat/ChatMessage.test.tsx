@@ -38,6 +38,25 @@ vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
 }))
 
+vi.mock("@/lib/task-runtime-ui-extension", async () => {
+  const actual = await vi.importActual<
+    typeof import("@/lib/task-runtime-ui-extension")
+  >("@/lib/task-runtime-ui-extension")
+  const ReactModule = await vi.importActual<typeof import("react")>("react")
+  return {
+    ...actual,
+    TaskRuntimeMessageMetadataExtension: ({ bindings }: { bindings: string[] }) => (
+      bindings.includes("browser_relay")
+        ? ReactModule.createElement(
+          "div",
+          { role: "note", "aria-label": "Computer use · My browser" },
+          "My browser",
+        )
+        : null
+    ),
+  }
+})
+
 vi.mock("@/components/file/docx-preview-renderer", () => ({
   DocxPreviewRenderer: ({ base64Content }: { base64Content: string }) => (
     <div data-testid="docx-preview">{base64Content}</div>
@@ -144,6 +163,46 @@ describe("ChatMessage Session file capability", () => {
     expect(
       screen.getByRole("note", { name: "Computer use · Local browser" }),
     ).toBeInTheDocument()
+  })
+
+  it("renders distribution message metadata without replacing the message", () => {
+    render(
+      <ChatMessage
+        role="user"
+        content="Inspect my browser"
+        taskRuntimeExtensionMetadata={{
+          bindings: ["browser_relay"],
+          publicMetadata: {
+            browser_relay: { kind: "browser_relay", connected: true },
+          },
+        }}
+      />,
+    )
+
+    expect(screen.getByText("Inspect my browser")).toBeInTheDocument()
+    expect(
+      screen.getByRole("note", { name: "Computer use · My browser" }),
+    ).toBeInTheDocument()
+  })
+
+  it("does not render distribution message metadata on assistant messages", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content="I inspected your browser"
+        taskRuntimeExtensionMetadata={{
+          bindings: ["browser_relay"],
+          publicMetadata: {
+            browser_relay: { kind: "browser_relay", connected: true },
+          },
+        }}
+      />,
+    )
+
+    expect(screen.getByText("I inspected your browser")).toBeInTheDocument()
+    expect(
+      screen.queryByRole("note", { name: "Computer use · My browser" }),
+    ).not.toBeInTheDocument()
   })
 
   it("uses the same safe projection for normal assistant DOM and copied content", () => {

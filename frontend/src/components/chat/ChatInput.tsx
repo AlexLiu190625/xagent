@@ -17,6 +17,10 @@ import { toast } from "@/components/ui/sonner";
 import { useVoiceInputControls } from "@/components/voice-input-controller";
 import { LocalBrowserMenu, type LocalBrowserTarget } from "./LocalBrowserMenu";
 import {
+  hasTaskRuntimeComposerExtension,
+  type TaskRuntimeComposerSelection,
+} from "@/lib/task-runtime-ui-extension";
+import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -163,6 +167,8 @@ export function ChatInput({
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [localBrowserTarget, setLocalBrowserTarget] =
     useState<LocalBrowserTarget | null>(null);
+  const [taskRuntimeSelection, setTaskRuntimeSelection] =
+    useState<TaskRuntimeComposerSelection | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
@@ -582,10 +588,18 @@ export function ChatInput({
     !allowsLiveGuidanceInput &&
     !isStoppedTaskStatus(normalizedTaskStatus);
   const showLocalBrowser = Boolean(user?.is_admin) && !readOnlyConfig && !hideConfig;
+  const showTaskRuntimeExtension =
+    hasTaskRuntimeComposerExtension && !readOnlyConfig && !hideConfig;
   const activeLocalBrowserTarget = showLocalBrowser ? localBrowserTarget : null;
+  const activeTaskRuntimeSelection = showTaskRuntimeExtension
+    ? taskRuntimeSelection
+    : null;
   useEffect(() => {
     if (!showLocalBrowser) setLocalBrowserTarget(null);
   }, [showLocalBrowser]);
+  useEffect(() => {
+    if (!showTaskRuntimeExtension) setTaskRuntimeSelection(null);
+  }, [showTaskRuntimeExtension]);
   const voiceInputLabel =
     voiceInput.status === "recording"
       ? t("voiceInput.stop")
@@ -685,9 +699,12 @@ export function ChatInput({
       const trimmed = message.trim();
       const messageToSend = trimmed;
       const executionMode = taskConfig?.executionMode;
+      const extraRuntimeExtensions = activeLocalBrowserTarget
+        ? { local_browser: { ...activeLocalBrowserTarget } }
+        : activeTaskRuntimeSelection?.runtimeExtensions;
       const deliveryKey = JSON.stringify([
         messageToSend,
-        activeLocalBrowserTarget,
+        extraRuntimeExtensions || null,
         enabledFiles.map((file) => [
           file.name,
           file.size,
@@ -703,11 +720,11 @@ export function ChatInput({
       const configToSend = {
         ...agentConfig,
         clientMessageId,
-        ...(activeLocalBrowserTarget
+        ...(extraRuntimeExtensions
           ? {
               runtimeExtensions: {
                 ...(agentConfig.runtimeExtensions || {}),
-                local_browser: { ...activeLocalBrowserTarget },
+                ...extraRuntimeExtensions,
               },
             }
           : {}),
@@ -724,6 +741,7 @@ export function ChatInput({
       await onSend(messageToSend, configToSend);
       deliveryAttemptRef.current = null;
       setLocalBrowserTarget(null);
+      setTaskRuntimeSelection(null);
       fileMention.resetMention();
 
       if (isControlled) {
@@ -1120,7 +1138,9 @@ export function ChatInput({
                   </>
                 )}
                 {/* Add files or bind this new task to a local host window. */}
-                {(!hideFileUpload && !filesDisabled) || showLocalBrowser ? (
+                {(!hideFileUpload && !filesDisabled)
+                  || showLocalBrowser
+                  || showTaskRuntimeExtension ? (
                   <>
                     {!hideFileUpload && !filesDisabled && (
                       <input
@@ -1136,12 +1156,15 @@ export function ChatInput({
                       disabled={isInputBusy}
                       selectedTarget={localBrowserTarget}
                       onTargetChange={setLocalBrowserTarget}
+                      extensionSelection={taskRuntimeSelection}
+                      onExtensionSelectionChange={setTaskRuntimeSelection}
                       onAddFiles={
                         !hideFileUpload && !filesDisabled
                           ? () => fileInputRef.current?.click()
                           : undefined
                       }
                       showLocalBrowser={showLocalBrowser}
+                      showTaskRuntimeExtension={showTaskRuntimeExtension}
                     />
                   </>
                 ) : null}

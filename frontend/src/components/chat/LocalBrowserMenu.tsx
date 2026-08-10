@@ -14,6 +14,11 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useI18n } from "@/contexts/i18n-context";
 import { apiRequest } from "@/lib/api-wrapper";
+import {
+  TaskRuntimeComposerMenuExtension,
+  TaskRuntimeComposerSelectionExtension,
+  type TaskRuntimeComposerSelection,
+} from "@/lib/task-runtime-ui-extension";
 import { cn, getApiUrl } from "@/lib/utils";
 
 interface ReadinessIssue {
@@ -41,16 +46,24 @@ interface LocalBrowserMenuProps {
   disabled: boolean;
   selectedTarget: LocalBrowserTarget | null;
   onTargetChange: (target: LocalBrowserTarget | null) => void;
+  extensionSelection: TaskRuntimeComposerSelection | null;
+  onExtensionSelectionChange: (
+    selection: TaskRuntimeComposerSelection | null,
+  ) => void;
   onAddFiles?: () => void;
   showLocalBrowser: boolean;
+  showTaskRuntimeExtension: boolean;
 }
 
 export function LocalBrowserMenu({
   disabled,
   selectedTarget,
   onTargetChange,
+  extensionSelection,
+  onExtensionSelectionChange,
   onAddFiles,
   showLocalBrowser,
+  showTaskRuntimeExtension,
 }: LocalBrowserMenuProps) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
@@ -236,6 +249,7 @@ export function LocalBrowserMenu({
                           disabled={localBrowserDisabled}
                           onClick={() => {
                             onTargetChange(browserWindow);
+                            onExtensionSelectionChange(null);
                             setShowWindowPicker(false);
                             setOpen(false);
                           }}
@@ -272,6 +286,17 @@ export function LocalBrowserMenu({
               </PopoverContent>
             </Popover>
           )}
+          {showTaskRuntimeExtension && (
+            <TaskRuntimeComposerMenuExtension
+              disabled={disabled}
+              selection={extensionSelection}
+              onSelectionChange={(selection) => {
+                onExtensionSelectionChange(selection);
+                if (selection) onTargetChange(null);
+              }}
+              onRequestClose={() => setOpen(false)}
+            />
+          )}
         </PopoverContent>
       </Popover>
 
@@ -304,6 +329,16 @@ export function LocalBrowserMenu({
             <X className="h-3 w-3" />
           </button>
         </div>
+      )}
+      {showTaskRuntimeExtension && (
+        <TaskRuntimeComposerSelectionExtension
+          disabled={disabled}
+          selection={extensionSelection}
+          onSelectionChange={(selection) => {
+            onExtensionSelectionChange(selection);
+            if (selection) onTargetChange(null);
+          }}
+        />
       )}
     </div>
   );

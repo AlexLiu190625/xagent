@@ -17,6 +17,20 @@ vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({ t: i18nState.t, locale: "en", setLocale: i18nState.setLocale }),
 }))
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest }))
+vi.mock("@/lib/task-runtime-ui-extension", async () => {
+  const actual = await vi.importActual<
+    typeof import("@/lib/task-runtime-ui-extension")
+  >("@/lib/task-runtime-ui-extension")
+  const ReactModule = await vi.importActual<typeof import("react")>("react")
+  return {
+    ...actual,
+    TaskRuntimeSettingsExtension: () => ReactModule.createElement(
+      "section",
+      { "data-testid": "task-runtime-settings-extension" },
+      "runtime settings",
+    ),
+  }
+})
 
 afterEach(() => { cleanup(); vi.restoreAllMocks() })
 
@@ -46,6 +60,19 @@ describe("SettingsPage auth profile synchronization", () => {
     })
     if (created.status !== "created") throw new Error("expected session")
     authState.session = created.projection.snapshot
+  })
+
+  it("renders the distribution task runtime settings slot", async () => {
+    apiRequest.mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      user: authState.user,
+    }), { headers: { "Content-Type": "application/json" } }))
+
+    render(<SettingsPage />)
+
+    expect(screen.getByTestId("task-runtime-settings-extension")).toHaveTextContent(
+      "runtime settings",
+    )
   })
 
   it("does not apply an old profile response to a replacement login", async () => {
