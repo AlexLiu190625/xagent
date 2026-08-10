@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from fastapi import WebSocket
 from fastapi.responses import JSONResponse
+from starlette.websockets import WebSocketState
 
 from ..auth_dependencies import get_user_from_websocket_token
 from ..models.database import get_session_local
@@ -32,8 +33,6 @@ class _WebSocketAuthenticationTerminated(Exception):
 async def send_websocket_authentication_infrastructure_failure(
     websocket: WebSocket,
     original_error: Exception,
-    *,
-    already_accepted: bool,
 ) -> None:
     """Send the shared sanitized response for an authentication outage."""
     route_template = getattr(websocket.scope.get("route"), "path", "<unresolved>")
@@ -47,7 +46,7 @@ async def send_websocket_authentication_infrastructure_failure(
         ),
     )
     try:
-        if already_accepted:
+        if websocket.application_state is WebSocketState.CONNECTED:
             await websocket.close(code=1011, reason="Internal server error")
         elif "websocket.http.response" in (websocket.scope.get("extensions") or {}):
             await websocket.send_denial_response(
@@ -98,6 +97,5 @@ async def get_authenticated_user(
         await send_websocket_authentication_infrastructure_failure(
             websocket,
             exc,
-            already_accepted=False,
         )
         raise _WebSocketAuthenticationTerminated() from exc

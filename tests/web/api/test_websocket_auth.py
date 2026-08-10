@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import WebSocket
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+from starlette.websockets import WebSocketState
 
 from tests.web.auth_token_cases import (
     REJECTED_ACCESS_TOKEN_CASES,
@@ -245,6 +246,26 @@ async def test_operational_auth_failure_without_extension_accepts_then_closes(
     serialized_messages = json.dumps(messages, default=lambda value: value.decode())
     assert "signed-token" not in serialized_messages
     assert "database pool" not in serialized_messages
+
+
+@pytest.mark.asyncio
+async def test_connected_auth_failure_closes_from_websocket_application_state() -> None:
+    websocket = MagicMock()
+    websocket.application_state = WebSocketState.CONNECTED
+    websocket.scope = {"extensions": {"websocket.http.response": {}}}
+    websocket.close = AsyncMock()
+    websocket.accept = AsyncMock()
+    websocket.send_denial_response = AsyncMock()
+
+    await websocket_auth.send_websocket_authentication_infrastructure_failure(
+        websocket,
+        TimeoutError("database pool"),
+    )
+
+    websocket.close.assert_awaited_once_with(
+        code=1011,
+        reason="Internal server error",
+    )
 
 
 @pytest.mark.asyncio

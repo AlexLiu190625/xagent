@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from xagent.web.api import public_chat_access
 from xagent.web.api.websocket import WebSocketPrincipal
@@ -21,6 +23,7 @@ class _SingleMessageWebSocket:
         # so a post-accept close preserves the code/reason on the wire.
         self.accept = AsyncMock()
         self.close = AsyncMock()
+        self.application_state = WebSocketState.CONNECTED
         self.scope = {"extensions": {}, "route": SimpleNamespace(path="/public/ws")}
 
     async def receive_text(self) -> str:
@@ -427,9 +430,11 @@ def _resolve_public_token(
 @pytest.mark.parametrize("resolver_kind", ["widget", "share"])
 def test_public_token_resolvers_propagate_database_failures_by_identity(
     resolver_kind: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     failure = RuntimeError("database unavailable")
     db = _PublicResolverSession(failure)
+    caplog.set_level(logging.ERROR, logger=public_chat_access.__name__)
     if resolver_kind == "widget":
         token = public_chat_access.create_public_chat_access_token(
             {
@@ -457,6 +462,71 @@ def test_public_token_resolvers_propagate_database_failures_by_identity(
     assert raised.value is failure
     assert db.bind_count == 1
     assert db.query_count == 1
+    assert "database unavailable" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("guest_id", "expected_status"),
+    (("", 401), (7, 401), ("   ", None)),
+    ids=("empty", "non-string", "whitespace"),
+)
+def test_public_widget_guest_id_requires_nonempty_string(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    guest_id: object,
+    expected_status: int | None,
+) -> None:
+    payload = {
+        "type": "widget",
+        "user_id": 1,
+        "channel_id": None,
+        "guest_id": guest_id,
+        "auth_mode": "widget",
+        "widget_agent_id": 3,
+    }
+    db = MagicMock()
+    db.get_bind.return_value = SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+    db.query.return_value.filter.return_value.first.return_value = SimpleNamespace(
+        id=1,
+        is_admin=False,
+    )
+    monkeypatch.setattr(
+        public_chat_access, "_decode_public_token", lambda _token: payload
+    )
+    monkeypatch.setattr(
+        public_chat_access, "ensure_widget_agent_available", MagicMock()
+    )
+    caplog.set_level(logging.INFO, logger=public_chat_access.__name__)
+
+    if expected_status is None:
+        context = public_chat_access.get_public_chat_user(
+            "signed-token", db, expected_auth_mode="widget"
+        )
+
+        assert context.guest_id == guest_id
+        return
+
+    with pytest.raises(HTTPException) as raised:
+        public_chat_access.get_public_chat_user(
+            "signed-token", db, expected_auth_mode="widget"
+        )
+
+    assert raised.value.status_code == expected_status
+    db.get_bind.assert_not_called()
+    assert "reason=INVALID_CLAIMS" in caplog.text
+    assert "signed-token" not in caplog.text
+    assert "database unavailable" not in caplog.text
+
+
+def test_public_token_failure_projection_preserves_http_exception_identity() -> None:
+    expected = HTTPException(status_code=403, detail="Access denied")
+
+    assert (
+        public_chat_access._project_public_token_failure(
+            expected, invalid_detail="Invalid widget token"
+        )
+        is expected
+    )
 
 
 @pytest.mark.parametrize(

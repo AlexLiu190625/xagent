@@ -21,6 +21,7 @@ from tests.web.auth_token_cases import (
 )
 from tests.web.auth_token_cases import build_access_token as _access_token
 from xagent.web import auth_dependencies
+from xagent.web.app import global_exception_handler
 from xagent.web.auth_dependencies import (
     get_current_user,
     get_current_user_optional,
@@ -477,14 +478,32 @@ def test_optional_direct_none_returns_none(db_session: Session) -> None:
 
 
 @pytest.mark.parametrize(
-    "headers",
-    ({}, {"Authorization": "Bearer "}, {"Authorization": "Basic abc"}),
-    ids=("missing", "empty-bearer", "basic"),
+    ("dependency_kind", "credential_kind", "expected_status"),
+    (
+        ("required", "missing", (401, 403)),
+        ("required", "empty-bearer", (401, 403)),
+        ("required", "basic", (401, 403)),
+        ("optional", "missing", (200,)),
+        ("optional", "empty-bearer", (200,)),
+        ("optional", "basic", (200,)),
+        ("required", "valid", (500,)),
+        ("optional", "valid", (500,)),
+    ),
 )
-def test_optional_dependency_treats_non_credentials_as_anonymous(
-    db_session: Session, headers: dict[str, str]
+def test_fastapi_auth_dependencies_preserve_framework_rejection_and_safe_pool_failure(
+    dependency_kind: str,
+    credential_kind: str,
+    expected_status: tuple[int, ...],
 ) -> None:
+    driver_message = "database pool driver detail"
+
+    class TimeoutSession(_DialectSession):
+        def query(self, _model: type[User]) -> "_DialectSession":
+            self.query_count += 1
+            raise SQLAlchemyTimeoutError(driver_message, None, None)
+
     app = FastAPI()
+    app.add_exception_handler(Exception, global_exception_handler)
 
     @app.get("/optional")
     def optional_endpoint(
@@ -496,11 +515,25 @@ def test_optional_dependency_treats_non_credentials_as_anonymous(
     def required_endpoint(user: User = Depends(get_current_user)) -> dict[str, int]:
         return {"user_id": user.id}
 
-    app.dependency_overrides[auth_dependencies.get_db] = lambda: db_session
+    app.dependency_overrides[auth_dependencies.get_db] = lambda: TimeoutSession(
+        "sqlite"
+    )
 
-    client = TestClient(app)
-    assert client.get("/optional", headers=headers).json() == {"user_id": None}
-    assert client.get("/required", headers=headers).status_code == 403
+    headers = {
+        "missing": {},
+        "empty-bearer": {"Authorization": "Bearer "},
+        "basic": {"Authorization": "Basic abc"},
+        "valid": {"Authorization": f"Bearer {_access_token()}"},
+    }[credential_kind]
+    path = f"/{dependency_kind}"
+    response = TestClient(app, raise_server_exceptions=False).get(path, headers=headers)
+
+    assert response.status_code in expected_status
+    if dependency_kind == "optional" and credential_kind != "valid":
+        assert response.json() == {"user_id": None}
+    if credential_kind == "valid":
+        assert driver_message not in response.text
+        assert "Traceback" not in response.text
 
 
 @pytest.mark.parametrize("helper", (get_user_from_token, get_user_from_websocket_token))
