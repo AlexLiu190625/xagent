@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import Text
+from sqlalchemy import cast as sql_cast
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import expression
@@ -19,6 +21,38 @@ logger = logging.getLogger(__name__)
 
 # Create router
 monitor_router = APIRouter(prefix="/api/monitor", tags=["monitor"])
+
+# The guard below matches on the payload's *text* form, where a doubled
+# backslash is an escaped backslash rather than the start of an escape.
+# Those are neutralized first, so every backslash that survives opens a
+# real JSON escape. That is what makes the match exact in both directions:
+# without it, text that merely looks like an escape is dropped, and worse,
+# a real unpaired surrogate sitting right after such text is missed.
+PG_ESCAPED_BACKSLASH = r"\\"
+PG_ESCAPED_BACKSLASH_STANDIN = "__"
+
+# A valid surrogate pair converts to text without complaint, so pairs are
+# removed before matching -- any surrogate escape still standing after that
+# is unpaired by construction. Stripping is also what keeps this cheap:
+# the lookahead/lookbehind form this replaces cost roughly an order of
+# magnitude more on a table the monitoring dashboard scans.
+PG_SURROGATE_PAIR_PATTERN = (
+    r"\\u[dD][89abAB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}"
+)
+
+# What PostgreSQL stores happily in a json column but refuses to convert to
+# text: the NUL escape, and either half of an unpaired surrogate. Matched
+# against the normalized, pair-stripped text produced above.
+#
+# This assumes a UTF8 server encoding, which is what the shipped compose file
+# runs. On a server in another encoding ->> also rejects any escape naming a
+# character outside that charset -- including a valid surrogate pair, which
+# the step above deliberately strips -- so the list is not exhaustive there.
+PG_UNSAFE_ESCAPE_PATTERN = (
+    r"\\u0000"
+    r"|\\u[dD][89abAB][0-9a-fA-F]{2}"
+    r"|\\u[dD][c-fC-F][0-9a-fA-F]{2}"
+)
 
 
 def is_admin_user(user: User) -> bool:
@@ -61,13 +95,46 @@ def get_json_field_expression(column: Any, field_path: str, db_session: Session)
     dialect_name = db_session.bind.dialect.name
 
     if dialect_name == "postgresql":
-        # PostgreSQL uses ->> operator to extract JSON field as text
-        # First filter out records containing binary data, then safely extract
+        # PostgreSQL extracts a JSON field as text with ->>. A json value can
+        # legally carry escape sequences that ->> then refuses to convert --
+        # NUL raises "unsupported Unicode escape sequence", an unpaired UTF-16
+        # surrogate raises "invalid input syntax for type json" -- and one such
+        # row fails the entire query. Null those payloads out before extracting
+        # so the row drops instead. jsonb would reject them at write time, but
+        # this column is json, which stores them happily.
+        #
+        # Matching runs on the column's text form because valid JSON never
+        # holds a raw control character or a bare surrogate (RFC 8259 requires
+        # escaping) -- the escape sequence is what has to be found. ~ is the
+        # regex-match operator and applies to text; the ~? used here before
+        # does not exist in PostgreSQL at all, so every query through this
+        # branch failed.
+        #
+        # Two normalizations run before the match, and both are load-bearing:
+        # escaped backslashes become an inert stand-in so nothing that merely
+        # looks like an escape is treated as one, and valid surrogate pairs are
+        # deleted so whatever surrogate escape remains is unpaired. Only then
+        # is a plain alternation enough -- no lookaround, which is what made an
+        # earlier version of this guard cost an order of magnitude more on a
+        # table these dashboard endpoints scan.
+        #
+        # The MySQL/SQLite branches strip the escape and keep the row. Doing
+        # that here would mean casting the edited text back to json, which
+        # raises whenever the edit leaves invalid JSON -- one bad row would
+        # again fail the request.
+        payload_text = func.replace(
+            sql_cast(column, Text),
+            PG_ESCAPED_BACKSLASH,
+            PG_ESCAPED_BACKSLASH_STANDIN,
+        )
+        unpaired_only = func.regexp_replace(
+            payload_text, PG_SURROGATE_PAIR_PATTERN, "", "g"
+        )
         valid_data = expression.case(
             (
-                column.op("~?")(r"[\u0000-\u0008\u000B\u000C\u000E-\u001F]"),
-                None,
-            ),  # Filter control characters
+                unpaired_only.op("~")(PG_UNSAFE_ESCAPE_PATTERN),
+                expression.null(),
+            ),
             else_=column,
         )
         return valid_data.op("->>")(field_name)
@@ -86,8 +153,7 @@ def get_json_field_expression(column: Any, field_path: str, db_session: Session)
 
 
 def safe_get_json_field(column: Any, field_path: str, db_session: Session) -> Any:
-    """
-    Safe JSON field extraction with NULL checks
+    """JSON field extraction expression for the session's dialect.
 
     Args:
         column: SQLAlchemy column object
@@ -95,10 +161,9 @@ def safe_get_json_field(column: Any, field_path: str, db_session: Session) -> An
         db_session: Database session
 
     Returns:
-        JSON field extraction expression with NULL checks
+        JSON field extraction expression suitable for the current database
     """
-    json_expr = get_json_field_expression(column, field_path, db_session)
-    return expression.case((json_expr.isnot(None), json_expr), else_=None)
+    return get_json_field_expression(column, field_path, db_session)
 
 
 @monitor_router.get("/tools")
