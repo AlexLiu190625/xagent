@@ -670,10 +670,12 @@ jobs:
       # and App Router suites so newly added tests are discovered automatically.
       - name: Run frontend test manifest contract
         working-directory: ./frontend
+        shell: bash
         run: npm run test:ci-manifest
 
       - name: Run page component tests
         working-directory: ./frontend
+        shell: bash
         run: npm run test:pages
 
       - name: Run App Router tests

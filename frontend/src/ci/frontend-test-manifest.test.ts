@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { parseDocument } from "yaml"
 import { describe, expect, it, vi } from "vitest"
 import vitestConfig from "../../vitest.config"
 
@@ -15,138 +16,125 @@ const pagesCommand =
 const appPagesCommand = "vitest run --config vitest.config.ts src/app"
 const homeBuildContractsCommand =
   "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts"
+const requiredFrontendSteps = [
+  { command: "npm run test:widget:coverage", shell: undefined },
+  { command: "npm run test:ci-manifest", shell: "bash" },
+  { command: "npm run test:pages", shell: "bash" },
+  { command: "npm run test:app-pages", shell: undefined },
+  { command: "npm run test:home-build-contracts", shell: undefined },
+] as const
 const moduleDir = path.dirname(fileURLToPath(import.meta.url))
 const packageJsonPath = path.resolve(moduleDir, "../../package.json")
 const workflowPath = path.resolve(moduleDir, "../../../.github/workflows/ci.yml")
 
-function exactLineCount(lines: string[], value: string) {
-  return lines.filter((line) => line === value).length
+function requireRecord(
+  value: unknown,
+  owner: string,
+): asserts value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${owner} must be an object`)
+  }
 }
 
-function extractFrontendBuildJob(source: string) {
-  source = source.replace(/\r\n/g, "\n")
-  const yamlHeader =
-    /^( *)(?:([A-Za-z_][A-Za-z0-9_-]*)|'([A-Za-z_][A-Za-z0-9_-]*)'|"([A-Za-z_][A-Za-z0-9_-]*)"):/gm
-  const headers = Array.from(source.matchAll(yamlHeader), (match) => ({
-    indent: match[1]!.length,
-    id: match[2] ?? match[3] ?? match[4] ?? "",
-    index: match.index!,
-  }))
-  const topLevelHeaders = headers.filter(({ indent }) => indent === 0)
-  const jobsHeaders = topLevelHeaders.filter(({ id }) => id === "jobs")
-  expect(jobsHeaders).toHaveLength(1)
+function assertNoDefaultShell(value: Record<string, unknown>, owner: string) {
+  const defaults = value.defaults
+  if (defaults === undefined) {
+    return
+  }
 
-  const jobsHeader = jobsHeaders[0]!
-  const nextTopLevelHeader = topLevelHeaders.find(
-    ({ index }) => index > jobsHeader.index,
-  )
-  const jobsEnd = nextTopLevelHeader?.index ?? source.length
+  requireRecord(defaults, `${owner}.defaults`)
+  const run = defaults.run
+  if (run === undefined) {
+    return
+  }
 
-  const jobHeaders = headers.filter(
-    ({ indent, index }) =>
-      indent === 2 && index > jobsHeader.index && index < jobsEnd,
-  )
-  const frontendHeaders = jobHeaders.filter(
-    ({ id }) => id === "frontend-build",
-  )
+  requireRecord(run, `${owner}.defaults.run`)
+  if (run.shell !== undefined) {
+    throw new Error(`${owner} must not set defaults.run.shell`)
+  }
+}
 
-  expect(frontendHeaders).toHaveLength(1)
+function assertSemanticWorkflowManifest(source: string) {
+  const document = parseDocument(source, {
+    version: "1.2",
+    uniqueKeys: true,
+    merge: false,
+  })
 
-  const frontendHeader = frontendHeaders[0]!
-  const frontendHeaderIndex = jobHeaders.indexOf(frontendHeader)
-  const nextHeader = jobHeaders[frontendHeaderIndex + 1]
-  const endIndex = nextHeader?.index ?? jobsEnd
+  if (document.errors.length > 0) {
+    throw document.errors[0]
+  }
+  if (document.warnings.length > 0) {
+    throw document.warnings[0]
+  }
 
-  return source.slice(frontendHeader.index, endIndex)
+  const workflow = document.toJS({ maxAliasCount: 100 })
+  requireRecord(workflow, "workflow root")
+  requireRecord(workflow.jobs, "jobs")
+  const frontendBuild = workflow.jobs["frontend-build"]
+  requireRecord(frontendBuild, "jobs.frontend-build")
+  if (!Array.isArray(frontendBuild.steps)) {
+    throw new Error("jobs.frontend-build.steps must be an array")
+  }
+
+  assertNoDefaultShell(workflow, "workflow root")
+  assertNoDefaultShell(frontendBuild, "jobs.frontend-build")
+  if (frontendBuild["continue-on-error"] !== undefined) {
+    throw new Error("jobs.frontend-build must not set continue-on-error")
+  }
+
+  for (const step of frontendBuild.steps) {
+    requireRecord(step, "jobs.frontend-build.steps entry")
+    if (step["continue-on-error"] !== undefined) {
+      throw new Error("frontend-build steps must not set continue-on-error")
+    }
+  }
+
+  for (const requiredStep of requiredFrontendSteps) {
+    const matchingSteps = frontendBuild.steps.filter((step) => {
+      requireRecord(step, "jobs.frontend-build.steps entry")
+      return step.run === requiredStep.command
+    })
+
+    if (matchingSteps.length !== 1) {
+      throw new Error(`${requiredStep.command} must appear in exactly one frontend step`)
+    }
+
+    const step = matchingSteps[0]!
+    if (step["working-directory"] !== "./frontend") {
+      throw new Error(`${requiredStep.command} must use ./frontend`)
+    }
+    if (step.if !== undefined) {
+      throw new Error(`${requiredStep.command} must not set if`)
+    }
+    if (step["continue-on-error"] !== undefined) {
+      throw new Error(`${requiredStep.command} must not set continue-on-error`)
+    }
+    if (step.shell !== requiredStep.shell) {
+      throw new Error(`${requiredStep.command} has an unexpected shell policy`)
+    }
+  }
+
+  if (frontendBuild.steps.some((step) => step.run === "npm run test:home-build-pages")) {
+    throw new Error("legacy test:home-build-pages must not run in frontend-build")
+  }
+}
+
+function readWorkflowSource() {
+  return readFileSync(workflowPath, "utf8")
 }
 
 describe("frontend CI test manifest", () => {
-  it("extracts the same frontend-build job from LF and CRLF workflow text", () => {
-    const workflowSource = readFileSync(workflowPath, "utf8")
-    const crlfWorkflowSource = workflowSource.replace(/\r?\n/g, "\r\n")
-
-    expect(extractFrontendBuildJob(crlfWorkflowSource)).toBe(
-      extractFrontendBuildJob(workflowSource),
-    )
-  })
+  it.each([["LF", readWorkflowSource()], ["CRLF", readWorkflowSource().replace(/\r?\n/g, "\r\n")]])(
+    "accepts the real workflow with %s line endings",
+    (_, source) => {
+      expect(() => assertSemanticWorkflowManifest(source)).not.toThrow()
+    },
+  )
 
   it.each([
     [
-      "a renamed successor",
-      (source: string) =>
-        source.replace("\n  ci-summary:\n", "\n  post-frontend:\n"),
-    ],
-    [
-      "an inserted unquoted successor",
-      (source: string) =>
-        source.replace(
-          "\n  ci-summary:\n",
-          "\n  manifest-sibling:\n    continue-on-error: true\n\n  ci-summary:\n",
-        ),
-    ],
-    [
-      "an inserted single-quoted successor",
-      (source: string) =>
-        source.replace(
-          "\n  ci-summary:\n",
-          "\n  'manifest-sibling':\n    runs-on: ubuntu-latest\n\n  ci-summary:\n",
-        ),
-    ],
-    [
-      "an inserted double-quoted successor",
-      (source: string) =>
-        source.replace(
-          "\n  ci-summary:\n",
-          "\n  \"manifest-sibling\":\n    runs-on: ubuntu-latest\n\n  ci-summary:\n",
-        ),
-    ],
-  ])("keeps the frontend-build slice for %s", (_, updateSource) => {
-    const workflowSource = readFileSync(workflowPath, "utf8")
-    const frontendBuildJob = extractFrontendBuildJob(workflowSource)
-
-    expect(extractFrontendBuildJob(updateSource(workflowSource))).toBe(
-      frontendBuildJob,
-    )
-  })
-
-  it("keeps the frontend-build slice when e2e becomes its successor", () => {
-    const workflowSource = readFileSync(workflowPath, "utf8")
-    const frontendBuildJob = extractFrontendBuildJob(workflowSource)
-    const reorderedWorkflowSource = workflowSource
-      .replace(frontendBuildJob, "")
-      .replace("  e2e:\n", `${frontendBuildJob}  e2e:\n`)
-
-    expect(extractFrontendBuildJob(reorderedWorkflowSource)).toBe(
-      frontendBuildJob,
-    )
-  })
-
-  it("keeps the frontend-build slice when it is the final job at workflow EOF", () => {
-    const workflowSource = readFileSync(workflowPath, "utf8")
-    const frontendBuildJob = extractFrontendBuildJob(workflowSource)
-    const workflowWithoutFrontend = workflowSource.replace(frontendBuildJob, "")
-    const frontendAtEof = `${workflowWithoutFrontend.trimEnd()}\n\n${frontendBuildJob}`
-
-    expect(extractFrontendBuildJob(frontendAtEof)).toBe(frontendBuildJob)
-  })
-
-  it("stops the final frontend-build job before a later top-level workflow key", () => {
-    const workflowSource = readFileSync(workflowPath, "utf8")
-    const frontendBuildJob = extractFrontendBuildJob(workflowSource)
-    const workflowWithoutFrontend = workflowSource.replace(frontendBuildJob, "")
-    const frontendBeforePermissions = `${workflowWithoutFrontend.trimEnd()}\n\n${frontendBuildJob}`
-    const workflowWithPermissions = `${frontendBeforePermissions}permissions:\n  contents: read\n`
-
-    const extractedFrontendBuildJob = extractFrontendBuildJob(workflowWithPermissions)
-
-    expect(extractedFrontendBuildJob).toBe(frontendBuildJob)
-    expect(extractedFrontendBuildJob).not.toContain("permissions:")
-    expect(extractedFrontendBuildJob).not.toContain("contents: read")
-  })
-
-  it.each([
-    [
-      "an anchored successor",
+      "an anchored sibling",
       (source: string) =>
         source.replace(
           "\n  ci-summary:\n",
@@ -154,81 +142,233 @@ describe("frontend CI test manifest", () => {
         ),
     ],
     [
-      "an aliased successor",
+      "an aliased sibling",
       (source: string) =>
         source
-          .replace(
-            "  prepare-deepdoc-cache:\n",
-            "  prepare-deepdoc-cache: &manifest_base\n",
-          )
-          .replace(
-            "\n  ci-summary:\n",
-            "\n  manifest-alias: *manifest_base\n\n  ci-summary:\n",
-          ),
+          .replace("  prepare-deepdoc-cache:\n", "  prepare-deepdoc-cache: &manifest_base\n")
+          .replace("\n  ci-summary:\n", "\n  manifest-alias: *manifest_base\n\n  ci-summary:\n"),
     ],
-  ])("stops before %s sibling job", (_, updateSource) => {
-    const workflowSource = readFileSync(workflowPath, "utf8")
-    const frontendBuildJob = extractFrontendBuildJob(workflowSource)
-    const transformedWorkflowSource = updateSource(workflowSource)
+  ])("accepts %s", (_, transform) => {
+    const source = transform(readWorkflowSource())
 
-    expect(transformedWorkflowSource).not.toBe(workflowSource)
-    expect(transformedWorkflowSource).toContain("&manifest_base")
-    expect(transformedWorkflowSource).toContain("*manifest_base")
-    expect(extractFrontendBuildJob(transformedWorkflowSource)).toBe(
-      frontendBuildJob,
+    expect(source).toContain("&manifest_base")
+    expect(source).toContain("*manifest_base")
+    expect(() => assertSemanticWorkflowManifest(source)).not.toThrow()
+  })
+
+  it("accepts a folded required command with the same semantic value", () => {
+    const source = readWorkflowSource().replace(
+      "        run: npm run test:app-pages\n",
+      "        run: >-\n          npm run\n          test:app-pages\n",
+    )
+
+    expect(source).not.toBe(readWorkflowSource())
+    expect(() => assertSemanticWorkflowManifest(source)).not.toThrow()
+  })
+
+  it("accepts a colon-shaped line in a block scalar", () => {
+    const source = readWorkflowSource().replace(
+      "        run: npm run build\n",
+      "        run: |\n          echo 'label: value'\n          npm run build\n",
+    )
+
+    expect(source).toContain("          echo 'label: value'\n")
+    expect(() => assertSemanticWorkflowManifest(source)).not.toThrow()
+  })
+
+  it("rejects an unknown YAML directive warning before conversion", () => {
+    const workflowSource = readWorkflowSource()
+    const source = `%BAD_DIRECTIVE\n---\n${workflowSource}`
+
+    expect(source).not.toBe(workflowSource)
+    expect(source).toMatch(/^%BAD_DIRECTIVE\n---\n/)
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow(
+      "Unknown directive %BAD_DIRECTIVE",
     )
   })
 
-  it("rejects duplicate semantic workflow and frontend-build ownership across quoting forms", () => {
-    const workflowSource = readFileSync(workflowPath, "utf8")
-    const workflowWithDuplicateJobs = `${workflowSource.trimEnd()}\n'jobs':\n  fallback:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo duplicate jobs\n`
-    const workflowWithDuplicateFrontendBuild = workflowSource.replace(
+  it("rejects an anchored job expanded through more than 100 aliases", () => {
+    const aliases = Array.from(
+      { length: 101 },
+      (_, index) => `  manifest-alias-${index + 1}: *manifest_base`,
+    ).join("\n")
+    const workflowSource = readWorkflowSource()
+    const source = workflowSource.replace(
       "\n  ci-summary:\n",
-      "\n  'frontend-build':\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo duplicate frontend build\n\n  ci-summary:\n",
+      `\n  manifest-anchor: &manifest_base\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo manifest anchor\n${aliases}\n\n  ci-summary:\n`,
     )
 
-    expect(() => extractFrontendBuildJob(workflowWithDuplicateJobs)).toThrow()
-    expect(() => extractFrontendBuildJob(workflowWithDuplicateFrontendBuild)).toThrow()
+    expect(source).not.toBe(workflowSource)
+    expect(source).toContain("  manifest-anchor: &manifest_base\n")
+    expect(source.match(/manifest-alias-\d+: \*manifest_base/g)).toHaveLength(101)
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
   })
 
   it.each([
     ["an empty source", ""],
-    [
-      "a jobs mapping without frontend-build",
-      "name: Manifest fixture\njobs:\n  fallback:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo fallback\n",
-    ],
-  ])("rejects %s workflow ownership", (_, source) => {
-    expect(() => extractFrontendBuildJob(source)).toThrow()
+    ["malformed YAML", "jobs:\n  frontend-build: ["],
+    ["missing jobs", "name: Manifest fixture\n"],
+    ["a non-mapping jobs owner", "jobs: []\n"],
+    ["missing frontend-build", "jobs: {}\n"],
+    ["a non-mapping frontend-build owner", "jobs:\n  frontend-build: []\n"],
+    ["a non-sequence steps owner", "jobs:\n  frontend-build:\n    steps: {}\n"],
+    ["an unresolved alias", "jobs:\n  frontend-build: *missing\n"],
+  ])("rejects %s", (_, source) => {
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
   })
 
-  it("keeps App Router discovery and required frontend CI lanes source-locked", () => {
+  it("rejects semantically complete duplicate jobs and frontend-build mappings", () => {
+    const workflowSource = readWorkflowSource()
+    const duplicateJobs = `${workflowSource
+      .replace("\njobs:\n", "\njobs: &manifest_jobs\n")
+      .trimEnd()}\n'jobs': *manifest_jobs\n`
+    const duplicateFrontendBuild = workflowSource
+      .replace(
+        "  frontend-build:\n",
+        "  frontend-build: &manifest_frontend_build\n",
+      )
+      .replace(
+        "\n  ci-summary:\n",
+        "\n  'frontend-build': *manifest_frontend_build\n\n  ci-summary:\n",
+      )
+
+    expect(duplicateJobs).not.toBe(workflowSource)
+    expect(duplicateJobs).toContain("jobs: &manifest_jobs\n")
+    expect(duplicateJobs).toContain("'jobs': *manifest_jobs\n")
+    expect(duplicateFrontendBuild).not.toBe(workflowSource)
+    expect(duplicateFrontendBuild).toContain(
+      "frontend-build: &manifest_frontend_build\n",
+    )
+    expect(duplicateFrontendBuild).toContain(
+      "'frontend-build': *manifest_frontend_build\n",
+    )
+    expect(() => assertSemanticWorkflowManifest(duplicateJobs)).toThrow()
+    expect(() => assertSemanticWorkflowManifest(duplicateFrontendBuild)).toThrow()
+  })
+
+  it("rejects a required command moved to a sibling job", () => {
+    const source = readWorkflowSource()
+      .replace(
+        "\n      - name: Run App Router tests\n        working-directory: ./frontend\n        run: npm run test:app-pages\n",
+        "",
+      )
+      .replace(
+        "\n  ci-summary:\n",
+        "\n  manifest-sibling:\n    runs-on: ubuntu-latest\n    steps:\n      - working-directory: ./frontend\n        run: npm run test:app-pages\n\n  ci-summary:\n",
+      )
+
+    expect(source).toContain("  manifest-sibling:\n")
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
+  })
+
+  it("rejects a same-job heredoc decoy after the real pages step is removed", () => {
+    const source = readWorkflowSource()
+      .replace(
+        "\n      - name: Run page component tests\n        working-directory: ./frontend\n        shell: bash\n        run: npm run test:pages\n",
+        "",
+      )
+      .replace(
+        "\n      - name: Run App Router tests\n",
+        "\n      - name: Preserve page launcher text as a shell heredoc\n        run: |\n          run: npm run test:pages\n\n      - name: Run App Router tests\n",
+      )
+
+    expect(source).not.toContain("      - name: Run page component tests\n")
+    expect(source).toContain("          run: npm run test:pages\n")
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow(
+      "npm run test:pages must appear in exactly one frontend step",
+    )
+  })
+
+  it("rejects missing and duplicate required semantic steps", () => {
+    const source = readWorkflowSource()
+    const missing = source.replace("        run: npm run test:app-pages\n", "")
+    const duplicate = source.replace(
+      "\n      - name: Run App Router tests\n",
+      "\n      - name: Duplicate App Router tests\n        working-directory: ./frontend\n        run: npm run test:app-pages\n\n      - name: Run App Router tests\n",
+    )
+
+    expect(missing).not.toContain("        run: npm run test:app-pages\n")
+    expect(duplicate.match(/run: npm run test:app-pages/g)).toHaveLength(2)
+    expect(() => assertSemanticWorkflowManifest(missing)).toThrow()
+    expect(() => assertSemanticWorkflowManifest(duplicate)).toThrow()
+  })
+
+  it("rejects a required step with the wrong working directory", () => {
+    const source = readWorkflowSource().replace(
+      "      - name: Run App Router tests\n        working-directory: ./frontend\n",
+      "      - name: Run App Router tests\n        working-directory: .\n",
+    )
+
+    expect(source).toContain("      - name: Run App Router tests\n        working-directory: .\n")
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
+  })
+
+  it("rejects a required step-level condition", () => {
+    const source = readWorkflowSource().replace(
+      "      - name: Run App Router tests\n",
+      "      - name: Run App Router tests\n        if: github.event_name == 'schedule'\n",
+    )
+
+    expect(source).toContain("        if: github.event_name == 'schedule'\n")
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
+  })
+
+  it("rejects custom shells on non-launcher required steps", () => {
+    const source = readWorkflowSource().replace(
+      "      - name: Run App Router tests\n        working-directory: ./frontend\n",
+      "      - name: Run App Router tests\n        working-directory: ./frontend\n        shell: echo {0}\n",
+    )
+
+    expect(source).toContain("        shell: echo {0}\n")
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
+  })
+
+  it.each([
+    [
+      "test:ci-manifest",
+      (source: string) =>
+        source.replace(
+          "        shell: bash\n        run: npm run test:ci-manifest\n",
+          "        shell: echo {0}\n        run: npm run test:ci-manifest\n",
+        ),
+    ],
+    [
+      "test:pages",
+      (source: string) =>
+        source.replace(
+          "      - name: Run page component tests\n        working-directory: ./frontend\n        shell: bash\n",
+          "      - name: Run page component tests\n        working-directory: ./frontend\n        shell: echo {0}\n",
+        ),
+    ],
+  ])("rejects a non-bash %s launcher", (_, transform) => {
+    const source = transform(readWorkflowSource())
+
+    expect(source).toContain("        shell: echo {0}\n")
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
+  })
+
+  it.each([
+    ["a step continue-on-error", (source: string) => source.replace("        run: npm run test:app-pages\n", "        continue-on-error: true\n        run: npm run test:app-pages\n")],
+    ["a job continue-on-error", (source: string) => source.replace("  frontend-build:\n", "  frontend-build:\n    continue-on-error: true\n")],
+    ["a workflow default shell", (source: string) => source.replace("jobs:\n", "defaults:\n  run:\n    shell: echo {0}\n\njobs:\n")],
+    ["a job default shell", (source: string) => source.replace("  frontend-build:\n", "  frontend-build:\n    defaults:\n      run:\n        shell: echo {0}\n")],
+  ])("rejects %s", (_, transform) => {
+    const source = transform(readWorkflowSource())
+
+    expect(source).not.toBe(readWorkflowSource())
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow()
+  })
+
+  it("keeps package launchers and Vitest discovery contracts source-locked", () => {
     const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
       scripts: Record<string, string>
     }
-    const workflowSource = readFileSync(workflowPath, "utf8")
-    const frontendBuildJob = extractFrontendBuildJob(workflowSource)
-    const frontendBuildLines = frontendBuildJob.split("\n").map((line) => line.trim())
 
     expect(packageJson.scripts["test:ci-manifest"]).toBe(manifestCommand)
     expect(packageJson.scripts["test:pages"]).toBe(pagesCommand)
     expect(packageJson.scripts["test:app-pages"]).toBe(appPagesCommand)
-    expect(packageJson.scripts["test:home-build-contracts"]).toBe(
-      homeBuildContractsCommand,
-    )
+    expect(packageJson.scripts["test:home-build-contracts"]).toBe(homeBuildContractsCommand)
     expect(packageJson.scripts["test:home-build-pages"]).toBeUndefined()
-
-    for (const command of [
-      "run: npm run test:widget:coverage",
-      "run: npm run test:ci-manifest",
-      "run: npm run test:pages",
-      "run: npm run test:app-pages",
-      "run: npm run test:home-build-contracts",
-    ]) {
-      expect(exactLineCount(frontendBuildLines, command)).toBe(1)
-    }
-
-    expect(frontendBuildLines).not.toContain("run: npm run test:home-build-pages")
-    expect(frontendBuildJob).not.toMatch(/^\s+continue-on-error:/m)
 
     const testConfig = vitestConfig.test
     expect([...(testConfig?.include ?? [])].sort()).toEqual([
