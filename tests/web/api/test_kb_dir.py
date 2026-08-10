@@ -247,6 +247,7 @@ def test_kb_ingest_creates_collection_dir(test_env, temp_uploads):
             doc_id="test_doc_id",
             parse_hash="hash",
             failed_step="",
+            chunk_count=1,
             message="success",
         )
 
@@ -839,6 +840,7 @@ def test_kb_ingest_accepts_unicode_collection_name(test_env, temp_uploads):
             doc_id="test_doc_id",
             parse_hash="hash",
             failed_step="",
+            chunk_count=1,
             message="success",
         )
 
@@ -869,6 +871,7 @@ def test_kb_ingest_accepts_space_collection_name(test_env, temp_uploads):
             doc_id="test_doc_id",
             parse_hash="hash",
             failed_step="",
+            chunk_count=1,
             message="success",
         )
 
@@ -901,6 +904,7 @@ def test_kb_ingest_normalizes_padded_collection_name(test_env, temp_uploads):
             doc_id="test_doc_id",
             parse_hash="hash",
             failed_step="",
+            chunk_count=1,
             message="success",
         )
 
@@ -934,6 +938,7 @@ def test_kb_ingest_falls_back_from_pdf_only_parser_for_xlsx(test_env, temp_uploa
             doc_id="test_doc_id",
             parse_hash="hash",
             failed_step="",
+            chunk_count=1,
             message="success",
         )
 
@@ -1020,6 +1025,7 @@ def test_kb_ingest_accepts_derived_collection_name_with_spaces(test_env, temp_up
             doc_id="test_doc_id",
             parse_hash="hash",
             failed_step="",
+            chunk_count=1,
             message="success",
         )
 
@@ -2364,6 +2370,7 @@ def test_kb_ingest_passes_file_id_to_pipeline(test_env, temp_uploads):
             doc_id="test_doc_id",
             parse_hash="hash",
             failed_step="",
+            chunk_count=1,
             message="success",
         )
 
@@ -2421,6 +2428,7 @@ def test_kb_ingest_setup_failure_cleans_new_collection_config(test_env, temp_upl
         )
 
     assert response.status_code == 500
+    metadata_store.save_collection_config.assert_not_awaited()
     metadata_store.delete_collection_metadata.assert_awaited_once_with(
         collection_name="new_collection",
         user_id=1,
@@ -2429,7 +2437,7 @@ def test_kb_ingest_setup_failure_cleans_new_collection_config(test_env, temp_upl
     )
 
 
-def test_kb_ingest_existing_collection_failure_restores_previous_config(
+def test_kb_ingest_existing_collection_failure_keeps_previous_config(
     test_env, temp_uploads
 ) -> None:
     """Failed direct ingest should not replace an existing collection config."""
@@ -2474,20 +2482,79 @@ def test_kb_ingest_existing_collection_failure_restores_previous_config(
         )
 
     assert response.status_code == 500
-    assert metadata_store.save_collection_config.await_count == 2
-    restore_call = metadata_store.save_collection_config.await_args_list[-1]
-    assert restore_call.kwargs == {
-        "collection": "existing_collection",
-        "config_json": '{"chunk_size":111}',
-        "user_id": 1,
-    }
+    metadata_store.save_collection_config.assert_not_awaited()
     metadata_store.delete_collection_metadata.assert_not_awaited()
 
 
-def test_kb_ingest_config_only_collection_failure_restores_previous_config(
+def test_kb_ingest_success_publishes_collection_config(test_env, temp_uploads) -> None:
+    """A successful ingest is what makes the collection visible in the list."""
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        IngestionResult,
+        IngestionStepResult,
+    )
+
+    app, headers, _user, _ = test_env
+    client = TestClient(app, raise_server_exceptions=False)
+    metadata_store = MagicMock()
+    metadata_store.get_collection_config = AsyncMock(return_value=None)
+    metadata_store.save_collection_config = AsyncMock()
+    metadata_store.delete_collection_metadata = AsyncMock()
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
+        patch("xagent.web.api.kb.get_collection_sync", side_effect=ValueError("new")),
+        patch(
+            "xagent.web.api.kb._upsert_uploaded_file_record",
+            return_value=MagicMock(file_id="file-1"),
+        ),
+        patch(
+            "xagent.web.api.kb.run_document_ingestion",
+            return_value=IngestionResult(
+                status="success",
+                doc_id="doc-1",
+                parse_hash="hash",
+                chunk_count=1,
+                completed_steps=[IngestionStepResult(name="register_document")],
+                message="ok",
+            ),
+        ) as ingest_mock,
+    ):
+        # Same parent, so the assertion below sees one ordered call log: saving
+        # the config first is exactly the bug this PR fixes, and a test that
+        # only counts the calls would pass on it.
+        order = MagicMock()
+        order.attach_mock(ingest_mock, "ingest")
+        order.attach_mock(metadata_store.save_collection_config, "save")
+
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": ("test_doc.txt", b"content", "text/plain")},
+            data={"collection": "brand_new_collection", "chunk_size": "2048"},
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert [name for name, _, _ in order.mock_calls] == ["ingest", "save"]
+    saved = metadata_store.save_collection_config.await_args_list
+    assert len(saved) == 1
+    assert saved[0].kwargs["collection"] == "brand_new_collection"
+    assert '"chunk_size":2048' in saved[0].kwargs["config_json"]
+    metadata_store.delete_collection_metadata.assert_not_awaited()
+
+
+def test_kb_ingest_config_only_collection_failure_does_not_republish_ghost_config(
     test_env, temp_uploads
 ) -> None:
-    """A saved config without collection metadata is still pre-existing state."""
+    """A failed ingest must not republish the config of a config-only ghost.
+
+    Removing the ghost itself is the rollback's job, covered by
+    ``test_cleanup_removes_a_config_only_ghost`` in test_kb_ingest_lifecycle.py;
+    the rollback is stubbed here so this test pins only the publish decision.
+    """
     from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
 
     app, headers, _user, _ = test_env
@@ -2529,72 +2596,53 @@ def test_kb_ingest_config_only_collection_failure_restores_previous_config(
         )
 
     assert response.status_code == 500
-    assert metadata_store.save_collection_config.await_count == 2
-    restore_call = metadata_store.save_collection_config.await_args_list[-1]
-    assert restore_call.kwargs == {
-        "collection": "config_only_collection",
-        "config_json": '{"chunk_size":111}',
-        "user_id": 1,
-    }
-    metadata_store.delete_collection_metadata.assert_not_awaited()
-    metadata_store.delete_collection.assert_awaited_once_with("config_only_collection")
+    metadata_store.save_collection_config.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_failed_ingest_config_restore_skips_delete_when_snapshot_unknown() -> (
-    None
-):
-    """Unknown prior config state should not be treated as an empty old config."""
-    from xagent.web.api.kb import (
-        _CollectionConfigSnapshot,
-        _restore_collection_config_after_failed_ingest,
-    )
+async def test_collection_config_is_not_saved_without_documents() -> None:
+    """An ingest that produced nothing must not publish a visible collection."""
+    from xagent.web.api.kb import _save_collection_config_after_ingest
 
     facade = MagicMock()
     facade.save_collection_config = AsyncMock()
-    facade.delete_collection_metadata = AsyncMock()
 
     with patch("xagent.web.api.kb._get_api_compatibility_facade", return_value=facade):
-        await _restore_collection_config_after_failed_ingest(
-            snapshot=_CollectionConfigSnapshot(
-                collection="existing_collection",
-                user_id=1,
-                previous_config_json=None,
-                previous_config_known=False,
-                saved=True,
-            ),
-            collection_existed_before=True,
+        await _save_collection_config_after_ingest(
+            collection="new_collection",
+            config_json='{"chunk_size":2048}',
+            user=MagicMock(id=1),
             context="unit-test",
+            documents_created=0,
         )
 
     facade.save_collection_config.assert_not_awaited()
-    facade.delete_collection_metadata.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_collection_config_snapshot_failure_does_not_save_new_config() -> None:
-    """If the old config cannot be read, failed ingests must not leave a new config."""
-    from xagent.web.api.kb import _save_collection_config_with_snapshot
+async def test_collection_config_save_failure_after_ingest_raises() -> None:
+    """Ingested documents behind an unsaved config are worse than none: surface it."""
+    from xagent.web.api.kb import (
+        CollectionConfigSaveError,
+        _save_collection_config_after_ingest,
+    )
 
-    metadata_store = MagicMock()
-    metadata_store.get_collection_config = AsyncMock(side_effect=RuntimeError("boom"))
-    metadata_store.save_collection_config = AsyncMock()
-    user = MagicMock(id=1)
+    facade = MagicMock()
+    facade.save_collection_config = AsyncMock(side_effect=RuntimeError("boom"))
+    facade.get_collection_config = AsyncMock(return_value=None)
 
-    with patch(
-        "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
-        return_value=metadata_store,
+    with (
+        patch("xagent.web.api.kb._get_api_compatibility_facade", return_value=facade),
+        pytest.raises(CollectionConfigSaveError),
     ):
-        snapshot = await _save_collection_config_with_snapshot(
-            collection="existing_collection",
+        await _save_collection_config_after_ingest(
+            collection="new_collection",
             config_json='{"chunk_size":2048}',
-            user=user,
+            user=MagicMock(id=1),
             context="unit-test",
+            documents_created=3,
+            collection_existed_before=False,
         )
-
-    assert snapshot.saved is False
-    assert snapshot.previous_config_known is False
-    metadata_store.save_collection_config.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2680,10 +2728,10 @@ def test_kb_ingest_cloud_all_failures_clean_new_collection_config(test_env) -> N
     )
 
 
-def test_kb_ingest_cloud_existing_collection_all_failures_restores_config(
+def test_kb_ingest_cloud_existing_collection_all_failures_keeps_config(
     test_env,
 ) -> None:
-    """All-failed cloud ingest should restore config for existing collections."""
+    """All-failed cloud ingest must leave an existing collection's config alone."""
     app, headers, _user, _ = test_env
     client = TestClient(app)
     metadata_store = MagicMock()
@@ -2717,20 +2765,14 @@ def test_kb_ingest_cloud_existing_collection_all_failures_restores_config(
 
     assert response.status_code == 200
     assert response.json()[0]["status"] == "error"
-    assert metadata_store.save_collection_config.await_count == 2
-    restore_call = metadata_store.save_collection_config.await_args_list[-1]
-    assert restore_call.kwargs == {
-        "collection": "cloud_existing_collection",
-        "config_json": '{"chunk_size":222}',
-        "user_id": 1,
-    }
+    metadata_store.save_collection_config.assert_not_awaited()
     metadata_store.delete_collection_metadata.assert_not_awaited()
 
 
-def test_kb_ingest_cloud_config_only_collection_all_failures_restores_config(
+def test_kb_ingest_cloud_config_only_collection_all_failures_drops_ghost_config(
     test_env,
 ) -> None:
-    """Cloud ingest must restore config-only collection state on failure."""
+    """A config-only ghost must not survive another all-failed cloud ingest."""
     app, headers, _user, _ = test_env
     client = TestClient(app)
     metadata_store = MagicMock()
@@ -2765,24 +2807,23 @@ def test_kb_ingest_cloud_config_only_collection_all_failures_restores_config(
 
     assert response.status_code == 200
     assert response.json()[0]["status"] == "error"
-    assert metadata_store.save_collection_config.await_count == 2
-    restore_call = metadata_store.save_collection_config.await_args_list[-1]
-    assert restore_call.kwargs == {
-        "collection": "cloud_config_only_collection",
-        "config_json": '{"chunk_size":333}',
-        "user_id": 1,
-    }
-    metadata_store.delete_collection_metadata.assert_not_awaited()
-    metadata_store.delete_collection.assert_awaited_once_with(
-        "cloud_config_only_collection"
+    metadata_store.save_collection_config.assert_not_awaited()
+    metadata_store.delete_collection_metadata.assert_awaited_once_with(
+        collection_name="cloud_config_only_collection",
+        user_id=1,
+        is_admin=False,
+        delete_orphaned_metadata=True,
     )
 
 
-def test_kb_ingest_cloud_existing_collection_mixed_failure_restores_config(
+def test_kb_ingest_cloud_mixed_failure_still_publishes_config(
     test_env, temp_uploads
 ) -> None:
-    """A mixed cloud ingest should not commit new config for an existing collection."""
-    from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+    """Half a cloud batch is still real data, so the collection must stay visible."""
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        IngestionResult,
+        IngestionStepResult,
+    )
 
     app, headers, _user, _ = test_env
     client = TestClient(app)
@@ -2823,6 +2864,8 @@ def test_kb_ingest_cloud_existing_collection_mixed_failure_restores_config(
                 status="success",
                 doc_id="cloud-doc-id",
                 parse_hash="hash",
+                chunk_count=1,
+                completed_steps=[IngestionStepResult(name="register_document")],
                 message="success",
             ),
         ),
@@ -2850,13 +2893,10 @@ def test_kb_ingest_cloud_existing_collection_mixed_failure_restores_config(
 
     assert response.status_code == 200
     assert [item["status"] for item in response.json()] == ["success", "error"]
-    assert metadata_store.save_collection_config.await_count == 2
-    restore_call = metadata_store.save_collection_config.await_args_list[-1]
-    assert restore_call.kwargs == {
-        "collection": "cloud_existing_collection",
-        "config_json": '{"chunk_size":444}',
-        "user_id": 1,
-    }
+    saved = metadata_store.save_collection_config.await_args_list
+    assert len(saved) == 1
+    assert saved[0].kwargs["collection"] == "cloud_existing_collection"
+    assert '"chunk_size":2048' in saved[0].kwargs["config_json"]
     metadata_store.delete_collection_metadata.assert_not_awaited()
 
 
@@ -2931,6 +2971,7 @@ def test_kb_ingest_cloud_passes_file_id_to_pipeline(test_env, temp_uploads):
             doc_id="cloud-doc-id",
             parse_hash="hash",
             failed_step="",
+            chunk_count=1,
             message="success",
         )
 
@@ -3345,6 +3386,7 @@ def test_kb_ingest_cloud_uses_unique_storage_paths_for_duplicate_filenames(
             doc_id=f"doc-{len(captured_paths)}",
             parse_hash="hash",
             failed_step="",
+            chunk_count=1,
             message="success",
         )
 
@@ -4942,3 +4984,105 @@ def test_list_collections_skips_document_scan_when_duplicate_names_have_metadata
     payload = response.json()
     assert payload["collections"][0]["name"] == "duplicate"
     assert len(payload["collections"][0]["document_metadata"]) == 2
+
+
+def test_kb_ingest_cloud_empty_batch_is_rejected(test_env) -> None:
+    """An empty batch publishes nothing, so it must not report success."""
+    app, headers, _user, _ = test_env
+    client = TestClient(app)
+    metadata_store = MagicMock()
+    metadata_store.get_collection_config = AsyncMock(return_value=None)
+    metadata_store.save_collection_config = AsyncMock()
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+        return_value=metadata_store,
+    ):
+        response = client.post(
+            "/api/kb/ingest-cloud",
+            json={"collection": "cloud_empty_batch", "files": []},
+            headers=headers,
+        )
+
+    assert response.status_code == 422
+    metadata_store.save_collection_config.assert_not_awaited()
+
+
+def test_kb_ingest_cloud_config_save_failure_keeps_per_file_results(
+    test_env, temp_uploads
+) -> None:
+    """A bare 500 would hide which files of the batch actually landed."""
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        IngestionResult,
+        IngestionStepResult,
+    )
+
+    app, headers, _user, _ = test_env
+    client = TestClient(app, raise_server_exceptions=False)
+    metadata_store = MagicMock()
+    metadata_store.get_collection_config = AsyncMock(return_value=None)
+    metadata_store.save_collection_config = AsyncMock(
+        side_effect=RuntimeError("config store down")
+    )
+    metadata_store.delete_collection_metadata = AsyncMock()
+
+    class _FakeFilesService:
+        def get_media(self, fileId: str):
+            return {"fileId": fileId}
+
+    class _FakeDriveService:
+        def files(self):
+            return _FakeFilesService()
+
+    class _FakeDownloader:
+        def __init__(self, fh, request_file):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"cloud-content")
+            return None, True
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
+        patch("xagent.web.api.kb.get_collection_sync", return_value=MagicMock()),
+        patch("xagent.web.api.kb.list_document_records", return_value=[{"d": 1}]),
+        patch("xagent.web.api.kb.get_google_credentials", return_value=object()),
+        patch("xagent.web.api.kb.build", return_value=_FakeDriveService()),
+        patch("xagent.web.api.kb.MediaIoBaseDownload", _FakeDownloader),
+        patch(
+            "xagent.web.api.kb.run_document_ingestion",
+            return_value=IngestionResult(
+                status="success",
+                doc_id="cloud-doc-id",
+                parse_hash="hash",
+                chunk_count=1,
+                completed_steps=[IngestionStepResult(name="register_document")],
+                message="success",
+                file_id="cloud-file-1",
+            ),
+        ),
+    ):
+        response = client.post(
+            "/api/kb/ingest-cloud",
+            json={
+                "collection": "cloud_publish_failure",
+                "chunk_size": 2048,
+                "files": [
+                    {
+                        "provider": "google-drive",
+                        "fileId": "drive-file-1",
+                        "fileName": "doc.txt",
+                    }
+                ],
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 500
+    payload = response.json()
+    assert [item["status"] for item in payload["results"]] == ["success"]
+    assert "cloud-file-1" in payload["detail"]

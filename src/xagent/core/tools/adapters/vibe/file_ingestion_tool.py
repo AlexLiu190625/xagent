@@ -131,7 +131,10 @@ async def _create_knowledge_base_from_file_impl(
         from ...core.RAG_tools.pipelines.document_ingestion import (
             run_document_ingestion,
         )
-        from .agent_kb_service import AgentKnowledgeBaseService
+        from .agent_kb_service import (
+            AgentKnowledgeBaseError,
+            AgentKnowledgeBaseService,
+        )
 
         tool_args = CreateKnowledgeBaseFromFileArgs.model_validate(args)
 
@@ -173,10 +176,10 @@ async def _create_knowledge_base_from_file_impl(
             user_id=user_id,
             is_admin=is_admin,
         )
-        collection_name = await kb_service.prepare_collection(
-            collection_name=collection_name,
-            ingestion_config=config,
-        )
+        collection_name = await kb_service.prepare_collection(collection_name)
+        # The ingest pipeline writes a metadata row of its own; remember whether
+        # the collection is ours to clean up if every file fails.
+        collection_existed_before = await kb_service.collection_exists(collection_name)
 
         ingested_count = 0
         errors = []
@@ -218,7 +221,7 @@ async def _create_knowledge_base_from_file_impl(
                 )
                 continue
 
-            if result.status == "error":
+            if not result.produced_documents:
                 errors.append(f"Failed to ingest {record.filename}: {result.message}")
             else:
                 ingested_count += 1
@@ -229,6 +232,8 @@ async def _create_knowledge_base_from_file_impl(
                 )
 
         if ingested_count == 0:
+            if not collection_existed_before:
+                await kb_service.cleanup_failed_collection(collection_name)
             return CreateKnowledgeBaseFromFileResult(
                 success=False,
                 collection_name=collection_name,
@@ -243,6 +248,26 @@ async def _create_knowledge_base_from_file_impl(
         if errors:
             message += f" Warnings: {'; '.join(errors)}"
 
+        try:
+            await kb_service.publish_collection(
+                collection_name,
+                config,
+                collection_existed_before=collection_existed_before,
+            )
+        except AgentKnowledgeBaseError as exc:
+            # The files landed; retrying would duplicate them. Report the
+            # collection name so the caller can act on what exists.
+            logger.error("Could not publish agent knowledge base: %s", exc)
+            return CreateKnowledgeBaseFromFileResult(
+                success=False,
+                collection_name=collection_name,
+                message=(
+                    f"Ingested {ingested_count} file(s) into '{collection_name}' but "
+                    f"could not publish it, so it is not listed yet. Do not re-import; "
+                    f"retry publishing: {exc}"
+                ),
+                files_ingested=ingested_count,
+            ).model_dump()
         await kb_service.refresh_collection_metadata(collection_name)
 
         return CreateKnowledgeBaseFromFileResult(

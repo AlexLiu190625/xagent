@@ -1255,6 +1255,31 @@ class IngestionResult(BaseModel):
         description="Uploaded file ID for preview/download via /api/files (when ingest registers the file)",
     )
 
+    @property
+    def produced_documents(self) -> int:
+        """How many documents this run left in the collection.
+
+        Keyed on the ``register_document`` step rather than on chunk counts: a
+        registered document is listed in the knowledge base and can be opened and
+        deleted, so it must be published even when it produced no chunks (an
+        empty file, a re-ingest with nothing new to embed). Counting chunks here
+        would leave those runs with documents and no config row — invisible to
+        their owner and blocking the name, which is the failure this PR removes.
+
+        This describes the run, not the collection, which is why callers that
+        roll back still differ in what they publish: `/ingest`, its job twin and
+        `/ingest-cloud` roll a ``partial`` document back, so they exclude those
+        states and publish nothing for them; the agent tools do not roll back, so
+        for them a ``partial`` document is still in the collection and must be
+        published. Same predicate, different rollback policy — a caller that rolls
+        back must either ask before doing so or exclude what it rolled back.
+        """
+        if self.status == "error":
+            return 0
+        return int(
+            any(step.name == "register_document" for step in self.completed_steps)
+        )
+
 
 # ------------------------- Management -------------------------
 
