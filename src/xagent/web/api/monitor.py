@@ -571,29 +571,39 @@ async def get_model_stats(
             logger.error(f"Failed to query model stats: {e}")
             model_stats = []
 
-        # Get total call count for calculating usage rate
-        total_calls = sum(stat.total_calls for stat in model_stats)
+        # Rows the response will carry. Filtered here rather than inside the
+        # loop so a dropped row stays out of the denominator too: the query
+        # rejects a NULL model name but not an empty one, and counting calls
+        # that are never reported would deflate every rate that is.
+        counted_models = [
+            (model_name, model_calls)
+            for model_name, model_calls in model_stats
+            if model_name and model_calls > 0
+        ]
+
+        # Denominator for each model's share of the traffic. Must stay distinct
+        # from the loop's per-model variable: while the two shared a name the
+        # rate divided a model's calls by itself and every model reported 100%
+        # (#1245).
+        all_model_calls = sum(model_calls for _, model_calls in counted_models)
 
         result = []
-        for model_name, total_calls in model_stats:
-            if model_name and total_calls > 0:
-                usage_rate = (total_calls / total_calls * 100) if total_calls > 0 else 0
+        for model_name, model_calls in counted_models:
+            # No zero-guard needed: the sum runs over these same rows, each of
+            # which the comprehension above established is positive.
+            usage_rate = model_calls / all_model_calls * 100
 
-                result.append(
-                    {
-                        "name": model_name,
-                        "status": "running",
-                        "usage_rate": round(usage_rate, 1),
-                        "success_rate": None,  # Simplified, do not calculate success rate
-                        "total_tasks": total_calls,
-                        "successful_tasks": None,
-                        "failed_tasks": None,
-                    }
-                )
-
-        # If no real data, return empty list
-        if not result:
-            return []
+            result.append(
+                {
+                    "name": model_name,
+                    "status": "running",
+                    "usage_rate": round(usage_rate, 1),
+                    "success_rate": None,  # Simplified, do not calculate success rate
+                    "total_tasks": model_calls,
+                    "successful_tasks": None,
+                    "failed_tasks": None,
+                }
+            )
 
         return result
     except Exception as e:
