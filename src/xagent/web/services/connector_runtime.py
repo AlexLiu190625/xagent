@@ -8,6 +8,7 @@ consume the resolved runtime view later in the execution path.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from threading import RLock
@@ -44,6 +45,8 @@ from ..models.agent import Agent
 from ..models.custom_api import CustomApi, UserCustomApi
 from ..models.mcp import MCPServer, UserMCPServer
 from ..models.task import Task, TaskConnectorRuntimeContext
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -244,6 +247,7 @@ def load_connector_runtime_view(
     task_id: int,
     turn_id: str | None,
     user_id: int | None,
+    agent_team_id: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Resolve task-bound and per-turn runtime values for tool creation."""
 
@@ -264,15 +268,25 @@ def load_connector_runtime_view(
     ephemeral_manifest = (
         get_ephemeral_runtime_manifest(turn_id) if isinstance(turn_id, str) else None
     )
-    visible = _load_visible_runtime_connectors(db, user_id=task_owner_user_id)
+    visible = _load_visible_runtime_connectors(
+        db, user_id=task_owner_user_id, agent_team_id=agent_team_id
+    )
 
     runtime_view: dict[str, dict[str, Any]] = {}
     for ref in selected_refs:
         connector = visible.get(ref)
         if connector is None:
-            # Tool loading applies the same visibility filter before instantiating
-            # MCP/Custom API tools, so a now-hidden historical ref has no runtime
-            # tool to receive values on this turn.
+            # Tool loading applies the same visibility filter before
+            # instantiating a tool, so a now-hidden historical ref has no
+            # runtime tool to receive values on this turn. This holds for
+            # MCP on both the new-hook and legacy-hook branches, and for
+            # Custom API on the new-hook branch too (narrowed to the
+            # junction-only set until a follow-up team-keys the Custom API
+            # tool loaders and this branch's Custom API set to match). On
+            # the legacy-hook branch the filters diverge for Custom API: a
+            # legacy user-keyed hook can grant a team-shared Custom API
+            # here while the Custom API tool loader resolves junction-only,
+            # so such a ref stays visible without a runtime tool.
             continue
         raw_ephemeral = (
             ephemeral_by_ref.get(ref.storage_key, {})
@@ -329,7 +343,11 @@ def prepare_create_connector_runtime(
     connector visibility and must be the same owner later persisted on Task.
     """
 
-    visible = _load_visible_runtime_connectors(db, user_id=int(connector_user_id))
+    visible = _load_visible_runtime_connectors(
+        db,
+        user_id=int(connector_user_id),
+        agent_team_id=int(agent.team_id) if agent.team_id is not None else None,
+    )
     selected_refs = _plan_selected_refs(agent, visible)
     payload_by_ref = _parse_payload_items(payload_items)
     if not allow_ephemeral:
@@ -383,10 +401,13 @@ def prepare_connector_runtime_selection_snapshot(
     This helper is intentionally selection-only: non-/v1 task creation paths do
     not accept per-invocation runtime payloads in this phase. ``agent`` supplies
     the agent's tool-selection policy, while ``connector_user_id`` supplies the
-    same connector visibility scope used by normal web tool loading
-    (``WebToolConfig`` loads MCP/Custom API junction rows for the task runtime
-    owner). For published-agent chats, this therefore follows the task owner
-    rather than the published agent owner, matching existing tool loading.
+    same connector visibility scope used by normal web tool loading:
+    ``connector_user_id``'s personal MCP/Custom API links, unioned with
+    ``agent``'s owning team's connectors for MCP when a team-keyed hook is
+    installed (Custom API stays junction-only for now). For published-agent
+    chats, personal visibility still follows the task owner rather than the
+    published agent's owner; team visibility follows the agent regardless of
+    who is running it.
     """
 
     if agent is None or connector_user_id is None:
@@ -467,7 +488,11 @@ def prepare_append_connector_runtime(
     task_source = _task_source(task)
     selected_refs = _load_task_selected_refs(task)
     payload_by_ref = _parse_payload_items(payload_items)
-    visible = _load_visible_runtime_connectors(db, user_id=task_owner_user_id)
+    visible = _load_visible_runtime_connectors(
+        db,
+        user_id=task_owner_user_id,
+        agent_team_id=int(agent.team_id) if agent.team_id is not None else None,
+    )
     _validate_payload_refs(payload_by_ref, visible=visible, selected_refs=selected_refs)
 
     persisted_context = _load_task_context_rows(db, task_id=int(task.id))
@@ -565,12 +590,51 @@ def _optional_mapping(value: Any) -> dict[str, Any]:
 
 
 def _load_visible_runtime_connectors(
-    db: Session, *, user_id: int
+    db: Session, *, user_id: int, agent_team_id: int | None = None
 ) -> dict[ConnectorRef, Any]:
-    from .connector_team_scope import visible_team_connector_ids
+    from .connector_team_scope import (
+        team_connector_hook_installed,
+        team_connector_ids,
+        visible_team_connector_ids,
+    )
 
     visible: dict[ConnectorRef, Any] = {}
-    team_ids = visible_team_connector_ids(db, int(user_id))
+    if team_connector_hook_installed():
+        # Team ownership is resolved from the team that owns the governing
+        # agent. A run with no governing agent resolves personal links only.
+        try:
+            team_ids = team_connector_ids(db, team_id=agent_team_id)
+        except ConnectorRuntimeError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Failed to resolve team connector scope for user %s",
+                user_id,
+                exc_info=True,
+            )
+            raise ConnectorRuntimeError(
+                ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+                "Connector team scope is unavailable.",
+                details={"reason": "team_scope_resolution_failed"},
+                status_code=503,
+            ) from exc
+        # Custom API is not team-keyed on either side of this seam yet: the
+        # tool-build loaders (WebToolConfig's custom-API paths) stay
+        # junction-only until a follow-up team-keys them too. Consuming the
+        # "custom_api" half here without a matching consumer would let a
+        # team-owned custom API be selected into a task's runtime snapshot
+        # and then fail at runtime-view resolution (no personal link to
+        # satisfy it) while never building a tool either -- so this side
+        # stays MCP-only until both halves move together.
+        team_ids = {"mcp": team_ids["mcp"], "custom_api": set()}
+    else:
+        # No team-keyed hook: keep the legacy user-keyed overlay exactly as
+        # it is, so an installation that adopts this revision without
+        # installing the new hook behaves as it did before. Selection is on
+        # hook presence, never on an empty result -- an installed hook
+        # answers with empty sets for a team that owns nothing, and that
+        # answer is authoritative.
+        team_ids = visible_team_connector_ids(db, int(user_id))
 
     own_mcp = (
         db.query(MCPServer)
@@ -615,7 +679,11 @@ def resolve_agent_selected_connectors(
     iterate deterministically by ``(connector_type, connector_id)``.
     """
 
-    visible = _load_visible_runtime_connectors(db, user_id=int(connector_user_id))
+    visible = _load_visible_runtime_connectors(
+        db,
+        user_id=int(connector_user_id),
+        agent_team_id=int(agent.team_id) if agent.team_id is not None else None,
+    )
     return _select_agent_visible_connectors(agent, visible)
 
 

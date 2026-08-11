@@ -28,6 +28,7 @@ def test_connector_team_hooks_delegate_and_reset():
 
     connector_scope.set_connector_team_hooks(
         visibility=lambda db, user_id: {"mcp": {11}, "custom_api": {22}},
+        team_visibility=lambda db, *, team_id: {"mcp": {33}, "custom_api": {44}},
         deleted=lambda db, user_id, kind, connector_id: (
             deleted_calls.append((db, user_id, kind, connector_id))
             or connector_scope.ConnectorDeleteDecision(
@@ -43,6 +44,10 @@ def test_connector_team_hooks_delegate_and_reset():
             "mcp": {11},
             "custom_api": {22},
         }
+        assert connector_scope.team_connector_ids(None, team_id=9) == {
+            "mcp": {33},
+            "custom_api": {44},
+        }
         decision = connector_scope.delete_team_connector(None, 7, "mcp", 11)
         assert decision.team_owned and decision.authorized
         connector_scope.rename_team_connector(None, 7, "mcp", 11, "old", "new")
@@ -50,6 +55,7 @@ def test_connector_team_hooks_delegate_and_reset():
         assert renamed_calls == [(None, 7, "mcp", 11, "old", "new")]
     finally:
         connector_scope.set_connector_team_hooks()
+    assert connector_scope.team_connector_hook_installed() is False
 
 
 def test_knowledge_base_team_hooks_delegate_with_none_session():

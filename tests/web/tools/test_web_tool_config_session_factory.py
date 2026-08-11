@@ -151,6 +151,9 @@ class _Chain:
     def join(self, *a, **k):
         return self
 
+    def order_by(self, *a, **k):
+        return self
+
     def all(self):
         return []
 
@@ -187,6 +190,9 @@ class _ListChain:
         return self
 
     def join(self, *a, **k):
+        return self
+
+    def order_by(self, *a, **k):
         return self
 
     def all(self):

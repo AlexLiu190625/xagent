@@ -1075,6 +1075,10 @@ class AgentRuntimeFields:
     name: str
     status: Any  # AgentStatus enum (typed loosely to avoid an import cycle)
     instructions: Optional[str]
+    # ``None`` for a personal/legacy agent and for every task with no
+    # ``agent_id``. Read by the team-scope connector-visibility hook seam;
+    # a fail-closed default keeps an un-migrated construction site personal.
+    team_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -1297,6 +1301,9 @@ def resolve_task_runtime_config_core(
                     str(agent_row.instructions)
                     if agent_row.instructions is not None
                     else None
+                ),
+                team_id=(
+                    int(agent_row.team_id) if agent_row.team_id is not None else None
                 ),
             )
     else:

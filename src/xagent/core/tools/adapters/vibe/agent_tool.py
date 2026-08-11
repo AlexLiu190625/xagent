@@ -2207,6 +2207,16 @@ class AgentTool(AbstractBaseTool):
                     "scope_segments": _scope_segments,
                 },
                 execution_scope=self._execution_scope,
+                # Delegated sub-agents stay closed: identity here is restored
+                # from a persisted workforce snapshot with no re-authorization
+                # at consumption, so opening team connector visibility would
+                # grant a team's connectors -- and the shared definition row's
+                # credentials, for static-auth transports -- off a snapshot
+                # nobody re-checks at delegation time. A spec naming a
+                # team-only server resolves to an empty tool set, silently,
+                # not an error; this is the deliberate scope this parameter
+                # enforces, not an oversight.
+                connector_team_id=None,
             )
 
             async def execute_delegated_runtime() -> tuple[dict[str, Any], Any]:
