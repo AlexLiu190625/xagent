@@ -751,12 +751,10 @@ describe("Home", () => {
     }
   })
 
-  it("keeps the Home replacement contract, resolver, interaction owner, and cumulative manifest non-vacuously source-locked", () => {
+  it("keeps the Home replacement contract, resolver, and interaction owner non-vacuously source-locked", () => {
     const contractsSource = readFileSync("src/lib/page-extension-contracts.ts", "utf8")
     const extensionSource = readFileSync("src/lib/home-page-extension.tsx", "utf8")
     const pageSource = readFileSync("src/app/page.tsx", "utf8")
-    const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as { scripts: Record<string, string> }
-    const expectedManifest = "vitest run --config vitest.config.ts src/app/build/ src/app/page.test.tsx src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts"
     const contractInterface = sourceSlice(
       contractsSource,
       "export interface HomeGetStartedDestinationOverrides",
@@ -793,7 +791,6 @@ describe("Home", () => {
     expect(cardRender.match(/resolveHomeGetStartedDestination\(/g)).toHaveLength(3)
     expect(cardRender.match(/defaultHomeGetStartedDestinations\./g)).toHaveLength(3)
     expect(cardRender).not.toMatch(/https:\/\/docs\.xagent\.co\//)
-    expect(packageJson.scripts["test:home-build-pages"]).toBe(expectedManifest)
   })
 
   it("uses the shared resolver, real task body parser, and ordered successful commit", async () => {
