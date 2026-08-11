@@ -1,10 +1,10 @@
 /**
  * Guards accidental drift across .github/workflows/ci.yml, package.json launchers,
- * and vitest.config.ts discovery. test:ci-manifest and test:pages are independent
+ * and vitest.config.ts discovery. test:ci-manifest and test:run are independent
  * launchers; legitimate changes update the owner files and these invariants together.
  */
 import { spawnSync } from "node:child_process"
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import ts from "typescript"
@@ -27,12 +27,7 @@ vi.mock("vitest/config", () => ({
 }))
 
 const manifestCommand = "vitest run --config vitest.config.ts src/ci/frontend-test-manifest.test.ts"
-const pagesCommand =
-  "vitest run --config vitest.config.ts src/components/pages src/ci/frontend-test-manifest.test.ts"
-const kbComponentsCommand = "vitest run --config vitest.config.ts src/components/kb"
-const appPagesCommand = "vitest run --config vitest.config.ts src/app"
-const homeBuildContractsCommand =
-  "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts"
+const fullSuiteCommand = "vitest run"
 const ciSummaryCondition =
   "always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)"
 const frontendSummaryCheckCommand =
@@ -60,13 +55,23 @@ const ciSummaryFailurePropagationCommands = [
 const requiredFrontendSteps = [
   { command: "npm run test:widget:coverage", requiresExplicitBash: false },
   { command: "npm run test:ci-manifest", requiresExplicitBash: true },
-  { command: "npm run test:pages", requiresExplicitBash: true },
-  { command: "npm run test:kb-components", requiresExplicitBash: false },
-  { command: "npm run test:app-pages", requiresExplicitBash: false },
-  { command: "npm run test:home-build-contracts", requiresExplicitBash: false },
+  { command: "npm run test:run", requiresExplicitBash: true },
 ] as const
+const retiredFrontendLaunchers = new Set([
+  "npm run test:pages",
+  "npm run test:kb-components",
+  "npm run test:app-pages",
+  "npm run test:home-build-contracts",
+])
 const moduleDir = path.dirname(fileURLToPath(import.meta.url))
 const frontendRoot = path.resolve(moduleDir, "../..")
+const frontendRootEntryNames = readdirSync(frontendRoot)
+const recognizedWorkspaceProjectFilenames = ["vitest.workspace", "vitest.projects"].flatMap(
+  (basename) =>
+    [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs", ".json"].map(
+      (extension) => `${basename}${extension}`,
+    ),
+)
 const packageJsonPath = path.resolve(moduleDir, "../../package.json")
 const workflowPath = path.resolve(moduleDir, "../../../.github/workflows/ci.yml")
 const widgetConfigPath = path.resolve(moduleDir, "../../vitest.widget.config.ts")
@@ -82,7 +87,7 @@ function replaceExactlyOnce(source: string, search: string, replacement: string,
     throw new Error(`${owner} must appear exactly once; found ${count}`)
   }
 
-  const mutated = source.replace(search, replacement)
+  const mutated = source.replace(search, () => replacement)
   if (mutated === source) {
     throw new Error(`${owner} mutation must change the source`)
   }
@@ -414,8 +419,79 @@ function assertSemanticWorkflowManifest(source: string) {
     }
   }
 
-  if (frontendBuild.steps.some((step) => step.run === "npm run test:home-build-pages")) {
-    throw new Error("legacy test:home-build-pages must not run in frontend-build")
+  const retiredDirectLauncher = frontendBuild.steps
+    .map((step) => {
+      requireRecord(step, "jobs.frontend-build.steps entry")
+      return typeof step.run === "string" ? step.run.trim() : undefined
+    })
+    .find((run) => run !== undefined && retiredFrontendLaunchers.has(run))
+
+  if (retiredDirectLauncher !== undefined) {
+    throw new Error(
+      `jobs.frontend-build must not directly run retired targeted launcher ${retiredDirectLauncher}`,
+    )
+  }
+}
+
+function assertRegularSuiteDiscovery(
+  config: unknown,
+  scripts: Record<string, string>,
+  rootEntryNames: readonly string[],
+) {
+  requireRecord(config, "regular Vitest config")
+  if (scripts["test:run"] !== fullSuiteCommand) {
+    throw new Error("regular launcher must keep test:run as vitest run")
+  }
+
+  const testConfig = config.test
+  requireRecord(testConfig, "regular Vitest config.test")
+  const expectedBaseInclude = ["src/**/*.test.ts", "src/**/*.test.tsx"]
+  const actualBaseInclude = Array.isArray(testConfig.include) ? [...testConfig.include].sort() : []
+  if (JSON.stringify(actualBaseInclude) !== JSON.stringify(expectedBaseInclude)) {
+    throw new Error("regular base discovery must preserve automatic discovery")
+  }
+  if (testConfig.exclude !== undefined) {
+    throw new Error("regular base discovery must preserve automatic discovery")
+  }
+  if (Boolean(testConfig.passWithNoTests)) {
+    throw new Error("regular base discovery must preserve automatic discovery")
+  }
+
+  if (
+    config.workspace !== undefined ||
+    testConfig.workspace !== undefined ||
+    rootEntryNames.some((entryName) => recognizedWorkspaceProjectFilenames.includes(entryName))
+  ) {
+    throw new Error("regular workspace/project graph must be disabled")
+  }
+
+  const selectionValues = [
+    config.root,
+    testConfig.root,
+    testConfig.dir,
+    config.testNamePattern,
+    testConfig.testNamePattern,
+    config.related,
+    testConfig.related,
+    config.changed,
+    testConfig.changed,
+    config.shard,
+    testConfig.shard,
+    config.project,
+    testConfig.project,
+    config.filters,
+    testConfig.filters,
+    config.cliExclude,
+    testConfig.cliExclude,
+  ]
+  if (
+    selectionValues.some((value) => value !== undefined) ||
+    Boolean(config.standalone) ||
+    Boolean(testConfig.standalone) ||
+    Boolean(config.allowOnly) ||
+    Boolean(testConfig.allowOnly)
+  ) {
+    throw new Error("regular execution must be selection-neutral")
   }
 }
 
@@ -1002,6 +1078,40 @@ describe("frontend CI test manifest", () => {
     )
   })
 
+  it("requires the full regular suite in frontend-build", () => {
+    expect(() => assertSemanticWorkflowManifest(realWorkflowSource)).not.toThrow()
+  })
+
+  it.each([
+    [
+      "npm run test:pages",
+      "      - name: Retired page test lane\n        working-directory: ./frontend\n        run: |\n\n          npm run test:pages\n\n",
+    ],
+    [
+      "npm run test:kb-components",
+      "      - name: Retired KB component test lane\n        working-directory: ./frontend\n        run: npm run test:kb-components\n\n",
+    ],
+    [
+      "npm run test:app-pages",
+      "      - name: Retired App Router test lane\n        working-directory: ./frontend\n        run: npm run test:app-pages\n\n",
+    ],
+    [
+      "npm run test:home-build-contracts",
+      "      - name: Retired home build contract lane\n        working-directory: ./frontend\n        run: npm run test:home-build-contracts\n\n",
+    ],
+  ])("rejects retired direct launcher %s", (launcher, retiredStep) => {
+    const source = replaceExactlyOnce(
+      realWorkflowSource,
+      "      - name: Build frontend (static export)\n",
+      `${retiredStep}      - name: Build frontend (static export)\n`,
+      `${launcher} direct launcher insertion`,
+    )
+
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow(
+      `jobs.frontend-build must not directly run retired targeted launcher ${launcher}`,
+    )
+  })
+
   it.each([
     ["LF", realWorkflowSource],
     ["CRLF", realWorkflowSource.replace(/\r?\n/g, "\r\n")],
@@ -1009,26 +1119,25 @@ describe("frontend CI test manifest", () => {
     expect(() => assertSemanticWorkflowManifest(source)).not.toThrow()
   })
 
-  it("removes the App Router step semantically when its presentation drifts", () => {
+  it("removes the full regular suite semantically when its presentation drifts", () => {
     const workflowSource = realWorkflowSource
     const source = replaceExactlyOnce(
       workflowSource,
-      "      - name: Run App Router tests\n        working-directory: ./frontend\n        run: npm run test:app-pages\n",
-      "      - run: npm run test:app-pages\n        env:\n          APP_ROUTER_TEST_MODE: manifest\n        working-directory: ./frontend\n        name: Run App Router tests\n",
-      "App Router step presentation drift",
+      "      - name: Run full frontend test suite\n        working-directory: ./frontend\n        shell: bash\n        run: npm run test:run\n",
+      "      - run: npm run test:run\n        env:\n          FULL_SUITE_MODE: manifest\n        working-directory: ./frontend\n        shell: bash\n        name: Run full frontend test suite\n",
+      "full regular suite presentation drift",
     )
     const followingJobs = source.slice(source.indexOf("\n  ci-summary:\n"))
-    const withoutAppStep = removeWorkflowStepByCommand(
+    const withoutFullSuiteStep = removeWorkflowStepByCommand(
       source,
       "frontend-build",
-      "npm run test:app-pages",
-      "App Router step removal",
+      "npm run test:run",
+      "full regular suite removal",
     )
 
-    expect(withoutAppStep).toContain(followingJobs)
-    expect(withoutAppStep).toContain("# The widget lane above is an explicit regression suite")
-    expect(() => assertSemanticWorkflowManifest(withoutAppStep)).toThrow(
-      "npm run test:app-pages must appear in exactly one frontend step",
+    expect(withoutFullSuiteStep).toContain(followingJobs)
+    expect(() => assertSemanticWorkflowManifest(withoutFullSuiteStep)).toThrow(
+      "npm run test:run must appear in exactly one frontend step",
     )
   })
 
@@ -1245,24 +1354,19 @@ describe("frontend CI test manifest", () => {
   it("accepts a folded required command with the same semantic value", () => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      "        run: npm run test:app-pages\n",
-      "        run: >-\n          npm run\n          test:app-pages\n",
-      "App Router command",
+      "        run: npm run test:run\n",
+      "        run: >-\n          npm run\n          test:run\n",
+      "full regular suite command",
     )
     expect(() => assertSemanticWorkflowManifest(source)).not.toThrow()
   })
 
-  it.each([
-    "npm run test:widget:coverage",
-    "npm run test:kb-components",
-    "npm run test:app-pages",
-    "npm run test:home-build-contracts",
-  ])("accepts an explicit bash shell on the %s non-launcher step", (command) => {
+  it("accepts an explicit bash shell on the Widget coverage step", () => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      `        run: ${command}\n`,
-      `        shell: bash\n        run: ${command}\n`,
-      `${command} shell insertion`,
+      "        run: npm run test:widget:coverage\n",
+      "        shell: bash\n        run: npm run test:widget:coverage\n",
+      "Widget coverage shell insertion",
     )
     expect(() => assertSemanticWorkflowManifest(source)).not.toThrow()
   })
@@ -1311,7 +1415,7 @@ describe("frontend CI test manifest", () => {
       "npm run test:ci-manifest has an unexpected shell policy",
     ],
     [
-      "pages launcher with job defaults",
+      "full suite launcher with job defaults",
       (source: string) =>
         replaceExactlyOnce(
           replaceExactlyOnce(
@@ -1320,11 +1424,11 @@ describe("frontend CI test manifest", () => {
             "  frontend-build:\n    defaults:\n      run:\n        shell: bash\n",
             "frontend-build owner",
           ),
-          "        shell: bash\n        run: npm run test:pages\n",
-          "        run: npm run test:pages\n",
-          "pages launcher shell",
+          "        shell: bash\n        run: npm run test:run\n",
+          "        run: npm run test:run\n",
+          "full suite launcher shell",
         ),
-      "npm run test:pages has an unexpected shell policy",
+      "npm run test:run has an unexpected shell policy",
     ],
   ])("requires explicit bash for the %s", (_, transform, expectedError) => {
     const source = transform(realWorkflowSource)
@@ -1458,64 +1562,64 @@ describe("frontend CI test manifest", () => {
   })
 
   it("rejects a required command moved to a sibling job", () => {
-    const withoutAppStep = removeWorkflowStepByCommand(
+    const withoutFullSuiteStep = removeWorkflowStepByCommand(
       realWorkflowSource,
       "frontend-build",
-      "npm run test:app-pages",
-      "App Router step removal",
+      "npm run test:run",
+      "full regular suite removal",
     )
     const source = replaceExactlyOnce(
-      withoutAppStep,
+      withoutFullSuiteStep,
       "\n  ci-summary:\n",
-      "\n  manifest-sibling:\n    runs-on: ubuntu-latest\n    steps:\n      - working-directory: ./frontend\n        run: npm run test:app-pages\n\n  ci-summary:\n",
+      "\n  manifest-sibling:\n    runs-on: ubuntu-latest\n    steps:\n      - working-directory: ./frontend\n        shell: bash\n        run: npm run test:run\n\n  ci-summary:\n",
       "ci-summary insertion point",
     )
 
     expect(source).toContain("  manifest-sibling:\n")
     expect(() => assertSemanticWorkflowManifest(source)).toThrow(
-      "npm run test:app-pages must appear in exactly one frontend step",
+      "npm run test:run must appear in exactly one frontend step",
     )
   })
 
-  it("keeps the moved-to-sibling fixture live when the App step presentation drifts", () => {
+  it("keeps the moved-to-sibling fixture live when full-suite presentation drifts", () => {
     const workflowSource = realWorkflowSource
     const driftedSource = replaceExactlyOnce(
       workflowSource,
-      "      - name: Run App Router tests\n        working-directory: ./frontend\n        run: npm run test:app-pages\n",
-      "      - run: npm run test:app-pages\n        env:\n          APP_ROUTER_TEST_MODE: manifest\n        working-directory: ./frontend\n        name: Run App Router tests\n",
-      "App Router step presentation drift",
+      "      - name: Run full frontend test suite\n        working-directory: ./frontend\n        shell: bash\n        run: npm run test:run\n",
+      "      - run: npm run test:run\n        env:\n          FULL_SUITE_MODE: manifest\n        working-directory: ./frontend\n        shell: bash\n        name: Run full frontend test suite\n",
+      "full regular suite presentation drift",
     )
-    const withoutAppStep = removeWorkflowStepByCommand(
+    const withoutFullSuiteStep = removeWorkflowStepByCommand(
       driftedSource,
       "frontend-build",
-      "npm run test:app-pages",
-      "App Router step removal",
+      "npm run test:run",
+      "full regular suite removal",
     )
 
     expect(driftedSource).not.toBe(workflowSource)
-    expect(() => assertSemanticWorkflowManifest(withoutAppStep)).toThrow(
-      "npm run test:app-pages must appear in exactly one frontend step",
+    expect(() => assertSemanticWorkflowManifest(withoutFullSuiteStep)).toThrow(
+      "npm run test:run must appear in exactly one frontend step",
     )
   })
 
-  it("rejects a same-job heredoc decoy after the real pages step is removed", () => {
-    const withoutPagesStep = replaceExactlyOnce(
+  it("rejects a same-job heredoc decoy after the full regular suite is removed", () => {
+    const withoutFullSuiteStep = replaceExactlyOnce(
       realWorkflowSource,
-      "\n      - name: Run page component tests\n        working-directory: ./frontend\n        shell: bash\n        run: npm run test:pages\n",
+      "\n      - name: Run full frontend test suite\n        working-directory: ./frontend\n        shell: bash\n        run: npm run test:run\n",
       "",
-      "pages launcher step removal",
+      "full regular suite removal",
     )
     const source = replaceExactlyOnce(
-      withoutPagesStep,
-      "\n      - name: Run App Router tests\n",
-      "\n      - name: Preserve page launcher text as a shell heredoc\n        run: |\n          run: npm run test:pages\n\n      - name: Run App Router tests\n",
-      "App Router step insertion point",
+      withoutFullSuiteStep,
+      "\n      - name: Build frontend (static export)\n",
+      "\n      - name: Preserve full-suite text as a shell heredoc\n        run: |\n          run: npm run test:run\n\n      - name: Build frontend (static export)\n",
+      "frontend build insertion point",
     )
 
-    expect(source).not.toContain("      - name: Run page component tests\n")
-    expect(source).toContain("          run: npm run test:pages\n")
+    expect(source).not.toContain("      - name: Run full frontend test suite\n")
+    expect(source).toContain("          run: npm run test:run\n")
     expect(() => assertSemanticWorkflowManifest(source)).toThrow(
-      "npm run test:pages must appear in exactly one frontend step",
+      "npm run test:run must appear in exactly one frontend step",
     )
   })
 
@@ -1523,88 +1627,66 @@ describe("frontend CI test manifest", () => {
     const source = realWorkflowSource
     const missing = replaceExactlyOnce(
       source,
-      "        run: npm run test:app-pages\n",
+      "        run: npm run test:run\n",
       "",
-      "App Router command removal",
+      "full regular suite command removal",
     )
     const duplicate = replaceExactlyOnce(
       source,
-      "\n      - name: Run App Router tests\n",
-      "\n      - name: Duplicate App Router tests\n        working-directory: ./frontend\n        run: npm run test:app-pages\n\n      - name: Run App Router tests\n",
-      "App Router duplicate insertion point",
+      "\n      - name: Run full frontend test suite\n",
+      "\n      - name: Duplicate full frontend test suite\n        working-directory: ./frontend\n        shell: bash\n        run: npm run test:run\n\n      - name: Run full frontend test suite\n",
+      "full regular suite duplicate insertion point",
     )
 
-    expect(missing).not.toContain("        run: npm run test:app-pages\n")
-    expect(duplicate.match(/run: npm run test:app-pages/g)).toHaveLength(2)
+    expect(missing).not.toContain("        run: npm run test:run\n")
+    expect(duplicate.match(/run: npm run test:run/g)).toHaveLength(2)
     expect(() => assertSemanticWorkflowManifest(missing)).toThrow(
-      "npm run test:app-pages must appear in exactly one frontend step",
+      "npm run test:run must appear in exactly one frontend step",
     )
     expect(() => assertSemanticWorkflowManifest(duplicate)).toThrow(
-      "npm run test:app-pages must appear in exactly one frontend step",
-    )
-  })
-
-  it("rejects missing and duplicate KB directory steps", () => {
-    const workflowSource = realWorkflowSource
-    const kbStep =
-      "\n      - name: Run knowledge base component tests\n        working-directory: ./frontend\n        run: npm run test:kb-components\n"
-    const missing = replaceExactlyOnce(workflowSource, kbStep, "", "KB test step removal")
-    const duplicate = replaceExactlyOnce(
-      workflowSource,
-      kbStep,
-      kbStep.repeat(2),
-      "KB test step duplication",
-    )
-
-    expect(missing).not.toContain("run: npm run test:kb-components")
-    expect(duplicate.match(/run: npm run test:kb-components/g)).toHaveLength(2)
-    expect(() => assertSemanticWorkflowManifest(missing)).toThrow(
-      "npm run test:kb-components must appear in exactly one frontend step",
-    )
-    expect(() => assertSemanticWorkflowManifest(duplicate)).toThrow(
-      "npm run test:kb-components must appear in exactly one frontend step",
+      "npm run test:run must appear in exactly one frontend step",
     )
   })
 
   it("rejects a required step with the wrong working directory", () => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      "      - name: Run App Router tests\n        working-directory: ./frontend\n",
-      "      - name: Run App Router tests\n        working-directory: .\n",
-      "App Router working directory",
+      "      - name: Run full frontend test suite\n        working-directory: ./frontend\n",
+      "      - name: Run full frontend test suite\n        working-directory: .\n",
+      "full regular suite working directory",
     )
 
-    expect(source).toContain("      - name: Run App Router tests\n        working-directory: .\n")
+    expect(source).toContain("      - name: Run full frontend test suite\n        working-directory: .\n")
     expect(() => assertSemanticWorkflowManifest(source)).toThrow(
-      "npm run test:app-pages must use ./frontend",
+      "npm run test:run must use ./frontend",
     )
   })
 
   it("rejects a required step-level condition", () => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      "      - name: Run App Router tests\n",
-      "      - name: Run App Router tests\n        if: github.event_name == 'schedule'\n",
-      "App Router step condition",
+      "      - name: Run full frontend test suite\n",
+      "      - name: Run full frontend test suite\n        if: github.event_name == 'schedule'\n",
+      "full regular suite condition",
     )
 
     expect(source).toContain("        if: github.event_name == 'schedule'\n")
     expect(() => assertSemanticWorkflowManifest(source)).toThrow(
-      "npm run test:app-pages must not set if",
+      "npm run test:run must not set if",
     )
   })
 
-  it("rejects custom shells on non-launcher required steps", () => {
+  it("rejects custom shells on the Widget coverage step", () => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      "      - name: Run App Router tests\n        working-directory: ./frontend\n",
-      "      - name: Run App Router tests\n        working-directory: ./frontend\n        shell: echo {0}\n",
-      "App Router step shell",
+      "      - name: Run widget regression tests with coverage\n        working-directory: ./frontend\n",
+      "      - name: Run widget regression tests with coverage\n        working-directory: ./frontend\n        shell: echo {0}\n",
+      "Widget coverage shell",
     )
 
     expect(source).toContain("        shell: echo {0}\n")
     expect(() => assertSemanticWorkflowManifest(source)).toThrow(
-      "npm run test:app-pages has an unexpected shell policy",
+      "npm run test:widget:coverage has an unexpected shell policy",
     )
   })
 
@@ -1620,13 +1702,13 @@ describe("frontend CI test manifest", () => {
         ),
     ],
     [
-      "test:pages",
+      "test:run",
       (source: string) =>
         replaceExactlyOnce(
           source,
-          "      - name: Run page component tests\n        working-directory: ./frontend\n        shell: bash\n",
-          "      - name: Run page component tests\n        working-directory: ./frontend\n        shell: echo {0}\n",
-          "pages launcher shell",
+          "      - name: Run full frontend test suite\n        working-directory: ./frontend\n        shell: bash\n",
+          "      - name: Run full frontend test suite\n        working-directory: ./frontend\n        shell: echo {0}\n",
+          "full regular suite launcher shell",
         ),
     ],
   ])("rejects a non-bash %s launcher", (_, transform) => {
@@ -1644,9 +1726,9 @@ describe("frontend CI test manifest", () => {
       (source: string) =>
         replaceExactlyOnce(
           source,
-          "        run: npm run test:app-pages\n",
-          "        continue-on-error: true\n        run: npm run test:app-pages\n",
-          "App Router continue-on-error insertion",
+          "        run: npm run test:run\n",
+          "        continue-on-error: true\n        run: npm run test:run\n",
+          "full regular suite continue-on-error insertion",
         ),
       "frontend-build steps must not set continue-on-error",
     ],
@@ -1937,24 +2019,128 @@ describe("frontend CI test manifest", () => {
     )
   })
 
-  it("keeps package launchers and Vitest discovery contracts source-locked", () => {
+  const buildRegularSuiteFixture = () => {
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+      scripts: Record<string, string>
+    }
+    return {
+      config: { ...vitestConfig, test: { ...vitestConfig.test } } as Record<string, unknown>,
+      scripts: { ...packageJson.scripts },
+      rootEntryNames: [...frontendRootEntryNames],
+    }
+  }
+
+  it.each([
+    ["a missing test:run launcher", (scripts: Record<string, string>) => delete scripts["test:run"]],
+    ["a wrong test:run launcher", (scripts: Record<string, string>) => (scripts["test:run"] = "vitest")],
+  ])("rejects %s at the regular launcher owner", (_, mutate) => {
+    const fixture = buildRegularSuiteFixture()
+    mutate(fixture.scripts)
+
+    expect(() => assertRegularSuiteDiscovery(fixture.config, fixture.scripts, fixture.rootEntryNames)).toThrow(
+      "regular launcher must keep test:run as vitest run",
+    )
+  })
+
+  it.each([
+    ["a wrong include", (test: Record<string, unknown>) => (test.include = ["src/**/*.test.ts"])],
+    ["any exclude", (test: Record<string, unknown>) => (test.exclude = [])],
+    ["truthy passWithNoTests", (test: Record<string, unknown>) => (test.passWithNoTests = true)],
+  ])("rejects %s at the regular base discovery owner", (_, mutate) => {
+    const fixture = buildRegularSuiteFixture()
+    mutate(fixture.config.test as Record<string, unknown>)
+
+    expect(() => assertRegularSuiteDiscovery(fixture.config, fixture.scripts, fixture.rootEntryNames)).toThrow(
+      "regular base discovery must preserve automatic discovery",
+    )
+  })
+
+  it.each([
+    ["a top-level root", "top-level", "root", "src"],
+    ["a test-level root", "test", "root", "src"],
+    ["a test-level dir", "test", "dir", "src"],
+    ["a top-level test name pattern", "top-level", "testNamePattern", "frontend CI test manifest"],
+    ["a test-level test name pattern", "test", "testNamePattern", "frontend CI test manifest"],
+    ["a top-level related selector", "top-level", "related", ["src/components/pages"]],
+    ["a test-level related selector", "test", "related", ["src/components/pages"]],
+    ["a top-level changed selector", "top-level", "changed", true],
+    ["a test-level changed selector", "test", "changed", true],
+    ["a top-level partial shard", "top-level", "shard", { index: 1, count: 2 }],
+    ["a test-level partial shard", "test", "shard", { index: 1, count: 2 }],
+    ["a top-level project selector", "top-level", "project", "focused"],
+    ["a test-level project selector", "test", "project", "focused"],
+    ["a top-level filters selector", "top-level", "filters", ["src"]],
+    ["a test-level filters selector", "test", "filters", ["src"]],
+    ["a top-level cliExclude selector", "top-level", "cliExclude", ["src/components"]],
+    ["a test-level cliExclude selector", "test", "cliExclude", ["src/components"]],
+    ["a truthy top-level standalone", "top-level", "standalone", true],
+    ["a truthy test-level standalone", "test", "standalone", true],
+    ["a truthy top-level allowOnly", "top-level", "allowOnly", true],
+    ["a truthy test-level allowOnly", "test", "allowOnly", true],
+  ])("rejects %s at the regular selection owner", (_, location, key, value) => {
+    const fixture = buildRegularSuiteFixture()
+    const owner = location === "test" ? fixture.config.test : fixture.config
+    ;(owner as Record<string, unknown>)[key as string] = value
+
+    expect(() => assertRegularSuiteDiscovery(fixture.config, fixture.scripts, fixture.rootEntryNames)).toThrow(
+      "regular execution must be selection-neutral",
+    )
+  })
+
+  it.each([
+    ["top-level workspace", "top-level"],
+    ["test workspace", "test"],
+  ])("rejects %s at the regular workspace/project graph owner", (_, location) => {
+    const fixture = buildRegularSuiteFixture()
+    const owner = location === "test" ? fixture.config.test : fixture.config
+    ;(owner as Record<string, unknown>).workspace = "vitest.workspace.ts"
+
+    expect(() => assertRegularSuiteDiscovery(fixture.config, fixture.scripts, fixture.rootEntryNames)).toThrow(
+      "regular workspace/project graph must be disabled",
+    )
+  })
+
+  it.each(recognizedWorkspaceProjectFilenames)(
+    "rejects the recognized workspace/project filename %s at the graph owner",
+    (filename) => {
+      const fixture = buildRegularSuiteFixture()
+      fixture.rootEntryNames.push(filename)
+
+      expect(() =>
+        assertRegularSuiteDiscovery(fixture.config, fixture.scripts, fixture.rootEntryNames),
+      ).toThrow("regular workspace/project graph must be disabled")
+    },
+  )
+
+  it.each([
+    ["top-level standalone false", "top-level", "standalone", false],
+    ["top-level standalone zero", "top-level", "standalone", 0],
+    ["top-level standalone empty string", "top-level", "standalone", ""],
+    ["test standalone false", "test", "standalone", false],
+    ["test standalone zero", "test", "standalone", 0],
+    ["test standalone empty string", "test", "standalone", ""],
+    ["top-level allowOnly false", "top-level", "allowOnly", false],
+    ["top-level allowOnly zero", "top-level", "allowOnly", 0],
+    ["top-level allowOnly empty string", "top-level", "allowOnly", ""],
+    ["test allowOnly false", "test", "allowOnly", false],
+    ["test allowOnly zero", "test", "allowOnly", 0],
+    ["test allowOnly empty string", "test", "allowOnly", ""],
+  ])("accepts falsey %s", (_, location, key, value) => {
+    const fixture = buildRegularSuiteFixture()
+    const owner = location === "test" ? fixture.config.test : fixture.config
+    ;(owner as Record<string, unknown>)[key as string] = value
+
+    expect(() =>
+      assertRegularSuiteDiscovery(fixture.config, fixture.scripts, fixture.rootEntryNames),
+    ).not.toThrow()
+  })
+
+  it("keeps package launchers and regular Vitest discovery contracts source-locked", () => {
     const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
       scripts: Record<string, string>
     }
 
     expect(packageJson.scripts["test:ci-manifest"]).toBe(manifestCommand)
-    expect(packageJson.scripts["test:pages"]).toBe(pagesCommand)
-    expect(packageJson.scripts["test:kb-components"]).toBe(kbComponentsCommand)
-    expect(packageJson.scripts["test:app-pages"]).toBe(appPagesCommand)
-    expect(packageJson.scripts["test:home-build-contracts"]).toBe(homeBuildContractsCommand)
-    expect(packageJson.scripts["test:home-build-pages"]).toBeUndefined()
-
-    const testConfig = vitestConfig.test
-    expect([...(testConfig?.include ?? [])].sort()).toEqual([
-      "src/**/*.test.ts",
-      "src/**/*.test.tsx",
-    ])
-    expect(testConfig?.exclude).toBeUndefined()
-    expect(testConfig?.passWithNoTests).toBeFalsy()
+    assertRegularSuiteDiscovery(vitestConfig, packageJson.scripts, frontendRootEntryNames)
   })
 })
