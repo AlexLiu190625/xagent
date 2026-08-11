@@ -39,6 +39,7 @@ from ..core.execution_scope import (
 from ..core.file_storage import StorageKeyScopeError
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.a2a import router as a2a_router
+from .api.admin_interaction_rollout import router as admin_interaction_rollout_router
 from .api.admin_mcp import admin_mcp_router
 from .api.admin_users import router as admin_users_router
 from .api.agent_api_keys import router as agent_api_keys_router
@@ -77,15 +78,27 @@ from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
 from .services.a2a_protocol import A2AApiError, a2a_api_error_handler, a2a_error
+from .services.interaction_rollout import (
+    get_interaction_rollout_policy,
+    is_native_schema_ready,
+    mark_native_schema_ready,
+    validate_interaction_rollout_at_startup,
+)
 from .services.local_browser_runtime import (
     register_local_browser_runtime,
     unregister_local_browser_runtime,
+)
+from .services.ops_signals import (
+    INTERACTION_ROLLOUT_SCHEMA_ABSENT,
+    clear_degradation,
+    register_degradation,
 )
 from .services.orphan_upload_gc import run_orphan_upload_gc_loop
 from .services.skill_runtime import (
     SkillRuntimeSessionBoundaryError,
     skill_runtime_session_boundary_error_handler,
 )
+from .services.task_interaction_schema import interaction_requests_table_exists
 from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
@@ -695,7 +708,20 @@ async def health_check() -> dict[str, Any]:
 
 @app.get("/ready")
 async def readiness_check() -> JSONResponse:
-    """Readiness check that reflects startup file storage sync status."""
+    """Readiness check for startup file storage sync and, in native
+    interaction-rollout mode, task_interaction_requests schema presence.
+
+    The interaction-rollout segment below is a one-way latch: once the
+    schema has been observed present, this endpoint never queries for it
+    again for the lifetime of the process (the table is only ever added,
+    never dropped, so a stale "present" reading cannot happen). In legacy
+    or read mode the schema check and the database query it would trigger
+    are skipped entirely -- zero added query. The frozen policy read
+    above the mode check always runs regardless of mode, including its
+    RuntimeError-if-uninitialized contract (see
+    ``get_interaction_rollout_policy``'s docstring); that read is cheap
+    (no I/O once the policy is frozen at startup) but it is not skipped.
+    """
     task = getattr(app.state, "file_storage_startup_sync_task", None)
     error = getattr(app.state, "file_storage_startup_sync_error", None)
 
@@ -712,6 +738,54 @@ async def readiness_check() -> JSONResponse:
                 "detail": "Startup file storage sync running",
             },
         )
+
+    policy = get_interaction_rollout_policy()
+    if policy.mode == "native" and not is_native_schema_ready():
+        # If the database itself is unreachable here (connection refused,
+        # timeout), that exception propagates out of this route unhandled
+        # and FastAPI turns it into a 500 -- asymmetric with the deliberate
+        # 503 below for "database reachable, schema not yet migrated".
+        # Accepted: a 500 still fails the readiness probe the same way a
+        # 503 would, and folding "database unreachable" into that same
+        # typed 503 would misreport a connectivity outage as a pending
+        # migration.
+        #
+        # get_session_local is imported here rather than hoisted with the
+        # policy/schema imports above: tests replace
+        # database_module.get_session_local itself with a stub session
+        # factory (see tests/web/test_interaction_rollout_observability.py),
+        # and this import must re-resolve that name from the module on
+        # every call for the replacement to take effect. A module-level
+        # import would bind the original function once at process start
+        # and keep calling it through that binding, silently defeating the
+        # test's monkeypatch.
+        from .models.database import get_session_local
+
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        try:
+            schema_present = interaction_requests_table_exists(db)
+        finally:
+            db.close()
+
+        if not schema_present:
+            # This endpoint is unauthenticated -- the detail below
+            # deliberately does not name the missing table.
+            register_degradation(
+                INTERACTION_ROLLOUT_SCHEMA_ABSENT,
+                "task_interaction_requests table not present",
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "detail": "Interaction rollout schema not ready",
+                },
+            )
+
+        mark_native_schema_ready()
+        clear_degradation(INTERACTION_ROLLOUT_SCHEMA_ABSENT)
+
     return JSONResponse(status_code=200, content={"status": "ready"})
 
 
@@ -994,6 +1068,7 @@ app.include_router(custom_api_router)
 app.include_router(deployment_config_router)
 app.include_router(tools_router)
 app.include_router(admin_users_router)
+app.include_router(admin_interaction_rollout_router)
 app.include_router(admin_mcp_router)
 app.include_router(skills_router)
 app.include_router(skill_hub_router)
@@ -1017,6 +1092,7 @@ app.include_router(v1_router)
 async def startup_event() -> None:
     global _migration_task
     logger.info("Agent runtime configured: %s", get_agent_runtime())
+    validate_interaction_rollout_at_startup()
     logger.info("Initializing database...")
     init_db()
     logger.info("Database initialized successfully")
