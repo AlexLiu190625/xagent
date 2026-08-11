@@ -4,13 +4,22 @@
  * launchers; legitimate changes update the owner files and these invariants together.
  */
 import { spawnSync } from "node:child_process"
-import { readFileSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import ts from "typescript"
 import { isMap, isScalar, isSeq, parseDocument } from "yaml"
 import type { Node } from "yaml"
 import { describe, expect, it, vi } from "vitest"
 import vitestConfig from "../../vitest.config"
+import widgetVitestConfig from "../../vitest.widget.config"
+import {
+  buildWidgetTestOptions,
+  widgetCoverageExtensions,
+  widgetCoverageOwners,
+  widgetTestFiles,
+} from "../../vitest.widget.policy"
+import type { WidgetCoverageOwner } from "../../vitest.widget.policy"
 
 // jsdom can load Vitest config in a second realm where vitest/config cannot initialize.
 vi.mock("vitest/config", () => ({
@@ -57,8 +66,10 @@ const requiredFrontendSteps = [
   { command: "npm run test:home-build-contracts", requiresExplicitBash: false },
 ] as const
 const moduleDir = path.dirname(fileURLToPath(import.meta.url))
+const frontendRoot = path.resolve(moduleDir, "../..")
 const packageJsonPath = path.resolve(moduleDir, "../../package.json")
 const workflowPath = path.resolve(moduleDir, "../../../.github/workflows/ci.yml")
+const widgetConfigPath = path.resolve(moduleDir, "../../vitest.widget.config.ts")
 const realWorkflowSource = readFileSync(workflowPath, "utf8")
 
 function replaceExactlyOnce(source: string, search: string, replacement: string, owner: string) {
@@ -408,7 +419,589 @@ function assertSemanticWorkflowManifest(source: string) {
   }
 }
 
+const coverageMetrics = ["statements", "branches", "functions", "lines"] as const
+const expectedWidgetCoverageExtensions = [".js", ".ts", ".tsx"]
+const widgetCoverageRawKeys = [
+  "provider",
+  "all",
+  "include",
+  "exclude",
+  "extension",
+  "reporter",
+  "reportsDirectory",
+  "thresholds",
+].sort()
+
+function assertFrontendRootRelativePath(value: string, owner: string) {
+  if (
+    value.length === 0 ||
+    path.isAbsolute(value) ||
+    path.win32.isAbsolute(value) ||
+    value.includes("\\") ||
+    value.split("/").includes("..")
+  ) {
+    throw new Error(`${owner} must be a frontend-root-relative POSIX path`)
+  }
+
+  const resolvedPath = path.resolve(frontendRoot, value)
+  if (!resolvedPath.startsWith(`${frontendRoot}${path.sep}`)) {
+    throw new Error(`${owner} must resolve under the frontend root`)
+  }
+  return resolvedPath
+}
+
+function escapeCoverageBrackets(sourcePath: string) {
+  return sourcePath.replace(/[\[\]]/g, (character) => (character === "[" ? "[[]" : "[]]"))
+}
+
+function assertWidgetTestFilePolicy(testFiles: readonly string[]) {
+  const seen = new Set<string>()
+  for (const testFile of testFiles) {
+    const resolvedPath = assertFrontendRootRelativePath(testFile, "Widget test path")
+    if (seen.has(testFile)) {
+      throw new Error("Widget test paths must be unique")
+    }
+    seen.add(testFile)
+    if (!testFile.startsWith("src/")) {
+      throw new Error("Widget test paths must remain under src/")
+    }
+    if (!testFile.endsWith(".test.ts") && !testFile.endsWith(".test.tsx")) {
+      throw new Error("Widget test paths must name Vitest test files")
+    }
+    if (!existsSync(resolvedPath)) {
+      throw new Error("Widget test paths must exist")
+    }
+  }
+}
+
+function assertWidgetCoverageOwnerPolicy(owners: readonly WidgetCoverageOwner[]) {
+  const sourcePaths = new Set<string>()
+  const coveragePatterns = new Set<string>()
+  for (const owner of owners) {
+    const resolvedPath = assertFrontendRootRelativePath(owner.sourcePath, "Widget coverage source path")
+    if (sourcePaths.has(owner.sourcePath)) {
+      throw new Error("Widget coverage source paths must be unique")
+    }
+    sourcePaths.add(owner.sourcePath)
+    if (!existsSync(resolvedPath)) {
+      throw new Error("Widget coverage source paths must exist")
+    }
+    if (/[*?{}()!]/.test(owner.sourcePath)) {
+      throw new Error("Widget coverage source paths must not contain glob metacharacters")
+    }
+
+    const coveragePattern = owner.coveragePattern ?? owner.sourcePath
+    if (coveragePatterns.has(coveragePattern)) {
+      throw new Error("Widget coverage patterns must be unique")
+    }
+    coveragePatterns.add(coveragePattern)
+    const hasBrackets = /[\[\]]/.test(owner.sourcePath)
+    if (hasBrackets && owner.coveragePattern === undefined) {
+      throw new Error("Widget coverage patterns must escape bracketed source paths")
+    }
+    if (!hasBrackets && owner.coveragePattern !== undefined) {
+      throw new Error("Widget coverage patterns must be absent for unbracketed source paths")
+    }
+    if (owner.coveragePattern !== undefined && owner.coveragePattern !== escapeCoverageBrackets(owner.sourcePath)) {
+      throw new Error("Widget coverage patterns must use canonical bracket escaping")
+    }
+    if (!expectedWidgetCoverageExtensions.includes(path.extname(owner.sourcePath))) {
+      throw new Error("Widget coverage source paths must use an owned extension")
+    }
+
+    const thresholdKeys = Object.keys(owner.thresholds).sort()
+    if (JSON.stringify(thresholdKeys) !== JSON.stringify([...coverageMetrics].sort())) {
+      throw new Error("Widget coverage thresholds must contain exactly four metrics")
+    }
+    for (const metric of coverageMetrics) {
+      const threshold = owner.thresholds[metric]
+      if (
+        typeof threshold !== "number" ||
+        !Number.isFinite(threshold) ||
+        threshold <= 0 ||
+        threshold > 100
+      ) {
+        throw new Error("Widget coverage thresholds must be finite positive percentages")
+      }
+    }
+  }
+}
+
+function assertWidgetCoveragePolicy(
+  coverage: unknown,
+  owners: readonly WidgetCoverageOwner[] = widgetCoverageOwners,
+) {
+  requireRecord(coverage, "Widget coverage")
+  if (JSON.stringify(Object.keys(coverage).sort()) !== JSON.stringify(widgetCoverageRawKeys)) {
+    throw new Error("Widget coverage raw keys must match the policy")
+  }
+  const effectiveOwners = owners.map((owner) => owner.coveragePattern ?? owner.sourcePath)
+  if (coverage.provider !== "v8") {
+    throw new Error("Widget coverage provider must be v8")
+  }
+  if (coverage.all !== true) {
+    throw new Error("Widget coverage all must be true")
+  }
+  if (JSON.stringify(coverage.include) !== JSON.stringify(effectiveOwners)) {
+    throw new Error("Widget coverage include must match the owner policy")
+  }
+  if (JSON.stringify(coverage.exclude) !== JSON.stringify([])) {
+    throw new Error("Widget coverage exclude must be empty")
+  }
+  if (JSON.stringify(coverage.extension) !== JSON.stringify(expectedWidgetCoverageExtensions)) {
+    throw new Error("Widget coverage extension must match the policy")
+  }
+  if (JSON.stringify(coverage.reporter) !== JSON.stringify(["text", "json-summary"])) {
+    throw new Error("Widget coverage reporter must match the policy")
+  }
+  if (coverage.reportsDirectory !== "coverage/widget") {
+    throw new Error("Widget coverage reports directory must match the policy")
+  }
+
+  requireRecord(coverage.thresholds, "Widget coverage thresholds")
+  const thresholds = coverage.thresholds
+  const thresholdKeys = ["perFile", ...effectiveOwners].sort()
+  if (JSON.stringify(Object.keys(thresholds).sort()) !== JSON.stringify(thresholdKeys)) {
+    throw new Error("Widget coverage threshold keys must match the owner policy")
+  }
+  if (thresholds.perFile !== true) {
+    throw new Error("Widget coverage perFile must be true")
+  }
+  for (const owner of owners) {
+    const coveragePattern = owner.coveragePattern ?? owner.sourcePath
+    if (JSON.stringify(thresholds[coveragePattern]) !== JSON.stringify(owner.thresholds)) {
+      throw new Error("Widget coverage thresholds must match the owner policy")
+    }
+  }
+}
+
+function buildValidWidgetCoverageFixture(owners: readonly WidgetCoverageOwner[] = widgetCoverageOwners) {
+  return {
+    provider: "v8",
+    all: true,
+    include: owners.map((owner) => owner.coveragePattern ?? owner.sourcePath),
+    exclude: [],
+    extension: [...expectedWidgetCoverageExtensions],
+    reporter: ["text", "json-summary"],
+    reportsDirectory: "coverage/widget",
+    thresholds: {
+      perFile: true,
+      ...Object.fromEntries(owners.map((owner) => [
+        owner.coveragePattern ?? owner.sourcePath,
+        owner.thresholds,
+      ])),
+    },
+  }
+}
+
+function assertWidgetConfigSourceConsumesPolicy(source: string) {
+  const ownerError = "Widget config test must be exactly buildWidgetTestOptions(baseConfig.test)"
+  const sourceFile = ts.createSourceFile(
+    widgetConfigPath,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  )
+  const defaultExports = sourceFile.statements.filter(
+    (statement): statement is ts.ExportAssignment =>
+      ts.isExportAssignment(statement) && !statement.isExportEquals,
+  )
+  if (defaultExports.length !== 1) {
+    throw new Error(ownerError)
+  }
+
+  const defineConfigCall = defaultExports[0]!.expression
+  if (
+    !ts.isCallExpression(defineConfigCall) ||
+    !ts.isIdentifier(defineConfigCall.expression) ||
+    defineConfigCall.expression.text !== "defineConfig" ||
+    defineConfigCall.arguments.length !== 1
+  ) {
+    throw new Error(ownerError)
+  }
+  const configObject = defineConfigCall.arguments[0]!
+  if (!ts.isObjectLiteralExpression(configObject)) {
+    throw new Error(ownerError)
+  }
+
+  const testProperties = configObject.properties.filter((property) => {
+    if (!("name" in property) || property.name === undefined) {
+      return false
+    }
+    if (ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)) {
+      return property.name.text === "test"
+    }
+    return (
+      ts.isComputedPropertyName(property.name) &&
+      ts.isStringLiteral(property.name.expression) &&
+      property.name.expression.text === "test"
+    )
+  })
+  if (testProperties.length !== 1 || !ts.isPropertyAssignment(testProperties[0]!)) {
+    throw new Error(ownerError)
+  }
+  const testProperty = testProperties[0]
+  const laterProperties = configObject.properties.slice(
+    configObject.properties.indexOf(testProperty) + 1,
+  )
+  if (laterProperties.length !== 0) {
+    throw new Error(ownerError)
+  }
+
+  const builderCall = testProperty.initializer
+  if (
+    !ts.isCallExpression(builderCall) ||
+    !ts.isIdentifier(builderCall.expression) ||
+    builderCall.expression.text !== "buildWidgetTestOptions" ||
+    builderCall.arguments.length !== 1
+  ) {
+    throw new Error(ownerError)
+  }
+  const baseTest = builderCall.arguments[0]!
+  if (
+    !ts.isPropertyAccessExpression(baseTest) ||
+    baseTest.questionDotToken !== undefined ||
+    !ts.isIdentifier(baseTest.expression) ||
+    baseTest.expression.text !== "baseConfig" ||
+    baseTest.name.text !== "test"
+  ) {
+    throw new Error(ownerError)
+  }
+}
+
+function assertWidgetConfigConsumesPolicy(config: unknown) {
+  requireRecord(config, "Widget config")
+  requireRecord(config.test, "Widget config.test")
+  const expected = buildWidgetTestOptions(vitestConfig.test)
+  if (JSON.stringify(config.test.include) !== JSON.stringify(expected.include)) {
+    throw new Error("Widget config must consume policy test files")
+  }
+  if (JSON.stringify(config.test.coverage) !== JSON.stringify(expected.coverage)) {
+    throw new Error("Widget config must consume policy coverage")
+  }
+  assertWidgetCoveragePolicy(config.test.coverage)
+}
+
 describe("frontend CI test manifest", () => {
+  it("keeps the current Widget coverage contract available to the real config", () => {
+    const expectedWidgetTestFiles = [
+      "src/app/layout.test.tsx",
+      "src/app/widget/chat/[token]/page-client.test.tsx",
+      "src/app/settings/page.test.tsx",
+      "src/components/chat/ChatInput.test.tsx",
+      "src/components/chat/chat-input-public-file-access.test.tsx",
+      "src/components/chat/ChatMessage.test.tsx",
+      "src/components/chat/TraceEventRenderer.test.tsx",
+      "src/components/chat/clarification-form.test.tsx",
+      "src/components/file/file-preview-content.test.tsx",
+      "src/components/file/file-viewer.test.tsx",
+      "src/components/file/inline-file-preview.test.tsx",
+      "src/components/file/pptx-preview-renderer.test.tsx",
+      "src/components/layout/sidebar.test.tsx",
+      "src/components/pages/login.test.tsx",
+      "src/components/pages/oidc-callback.test.tsx",
+      "src/components/task/task-conversation-panel.test.tsx",
+      "src/components/ui/__tests__/markdown-renderer.test.tsx",
+      "src/components/widget/widget-bootstrap.test.ts",
+      "src/components/widget/widget-session.test.ts",
+      "src/components/widget/public-agent-chat-page.test.tsx",
+      "src/components/widget/session-agent-chat-page.test.tsx",
+      "src/components/widget/session-agent-chat-page.integration.test.tsx",
+      "src/components/widget/use-widget-session.test.tsx",
+      "src/contexts/app-context-chat.test.tsx",
+      "src/contexts/auth-context.test.tsx",
+      "src/contexts/file-access-context.test.tsx",
+      "src/hooks/use-file-mention.test.tsx",
+      "src/hooks/use-websocket.test.ts",
+      "src/lib/api-wrapper.test.ts",
+      "src/lib/auth-cache.test.ts",
+      "src/lib/files-disabled-presentation.test.ts",
+    ]
+    const expectedWidgetCoverageThresholds = {
+      "public/widget.js": { statements: 95, branches: 90, functions: 95, lines: 95 },
+      "src/app/widget/chat/[[]token[]]/page-client.tsx": { statements: 90, branches: 75, functions: 90, lines: 90 },
+      "src/components/chat/ChatInput.tsx": { statements: 60, branches: 60, functions: 40, lines: 60 },
+      "src/components/chat/ChatMessage.tsx": { statements: 50, branches: 50, functions: 40, lines: 50 },
+      "src/components/chat/TraceEventRenderer.tsx": { statements: 80, branches: 75, functions: 75, lines: 80 },
+      "src/components/file/file-preview-content.tsx": { statements: 70, branches: 50, functions: 55, lines: 70 },
+      "src/components/file/file-viewer.tsx": { statements: 70, branches: 55, functions: 80, lines: 70 },
+      "src/components/file/inline-file-preview.tsx": { statements: 70, branches: 55, functions: 60, lines: 70 },
+      "src/components/file/pptx-preview-renderer.tsx": { statements: 45, branches: 35, functions: 30, lines: 45 },
+      "src/components/task/task-conversation-panel.tsx": { statements: 80, branches: 70, functions: 60, lines: 80 },
+      "src/components/ui/markdown-renderer.tsx": { statements: 65, branches: 65, functions: 75, lines: 65 },
+      "src/components/widget/public-agent-chat-page.tsx": { statements: 80, branches: 55, functions: 45, lines: 80 },
+      "src/components/widget/session-agent-chat-page.tsx": { statements: 90, branches: 85, functions: 75, lines: 90 },
+      "src/components/widget/use-widget-session.ts": { statements: 95, branches: 80, functions: 90, lines: 95 },
+      "src/contexts/app-context-chat.tsx": { statements: 40, branches: 60, functions: 60, lines: 40 },
+      "src/contexts/auth-context.tsx": { statements: 70, branches: 65, functions: 90, lines: 70 },
+      "src/contexts/file-access-context.tsx": { statements: 85, branches: 75, functions: 85, lines: 85 },
+      "src/hooks/use-file-mention.ts": { statements: 60, branches: 60, functions: 60, lines: 60 },
+      "src/hooks/use-websocket.ts": { statements: 80, branches: 75, functions: 65, lines: 80 },
+      "src/lib/api-wrapper.ts": { statements: 75, branches: 65, functions: 60, lines: 75 },
+      "src/lib/auth-cache.ts": { statements: 90, branches: 80, functions: 90, lines: 90 },
+      "src/lib/files-disabled-presentation.ts": { statements: 85, branches: 80, functions: 90, lines: 85 },
+      "src/contexts/presentation-capabilities.tsx": { statements: 100, branches: 100, functions: 100, lines: 100 },
+      "src/app/settings/page.tsx": { statements: 75, branches: 50, functions: 50, lines: 75 },
+      "src/components/layout/sidebar.tsx": { statements: 35, branches: 40, functions: 10, lines: 35 },
+      "src/components/pages/login.tsx": { statements: 85, branches: 55, functions: 60, lines: 85 },
+      "src/components/pages/oidc-callback.tsx": { statements: 75, branches: 45, functions: 95, lines: 75 },
+    }
+    const widgetTest = widgetVitestConfig.test as Record<string, unknown>
+    const coverage = widgetTest.coverage as Record<string, unknown>
+    const thresholds = coverage.thresholds as Record<string, unknown>
+
+    expect(widgetTest.include).toEqual(expectedWidgetTestFiles)
+    expect(widgetCoverageExtensions).toEqual(expectedWidgetCoverageExtensions)
+    expect(coverage.provider).toBe("v8")
+    expect(coverage.reporter).toEqual(["text", "json-summary"])
+    expect(coverage.reportsDirectory).toBe("coverage/widget")
+    expect(thresholds.perFile).toBe(true)
+    expect(Object.keys(thresholds).filter((key) => key !== "perFile").sort()).toEqual(
+      [...(coverage.include as string[])].sort(),
+    )
+    expect(Object.fromEntries(widgetCoverageOwners.map((owner) => [
+      owner.coveragePattern ?? owner.sourcePath,
+      owner.thresholds,
+    ]))).toEqual(expectedWidgetCoverageThresholds)
+  })
+
+  it("requires the real Widget config to fail close on every coverage owner", () => {
+    const widgetTest = widgetVitestConfig.test as Record<string, unknown>
+    const coverage = widgetTest.coverage as Record<string, unknown>
+    const widgetConfigSource = readFileSync(widgetConfigPath, "utf8")
+
+    expect.soft(coverage.all).toBe(true)
+    expect.soft(coverage.exclude).toEqual([])
+    expect.soft(coverage.extension).toEqual([".js", ".ts", ".tsx"])
+    expect(() => assertWidgetConfigSourceConsumesPolicy(widgetConfigSource)).not.toThrow()
+  })
+
+  it("keeps Widget policy paths, patterns, and thresholds independently valid", () => {
+    assertWidgetTestFilePolicy(widgetTestFiles)
+    assertWidgetCoverageOwnerPolicy(widgetCoverageOwners)
+    assertWidgetCoveragePolicy(buildWidgetTestOptions(vitestConfig.test).coverage)
+  })
+
+  it("makes the real Widget config consume the complete policy builder", () => {
+    assertWidgetConfigConsumesPolicy(widgetVitestConfig)
+  })
+
+  it.each([
+    ["duplicate test paths", () => assertWidgetTestFilePolicy([...widgetTestFiles, widgetTestFiles[0]!]), "Widget test paths must be unique"],
+    ["a missing test path", () => assertWidgetTestFilePolicy([""]), "Widget test path must be a frontend-root-relative POSIX path"],
+    ["a nonexistent test path", () => assertWidgetTestFilePolicy(["src/ci/missing.test.ts"]), "Widget test paths must exist"],
+    ["a parent-relative test path", () => assertWidgetTestFilePolicy(["../outside.test.ts"]), "Widget test path must be a frontend-root-relative POSIX path"],
+    ["an absolute test path", () => assertWidgetTestFilePolicy(["/tmp/outside.test.ts"]), "Widget test path must be a frontend-root-relative POSIX path"],
+    ["a backslash test path", () => assertWidgetTestFilePolicy(["src\\ci\\frontend-test-manifest.test.ts"]), "Widget test path must be a frontend-root-relative POSIX path"],
+  ])("rejects %s at the Widget test-path owner", (_, mutate, expectedError) => {
+    expect(mutate).toThrow(expectedError)
+  })
+
+  it.each([
+    [
+      "duplicate source paths",
+      () => assertWidgetCoverageOwnerPolicy([...widgetCoverageOwners, { ...widgetCoverageOwners[0]! }]),
+      "Widget coverage source paths must be unique",
+    ],
+    [
+      "duplicate effective coverage patterns",
+      () => assertWidgetCoverageOwnerPolicy([
+        ...widgetCoverageOwners,
+        {
+          sourcePath: "package.json",
+          coveragePattern: "public/widget.js",
+          thresholds: { statements: 1, branches: 1, functions: 1, lines: 1 },
+        },
+      ]),
+      "Widget coverage patterns must be unique",
+    ],
+    [
+      "a missing source path",
+      () => assertWidgetCoverageOwnerPolicy([
+        ...widgetCoverageOwners,
+        {
+          sourcePath: "",
+          thresholds: { statements: 1, branches: 1, functions: 1, lines: 1 },
+        },
+      ]),
+      "Widget coverage source path must be a frontend-root-relative POSIX path",
+    ],
+    [
+      "a nonexistent source path",
+      () => assertWidgetCoverageOwnerPolicy([
+        ...widgetCoverageOwners,
+        {
+          sourcePath: "src/ci/missing-source.ts",
+          thresholds: { statements: 1, branches: 1, functions: 1, lines: 1 },
+        },
+      ]),
+      "Widget coverage source paths must exist",
+    ],
+    [
+      "an outside-root source path",
+      () => assertWidgetCoverageOwnerPolicy([
+        ...widgetCoverageOwners,
+        {
+          sourcePath: "../outside.ts",
+          thresholds: { statements: 1, branches: 1, functions: 1, lines: 1 },
+        },
+      ]),
+      "Widget coverage source path must be a frontend-root-relative POSIX path",
+    ],
+    [
+      "a mismatched bracket escape",
+      () => assertWidgetCoverageOwnerPolicy(widgetCoverageOwners.map((owner, index) => index === 1
+        ? { ...owner, coveragePattern: "src/app/widget/chat/[token]/page-client.tsx" }
+        : owner)),
+      "Widget coverage patterns must use canonical bracket escaping",
+    ],
+    [
+      "an unsupported source extension",
+      () => assertWidgetCoverageOwnerPolicy([
+        ...widgetCoverageOwners,
+        {
+          sourcePath: "package.json",
+          thresholds: { statements: 1, branches: 1, functions: 1, lines: 1 },
+        },
+      ]),
+      "Widget coverage source paths must use an owned extension",
+    ],
+    [
+      "a missing coverage metric",
+      () => assertWidgetCoverageOwnerPolicy(widgetCoverageOwners.map((owner, index) => index === 0
+        ? {
+            ...owner,
+            thresholds: { statements: 1, branches: 1, functions: 1 } as unknown as WidgetCoverageOwner["thresholds"],
+          }
+        : owner)),
+      "Widget coverage thresholds must contain exactly four metrics",
+    ],
+    [
+      "a zero coverage metric",
+      () => assertWidgetCoverageOwnerPolicy(widgetCoverageOwners.map((owner, index) => index === 0
+        ? { ...owner, thresholds: { ...owner.thresholds, lines: 0 } }
+        : owner)),
+      "Widget coverage thresholds must be finite positive percentages",
+    ],
+    [
+      "a NaN coverage metric",
+      () => assertWidgetCoverageOwnerPolicy(widgetCoverageOwners.map((owner, index) => index === 0
+        ? { ...owner, thresholds: { ...owner.thresholds, statements: Number.NaN } }
+        : owner)),
+      "Widget coverage thresholds must be finite positive percentages",
+    ],
+    [
+      "an infinite coverage metric",
+      () => assertWidgetCoverageOwnerPolicy(widgetCoverageOwners.map((owner, index) => index === 0
+        ? { ...owner, thresholds: { ...owner.thresholds, statements: Number.POSITIVE_INFINITY } }
+        : owner)),
+      "Widget coverage thresholds must be finite positive percentages",
+    ],
+  ])("rejects %s at the Widget coverage-owner owner", (_, mutate, expectedError) => {
+    expect(mutate).toThrow(expectedError)
+  })
+
+  it.each([
+    ["all: false", (coverage: Record<string, unknown>) => ({ ...coverage, all: false }), "Widget coverage all must be true"],
+    ["an owner exclusion", (coverage: Record<string, unknown>) => ({ ...coverage, exclude: ["public/widget.js"] }), "Widget coverage exclude must be empty"],
+    ["a lost extension", (coverage: Record<string, unknown>) => ({ ...coverage, extension: [".js", ".ts"] }), "Widget coverage extension must match the policy"],
+    ["a changed provider", (coverage: Record<string, unknown>) => ({ ...coverage, provider: "istanbul" }), "Widget coverage provider must be v8"],
+    ["a changed reporter", (coverage: Record<string, unknown>) => ({ ...coverage, reporter: ["text"] }), "Widget coverage reporter must match the policy"],
+    ["a changed report directory", (coverage: Record<string, unknown>) => ({ ...coverage, reportsDirectory: "coverage/other" }), "Widget coverage reports directory must match the policy"],
+    [
+      "a disabled per-file threshold",
+      (coverage: Record<string, unknown>) => ({
+        ...coverage,
+        thresholds: { ...(coverage.thresholds as Record<string, unknown>), perFile: false },
+      }),
+      "Widget coverage perFile must be true",
+    ],
+    [
+      "an orphan threshold",
+      (coverage: Record<string, unknown>) => ({
+        ...coverage,
+        thresholds: {
+          ...(coverage.thresholds as Record<string, unknown>),
+          orphan: { statements: 1, branches: 1, functions: 1, lines: 1 },
+        },
+      }),
+      "Widget coverage threshold keys must match the owner policy",
+    ],
+    [
+      "a missing owner threshold",
+      (coverage: Record<string, unknown>) => {
+        const thresholds = { ...(coverage.thresholds as Record<string, unknown>) }
+        delete thresholds["public/widget.js"]
+        return { ...coverage, thresholds }
+      },
+      "Widget coverage threshold keys must match the owner policy",
+    ],
+    [
+      "a global floor",
+      (coverage: Record<string, unknown>) => ({
+        ...coverage,
+        thresholds: { ...(coverage.thresholds as Record<string, unknown>), 100: 1 },
+      }),
+      "Widget coverage threshold keys must match the owner policy",
+    ],
+    ["an unowned coverage key", (coverage: Record<string, unknown>) => ({ ...coverage, autoUpdate: true }), "Widget coverage raw keys must match the policy"],
+  ])("rejects %s at the Widget coverage-config owner", (_, mutate, expectedError) => {
+    const coverage = buildValidWidgetCoverageFixture()
+    expect(() => assertWidgetCoveragePolicy(mutate(coverage))).toThrow(expectedError)
+  })
+
+  it("rejects a Widget config detached from the policy builder", () => {
+    expect(() => assertWidgetConfigConsumesPolicy({
+      ...widgetVitestConfig,
+      test: {
+        ...widgetVitestConfig.test,
+        include: [],
+      },
+    })).toThrow("Widget config must consume policy test files")
+    expect(() => assertWidgetConfigConsumesPolicy({
+      ...widgetVitestConfig,
+      test: {
+        ...widgetVitestConfig.test,
+        coverage: {},
+      },
+    })).toThrow("Widget config must consume policy coverage")
+  })
+
+  it("rejects a redundant Widget include override at the config-source owner", () => {
+    const widgetConfigSource = readFileSync(widgetConfigPath, "utf8")
+    const source = replaceExactlyOnce(
+      widgetConfigSource,
+      "  test: buildWidgetTestOptions(baseConfig.test),\n",
+      "  test: {\n    ...buildWidgetTestOptions(baseConfig.test),\n    include: Array.from(widgetTestFiles),\n  },\n",
+      "Widget config redundant include override",
+    )
+
+    expect(() => assertWidgetConfigSourceConsumesPolicy(source)).toThrow(
+      "Widget config test must be exactly buildWidgetTestOptions(baseConfig.test)",
+    )
+  })
+
+  it("rejects a later dynamic Widget test override at the config-source owner", () => {
+    const widgetConfigSource = readFileSync(widgetConfigPath, "utf8")
+    const withComputedKey = replaceExactlyOnce(
+      widgetConfigSource,
+      'import { buildWidgetTestOptions } from "./vitest.widget.policy"\n',
+      'import { buildWidgetTestOptions } from "./vitest.widget.policy"\n\nconst widgetTestKey = "test"\n',
+      "Widget config computed test key",
+    )
+    const source = replaceExactlyOnce(
+      withComputedKey,
+      "  test: buildWidgetTestOptions(baseConfig.test),\n",
+      "  test: buildWidgetTestOptions(baseConfig.test),\n  [widgetTestKey]: {\n    ...buildWidgetTestOptions(baseConfig.test),\n    include: Array.from(widgetTestFiles),\n  },\n",
+      "Widget config dynamic test override",
+    )
+
+    expect(() => assertWidgetConfigSourceConsumesPolicy(source)).toThrow(
+      "Widget config test must be exactly buildWidgetTestOptions(baseConfig.test)",
+    )
+  })
+
   it.each([
     ["LF", realWorkflowSource],
     ["CRLF", realWorkflowSource.replace(/\r?\n/g, "\r\n")],
