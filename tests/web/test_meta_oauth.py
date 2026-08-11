@@ -312,6 +312,205 @@ def test_gmail_callback_survives_a_raising_account_lookup_during_provisioning(
     assert "Failed to resolve Gmail accounts for user" in caplog.text
 
 
+def test_oauth_callback_survives_a_raising_post_commit_side_effect(
+    db_session, monkeypatch, caplog
+):
+    """The post-commit region is guarded as a region, not per side effect.
+
+    The tests above all raise from inside Gmail provisioning, which carries its
+    own guard, so they cannot tell a per-call guard apart from a regional one.
+    Here the guarded wrapper itself raises, which is what a newly added
+    post-commit side effect would do before anyone remembers to guard it.
+    """
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "google",
+            "app_id": "gmail",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "gmail-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "gmail-token",
+                    "refresh_token": "gmail-refresh",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "scope": "https://www.googleapis.com/auth/gmail.modify",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-user-1", "email": "alice@gmail.com"}
+            )
+        ),
+    )
+
+    def raising_side_effect(_db, *, user_id: int):
+        raise RuntimeError("an unguarded post-commit side effect blew up")
+
+    monkeypatch.setattr(
+        auth_api, "_best_effort_ensure_gmail_watches_for_user", raising_side_effect
+    )
+
+    caplog.set_level(logging.WARNING, logger=auth_api.__name__)
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200
+    assert "Authentication Failed" not in response.body.decode()
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "gmail")
+        .one()
+    )
+    assert oauth_account.email == "alice@gmail.com"
+    assert "Post-commit OAuth side effects failed" in caplog.text
+
+
+def test_oauth_callback_still_fails_when_the_success_page_cannot_be_rendered(
+    db_session, monkeypatch
+):
+    """The swallow covers post-commit side effects only, not response building.
+
+    Rendering runs after the commit too, but a failure there leaves nothing to
+    return, so it must keep reaching the outer handler instead of being
+    swallowed into a response that does not exist.
+    """
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "google",
+            "app_id": "gmail",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "gmail-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "gmail-token",
+                    "refresh_token": "gmail-refresh",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "scope": "https://www.googleapis.com/auth/gmail.modify",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-user-1", "email": "alice@gmail.com"}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.gmail_provisioning."
+        "best_effort_provision_gmail_watches_for_user",
+        lambda _db, *, user_id, context: None,
+    )
+
+    real_html_response = auth_api.HTMLResponse
+
+    def failing_success_page(*args, **kwargs):
+        # Fail only the success page; the outer handler's own error page has to
+        # keep rendering, otherwise the test could not observe the 500.
+        content = kwargs.get("content", args[0] if args else "")
+        if "Connected Successfully" in str(content):
+            raise RuntimeError("template rendering failed")
+        return real_html_response(*args, **kwargs)
+
+    monkeypatch.setattr(auth_api, "HTMLResponse", failing_success_page)
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 500
+    assert "Authentication Failed" in response.body.decode()
+
+
+def test_oauth_callback_survives_a_non_integer_user_id_claim(
+    db_session, monkeypatch, caplog
+):
+    """Coercing the state claim is post-commit work, so it belongs in the guard.
+
+    A ``user_id`` claim that is not an integer only becomes observable once the
+    OAuth row is committed, so failing the coercion has to behave like any
+    other post-commit failure rather than rendering a 500 for a connect that
+    already succeeded. Reachable if a deployment is still running on the
+    default ``XAGENT_JWT_SECRET``, which makes the state token forgeable.
+    """
+    db, _user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": "7abc",
+            "provider": "google",
+            "app_id": "gmail",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "gmail-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "gmail-token",
+                    "refresh_token": "gmail-refresh",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "scope": "https://www.googleapis.com/auth/gmail.modify",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-user-1", "email": "alice@gmail.com"}
+            )
+        ),
+    )
+    provision = Mock()
+    monkeypatch.setattr(
+        "xagent.web.services.gmail_provisioning."
+        "best_effort_provision_gmail_watches_for_user",
+        provision,
+    )
+
+    caplog.set_level(logging.WARNING, logger=auth_api.__name__)
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200
+    assert "Authentication Failed" not in response.body.decode()
+    provision.assert_not_called()
+    assert "Post-commit OAuth side effects failed" in caplog.text
+
+
 def test_meta_callback_exchanges_short_lived_token_and_connects_selected_app(
     db_session, monkeypatch
 ):
