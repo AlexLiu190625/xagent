@@ -33,6 +33,18 @@ Pure-function design:
     place SDK clients can observe a behavior change is through this
     one function's output -- which makes regressions easy to gate.
 
+Incremental projection:
+
+    The state machine that implements the pairing rules below lives in
+    :class:`PublicStepProjector`, not in this function. The projector
+    holds all the folding state a fold needs -- the pending
+    (start-seen, end-not-yet-seen) table, the ``dag_plan_*`` replan
+    counter -- so a caller can feed it one event at a time and read
+    back the steps that changed. ``map_trace_events_to_public_steps``
+    stays pure by constructing one fresh, throwaway projector per
+    call and reading back its materialized result; it keeps no
+    folding state of its own.
+
 Pairing rule:
 
     Start / end events are paired by a stable ``key``:
@@ -83,12 +95,14 @@ logger = logging.getLogger(__name__)
 class PublicStepProjector:
     """Incremental folding state machine: trace events -> public steps.
 
-    This holds exactly the folding state ``map_trace_events_to_public_steps``
-    used to keep as local variables -- the pending (start-seen,
-    end-not-yet-seen) pairing table and the ``dag_plan_*`` counter/open-key
-    used to disambiguate replan. Pulling it into an instance is what lets a
-    caller feed a live event stream one event at a time (see the module
-    docstring's pairing rules for what "pairing" means per event family).
+    Holds all the folding state a fold needs -- the pending
+    (start-seen, end-not-yet-seen) pairing table and the ``dag_plan_*``
+    counter/open-key used to disambiguate replan. The batch driver
+    (``map_trace_events_to_public_steps``) keeps none of its own: it
+    builds one instance and reads back the result. Holding this state
+    on an instance is what lets a caller feed a live event stream one
+    event at a time (see the module docstring's pairing rules for what
+    "pairing" means per event family).
 
     Two ways to build one:
 

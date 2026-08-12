@@ -9,6 +9,7 @@ dict)`` works too -- but the attribute form is closer to production
 behavior.
 """
 
+import copy
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -678,16 +679,17 @@ def test_float_timestamp_is_coerced_to_datetime():
     assert steps[0]["completed_at"] - steps[0]["started_at"] == timedelta(seconds=1)
 
 
-# ===== PR-B0: PublicStepProjector <-> batch driver equivalence pin =====
+# ===== PublicStepProjector <-> batch driver equivalence pin =====
 #
-# ``map_trace_events_to_public_steps`` is being rewritten to be a thin
-# batch driver over ``PublicStepProjector`` (from_history + materialized
-# steps + the existing started_at sort). These cases cover every pairing
-# family the module docstring documents (thinking/planning incl. replan,
-# tool_call, agent_delegation, skill_select, message, orphan start/end,
-# unexposed-type filtering, out-of-order timestamps) so the equivalence
-# assertion below is a byte-for-byte pin on the refactor, not just a
-# smoke test.
+# ``map_trace_events_to_public_steps`` is a thin batch driver over
+# ``PublicStepProjector`` (from_history + materialized_steps + the
+# started_at sort): it holds no folding logic of its own. These cases
+# cover every pairing family the module docstring documents
+# (thinking/planning incl. replan, tool_call, agent_delegation,
+# skill_select, message, orphan start/end, unexposed-type filtering,
+# out-of-order timestamps) so the equivalence assertion below pins
+# that invariant -- the batch driver can never grow a second copy of
+# the folding logic without this test catching the divergence.
 
 _PROJECTOR_EQUIVALENCE_CASES: Dict[str, List[SimpleNamespace]] = {
     "react_action_pair": [
@@ -969,11 +971,11 @@ _PROJECTOR_EQUIVALENCE_CASES: Dict[str, List[SimpleNamespace]] = {
 )
 def test_projector_equivalent_to_batch(events):
     """``PublicStepProjector.from_history(events).materialized_steps()``,
-    sorted by the same ``started_at`` key the batch driver applies at
-    ``_step_mapping.py:324``, must equal ``map_trace_events_to_public_steps``
-    exactly. This is the byte-for-byte equivalence pin for the PR-B0
-    extraction: the batch function must remain a pure driver over the
-    projector, never a second copy of the folding logic.
+    sorted by the same ``started_at`` key the batch driver's trailing
+    sort applies, must equal ``map_trace_events_to_public_steps``
+    exactly. This is the byte-for-byte pin that the batch function
+    stays a pure driver over the projector, never a second copy of
+    the folding logic.
     """
     expected = map_trace_events_to_public_steps(events)
     projected = PublicStepProjector.from_history(events).materialized_steps()
@@ -1002,3 +1004,58 @@ def test_projector_incremental_feed_matches_materialized_steps(events):
     reconstructed = sorted(by_id.values(), key=lambda s: s["id"])
     materialized = sorted(projector.materialized_steps(), key=lambda s: s["id"])
     assert reconstructed == materialized
+
+
+def test_feed_return_value_reflects_step_state_at_call_time():
+    """``feed()``'s return is the same dict object later mutated in place
+    when the matching end event finalizes the step -- so a caller that
+    wants to know what a step looked like *at the moment of a given
+    feed() call* must deep-copy the return value immediately, which is
+    exactly what this test does. Without the ``copy.deepcopy`` calls
+    below, ``start_steps[0]`` would silently become the finalized
+    ``completed`` step by the time the last assertion runs, and this
+    test could only ever observe the terminal state.
+    """
+    projector = PublicStepProjector()
+
+    start_steps = copy.deepcopy(
+        projector.feed(
+            _ev(
+                "react_action_start",
+                step_id="s1",
+                timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+            )
+        )
+    )
+    assert len(start_steps) == 1
+    assert start_steps[0]["status"] == "running"
+    assert start_steps[0]["completed_at"] is None
+
+    end_steps = copy.deepcopy(
+        projector.feed(
+            _ev(
+                "react_action_end",
+                step_id="s1",
+                timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+            )
+        )
+    )
+    assert len(end_steps) == 1
+    assert end_steps[0]["status"] == "completed"
+    assert end_steps[0]["completed_at"] is not None
+
+    # Proof the deep copy above actually decoupled the snapshot: the
+    # start-time copy must still read "running" now that the live
+    # object backing the un-copied return value has been mutated to
+    # "completed" by the end event.
+    assert start_steps[0]["status"] == "running"
+    assert start_steps[0]["completed_at"] is None
+
+    # Orphan end (no matching start): dropped silently, nothing to feed back.
+    assert PublicStepProjector().feed(_ev("react_action_end", step_id="orphan")) == []
+
+    # Unexposed event type: not part of the public step contract.
+    assert PublicStepProjector().feed(_ev("llm_call_start", step_id="s1")) == []
+
+    # Empty/falsy event_type: nothing identifiable to fold.
+    assert PublicStepProjector().feed(_ev("", step_id="s1")) == []
