@@ -542,9 +542,12 @@ class PublicStep(BaseModel):
         ...,
         description=(
             "running while the corresponding end event has not yet "
-            "fired (i.e. the SDK polled mid-step), completed on a "
-            "normal end event, failed when the end event carries "
-            "success=false."
+            "fired. A task in a terminal state can still contain "
+            "running steps: interrupted or cancelled steps never get "
+            "an end event, so terminal state is judged from the task's "
+            "own status, not from the absence of running steps. "
+            "completed on a normal end event, failed when the end "
+            "event carries success=false."
         ),
     )
     started_at: datetime = Field(
