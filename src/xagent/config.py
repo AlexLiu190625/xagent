@@ -52,6 +52,8 @@ UPLOADED_FILE_RECOVERY_BATCH_SIZE = "XAGENT_UPLOADED_FILE_RECOVERY_BATCH_SIZE"
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
 NATIVE_BROWSER_ENABLED = "XAGENT_NATIVE_BROWSER_ENABLED"
 NATIVE_BROWSER_APP_NAME = "XAGENT_NATIVE_BROWSER_APP_NAME"
+BROWSER_TOOL_DEFAULT_LOCALE = "XAGENT_BROWSER_TOOL_DEFAULT_LOCALE"
+BROWSER_TOOL_DEFAULT_TIMEZONE = "XAGENT_BROWSER_TOOL_DEFAULT_TIMEZONE"
 BROWSER_CUA_DRIVER_COMMAND = "XAGENT_BROWSER_CUA_DRIVER_COMMAND"
 BROWSER_CUA_DRIVER_SOCKET = "XAGENT_BROWSER_CUA_DRIVER_SOCKET"
 BROWSER_CUA_DRIVER_TIMEOUT_SECONDS = "XAGENT_BROWSER_CUA_DRIVER_TIMEOUT_SECONDS"
@@ -683,6 +685,68 @@ def get_native_browser_app_name() -> str:
             f"{NATIVE_BROWSER_APP_NAME} must name a supported browser: {supported}"
         )
     return canonical
+
+
+_BCP47_LOCALE_RE = re.compile(r"^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$")
+
+
+def get_browser_tool_default_locale() -> str:
+    """Get the fallback Playwright context locale for the browser_use tool.
+
+    Used when a task/request carries no resolvable locale of its own (see
+    ``WebToolConfig.get_browser_locale``). Was previously hardcoded to
+    ``"zh-CN"``, which forced every automated browser session -- regardless
+    of the requesting user's own language -- to request and render
+    Chinese-localized pages.
+
+    Priority:
+        1. XAGENT_BROWSER_TOOL_DEFAULT_LOCALE environment variable
+        2. "en-US"
+
+    Raises:
+        ValueError: if the env var is set but isn't a plausible BCP-47 tag
+            (e.g. "en-US"). This getter is called lazily, from
+            BrowserSession.__init__ on first browser tool use rather than at
+            process startup, so a typo still fails as a clean tool-call
+            error instead of an opaque Playwright error at session creation.
+    """
+    configured = os.getenv(BROWSER_TOOL_DEFAULT_LOCALE, "").strip()
+    if not configured:
+        return "en-US"
+    if not _BCP47_LOCALE_RE.match(configured):
+        raise ValueError(
+            f"{BROWSER_TOOL_DEFAULT_LOCALE} must be a BCP-47 locale tag "
+            f"(e.g. 'en-US', 'zh-CN'), got {configured!r}"
+        )
+    return configured
+
+
+def get_browser_tool_default_timezone() -> str | None:
+    """Get the fallback Playwright context timezone for the browser_use tool.
+
+    Priority:
+        1. XAGENT_BROWSER_TOOL_DEFAULT_TIMEZONE environment variable
+        2. None (Playwright falls back to the host's own system timezone)
+
+    Raises:
+        ValueError: if the env var is set but isn't a recognized IANA
+            timezone name (e.g. "Asia/Shanghai"). Like
+            get_browser_tool_default_locale, this is read lazily on first
+            browser tool use, not at process startup.
+    """
+    configured = os.getenv(BROWSER_TOOL_DEFAULT_TIMEZONE, "").strip()
+    if not configured:
+        return None
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        ZoneInfo(configured)
+    except (ZoneInfoNotFoundError, ValueError, KeyError) as exc:
+        raise ValueError(
+            f"{BROWSER_TOOL_DEFAULT_TIMEZONE} must be a valid IANA timezone "
+            f"name (e.g. 'Asia/Shanghai'), got {configured!r}"
+        ) from exc
+    return configured
 
 
 def get_browser_cua_driver_command() -> str:
