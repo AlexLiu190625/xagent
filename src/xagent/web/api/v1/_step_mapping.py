@@ -433,8 +433,8 @@ def _thinking_pair_key(event: Any, phase: str) -> str:
 
     ``react_action_*`` and ``dag_step_*`` always carry a step_id
     which is the natural pairing key. Planning events are handled
-    inline in :func:`map_trace_events_to_public_steps` because they
-    lack a per-plan identifier and need a synthesized counter.
+    inline in :meth:`PublicStepProjector.feed` because they lack a
+    per-plan identifier and need a synthesized counter.
     """
     return str(_safe_get(event, "step_id") or _safe_get(event, "event_id") or "")
 
