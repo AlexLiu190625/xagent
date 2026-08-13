@@ -202,14 +202,24 @@ class Task(Base):  # type: ignore
     lease_attempt_id = Column(String(64), nullable=True)
 
     # Protocol version of the interaction row that will back this task's
-    # current wait. Each of its two writer groups is spoken for, and none of
-    # those writers exists yet: the three wait finalizers will write it (1
-    # when a row was staged, NULL when staging degraded), and the three
-    # legacy-resume injection sites will clear it. Readers will need to gate
-    # on status == WAITING_FOR_USER first: a task that left the waiting
-    # state by a path with no injection site (cancel, delete, failure, TTL
-    # reclaim, admin cleanup) will be able to carry a stale 1, and the next
-    # wait will overwrite it either way.
+    # current wait. Three writer groups are spoken for. The three wait
+    # finalizers will write it (1 when a row was staged, NULL when staging
+    # degraded) and have no writer yet. The four legacy-resume injection
+    # sites (the two WebSocket sites, the A2A resume-input path, and the
+    # v1 reply resume-input path) clear it back to NULL unconditionally,
+    # paired with retiring the row they answered; that writer already
+    # exists in task_interaction_close.py
+    # (close_legacy_resume_interaction). The three resume-abandonment
+    # paths clear it back to NULL only when it no longer names any active
+    # row; that writer also already exists in task_interaction_close.py
+    # (clear_interaction_marker_if_unpaired), called from the A2A prelease
+    # restore (a2a.py), the WebSocket lease restore (websocket.py), and
+    # the v1 reply prelease restore (task_reply.py), all
+    # production-reachable. Readers will need to gate on status ==
+    # WAITING_FOR_USER first: a task that left the waiting state by a path
+    # with no injection site (cancel, delete, failure, TTL reclaim, admin
+    # cleanup) will be able to carry a stale 1, and the next wait will
+    # overwrite it either way.
     #
     # Why a column on tasks rather than an EXISTS over
     # task_interaction_requests: the read surface's first check is
@@ -224,8 +234,7 @@ class Task(Base):  # type: ignore
     # read path. The marker only ever decides priority, never whether the
     # legacy fallback exists: readers fall back unconditionally when no
     # active row matches, so a stale marker degrades to the legacy question
-    # rather than corrupting anything. Re-examine the status coupling when
-    # the first writer lands.
+    # rather than corrupting anything.
     interaction_protocol_version = Column(Integer, nullable=True)
 
     # Model configuration

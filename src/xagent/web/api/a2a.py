@@ -61,6 +61,11 @@ from ..services.task_execution_controller import (
     TaskControlState,
     task_execution_controller,
 )
+from ..services.task_interaction_close import (
+    clear_interaction_marker_if_unpaired,
+    close_legacy_resume_interaction,
+)
+from ..services.task_interaction_schema import interaction_requests_table_exists
 from ..services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -254,6 +259,14 @@ def _restore_a2a_resume_prelease_sync(
     retry with the same A2A message id is idempotent at the runner boundary.
     If ownership changed, no row is mutated and the current owner remains the
     sole lifecycle authority.
+
+    Two callers reach this today: the isolated wrapper right below, used by
+    the no-checkpoint and checkpoint-read-error fallbacks; and the cancel
+    settlement callback ``acquire_task_lease_cancellation_safe`` passes to
+    ``_resume_input_required_a2a_task``'s lease acquisition, which fires on
+    a cancellation with no ``posted`` outcome to consult at all -- the
+    marker clear below has to hold on that path too, not only on the two
+    ``posted``-gated fallbacks.
     """
 
     SessionLocal = get_session_local()
@@ -264,6 +277,18 @@ def _restore_a2a_resume_prelease_sync(
             status=status,
         )
         if restored:
+            # Mirror of the WebSocket lease restore: this is an abandoned
+            # resume, not a completed one, so only the marker may need
+            # reconciling -- see clear_interaction_marker_if_unpaired's
+            # docstring for the NOT EXISTS semantics. No lock read precedes
+            # this statement; release_task_lease_no_commit's own tasks
+            # UPDATE writes only non-key columns and is already the first
+            # statement this transaction directs at tasks or
+            # task_interaction_requests.
+            assert task_lease.run_id is not None
+            clear_interaction_marker_if_unpaired(
+                db, task_id=task_lease.task_id, run_id=task_lease.run_id
+            )
             db.commit()
         else:
             db.rollback()
@@ -281,6 +306,17 @@ async def _restore_a2a_resume_prelease_isolated(
             status=status,
         )
     )
+
+
+# The exact non-key column set the resume-input fence UPDATE below writes.
+# Shared with test_interaction_close_lock_ordering.py's static guard, which
+# asserts the UPDATE's values keys equal this set exactly: the fence's
+# no-lock-read argument (see the inline comment inside
+# _update_a2a_resume_input_sync) depends on every one of these columns being
+# a non-key column, so a future change widening the UPDATE's values must
+# widen this constant too, deliberately, not just add a key to a dict
+# literal the guard never looks at again.
+RESUME_INPUT_FENCE_UPDATE_COLUMNS = frozenset({"input", "output", "error_message"})
 
 
 def _update_a2a_resume_input_sync(
@@ -311,6 +347,30 @@ def _update_a2a_resume_input_sync(
         if updated != 1:
             db.rollback()
             return False
+        # This update() call is the fence above, not a new transaction: a
+        # rollback here would undo it together with the input write, which
+        # is the point -- ownership and the interaction close are one
+        # atomic fact. No run_db_io_cancellation_safe wrap: the caller
+        # already wraps this whole function in one. No lock read either --
+        # the fence UPDATE above writes only non-key columns (input,
+        # output, error_message) and is already the first statement this
+        # transaction directs at tasks or task_interaction_requests, so it
+        # satisfies the same ordering and strength obligation a dedicated
+        # lock read would. If a future change adds a key column (or any
+        # column covered by a unique index) to that UPDATE's values, this
+        # judgment call must be redone -- the lock strength that UPDATE
+        # takes would change.
+        #
+        # The table-presence gate sits here, immediately before the close
+        # call and after the fence UPDATE, not at the top of the function:
+        # the gate only inspects the catalog and takes no row lock, so it
+        # does not count as preceding the fence UPDATE in the sense the
+        # ordering obligation above means.
+        assert task_lease.run_id is not None
+        if interaction_requests_table_exists(db):
+            close_legacy_resume_interaction(
+                db, task_id=task_lease.task_id, run_id=task_lease.run_id
+            )
         db.commit()
         return True
 

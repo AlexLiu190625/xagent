@@ -150,6 +150,10 @@ from ..services.task_execution_controller import (
     task_control_snapshot,
     task_execution_controller,
 )
+from ..services.task_interaction_close import (
+    clear_interaction_marker_if_unpaired,
+    close_legacy_resume_interaction_sync,
+)
 from ..services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -2829,11 +2833,29 @@ def _restore_resumed_task_lease_to_prior_status(
     affects zero rows instead of double-releasing. The commit below is
     unconditional, unlike the A2A prelease restore: when the fence excludes
     every row, the UPDATE affects zero rows and this commits that no-op
-    rather than rolling back.
+    rather than rolling back. That unconditional commit is unrelated to the
+    protocol-marker clear below, which is conditioned on ``restored``: a
+    fence miss means this call lost the race for the row and must not touch
+    a marker some other winner now owns.
     """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         restored = release_task_lease_no_commit(db, lease, status=status)
+        if restored:
+            # This is a resume abandonment, not a completion: no injection
+            # ran, so there is no interaction row to close here, only a
+            # marker to reconcile if it no longer names an active row. See
+            # clear_interaction_marker_if_unpaired's docstring for the
+            # NOT EXISTS semantics. No lock read precedes this statement --
+            # release_task_lease_no_commit's own tasks UPDATE writes only
+            # non-key columns and is already the first statement this
+            # transaction directs at tasks or task_interaction_requests, so
+            # it already satisfies the ordering and strength obligation a
+            # dedicated lock read would.
+            assert lease.run_id is not None
+            clear_interaction_marker_if_unpaired(
+                db, task_id=lease.task_id, run_id=lease.run_id
+            )
         db.commit()
         return restored
 
@@ -3248,6 +3270,44 @@ async def execute_resume_background(
                     "checkpoint became available."
                 )
             delivery_was_dispatched = True
+            # Unconditional and not nested inside the delivery_turn_id branch
+            # below: retiring this run's active interaction row and clearing
+            # the task's protocol marker has nothing to do with whether a
+            # delivery-ack turn id is present. Borrowing that condition would
+            # give the close a gate it has no reason to have. Bound to a
+            # plain local first, not read from lease inside the lambda below:
+            # a narrowing assert on an enclosing-scope variable does not
+            # apply inside a nested closure.
+            assert lease.run_id is not None
+            close_run_id = lease.run_id
+            try:
+                await run_db_io_cancellation_safe(
+                    lambda: close_legacy_resume_interaction_sync(
+                        task_id,
+                        close_run_id,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "legacy resume interaction close failed after deferred "
+                    "message seal for task %s run %s",
+                    task_id,
+                    close_run_id,
+                    exc_info=True,
+                )
+            except asyncio.CancelledError:
+                # See run_db_io_cancellation_safe's docstring: it drains its
+                # worker to completion before propagating a cancellation
+                # raised while awaiting it, so the close-and-clear
+                # transaction has already committed or failed by the time
+                # this branch runs. Only the log statement was interrupted.
+                logger.warning(
+                    "legacy resume interaction close was cancelled after "
+                    "deferred message seal for task %s run %s; continuing "
+                    "resume",
+                    task_id,
+                    close_run_id,
+                )
             if delivery_turn_id is not None:
                 try:
                     await run_db_io_cancellation_safe(
@@ -5993,6 +6053,61 @@ async def _handle_chat_message_unserialized(
                                 task_id,
                                 turn_id,
                                 exc_info=True,
+                            )
+                        # `posted` is true, meaning a message with this
+                        # turn id is in a live checkpoint -- written by this
+                        # call, or already present from an earlier attempt
+                        # with the same turn id, which short-circuits without
+                        # persisting anything new (see
+                        # AgentRunner.inject_user_message) -- instead of
+                        # going through the native interaction
+                        # protocol's answer path, so any question this run
+                        # had open under that protocol is answered by other
+                        # means now. Retire it and clear the task's
+                        # marker in the same short transaction. The run fence
+                        # is live_task_lease.run_id, not task_run_id: posted
+                        # being true only happens by way of the
+                        # live_task_lease is not None branch above, which is
+                        # what makes this attribute access safe. Bound to a
+                        # plain local first, not read from live_task_lease
+                        # inside the lambda below: a narrowing assert on an
+                        # enclosing-scope variable does not apply inside a
+                        # nested closure.
+                        assert live_task_lease is not None
+                        assert live_task_lease.run_id is not None
+                        close_run_id = live_task_lease.run_id
+                        try:
+                            await run_db_io_cancellation_safe(
+                                lambda: close_legacy_resume_interaction_sync(
+                                    task_id,
+                                    close_run_id,
+                                )
+                            )
+                        except Exception:
+                            logger.warning(
+                                "legacy resume interaction close failed after "
+                                "registered resume handoff for task %s run %s",
+                                task_id,
+                                close_run_id,
+                                exc_info=True,
+                            )
+                        except asyncio.CancelledError:
+                            # run_db_io_cancellation_safe drains its worker
+                            # thread to completion before propagating a
+                            # cancellation raised while awaiting it, so by the
+                            # time this branch runs the close-and-clear
+                            # transaction has already committed or failed on
+                            # its own; there is nothing left in flight to
+                            # protect. This only logs the interruption instead
+                            # of letting it escape as an unhandled
+                            # cancellation. Unlike the delivery marker above,
+                            # this branch is deliberate, not a gap to copy.
+                            logger.warning(
+                                "legacy resume interaction close was cancelled "
+                                "for task %s run %s; the resume proceeds "
+                                "unaffected",
+                                task_id,
+                                close_run_id,
                             )
                 except BaseException:
                     if bg_task is not None and not handoff_registered:

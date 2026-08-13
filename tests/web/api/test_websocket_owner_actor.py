@@ -39,6 +39,7 @@ from xagent.web.api.websocket import (
     _handle_chat_message_unserialized,
     _handle_pause_task_unserialized,
     _handle_resume_task_unserialized,
+    _restore_resumed_task_lease_to_prior_status,
     _waiting_or_paused_event_fields,
     background_task_manager,
     execute_resume_background,
@@ -1642,6 +1643,175 @@ async def test_live_marker_failure_after_registered_handoff_is_still_accepted(
     assert len(accepted) == 1
 
 
+@pytest.mark.asyncio
+async def test_live_close_failure_after_registered_handoff_is_still_accepted(
+    db_session,
+) -> None:
+    """A legacy resume interaction close failure must not turn an already
+    registered, already accepted resume handoff into a rejected one."""
+    owner = _user(db_session, "close-failure-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "close-failure-runner"
+    task.run_id = "close-failure-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(return_value=True)
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch(
+            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            side_effect=RuntimeError("interaction close unavailable"),
+        ) as close_mock,
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Apply this once",
+                "client_message_id": "close-failure-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    bg_mgr.register_reserved_resume.assert_called_once()
+    close_mock.assert_called_once_with(int(task.id), "close-failure-run")
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_close_cancellation_does_not_abort_registered_handoff(
+    db_session,
+) -> None:
+    """Same guarantee as the failure case above, for the CancelledError
+    branch specifically -- deleting that branch must turn this red."""
+    owner = _user(db_session, "close-cancel-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "close-cancel-runner"
+    task.run_id = "close-cancel-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(return_value=True)
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+
+    def raise_cancelled(*_args: object, **_kwargs: object) -> int:
+        raise asyncio.CancelledError
+
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch(
+            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            side_effect=raise_cancelled,
+        ) as close_mock,
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Apply this once",
+                "client_message_id": "close-cancel-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    bg_mgr.register_reserved_resume.assert_called_once()
+    close_mock.assert_called_once_with(int(task.id), "close-cancel-run")
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
+
+
+def test_lease_restore_fence_miss_leaves_the_marker_untouched(db_session) -> None:
+    """When the exact-lease fence excludes every row (this call lost the
+    race for the row), the marker clear must not run at all -- not even
+    the no-op form. Flipping the ``if restored:`` guard to unconditional
+    would clear a marker this call never had authority to touch.
+    """
+    owner = _user(db_session, "restore-fence-miss-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
+    task.runner_id = "current-runner"
+    task.run_id = "run-fence-miss"
+    task.interaction_protocol_version = 1
+    db_session.commit()
+
+    stale_lease = TaskLease(
+        task_id=int(task.id), runner_id="a-different-runner", run_id="run-fence-miss"
+    )
+    restored = _restore_resumed_task_lease_to_prior_status(
+        stale_lease, status=TaskStatus.WAITING_FOR_USER
+    )
+
+    assert restored is False
+    db_session.expire_all()
+    refreshed = db_session.query(Task).filter(Task.id == task.id).one()
+    assert refreshed.interaction_protocol_version == 1
+
+
+def test_lease_restore_clears_the_marker_once_no_active_row_remains(
+    db_session,
+) -> None:
+    """The mirror case: the fence matches (this call owns the row) and no
+    active interaction row remains, so the marker is stale and gets
+    zeroed."""
+    owner = _user(db_session, "restore-clears-marker-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
+    task.runner_id = "current-runner"
+    task.run_id = "run-clears-marker"
+    task.interaction_protocol_version = 1
+    db_session.commit()
+
+    lease = TaskLease(
+        task_id=int(task.id), runner_id="current-runner", run_id="run-clears-marker"
+    )
+    restored = _restore_resumed_task_lease_to_prior_status(
+        lease, status=TaskStatus.WAITING_FOR_USER
+    )
+
+    assert restored is True
+    db_session.expire_all()
+    refreshed = db_session.query(Task).filter(Task.id == task.id).one()
+    assert refreshed.interaction_protocol_version is None
+
+
 def test_live_claim_unique_loser_returns_the_committed_winner(
     db_session,
 ) -> None:
@@ -3190,6 +3360,202 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
         )
 
     agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
+
+
+@pytest.mark.asyncio
+async def test_deferred_injection_close_failure_does_not_abort_resume(
+    db_session,
+) -> None:
+    """Same guarantee as the deferred delivery-marker failure case above,
+    for the legacy resume interaction close issued right before it."""
+    owner = _user(db_session, "deferred-close-failure-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Deferred guidance",
+            message_type="user_message",
+            turn_id="deferred-close-failure-turn",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="user",
+                metadata={"turn_id": "deferred-close-failure-turn"},
+            )
+        ]
+    )
+    agent = MagicMock(
+        post_user_message=AsyncMock(return_value=True),
+        resume_execution_by_id=AsyncMock(
+            return_value={
+                "status": "completed",
+                "success": True,
+                "output": "Applied",
+                "agent_result": {"context": context},
+            }
+        ),
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    # Recorded, not asserted, inside the side_effect below: the production
+    # code that calls close_legacy_resume_interaction_sync wraps it in
+    # ``except Exception:``, which would silently swallow an AssertionError
+    # raised from inside this callback the same way it swallows the
+    # RuntimeError this test is otherwise driving. The real assertions run
+    # after the `with` block, outside that handler's reach.
+    observed_close_calls: list[tuple[int, str, str | None]] = []
+
+    def fail_close(task_id_arg: int, run_id_arg: str) -> int:
+        # A fresh session, not db_session: this runs inside the worker
+        # thread run_db_io_cancellation_safe schedules it on, while the
+        # test's own db_session sits unused on the main thread -- sharing
+        # one Session across that handoff is not a pattern this suite uses
+        # elsewhere.
+        probe = next(get_db())
+        try:
+            live_run_id = probe.query(Task).filter(Task.id == task_id_arg).one().run_id
+        finally:
+            probe.close()
+        observed_close_calls.append((task_id_arg, run_id_arg, live_run_id))
+        raise RuntimeError("interaction close unavailable")
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
+        patch(
+            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            side_effect=fail_close,
+        ),
+    ):
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            pending_user_message={
+                "execution_message": "Deferred guidance",
+                "display_message": "Deferred guidance",
+                "files": [],
+                "turn_id": "deferred-close-failure-turn",
+            },
+            delivery_turn_id="deferred-close-failure-turn",
+            delivery_websocket=MagicMock(),
+            delivery_client_message_id="deferred-close-failure-turn",
+        )
+
+    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    assert len(observed_close_calls) == 1
+    called_task_id, called_run_id, live_run_id = observed_close_calls[0]
+    assert called_task_id == int(task.id)
+    assert called_run_id
+    assert called_run_id == live_run_id
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
+
+
+@pytest.mark.asyncio
+async def test_deferred_injection_close_cancellation_does_not_abort_resume(
+    db_session,
+) -> None:
+    """CancelledError branch specifically -- deleting it must turn this red."""
+    owner = _user(db_session, "deferred-close-cancel-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Deferred guidance",
+            message_type="user_message",
+            turn_id="deferred-close-cancel-turn",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="user",
+                metadata={"turn_id": "deferred-close-cancel-turn"},
+            )
+        ]
+    )
+    agent = MagicMock(
+        post_user_message=AsyncMock(return_value=True),
+        resume_execution_by_id=AsyncMock(
+            return_value={
+                "status": "completed",
+                "success": True,
+                "output": "Applied",
+                "agent_result": {"context": context},
+            }
+        ),
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    # Recorded, not asserted, inside the side_effect below -- see the sibling
+    # failure-case test's comment: an AssertionError raised from inside this
+    # callback would be swallowed by the production code's own
+    # ``except Exception:`` the same way it swallows an ordinary failure.
+    observed_close_calls: list[tuple[int, str, str | None]] = []
+
+    def raise_cancelled(task_id_arg: int, run_id_arg: str) -> int:
+        probe = next(get_db())
+        try:
+            live_run_id = probe.query(Task).filter(Task.id == task_id_arg).one().run_id
+        finally:
+            probe.close()
+        observed_close_calls.append((task_id_arg, run_id_arg, live_run_id))
+        raise asyncio.CancelledError
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
+        patch(
+            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            side_effect=raise_cancelled,
+        ),
+    ):
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            pending_user_message={
+                "execution_message": "Deferred guidance",
+                "display_message": "Deferred guidance",
+                "files": [],
+                "turn_id": "deferred-close-cancel-turn",
+            },
+            delivery_turn_id="deferred-close-cancel-turn",
+            delivery_websocket=MagicMock(),
+            delivery_client_message_id="deferred-close-cancel-turn",
+        )
+
+    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    assert len(observed_close_calls) == 1
+    called_task_id, called_run_id, live_run_id = observed_close_calls[0]
+    assert called_task_id == int(task.id)
+    assert called_run_id
+    assert called_run_id == live_run_id
     accepted = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list

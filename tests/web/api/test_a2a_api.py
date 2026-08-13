@@ -22,6 +22,7 @@ from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services.a2a_protocol import (
     A2A_MAX_MESSAGE_TEXT_LENGTH,
     A2AApiError,
@@ -84,6 +85,47 @@ def _create_published_agent_with_key() -> tuple[int, str]:
     key_response = client.post(f"/api/agents/{agent_id}/api-key", headers=headers)
     assert key_response.status_code == 200, key_response.text
     return agent_id, key_response.json()["full_key"]
+
+
+def _seed_active_interaction_row(
+    db: Session, *, task_id: int, run_id: str, idempotency_key: str
+) -> int:
+    """One legal active TaskInteractionRequest row, for the legacy resume
+    close/compensation tests below. Not the interaction staging primitive's
+    fixture builder (tests/web/services/task_interaction_schema_shared.py)
+    -- this file has no other reason to depend on that directory, so this
+    stays a small, local, single-purpose row builder instead."""
+    anchor = TraceEvent(
+        task_id=task_id,
+        event_id=f"anchor-{idempotency_key}",
+        event_type="agent_execution_checkpoint",
+        timestamp=datetime.now(UTC),
+        data={},
+    )
+    db.add(anchor)
+    db.flush()
+    row = TaskInteractionRequest(
+        task_id=task_id,
+        run_id=run_id,
+        kind="clarification",
+        protocol_version=1,
+        status="active",
+        active_slot=1,
+        origin="a2a",
+        request_payload={"prompt": "example"},
+        request_idempotency_key=idempotency_key,
+        resume_trace_event_id=int(anchor.id),
+        resume_event_id="resume-event-1",
+        resume_execution_id="resume-execution-1",
+        resume_locator_format="trace_event_pk_v1",
+        resume_checkpoint_type="agent_execution_checkpoint",
+        resume_run_partition=run_id,
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return int(row.id)
 
 
 def test_agent_card_exposes_published_agent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -752,6 +794,156 @@ def test_checkpoint_resume_schedule_failure_exactly_restores_waiting_task() -> N
         db.close()
 
 
+def test_update_a2a_resume_input_rolls_back_the_interaction_close_with_the_fence() -> (
+    None
+):
+    """The fence UPDATE and the legacy resume interaction close are one
+    atomic write: a fence miss (ownership changed under this lease) must
+    roll back both together, not close the row while rejecting the input.
+
+    What this actually pins is that the close must never commit
+    independently of the host transaction -- reordering the two statements
+    within that same transaction changes nothing observable, because a
+    rollback undoes every statement issued since the last commit regardless
+    of program order. Turning this red needs two changes at once: the close
+    must move ahead of the fence's early return (unreachable there today,
+    since a fence miss returns before the close ever runs) and it must
+    commit independently of this function's session -- either change alone
+    leaves this cell green, verified directly.
+    """
+    db = _direct_db_session()
+    try:
+        agent_id, _full_key = _create_published_agent_with_key()
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="atomicity",
+            status=TaskStatus.RUNNING,
+            runner_id="current-runner",
+            run_id="run-atomicity",
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            interaction_protocol_version=1,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        row_id = _seed_active_interaction_row(
+            db, task_id=task_id, run_id="run-atomicity", idempotency_key="atomicity-q1"
+        )
+    finally:
+        db.close()
+
+    # A different runner_id than the row's current one: the fence's WHERE
+    # clause requires an exact match, so this lease has already lost the
+    # race by the time the write is attempted.
+    stale_lease = TaskLease(
+        task_id=task_id, runner_id="a-different-runner", run_id="run-atomicity"
+    )
+    updated = a2a_api._update_a2a_resume_input_sync(stale_lease, "attempted text")
+
+    assert updated is False
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "active"
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        assert refreshed.interaction_protocol_version == 1
+        assert refreshed.input is None
+    finally:
+        db.close()
+
+
+def test_message_send_closes_the_legacy_resume_interaction_row_on_successful_injection() -> (
+    None
+):
+    """The success path this whole change exists for, driven through the
+    real HTTP message:send call rather than the sync helper directly: once
+    the fence UPDATE lands, the run's active interaction row is retired
+    (``terminated`` / ``answered_via_legacy_resume``) and the task's
+    protocol marker is cleared back to NULL in the same commit."""
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="legacy resume close success",
+            status=TaskStatus.PAUSED,
+            control_state=TaskControlState.PAUSED.value,
+            run_id="run-close-success",
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-close-success"},
+            interaction_protocol_version=1,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        row_id = _seed_active_interaction_row(
+            db,
+            task_id=task_id,
+            run_id="run-close-success",
+            idempotency_key="close-success-q1",
+        )
+    finally:
+        db.close()
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    begin_turn = AsyncMock()
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch("xagent.web.api.a2a._schedule_waiting_a2a_resume"),
+        patch(
+            "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+            new=begin_turn,
+        ),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-close-success",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "answered via legacy resume"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    agent_service.post_user_message.assert_awaited_once()
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "terminated"
+        assert row.terminal_reason == "answered_via_legacy_resume"
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        assert refreshed.interaction_protocol_version is None
+    finally:
+        db.close()
+
+
 @pytest.mark.asyncio
 async def test_a2a_handover_restores_input_required_on_unreadable_checkpoint() -> None:
     """The A2A handover carries the pre-claim status into the resume.
@@ -1084,6 +1276,149 @@ def test_failed_follow_up_restores_input_required_status() -> None:
     try:
         recovered = db.query(Task).filter(Task.id == task_id).one()
         assert recovered.status == TaskStatus.WAITING_FOR_USER
+    finally:
+        db.close()
+
+
+def test_failed_follow_up_leaves_a_still_active_question_and_marker_untouched() -> None:
+    """Injection never happened here (post_user_message returned False), so
+    the prelease restore's marker-clear compensation must not fire: the
+    active interaction row and the protocol marker are both untouched.
+
+    Deleting the NOT EXISTS guard from clear_interaction_marker_if_unpaired
+    would turn this red -- the marker would be zeroed out from under a
+    question that is still active.
+    """
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="waiting with an open question",
+            status=TaskStatus.WAITING_FOR_USER,
+            run_id="run-not-posted",
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-not-posted"},
+            interaction_protocol_version=1,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        row_id = _seed_active_interaction_row(
+            db,
+            task_id=task_id,
+            run_id="run-not-posted",
+            idempotency_key="not-posted-q1",
+        )
+    finally:
+        db.close()
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=False)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    with patch(
+        "xagent.web.api.chat.get_agent_manager",
+        return_value=agent_manager,
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-not-posted",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "no checkpoint available"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 400, response.text
+    db = _direct_db_session()
+    try:
+        recovered = db.query(Task).filter(Task.id == task_id).one()
+        assert recovered.status == TaskStatus.WAITING_FOR_USER
+        assert recovered.interaction_protocol_version == 1
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "active"
+    finally:
+        db.close()
+
+
+def test_prelease_restore_from_a_cancelled_acquisition_leaves_marker_untouched() -> (
+    None
+):
+    """``_restore_a2a_resume_prelease_sync`` is also the cleanup callback
+    ``acquire_task_lease_cancellation_safe`` invokes directly when the
+    acquisition committed a prelease but the caller was then cancelled --
+    no ``post_user_message`` outcome participates in that path at all.
+    Called here exactly as that callback calls it: with a live active
+    interaction row still in place, the marker must survive.
+
+    Deleting the NOT EXISTS guard would turn this red the same way it does
+    for the ``if not posted`` path above -- both routes converge on the
+    same shared clear_interaction_marker_if_unpaired call.
+    """
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="prelease acquired then cancelled",
+            status=TaskStatus.RUNNING,
+            runner_id="cancelled-acquire-runner",
+            run_id="run-cancelled-acquire",
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            interaction_protocol_version=1,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        row_id = _seed_active_interaction_row(
+            db,
+            task_id=task_id,
+            run_id="run-cancelled-acquire",
+            idempotency_key="cancelled-acquire-q1",
+        )
+    finally:
+        db.close()
+
+    acquired_lease = TaskLease(
+        task_id=task_id,
+        runner_id="cancelled-acquire-runner",
+        run_id="run-cancelled-acquire",
+    )
+    restored = a2a_api._restore_a2a_resume_prelease_sync(
+        acquired_lease, status=TaskStatus.WAITING_FOR_USER
+    )
+
+    assert restored is True
+    db = _direct_db_session()
+    try:
+        recovered = db.query(Task).filter(Task.id == task_id).one()
+        assert recovered.status == TaskStatus.WAITING_FOR_USER
+        assert recovered.interaction_protocol_version == 1
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "active"
     finally:
         db.close()
 
