@@ -389,11 +389,11 @@ async def test_watchdog_missing_task_row_closes_with_task_deleted():
 async def test_watchdog_survives_transient_check_failure_and_still_closes():
     """A single failed watchdog cycle (e.g. a transient DB error reading
     the task row) must not silence the watchdog for the rest of the
-    stream's life. Before this fix, an uncaught exception inside the
-    watchdog loop killed the loop's background task permanently and
-    silently -- the generator's teardown swallowed it via a blanket
-    ``except BaseException``, so nothing was left watching the stream
-    until the 1-hour absolute cap. This injects a ``read_task_snapshot``
+    stream's life: an exception escaping the loop would kill its
+    background task permanently, leaving nothing to close the stream
+    until the 1-hour absolute cap. Each cycle therefore catches and
+    logs its own failures and retries on the next tick. This injects a
+    ``read_task_snapshot``
     that raises on its first call and returns a real, terminal
     snapshot on its second, and asserts the stream still reaches
     ``task.completed`` -- i.e. the watchdog retried instead of dying."""
