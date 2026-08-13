@@ -11,6 +11,7 @@ attach shapes, where the JSON-vs-event-stream distinction actually
 matters).
 """
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
@@ -385,6 +386,57 @@ async def test_watchdog_missing_task_row_closes_with_task_deleted():
     assert sink.queue.get_nowait() == (es.error_frame("task_deleted"), True)
 
 
+async def test_watchdog_survives_transient_check_failure_and_still_closes():
+    """A single failed watchdog cycle (e.g. a transient DB error reading
+    the task row) must not silence the watchdog for the rest of the
+    stream's life. Before this fix, an uncaught exception inside the
+    watchdog loop killed the loop's background task permanently and
+    silently -- the generator's teardown swallowed it via a blanket
+    ``except BaseException``, so nothing was left watching the stream
+    until the 1-hour absolute cap. This injects a ``read_task_snapshot``
+    that raises on its first call and returns a real, terminal
+    snapshot on its second, and asserts the stream still reaches
+    ``task.completed`` -- i.e. the watchdog retried instead of dying."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    call_count = 0
+
+    def flaky_reader(task_id_, principal_):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("boom - transient read failure")
+        return v1_tasks._load_task_info_snapshot(task_id_, principal_)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=flaky_reader,
+        watchdog_interval_seconds=0.01,
+        stream_max_duration_seconds=1000,
+        heartbeat_interval_seconds=1000,
+    )
+    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    assert "event: task.status" in first
+
+    _set_task_status(task_id, TaskStatus.COMPLETED, output="done")
+
+    frames = []
+
+    async def _drain():
+        async for frame in resp.body_iterator:
+            frames.append(frame)
+
+    await asyncio.wait_for(_drain(), timeout=2)
+    assert call_count >= 2  # the first (failing) cycle and the retry
+    assert any("event: task.completed" in f for f in frames)
+    assert es.count_task_sinks(task_id) == 0
+
+
 # ===== endpoint signature carries no request-scoped DB dependency =====
 
 
@@ -422,6 +474,45 @@ async def test_sink_unregistered_after_generator_teardown():
     assert es.count_task_sinks(task_id) == 0
 
 
+# ===== a generator that's built but never started leaks nothing =====
+
+
+async def test_unstarted_generator_leaves_no_registration_or_reservation():
+    """An async generator's body doesn't run until it's first iterated.
+    Registering the sink and reserving the per-principal slot both
+    happen *inside* ``_generate``'s own ``try`` (not at
+    ``build_event_stream_response`` construction time) specifically so
+    that a ``StreamingResponse`` that's constructed but never iterated
+    -- ``__anext__`` never called even once -- leaves nothing behind:
+    no sink in ``manager``, no held slot in the per-principal counter.
+    Before that fix, registration/reservation ran at construction time,
+    so this exact sequence (build, then ``aclose()`` with zero reads)
+    leaked both forever, since the only code that ever released them
+    lived inside the generator body that never got to run."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    key_prefix = _key_prefix_for_agent(agent_id)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        watchdog_interval_seconds=1000,
+        stream_max_duration_seconds=1000,
+        heartbeat_interval_seconds=1000,
+    )
+    # No __anext__() call at all -- the generator body has never run.
+    assert es.count_task_sinks(task_id) == 0
+    assert es._principal_stream_counts.get(key_prefix, 0) == 0
+
+    await resp.body_iterator.aclose()
+    assert es.count_task_sinks(task_id) == 0
+    assert es._principal_stream_counts.get(key_prefix, 0) == 0
+
+
 # ===== per-principal stream cap =====
 
 
@@ -448,6 +539,33 @@ def test_events_principal_cap_returns_429_json():
     assert resp.headers["content-type"].startswith("application/json")
     assert resp.json()["error"]["code"] == "rate_limited"
     assert es.count_task_sinks(task_id) == 0  # rejected before registration
+
+
+async def test_principal_slot_released_after_real_stream_teardown():
+    """A real attach through ``build_event_stream_response`` (not the
+    raw counter functions in isolation) must actually give its slot
+    back on teardown -- otherwise every stream a key ever opens
+    permanently eats one of its 32 concurrent slots."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    key_prefix = _key_prefix_for_agent(agent_id)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        watchdog_interval_seconds=1000,
+        stream_max_duration_seconds=1000,
+        heartbeat_interval_seconds=1000,
+    )
+    await resp.body_iterator.__anext__()
+    assert es._principal_stream_counts.get(key_prefix, 0) == 1
+
+    await resp.body_iterator.aclose()
+    assert es._principal_stream_counts.get(key_prefix, 0) == 0
 
 
 # ===== absolute deadline emits stream_expired before closing =====
@@ -490,6 +608,72 @@ async def test_enqueue_close_is_idempotent_first_writer_wins():
     assert second is False
     assert sink.queue.qsize() == 1
     assert sink.queue.get_nowait() == (es.error_frame("stream_expired"), True)
+
+
+# ===== close frame isn't lost when it's enqueued while the generator is
+# suspended mid-yield on an earlier, non-close frame =====
+
+
+async def test_close_frame_delivered_when_enqueued_between_two_yields():
+    """The generator can be suspended at ``yield frame_text`` (Starlette
+    awaiting the socket write) when a concurrent close call lands. The
+    close-ness of the *next* frame the generator delivers must come
+    from that frame's own queue entry, not from re-reading
+    ``sink.closing`` after the unrelated earlier yield resumes -- by
+    then ``closing`` is already true even though the frame just sent
+    wasn't the close frame. Driven by hand via ``asend`` to control
+    exactly where the generator is suspended when the race hits."""
+
+    async def _never_read(task_id, principal):  # pragma: no cover
+        raise AssertionError("watchdog must not run in this test")
+
+    task_id = 987_654_321  # sentinel, not a real DB row -- unused by this test
+    gen = es._generate(
+        task_id,
+        None,
+        key_prefix="pfx-close-frame-race-test",
+        initial_status="running",
+        read_task_snapshot=_never_read,
+        watchdog_interval_seconds=10_000,
+        stream_max_duration_seconds=10_000,
+        heartbeat_interval_seconds=10_000,
+    )
+    try:
+        first = await gen.asend(None)
+        assert "event: task.status" in first
+
+        # ``_generate`` builds and registers the sink internally now (fix
+        # for the double-leak on an unstarted generator) -- fetch the
+        # live instance via the same ``manager`` registry the generator
+        # just registered it into.
+        sink = next(
+            c
+            for c in es.manager.connections_for_task(task_id)
+            if isinstance(c, es.V1EventStreamSink)
+        )
+
+        sink.enqueue_status("paused")
+        second = await gen.asend(None)
+        assert "paused" in second
+        # The generator is now suspended right after yielding ``second``
+        # -- exactly the window in which the real consumer would be
+        # awaiting the socket write while other tasks run.
+
+        won = sink.enqueue_close(
+            es.completed_frame(status="completed", output="done", error=None)
+        )
+        assert won is True
+
+        third = await gen.asend(None)
+        assert "event: task.completed" in third
+        with pytest.raises(StopAsyncIteration):
+            await gen.asend(None)
+    finally:
+        # ``_generate``'s own ``finally`` already released the slot it
+        # reserved once the close frame was delivered above; ``aclose()``
+        # here only matters if an assertion failed earlier and the
+        # generator is still suspended mid-stream.
+        await gen.aclose()
 
 
 async def test_close_exactly_once_under_watchdog_deadline_race():
@@ -601,3 +785,153 @@ async def test_sink_send_text_never_queries_db(monkeypatch):
         json.dumps({"type": "task_completed", "task": {"id": sink.task_id}})
     )
     assert calls == []
+
+
+# ===== the heartbeat comment line actually gets sent while idle =====
+
+
+async def test_heartbeat_actually_sent_when_idle():
+    """The 15s heartbeat comment must actually be emitted while the
+    stream is otherwise idle -- this is a real, non-vacuous assertion
+    that at least one ``: ping`` frame arrives, not a shape check that
+    would pass whether zero or many heartbeats fired (that was the bug
+    in the older deadline test, which only ever asserted a frame-count
+    identity that holds either way). Injects a short heartbeat interval
+    with a long watchdog interval and deadline so a heartbeat is the
+    only thing that can produce a frame here."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        watchdog_interval_seconds=1000,
+        stream_max_duration_seconds=1000,
+        heartbeat_interval_seconds=0.01,
+    )
+    pings = 0
+    try:
+
+        async def _collect() -> None:
+            nonlocal pings
+            async for frame in resp.body_iterator:
+                if frame == ": ping\n\n":
+                    pings += 1
+                    return
+
+        await asyncio.wait_for(_collect(), timeout=2)
+    finally:
+        await resp.body_iterator.aclose()
+    assert pings >= 1
+
+
+# ===== a broadcast-shaped frame reaching the sink ends up as real
+# SSE output text out of the generator, not just in the internal queue =====
+
+
+async def test_broadcast_frame_reaches_generator_output_as_task_status():
+    """Wiring test for the full path: ``sink.send_text`` (what
+    ``broadcast_to_task`` calls) -> ``enqueue_status`` -> the outbound
+    queue -> ``_generate``'s yield. Uses a status distinct from the
+    initial attach status ("running") so the assertion can't pass
+    merely because the *first* frame already says ``task.status`` --
+    it must be *this* broadcast that produced the second frame."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+    assert snapshot.status.value == "running"
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        watchdog_interval_seconds=1000,
+        stream_max_duration_seconds=1000,
+        heartbeat_interval_seconds=1000,
+    )
+    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    assert json.loads(first.split("data: ", 1)[1]) == {"status": "running"}
+
+    sink = next(
+        c
+        for c in es.manager.connections_for_task(task_id)
+        if isinstance(c, es.V1EventStreamSink)
+    )
+    await sink.send_text(
+        json.dumps({"type": "task_paused", "task_id": task_id, "status": "paused"})
+    )
+
+    second = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    assert "event: task.status" in second
+    assert json.loads(second.split("data: ", 1)[1]) == {"status": "paused"}
+
+    await resp.body_iterator.aclose()
+
+
+# ===== consecutive identical statuses only produce one frame =====
+
+
+async def test_consecutive_same_status_broadcasts_are_deduped_to_one_frame():
+    sink = _make_sink(task_id=1, status="running")
+    for _ in range(3):
+        await sink.send_text(
+            json.dumps({"type": "task_paused", "task_id": 1, "status": "paused"})
+        )
+    assert sink.queue.qsize() == 1
+    assert sink.queue.get_nowait() == (es.status_frame("paused"), False)
+
+
+# ===== the completion_hint wakes the watchdog early, not on its next
+# periodic tick =====
+
+
+async def test_completion_hint_wakes_watchdog_before_its_next_periodic_tick():
+    """The ``task_completed`` broadcast hint is supposed to be an
+    acceleration path -- the watchdog wakes and checks immediately
+    instead of waiting out its normal interval. This pins that it's a
+    genuine early wake, not something that happens to work because the
+    interval is already short: the watchdog interval here is 1000s, so
+    the only way this test can finish inside its 2s bound is if the
+    hint actually woke it early. If the hint stopped working, this
+    would hang until the bound trips and the test would fail instead of
+    silently passing."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        watchdog_interval_seconds=1000,
+        stream_max_duration_seconds=1000,
+        heartbeat_interval_seconds=1000,
+    )
+    await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+
+    _set_task_status(task_id, TaskStatus.COMPLETED, output="done")
+    sink = next(
+        c
+        for c in es.manager.connections_for_task(task_id)
+        if isinstance(c, es.V1EventStreamSink)
+    )
+    await sink.send_text(
+        json.dumps({"type": "task_completed", "task": {"id": task_id}})
+    )
+
+    frames = []
+
+    async def _drain() -> None:
+        async for frame in resp.body_iterator:
+            frames.append(frame)
+
+    await asyncio.wait_for(_drain(), timeout=2)
+    assert any("event: task.completed" in f for f in frames)
