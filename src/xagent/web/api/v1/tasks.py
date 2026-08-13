@@ -1208,8 +1208,9 @@ async def stream_chat_task_events(
 ) -> StreamingResponse:
     """Stream a task's lifecycle as Server-Sent Events.
 
-    Transport layer only: emits ``task.status``, ``task.completed``, and
-    ``stream.error``. Step-by-step and token-by-token content
+    Transport layer only: emits ``task.status``, ``task.completed``,
+    ``task.input_required``, and ``stream.error``. Step-by-step and
+    token-by-token content
     (``step.*`` / ``message.*``) is not projected onto this stream yet --
     poll ``GET /v1/chat/tasks/{task_id}/steps`` for that in the meantime.
 

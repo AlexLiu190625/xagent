@@ -4,8 +4,9 @@ This module owns everything about *moving bytes to the client and
 deciding when to stop* -- registration into the shared connection
 ``manager``, the outbound frame queue, the 30-second watchdog, the
 1-hour absolute duration cap, and per-task / per-principal concurrency
-limits. It emits three lifecycle events -- ``task.status``,
-``task.completed``, and ``stream.error`` -- and nothing else.
+limits. It emits four lifecycle events -- ``task.status``,
+``task.completed``, ``task.input_required``, and ``stream.error`` --
+and nothing else.
 
 Explicitly out of scope here:
   - Projecting ``step.*`` / ``message.*`` content from trace events.
@@ -143,7 +144,16 @@ class V1EventStreamSink:
         self.principal_key_prefix = principal_key_prefix
         self.dropped_frame_count = 0
         self.completion_hint = asyncio.Event()
-        self._queue: "asyncio.Queue[str]" = asyncio.Queue(
+        # Each element is ``(frame_text, is_close)``. ``is_close`` travels
+        # with the frame itself rather than being inferred from
+        # ``self._closing`` at dequeue time -- the generator can be
+        # suspended at ``yield`` on an *earlier*, non-close frame while a
+        # concurrent ``enqueue_close`` flips ``_closing`` and appends the
+        # close frame behind it; reading ``_closing`` after that yield
+        # would wrongly treat the earlier frame as the close and return
+        # without ever delivering the close frame still sitting in the
+        # queue.
+        self._queue: "asyncio.Queue[tuple[str, bool]]" = asyncio.Queue(
             maxsize=OUTBOUND_QUEUE_MAX_SIZE
         )
         self._closing = False
@@ -158,7 +168,7 @@ class V1EventStreamSink:
         return self._closing
 
     @property
-    def queue(self) -> "asyncio.Queue[str]":
+    def queue(self) -> "asyncio.Queue[tuple[str, bool]]":
         return self._queue
 
     def _assert_owner_loop(self) -> None:
@@ -192,7 +202,7 @@ class V1EventStreamSink:
                 self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-        self._queue.put_nowait(frame_text)
+        self._queue.put_nowait((frame_text, True))
         return True
 
     def _put_or_overflow(self, frame_text: str) -> None:
@@ -202,7 +212,7 @@ class V1EventStreamSink:
         if self._closing:
             return
         try:
-            self._queue.put_nowait(frame_text)
+            self._queue.put_nowait((frame_text, False))
         except asyncio.QueueFull:
             self.enqueue_close(error_frame("resync_required"))
 
@@ -274,6 +284,17 @@ def try_reserve_principal_slot(key_prefix: str) -> bool:
         return False
     _principal_stream_counts[key_prefix] = current + 1
     return True
+
+
+def principal_slot_available(key_prefix: str) -> bool:
+    """Read-only capacity check -- would ``try_reserve_principal_slot``
+    currently succeed for this key. Used at response-construction time
+    (``build_event_stream_response``) so a 429 is raised before any
+    stream opens, without mutating the counter yet: the actual
+    reservation happens once the generator starts running (see
+    ``_generate``), so a response that's constructed but never iterated
+    never touches this counter."""
+    return _principal_stream_counts.get(key_prefix, 0) < PER_PRINCIPAL_STREAM_CAP
 
 
 def release_principal_slot(key_prefix: str) -> None:
@@ -383,7 +404,15 @@ async def _watchdog_loop(
     interval_seconds: float,
 ) -> None:
     """Runs every ``interval_seconds`` and also wakes early on a
-    ``task_completed`` broadcast hint: same check, just run sooner."""
+    ``task_completed`` broadcast hint: same check, just run sooner.
+
+    A single failed check (e.g. a transient DB error) must not end
+    watchdog coverage for the rest of the stream's lifetime -- that
+    would leave an orphaned stream open until the 1-hour absolute cap
+    with nobody watching it. So every per-cycle check is wrapped and
+    logged; only cancellation (this loop's own teardown, not a check
+    failure) ends the loop early.
+    """
     while not sink.closing:
         try:
             await asyncio.wait_for(
@@ -395,10 +424,16 @@ async def _watchdog_loop(
             sink.completion_hint.clear()
         if sink.closing:
             return
-        if await watchdog_check_once(
-            sink, task_id, principal, read_task_snapshot=read_task_snapshot
-        ):
-            return
+        try:
+            if await watchdog_check_once(
+                sink, task_id, principal, read_task_snapshot=read_task_snapshot
+            ):
+                return
+        except Exception:
+            logger.exception(
+                "v1 SSE watchdog check failed for task %s; retrying next cycle",
+                task_id,
+            )
 
 
 # -- Response assembly ----------------------------------------------------
@@ -417,27 +452,54 @@ async def _terminal_snapshot_stream(
 
 
 async def _generate(
-    sink: V1EventStreamSink,
     task_id: int,
     principal: ApiKeyPrincipal,
     *,
+    key_prefix: str,
     initial_status: str,
     read_task_snapshot: TaskSnapshotReader,
     watchdog_interval_seconds: float,
     stream_max_duration_seconds: float,
     heartbeat_interval_seconds: float,
 ) -> AsyncIterator[str]:
+    """Build the sink, register it, run the stream, tear it all down.
+
+    Sink construction, ``manager`` registration, and the per-principal
+    slot reservation all happen *inside* this ``try`` -- deliberately
+    not in ``build_event_stream_response`` -- because an async
+    generator's body doesn't run at all until it's first iterated. If
+    registration/reservation happened at response-construction time
+    instead, a ``StreamingResponse`` that gets built but never iterated
+    (e.g. the caller closes it before Starlette ever pulls a chunk)
+    would leak both: this generator's ``finally`` -- the only code that
+    unregisters and releases -- would simply never execute. Deferring
+    both into here means whatever starts this generator (even just one
+    ``aclose()`` with no frames read) is guaranteed to reach the
+    ``finally`` and clean up exactly what it reserved.
+
+    The 429 capacity *checks* still happen earlier, in
+    ``build_event_stream_response`` (read-only, no mutation) -- so a
+    rejected attach still fails before any stream bytes are sent; only
+    the actual counter mutation and registration move here.
+    """
     deadline = monotonic() + stream_max_duration_seconds
-    watchdog_task = asyncio.create_task(
-        _watchdog_loop(
-            sink,
-            task_id,
-            principal,
-            read_task_snapshot=read_task_snapshot,
-            interval_seconds=watchdog_interval_seconds,
-        )
+    sink = V1EventStreamSink(
+        task_id=task_id, principal_key_prefix=key_prefix, initial_status=initial_status
     )
+    principal_slot_reserved = False
+    watchdog_task: "asyncio.Task[None] | None" = None
     try:
+        principal_slot_reserved = try_reserve_principal_slot(key_prefix)
+        manager.register_connection(cast(WebSocket, sink), task_id)
+        watchdog_task = asyncio.create_task(
+            _watchdog_loop(
+                sink,
+                task_id,
+                principal,
+                read_task_snapshot=read_task_snapshot,
+                interval_seconds=watchdog_interval_seconds,
+            )
+        )
         # The initial yield must be inside this ``try`` too: a generator
         # closed (``aclose()``, e.g. on client disconnect) while suspended
         # here still has to unregister the sink and cancel the watchdog.
@@ -450,23 +512,41 @@ async def _generate(
                 sink.enqueue_close(error_frame("stream_expired"))
             wait_budget = heartbeat_interval_seconds if remaining > 0 else 1.0
             try:
-                frame = await asyncio.wait_for(sink.queue.get(), timeout=wait_budget)
+                frame_text, is_close = await asyncio.wait_for(
+                    sink.queue.get(), timeout=wait_budget
+                )
             except asyncio.TimeoutError:
                 yield ": ping\n\n"
                 continue
-            yield frame
-            if sink.closing:
+            yield frame_text
+            # ``is_close`` is the flag recorded on *this* frame at enqueue
+            # time, not ``sink.closing`` re-read now -- see the queue
+            # element's docstring in ``V1EventStreamSink.__init__`` for why
+            # that distinction is load-bearing under concurrent
+            # ``enqueue_close`` calls.
+            if is_close:
                 return
     finally:
-        watchdog_task.cancel()
-        with contextlib.suppress(BaseException):
-            await watchdog_task
+        if watchdog_task is not None:
+            watchdog_task.cancel()
+            # Narrowed to ``CancelledError`` only (not a blanket
+            # ``BaseException``): the watchdog loop itself now catches
+            # and logs every per-cycle ``Exception`` internally (see
+            # ``_watchdog_loop``) and retries rather than dying, so the
+            # only exception this teardown should ever observe here is
+            # the cancellation just requested above. If the watchdog
+            # task raises anything else, that's a real bug and must
+            # propagate instead of being silently swallowed.
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog_task
         # ``manager`` is typed against a real ``WebSocket``; this sink only
         # duck-types its ``send_text`` contract (module docstring) -- the
         # cast documents that intentional narrowing instead of suppressing
-        # the type error blanket-wide.
+        # the type error blanket-wide. A safe no-op if registration above
+        # never ran or never completed.
         manager.disconnect(cast(WebSocket, sink))
-        release_principal_slot(sink.principal_key_prefix)
+        if principal_slot_reserved:
+            release_principal_slot(key_prefix)
 
 
 async def build_event_stream_response(
@@ -484,8 +564,9 @@ async def build_event_stream_response(
     ``initial_snapshot`` must already be authorized (i.e. come from
     ``_resolve_task_or_404`` via ``read_task_snapshot``) -- this
     function does no auth of its own. Concurrency caps (429) are
-    checked here, before any sink is registered, so a rejected attach
-    never touches ``manager`` or the per-principal counter.
+    checked here, before the generator (and therefore the sink and the
+    per-principal reservation) ever exists, so a rejected attach never
+    touches ``manager`` or the per-principal counter.
     """
     if initial_snapshot.status in _TERMINAL_STATUSES:
         return StreamingResponse(
@@ -497,25 +578,14 @@ async def build_event_stream_response(
         raise V1ApiError(V1ErrorCode.RATE_LIMITED, 429)
 
     key_prefix = principal.key.key_prefix
-    if not try_reserve_principal_slot(key_prefix):
+    if not principal_slot_available(key_prefix):
         raise V1ApiError(V1ErrorCode.RATE_LIMITED, 429)
-
-    sink = V1EventStreamSink(
-        task_id=task_id,
-        principal_key_prefix=key_prefix,
-        initial_status=initial_snapshot.status.value,
-    )
-    try:
-        manager.register_connection(cast(WebSocket, sink), task_id)
-    except Exception:
-        release_principal_slot(key_prefix)
-        raise
 
     return StreamingResponse(
         _generate(
-            sink,
             task_id,
             principal,
+            key_prefix=key_prefix,
             initial_status=initial_snapshot.status.value,
             read_task_snapshot=read_task_snapshot,
             watchdog_interval_seconds=watchdog_interval_seconds,

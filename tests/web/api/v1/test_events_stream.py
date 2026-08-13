@@ -240,7 +240,7 @@ async def test_slow_consumer_queue_overflow_closes_with_resync_required():
     # Memory doesn't grow past the cap even under sustained overflow --
     # exactly one frame (the close frame) survives.
     assert sink.queue.qsize() == 1
-    assert sink.queue.get_nowait() == es.error_frame("resync_required")
+    assert sink.queue.get_nowait() == (es.error_frame("resync_required"), True)
 
 
 # ===== key revoked/paused closes within one watchdog cycle =====
@@ -269,7 +269,7 @@ async def test_watchdog_closes_within_one_cycle_on_key_invalidation(field):
     )
     assert closed is True
     assert sink.closing is True
-    assert sink.queue.get_nowait() == es.error_frame("unauthorized")
+    assert sink.queue.get_nowait() == (es.error_frame("unauthorized"), True)
 
 
 async def test_watchdog_paused_does_not_close():
@@ -287,7 +287,7 @@ async def test_watchdog_paused_does_not_close():
     )
     assert closed is False
     assert sink.closing is False
-    assert sink.queue.get_nowait() == es.status_frame("paused")
+    assert sink.queue.get_nowait() == (es.status_frame("paused"), False)
 
 
 async def test_watchdog_waiting_for_user_closes_with_null_prompt_input_required():
@@ -309,7 +309,7 @@ async def test_watchdog_waiting_for_user_closes_with_null_prompt_input_required(
     )
     assert closed is True
     assert sink.closing is True
-    assert sink.queue.get_nowait() == es.input_required_frame(task_id)
+    assert sink.queue.get_nowait() == (es.input_required_frame(task_id), True)
     assert (
         json.loads(es.input_required_frame(task_id).split("data: ", 1)[1])["prompt"]
         is None
@@ -354,8 +354,9 @@ async def test_watchdog_terminal_task_row_closes_with_completed():
         sink, task_id, principal, read_task_snapshot=v1_tasks._load_task_info_snapshot
     )
     assert closed is True
-    assert sink.queue.get_nowait() == es.completed_frame(
-        status="failed", output=None, error="boom"
+    assert sink.queue.get_nowait() == (
+        es.completed_frame(status="failed", output=None, error="boom"),
+        True,
     )
 
 
@@ -381,7 +382,7 @@ async def test_watchdog_missing_task_row_closes_with_task_deleted():
         sink, task_id, principal, read_task_snapshot=v1_tasks._load_task_info_snapshot
     )
     assert closed is True
-    assert sink.queue.get_nowait() == es.error_frame("task_deleted")
+    assert sink.queue.get_nowait() == (es.error_frame("task_deleted"), True)
 
 
 # ===== endpoint signature carries no request-scoped DB dependency =====
@@ -488,7 +489,7 @@ async def test_enqueue_close_is_idempotent_first_writer_wins():
     assert first is True
     assert second is False
     assert sink.queue.qsize() == 1
-    assert sink.queue.get_nowait() == es.error_frame("stream_expired")
+    assert sink.queue.get_nowait() == (es.error_frame("stream_expired"), True)
 
 
 async def test_close_exactly_once_under_watchdog_deadline_race():
