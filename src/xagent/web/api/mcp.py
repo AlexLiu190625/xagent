@@ -2009,8 +2009,37 @@ def list_mcp_apps(
             results.append(app_copy)
 
     if location in ["local", "all"]:
+        # Sharing a connector with a team writes a team link row and no
+        # per-member association, so the personal queries above resolve nothing
+        # for every member but the creator. Overlay the team-owned ids the way
+        # get_mcp_servers does, or the Tools page would list a connector the
+        # picker cannot offer (#1321). Scoped to this branch on purpose: the
+        # remote branch's lookups answer "is this catalog app connected *for
+        # me*", which only a personal association can establish. Standalone
+        # deployments install no hook, resolve empty, and take the same path
+        # they always did.
+        from ..services.connector_team_scope import visible_team_connector_ids
+
+        team_ids = visible_team_connector_ids(db, cast(int, current_user.id))
+
+        # (server, user_mcp) for a personal row; (server, None) for a
+        # team-owned connector the user holds no association for. Excluding the
+        # ids already covered personally is what keeps a member who holds both
+        # from seeing the connector twice.
+        local_mcps: list[tuple[MCPServer, UserMCPServer | None]] = list(user_mcps)
+        missing_mcp = [
+            sid for sid in team_ids["mcp"] if sid not in user_mcp_by_server_id
+        ]
+        if missing_mcp:
+            local_mcps.extend(
+                (server, None)
+                for server in db.query(MCPServer)
+                .filter(MCPServer.id.in_(missing_mcp))
+                .all()
+            )
+
         library_names = {app["name"].lower() for app in library_apps}
-        for server, user_mcp in user_mcps:
+        for server, user_mcp in local_mcps:
             if server.name.lower() in library_names:
                 continue
 
@@ -2057,8 +2086,15 @@ def list_mcp_apps(
             # Configure button away from the custom edit form. Inactive
             # associations are excluded because the per-server OAuth endpoints
             # require an active one — a deactivated server needs re-enabling,
-            # not re-authorization.
-            if user_mcp.is_active and _is_mcp_oauth_server(server):
+            # not re-authorization. A team-owned server (user_mcp is None) is
+            # excluded for the same reason, more strongly: the member holds no
+            # association at all, so /{server_id}/oauth/connect would 404 and
+            # the advertised flow would dead-end in a failed popup.
+            if (
+                user_mcp is not None
+                and user_mcp.is_active
+                and _is_mcp_oauth_server(server)
+            ):
                 entry["auth_type"] = "mcp_oauth"
 
             results.append(entry)
@@ -2071,7 +2107,20 @@ def list_mcp_apps(
             .all()
         )
 
-        for user_api, api in user_custom_apis:
+        # Same overlay as the MCP half above: a team-owned Custom API has no
+        # UserCustomApi row for the member. Nothing in the entry below reads
+        # the association, so team-owned APIs need no stand-in — only the id.
+        local_custom_apis: list[CustomApi] = [
+            api for _user_api, api in user_custom_apis
+        ]
+        own_api_ids = {cast(int, api.id) for api in local_custom_apis}
+        missing_api = [aid for aid in team_ids["custom_api"] if aid not in own_api_ids]
+        if missing_api:
+            local_custom_apis.extend(
+                db.query(CustomApi).filter(CustomApi.id.in_(missing_api)).all()
+            )
+
+        for api in local_custom_apis:
             if search:
                 search_lower = search.lower()
                 if search_lower not in api.name.lower() and (
