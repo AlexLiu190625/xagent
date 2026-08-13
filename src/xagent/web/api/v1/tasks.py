@@ -1214,12 +1214,29 @@ async def stream_chat_task_events(
     (``step.*`` / ``message.*``) is not projected onto this stream yet --
     poll ``GET /v1/chat/tasks/{task_id}/steps`` for that in the meantime.
 
+    This endpoint declares no ``responses=`` schema, so the field lists
+    below are the only OpenAPI-visible contract for its four SSE event
+    types (each a ``event: <name>`` / ``data: <json>`` frame pair):
+      - ``task.status``: ``{status}``.
+      - ``task.completed``: ``{status, output, error}``. A failed task
+        also ends the stream with this event rather than a separate
+        one -- ``status`` is ``"failed"`` and ``error`` is set.
+      - ``task.input_required``: ``{task_id, prompt: null}`` -- ``prompt``
+        is always ``null`` at this transport layer (see module docstring
+        for why).
+      - ``stream.error``: ``{code, message}``, a flat shape distinct
+        from the nested error envelope ``V1ApiError`` HTTP responses use
+        elsewhere in this router; the two error-code vocabularies do
+        not overlap.
+
     Behavior:
       - Normal attach: opens the stream, emits ``task.status`` for the
         task's current state, then a status update each time it
         changes (consecutive duplicates are suppressed), and
         ``task.completed`` when the task finishes. A ``: ping`` comment
-        line is sent every 15s to keep the connection alive.
+        line is sent whenever 15s pass without any other frame going
+        out, to keep the connection alive -- not on a fixed 15s
+        cadence regardless of activity.
       - Attaching to an already-finished task is not an error: the
         stream opens, emits ``task.status`` then ``task.completed``,
         and closes immediately.
@@ -1251,15 +1268,18 @@ async def stream_chat_task_events(
             the stream never opens).
         V1ApiError 404: task missing or not owned by the calling key
             (plain JSON; the stream never opens).
-        V1ApiError 429 ``rate_limited``: more than 2 concurrent streams
-            already open on this task. The per-key cap (32 concurrent
-            streams across all tasks) is enforced the same way for a
-            normal attach, but it is best-effort under a concurrent
-            attach burst: several attaches for the same key can pass
-            the check at the same instant, so the count can be
-            exceeded briefly instead of the extra attaches getting a
-            429. No stream is aborted once opened; the count corrects
-            itself as open streams for that key close.
+        V1ApiError 429 ``rate_limited``: 2 or more concurrent streams
+            already open on this task, or 32 or more already open for
+            this key across all tasks (the per-key cap). Both caps are
+            checked once, before the attach's own stream registers, so
+            both are best-effort under a concurrent attach burst:
+            several attaches can pass the check at the same instant,
+            so the number of streams actually open can briefly exceed
+            the cap -- the per-key cap's own counter never does, since
+            it checks before it increments; it's specifically the
+            count of open streams that can run ahead of it. No stream
+            is aborted once opened; both counts self-heal as open
+            streams close.
     """
     snapshot = await run_db_io_cancellation_safe(
         lambda: _load_task_info_snapshot(task_id, principal)

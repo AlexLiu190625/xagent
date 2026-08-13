@@ -230,6 +230,62 @@ def test_events_terminal_task_immediate_close():
     assert es.count_task_sinks(task_id) == 0
 
 
+# ===== attach on a task already waiting for user input =====
+
+
+def test_events_waiting_for_user_attach_takes_the_fast_path():
+    """The attach-time fast path for a task that's already
+    ``waiting_for_user`` (and not mid-resume): emits ``task.status`` +
+    ``task.input_required`` and closes immediately, instead of waiting
+    out the watchdog's first cycle (up to 30s in production) to reach
+    the same conclusion."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _set_task_status(task_id, TaskStatus.WAITING_FOR_USER, control_state="idle")
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/events", headers=_bearer(full_key))
+    assert resp.status_code == 200
+    body = resp.text
+    assert body.count("event: task.status") == 1
+    assert body.count("event: task.input_required") == 1
+    assert body.count("event: task.completed") == 0
+    blocks = [b for b in body.split("\n\n") if b.strip()]
+    status_data = json.loads(blocks[0].split("data: ", 1)[1])
+    input_required_data = json.loads(blocks[1].split("data: ", 1)[1])
+    assert status_data == {"status": "waiting_for_user"}
+    assert input_required_data == {"task_id": task_id, "prompt": None}
+    # No sink is registered for this fast path either -- nothing to close.
+    assert es.count_task_sinks(task_id) == 0
+
+
+async def test_events_paused_attach_does_not_take_a_fast_path():
+    """A ``paused`` task is not ``waiting_for_user``, so attach must fall
+    through to the normal streaming path (sink registered, watchdog
+    running) instead of the fast path above -- the two tests pin the
+    fast path's condition from both sides."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    _set_task_status(task_id, TaskStatus.PAUSED)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        watchdog_interval_seconds=1000,
+        stream_max_duration_seconds=1000,
+        heartbeat_interval_seconds=1000,
+    )
+    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    assert json.loads(first.split("data: ", 1)[1]) == {"status": "paused"}
+    assert es.count_task_sinks(task_id) == 1
+
+    await resp.body_iterator.aclose()
+    assert es.count_task_sinks(task_id) == 0
+
+
 # ===== bounded outbound queue, overflow closes with resync_required =====
 
 
@@ -441,10 +497,23 @@ async def test_watchdog_survives_transient_check_failure_and_still_closes():
 
 
 def test_events_endpoint_signature_has_no_db_dependency():
+    """No parameter is typed as a SQLAlchemy ``Session``.
+
+    A ``Session``-typed FastAPI dependency is request-scoped: it would be
+    checked out for the entire life of the stream (up to the 1-hour cap)
+    instead of only for the brief, per-check reads that
+    ``_events_stream`` already routes through
+    ``run_db_io_cancellation_safe``. Asserting on the exact parameter
+    *name* set is what used to live here; it broke on any unrelated
+    rename and never actually verified the no-request-scoped-session
+    property it claimed to.
+    """
     import inspect
 
+    from sqlalchemy.orm import Session
+
     sig = inspect.signature(v1_tasks.stream_chat_task_events)
-    assert set(sig.parameters) == {"task_id", "principal"}
+    assert not any(param.annotation is Session for param in sig.parameters.values())
 
 
 # ===== generator teardown unregisters the sink =====
@@ -950,6 +1019,22 @@ async def test_consecutive_same_status_broadcasts_are_deduped_to_one_frame():
         )
     assert sink.queue.qsize() == 1
     assert sink.queue.get_nowait() == (es.status_frame("paused"), False)
+
+
+# ===== a `task_completed` broadcast is acceleration-only, never a status
+# frame =====
+
+
+async def test_task_completed_broadcast_never_enqueues_a_status_frame():
+    """``task_completed`` only sets ``completion_hint`` and returns early
+    -- it must never also reach ``enqueue_status``, or a ``task_completed``
+    broadcast racing the watchdog's own authoritative ``task.completed``
+    frame could emit a spurious extra ``task.status`` right as the stream
+    is closing."""
+    sink = _make_sink(task_id=1, status="running")
+    await sink.send_text(json.dumps({"type": "task_completed", "task": {"id": 1}}))
+    assert sink.completion_hint.is_set()
+    assert sink.queue.empty()
 
 
 # ===== the completion_hint wakes the watchdog early, not on its next

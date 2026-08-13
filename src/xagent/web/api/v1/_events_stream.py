@@ -238,8 +238,10 @@ class V1EventStreamSink:
         that re-raise happens on the *task's own* outbound event path, so
         an uncaught exception here would abort the broadcast for every
         other listener on the task, not just this stream. This is the
-        one deliberate blanket ``except Exception`` in this module;
-        dropped frames are counted, not silent.
+        one deliberate blanket ``except Exception`` in this module; every
+        drop is logged via ``logger.exception`` below, and also counted
+        on ``dropped_frame_count`` for tests to assert against (no
+        production code reads that counter today).
         """
         try:
             self._assert_owner_loop()
@@ -433,7 +435,8 @@ async def _watchdog_loop(
     interval_seconds: float,
 ) -> None:
     """Runs every ``interval_seconds`` and also wakes early on a
-    ``task_completed`` broadcast hint: same check, just run sooner.
+    completion hint from a terminal (completed or failed) broadcast:
+    same check, just run sooner.
 
     A single failed check (e.g. a transient DB error) must not end
     watchdog coverage for the rest of the stream's lifetime -- that
@@ -538,13 +541,16 @@ async def _generate(
         # concurrent burst of attaches for the same principal all pass the
         # earlier read-only check and then land here before any of them
         # releases a slot, `try_reserve_principal_slot` returns False for
-        # the late arrivals: the count is briefly over `PER_PRINCIPAL_STREAM_CAP`,
-        # it's logged, and the stream is served anyway. The sentinel
-        # (`principal_slot_reserved`) stays False for these streams, so the
-        # `finally` below correctly skips `release_principal_slot` for them
-        # -- nothing was reserved, so nothing is released. The count
-        # self-heals as soon as any concurrently-open stream for this
-        # principal finishes and releases its own slot.
+        # the late arrivals: the number of open streams for this principal
+        # can briefly exceed `PER_PRINCIPAL_STREAM_CAP` -- the counter
+        # itself never does, since `try_reserve_principal_slot` checks
+        # before it increments -- it's logged, and the stream is served
+        # anyway. The sentinel (`principal_slot_reserved`) stays False for
+        # these streams, so the `finally` below correctly skips
+        # `release_principal_slot` for them -- nothing was reserved, so
+        # nothing is released. The open-stream count self-heals as soon as
+        # any concurrently-open stream for this principal finishes and
+        # releases its own slot.
         principal_slot_reserved = try_reserve_principal_slot(key_prefix)
         if not principal_slot_reserved:
             logger.warning(
