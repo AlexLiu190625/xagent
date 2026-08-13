@@ -26,6 +26,7 @@ from datetime import datetime
 from typing import Any, NoReturn, Optional, cast
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -89,6 +90,7 @@ from ...services.task_orchestrator import (
     _retire_turn_session_best_effort,
     commit_claimed_turn_or_reconcile,
 )
+from . import _events_stream
 from ._step_mapping import map_trace_events_to_public_steps
 from .deps import ApiKeyPrincipal, get_principal_from_api_key, record_key_usage
 from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
@@ -1196,4 +1198,68 @@ async def get_chat_task_steps(
     """
     return await run_db_io_cancellation_safe(
         lambda: _get_chat_task_steps_sync(task_id, principal)
+    )
+
+
+@router.get("/chat/tasks/{task_id}/events")
+async def stream_chat_task_events(
+    task_id: int,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> StreamingResponse:
+    """Stream a task's lifecycle as Server-Sent Events.
+
+    Transport layer only: emits ``task.status``, ``task.completed``, and
+    ``stream.error``. Step-by-step and token-by-token content
+    (``step.*`` / ``message.*``) is not projected onto this stream yet --
+    poll ``GET /v1/chat/tasks/{task_id}/steps`` for that in the meantime.
+
+    Behavior:
+      - Normal attach: opens the stream, emits ``task.status`` for the
+        task's current state, then a status update each time it
+        changes (consecutive duplicates are suppressed), and
+        ``task.completed`` when the task finishes. A ``: ping`` comment
+        line is sent every 15s to keep the connection alive.
+      - Attaching to an already-finished task is not an error: the
+        stream opens, emits ``task.status`` then ``task.completed``,
+        and closes immediately.
+      - The stream force-closes with ``task.input_required``
+        (``prompt`` always ``null`` at this stage) if the task is
+        found waiting on user input; with ``stream.error`` if the
+        API key is revoked/paused, the task row disappears, the
+        client can't keep up (``resync_required``), or the stream has
+        been open for the 1-hour maximum (``stream_expired``, emitted
+        before the connection closes so it's distinguishable from a
+        clean end). After any ``stream.error``, re-attaching is the
+        supported recovery path (no replay -- reconcile via
+        ``steps()`` first).
+      - A task that's ``paused`` does not close the stream (matching
+        SDK ``wait()`` semantics: another process may resume it); the
+        1-hour cap is what eventually ends an orphaned paused stream.
+      - The moment of attach can emit a stale ``task.status`` out of
+        order relative to a concurrent live update -- accepted for
+        this transport-only layer (no attach buffering yet).
+
+    Args:
+        task_id: Path parameter; the target task's primary key.
+        principal: Resolved by the auth dependency; also used (not as
+            an authorization gate) for the per-key concurrency count
+            and the periodic key-validity check.
+
+    Raises:
+        V1ApiError 401: missing / invalid / revoked key (plain JSON;
+            the stream never opens).
+        V1ApiError 404: task missing or not owned by the calling key
+            (plain JSON; the stream never opens).
+        V1ApiError 429 ``rate_limited``: more than 2 concurrent streams
+            already open on this task, or more than 32 concurrent
+            streams already open for this key across all tasks.
+    """
+    snapshot = await run_db_io_cancellation_safe(
+        lambda: _load_task_info_snapshot(task_id, principal)
+    )
+    return await _events_stream.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=_load_task_info_snapshot,
     )
