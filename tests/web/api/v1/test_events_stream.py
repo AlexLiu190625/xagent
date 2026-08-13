@@ -1037,6 +1037,25 @@ async def test_task_completed_broadcast_never_enqueues_a_status_frame():
     assert sink.queue.empty()
 
 
+# ===== a terminal-failure broadcast also sets the completion_hint =====
+
+
+async def test_terminal_failure_broadcast_also_sets_completion_hint():
+    """A failed task's broadcast (``task_error``) reaches the sink through
+    the generic versioned-event branch below, not the ``task_completed``
+    short-circuit above -- unlike that short-circuit, it must still do
+    both things: enqueue the ``task.status`` frame *and* set
+    ``completion_hint``, so the watchdog wakes early instead of waiting
+    out its normal cadence to emit the authoritative ``task.completed``
+    close frame."""
+    sink = _make_sink(task_id=1, status="running")
+    await sink.send_text(
+        json.dumps({"type": "task_error", "task_id": 1, "status": "failed"})
+    )
+    assert sink.completion_hint.is_set()
+    assert sink.queue.get_nowait() == (es.status_frame("failed"), False)
+
+
 # ===== the completion_hint wakes the watchdog early, not on its next
 # periodic tick =====
 
