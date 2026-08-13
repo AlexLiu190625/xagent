@@ -137,6 +137,13 @@ class V1EventStreamSink:
     ``_resolve_task_or_404``.
     """
 
+    # This sink only consumes the broadcast fan-out; it must never be
+    # picked as the target for a personal reply to a durable command (see
+    # ``websocket.py``'s ``_execute_durable_task_command``), since it only
+    # understands versioned task-status events and would silently drop
+    # anything else routed to it.
+    is_broadcast_only = True
+
     def __init__(
         self, *, task_id: int, principal_key_prefix: str, initial_status: str
     ) -> None:
