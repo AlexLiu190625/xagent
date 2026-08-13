@@ -27,7 +27,7 @@ auth flow) and §10 (security considerations).
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import cast
+from typing import Any, cast
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -146,6 +146,22 @@ def _enum_value(value: object) -> str:
     return str(getattr(value, "value", value))
 
 
+def active_runtime_key_filters(prefix: str) -> tuple[Any, ...]:
+    """Shared "is this runtime key still usable" predicate.
+
+    A key is usable iff its prefix matches, it hasn't been revoked, and
+    it isn't paused. Used both by request-time authentication (below)
+    and by the v1 SSE watchdog's out-of-band key-validity check
+    (``web/api/v1/_events_stream.py``), so the two paths can't drift on
+    what "usable" means.
+    """
+    return (
+        AgentApiKey.key_prefix == prefix,
+        AgentApiKey.revoked_at.is_(None),
+        AgentApiKey.paused_at.is_(None),
+    )
+
+
 def _load_runtime_key_record(prefix: str) -> _RuntimeKeyRecord | None:
     """Load and detach runtime-key state before bcrypt verification."""
 
@@ -157,11 +173,7 @@ def _load_runtime_key_record(prefix: str) -> _RuntimeKeyRecord | None:
                 joinedload(AgentApiKey.agent),
                 joinedload(AgentApiKey.workforce),
             )
-            .filter(
-                AgentApiKey.key_prefix == prefix,
-                AgentApiKey.revoked_at.is_(None),
-                AgentApiKey.paused_at.is_(None),
-            )
+            .filter(*active_runtime_key_filters(prefix))
             .first()
         )
         if key_row is None:
