@@ -84,9 +84,11 @@ Pairing rule:
     carry the same public step id (id and pairing key are derived from
     the same (type, key) pair), so a consumer folding ``feed`` results
     by id converges on the second step rather than being left with a
-    stranded ``running`` one. ``dag_plan_*`` is the one exception: it
-    has no natural key at all, so a counter gives every plan a
-    distinct one.
+    stranded ``running`` one. ``dag_plan_*`` and the planning-phase
+    steps ``dag_execution`` produces are the exception: neither has a
+    natural key at all, so each family keeps its own counter (and its
+    own ``plan:`` / ``planning:`` key prefix) to generate a distinct
+    one per occurrence.
 """
 
 from __future__ import annotations
@@ -245,6 +247,9 @@ class PublicStepProjector:
             # Special-cased because plan events have no per-plan id;
             # we generate one from a counter and remember the open
             # key so the next dag_plan_end pairs with the latest start.
+            # The dag_execution branch below keeps its own independent
+            # counter and "planning:" key prefix; keep pairing
+            # semantics changes in lockstep between the two branches.
             if event_type.endswith("_start"):
                 self._plan_counter += 1
                 task_ref = (

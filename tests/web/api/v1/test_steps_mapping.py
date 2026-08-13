@@ -1192,6 +1192,29 @@ def test_dag_execution_planning_pair_becomes_thinking_planning():
     assert s["id"] == "thinking:planning:t1:1"
 
 
+def test_dag_execution_planning_pair_with_integer_task_id():
+    events = [
+        _dag_exec_ev(
+            "planning",
+            task_id=42,
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "executing",
+            task_id=42,
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 1
+    s = steps[0]
+    # An int task_id must interpolate into the key the same way a str
+    # one does.
+    assert s["id"] == "thinking:planning:42:1"
+    assert s["status"] == "completed"
+    assert s["completed_at"] == events[1].timestamp
+
+
 def test_two_dag_execution_planning_entries_produce_two_separate_steps():
     """Each entry into planning -- not just replan -- produces its own
     step; a replanning entry reports the same public phase as a first

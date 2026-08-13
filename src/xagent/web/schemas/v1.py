@@ -498,9 +498,10 @@ class TaskInfoResponse(BaseModel):
 # internal->public mapping table.
 PublicStepType = Literal["thinking", "tool_call", "agent_delegation", "message"]
 
-# ``running`` means a start event was seen with no matching end (the
-# task is still mid-step at the time of the GET). ``completed`` /
-# ``failed`` reflect the end event's success flag.
+# ``running`` means a start event was seen with no matching end; a
+# terminal task can still contain running steps (interrupted/cancelled
+# steps never get an end event). ``completed`` / ``failed`` reflect
+# the end event's success flag.
 PublicStepStatus = Literal["running", "completed", "failed"]
 
 
@@ -542,12 +543,12 @@ class PublicStep(BaseModel):
         ...,
         description=(
             "running while the corresponding end event has not yet "
-            "fired. A task in a terminal state can still contain "
-            "running steps: interrupted or cancelled steps never get "
-            "an end event, so terminal state is judged from the task's "
-            "own status, not from the absence of running steps. "
-            "completed on a normal end event, failed when the end "
-            "event carries success=false."
+            "fired, completed on a normal end event, failed when the "
+            "end event carries success=false. A task in a terminal "
+            "state can still contain running steps: interrupted or "
+            "cancelled steps never get an end event, so terminal "
+            "state is judged from the task's own status, not from "
+            "the absence of running steps."
         ),
     )
     started_at: datetime = Field(
