@@ -290,6 +290,100 @@ async def test_watchdog_paused_does_not_close():
     assert sink.queue.get_nowait() == es.status_frame("paused")
 
 
+async def test_watchdog_waiting_for_user_closes_with_null_prompt_input_required():
+    """The watchdog is the only trigger this transport layer implements
+    for input_required, and it always sends a null prompt -- populating
+    it from the agent's question text belongs to the content-projection
+    layer."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    key_prefix = _key_prefix_for_agent(agent_id)
+    _set_task_status(task_id, TaskStatus.WAITING_FOR_USER, control_state="idle")
+
+    sink = es.V1EventStreamSink(
+        task_id=task_id, principal_key_prefix=key_prefix, initial_status="running"
+    )
+    closed = await es.watchdog_check_once(
+        sink, task_id, principal, read_task_snapshot=v1_tasks._load_task_info_snapshot
+    )
+    assert closed is True
+    assert sink.closing is True
+    assert sink.queue.get_nowait() == es.input_required_frame(task_id)
+    assert (
+        json.loads(es.input_required_frame(task_id).split("data: ", 1)[1])["prompt"]
+        is None
+    )
+
+
+async def test_watchdog_waiting_for_user_with_resume_requested_does_not_close():
+    """The ``resume_requested`` carve-out: a task about to resume isn't
+    "stuck waiting" even though its status hasn't flipped yet."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    key_prefix = _key_prefix_for_agent(agent_id)
+    _set_task_status(
+        task_id, TaskStatus.WAITING_FOR_USER, control_state="resume_requested"
+    )
+
+    sink = es.V1EventStreamSink(
+        task_id=task_id, principal_key_prefix=key_prefix, initial_status="running"
+    )
+    closed = await es.watchdog_check_once(
+        sink, task_id, principal, read_task_snapshot=v1_tasks._load_task_info_snapshot
+    )
+    assert closed is False
+    assert sink.closing is False
+
+
+async def test_watchdog_terminal_task_row_closes_with_completed():
+    """The watchdog itself is the authoritative source for task.completed,
+    independent of the attach-time fast path for an already-terminal
+    task or the broadcast acceleration hint."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    key_prefix = _key_prefix_for_agent(agent_id)
+    _set_task_status(task_id, TaskStatus.FAILED, error_message="boom")
+
+    sink = es.V1EventStreamSink(
+        task_id=task_id, principal_key_prefix=key_prefix, initial_status="running"
+    )
+    closed = await es.watchdog_check_once(
+        sink, task_id, principal, read_task_snapshot=v1_tasks._load_task_info_snapshot
+    )
+    assert closed is True
+    assert sink.queue.get_nowait() == es.completed_frame(
+        status="failed", output=None, error="boom"
+    )
+
+
+async def test_watchdog_missing_task_row_closes_with_task_deleted():
+    """A task row that vanishes out from under an open stream
+    (hard-deleted) surfaces as task_deleted, not a hang or a 500."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    key_prefix = _key_prefix_for_agent(agent_id)
+
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+    sink = es.V1EventStreamSink(
+        task_id=task_id, principal_key_prefix=key_prefix, initial_status="running"
+    )
+    closed = await es.watchdog_check_once(
+        sink, task_id, principal, read_task_snapshot=v1_tasks._load_task_info_snapshot
+    )
+    assert closed is True
+    assert sink.queue.get_nowait() == es.error_frame("task_deleted")
+
+
 # ===== endpoint signature carries no request-scoped DB dependency =====
 
 
