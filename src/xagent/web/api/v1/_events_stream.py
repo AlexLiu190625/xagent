@@ -489,7 +489,29 @@ async def _generate(
     principal_slot_reserved = False
     watchdog_task: "asyncio.Task[None] | None" = None
     try:
+        # Soft cap: `principal_slot_available` in `build_event_stream_response`
+        # already did the *check* before this generator started, and that
+        # check is what carries the normal 429 -- an attach that loses the
+        # race here has already been told "yes, come in", so this
+        # reservation only accounts for capacity, it never rejects. If a
+        # concurrent burst of attaches for the same principal all pass the
+        # earlier read-only check and then land here before any of them
+        # releases a slot, `try_reserve_principal_slot` returns False for
+        # the late arrivals: the count is briefly over `PER_PRINCIPAL_STREAM_CAP`,
+        # it's logged, and the stream is served anyway. The sentinel
+        # (`principal_slot_reserved`) stays False for these streams, so the
+        # `finally` below correctly skips `release_principal_slot` for them
+        # -- nothing was reserved, so nothing is released. The count
+        # self-heals as soon as any concurrently-open stream for this
+        # principal finishes and releases its own slot.
         principal_slot_reserved = try_reserve_principal_slot(key_prefix)
+        if not principal_slot_reserved:
+            logger.warning(
+                "v1 SSE per-principal cap best-effort exceeded for "
+                "key_prefix=%s under concurrent attach burst; serving the "
+                "stream anyway (soft cap, no reservation held)",
+                key_prefix,
+            )
         manager.register_connection(cast(WebSocket, sink), task_id)
         watchdog_task = asyncio.create_task(
             _watchdog_loop(
@@ -527,26 +549,35 @@ async def _generate(
             if is_close:
                 return
     finally:
-        if watchdog_task is not None:
-            watchdog_task.cancel()
-            # Narrowed to ``CancelledError`` only (not a blanket
-            # ``BaseException``): the watchdog loop itself now catches
-            # and logs every per-cycle ``Exception`` internally (see
-            # ``_watchdog_loop``) and retries rather than dying, so the
-            # only exception this teardown should ever observe here is
-            # the cancellation just requested above. If the watchdog
-            # task raises anything else, that's a real bug and must
-            # propagate instead of being silently swallowed.
-            with contextlib.suppress(asyncio.CancelledError):
-                await watchdog_task
-        # ``manager`` is typed against a real ``WebSocket``; this sink only
-        # duck-types its ``send_text`` contract (module docstring) -- the
-        # cast documents that intentional narrowing instead of suppressing
-        # the type error blanket-wide. A safe no-op if registration above
-        # never ran or never completed.
-        manager.disconnect(cast(WebSocket, sink))
-        if principal_slot_reserved:
-            release_principal_slot(key_prefix)
+        # The watchdog wait-and-cancel is wrapped in its own try/finally so
+        # that `manager.disconnect` and `release_principal_slot` below --
+        # the two calls that actually undo what this generator reserved --
+        # still run even if awaiting the cancelled watchdog task raises
+        # something unexpected. Without this inner `finally`, a raise here
+        # would skip straight past both cleanup calls, leaking the sink
+        # registration and (if held) the per-principal slot.
+        try:
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+                # Narrowed to ``CancelledError`` only (not a blanket
+                # ``BaseException``): the watchdog loop itself now catches
+                # and logs every per-cycle ``Exception`` internally (see
+                # ``_watchdog_loop``) and retries rather than dying, so the
+                # only exception this teardown should ever observe here is
+                # the cancellation just requested above. If the watchdog
+                # task raises anything else, that's a real bug and must
+                # propagate instead of being silently swallowed.
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watchdog_task
+        finally:
+            # ``manager`` is typed against a real ``WebSocket``; this sink only
+            # duck-types its ``send_text`` contract (module docstring) -- the
+            # cast documents that intentional narrowing instead of suppressing
+            # the type error blanket-wide. A safe no-op if registration above
+            # never ran or never completed.
+            manager.disconnect(cast(WebSocket, sink))
+            if principal_slot_reserved:
+                release_principal_slot(key_prefix)
 
 
 async def build_event_stream_response(

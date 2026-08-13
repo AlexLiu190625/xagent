@@ -568,6 +568,71 @@ async def test_principal_slot_released_after_real_stream_teardown():
     assert es._principal_stream_counts.get(key_prefix, 0) == 0
 
 
+# ===== per-principal cap is soft: a lost reservation race doesn't 429 =====
+
+
+async def test_generate_serves_stream_when_reservation_race_lost(caplog):
+    """``build_event_stream_response`` only *checks* the per-principal cap
+    (``principal_slot_available``, read-only) before starting the
+    generator; the actual counter mutation (``try_reserve_principal_slot``)
+    happens once ``_generate`` runs. Between those two moments, enough
+    concurrently-racing attaches for the same key can fill the last slot
+    first, so the reservation inside ``_generate`` can fail even though
+    the earlier check passed. That loss must not abort an attach whose
+    response has already started streaming: the stream is served anyway
+    (soft cap), and because ``principal_slot_reserved`` stays False, the
+    ``finally`` teardown must not release a slot this stream never held --
+    doing so would erroneously free a slot actually owned by one of the
+    other concurrent streams that did win the race."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    key_prefix = _key_prefix_for_agent(agent_id)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    # Simulate the losing side of the race: every slot is already held by
+    # other concurrent attaches by the time this stream's own generator
+    # runs `try_reserve_principal_slot`.
+    for _ in range(es.PER_PRINCIPAL_STREAM_CAP):
+        assert es.try_reserve_principal_slot(key_prefix)
+    full_count = es._principal_stream_counts[key_prefix]
+
+    with caplog.at_level("WARNING", logger="xagent.web.api.v1._events_stream"):
+        agen = es._generate(
+            task_id,
+            principal,
+            key_prefix=key_prefix,
+            initial_status=snapshot.status.value,
+            read_task_snapshot=v1_tasks._load_task_info_snapshot,
+            watchdog_interval_seconds=1000,
+            stream_max_duration_seconds=1000,
+            heartbeat_interval_seconds=1000,
+        )
+        first = await agen.__anext__()
+
+    # The stream is served normally despite the lost reservation race.
+    assert "event: task.status" in first
+    assert es.count_task_sinks(task_id) == 1
+    # No extra slot was claimed -- the reservation attempt failed and
+    # nothing was added on top of the already-full count.
+    assert es._principal_stream_counts[key_prefix] == full_count
+    assert any(
+        key_prefix in record.message and "best-effort" in record.message
+        for record in caplog.records
+    )
+
+    await agen.aclose()
+
+    # Teardown must not touch the counter: this stream never held a slot,
+    # so releasing one here would steal it from a stream that did.
+    assert es.count_task_sinks(task_id) == 0
+    assert es._principal_stream_counts.get(key_prefix, 0) == full_count
+    assert es._principal_stream_counts[key_prefix] >= 0
+
+    for _ in range(es.PER_PRINCIPAL_STREAM_CAP):
+        es.release_principal_slot(key_prefix)
+
+
 # ===== absolute deadline emits stream_expired before closing =====
 
 

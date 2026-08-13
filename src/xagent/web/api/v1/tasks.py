@@ -1252,8 +1252,14 @@ async def stream_chat_task_events(
         V1ApiError 404: task missing or not owned by the calling key
             (plain JSON; the stream never opens).
         V1ApiError 429 ``rate_limited``: more than 2 concurrent streams
-            already open on this task, or more than 32 concurrent
-            streams already open for this key across all tasks.
+            already open on this task. The per-key cap (32 concurrent
+            streams across all tasks) is enforced the same way for a
+            normal attach, but it is best-effort under a concurrent
+            attach burst: several attaches for the same key can pass
+            the check at the same instant, so the count can be
+            exceeded briefly instead of the extra attaches getting a
+            429. No stream is aborted once opened; the count corrects
+            itself as open streams for that key close.
     """
     snapshot = await run_db_io_cancellation_safe(
         lambda: _load_task_info_snapshot(task_id, principal)
