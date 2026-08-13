@@ -731,6 +731,37 @@ async def test_absolute_deadline_emits_expired_then_closes():
     assert es.count_task_sinks(task_id) == 0
 
 
+async def test_deadline_wait_budget_shrinks_below_the_heartbeat():
+    """Heartbeat (5s) is deliberately much larger than the deadline
+    (0.05s), so only a ``wait_budget`` that's capped at what's left
+    before the deadline -- not the full heartbeat interval -- closes
+    this stream quickly. The old formula (heartbeat whenever any time
+    remains) would instead wait out the full 5s heartbeat before ever
+    rechecking the deadline; ``wait_for(timeout=1)`` turns that into a
+    hard failure instead of a slow pass."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        watchdog_interval_seconds=1000,
+        stream_max_duration_seconds=0.05,
+        heartbeat_interval_seconds=5.0,
+    )
+
+    async def _drain() -> list[str]:
+        return [frame async for frame in resp.body_iterator]
+
+    frames = await asyncio.wait_for(_drain(), timeout=1)
+    assert "event: stream.error" in frames[-1]
+    assert "stream_expired" in frames[-1]
+
+
 # ===== watchdog vs. deadline race closes exactly once =====
 
 
