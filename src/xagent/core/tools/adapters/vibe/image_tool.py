@@ -5,6 +5,7 @@ This module provides image generation capabilities using pre-configured image mo
 passed from the web layer.
 """
 
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ....model.image.base import BaseImageModel
@@ -12,6 +13,8 @@ from ....workspace import TaskWorkspace
 from ...core.image_tool import ImageGenerationToolCore
 from .base import ToolCategory
 from .function import FunctionTool
+
+logger = logging.getLogger(__name__)
 
 
 class ImageGenerationFunctionTool(FunctionTool):
@@ -72,6 +75,17 @@ class ImageGenerationTool(ImageGenerationToolCore):
         # class, not a deployment without image models.
         can_generate = self._get_model() is not None
         can_edit = self._get_edit_model() is not None
+
+        # Withholding a tool is silent otherwise: the operator sees "editing
+        # stopped working" with nothing in the log pointing at the abilities.
+        # isEnabledFor guards the summary, which walks every model eagerly.
+        if (not can_edit or not can_generate) and logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "Image tools withheld (generate=%s, edit=%s) from models: %s",
+                can_generate,
+                can_edit,
+                self._available_models_summary(),
+            )
 
         tools = []
 

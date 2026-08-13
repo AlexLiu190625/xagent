@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterator, Optional, cast
 
 from sqlalchemy.orm import Session
 
-from xagent.core.model.image.base import BaseImageModel
+from xagent.core.model.image.base import BaseImageModel, default_image_abilities
 from xagent.web.api.model import DBModel
 
 from ...core.model.chat.basic.base import BaseLLM
@@ -559,36 +559,41 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                 raise ValueError("Image model base URL cannot be empty")
             model_provider = str(db_model.model_provider).strip().lower()
             try:
+                model_name = str(db_model.model_name)
+                abilities = list(
+                    db_model.abilities
+                    or default_image_abilities(model_provider, model_name)
+                )
                 if model_provider == "dashscope":
                     image_model = DashScopeImageModel(
-                        model_name=str(db_model.model_name),
+                        model_name=model_name,
                         api_key=api_key,
                         base_url=base_url,
-                        abilities=list(db_model.abilities or ["generate"]),  # pyright: ignore[reportArgumentType]
+                        abilities=abilities,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "gemini":
                     image_model = GeminiImageModel(
-                        model_name=str(db_model.model_name),
+                        model_name=model_name,
                         api_key=api_key,
                         base_url=base_url,
-                        abilities=list(db_model.abilities or ["generate"]),  # pyright: ignore[reportArgumentType]
+                        abilities=abilities,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "openai":
                     image_model = OpenAIImageModel(
-                        model_name=str(db_model.model_name),
+                        model_name=model_name,
                         api_key=api_key,
                         base_url=base_url,
-                        abilities=list(db_model.abilities or ["generate", "edit"]),  # pyright: ignore[reportArgumentType]
+                        abilities=abilities,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "xinference":
                     image_model = XinferenceImageModel(
-                        model_name=str(db_model.model_name),
+                        model_name=model_name,
                         api_key=api_key,
                         base_url=base_url,
-                        abilities=list(db_model.abilities or ["generate", "edit"]),  # pyright: ignore[reportArgumentType]
+                        abilities=abilities,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
             except Exception as e:
