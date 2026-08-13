@@ -50,6 +50,7 @@ from ....tools.user_interaction import (
 )
 from ...clarification import draft_from_waiting_request
 from ...context.enrichment import (
+    IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     enrich_context_with_memory,
     latest_user_text,
 )
@@ -389,6 +390,11 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any]:
         self.status = "thinking"
         self._tool_decision_groups_by_name = self._tool_decision_groups_for_tools(tools)
+        # Read by get_system_context to contradict skill text naming edit_image.
+        context.metadata[IMAGE_EDIT_UNAVAILABLE_METADATA_KEY] = (
+            "generate_image" in self._tool_decision_groups_by_name
+            and "edit_image" not in self._tool_decision_groups_by_name
+        )
         base_tool_schemas = (
             []
             if self.tool_choice == "none"

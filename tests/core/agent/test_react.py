@@ -5716,3 +5716,41 @@ async def test_react_discards_the_preamble_with_the_rejected_response() -> None:
         "Let me look into that." not in str(event.get("content") or event.get("delta"))
         for event in outbound.events
     )
+
+
+@pytest.mark.parametrize(
+    ("tool_names", "unavailable"),
+    [
+        (["generate_image", "list_image_models"], True),
+        (["generate_image", "edit_image"], False),
+        (["list_image_models"], False),
+        (["web_search"], False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_flags_missing_image_editing_and_renders_the_correction(
+    tool_names: list[str], unavailable: bool
+) -> None:
+    from xagent.core.agent.context.enrichment import (
+        IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
+        SKILL_CONTEXT_METADATA_KEY,
+    )
+
+    from .concurrency_harness import FakeTool as NamedFakeTool
+
+    llm = FakeLLM(responses=[{"content": "done", "done": True}])
+    pattern = ReActPattern(max_iterations=2)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.metadata[SKILL_CONTEXT_METADATA_KEY] = "Use `edit_image` to refine."
+    context.add_user_message("make an ad")
+
+    await pattern.run(
+        context=context,
+        tools=[NamedFakeTool(name) for name in tool_names],
+        llm=llm,
+    )
+
+    assert context.metadata[IMAGE_EDIT_UNAVAILABLE_METADATA_KEY] is unavailable
+    rendered = llm.calls[0]["messages"][0]["content"]
+    assert ("image editing is unavailable here" in rendered) is unavailable
+    assert ("attach a reference through images" in rendered) is unavailable
