@@ -1222,6 +1222,31 @@ class TestGetLancedbPath:
         assert result == Path("/custom/lancedb")
 
 
+class TestGoogleDriveDownloadTimeout:
+    """Test the Google Drive LRO timeout configuration."""
+
+    def test_constant_name(self):
+        assert (
+            config.GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS
+            == "XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS"
+        )
+
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv(
+            "XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS", raising=False
+        )
+        assert config.get_google_drive_download_timeout_seconds() == 600
+
+    def test_environment_override(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS", "120")
+        assert config.get_google_drive_download_timeout_seconds() == 120
+
+    @pytest.mark.parametrize("value", ["0", "-1", "not-a-number"])
+    def test_invalid_value_uses_default(self, monkeypatch, value):
+        monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS", value)
+        assert config.get_google_drive_download_timeout_seconds() == 600
+
+
 class TestGetKbCollectionsTimeoutSeconds:
     """Test get_kb_collections_timeout_seconds() function."""
 

@@ -85,6 +85,7 @@ SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
 KB_COLLECTIONS_TIMEOUT_SECONDS = "XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS"
 KB_SEARCH_TIMEOUT_SECONDS = "XAGENT_KB_SEARCH_TIMEOUT_SECONDS"
+GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS = "XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS"
 DATABASE_URL = "DATABASE_URL"
 DB_POOL_SIZE = "XAGENT_DB_POOL_SIZE"
 DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
@@ -2148,6 +2149,23 @@ def get_lancedb_path() -> Path:
 
     # Default: storage_root/data/lancedb
     return get_storage_root() / "data" / "lancedb"
+
+
+def get_google_drive_download_timeout_seconds() -> int:
+    """Get the maximum wait for a Google Drive long-running download.
+
+    Native Google Workspace exports can return a pending Drive operation. This
+    timeout bounds polling inside the cloud-ingest HTTP request. External proxy
+    timeouts must also allow time for the final file transfer.
+
+    Priority:
+        1. XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS environment variable
+        2. Default of 600 seconds
+
+    Returns:
+        Maximum operation wait in seconds.
+    """
+    return _get_positive_int_env(GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS, 600)
 
 
 def get_kb_collections_timeout_seconds() -> int:
