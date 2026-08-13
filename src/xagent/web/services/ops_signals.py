@@ -60,6 +60,11 @@ INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED = (
 # no in-process registry can observe that row being fixed. Auto-clearing
 # would assert "the data got fixed" without evidence for it.
 INTERACTION_ANCHOR_CORRUPT = "interaction_anchor_corrupt"
+# Set when the supersede helper's own UPDATE fails; cleared by the next
+# supersede that completes normally, for any task. Task-scoped detail,
+# process-scoped signal: it reports whether the sweep mechanism is
+# working, not whether a particular task has been repaired.
+CLARIFICATION_LEGACY_SUPERSEDE_FAILED = "clarification_legacy_supersede_failed"
 
 # task_clarification_draft.py registers this when a waiting run's result
 # carries no clarification draft to publish, and clears it the next time a
