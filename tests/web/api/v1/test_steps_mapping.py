@@ -9,11 +9,17 @@ dict)`` works too -- but the attribute form is closer to production
 behavior.
 """
 
+import copy
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
-from xagent.web.api.v1._step_mapping import map_trace_events_to_public_steps
+import pytest
+
+from xagent.web.api.v1._step_mapping import (
+    PublicStepProjector,
+    map_trace_events_to_public_steps,
+)
 
 
 def _ev(
@@ -671,3 +677,409 @@ def test_float_timestamp_is_coerced_to_datetime():
     assert isinstance(steps[0]["started_at"], datetime)
     assert isinstance(steps[0]["completed_at"], datetime)
     assert steps[0]["completed_at"] - steps[0]["started_at"] == timedelta(seconds=1)
+
+
+# ===== PublicStepProjector <-> batch driver equivalence pin =====
+#
+# ``map_trace_events_to_public_steps`` is a thin batch driver over
+# ``PublicStepProjector`` (from_history + materialized_steps + the
+# started_at sort): it holds no folding logic of its own. These cases
+# cover every pairing family the module docstring documents
+# (thinking/planning incl. replan, tool_call, agent_delegation,
+# skill_select, message, orphan start/end, unexposed-type filtering,
+# out-of-order timestamps) so the equivalence assertion below pins
+# that invariant -- the batch driver can never grow a second copy of
+# the folding logic without this test catching the divergence.
+
+_PROJECTOR_EQUIVALENCE_CASES: Dict[str, List[SimpleNamespace]] = {
+    "react_action_pair": [
+        _ev("react_action_start", step_id="s1"),
+        _ev(
+            "react_action_end",
+            step_id="s1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+    ],
+    "dag_step_pair": [
+        _ev("dag_step_start", step_id="s2"),
+        _ev(
+            "dag_step_end",
+            step_id="s2",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+    ],
+    "dag_plan_pair": [
+        _ev("dag_plan_start", task_id="t1"),
+        _ev(
+            "dag_plan_end",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+    ],
+    "replan_two_plan_pairs": [
+        _ev(
+            "dag_plan_start",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "dag_plan_end",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "dag_plan_start",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "dag_plan_end",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 3, tzinfo=timezone.utc),
+        ),
+    ],
+    "dag_plan_orphan_end_no_open_plan": [
+        _ev("dag_plan_end", task_id="t1"),
+    ],
+    "tool_call_success": [
+        _ev(
+            "tool_execution_start",
+            step_id="s3",
+            data={
+                "tool_name": "execute_python",
+                "tool_args": {"code": "print(1)"},
+                "tool_execution_id": "tx-1",
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="s3",
+            data={
+                "tool_name": "execute_python",
+                "tool_args": {"code": "print(1)"},
+                "tool_execution_id": "tx-1",
+                "result": {"output": "1\n"},
+                "success": True,
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 3, tzinfo=timezone.utc),
+        ),
+    ],
+    "tool_call_failure": [
+        _ev(
+            "tool_execution_start",
+            step_id="s5",
+            data={
+                "tool_name": "broken_tool",
+                "tool_args": {},
+                "tool_execution_id": "tx-3",
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="s5",
+            data={
+                "tool_name": "broken_tool",
+                "tool_args": {},
+                "tool_execution_id": "tx-3",
+                "success": False,
+                "error": "exploded",
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 5, tzinfo=timezone.utc),
+        ),
+    ],
+    "tool_execution_failed_event": [
+        _ev(
+            "tool_execution_start",
+            step_id="s_fail",
+            data={
+                "tool_name": "execute_python",
+                "tool_params": {"code": "1 / 0"},
+                "tool_call_id": "call-fail",
+            },
+        ),
+        _ev(
+            "tool_execution_failed",
+            step_id="s_fail",
+            data={
+                "tool_name": "execute_python",
+                "tool_call_id": "call-fail",
+                "error": "division by zero",
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 5, tzinfo=timezone.utc),
+        ),
+    ],
+    "agent_delegation": [
+        _ev(
+            "tool_execution_start",
+            step_id="s4",
+            data={
+                "tool_name": "agent_42",
+                "tool_args": {"text": "hello"},
+                "tool_execution_id": "tx-2",
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="s4",
+            data={
+                "tool_name": "agent_42",
+                "tool_args": {"text": "hello"},
+                "tool_execution_id": "tx-2",
+                "result": {"translated": "你好"},
+                "success": True,
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 4, tzinfo=timezone.utc),
+        ),
+    ],
+    "two_tool_calls_same_step_id": [
+        _ev(
+            "tool_execution_start",
+            step_id="shared_step",
+            event_id="evt-1",
+            data={
+                "tool_name": "tool_a",
+                "tool_params": {"q": "a"},
+                "tool_call_id": "call-a",
+            },
+        ),
+        _ev(
+            "tool_execution_start",
+            step_id="shared_step",
+            event_id="evt-2",
+            data={
+                "tool_name": "tool_b",
+                "tool_params": {"q": "b"},
+                "tool_call_id": "call-b",
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="shared_step",
+            event_id="evt-3",
+            data={
+                "tool_name": "tool_a",
+                "tool_call_id": "call-a",
+                "result": "result_a",
+                "success": True,
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="shared_step",
+            event_id="evt-4",
+            data={
+                "tool_name": "tool_b",
+                "tool_call_id": "call-b",
+                "result": "result_b",
+                "success": True,
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 3, tzinfo=timezone.utc),
+        ),
+    ],
+    "tool_start_key_collision": [
+        _ev(
+            "tool_execution_start",
+            step_id="collide",
+            data={"tool_name": "tool_x", "tool_args": {"a": 1}},
+        ),
+        _ev(
+            "tool_execution_start",
+            step_id="collide",
+            data={"tool_name": "tool_y", "tool_args": {"b": 2}},
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="collide",
+            data={"tool_name": "tool_y", "result": "result_y", "success": True},
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+    ],
+    "skill_select_pair": [
+        _ev(
+            "skill_select_start",
+            data={"skill_name": "presentation"},
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "skill_select_end",
+            data={"skill_name": "presentation", "result": "ok"},
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+    ],
+    "user_and_ai_messages": [
+        _ev(
+            "user_message",
+            data={"message": "hello"},
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "ai_message",
+            data={"content": "hi back"},
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+    ],
+    "start_without_end_is_running": [
+        _ev("react_action_start", step_id="s1"),
+    ],
+    "orphan_end_is_dropped": [
+        _ev("react_action_end", step_id="s1"),
+    ],
+    "out_of_order_timestamps": [
+        _ev(
+            "react_action_start",
+            step_id="late",
+            timestamp=datetime(2026, 1, 1, 12, 0, 5, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "react_action_end",
+            step_id="late",
+            timestamp=datetime(2026, 1, 1, 12, 0, 6, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "react_action_start",
+            step_id="early",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "react_action_end",
+            step_id="early",
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+    ],
+    "pending_after_completed": [
+        _ev(
+            "react_action_start",
+            step_id="done",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "react_action_end",
+            step_id="done",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "react_action_start",
+            step_id="running",
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+    ],
+    "unexposed_event_types_are_dropped": [
+        _ev("llm_call_start", step_id="s1"),
+        _ev("llm_call_end", step_id="s1"),
+        _ev("dag_execute_start"),
+        _ev("dag_execute_end"),
+        _ev("react_task_start"),
+        _ev("react_task_end"),
+        _ev("react_step_start", step_id="s1"),
+        _ev("react_step_end", step_id="s1"),
+        _ev("visualization_update"),
+        _ev("task_completion"),
+        _ev("trace_error"),
+    ],
+    "empty_event_list": [],
+}
+
+
+@pytest.mark.parametrize(
+    "events",
+    _PROJECTOR_EQUIVALENCE_CASES.values(),
+    ids=list(_PROJECTOR_EQUIVALENCE_CASES.keys()),
+)
+def test_projector_equivalent_to_batch(events):
+    """``PublicStepProjector.from_history(events).materialized_steps()``,
+    sorted by the same ``started_at`` key the batch driver's trailing
+    sort applies, must equal ``map_trace_events_to_public_steps``
+    exactly. This is the byte-for-byte pin that the batch function
+    stays a pure driver over the projector, never a second copy of
+    the folding logic.
+
+    Literal output shapes per event family are already pinned by this
+    file's 23 direct-call tests above, which now exercise the
+    projector itself. What this test guards instead is that the batch
+    driver never grows a second, independent folding implementation.
+    """
+    expected = map_trace_events_to_public_steps(events)
+    projected = PublicStepProjector.from_history(events).materialized_steps()
+    projected.sort(key=lambda s: s["started_at"])
+    assert projected == expected
+
+
+@pytest.mark.parametrize(
+    "events",
+    _PROJECTOR_EQUIVALENCE_CASES.values(),
+    ids=list(_PROJECTOR_EQUIVALENCE_CASES.keys()),
+)
+def test_projector_incremental_feed_matches_materialized_steps(events):
+    """Folding the per-event increments ``feed()`` returns (keyed by
+    step id, last write wins) must reconstruct exactly the same step
+    objects ``materialized_steps()`` holds afterwards -- pins that the
+    incremental ``feed()`` view and the projector's own materialized
+    state can never drift apart.
+    """
+    projector = PublicStepProjector()
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for event in events:
+        for step in projector.feed(event):
+            by_id[step["id"]] = step
+
+    reconstructed = sorted(by_id.values(), key=lambda s: s["id"])
+    materialized = sorted(projector.materialized_steps(), key=lambda s: s["id"])
+    assert reconstructed == materialized
+
+
+def test_feed_return_value_reflects_step_state_at_call_time():
+    """``feed()``'s return is the same dict object later mutated in place
+    when the matching end event finalizes the step -- so a caller that
+    wants to know what a step looked like *at the moment of a given
+    feed() call* must deep-copy the return value immediately, which is
+    exactly what this test does. Without the ``copy.deepcopy`` calls
+    below, ``start_steps[0]`` would silently become the finalized
+    ``completed`` step by the time the last assertion runs, and this
+    test could only ever observe the terminal state.
+    """
+    projector = PublicStepProjector()
+
+    start_steps = copy.deepcopy(
+        projector.feed(
+            _ev(
+                "react_action_start",
+                step_id="s1",
+                timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+            )
+        )
+    )
+    assert len(start_steps) == 1
+    assert start_steps[0]["status"] == "running"
+    assert start_steps[0]["completed_at"] is None
+
+    end_steps = copy.deepcopy(
+        projector.feed(
+            _ev(
+                "react_action_end",
+                step_id="s1",
+                timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+            )
+        )
+    )
+    assert len(end_steps) == 1
+    assert end_steps[0]["status"] == "completed"
+    assert end_steps[0]["completed_at"] is not None
+
+    # Proof the deep copy above actually decoupled the snapshot: the
+    # start-time copy must still read "running" now that the live
+    # object backing the un-copied return value has been mutated to
+    # "completed" by the end event.
+    assert start_steps[0]["status"] == "running"
+    assert start_steps[0]["completed_at"] is None
+
+    # Orphan end (no matching start): dropped silently, nothing to feed back.
+    assert PublicStepProjector().feed(_ev("react_action_end", step_id="orphan")) == []
+
+    # Unexposed event type: not part of the public step contract.
+    assert PublicStepProjector().feed(_ev("llm_call_start", step_id="s1")) == []
+
+    # Empty/falsy event_type: nothing identifiable to fold.
+    assert PublicStepProjector().feed(_ev("", step_id="s1")) == []
