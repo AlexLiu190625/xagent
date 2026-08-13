@@ -19,6 +19,7 @@ from typing import (
 from sqlalchemy.orm import Session
 
 from .....config import get_uploads_dir
+from .....core.task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from .....core.workspace import TaskWorkspace
 from .base import AbstractBaseTool, Tool
 from .config import (
@@ -862,10 +863,16 @@ class ToolFactory:
                 allowed_external_dirs=workspace_config.get("allowed_external_dirs"),
                 db_task_id=workspace_config.get("db_task_id"),
                 scope_segments=tuple(workspace_config.get("scope_segments") or ()),
+                durable_storage_segments=workspace_config.get(
+                    "durable_storage_segments"
+                ),
             )
             user_id = workspace_config.get("user_id")
             if isinstance(user_id, int):
                 workspace.owner_user_id = user_id
+            workspace.file_operation_access_version = workspace_config.get(
+                FILE_OPERATION_ACCESS_VERSION_KEY
+            )
             return workspace
         except Exception as e:
             logger.warning(f"Failed to create workspace: {e}")
