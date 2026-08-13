@@ -68,6 +68,16 @@ Pairing rule:
     Orphan starts (start with no matching end) are emitted with
     ``status='running'`` and ``completed_at=None``. This naturally
     handles the case where the SDK polls ``/steps`` mid-task.
+
+    Key collision -- two starts sharing one pairing key before either
+    ends -- is last-write-wins: the second start replaces the first
+    pending entry, so only the second reaches a terminal state. Both
+    carry the same public step id (id and pairing key are derived from
+    the same (type, key) pair), so a consumer folding ``feed`` results
+    by id converges on the second step rather than being left with a
+    stranded ``running`` one. ``dag_plan_*`` is the one exception: it
+    has no natural key at all, so a counter gives every plan a
+    distinct one.
 """
 
 from __future__ import annotations
@@ -119,6 +129,13 @@ class PublicStepProjector:
     resort is a batch-only concern (see ``map_trace_events_to_public_steps``):
     a live consumer wants steps in the order they actually resolved, not
     resorted on every event.
+
+    Preconditions for the incremental path: one instance per task, fed
+    in event order, from one thread/task at a time. ``feed`` mutates
+    the pairing tables without any locking, and the ``dag_plan_*`` open
+    key is a single slot, so two interleaved tasks would cross-pair.
+    The batch driver satisfies all three trivially -- it builds a fresh
+    throwaway instance per call.
     """
 
     def __init__(self) -> None:
@@ -164,6 +181,12 @@ class PublicStepProjector:
         Callers that need the public started_at-sorted order (currently
         only the ``map_trace_events_to_public_steps`` batch driver) sort
         this themselves.
+
+        The list itself is a fresh snapshot, but the step dicts inside
+        it are the projector's live objects: a still-``running`` step
+        is mutated in place when its end event arrives (see
+        :meth:`feed`). Treat them as read-only views -- a caller that
+        needs a stable picture must copy before storing.
         """
         steps = list(self._finished)
         steps.extend(self._pending.values())

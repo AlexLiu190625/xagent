@@ -878,6 +878,25 @@ _PROJECTOR_EQUIVALENCE_CASES: Dict[str, List[SimpleNamespace]] = {
             timestamp=datetime(2026, 1, 1, 12, 0, 3, tzinfo=timezone.utc),
         ),
     ],
+    "tool_start_key_collision": [
+        _ev(
+            "tool_execution_start",
+            step_id="collide",
+            data={"tool_name": "tool_x", "tool_args": {"a": 1}},
+        ),
+        _ev(
+            "tool_execution_start",
+            step_id="collide",
+            data={"tool_name": "tool_y", "tool_args": {"b": 2}},
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="collide",
+            data={"tool_name": "tool_y", "result": "result_y", "success": True},
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+    ],
     "skill_select_pair": [
         _ev(
             "skill_select_start",
@@ -976,6 +995,11 @@ def test_projector_equivalent_to_batch(events):
     exactly. This is the byte-for-byte pin that the batch function
     stays a pure driver over the projector, never a second copy of
     the folding logic.
+
+    Literal output shapes per event family are already pinned by this
+    file's 23 direct-call tests above, which now exercise the
+    projector itself. What this test guards instead is that the batch
+    driver never grows a second, independent folding implementation.
     """
     expected = map_trace_events_to_public_steps(events)
     projected = PublicStepProjector.from_history(events).materialized_steps()
