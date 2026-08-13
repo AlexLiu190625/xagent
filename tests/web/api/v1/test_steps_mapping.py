@@ -46,6 +46,25 @@ def _ev(
     )
 
 
+def _dag_exec_ev(
+    phase: str,
+    *,
+    task_id: Optional[str] = "t1",
+    timestamp: Optional[datetime] = None,
+    **extra_data: Any,
+) -> SimpleNamespace:
+    """Build a synthetic ``dag_execution`` event.
+
+    ``phase`` is the only field the projector reads out of ``data``;
+    ``extra_data`` lets callers attach the other fields a real
+    emission carries (``completed_step_count``, ``plan_step_count``,
+    ``steps``, ...) so a test can prove none of them leak into the
+    public step.
+    """
+    data: Dict[str, Any] = {"phase": phase, **extra_data}
+    return _ev("dag_execution", task_id=task_id, data=data, timestamp=timestamp)
+
+
 # ===== happy paths: each public type appears at least once =====
 
 
@@ -966,6 +985,62 @@ _PROJECTOR_EQUIVALENCE_CASES: Dict[str, List[SimpleNamespace]] = {
             timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
         ),
     ],
+    "dag_execution_planning_pair": [
+        _dag_exec_ev(
+            "planning",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+            completed_step_count=0,
+            previous_step_count=0,
+        ),
+        _dag_exec_ev(
+            "executing",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+            plan_step_count=2,
+            replan=False,
+            steps=[{"id": "s1"}, {"id": "s2"}],
+        ),
+    ],
+    "dag_execution_resume_sequence": [
+        _dag_exec_ev(
+            "planning",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "planning",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "executing",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+    ],
+    "dag_plan_and_dag_execution_coexist": [
+        _ev(
+            "dag_plan_start",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "planning",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "dag_plan_end",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "executing",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 3, tzinfo=timezone.utc),
+        ),
+    ],
     "unexposed_event_types_are_dropped": [
         _ev("llm_call_start", step_id="s1"),
         _ev("llm_call_end", step_id="s1"),
@@ -1083,3 +1158,277 @@ def test_feed_return_value_reflects_step_state_at_call_time():
 
     # Empty/falsy event_type: nothing identifiable to fold.
     assert PublicStepProjector().feed(_ev("", step_id="s1")) == []
+
+
+# ===== dag_execution: planning-phase visibility from an existing signal =====
+
+
+def test_dag_execution_planning_pair_becomes_thinking_planning():
+    events = [
+        _dag_exec_ev(
+            "planning",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+            completed_step_count=0,
+            previous_step_count=0,
+        ),
+        _dag_exec_ev(
+            "executing",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+            plan_step_count=2,
+            replan=False,
+            steps=[{"id": "s1"}, {"id": "s2"}],
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 1
+    s = steps[0]
+    assert s["type"] == "thinking"
+    assert s["data"]["phase"] == "planning"
+    assert s["status"] == "completed"
+    # id shape is pinned separately from the legacy dag_plan_* family
+    # so the two counters can never collide.
+    assert s["id"] == "thinking:planning:t1:1"
+
+
+def test_dag_execution_planning_pair_with_integer_task_id():
+    events = [
+        _dag_exec_ev(
+            "planning",
+            task_id=42,
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "executing",
+            task_id=42,
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 1
+    s = steps[0]
+    # An int task_id must interpolate into the key the same way a str
+    # one does.
+    assert s["id"] == "thinking:planning:42:1"
+    assert s["status"] == "completed"
+    assert s["completed_at"] == events[1].timestamp
+
+
+def test_two_dag_execution_planning_entries_produce_two_separate_steps():
+    """Each entry into planning -- not just replan -- produces its own
+    step; a replanning entry reports the same public phase as a first
+    planning entry.
+    """
+    events = [
+        _dag_exec_ev(
+            "planning",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "executing",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "replanning",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "executing",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 3, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 2
+    assert all(s["data"]["phase"] == "planning" for s in steps)
+    assert all(s["status"] == "completed" for s in steps)
+    assert steps[0]["id"] == "thinking:planning:t1:1"
+    assert steps[1]["id"] == "thinking:planning:t1:2"
+
+
+def test_dag_execution_planning_without_executing_stays_running():
+    """No executing row (planning failed or task is still in flight):
+    the step stays running -- and the output is already non-empty with
+    the first step reporting phase=planning, i.e. visible without
+    waiting for the executing row.
+    """
+    events = [_dag_exec_ev("planning", task_id="t1")]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 1
+    assert steps[0]["type"] == "thinking"
+    assert steps[0]["data"]["phase"] == "planning"
+    assert steps[0]["status"] == "running"
+    assert steps[0]["completed_at"] is None
+
+
+def test_dag_execution_planning_failure_does_not_disturb_other_steps():
+    """A planning step left running does not block other, unrelated
+    steps in the same stream from folding normally."""
+    events = [
+        _dag_exec_ev(
+            "planning",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "react_action_start",
+            step_id="s1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "react_action_end",
+            step_id="s1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 2
+    planning_step = next(s for s in steps if s["data"]["phase"] == "planning")
+    action_step = next(s for s in steps if s["data"]["phase"] == "action")
+    assert planning_step["status"] == "running"
+    assert action_step["status"] == "completed"
+
+
+def test_dag_execution_resume_sequence_first_running_second_completed():
+    """A resumed-after-interruption sequence (planning, planning,
+    executing -- no executing between the two plannings) leaves the
+    first step running and closes only the second."""
+    events = [
+        _dag_exec_ev(
+            "planning",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "planning",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "executing",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 2
+    assert steps[0]["status"] == "running"
+    assert steps[0]["completed_at"] is None
+    assert steps[1]["status"] == "completed"
+    assert steps[1]["completed_at"] is not None
+    assert steps[0]["id"] != steps[1]["id"]
+
+
+def test_dag_execution_translated_step_data_is_phase_only():
+    """The translated step's ``data`` is exactly ``{"phase": ...}`` --
+    none of the source event's other fields (completed_step_count,
+    plan_step_count, replan, the full plan step list) leak through,
+    whether the step is still running or already completed.
+    """
+    running_only = map_trace_events_to_public_steps(
+        [
+            _dag_exec_ev(
+                "planning",
+                task_id="t1",
+                completed_step_count=1,
+                previous_step_count=2,
+            )
+        ]
+    )
+    assert set(running_only[0]["data"].keys()) == {"phase"}
+
+    events = [
+        _dag_exec_ev(
+            "planning",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+            completed_step_count=1,
+            previous_step_count=2,
+        ),
+        _dag_exec_ev(
+            "executing",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+            plan_step_count=3,
+            replan=True,
+            steps=[{"id": "s1", "task": "do x"}],
+        ),
+    ]
+    completed = map_trace_events_to_public_steps(events)
+    assert len(completed) == 1
+    assert set(completed[0]["data"].keys()) == {"phase"}
+    assert completed[0]["data"]["phase"] == "planning"
+
+
+@pytest.mark.parametrize("phase", ["completion_assessment", "some_future_phase"])
+def test_dag_execution_other_phases_are_dropped(phase):
+    """Phases outside {planning, replanning, executing} are not
+    translated -- current behavior for dag_execution is preserved."""
+    events = [_dag_exec_ev(phase, task_id="t1")]
+    assert map_trace_events_to_public_steps(events) == []
+
+
+def test_dag_execution_missing_or_malformed_phase_is_dropped():
+    """Fail-safe: a missing/non-string ``phase``, or a ``data``
+    payload that isn't even a dict, falls into the discard branch
+    instead of raising."""
+    no_phase = _dag_exec_ev("planning", task_id="t1")
+    no_phase.data = {}
+    non_str_phase = _dag_exec_ev("planning", task_id="t1")
+    non_str_phase.data = {"phase": 123}
+    none_phase = _dag_exec_ev("planning", task_id="t1")
+    none_phase.data = {"phase": None}
+    non_dict_data = _dag_exec_ev("planning", task_id="t1")
+    non_dict_data.data = None
+    for event in (no_phase, non_str_phase, none_phase, non_dict_data):
+        assert PublicStepProjector().feed(event) == []
+
+
+def test_dag_execution_executing_without_open_planning_is_noop():
+    """Orphan executing (no preceding planning start): drops silently,
+    same policy as an orphan end elsewhere in this module."""
+    events = [_dag_exec_ev("executing", task_id="t1", plan_step_count=1, steps=[])]
+    assert map_trace_events_to_public_steps(events) == []
+
+
+def test_dag_plan_and_dag_execution_coexist_without_id_collision():
+    """Legacy dag_plan_* and dag_execution-derived planning steps
+    interleaved in one stream fold independently: separate counters,
+    separate open keys, each end pairs with its own family's start,
+    and the resulting ids never collide.
+    """
+    events = [
+        _ev(
+            "dag_plan_start",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "planning",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "dag_plan_end",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "executing",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 3, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 2
+    assert all(
+        s["type"] == "thinking" and s["data"] == {"phase": "planning"} for s in steps
+    )
+    assert all(s["status"] == "completed" for s in steps)
+    ids = {s["id"] for s in steps}
+    assert len(ids) == 2
+    assert ids == {"thinking:plan:t1:1", "thinking:planning:t1:1"}

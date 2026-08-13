@@ -39,6 +39,7 @@ Incremental projection:
     :class:`PublicStepProjector`, not in this function. The projector
     holds all the folding state a fold needs -- the pending
     (start-seen, end-not-yet-seen) table, the ``dag_plan_*`` replan
+    counter, and the independent ``dag_execution`` planning-phase
     counter -- so a caller can feed it one event at a time and read
     back the steps that changed. ``map_trace_events_to_public_steps``
     stays pure by constructing one fresh, throwaway projector per
@@ -58,6 +59,13 @@ Pairing rule:
       - ``dag_step_*`` events pair on ``step_id``.
       - ``dag_plan_*`` events pair on ``task_id`` (single planning
         phase per task; no per-plan identifier available).
+      - ``dag_execution`` events pair on ``data['phase']``: a
+        ``planning``/``replanning`` value opens a planning-phase
+        thinking step, an ``executing`` value closes the currently
+        open one. This is a second, independent source of the same
+        public phase as ``dag_plan_*`` above -- it keeps its own
+        counter and open key so the two families never collide, even
+        when both appear in the same event stream.
       - ``skill_select_*`` events pair on ``task_id`` (single skill
         selection phase per task).
 
@@ -76,9 +84,11 @@ Pairing rule:
     carry the same public step id (id and pairing key are derived from
     the same (type, key) pair), so a consumer folding ``feed`` results
     by id converges on the second step rather than being left with a
-    stranded ``running`` one. ``dag_plan_*`` is the one exception: it
-    has no natural key at all, so a counter gives every plan a
-    distinct one.
+    stranded ``running`` one. ``dag_plan_*`` and the planning-phase
+    steps ``dag_execution`` produces are the exception: neither has a
+    natural key at all, so each family keeps its own counter (and its
+    own ``plan:`` / ``planning:`` key prefix) to generate a distinct
+    one per occurrence.
 """
 
 from __future__ import annotations
@@ -158,6 +168,14 @@ class PublicStepProjector:
         # time); nesting would require a stack, which DAG doesn't emit.
         self._plan_counter = 0
         self._open_plan_key: Optional[str] = None
+        # ``dag_execution`` (phase planning/replanning/executing) is a
+        # second source of the same public planning phase, translated
+        # further down in ``feed``. It gets its own counter and open
+        # key so it never shares pairing state with ``dag_plan_*``
+        # above -- both families can appear in the same stream without
+        # cross-talk or id collisions.
+        self._dag_execution_counter = 0
+        self._open_dag_execution_key: Optional[str] = None
 
     @classmethod
     def from_history(cls, events: List[Any]) -> "PublicStepProjector":
@@ -229,6 +247,9 @@ class PublicStepProjector:
             # Special-cased because plan events have no per-plan id;
             # we generate one from a counter and remember the open
             # key so the next dag_plan_end pairs with the latest start.
+            # The dag_execution branch below keeps its own independent
+            # counter and "planning:" key prefix; keep pairing
+            # semantics changes in lockstep between the two branches.
             if event_type.endswith("_start"):
                 self._plan_counter += 1
                 task_ref = (
@@ -272,8 +293,8 @@ class PublicStepProjector:
                     status="completed",
                 )
                 return [finalized] if finalized is not None else []
-            # other actions (e.g. dag_execution UPDATE) for these
-            # categories are not exposed.
+            # Events in these families that are neither a start nor an
+            # end carry no step transition.
             return []
 
         # ===== tool_call / agent_delegation: paired start/end + failure =====
@@ -381,6 +402,42 @@ class PublicStepProjector:
                 extra_data_fn=lambda ev: {"result": _data_get(ev, "result")},
             )
             return [finalized] if finalized is not None else []
+
+        # ===== dag_execution: translate an existing signal into the
+        # same public planning phase ``dag_plan_*`` produces =====
+        if event_type == "dag_execution":
+            phase = _data_get(event, "phase")
+            if not isinstance(phase, str):
+                # Missing/malformed phase: nothing to translate.
+                return []
+            if phase in ("planning", "replanning"):
+                self._dag_execution_counter += 1
+                task_ref = (
+                    _safe_get(event, "task_id")
+                    or _safe_get(event, "event_id")
+                    or "anon"
+                )
+                key = f"planning:{task_ref}:{self._dag_execution_counter}"
+                self._open_dag_execution_key = key
+                step = _build_thinking_start(event, phase="planning", key=key)
+                self._pending[("thinking", key)] = step
+                return [step]
+            if phase == "executing":
+                if self._open_dag_execution_key is None:
+                    # No open planning step to close: same policy as an
+                    # orphan end elsewhere in this module -- drop.
+                    return []
+                finalized = _finalize_pending(
+                    self._pending,
+                    self._finished,
+                    ("thinking", self._open_dag_execution_key),
+                    end_event=event,
+                    status="completed",
+                )
+                self._open_dag_execution_key = None
+                return [finalized] if finalized is not None else []
+            # Other phases (e.g. completion_assessment): not exposed.
+            return []
 
         # Everything else (llm_call_*, memory_*, dag_execute_*,
         # react_task_*, react_step_*, visualization_update,

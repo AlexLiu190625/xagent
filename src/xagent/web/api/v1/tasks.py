@@ -1174,9 +1174,11 @@ async def get_chat_task_steps(
     The internal trace event taxonomy has ~32 ``event_type`` strings
     today; SDK callers see only the 4 types listed above. Internal
     events not on the public allow-list (LLM calls, memory ops,
-    visualization ticks, DAG bookkeeping) are silently dropped --
+    visualization ticks, most DAG bookkeeping) are silently dropped --
     intentionally, so internal trace evolution doesn't break the SDK
-    contract.
+    contract; the exception is dag_execution's planning/replanning/
+    executing phase transitions, which project onto a planning
+    thinking step.
 
     Args:
         task_id: Path parameter; the target task's primary key.
