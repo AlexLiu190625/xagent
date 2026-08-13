@@ -47,6 +47,7 @@ from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_session_local
 from ...models.task import TaskStatus
 from ...services.db_runtime import run_db_io_cancellation_safe
+from ...services.task_execution_controller import TaskControlState
 from ..websocket import _is_versioned_task_event, manager
 from .deps import ApiKeyPrincipal, active_runtime_key_filters
 from .errors import V1ApiError, V1ErrorCode
@@ -75,8 +76,13 @@ STREAM_MAX_DURATION_SECONDS = 60.0 * 60.0
 OUTBOUND_QUEUE_MAX_SIZE = 256
 PER_TASK_STREAM_CAP = 2
 PER_PRINCIPAL_STREAM_CAP = 32
+# Floor for the final wait when the 1-hour deadline is close: keeps the
+# queue wait from being called with a near-zero timeout, which would spin
+# the loop instead of actually waiting.
+_MIN_WAIT_BUDGET_SECONDS = 0.05
 
 _TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
+_TERMINAL_STATUS_VALUES = {status.value for status in _TERMINAL_STATUSES}
 
 # A sync callable: (task_id, principal) -> ``_TaskInfoSnapshot``-shaped
 # object (duck-typed: ``.status`` / ``.control_state`` / ``.output`` /
@@ -256,11 +262,27 @@ class V1EventStreamSink:
                 status = message.get("status")
                 if isinstance(status, str):
                     self.enqueue_status(status)
+                    if status in _TERMINAL_STATUS_VALUES:
+                        # A failed task's broadcast (``task_error``) never
+                        # carries ``type == "task_completed"``, so it would
+                        # otherwise miss the acceleration signal above and
+                        # wait out the watchdog's normal cadence.
+                        self.completion_hint.set()
         except Exception:
             self.dropped_frame_count += 1
             logger.exception(
                 "v1 SSE sink dropped a broadcast frame for task %s", self.task_id
             )
+
+    async def close(self, *args: Any, **kwargs: Any) -> None:
+        """No-op. Duck-types ``WebSocket.close`` -- task deletion
+        (``chat.py``'s ``_cleanup_runtime_state``) calls ``close()`` on every
+        connection still registered for the task, and a missing method here
+        would log a misleading "failed to close" warning for a sink that was
+        never a real socket in the first place. This generator's own
+        ``finally`` block is what actually tears the stream down.
+        """
+        return None
 
     def _binding_matches(self, message: dict[str, Any]) -> bool:
         """Drop frames whose task_id doesn't match this stream's binding
@@ -383,7 +405,7 @@ async def watchdog_check_once(
         )
     if (
         status is TaskStatus.WAITING_FOR_USER
-        and snapshot.control_state != "resume_requested"
+        and snapshot.control_state != TaskControlState.RESUME_REQUESTED.value
     ):
         return sink.enqueue_close(input_required_frame(task_id))
     if status is TaskStatus.PAUSED:
@@ -456,6 +478,18 @@ async def _terminal_snapshot_stream(
     yield completed_frame(
         status=snapshot.status.value, output=snapshot.output, error=snapshot.error
     )
+
+
+async def _input_required_snapshot_stream(
+    snapshot: "_TaskInfoSnapshot",
+) -> AsyncIterator[str]:
+    """Attach-time fast path for a task already waiting on user input (and
+    not mid-resume): emit ``task.status`` + ``task.input_required`` and
+    end. Same rationale as ``_terminal_snapshot_stream`` -- without this,
+    the same conclusion is only reached via the watchdog's first cycle,
+    up to ``watchdog_interval_seconds`` (30s in production) after attach."""
+    yield status_frame(snapshot.status.value)
+    yield input_required_frame(snapshot.task_id)
 
 
 async def _generate(
@@ -539,7 +573,19 @@ async def _generate(
                 # First-to-close-wins: a no-op if the watchdog already
                 # closed the stream first in the same tick.
                 sink.enqueue_close(error_frame("stream_expired"))
-            wait_budget = heartbeat_interval_seconds if remaining > 0 else 1.0
+            # Capped at the heartbeat interval so the deadline check above
+            # re-runs often enough, but never let it run past the deadline
+            # itself -- otherwise an idle stream whose last ping landed just
+            # before the deadline could sleep a full heartbeat interval past
+            # ``stream_max_duration_seconds`` before ``stream_expired`` is
+            # even enqueued.
+            wait_budget = (
+                min(
+                    heartbeat_interval_seconds, max(remaining, _MIN_WAIT_BUDGET_SECONDS)
+                )
+                if remaining > 0
+                else 1.0
+            )
             try:
                 frame_text, is_close = await asyncio.wait_for(
                     sink.queue.get(), timeout=wait_budget
@@ -609,6 +655,15 @@ async def build_event_stream_response(
     if initial_snapshot.status in _TERMINAL_STATUSES:
         return StreamingResponse(
             _terminal_snapshot_stream(initial_snapshot),
+            media_type="text/event-stream",
+        )
+
+    if (
+        initial_snapshot.status is TaskStatus.WAITING_FOR_USER
+        and initial_snapshot.control_state != TaskControlState.RESUME_REQUESTED.value
+    ):
+        return StreamingResponse(
+            _input_required_snapshot_stream(initial_snapshot),
             media_type="text/event-stream",
         )
 
