@@ -3485,7 +3485,11 @@ class WebToolConfig(BaseToolConfig):
     async def _load_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations visible to this run: the user's
         personal servers, unioned with the governing agent's team-owned
-        servers when a team-scope hook is installed."""
+        servers when a team-scope hook is installed. For each team-owned
+        server id, this method also re-keys the shared env layer onto the
+        governing team's own row -- see the team-env block below -- instead
+        of leaving the shared layer keyed on the run owner's personal
+        shared-env hook answer."""
         self._mcp_oauth_diagnostics = []
         self._reset_mcp_config_load_cache_state()
 
@@ -3505,8 +3509,10 @@ class WebToolConfig(BaseToolConfig):
         try:
             from ..services.mcp_runtime import (
                 load_shared_env_overrides,
+                load_team_env_overrides,
                 load_user_env_overrides,
                 load_user_env_sources,
+                team_env_hook_installed,
             )
 
             servers = self._visible_mcp_server_query(team_mcp_ids).all()
@@ -3522,6 +3528,51 @@ class WebToolConfig(BaseToolConfig):
             user_env_by_id = load_user_env_overrides(self.db, self._user_id)
             shared_env_by_id = load_shared_env_overrides(self.db, self._user_id)
             env_source_by_id = load_user_env_sources(self.db, self._user_id)
+
+            # Re-key the shared env layer, for team-owned ids only, onto the
+            # governing team's own row -- never the run owner's team, and
+            # never any other team's. Guarded on all three of
+            # connector_team_id, the installed predicate, and a non-empty
+            # team_mcp_ids so a run that touches none of this pays no team
+            # query at all.
+            if (
+                self._connector_team_id is not None
+                and team_env_hook_installed()
+                and team_mcp_ids
+            ):
+                team_env_by_id = load_team_env_overrides(
+                    self.db, self._connector_team_id
+                )
+                # Never mutate the loader-returned mappings in place: either
+                # may be the object a hook keeps its own reference to.
+                # Shallow copies of the outer dict are sufficient because
+                # every downstream consumer only reads the inner per-server
+                # values -- resolve_stdio_env's lookups, this file's own
+                # per-server env merge in _build_mcp_server_config's stdio
+                # branch, and mcp_runtime.build_mcp_runtime_connection's
+                # caller-id env merge (both of the latter two are
+                # unconditional-overwrite `{**a, **b}` merges) -- none of
+                # them assign back into shared_env_by_id or env_source_by_id.
+                shared_env_by_id = dict(shared_env_by_id)
+                env_source_by_id = dict(env_source_by_id)
+                for server_id in team_mcp_ids:
+                    if server_id in team_env_by_id:
+                        shared_env_by_id[server_id] = team_env_by_id[server_id]
+                    else:
+                        shared_env_by_id.pop(server_id, None)
+                        if env_source_by_id.get(server_id) == "shared":
+                            # Unconditional, not only when the pop above
+                            # removed something: firing it only on an actual
+                            # removal would make a non-member runner's
+                            # outcome depend on whether the RUNNER'S OWN team
+                            # happens to hold a row for this server -- the
+                            # exact cross-team influence this seam forbids,
+                            # re-entering through a side door. Unconditional,
+                            # the outcome depends on exactly three inputs:
+                            # the governing team's row, the runner's own key,
+                            # and this pick -- the runner's own team's rows
+                            # never enter the computation.
+                            del env_source_by_id[server_id]
         except ConnectorRuntimeError:
             raise
         except Exception as error:

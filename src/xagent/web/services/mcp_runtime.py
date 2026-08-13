@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterator, Protocol
 
+from ...core.tools.adapters.vibe.connector_runtime import (
+    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+    ConnectorRuntimeError,
+)
 from .mcp_oauth import MCPOAuthRuntimeError, resolve_mcp_oauth_runtime_auth
 
 HTTP_MCP_TRANSPORTS = frozenset({"sse", "websocket", "streamable_http"})
@@ -96,6 +102,139 @@ def load_shared_env_overrides(db: Any, user_id: int | None) -> dict[int, dict]:
 
         logging.getLogger(__name__).exception("shared env hook failed")
         return {}
+
+
+class TeamMCPEnvHook(Protocol):
+    """Resolver for a team's own shared MCP env overrides, keyed by server id.
+
+    Typed as a ``Protocol`` with a keyword-only ``team_id`` for the same
+    reason ``TeamConnectorVisibilityHook`` (the visibility twin in
+    connector_team_scope.py) is: this hook and the user-keyed
+    ``_get_mcp_shared_env_hook`` above are otherwise structurally
+    identical -- ``(db, id) -> {mcpserver_id: {env}}`` -- and a swapped
+    install would type-check while resolving an unrelated team's or
+    user's env.
+    """
+
+    def __call__(self, db: Any, *, team_id: int) -> dict[int, dict]: ...
+
+
+# Hook signature: (db, *, team_id) -> {mcpserver_id: {env}}. Deliberately a
+# separate module-global slot from _get_mcp_shared_env_hook, not a keyword on
+# set_mcp_shared_env_hook: the two hooks answer different questions -- "did
+# the application register anything shared at all" (user-keyed, default:
+# none) versus "does THIS SPECIFIC governing team have a row" (team-keyed,
+# authorization-relevant) -- and load_shared_env_overrides's failure policy
+# (degrade to no shared layer) would hide a signature TypeError or a
+# malformed answer from this hook instead of surfacing it.
+_get_mcp_team_env_hook: TeamMCPEnvHook | None = None
+
+
+def set_mcp_team_env_hook(hook: TeamMCPEnvHook | None) -> None:
+    global _get_mcp_team_env_hook
+    _get_mcp_team_env_hook = hook
+
+
+def team_env_hook_installed() -> bool:
+    """Whether an application installed a team-keyed env hook.
+
+    Callers select on this, never on an empty return value: an installed
+    hook legitimately answers empty for a team that stored nothing for any
+    server (see load_team_env_overrides).
+    """
+    return _get_mcp_team_env_hook is not None
+
+
+def _validate_team_mcp_env_answer(answer: Any) -> dict[int, dict]:
+    """Validate the team-env hook's answer shape.
+
+    This is an authorization input, not user-facing data: a malformed
+    answer must fail loudly, never be normalized, coerced, or defaulted to
+    empty -- the same stance connector_team_scope's
+    ``_validate_team_connector_answer`` takes for the visibility twin. The
+    hook must return a ``dict`` whose keys are all ``int`` server ids
+    (``bool`` is a subclass of ``int`` in Python but is rejected here -- a
+    truthy/falsy value is never a legitimate server id) and whose values
+    are all ``dict`` env mappings.
+    """
+    if not isinstance(answer, dict):
+        raise ValueError(
+            "team env hook returned a malformed answer: expected a dict, "
+            f"got {type(answer).__name__}"
+        )
+    for key, value in answer.items():
+        if isinstance(key, bool) or not isinstance(key, int):
+            raise ValueError(
+                "team env hook returned a malformed answer: key "
+                f"{key!r} is not a server id (must be int, not bool)"
+            )
+        if not isinstance(value, dict):
+            raise ValueError(
+                "team env hook returned a malformed answer: value for key "
+                f"{key!r} must be a dict, got {type(value).__name__}"
+            )
+    # Defensive copy at the authorization boundary: the caller must not be
+    # able to mutate the installing application's own answer object (or
+    # vice versa). Shallow is sufficient -- every downstream consumer only
+    # ever reads the inner per-server env dicts, never mutates them in
+    # place (see the shallow-copy note in config.py's wiring block).
+    return dict(answer)
+
+
+def load_team_env_overrides(db: Any, team_id: int | None) -> dict[int, dict]:
+    """Batch-load a governing team's own shared MCP env overrides, keyed by
+    server id.
+
+    Unlike load_shared_env_overrides, this loader's failure policy is
+    raise, not degrade: any hook exception and any answer shape violation
+    becomes a typed ConnectorRuntimeError instead of silently falling back
+    to no shared layer. A misbehaving hook here must not be
+    indistinguishable from "the governing team legitimately has no row" --
+    the caller (config.py's wiring) already treats the latter as a
+    deliberate, signal-losing degrade of its own; collapsing hook failure
+    into the same outcome would double that loss silently.
+    """
+    if team_id is None or _get_mcp_team_env_hook is None:
+        return {}
+    try:
+        answer = _get_mcp_team_env_hook(db, team_id=team_id)
+        return _validate_team_mcp_env_answer(answer)
+    except ConnectorRuntimeError:
+        raise
+    except Exception as exc:
+        logging.getLogger(__name__).warning("team env hook failed", exc_info=True)
+        raise ConnectorRuntimeError(
+            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+            "Team MCP env is unavailable.",
+            details={"reason": "team_env_resolution_failed"},
+            status_code=503,
+        ) from exc
+
+
+@contextmanager
+def mcp_env_hooks_snapshot() -> Iterator[None]:
+    """Save every env hook slot in this module on entry, restore all of
+    them on exit.
+
+    Covers both the pre-existing shared (user-keyed) slot and the
+    team-keyed slot above, so a test that installs either hook is
+    restored to the pre-entry state deterministically without reaching
+    past the public setters. A hook slot added to this module later,
+    following the same ``_get_mcp_*_hook`` naming pattern as the two
+    above, that is not added here as well fails the coverage test in
+    tests/web/services/test_mcp_team_env_hook.py, by design -- see that
+    module's docstring rule. A slot that breaks the naming pattern is
+    outside what that coverage test can discover and must be added here
+    by hand.
+    """
+    global _get_mcp_shared_env_hook, _get_mcp_team_env_hook
+    saved_shared = _get_mcp_shared_env_hook
+    saved_team = _get_mcp_team_env_hook
+    try:
+        yield
+    finally:
+        _get_mcp_shared_env_hook = saved_shared
+        _get_mcp_team_env_hook = saved_team
 
 
 CALLER_ID_ENV_VAR = "XAGENT_MCP_CALLER_ID"
