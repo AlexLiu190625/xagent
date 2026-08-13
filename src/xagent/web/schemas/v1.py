@@ -678,7 +678,9 @@ class PublicStep(BaseModel):
         description=(
             "running while the corresponding end event has not yet "
             "fired, completed on a normal end event, failed when the "
-            "end event carries success=false. A task in a terminal "
+            "end event reports failure (success=false or a dedicated "
+            "*_failed event for tool events, status='failed' for step "
+            "events). A task in a terminal "
             "state can still contain running steps: interrupted or "
             "cancelled steps never get an end event, so terminal "
             "state is judged from the task's own status, not from "
