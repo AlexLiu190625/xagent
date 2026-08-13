@@ -1823,6 +1823,20 @@ def _connected_non_oauth_server_for_app(
     return cast(int, server.id)
 
 
+def _is_mcp_oauth_server(server: MCPServer) -> bool:
+    """Whether a stored server row is authorized through per-user MCP OAuth.
+
+    The shape check behind both the connection-state gate below and the
+    connector picker's `auth_type` hint, so the field that decides which
+    Connect flow the picker starts can't disagree with the field that decides
+    whether the server counts as connected."""
+    auth: dict[str, Any] = server.auth if isinstance(server.auth, dict) else {}
+    return (
+        str(server.transport or "").lower() in HTTP_MCP_TRANSPORTS
+        and auth.get("type") == "mcp_oauth"
+    )
+
+
 def _mcp_oauth_server_is_actually_connected(
     server: MCPServer, active_grant_server_ids: set[int]
 ) -> bool:
@@ -1833,11 +1847,7 @@ def _mcp_oauth_server_is_actually_connected(
     branch — shared so every code path that reports connection state for an
     mcp_oauth server (including the location=local/all branch, which used to
     bypass this check entirely) agrees (F1)."""
-    auth: dict[str, Any] = server.auth if isinstance(server.auth, dict) else {}
-    if (
-        str(server.transport or "").lower() not in HTTP_MCP_TRANSPORTS
-        or auth.get("type") != "mcp_oauth"
-    ):
+    if not _is_mcp_oauth_server(server):
         return True
     return cast(int, server.id) in active_grant_server_ids
 
@@ -2015,28 +2025,43 @@ def list_mcp_apps(
             if category and category != "All":
                 continue
 
-            results.append(
-                {
-                    "id": server.name,
-                    "name": server.name,
-                    "description": server.description or "Custom MCP Server",
-                    "icon": "",
-                    "users": "1",
-                    "transport": server.transport,
-                    # F1: this loop's own membership check above (name-based)
-                    # doesn't gate on a real grant, so a custom mcp_oauth
-                    # server the user abandoned mid-consent must not be
-                    # reported connected just because the row exists.
-                    "is_connected": _mcp_oauth_server_is_actually_connected(
-                        server, active_grant_server_ids
-                    ),
-                    "provider": "custom",
-                    "category": "Local",
-                    "is_local": True,
-                    "server_id": server.id,
-                    "is_custom": True,
-                }
-            )
+            entry = {
+                "id": server.name,
+                "name": server.name,
+                "description": server.description or "Custom MCP Server",
+                "icon": "",
+                "users": "1",
+                "transport": server.transport,
+                # F1: this loop's own membership check above (name-based)
+                # doesn't gate on a real grant, so a custom mcp_oauth
+                # server the user abandoned mid-consent must not be
+                # reported connected just because the row exists.
+                "is_connected": _mcp_oauth_server_is_actually_connected(
+                    server, active_grant_server_ids
+                ),
+                "provider": "custom",
+                "category": "Local",
+                "is_local": True,
+                "server_id": server.id,
+                "is_custom": True,
+            }
+            # The picker dispatches its Connect button on auth_type, and custom
+            # entries used to omit the field entirely — so an mcp_oauth server
+            # left unconnected by the check above had no way forward and hit
+            # the mis-authored-entry toast instead (#1313).
+            #
+            # Emitted only for the mcp_oauth shape, deliberately: every other
+            # custom shape is reported connected unconditionally (so its
+            # Connect button never renders), while tagging those rows with a
+            # catalog classification would repoint the settings dialog's
+            # Configure button away from the custom edit form. Inactive
+            # associations are excluded because the per-server OAuth endpoints
+            # require an active one — a deactivated server needs re-enabling,
+            # not re-authorization.
+            if user_mcp.is_active and _is_mcp_oauth_server(server):
+                entry["auth_type"] = "mcp_oauth"
+
+            results.append(entry)
 
         # Append Custom APIs
         user_custom_apis = (
