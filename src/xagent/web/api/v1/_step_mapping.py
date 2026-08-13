@@ -49,10 +49,11 @@ Pairing rule:
 
     Start / end events are paired by a stable ``key``:
 
-      - ``tool_execution_*`` events pair on ``data['tool_execution_id']``
-        when present, falling back to ``step_id``. The tool execution
-        id is generated per-invocation and is the only safe key when
-        the same tool is called twice in the same step.
+      - ``tool_execution_*`` events pair on ``data['tool_call_id']``
+        (the provider-assigned call id), falling back to ``step_id``.
+        ``tool_execution_id`` is accepted ahead of it for compatibility
+        but has no current producer. A per-invocation id is the only
+        safe key when the same tool is called twice in the same step.
       - ``react_action_*`` events pair on ``step_id``.
       - ``dag_step_*`` events pair on ``step_id``.
       - ``dag_plan_*`` events pair on ``task_id`` (single planning
@@ -285,10 +286,11 @@ class PublicStepProjector:
             is_delegation = is_agent_tool_name(tool_name)
             public_type = "agent_delegation" if is_delegation else "tool_call"
             # Pair on a per-invocation id (unique even when one step
-            # invokes the same tool twice). v1 emits
-            # ``tool_execution_id``; v2 emits ``tool_call_id``. Either
-            # is fine — the fallback chain accepts both. step_id alone
-            # is unsafe because one step may invoke multiple tools.
+            # invokes the same tool twice). The effective key today is
+            # ``tool_call_id``; ``tool_execution_id`` is accepted ahead
+            # of it for compatibility but has no current producer.
+            # step_id alone is unsafe because one step may invoke
+            # multiple tools.
             key = (
                 _data_get(event, "tool_execution_id")
                 or _data_get(event, "tool_call_id")
