@@ -1,4 +1,5 @@
 import json
+import re
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ import httpx
 import pytest
 
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
+from xagent.core.tools.adapters.vibe.agent_tool_names import MAX_AGENT_TOOL_NAME_LENGTH
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPFailurePhase,
     MCPServerLoadFailure,
@@ -267,6 +269,107 @@ def test_mcp_tool_adapter_source_server_defaults_none():
     )
     assert adapter.source_server is None
     assert adapter.metadata.source_server is None
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected"),
+    [
+        # `.` namespacing, the case the fix was written for.
+        ("coding.start", "mcp_Coding_MCP_coding_start"),
+        # Path-like separator.
+        ("list/items", "mcp_Coding_MCP_list_items"),
+        # Parentheses and a space alongside the version marker.
+        ("run (v2)", "mcp_Coding_MCP_run__v2_"),
+        # Non-ASCII names collapse to underscores rather than raising or
+        # being romanized -- `_semantic_slug` (agent_tool_names.py) makes
+        # the opposite, deliberate choice for agent-delegation tool names
+        # (pinyin-transliterate instead of drop) because it can carry a
+        # unique per-agent id in the suffix; MCP tool names have no such
+        # id to fall back on for uniqueness, so this test pins today's
+        # trade-off (two same-length CJK names collide) rather than
+        # leaving it to be discovered later.
+        ("查询", "mcp_Coding_MCP___"),
+    ],
+)
+def test_mcp_tool_adapter_name_strips_disallowed_characters_for_openai_compatible_apis(
+    tool_name, expected
+):
+    """OpenAI-compatible chat-completions APIs (and at least DeepSeek's)
+    validate `tools[].function.name` against `^[a-zA-Z0-9_-]+$` and 400
+    the whole call if any tool name fails it. MCP servers namespace tool
+    names with all sorts of characters (e.g. the `.` in `coding.start`)
+    to avoid collisions between generically-named tools -- none of that
+    must survive into the LLM-visible name."""
+    mcp_tool = SimpleNamespace(
+        name=tool_name,
+        description="Start a coding run",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = _build_mcp_tool_adapter(
+        "Coding MCP",
+        {"transport": "streamable_http", "url": "http://127.0.0.1:8642/mcp"},
+        mcp_tool,
+    )
+
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", adapter.name)
+    assert adapter.name == expected
+
+
+def test_mcp_tool_adapter_name_is_truncated_to_the_provider_length_limit():
+    """Same failure mode as an illegal character -- an over-long name is
+    rejected by the same providers, just on length. Nothing upstream
+    (MCP server name, MCP tool name) is length-bounded, so this adapter
+    must enforce the limit itself instead of assuming it never comes up.
+    A tool name alone at or past the limit squeezes the prefix down to
+    nothing rather than wrapping around from the end (a negative slice
+    on the *tool* name would otherwise do exactly that).
+    """
+    mcp_tool = SimpleNamespace(
+        name="x" * 200,
+        description="A tool with an absurdly long name",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = _build_mcp_tool_adapter(
+        "Coding MCP",
+        {"transport": "streamable_http", "url": "http://127.0.0.1:8642/mcp"},
+        mcp_tool,
+    )
+
+    assert len(adapter.name) == MAX_AGENT_TOOL_NAME_LENGTH
+    assert adapter.name == "x" * MAX_AGENT_TOOL_NAME_LENGTH
+
+
+def test_mcp_tool_adapter_truncation_keeps_same_server_tools_distinct():
+    """Regression: truncating the *tool name* end of `prefix + tool_name`
+    can make two distinct tools on one long-named server collapse into
+    one identical LLM-visible name once the combined length passes
+    `MAX_AGENT_TOOL_NAME_LENGTH` -- `_find_tool` (react.py) has no
+    duplicate-name detection, so the model asking for one tool would
+    silently get whichever tool happens to register first instead. MCP
+    server names are bounded at 100 (web/api/mcp.py), so 59 characters
+    -- long enough that `mcp_<server>_` alone already reaches the limit
+    -- is a length a real deployment can produce, not a contrived one.
+    The fix keeps the tool name whole and squeezes the prefix instead.
+    """
+    server = "s" * 59
+
+    def _adapter(tool_name: str) -> MCPToolAdapter:
+        return _build_mcp_tool_adapter(
+            server,
+            {"transport": "streamable_http", "url": "http://127.0.0.1:8642/mcp"},
+            SimpleNamespace(
+                name=tool_name,
+                description=tool_name,
+                inputSchema={"type": "object", "properties": {}},
+            ),
+        )
+
+    read_name = _adapter("read_file").name
+    delete_name = _adapter("delete_all_files").name
+
+    assert read_name != delete_name
+    assert read_name.endswith("read_file")
+    assert delete_name.endswith("delete_all_files")
 
 
 def test_mcp_tool_adapter_defaults_to_not_concurrency_safe():
