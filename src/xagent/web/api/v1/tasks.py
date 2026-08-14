@@ -1240,10 +1240,16 @@ async def stream_chat_task_events(
       - Frame sequence into ``task.completed``: a task that fails emits
         ``task.status`` (``"failed"``) from the failure broadcast first,
         then the watchdog's authoritative ``task.completed`` close
-        frame. A task that succeeds has no such intermediate broadcast,
-        so it goes straight to ``task.completed`` with no preceding
-        ``task.status``. Attaching to a task that's already terminal
-        (the fast path below) always sends both frames regardless.
+        frame. This is best-effort, not guaranteed: closing a stream
+        drains its queued backlog before inserting the close frame, so
+        an already-queued ``task.status`` (``"failed"``) can be dropped
+        rather than delivered. No failure information is lost when that
+        happens -- ``task.completed`` still carries ``status: "failed"``
+        and a populated ``error``. A task that succeeds has no such
+        intermediate broadcast, so it goes straight to ``task.completed``
+        with no preceding ``task.status``. Attaching to a task that's
+        already terminal (the fast path below) always sends both frames
+        regardless.
       - Attaching to an already-finished task is not an error: the
         stream opens, emits ``task.status`` then ``task.completed``,
         and closes immediately.
@@ -1261,9 +1267,12 @@ async def stream_chat_task_events(
       - A task that's ``paused`` does not close the stream (matching
         SDK ``wait()`` semantics: another process may resume it); the
         1-hour cap is what eventually ends an orphaned paused stream.
-      - The moment of attach can emit a stale ``task.status`` out of
-        order relative to a concurrent live update -- accepted for
-        this transport-only layer (no attach buffering yet).
+      - No ``task.status`` frame is guaranteed to be fresh or in order,
+        at any point in the stream's life, not only at attach -- this
+        transport-only layer never buffers or reconciles frame order.
+        Accepted because only the three close frames above are treated
+        as authoritative; each comes from a direct read of the task
+        row, never from frame ordering.
 
     Args:
         task_id: Path parameter; the target task's primary key.
@@ -1293,7 +1302,15 @@ async def stream_chat_task_events(
             times the worker count. An attach that takes the terminal
             or waiting-for-user fast path (see Behavior above) never
             registers a sink at all, so it never counts toward either
-            cap.
+            cap. Broadcast delivery is per-process too: a sink only
+            receives the broadcasts fanned out by its own worker
+            process's connection manager, so a task transition driven
+            by a different worker reaches this stream only once the
+            watchdog's 30s database poll picks it up, not via broadcast.
+            Some transitions -- lease-expiry recovery among them --
+            never broadcast at all, in any deployment shape, so the
+            watchdog poll is their only delivery path regardless of
+            worker count.
     """
     snapshot = await run_db_io_cancellation_safe(
         lambda: _load_task_info_snapshot(task_id, principal)

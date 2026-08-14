@@ -10,14 +10,22 @@ and nothing else.
 
 Explicitly out of scope here:
   - Projecting ``step.*`` / ``message.*`` content from trace events.
-  - Buffering live frames during attach warm-up. Without that buffer,
-    a live status update emitted between sink registration and the
-    first ``task.status`` frame can arrive out of order or duplicate
-    the first frame; this is accepted. Worst case the client sees one
-    extra, stale ``task.status``. That's harmless because the
-    authoritative terminal/close determination always comes from the
-    watchdog reading the task row (or the attach-time snapshot read),
-    never from frame ordering.
+  - Buffering live frames during attach warm-up, or reconciling frame
+    order at all. No ``task.status`` frame is ever guaranteed to be
+    fresh or in order: ``ConnectionManager.broadcast_to_task`` stamps
+    each event with whatever ``run_id`` / ``state_version`` tuple its
+    producer captured, falling back to a fresh read of the task row
+    (status included) when the producer didn't capture one, and this
+    sink never compares that stamp against anything -- it just forwards
+    each status string it sees, deduped only against the last one it
+    sent. A stale or out-of-order
+    ``task.status`` frame can therefore reach the client at any point
+    during the stream's life, not only right after attach. This is
+    accepted: the only frames this module treats as authoritative are
+    the three close frames -- ``task.completed``, ``task.input_required``,
+    and ``stream.error`` -- and all three are produced by the watchdog
+    (or the attach-time snapshot read) reading the task row directly,
+    never inferred from frame ordering.
   - Populating ``task.input_required``'s ``prompt`` field from the
     agent's question text. Only the watchdog closes the stream on a
     task stuck waiting for user input (within one watchdog cycle), and

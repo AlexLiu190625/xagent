@@ -29,7 +29,12 @@ from xagent.web.api.v1.errors import V1ApiError, V1ErrorCode
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.task import Task, TaskStatus
 
-from ..conftest import _admin_headers, _direct_db_session, client
+from ..conftest import (
+    _admin_headers,
+    _direct_db_session,
+    _install_one_slot_queue_pool,
+    client,
+)
 
 pytestmark = pytest.mark.usefixtures("_test_db")
 
@@ -595,32 +600,58 @@ async def test_watchdog_survives_transient_check_failure_and_still_closes():
     assert es.count_task_sinks(task_id) == 0
 
 
-# ===== endpoint signature carries no request-scoped DB dependency =====
+# ===== a live stream never holds a connection-pool slot open =====
 
 
-def test_events_endpoint_signature_has_no_db_dependency():
-    """No parameter is typed as a SQLAlchemy ``Session``.
+async def test_live_stream_holds_no_connection_pool_slot(monkeypatch):
+    """A live SSE stream must not occupy a pooled DB connection for its
+    lifetime: every read the stream itself does (the periodic watchdog
+    checks) goes through ``run_db_io_cancellation_safe``, which checks a
+    connection out and back in per read, not once for the whole stream.
 
-    A ``Session``-typed FastAPI dependency is request-scoped: it would be
-    checked out for the entire life of the stream (up to the 1-hour cap)
-    instead of only for the brief, per-check reads that
-    ``_events_stream`` already routes through
-    ``run_db_io_cancellation_safe``. Asserting on the exact parameter
-    *name* set is what used to live here; it broke on any unrelated
-    rename and never actually verified the no-request-scoped-session
-    property it claimed to.
+    Calls the route handler ``stream_chat_task_events`` itself (not
+    ``build_event_stream_response``) with ``task_id``/``principal`` passed
+    directly as keyword arguments -- this runs the handler's exact body
+    (its own snapshot read, then the call into ``_events_stream``) without
+    going through FastAPI's HTTP/dependency-injection layer, so a session
+    opened anywhere in that body, not only inside ``_events_stream``,
+    would show up in the assertion below.
 
-    Signature-only: this can't see whether the function body opens its
-    own ad hoc DB session internally (rather than through
-    ``run_db_io_cancellation_safe``) -- it only rules out a request-scoped
-    ``Session`` dependency injected by FastAPI.
+    Proven behaviorally, not by inspecting the endpoint's signature:
+    rebind the test database onto a real one-connection pool
+    (``_install_one_slot_queue_pool``), open a live stream, and -- while
+    it's still open with its first frame already delivered, the moment a
+    held connection would show up -- assert the pool has nothing checked
+    out. A second, independent connection is then actually pulled from
+    the pool to prove the one slot is genuinely free, not merely under
+    some checkout-count threshold that would pass even with a stale
+    reference still pinning it.
+
+    This replaces a signature-only check that asserted no parameter was
+    typed as ``Session``: true, but blind to a session opened inside the
+    function body instead of injected as a dependency.
     """
-    import inspect
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
 
-    from sqlalchemy.orm import Session
+    engine = _install_one_slot_queue_pool(monkeypatch, pool_timeout=0.5)
 
-    sig = inspect.signature(v1_tasks.stream_chat_task_events)
-    assert not any(param.annotation is Session for param in sig.parameters.values())
+    resp = await v1_tasks.stream_chat_task_events(task_id=task_id, principal=principal)
+    first = await resp.body_iterator.__anext__()
+    assert "event: task.status" in first
+    assert es.count_task_sinks(task_id) == 1
+
+    assert engine.pool.checkedout() == 0
+    held = engine.connect()
+    try:
+        assert engine.pool.checkedout() == 1
+    finally:
+        held.close()
+
+    await resp.body_iterator.aclose()
+    assert es.count_task_sinks(task_id) == 0
+    engine.dispose()
 
 
 # ===== generator teardown unregisters the sink =====
@@ -1009,6 +1040,86 @@ async def test_events_per_task_cap_third_stream_429():
     for resp in responses:
         await resp.body_iterator.aclose()
     assert es.count_task_sinks(task_id) == 0
+
+
+# ===== the fast paths are exempt from both concurrency caps =====
+
+
+@pytest.mark.parametrize(
+    ("fast_path_status", "closing_event"),
+    [
+        (TaskStatus.COMPLETED, "event: task.completed"),
+        (TaskStatus.WAITING_FOR_USER, "event: task.input_required"),
+    ],
+)
+async def test_fast_path_attach_exempt_from_both_caps(fast_path_status, closing_event):
+    """``build_event_stream_response`` checks ``_stream_close_reason``
+    before either concurrency cap (see its own docstring): a task that's
+    already terminal or already waiting for user input takes the
+    snapshot-closing fast path and returns before the per-task and
+    per-principal cap checks ever run, so it must succeed even when both
+    caps are already saturated.
+
+    Setup order matters: the per-task cap has to be filled with real
+    streams *while the task is still running*, because the fast path
+    never registers a sink -- once the task row is already terminal
+    there is no way to fill that cap through it. Only after both caps
+    are full does the task row flip to the fast-path status under test.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    key_prefix = _key_prefix_for_agent(agent_id)
+    running_snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    # Fill the per-task cap with real streams while the task is running.
+    responses = []
+    for _ in range(es.PER_TASK_STREAM_CAP):
+        resp = await es.build_event_stream_response(
+            task_id=task_id,
+            principal=principal,
+            initial_snapshot=running_snapshot,
+            read_task_snapshot=v1_tasks._load_task_info_snapshot,
+            **_long_intervals(),
+        )
+        await resp.body_iterator.__anext__()
+        responses.append(resp)
+    assert es.count_task_sinks(task_id) == es.PER_TASK_STREAM_CAP
+
+    # Fill the rest of the per-principal cap too -- opening the streams
+    # above already reserved one principal slot per stream (`_generate`
+    # reserves on the same key_prefix), so only the remainder needs
+    # filling here.
+    already_reserved = es._principal_stream_counts.get(key_prefix, 0)
+    for _ in range(es.PER_PRINCIPAL_STREAM_CAP - already_reserved):
+        assert es.try_reserve_principal_slot(key_prefix)
+    assert es._principal_stream_counts[key_prefix] == es.PER_PRINCIPAL_STREAM_CAP
+
+    # Now flip the task row to the fast-path status under test.
+    if fast_path_status is TaskStatus.WAITING_FOR_USER:
+        _set_task_status(task_id, fast_path_status, control_state="idle")
+    else:
+        _set_task_status(task_id, fast_path_status, output="done")
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/events", headers=_bearer(full_key))
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    body = resp.text
+    assert body.count("event: task.status") == 1
+    assert body.count(closing_event) == 1
+
+    # The fast path never registers a sink, so the count above -- entirely
+    # made up of the cap-filling streams -- is unchanged.
+    assert es.count_task_sinks(task_id) == es.PER_TASK_STREAM_CAP
+
+    for resp in responses:
+        await resp.body_iterator.aclose()
+    assert es.count_task_sinks(task_id) == 0
+    # Closing each stream above already released its own reserved slot;
+    # release only the ones this test reserved manually.
+    for _ in range(es.PER_PRINCIPAL_STREAM_CAP - already_reserved):
+        es.release_principal_slot(key_prefix)
+    assert es._principal_stream_counts.get(key_prefix, 0) == 0
 
 
 # ===== the sink never touches the database on its per-frame path =====
