@@ -263,6 +263,61 @@ async def test_kb_team_hook_absent_falls_back_to_user_keyed_overlay(
 
 
 # ---------------------------------------------------------------------------
+# Both a team-keyed hook and a runner-keyed hook installed at once: the
+# governing branch must consult only the team-keyed one.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_governing_branch_never_unions_with_runner_keyed_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two invariants pinned together, because either one can regress
+    without the other noticing:
+
+    1. Never a union. With both hooks installed, the governing branch must
+       resolve only through the team-keyed hook. The team-keyed hook here
+       answers ``[]`` for the governing team, while the runner-keyed hook
+       answers a real collection ("runner-owned") for the same runner: if
+       the governing branch ever merged in the runner-keyed hook's answer,
+       "runner-owned" would appear in the result, and the runner-keyed
+       hook's callable would be invoked at all -- both are asserted against.
+    2. Selection is on the predicate, not on the answer. The team-keyed
+       hook's empty answer must not be read as "no team-keyed hook, fall
+       back to the runner-keyed one" -- the governing branch stays selected
+       purely because ``team_knowledge_base_hook_installed()`` is true.
+    """
+    team_calls: list[int] = []
+    runner_calls: list[int] = []
+
+    def _team_visibility(db: Any, *, team_id: int) -> list:
+        team_calls.append(team_id)
+        return []
+
+    def _runner_visibility(db: Any, user_id: int) -> list:
+        runner_calls.append(user_id)
+        return [
+            kb_scope.KnowledgeBaseAccess(
+                name="runner-owned", storage_user_id=CREATOR, team_owned=True
+            )
+        ]
+
+    kb_scope.set_knowledge_base_team_hooks(
+        team_visibility=_team_visibility, visibility=_runner_visibility
+    )
+    _install_collections(monkeypatch, {MEMBER: [], CREATOR: [_kb("runner-owned")]})
+
+    result = await document_search._list_visible_collections(
+        user_id=MEMBER, is_admin=False, governing_team_id=TEAM
+    )
+
+    names = {c.name for c in result.collections}
+    assert "runner-owned" not in names
+    assert team_calls == [TEAM]
+    assert runner_calls == []
+
+
+# ---------------------------------------------------------------------------
 # The typed error survives the run-path re-wrap; the build-frame
 # narrowings are defence in depth only.
 # ---------------------------------------------------------------------------
@@ -428,6 +483,19 @@ def test_list_knowledge_bases_tool_has_exactly_two_construction_sites() -> None:
     import subprocess
 
     repo_root = pathlib.Path(__file__).resolve().parents[4]
+    try:
+        probe = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        pytest.skip("git is not available -- git grep counting is unavailable")
+    if probe.returncode != 0 or probe.stdout.strip() != "true":
+        pytest.skip("not inside a git checkout -- git grep counting is unavailable")
+
     output = subprocess.run(
         ["git", "grep", "-n", "ListKnowledgeBasesTool("],
         cwd=repo_root,

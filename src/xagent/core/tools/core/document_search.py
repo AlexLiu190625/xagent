@@ -76,9 +76,11 @@ async def _list_visible_collections(
         # installed hook legitimately answers "this team owns nothing".
         #
         # Reached before the is_admin short-circuit below on purpose: for a
-        # team-governed run, an admin's declared names must still resolve
-        # against the governing team, not against the admin's unrestricted
-        # view of every collection on the platform.
+        # team-governed run, the team layer's source is the governing team,
+        # not the admin's own team memberships. This changes only where the
+        # team layer's rows come from -- the admin's platform-wide view in
+        # ``result`` is not narrowed by it; matching names are re-stamped
+        # with the team's ownership metadata below, the rest stay as-is.
         team_refs = await run_db_io_cancellation_safe(
             lambda: resolve_team_knowledge_bases_or_raise(
                 None, team_id=governing_team_id, log_subject=user_id

@@ -16,6 +16,12 @@ is actually asking. An application that wants to narrow who may run a
 team's agents at all enforces that at its agent-access policy layer, not at
 this seam -- this seam only answers "which knowledge base does this team
 own", never "is the current runner allowed to run this agent".
+
+A visibility hook's answer must set ``can_edit`` and ``can_delete`` to
+exactly ``False`` on every entry: ``KnowledgeBaseAccess`` defaults both to
+``True``, and an answer that leaves either at its default -- or omits it --
+is rejected outright rather than narrowed, which surfaces to every caller
+as the seam's one typed 503.
 """
 
 from __future__ import annotations

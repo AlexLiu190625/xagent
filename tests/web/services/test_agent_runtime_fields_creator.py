@@ -45,8 +45,8 @@ def db_session(tmp_path):
         Base.metadata.drop_all(bind=get_engine())
 
 
-def _create_user(db, username: str) -> User:
-    user = User(username=username, password_hash="hash", is_admin=False)
+def _create_user(db, username: str, *, is_admin: bool = False) -> User:
+    user = User(username=username, password_hash="hash", is_admin=is_admin)
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -95,27 +95,33 @@ def test_snapshot_carries_agent_creator_alongside_team_id(db_session) -> None:
     snapshot's ``team_id`` and ``agent_creator_user_id`` describe the same
     agent.
 
-    The task owner here is the same user as the agent's creator -- this
-    file's job is to pin that the single ``AgentRuntimeFields`` construction
-    site populates both new-and-old fields off the same loaded ``agent_row``
-    (a wrong binding here would leave ``agent_creator_user_id`` mismatched
-    against ``team_id`` on *every* run, not only a cross-user one); a
-    creator-vs-runner *resolution* scenario, where the two differ, is
-    exercised by the resolution-outcome tests against ``_search_knowledge_base_impl``
-    directly.
+    The agent creator and the task owner are two different users here --
+    a binding that read ``agent_creator_user_id`` off the task owner
+    instead of ``agent_row.user_id`` would still pass against an
+    equal-user fixture, so this fixture keeps the two apart and asserts
+    the field names the creator, not the owner. The owner is an admin
+    only so that ``_load_agent_for_task_runtime`` can load a PUBLISHED
+    agent it does not own and is not team-scoped into -- standalone
+    xagent has no other cross-user visibility path for a published
+    agent, and that access check is incidental to what this test pins.
+    A creator-vs-runner *resolution* scenario, where the two differ, is
+    exercised by the resolution-outcome tests against
+    ``_search_knowledge_base_impl`` directly.
     """
     creator = _create_user(db_session, "creator-pin-creator")
+    owner = _create_user(db_session, "creator-pin-owner", is_admin=True)
     agent = _create_agent(db_session, user_id=int(creator.id), team_id=101)
-    task = _create_task(db_session, user_id=int(creator.id), agent_id=int(agent.id))
+    task = _create_task(db_session, user_id=int(owner.id), agent_id=int(agent.id))
 
     snapshot = load_task_setup_snapshot_sync(
-        task_id=int(task.id), task_owner_user_id=int(creator.id)
+        task_id=int(task.id), task_owner_user_id=int(owner.id)
     )
 
     assert snapshot is not None and snapshot.agent is not None
     assert isinstance(snapshot.agent, AgentRuntimeFields)
     assert snapshot.agent.team_id == 101
     assert snapshot.agent.agent_creator_user_id == int(creator.id)
+    assert snapshot.agent.agent_creator_user_id != int(owner.id)
 
 
 # No test below this point for chat.py's snapshot-less derivation branch
