@@ -26,6 +26,7 @@ from datetime import datetime
 from typing import Any, NoReturn, Optional, cast
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -89,6 +90,7 @@ from ...services.task_orchestrator import (
     _retire_turn_session_best_effort,
     commit_claimed_turn_or_reconcile,
 )
+from . import _events_stream
 from ._step_mapping import map_trace_events_to_public_steps
 from .deps import ApiKeyPrincipal, get_principal_from_api_key, record_key_usage
 from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
@@ -1196,4 +1198,126 @@ async def get_chat_task_steps(
     """
     return await run_db_io_cancellation_safe(
         lambda: _get_chat_task_steps_sync(task_id, principal)
+    )
+
+
+@router.get("/chat/tasks/{task_id}/events")
+async def stream_chat_task_events(
+    task_id: int,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> StreamingResponse:
+    """Stream a task's lifecycle as Server-Sent Events.
+
+    Transport layer only: emits ``task.status``, ``task.completed``,
+    ``task.input_required``, and ``stream.error``. Step-by-step and
+    token-by-token content
+    (``step.*`` / ``message.*``) is not projected onto this stream yet --
+    poll ``GET /v1/chat/tasks/{task_id}/steps`` for that in the meantime.
+
+    This endpoint declares no ``responses=`` schema, so the field lists
+    below are the only OpenAPI-visible contract for its four SSE event
+    types (each a ``event: <name>`` / ``data: <json>`` frame pair):
+      - ``task.status``: ``{status}``.
+      - ``task.completed``: ``{status, output, error}``. A failed task
+        also ends the stream with this event rather than a separate
+        one -- ``status`` is ``"failed"`` and ``error`` is set.
+      - ``task.input_required``: ``{task_id, prompt: null}`` -- ``prompt``
+        is always ``null`` at this transport layer (see module docstring
+        for why).
+      - ``stream.error``: ``{code, message}``, a flat shape distinct
+        from the nested error envelope ``V1ApiError`` HTTP responses use
+        elsewhere in this router; the two error-code vocabularies do
+        not overlap.
+
+    Behavior:
+      - Normal attach: opens the stream, emits ``task.status`` for the
+        task's current state, then a status update each time it
+        changes (consecutive duplicates are suppressed), and
+        ``task.completed`` when the task finishes. A ``: ping`` comment
+        line is sent whenever 15s pass without any other frame going
+        out, to keep the connection alive -- not on a fixed 15s
+        cadence regardless of activity.
+      - Frame sequence into ``task.completed``: a task that fails emits
+        ``task.status`` (``"failed"``) from the failure broadcast first,
+        then the watchdog's authoritative ``task.completed`` close
+        frame. This is best-effort, not guaranteed: closing a stream
+        drains its queued backlog before inserting the close frame, so
+        an already-queued ``task.status`` (``"failed"``) can be dropped
+        rather than delivered. No failure information is lost when that
+        happens -- ``task.completed`` still carries ``status: "failed"``
+        and a populated ``error``. A task that succeeds has no such
+        intermediate broadcast, so it goes straight to ``task.completed``
+        with no preceding ``task.status``. Attaching to a task that's
+        already terminal (the fast path below) always sends both frames
+        regardless.
+      - Attaching to an already-finished task is not an error: the
+        stream opens, emits ``task.status`` then ``task.completed``,
+        and closes immediately.
+      - The stream force-closes with ``task.input_required``
+        (``prompt`` always ``null`` at this stage) if the task is
+        found waiting on user input; with ``stream.error`` if the
+        API key is revoked/paused, the task row disappears (within one
+        watchdog cycle, 30s in production, of the delete), the
+        client can't keep up (``resync_required``), or the stream has
+        been open for the 1-hour maximum (``stream_expired``, emitted
+        before the connection closes so it's distinguishable from a
+        clean end). After any ``stream.error``, re-attaching is the
+        supported recovery path (no replay -- reconcile via
+        ``steps()`` first).
+      - A task that's ``paused`` does not close the stream (matching
+        SDK ``wait()`` semantics: another process may resume it); the
+        1-hour cap is what eventually ends an orphaned paused stream.
+      - No ``task.status`` frame is guaranteed to be fresh or in order,
+        at any point in the stream's life, not only at attach -- this
+        transport-only layer never buffers or reconciles frame order.
+        Accepted because only the three close frames above are treated
+        as authoritative; each comes from a direct read of the task
+        row, never from frame ordering.
+
+    Args:
+        task_id: Path parameter; the target task's primary key.
+        principal: Resolved by the auth dependency; also used (not as
+            an authorization gate) for the per-key concurrency count
+            and the periodic key-validity check.
+
+    Raises:
+        V1ApiError 401: missing / invalid / revoked key (plain JSON;
+            the stream never opens).
+        V1ApiError 404: task missing or not owned by the calling key
+            (plain JSON; the stream never opens).
+        V1ApiError 429 ``rate_limited``: 2 or more concurrent streams
+            already open on this task, or 32 or more already open for
+            this key across all tasks (the per-key cap). Both caps are
+            checked once, before the attach's own stream registers, so
+            both are best-effort under a concurrent attach burst:
+            several attaches can pass the check at the same instant,
+            so the number of streams actually open can briefly exceed
+            the cap -- the per-key cap's own counter never does, since
+            it checks before it increments; it's specifically the
+            count of open streams that can run ahead of it. No stream
+            is aborted once opened; both counts self-heal as open
+            streams close. Both caps are per-process: a multi-worker
+            deployment counts independently in each worker process, so
+            the effective cluster-wide limit is the per-process cap
+            times the worker count. An attach that takes the terminal
+            or waiting-for-user fast path (see Behavior above) never
+            registers a sink at all, so it never counts toward either
+            cap. Broadcast delivery is per-process too: a sink only
+            receives the broadcasts fanned out by its own worker
+            process's connection manager, so a task transition driven
+            by a different worker reaches this stream only once the
+            watchdog's 30s database poll picks it up, not via broadcast.
+            Some transitions -- lease-expiry recovery among them --
+            never broadcast at all, in any deployment shape, so the
+            watchdog poll is their only delivery path regardless of
+            worker count.
+    """
+    snapshot = await run_db_io_cancellation_safe(
+        lambda: _load_task_info_snapshot(task_id, principal)
+    )
+    return await _events_stream.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=_load_task_info_snapshot,
     )

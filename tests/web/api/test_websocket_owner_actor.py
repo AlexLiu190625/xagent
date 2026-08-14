@@ -2645,6 +2645,114 @@ async def test_durable_control_converts_handler_stale_run_to_terminal_rejection(
     assert "run rotated" in str(exc_info.value)
 
 
+def _durable_pause_command(task: Task, owner: User) -> ClaimedTaskCommand:
+    return ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(owner.id),
+        command_id="pause-personal-reply-routing",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+        target_run_id="run-a",
+        attempt_count=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_durable_command_skips_broadcast_only_connections(db_session) -> None:
+    """A v1 SSE sink registers into the same shared connection list as
+    real WebSocket connections but only understands versioned status
+    events; it must never be selected as the target for a personal reply
+    to a durable command. With a broadcast-only connection ahead of a
+    real one in the list, the real one is still picked."""
+    owner = _user(db_session, "broadcast-skip-owner")
+    task = _task(db_session, owner.id)
+    task.runner_id = None
+    task.run_id = "run-a"
+    db_session.commit()
+    command = _durable_pause_command(task, owner)
+
+    broadcast_only = SimpleNamespace(is_broadcast_only=True)
+    real_connection = SimpleNamespace()  # no `is_broadcast_only` attribute at all
+
+    with (
+        patch.object(
+            websocket_api.manager,
+            "connections_for_task",
+            return_value=[broadcast_only, real_connection],
+        ),
+        patch(
+            "xagent.web.api.websocket._handle_pause_task_unserialized",
+            new=AsyncMock(return_value=None),
+        ) as handler,
+    ):
+        await _execute_durable_task_command(command)
+
+    assert handler.await_args.args[0] is real_connection
+
+
+@pytest.mark.asyncio
+async def test_durable_command_falls_back_to_discarding_websocket_when_all_connections_are_broadcast_only(
+    db_session,
+) -> None:
+    """When every registered connection for the task is broadcast-only
+    (e.g. only v1 SSE streams are attached, no real WebSocket), there is
+    no valid personal-reply target, so the handler gets the discarding
+    sink -- same as when the list is empty."""
+    owner = _user(db_session, "broadcast-only-fallback-owner")
+    task = _task(db_session, owner.id)
+    task.runner_id = None
+    task.run_id = "run-a"
+    db_session.commit()
+    command = _durable_pause_command(task, owner)
+
+    broadcast_only = SimpleNamespace(is_broadcast_only=True)
+
+    with (
+        patch.object(
+            websocket_api.manager,
+            "connections_for_task",
+            return_value=[broadcast_only],
+        ),
+        patch(
+            "xagent.web.api.websocket._handle_pause_task_unserialized",
+            new=AsyncMock(return_value=None),
+        ) as handler,
+    ):
+        await _execute_durable_task_command(command)
+
+    assert isinstance(
+        handler.await_args.args[0], websocket_api._DiscardingCommandWebSocket
+    )
+
+
+@pytest.mark.asyncio
+async def test_durable_command_falls_back_to_discarding_websocket_when_no_connections(
+    db_session,
+) -> None:
+    """An empty connection list still routes to the discarding sink,
+    unchanged by the broadcast-only filter."""
+    owner = _user(db_session, "no-connections-fallback-owner")
+    task = _task(db_session, owner.id)
+    task.runner_id = None
+    task.run_id = "run-a"
+    db_session.commit()
+    command = _durable_pause_command(task, owner)
+
+    with (
+        patch.object(websocket_api.manager, "connections_for_task", return_value=[]),
+        patch(
+            "xagent.web.api.websocket._handle_pause_task_unserialized",
+            new=AsyncMock(return_value=None),
+        ) as handler,
+    ):
+        await _execute_durable_task_command(command)
+
+    assert isinstance(
+        handler.await_args.args[0], websocket_api._DiscardingCommandWebSocket
+    )
+
+
 @pytest.mark.asyncio
 async def test_pause_non_owner_non_admin_is_refused(db_session) -> None:
     owner = _user(db_session, "owner")

@@ -7954,7 +7954,13 @@ async def _execute_durable_task_command(
     """
 
     connections = manager.connections_for_task(command.task_id)
-    websocket: Any = connections[0] if connections else _DiscardingCommandWebSocket()
+    # Broadcast-only subscribers (e.g. the v1 SSE sink) never issued this
+    # command and must not be mistaken for the originating socket, so they
+    # are skipped when picking the target for a personal reply.
+    websocket: Any = next(
+        (c for c in connections if not getattr(c, "is_broadcast_only", False)),
+        _DiscardingCommandWebSocket(),
+    )
     message_data = dict(command.payload)
     message_data.update(
         {

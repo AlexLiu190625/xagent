@@ -94,8 +94,8 @@ class V1ErrorCode(str, Enum):
     # clients always switch on ``body.error.code``.
     INVALID_INPUT = "invalid_input"
 
-    # Reserved for rate limiting. The server does not emit this yet, but
-    # it stays in the enum so SDK clients can encode the mapping now.
+    # Emitted when a caller exceeds the v1 SSE stream concurrency caps
+    # (per-task or per-principal).
     RATE_LIMITED = "rate_limited"
 
     # Monthly execution quota exhausted. 402 Payment Required. Two distinct
