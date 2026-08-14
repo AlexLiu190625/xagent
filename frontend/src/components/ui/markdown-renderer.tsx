@@ -222,19 +222,54 @@ const nodeText = (children: React.ReactNode): string => {
 
 function resolvePreviewableFileLink({
   fileNameFromPath,
-  fileName,
+  title,
+  visibleText,
 }: {
   fileNameFromPath: string
-  fileName: string
+  /**
+   * Link title, if any. The backend injects the real filename here
+   * precisely so type detection survives when the model rewrites the
+   * visible label/alt text into descriptive prose that drops the
+   * extension — so this is tried before ``visibleText`` for detection.
+   */
+  title: string
+  /**
+   * The model's own label (link) or alt text (image), if any. Preferred
+   * over the title for what's *shown* to the user — the title is a
+   * detection hint, not display text — and also tried for *detection*
+   * whenever the title itself doesn't classify as any previewable kind,
+   * so a label that reveals the type (e.g. a plain ``report.mp4``) still
+   * classifies correctly when there's no title, or a stale/irrelevant one.
+   *
+   * Detection tries ``title`` first and stops at the first candidate that
+   * classifies to *any* previewable kind — it does not compare the two and
+   * prefer visibleText's kind when it differs from title's. This is looser
+   * than the backend's own gate for when it injects/overwrites a title
+   * (``label_reveals_type`` in file_reference_output_service.py): the
+   * backend only touches the title when the label doesn't already reveal a
+   * type, so in the reference-generation path the two never disagree in
+   * practice. A hand-authored or otherwise unusual reference where both
+   * title and label classify, to different kinds, resolves to title's kind
+   * here rather than label's -- pinned by the "lets a title that
+   * classifies differently than the label win detection" test in
+   * markdown-renderer.test.tsx; this component does not attempt to close
+   * that edge case.
+   */
+  visibleText: string
 }): { previewKind: PreviewableInlineFileKind; displayFilename: string } | null {
+  const displayFilename = visibleText || title || fileNameFromPath
+
   const pathKind = getInlineFilePreviewKind({ filename: fileNameFromPath })
   if (isPreviewableInlineFileKind(pathKind)) {
-    return { previewKind: pathKind, displayFilename: fileName }
+    return { previewKind: pathKind, displayFilename }
   }
 
-  const labelKind = getInlineFilePreviewKind({ filename: fileName })
-  if (isPreviewableInlineFileKind(labelKind)) {
-    return { previewKind: labelKind, displayFilename: fileName }
+  for (const candidate of [title, visibleText]) {
+    if (!candidate) continue
+    const kind = getInlineFilePreviewKind({ filename: candidate })
+    if (isPreviewableInlineFileKind(kind)) {
+      return { previewKind: kind, displayFilename }
+    }
   }
 
   return null
@@ -247,8 +282,10 @@ function containsPreviewFileLinkNode(node: any): boolean {
     const filePath = href.replace(/^file:/, '')
     const fileNameFromPath = filePath.split('/').pop() || filePath
     const title = typeof node.properties?.title === 'string' ? node.properties.title : ''
-    const label = title || hastText(node)
-    if (resolvePreviewableFileLink({ fileNameFromPath, fileName: label })) return true
+    const label = hastText(node)
+    if (resolvePreviewableFileLink({ fileNameFromPath, title, visibleText: label })) {
+      return true
+    }
   }
   const src = node.properties?.src
   if (typeof src === 'string' && src.startsWith('file:')) {
@@ -329,8 +366,11 @@ function MarkdownLink({
   if (href && href.startsWith('file:')) {
     const filePath = href.replace(/^file:/, '')
     const fileNameFromPath = filePath.split('/').pop() || filePath
-    const fileName = title || linkText || fileNameFromPath
-    const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
+    const preview = resolvePreviewableFileLink({
+      fileNameFromPath,
+      title: title || '',
+      visibleText: linkText,
+    })
     const fileId = resolveInlineFileId(filePath)
 
     if (filesDisabled) {
@@ -356,7 +396,10 @@ function MarkdownLink({
     const handleClick = (event: React.MouseEvent<HTMLAnchorElement>) => {
       if (onFileClick) {
         event.preventDefault()
-        const fallbackTitle = title || linkText || fileNameFromPath
+        // linkText-first, matching every other display path in this
+        // component: title is a detection hint (see resolvePreviewableFileLink
+        // above), not the name a user should see in the resulting preview.
+        const fallbackTitle = linkText || title || fileNameFromPath
         onFileClick(fileId, fallbackTitle)
       }
     }
@@ -443,18 +486,32 @@ function MarkdownImage({
   if (resolvedSrc.startsWith('file:')) {
     const filePath = resolvedSrc.replace(/^file:/, '')
     const fileNameFromPath = filePath.split('/').pop() || filePath
-    const fileName = title || alt || fileNameFromPath
-    const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
+    const displayName = alt || title || fileNameFromPath
+    const preview = resolvePreviewableFileLink({
+      fileNameFromPath,
+      title: title || '',
+      visibleText: alt || '',
+    })
     const previewKind = preview?.previewKind ?? 'image'
     if (filesDisabled) {
-      return <span>{presentationTitle || presentationAlt || sanitizeFilesDisabledPresentationText(fileName)}</span>
+      // Unreachable via MarkdownRenderer today: sanitizeFilesDisabledPresentationText
+      // (see the pre-parse step in MarkdownRenderer below) already converts
+      // any ![alt](file:...) node to plain text before ReactMarkdown ever
+      // builds this <img>, so a `file:` src can't reach this component
+      // while filesDisabled is set. Kept as defense-in-depth -- if that
+      // ever changes, falling through to InlineFilePreview below would
+      // render an interactive preview despite files being disabled, which
+      // is a much worse regression than a display-order nit. displayName
+      // is alt-first, matching the rule this component applies everywhere
+      // else (the title is a detection hint, not display text).
+      return <span>{sanitizeFilesDisabledPresentationText(displayName)}</span>
     }
 
     return (
       <InlineFilePreview
         source={{
           fileId: resolveInlineFileId(filePath),
-          filename: preview?.displayFilename ?? fileName,
+          filename: preview?.displayFilename ?? displayName,
           type: previewKind,
           mimeType: getInlineFilePreviewMimeType(previewKind),
         }}
@@ -473,13 +530,29 @@ function MarkdownImage({
       || sanitizeFilesDisabledPresentationText(resolvedSrc) !== resolvedSrc
     )
   ) {
-    return <span>{presentationTitle || presentationAlt}</span>
+    // Rarely (if ever) reached via MarkdownRenderer: the tree-level
+    // pre-sanitizer (sanitizeFilesDisabledPresentationText) replaces any
+    // image/link node whose url is isInertFileTarget -- which includes the
+    // same isManagedFileUrl check this condition duplicates -- with its
+    // alt-first plain text before ReactMarkdown ever builds this <img>
+    // node. Every straightforward managed-URL shape is intercepted there
+    // (no current test reaches this line), but the two checks decode/
+    // normalize URLs slightly differently, so an encoding edge case
+    // slipping past the tree level while matching here has been reported
+    // in review and cannot be ruled out. Alt-first to match the rule this
+    // component applies everywhere else: the title can carry a
+    // backend-injected filename and must not replace the model's own alt
+    // text as visible content.
+    return <span>{presentationAlt || presentationTitle}</span>
   }
 
   return (
     <img
       src={resolvedSrc}
       alt={presentationAlt}
+      // Title-first is correct here, unlike the filesDisabled span above:
+      // this is the standard <img title> tooltip, where the markdown title
+      // is the expected content and the alt text already rides in `alt`.
       title={presentationTitle || presentationAlt}
       {...props}
     />

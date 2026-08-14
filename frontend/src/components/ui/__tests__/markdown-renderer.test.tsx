@@ -256,6 +256,21 @@ describe('MarkdownRenderer', () => {
     expect(handleFileClick).toHaveBeenCalledWith('/tmp/test.txt', 'open file')
   })
 
+  it('passes the model label, not the title, to onFileClick for a non-previewable file link', () => {
+    // "notes.txt" isn't a previewable kind, so resolvePreviewableFileLink
+    // returns null and this falls to the plain-anchor branch below --
+    // the filename handed to onFileClick must still be linkText-first,
+    // matching every other display path in this component.
+    const handleFileClick = vi.fn()
+    const content = '[Open Notes](file:some-id "notes.txt")'
+
+    render(<MarkdownRenderer content={content} onFileClick={handleFileClick} />)
+
+    fireEvent.click(screen.getByText('Open Notes'))
+
+    expect(handleFileClick).toHaveBeenCalledWith('some-id', 'Open Notes')
+  })
+
   it('renders file links and images as inert text when files are disabled', () => {
     const handleFileClick = vi.fn()
     const content = [
@@ -841,9 +856,9 @@ describe('MarkdownRenderer', () => {
   })
 
   it('renders image-syntax video references as an inline video preview', async () => {
-    // The backend restores the filename as the label even for ![...] refs
-    // pointing at media files; the image renderer then resolves the video
-    // kind from the label instead of falling back to a broken <img>.
+    // The image renderer resolves the video kind from alt/title text
+    // instead of falling back to a broken <img> for ![...] refs pointing
+    // at media files.
     apiRequestMock.mockResolvedValue({
       ok: true,
       blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
@@ -853,6 +868,130 @@ describe('MarkdownRenderer', () => {
 
     const video = await screen.findByLabelText('puppy_drinking.mp4')
     expect(video.tagName.toLowerCase()).toBe('video')
+  })
+
+  it('detects video via the link title while displaying the model label', async () => {
+    // The backend (file_reference_output_service.reconcile_assistant_file_
+    // references) adds the real filename as the link *title* rather than
+    // overwriting the label, so a localized label survives while the
+    // frontend still detects the media type from the title.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+    const content =
+      '[下载视频（MP4）](file:550e8400-e29b-41d4-a716-446655440000 "puppy_drinking.mp4")'
+    render(<MarkdownRenderer content={content} />)
+
+    const video = await screen.findByLabelText('下载视频（MP4）')
+    expect(video.tagName.toLowerCase()).toBe('video')
+    expect(screen.queryByLabelText('puppy_drinking.mp4')).not.toBeInTheDocument()
+    expect(screen.getByText('下载视频（MP4）')).toBeInTheDocument()
+  })
+
+  it('falls back to the label for detection when a pre-existing title does not reveal the type', async () => {
+    // The backend only injects/overwrites a title when the label doesn't
+    // already reveal the media type (label_reveals_type in
+    // file_reference_output_service.py) -- so it leaves this exact
+    // combination (a label that already says .mp4, alongside an
+    // unrelated, non-descriptive pre-existing title) untouched. Detection
+    // must mirror that: falling back to the label when the title alone
+    // doesn't classify, instead of trusting a title that was never meant
+    // to be a detection hint in the first place.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+    const content =
+      '[report.mp4](file:550e8400-e29b-41d4-a716-446655440000 "See the notes")'
+    render(<MarkdownRenderer content={content} />)
+
+    const video = await screen.findByLabelText('report.mp4')
+    expect(video.tagName.toLowerCase()).toBe('video')
+  })
+
+  it('detects video via the image title while displaying the model alt text', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+    const content =
+      '![预览视频](file:550e8400-e29b-41d4-a716-446655440000 "puppy_drinking.mp4")'
+    render(<MarkdownRenderer content={content} />)
+
+    const video = await screen.findByLabelText('预览视频')
+    expect(video.tagName.toLowerCase()).toBe('video')
+  })
+
+  it('shows the model alt text, not the backend-injected title, when files are disabled', () => {
+    // This exercises MarkdownRenderer's tree-level pre-sanitizer
+    // (sanitizeFilesDisabledPresentationText), NOT MarkdownImage's own
+    // internal `if (filesDisabled) return <span>...</span>` branch for a
+    // `file:` src: the pre-sanitizer converts a `![alt](file:... "title")`
+    // node to plain text before ReactMarkdown ever builds an <img> node, so
+    // that branch is unreachable through this entry point and this test
+    // cannot exercise it (confirmed: reverting that branch's fix does not
+    // change this test's outcome). It's still real, useful coverage of a
+    // real code path -- the pre-sanitizer must itself prefer alt over
+    // title when converting the node to a label -- just not what its
+    // original name/comment claimed to guard. The component-level branch
+    // is kept as defense-in-depth (see its own comment in
+    // markdown-renderer.tsx) since falling through to InlineFilePreview
+    // would render an interactive preview despite files being disabled.
+    render(
+      <MarkdownRenderer
+        filesDisabled
+        content='![预览视频](file:550e8400-e29b-41d4-a716-446655440000 "generated_video.mp4")'
+      />,
+    )
+
+    expect(screen.getByText('预览视频')).toBeInTheDocument()
+    expect(screen.queryByText('generated_video.mp4')).not.toBeInTheDocument()
+  })
+
+  it('displays the model label, not the title, for a non-media titled file link', async () => {
+    // The title is only ever a media-type detection hint; even once it
+    // wins detection (the label here reveals no type of its own), the
+    // model's own label must still be what's shown as the previewed
+    // file's name, not the title. Uses a .docx title rather than .pdf
+    // deliberately: .pdf is never previewable via either title or label,
+    // so a test using it can't distinguish "display correctly stayed
+    // label-first" from "nothing preview-related could ever happen here
+    // regardless of precedence" -- this needs a title that genuinely wins
+    // detection (mounting the real office-preview header) to be
+    // load-bearing against a title-first display regression.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      arrayBuffer: async () => new Uint8Array([65, 66]).buffer,
+    })
+    const content = '[下载报告](file:doc-file-id "annual_report_2024.docx")'
+    render(<MarkdownRenderer content={content} />)
+
+    expect(await screen.findByTestId('docx-preview')).toBeInTheDocument()
+    expect(screen.getByText('下载报告')).toBeInTheDocument()
+    expect(screen.queryByText('annual_report_2024.docx')).not.toBeInTheDocument()
+  })
+
+  it('lets a title that classifies differently than the label win detection', async () => {
+    // resolvePreviewableFileLink tries title first and stops at the first
+    // candidate that classifies to any previewable kind -- it does not
+    // compare title's and visibleText's kinds and prefer whichever the
+    // label reveals. The backend's own gate never produces this shape (it
+    // only writes a title when the label doesn't already reveal a type),
+    // so this only arises for a hand-authored or otherwise unusual
+    // reference; pinning it here documents the actual (title-wins)
+    // behavior rather than the label-aware guarantee the code comment used
+    // to (incorrectly) claim.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      arrayBuffer: async () => new Uint8Array([65, 66]).buffer,
+    })
+    const content = '[report.mp4](file:doc-file-id "notes.docx")'
+
+    render(<MarkdownRenderer content={content} />)
+
+    expect(await screen.findByTestId('docx-preview')).toBeInTheDocument()
+    expect(screen.queryByLabelText('report.mp4')).not.toBeInTheDocument()
   })
 
   it('renders file links as image previews when the path has an image extension', async () => {
