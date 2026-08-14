@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from ....config import get_kb_search_timeout_seconds
+from .knowledge_base_scope import KnowledgeBaseScopeError
 from .RAG_tools.core.schemas import ListCollectionsResult
 from .RAG_tools.management.collections import list_collections
 from .RAG_tools.pipelines.document_search import run_document_search
@@ -34,29 +35,70 @@ def _get_tool_compatibility_facade() -> "KBToolCompatibilityFacade":
 
 
 async def _list_visible_collections(
-    user_id: Optional[int], is_admin: bool
+    user_id: Optional[int],
+    is_admin: bool,
+    governing_team_id: Optional[int] = None,
 ) -> ListCollectionsResult:
-    """Union personal collections with application-provided team overlays."""
+    """Union personal collections with application-provided team overlays.
+
+    For a team-governed run (``governing_team_id`` set and a team-keyed hook
+    installed), the team layer is the *governing* team's own knowledge
+    bases, resolved through ``resolve_team_knowledge_bases_or_raise`` --
+    never the runner's own team memberships, and never a union of the two.
+    Every other case falls back to the existing runner-keyed overlay through
+    ``visible_team_knowledge_bases``, unchanged.
+
+    This function stays a pure union either way: it decides *whose* team
+    rows are visible, never which of the agent's declared names may search
+    them -- that rule belongs to the callers that read the agent's stored
+    configuration, not here, so a future consumer of this function cannot
+    inherit the declared-name rule by accident.
+    """
     result = await list_collections(user_id=user_id, is_admin=is_admin)
-    if user_id is None or is_admin:
+    # This is not an optimisation: the calls below do int(user_id), so
+    # removing this guard would turn an unauthenticated caller into a
+    # TypeError instead of this well-defined early return. It keeps its
+    # position as the first check for exactly that reason -- the governing
+    # team branch below still needs a real user_id.
+    if user_id is None:
         return result
 
     from ....web.services.db_runtime import run_db_io_cancellation_safe
     from ....web.services.knowledge_base_team_scope import (
         has_knowledge_base_visibility_hook,
+        resolve_team_knowledge_bases_or_raise,
+        team_knowledge_base_hook_installed,
         visible_team_knowledge_bases,
     )
 
-    if not has_knowledge_base_visibility_hook():
+    if governing_team_id is not None and team_knowledge_base_hook_installed():
+        # Selection is on the predicate above, never on an empty return: an
+        # installed hook legitimately answers "this team owns nothing".
+        #
+        # Reached before the is_admin short-circuit below on purpose: for a
+        # team-governed run, the team layer's source is the governing team,
+        # not the admin's own team memberships. This changes only where the
+        # team layer's rows come from -- the admin's platform-wide view in
+        # ``result`` is not narrowed by it; matching names are re-stamped
+        # with the team's ownership metadata below, the rest stay as-is.
+        team_refs = await run_db_io_cancellation_safe(
+            lambda: resolve_team_knowledge_bases_or_raise(
+                None, team_id=governing_team_id, log_subject=user_id
+            )
+        )
+    elif is_admin:
         return result
+    elif not has_knowledge_base_visibility_hook():
+        return result
+    else:
+        team_refs = await run_db_io_cancellation_safe(
+            lambda: visible_team_knowledge_bases(None, int(user_id))
+        )
 
     collections_by_name = {
         collection.name: collection for collection in result.collections
     }
     refs_by_owner: dict[int, list] = {}
-    team_refs = await run_db_io_cancellation_safe(
-        lambda: visible_team_knowledge_bases(None, int(user_id))
-    )
     for ref in team_refs:
         refs_by_owner.setdefault(ref.storage_user_id, []).append(ref)
     for storage_user_id, refs in refs_by_owner.items():
@@ -68,6 +110,10 @@ async def _list_visible_collections(
             collection = owner_collections.get(ref.name)
             if collection is None:
                 continue
+            # The sole source of an ``ownership == "team"`` entry in the
+            # merged map is this loop -- every consumer's "does the
+            # governing team own this name" test (below, and in the two
+            # impls further down) is only trustworthy because of that.
             collections_by_name[ref.name] = collection.model_copy(
                 update={
                     "ownership": "team",
@@ -147,12 +193,18 @@ async def list_knowledge_bases(
     tool_args: ListKnowledgeBasesArgs,
     user_id: Optional[int] = None,
     is_admin: bool = False,
+    governing_team_id: Optional[int] = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[List[str]] = None,
 ) -> ListKnowledgeBasesResult:
     """List all available knowledge bases through the tool compatibility facade."""
     return await _get_tool_compatibility_facade().list_knowledge_bases(
         tool_args,
         user_id=user_id,
         is_admin=is_admin,
+        governing_team_id=governing_team_id,
+        agent_creator_user_id=agent_creator_user_id,
+        declared_knowledge_bases=declared_knowledge_bases,
     )
 
 
@@ -160,6 +212,9 @@ async def _list_knowledge_bases_impl(
     tool_args: ListKnowledgeBasesArgs,
     user_id: Optional[int] = None,
     is_admin: bool = False,
+    governing_team_id: Optional[int] = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[List[str]] = None,
 ) -> ListKnowledgeBasesResult:
     """List all available knowledge bases with their statistics.
 
@@ -167,15 +222,38 @@ async def _list_knowledge_bases_impl(
         tool_args: Args with optional allowed_collections filter
         user_id: Optional user ID for multi-tenancy filtering
         is_admin: Whether the user has admin privileges
+        governing_team_id: The governing agent's owning team, if any. Only
+            affects *which* collections are visible (the team layer resolves
+            on this team instead of the runner's own team memberships); see
+            ``_list_visible_collections``.
+        agent_creator_user_id: Accepted for signature symmetry with
+            ``_search_knowledge_base_impl`` and never read here.
+            ``knowledge_tools.py`` builds the list tool only when the
+            agent's allowed collections are ``None`` -- a non-empty list
+            builds the search tool alone, and an empty list builds no
+            knowledge tool at all -- and both chat call sites derive that
+            value and the declaration from the same stored field, so on this
+            path there is no declared name to classify at all. See
+            ``declared_knowledge_bases`` below.
+        declared_knowledge_bases: Accepted for signature symmetry and never
+            read here, for the same reason. This function reports "here is
+            what is available" -- an unresolved declared name simply does
+            not appear in the list, with no separate message field.
 
     Returns:
         ListKnowledgeBasesResult containing knowledge base information
 
     Raises:
-        RuntimeError: If listing knowledge bases fails
+        KnowledgeBaseScopeError: If the team-scope hook is installed but
+            fails or returns a malformed answer.
+        RuntimeError: If listing knowledge bases fails for any other reason.
     """
     try:
-        result = await _list_visible_collections(user_id=user_id, is_admin=is_admin)
+        result = await _list_visible_collections(
+            user_id=user_id,
+            is_admin=is_admin,
+            governing_team_id=governing_team_id,
+        )
 
         kb_list = []
         for collection in result.collections:
@@ -199,6 +277,8 @@ async def _list_knowledge_bases_impl(
 
         return ListKnowledgeBasesResult(knowledge_bases=kb_list)
 
+    except KnowledgeBaseScopeError:
+        raise
     except Exception as e:
         logger.error(f"Failed to list knowledge bases: {e}", exc_info=True)
         raise RuntimeError(f"Failed to list knowledge bases: {e}") from e
@@ -222,7 +302,13 @@ async def _find_missing_knowledge_bases_impl(
     user_id: Optional[int] = None,
     is_admin: bool = False,
 ) -> List[str]:
-    """Return requested knowledge base names that are not visible to the user."""
+    """Return requested knowledge base names that are not visible to the user.
+
+    Deliberately stays runner-keyed: this backs the agent-builder's
+    save-time validation of an agent's own collection selection, which must
+    answer against the runner's own visible set, not any governing team --
+    an agent being edited is not yet the governing agent of any run.
+    """
     requested = [name.strip() for name in knowledge_bases if name and name.strip()]
     if not requested:
         return []
@@ -236,12 +322,18 @@ async def search_knowledge_base(
     tool_args: KnowledgeSearchArgs,
     user_id: Optional[int] = None,
     is_admin: bool = False,
+    governing_team_id: Optional[int] = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[List[str]] = None,
 ) -> KnowledgeSearchResult:
     """Search across knowledge bases through the tool compatibility facade."""
     return await _get_tool_compatibility_facade().search_knowledge_base(
         tool_args,
         user_id=user_id,
         is_admin=is_admin,
+        governing_team_id=governing_team_id,
+        agent_creator_user_id=agent_creator_user_id,
+        declared_knowledge_bases=declared_knowledge_bases,
     )
 
 
@@ -249,6 +341,9 @@ async def _search_knowledge_base_impl(
     tool_args: KnowledgeSearchArgs,
     user_id: Optional[int] = None,
     is_admin: bool = False,
+    governing_team_id: Optional[int] = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[List[str]] = None,
 ) -> KnowledgeSearchResult:
     """Search across knowledge base collections.
 
@@ -256,17 +351,37 @@ async def _search_knowledge_base_impl(
         tool_args: Search configuration including query, collections, and search parameters
         user_id: Optional user ID for multi-tenancy filtering
         is_admin: Whether the user has admin privileges
+        governing_team_id: The governing agent's owning team, if any. Only
+            affects *which* collections are visible; see
+            ``_list_visible_collections``.
+        agent_creator_user_id: The governing agent's creator, if any.
+            Carried to this function but not read by it: the rule that
+            tells the agent's own creator apart from every other runner of
+            a team-governed agent arrives separately.
+        declared_knowledge_bases: The governing agent's STORED
+            ``knowledge_bases`` declaration, if any -- never
+            ``tool_args.allowed_collections`` and never
+            ``tool_args.collections``, both of which are model-authored on
+            every path (a declared schema field the model can overwrite).
+            Carried here but not read yet, for the same reason as
+            ``agent_creator_user_id``; keeping the two apart all the way to
+            this function is what lets the rule land without re-threading
+            anything.
 
     Returns:
         KnowledgeSearchResult with formatted search results
 
     Raises:
-        RuntimeError: If search fails
+        KnowledgeBaseScopeError: If the team-scope hook is installed but
+            fails or returns a malformed answer.
+        RuntimeError: If search fails for any other reason.
     """
     try:
         # List all collections
         collections_result = await _list_visible_collections(
-            user_id=user_id, is_admin=is_admin
+            user_id=user_id,
+            is_admin=is_admin,
+            governing_team_id=governing_team_id,
         )
 
         if not collections_result.collections:
@@ -550,6 +665,8 @@ async def _search_knowledge_base_impl(
 
         return KnowledgeSearchResult(results=formatted_results, summary=summary)
 
+    except KnowledgeBaseScopeError:
+        raise
     except Exception as e:
         logger.error(f"Knowledge base search failed: {e}", exc_info=True)
         raise RuntimeError(f"Knowledge base search failed: {e}") from e

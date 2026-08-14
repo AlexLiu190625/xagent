@@ -1079,6 +1079,17 @@ class AgentRuntimeFields:
     # ``agent_id``. Read by the team-scope connector-visibility hook seam;
     # a fail-closed default keeps an un-migrated construction site personal.
     team_id: Optional[int] = None
+    # The Agent row's own creator, never the runner of this task. The one
+    # construction site in this module fills it unconditionally from the
+    # Agent row's ``user_id``, for a team agent and a personal one alike -- unlike
+    # ``team_id`` above, a personal agent still has a creator. The ``None``
+    # default is what a task with no Agent row gets (``TaskSetupSnapshot``
+    # leaves ``agent`` unset there) and what an un-migrated future
+    # construction site would get; it is a fail-closed default, not a
+    # description of the personal-agent case. Named for what it is -- the
+    # agent's creator -- not "owner", which this module already uses
+    # elsewhere for the running principal.
+    agent_creator_user_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -1305,6 +1316,7 @@ def resolve_task_runtime_config_core(
                 team_id=(
                     int(agent_row.team_id) if agent_row.team_id is not None else None
                 ),
+                agent_creator_user_id=int(agent_row.user_id),
             )
     else:
         # Inline agent_config path: task carries its own agent config

@@ -596,6 +596,8 @@ async def create_default_tools(
     connector_team_id: Optional[int] = None,
     db_task_id: Optional[int] = None,
     file_operation_access_version: Any = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[List[str]] = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -614,6 +616,17 @@ async def create_default_tools(
     historical positional signature. Runtime callers pass them by keyword so
     File Operation receives trusted task and rollout authority without shifting
     existing positional integrations.
+
+    ``agent_creator_user_id`` and ``declared_knowledge_bases`` thread the same
+    governing agent's creator and its *stored* ``knowledge_bases`` list
+    alongside ``connector_team_id`` into ``WebToolConfig``, so the
+    knowledge-base search path can resolve a declared name against the
+    governing team, fall back to the creator's own collection, and report a
+    name the team never received rather than reaching for the runner's own
+    same-named collection. ``declared_knowledge_bases`` is read from the same
+    place ``allowed_collections`` already is (the agent's own configuration)
+    and is never the model-supplied value on a search request -- the two stay
+    distinct all the way to the resolution point.
     """
     if not user:
         raise ValueError("User is required for tool creation")
@@ -687,6 +700,8 @@ async def create_default_tools(
         mcp_load_summary_tracer=mcp_load_summary_tracer,
         mcp_load_summary_trace_task_id=mcp_load_summary_trace_task_id,
         connector_team_id=connector_team_id,
+        agent_creator_user_id=agent_creator_user_id,
+        declared_knowledge_bases=declared_knowledge_bases,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -1945,6 +1960,14 @@ class AgentServiceManager:
                 if task_setup_snapshot.agent is not None
                 else None
             )
+            # Same agent as connector_team_id above -- both are read off the
+            # same frozen AgentRuntimeFields snapshot, so they can never
+            # describe two different agents.
+            agent_creator_user_id = (
+                task_setup_snapshot.agent.agent_creator_user_id
+                if task_setup_snapshot.agent is not None
+                else None
+            )
         else:
             if db is None:
                 raise ValueError("Database session or task snapshot is required")
@@ -1966,6 +1989,12 @@ class AgentServiceManager:
                 int(current_agent.team_id)
                 if current_agent is not None and current_agent.team_id is not None
                 else None
+            )
+            # Captured alongside connector_team_id, for the same reason: both
+            # must describe the agent resolved above, never a preview agent
+            # substituted into ``current_agent`` by a branch further down.
+            agent_creator_user_id = (
+                int(current_agent.user_id) if current_agent is not None else None
             )
             if current_agent and _is_published_agent(current_agent):
                 excluded_agent_id = int(current_agent.id)
@@ -2058,6 +2087,10 @@ class AgentServiceManager:
             mcp_load_summary_tracer=parent_tracer,
             mcp_load_summary_trace_task_id=str(task_id),
             connector_team_id=connector_team_id,
+            agent_creator_user_id=agent_creator_user_id,
+            declared_knowledge_bases=agent_config["knowledge_bases"]
+            if agent_config
+            else None,
         )
 
     async def get_agent_for_task(
@@ -2706,6 +2739,21 @@ class AgentServiceManager:
                         if snapshot is not None and snapshot.agent is not None
                         else None
                     ),
+                    # Same agent as connector_team_id immediately above -- both
+                    # read off the same snapshot, so a governing team is never
+                    # paired with another agent's creator. This is the one of
+                    # the three derivation points that does not have its own
+                    # named local variable; it is folded straight into this
+                    # call because that is how connector_team_id already reads
+                    # here.
+                    agent_creator_user_id=(
+                        snapshot.agent.agent_creator_user_id
+                        if snapshot is not None and snapshot.agent is not None
+                        else None
+                    ),
+                    declared_knowledge_bases=agent_config["knowledge_bases"]
+                    if agent_config
+                    else None,
                 )
 
                 with UserContext(runtime_user_id):

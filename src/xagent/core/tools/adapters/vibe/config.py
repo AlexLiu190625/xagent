@@ -333,6 +333,23 @@ class BaseToolConfig(ABC):
         """Get allowed knowledge base collections. None means all collections are allowed."""
         pass
 
+    def get_agent_creator_user_id(self) -> Optional[int]:
+        """Get the governing agent's creator, for the knowledge-base seam.
+
+        Fail-closed default for every config that is not web-backed: without
+        a governing team there is no creator exemption to resolve, so
+        ``None`` is always correct here, not merely convenient.
+        """
+        return None
+
+    def get_declared_knowledge_bases(self) -> Optional[List[str]]:
+        """Get the governing agent's stored knowledge-base declaration.
+
+        Fail-closed default for every config that is not web-backed: see
+        ``get_agent_creator_user_id``.
+        """
+        return None
+
     @abstractmethod
     def get_allowed_skills(self) -> Optional[List[str]]:
         """Get allowed skill names. None means all skills are allowed."""

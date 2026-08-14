@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from .....config import get_uploads_dir
 from .....core.task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from .....core.workspace import TaskWorkspace
+from ...core.knowledge_base_scope import KnowledgeBaseScopeError
 from .base import AbstractBaseTool, Tool
 from .config import (
     BaseToolConfig,
@@ -222,10 +223,11 @@ class ToolRegistry:
         dispatched and are responsible for
         short-circuiting internally based on the spec.
 
-        Exception contract for creators: ``ConnectorRuntimeError`` and
-        ``RequiredMCPUnavailableError`` propagate to the caller; any other
-        exception is logged as a warning and that creator contributes no
-        tools. Creators rely on this and must not catch broadly themselves.
+        Exception contract for creators: ``ConnectorRuntimeError``,
+        ``RequiredMCPUnavailableError`` and ``KnowledgeBaseScopeError``
+        propagate to the caller; any other exception is logged as a warning
+        and that creator contributes no tools. Creators rely on this and must
+        not catch broadly themselves.
         """
         # Import tool modules on first call to trigger decorator registration
         cls._import_tool_modules()
@@ -248,6 +250,14 @@ class ToolRegistry:
             except ConnectorRuntimeError:
                 raise
             except RequiredMCPUnavailableError:
+                raise
+            except KnowledgeBaseScopeError:
+                # Defence in depth only (see knowledge_tools.py's own
+                # narrowing): the team hook is never invoked while tools are
+                # being built, so nothing today raises this here. Kept so a
+                # future change that does resolve the team layer during tool
+                # build cannot have the typed error silently swallowed by
+                # the blanket handler below.
                 raise
             except Exception as e:
                 logger.warning(
