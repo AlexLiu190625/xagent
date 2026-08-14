@@ -2,7 +2,14 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import { ChevronDown, ChevronUp, Copy, Check, Laptop } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
-import { TraceEventRenderer, type AgentExecutionSummary } from "./TraceEventRenderer";
+import {
+  TraceEventRenderer,
+  getFriendlyToolName,
+  getRawToolName,
+  isAgentProgressEvent,
+  getProgressNarrationText,
+  type AgentExecutionSummary,
+} from "./TraceEventRenderer";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
@@ -344,10 +351,62 @@ export function ChatMessage({
   const hasTraceEvents = Array.isArray(traceEvents) && traceEvents.length > 0;
   const shouldShowProcess = !!showProcessView && hasTraceEvents;
 
+  // traceEvents comes straight off an external WS/API payload, so validate
+  // that each entry is actually an object here, once, rather than repeating
+  // a null/type guard in every helper below that reads from the list.
+  const sanitizedTraceEvents: TraceEvent[] = Array.isArray(traceEvents)
+    ? traceEvents
+        .filter(
+          (event): event is TraceEvent =>
+            !!event && typeof event === "object" && !Array.isArray(event),
+        )
+        // A non-string event_type (e.g. a stray number) would otherwise
+        // render as a garbage status label further down — drop it here
+        // rather than have every reader guard against it individually.
+        .map((event) =>
+          typeof event.event_type === "string"
+            ? event
+            : { ...event, event_type: undefined },
+        )
+    : [];
+
+  // The model's own narration ("I'll look into pricing now...") is more
+  // useful here than a generic action label. It keeps showing through one
+  // later, un-narrated tool call — the narration is still accurate for
+  // that long — but expires once a second one starts: without a cutoff a
+  // narration from early in a long turn would keep naming a step the
+  // trace has long since moved past.
+  const latestProgressNarration = (): string => {
+    let toolStartsSinceNarration = 0;
+    for (let i = sanitizedTraceEvents.length - 1; i >= 0; i--) {
+      const event = sanitizedTraceEvents[i];
+      if (isAgentProgressEvent(event)) {
+        const message = getProgressNarrationText(event);
+        if (!message) continue;
+        return toolStartsSinceNarration <= 1 ? message : "";
+      }
+      if (event.event_type === "tool_execution_start") {
+        toolStartsSinceNarration += 1;
+      }
+    }
+    return "";
+  };
+
   // Map event/action to i18n key
   const getEventTitle = (e: TraceEvent | undefined) => {
     if (!e) return "";
     const type = e.event_type || "";
+    // Tool events carry a specific tool name — prefer "Searching the web" over
+    // the generic "Working on it" fallback whenever we know which tool it is.
+    // Only for the start event: once the tool has finished, naming it again
+    // here would read as still in progress, so tool_execution_end falls
+    // through to the generic "Done" label below instead.
+    if (type === "tool_execution_start") {
+      const rawToolName = getRawToolName(e);
+      if (rawToolName) {
+        return getFriendlyToolName(rawToolName, tDynamic);
+      }
+    }
     const action = (typeof e.data?.action === "string" ? (e.data!.action as string) : "") || type;
     if (type) {
       const key = `agent.logs.event.actions.${type}`;
@@ -356,16 +415,21 @@ export function ChatMessage({
     return action || t("traceEventRenderer.taskExecution");
   };
 
-  const latestTitle = getEventTitle(
-    Array.isArray(traceEvents) && traceEvents.length > 0
-      ? traceEvents[traceEvents.length - 1]
-      : undefined
-  );
   const resolvedProcessStatus = resolveTraceProcessStatus({
     processStatus,
     taskStatus,
     traceEvents,
   });
+
+  // Once the turn has actually finished, the terminal event's own title
+  // ("Done") is what belongs here — not a mid-run narration that's still
+  // sitting in the trace. Without this gate, a completed turn with no
+  // answer text (an empty final response) could keep showing "Searching
+  // the web" indefinitely, since narration has no other way to know the
+  // turn is over.
+  const latestTitle =
+    (resolvedProcessStatus === "completed" ? "" : latestProgressNarration()) ||
+    getEventTitle(sanitizedTraceEvents.at(-1));
 
   // A turn that stopped without an answer — failed, paused, or waiting for
   // user input — must leave a visible mark once the trace is hidden: dropping
@@ -390,9 +454,9 @@ export function ChatMessage({
   // often than not). With the trace hidden the failure line must not become its
   // replacement channel, so only mine the events when the process view is on.
   let errorMessage = "";
-  if (showProcessView && resolvedProcessStatus === "failed" && Array.isArray(traceEvents)) {
-    for (let i = traceEvents.length - 1; i >= 0; i--) {
-      const event = traceEvents[i];
+  if (showProcessView && resolvedProcessStatus === "failed") {
+    for (let i = sanitizedTraceEvents.length - 1; i >= 0; i--) {
+      const event = sanitizedTraceEvents[i];
       if (['trace_error', 'task_failed', 'react_task_failed', 'dag_step_failed', 'agent_error'].includes(event.event_type || '')) {
         errorMessage = (event.data?.error as string) || (event.data?.message as string) || (event.data?.error_message as string) || "";
         if (errorMessage) break;

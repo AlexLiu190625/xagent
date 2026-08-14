@@ -19,7 +19,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useApp } from '@/contexts/app-context-chat';
-import { useI18n, type Translate } from '@/contexts/i18n-context';
+import { useI18n, type Translate, type TranslateDynamic } from '@/contexts/i18n-context';
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
 import {
   getFilesDisabledPresentationFileLabel,
@@ -256,7 +256,55 @@ const getWaitingQuestionFromEvents = (events: TraceEvent[]): string | null => {
   return null;
 };
 
-const isAgentProgressEvent = (event: TraceEvent): boolean => (
+// Raw tool identifiers (e.g. "python_executor") are internal names, not
+// user-facing copy. Turn any unmapped one into readable words as a safety net
+// so new/uncommon tools never fall back to a bare snake_case string.
+function prettifyToolName(name: string): string {
+  const spaced = name
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_.-]+/g, ' ')
+    .trim();
+  // An all-separator name (rare, but possible for a malformed/adversarial
+  // tool id) leaves nothing after stripping — an empty title is worse than
+  // the raw name, so fall back to that instead of rendering blank.
+  if (!spaced) return name;
+  return spaced
+    .split(' ')
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ');
+}
+
+// The i18n toolNames table (i18n/locales/*.ts -> traceEventRenderer.toolNames)
+// holds friendly phrasing ("Searching the web") for the common built-in
+// tools; anything not listed there degrades to the prettified raw name
+// instead of surfacing the identifier verbatim.
+export function getFriendlyToolName(toolName: string, tDynamic?: TranslateDynamic): string {
+  // toolName ultimately traces back to an external WS/API payload; the string
+  // type is a compile-time annotation only; not a runtime guarantee. Guard
+  // here too since this helper is exported and may be reused elsewhere.
+  if (typeof toolName !== 'string' || !toolName) return '';
+  const fallback = prettifyToolName(toolName);
+  if (!tDynamic) return fallback;
+  return tDynamic(`traceEventRenderer.toolNames.${toolName}`, fallback);
+}
+
+// Shared with ChatMessage.tsx's status line so both surfaces resolve the
+// same event to the same raw tool name. Checks response.tool_name and
+// data.tool_name independently rather than `a || b` then type-checking the
+// combined result — the latter (this file's own previous version) gives up
+// on an otherwise-valid data.tool_name if response.tool_name exists but
+// happens to be a truthy non-string, e.g. {response: {tool_name: 42},
+// tool_name: 'web_search'} resolved to '' instead of falling through.
+export function getRawToolName(event: TraceEvent): string {
+  const response = event.data?.response;
+  if (response && typeof response.tool_name === 'string') {
+    return response.tool_name;
+  }
+  return typeof event.data?.tool_name === 'string' ? event.data.tool_name : '';
+}
+
+export const isAgentProgressEvent = (event: TraceEvent): boolean => (
   event.event_type === 'agent_progress' ||
   (
     event.event_type === 'agent_message' &&
@@ -265,6 +313,15 @@ const isAgentProgressEvent = (event: TraceEvent): boolean => (
   )
 );
 
+// Shared with ChatMessage.tsx's status line so both surfaces agree on what
+// counts as narration text for the same event — a hand-duplicated copy
+// there previously used ?? instead of ||, silently disagreeing with this
+// file on events shaped like {message: "", content: "..."}.
+export function getProgressNarrationText(event: TraceEvent): string {
+  const raw = event.data?.message || event.data?.content;
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
 // Process trace events into steps
 // Pure reducer over trace events -> ordered steps. Exported for unit testing
 // (e.g. tool_call_id attribution under in-turn tool concurrency).
@@ -272,6 +329,7 @@ export function processTraceEvents(
   events: TraceEvent[],
   t: Translate,
   taskStatus?: string,
+  tDynamic?: TranslateDynamic,
 ): ProcessedStep[] {
     const stepsMap = new Map<string, ProcessedStep>();
     // Steps that ever had more than one tool in flight at once. Their step-level
@@ -428,7 +486,7 @@ export function processTraceEvents(
         step.actions.push({
           id: eventId,
           type: 'llm',
-          title: t('traceEventRenderer.callLLM', { model: eventData.model_name || t('traceEventRenderer.unknownModel') }),
+          title: t('traceEventRenderer.callLLM'),
           status: 'running',
           timestamp,
           data: { model: eventData.model_name }
@@ -465,8 +523,8 @@ export function processTraceEvents(
       }
 
       if (isProgressMessage) {
-        const message = event.data?.message || event.data?.content;
-        if (typeof message === 'string' && message.trim()) {
+        const message = getProgressNarrationText(event);
+        if (message) {
           if (!step.stepName) {
             step.stepName = t('traceEventRenderer.taskExecution');
           }
@@ -480,7 +538,7 @@ export function processTraceEvents(
             status: 'completed',
             timestamp,
             data: {
-              output: message.trim(),
+              output: message,
               inline: true,
               workforceSummary: isWorkforceManagerSummary,
             }
@@ -577,8 +635,9 @@ export function processTraceEvents(
         if (toolArgs?.file_path) {
           step.filePath = String(toolArgs.file_path);
         }
-        // Support both data.response.tool_name and data.tool_name
-        const toolName = event.data?.response?.tool_name || event.data?.tool_name || t('traceEventRenderer.unknownTool');
+        const rawToolName = getRawToolName(event);
+        const toolName = rawToolName || t('traceEventRenderer.unknownTool');
+        const toolDisplayName = rawToolName ? getFriendlyToolName(rawToolName, tDynamic) : toolName;
         const toolCallId = event.data?.tool_call_id as string | undefined;
         const assistantContent = event.data?.response?.assistant_content || event.data?.assistant_content;
 
@@ -606,7 +665,7 @@ export function processTraceEvents(
         step.actions.push({
           id: eventId,
           type: 'tool',
-          title: t('traceEventRenderer.executeTool', { tool: toolName }),
+          title: t('traceEventRenderer.executeTool', { tool: toolDisplayName }),
           status: 'running',
           timestamp,
           data: {
@@ -819,10 +878,10 @@ export function processTraceEvents(
 }
 
 function useProcessedSteps(events: TraceEvent[], taskStatus?: string): ProcessedStep[] {
-  const { t } = useI18n();
+  const { t, tDynamic } = useI18n();
   return useMemo(
-    () => processTraceEvents(events, t, taskStatus),
-    [events, taskStatus, t],
+    () => processTraceEvents(events, t, taskStatus, tDynamic),
+    [events, taskStatus, t, tDynamic],
   );
 }
 

@@ -63,9 +63,18 @@ vi.mock("@/components/file/docx-preview-renderer", () => ({
   ),
 }))
 
-vi.mock("./TraceEventRenderer", () => ({
-  TraceEventRenderer: () => <div data-testid="trace-renderer" />,
-}))
+vi.mock("./TraceEventRenderer", async () => {
+  // Keep the real getFriendlyToolName (imported by ChatMessage) so the
+  // active-tool-name status-line tests exercise the actual implementation;
+  // only the heavy TraceEventRenderer component itself is stubbed out.
+  const actual = await vi.importActual<typeof import("./TraceEventRenderer")>(
+    "./TraceEventRenderer",
+  )
+  return {
+    ...actual,
+    TraceEventRenderer: () => <div data-testid="trace-renderer" />,
+  }
+})
 
 vi.mock("./clarification-form", () => ({
   ClarificationForm: (props: unknown) => {
@@ -441,5 +450,248 @@ describe("ChatMessage Session file capability", () => {
     const copied = clipboardWriteTextMock.mock.calls[0][0]
     expect(copied).not.toContain("raw-file-id")
     expect(copied).not.toContain("/private/raw-secret.csv")
+  })
+
+  it("names the active tool in the status line while it is running", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          { event_type: "tool_execution_start", data: { tool_name: "web_search" } },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText(/traceEventRenderer\.toolNames\.web_search/)).toBeInTheDocument()
+  })
+
+  it("falls back to the generic done label once the tool has finished, instead of still naming it", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          { event_type: "tool_execution_end", data: { tool_name: "web_search" } },
+        ]}
+      />,
+    )
+
+    expect(
+      screen.queryByText(/traceEventRenderer\.toolNames\.web_search/),
+    ).not.toBeInTheDocument()
+    expect(screen.getByText(/agent\.logs\.event\.actions\.tool_execution_end/)).toBeInTheDocument()
+  })
+
+  it("does not throw when traceEvents contains null, primitive, or malformed entries", () => {
+    // traceEvents comes off an external WS/API payload; mirrors the
+    // malformed-input coverage in TraceEventRenderer.test.tsx.
+    expect(() =>
+      render(
+        <ChatMessage
+          role="assistant"
+          content={null}
+          taskStatus="running"
+          traceEvents={[
+            null,
+            42,
+            "not-an-event",
+            { event_type: 17, data: "not-an-object" },
+            {
+              event_type: "agent_progress",
+              data: { message: "Still valid despite the noise around it." },
+            },
+          ] as unknown as React.ComponentProps<typeof ChatMessage>["traceEvents"]}
+        />,
+      ),
+    ).not.toThrow()
+    expect(
+      screen.getByText(/Still valid despite the noise around it\./),
+    ).toBeInTheDocument()
+  })
+
+  it("surfaces the model's own progress narration in the status line, not a generic action label", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          { event_type: "tool_execution_start", data: { tool_name: "web_search" } },
+          { event_type: "tool_execution_end", data: { tool_name: "web_search" } },
+          {
+            event_type: "agent_progress",
+            data: { message: "Looking into LangChain and CrewAI pricing now." },
+          },
+        ]}
+      />,
+    )
+
+    expect(
+      screen.getByText(/Looking into LangChain and CrewAI pricing now\./),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/agent\.logs\.event\.actions/)).not.toBeInTheDocument()
+  })
+
+  it("keeps showing the last narration even after a newer, un-narrated tool call", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          {
+            event_type: "agent_progress",
+            data: { message: "Checking pricing pages first." },
+          },
+          { event_type: "tool_execution_start", data: { tool_name: "browser_use" } },
+        ]}
+      />,
+    )
+
+    // The narration is still accurate — a later tool call with no message
+    // of its own shouldn't bump it back to a generic tool-name label.
+    expect(screen.getByText(/Checking pricing pages first\./)).toBeInTheDocument()
+    expect(
+      screen.queryByText(/traceEventRenderer\.toolNames\.browser_use/),
+    ).not.toBeInTheDocument()
+  })
+
+  it("expires a narration once a second later tool call starts, instead of staying stale for the rest of the run", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          {
+            event_type: "agent_progress",
+            data: { message: "Checking pricing pages first." },
+          },
+          { event_type: "tool_execution_start", data: { tool_name: "browser_use" } },
+          { event_type: "tool_execution_end", data: { tool_name: "browser_use" } },
+          { event_type: "tool_execution_start", data: { tool_name: "write_file" } },
+        ]}
+      />,
+    )
+
+    // Two tool calls have started since the narration — it no longer
+    // describes what's happening now, so the generic label takes over
+    // instead of naming a step the trace has long since moved past.
+    expect(screen.queryByText(/Checking pricing pages first\./)).not.toBeInTheDocument()
+  })
+
+  it("shows the terminal 'Done' label once the turn has completed, not a leftover narration", () => {
+    // A completed turn with no answer text (an empty final response) still
+    // renders GeneratingIndicator — without gating on process status, the
+    // narration priority would keep naming a step forever since narration
+    // has no other way to learn the turn is over.
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        processStatus="completed"
+        traceEvents={[
+          {
+            event_type: "agent_progress",
+            data: { message: "Checking pricing pages first." },
+          },
+          { event_type: "task_completion", data: {} },
+        ]}
+      />,
+    )
+
+    expect(screen.queryByText(/Checking pricing pages first\./)).not.toBeInTheDocument()
+    expect(screen.getByText(/agent\.logs\.event\.actions\.task_completion/)).toBeInTheDocument()
+  })
+
+  it("shows the most recent narration when there are several, not an earlier one", () => {
+    // Pins the backward-scan direction in latestProgressNarration — a
+    // regression that scanned forward instead would still pass every other
+    // narration test here (each of them only has one narration).
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          { event_type: "agent_progress", data: { message: "First: scoping the task." } },
+          {
+            event_type: "agent_progress",
+            data: { message: "Second: now writing the file." },
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText(/Second: now writing the file\./)).toBeInTheDocument()
+    expect(screen.queryByText(/First: scoping the task\./)).not.toBeInTheDocument()
+  })
+
+  it("excludes a question from narration by message_type alone, without expect_response set", () => {
+    // The exclusion is `expect_response !== true && message_type !== 'question'`
+    // — two independent disjuncts. The other test for this only sets
+    // expect_response; this one isolates message_type so deleting either
+    // half of the exclusion would fail a test.
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          {
+            event_type: "agent_message",
+            data: { message: "Which region should I search?", message_type: "question" },
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.queryByText(/Which region should I search\?/)).not.toBeInTheDocument()
+  })
+
+  it("does not throw when the last trace event is malformed and no narration short-circuits first", () => {
+    // The existing malformed-entries test ends with a valid narration, so
+    // latestProgressNarration() short-circuits the `||` before
+    // getEventTitle ever runs on the malformed tail — its own guards go
+    // unexercised. Drop the narration so this one actually reaches them.
+    expect(() =>
+      render(
+        <ChatMessage
+          role="assistant"
+          content={null}
+          taskStatus="running"
+          traceEvents={[
+            null,
+            42,
+            "not-an-event",
+            { event_type: 17, data: "not-an-object" },
+          ] as unknown as React.ComponentProps<typeof ChatMessage>["traceEvents"]}
+        />,
+      ),
+    ).not.toThrow()
+  })
+
+  it("does not treat a pending question as narration in the status line", () => {
+    // expect_response=true means this agent_message is a question awaiting
+    // the user's answer, not a progress update — it must not surface in the
+    // status line the way real narration would.
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          {
+            event_type: "agent_message",
+            data: { message: "Which region should I search?", expect_response: true },
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.queryByText(/Which region should I search\?/)).not.toBeInTheDocument()
   })
 })
