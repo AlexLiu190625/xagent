@@ -1160,6 +1160,14 @@ class ToolFactory:
                     UserMCPServer, MCPServer.id == UserMCPServer.mcpserver_id
                 ).filter(UserMCPServer.user_id == user_id, UserMCPServer.is_active)
 
+            # This shared layer is resolved purely on user_id and is
+            # outside team governance: the query above is already
+            # restricted to the user's own active links, so no team-owned
+            # server reaches it today, and this classmethod has no
+            # production caller. Broadening either of those -- a caller in
+            # src/, or a query that admits team-owned servers -- means this
+            # path must first re-key the shared layer onto the governing
+            # team the way the web tool-config loader does.
             user_env_overrides = load_user_env_overrides(db, user_id)
             shared_env_overrides = load_shared_env_overrides(db, user_id)
             env_source_overrides = load_user_env_sources(db, user_id)
