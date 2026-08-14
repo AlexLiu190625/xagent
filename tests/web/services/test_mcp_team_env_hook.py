@@ -23,9 +23,12 @@ T1 = 101
 
 @pytest.fixture(autouse=True)
 def _reset_hooks() -> Iterator[None]:
-    yield
-    mcp_runtime.set_mcp_team_env_hook(None)
-    mcp_runtime.set_mcp_shared_env_hook(None)
+    # Through the module's own snapshot primitive rather than by resetting
+    # each slot by hand: a slot added to the module later is then covered
+    # by this fixture automatically, which is the whole point of the
+    # primitive being slot-complete.
+    with mcp_runtime.mcp_env_hooks_snapshot():
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -138,23 +141,27 @@ def test_load_team_env_overrides_passes_through_planted_connector_runtime_error(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "malformed_answer",
-    [
-        None,
-        "not-a-dict",
-        {"5": {"K": "v"}},  # string key, not int
-        {True: {"K": "v"}},  # bool key, not accepted as int
-        {5: "not-a-dict"},  # value is not a dict
-    ],
-    ids=[
-        "none",
-        "non-dict-answer",
-        "string-key",
-        "bool-key",
-        "non-dict-value",
-    ],
-)
+# Both malformed-answer tests below consume this one table: the loader
+# level (which must convert every case into the typed 503) and the
+# validator level (which must raise ValueError for every case). A case
+# added here is automatically exercised at both levels.
+_MALFORMED_TEAM_ENV_ANSWERS = [
+    pytest.param(None, id="none"),
+    pytest.param("not-a-dict", id="non-dict-answer"),
+    pytest.param({"5": {"K": "v"}}, id="string-key"),
+    pytest.param({True: {"K": "v"}}, id="bool-key"),
+    pytest.param({5: "not-a-dict"}, id="non-dict-value"),
+    pytest.param({5: {1: "v"}}, id="non-str-env-key"),
+    pytest.param({5: {"K": 1}}, id="non-str-env-value"),
+    pytest.param({5: {"K": None}}, id="none-env-value"),
+    # A bad server-id key whose env mapping is empty: the loader drops
+    # empty rows, and this pins that it drops them only AFTER the shape
+    # check, so a malformed key cannot ride an empty row past validation.
+    pytest.param({"5": {}}, id="string-key-with-empty-env"),
+]
+
+
+@pytest.mark.parametrize("malformed_answer", _MALFORMED_TEAM_ENV_ANSWERS)
 def test_load_team_env_overrides_raises_on_malformed_answer(malformed_answer):
     mcp_runtime.set_mcp_team_env_hook(lambda db, *, team_id: malformed_answer)
     with pytest.raises(ConnectorRuntimeError) as excinfo:
@@ -162,23 +169,7 @@ def test_load_team_env_overrides_raises_on_malformed_answer(malformed_answer):
     assert excinfo.value.status_code == 503
 
 
-@pytest.mark.parametrize(
-    "malformed_answer",
-    [
-        None,
-        "not-a-dict",
-        {"5": {"K": "v"}},
-        {True: {"K": "v"}},
-        {5: "not-a-dict"},
-    ],
-    ids=[
-        "none",
-        "non-dict-answer",
-        "string-key",
-        "bool-key",
-        "non-dict-value",
-    ],
-)
+@pytest.mark.parametrize("malformed_answer", _MALFORMED_TEAM_ENV_ANSWERS)
 def test_validate_team_mcp_env_answer_raises_value_error(malformed_answer):
     with pytest.raises(ValueError):
         mcp_runtime._validate_team_mcp_env_answer(malformed_answer)
@@ -186,6 +177,33 @@ def test_validate_team_mcp_env_answer_raises_value_error(malformed_answer):
 
 def test_validate_team_mcp_env_answer_accepts_empty_dict():
     assert mcp_runtime._validate_team_mcp_env_answer({}) == {}
+
+
+def test_validate_keeps_an_empty_row_but_loader_drops_it():
+    """The validator's job is shape, the loader's job is normalization.
+    An empty env mapping is a well-shaped row, so the validator keeps it;
+    the loader then drops it so no consumer ever sees the two states."""
+    assert mcp_runtime._validate_team_mcp_env_answer({5: {}}) == {5: {}}
+
+    mcp_runtime.set_mcp_team_env_hook(lambda db, *, team_id: {5: {}})
+    assert mcp_runtime.load_team_env_overrides("db", T1) == {}
+
+
+def test_loader_drops_only_the_empty_rows():
+    mcp_runtime.set_mcp_team_env_hook(lambda db, *, team_id: {5: {}, 6: {"KEY": "v"}})
+    assert mcp_runtime.load_team_env_overrides("db", T1) == {6: {"KEY": "v"}}
+
+
+def test_load_team_env_overrides_none_db_never_calls_installed_hook():
+    calls: list[object] = []
+
+    def hook(db, *, team_id):
+        calls.append(team_id)
+        return {}
+
+    mcp_runtime.set_mcp_team_env_hook(hook)
+    assert mcp_runtime.load_team_env_overrides(None, T1) == {}
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------

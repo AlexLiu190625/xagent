@@ -158,7 +158,14 @@ def _validate_team_mcp_env_answer(answer: Any) -> dict[int, dict]:
     hook must return a ``dict`` whose keys are all ``int`` server ids
     (``bool`` is a subclass of ``int`` in Python but is rejected here -- a
     truthy/falsy value is never a legitimate server id) and whose values
-    are all ``dict`` env mappings.
+    are all ``dict`` env mappings whose own keys and values are all
+    ``str``: this env eventually becomes a subprocess environment, where a
+    non-string surfaces as an unclassified failure at spawn time rather
+    than as the typed error this boundary promises. There is no ``bool``
+    special case on the inner side, unlike the server-id keys above,
+    because ``bool`` is not a ``str`` subclass and is already rejected.
+    A malformed env value's own content is never formatted into the error
+    message -- these are credentials.
     """
     if not isinstance(answer, dict):
         raise ValueError(
@@ -182,6 +189,19 @@ def _validate_team_mcp_env_answer(answer: Any) -> dict[int, dict]:
                 "team env hook returned a malformed answer: value for key "
                 f"{key!r} must be a dict, got {type(value).__name__}"
             )
+        for env_key, env_value in value.items():
+            if not isinstance(env_key, str):
+                raise ValueError(
+                    "team env hook returned a malformed answer: env key "
+                    f"{env_key!r} under server id {key!r} is not a string "
+                    f"(got {type(env_key).__name__})"
+                )
+            if not isinstance(env_value, str):
+                raise ValueError(
+                    "team env hook returned a malformed answer: env value "
+                    f"for env key {env_key!r} under server id {key!r} is "
+                    f"not a string (got {type(env_value).__name__})"
+                )
     # Defensive copy at the authorization boundary: the caller must not be
     # able to mutate the installing application's own answer object (or
     # vice versa). Shallow is sufficient -- every downstream consumer only
@@ -202,12 +222,26 @@ def load_team_env_overrides(db: Any, team_id: int | None) -> dict[int, dict]:
     the caller (config.py's wiring) already treats the latter as a
     deliberate, signal-losing degrade of its own; collapsing hook failure
     into the same outcome would double that loss silently.
+
+    A row whose env mapping is empty is dropped here rather than passed on:
+    an empty mapping carries nothing, and letting it through as "the team
+    has a row" would make storing an empty row strictly worse for the
+    runner than storing nothing at all -- the caller's row-present branch
+    keeps a "shared" pick that then merges nothing, pinning the run to the
+    global env, whereas a missing row degrades that pick and lets the
+    runner's own key through. load_user_env_overrides above applies the
+    same convention to a per-user override that decrypts to an empty
+    mapping.
     """
-    if team_id is None or _get_mcp_team_env_hook is None:
+    if db is None or team_id is None or _get_mcp_team_env_hook is None:
         return {}
     try:
         answer = _get_mcp_team_env_hook(db, team_id=int(team_id))
-        return _validate_team_mcp_env_answer(answer)
+        validated = _validate_team_mcp_env_answer(answer)
+        # Validate first, then drop rows whose env mapping is empty. The
+        # order matters: dropping first would let a malformed server-id key
+        # with an empty value escape the shape check entirely.
+        return {server_id: env for server_id, env in validated.items() if env}
     except ConnectorRuntimeError:
         raise
     except Exception as exc:
