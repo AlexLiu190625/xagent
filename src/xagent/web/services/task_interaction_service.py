@@ -7,26 +7,24 @@ docstring pins its merge reason to a fact this module does not share: its
 two entry points exist in one file because they share every exception type
 and one nesting invariant that must never be split across a file boundary,
 both live on the ask side, and both require the caller to already hold the
-transaction they run inside. This module's future ``respond()`` -- not
-implemented in this delivery, see below for what is -- is designed to be
-the opposite shape on every one of those points: it will own its own
-session and its own commit, and will not nest inside anyone else's
-savepoint. Nothing in this delivery opens a session or commits anything;
-``create()`` takes a caller-owned session and only reads through it. Putting
-the future seam in the same file as the staging primitive would make that
-staging module's merge-reason docstring false the day it lands. What this
-delivery reuses from the staging module
-instead of duplicating is narrow and one-directional: the private kind
-vocabulary (``_KIND_VOCABULARY``), imported by name. ``create()`` never
-calls ``stage_interaction_request`` in this delivery and therefore never
-raises or catches any of that module's nine exception classes, and this
-module's own read-direction anchor resolver validates a real
-``trace_events`` row against a stored interaction row's fields -- a
-different check from the staging module's ``_validate_anchor_fields``,
-which validates an ``InteractionAnchor`` value object before an INSERT --
-so it is not reused here either. See ``create()``'s own docstring for the
-exception-family accounting, and ``_resolve_read_direction_anchor``'s for
-the anchor-check distinction.
+transaction they run inside. This module's ``respond()`` is the opposite
+shape on every one of those points: it owns its own session end to end
+(opens it, commits or rolls it back, retires it) and never nests inside a
+caller's transaction. ``create()``, by contrast, takes a caller-owned
+session and only reads through it, never opening or committing one of its
+own. Putting ``respond()`` in the same file as the staging primitive would
+make that staging module's merge-reason docstring false. What this module
+reuses from the staging module instead of duplicating is narrow and
+one-directional: the private kind vocabulary (``_KIND_VOCABULARY``),
+imported by name. Neither ``create()`` nor ``respond()`` calls
+``stage_interaction_request`` and neither raises or catches any of that
+module's nine exception classes, and this module's own read-direction
+anchor resolver validates a real ``trace_events`` row against a stored
+interaction row's fields -- a different check from the staging module's
+``_validate_anchor_fields``, which validates an ``InteractionAnchor``
+value object before an INSERT -- so it is not reused here either. See
+``create()``'s own docstring for the exception-family accounting, and
+``_resolve_read_direction_anchor``'s for the anchor-check distinction.
 
 Concurrency precondition, stated once here because every rowcount-based
 branch this service will grow depends on it: every rowcount-based branch
@@ -44,29 +42,50 @@ records who answered a request must treat ``responder_identity`` as
 authoritative and ``responder_user_id`` as a convenience join that can go
 missing under normal account deletion, not a corruption signal.
 
-Delivered here: the ``InteractionPrincipal`` value object and the shared
-public-chat ownership predicate extracted from ``public_chat_access.py``;
-the ``RespondOutcome`` and ``CreateOutcome`` discriminated unions and their
-reason vocabularies; the ``create()`` typed seam (validates and returns,
-does not stage a row); ``get()``/``list_active()``; and the three-tier compatibility
-materialization view. Not delivered here: ``respond()``'s call body, the
-answer fence, the compatibility seam into the existing resume coordinator,
-and any new counter. Those land with later changes; this module's own
+This module now delivers the full answer side: the ``InteractionPrincipal``
+value object and the shared public-chat ownership predicate extracted from
+``public_chat_access.py``; the ``RespondOutcome`` and ``CreateOutcome``
+discriminated unions; the ``create()`` typed seam (validates and returns,
+does not stage a row); ``get()``/``list_active()``; the three-tier
+compatibility materialization view; the answer fence and its active-row
+predicate; ``respond()``'s own call body (validation, authorization, the
+idempotency pre-read, anchor resolution, the answer fence, the task
+control-state transition, staging the resume command, and committing --
+this delivery reports an unresolved fence miss or a failed commit as
+``RespondOutcomeUnknown`` rather than further classifying or reconciling
+either); and the response-conflict counter
+(``COUNTER_LIFECYCLE_RESPONSE_CONFLICT``).
+
+Not delivered here, and named so a reader does not go looking for them in
+this module: the compatibility seam that routes the existing resume
+coordinator (``websocket.py``'s ``_handle_resume_task_unserialized``)
+through ``_active_native_row_criteria()`` shipped as its own change in this
+same series and has already merged -- ``websocket.py`` now imports
+``_active_native_row_criteria`` from this module -- but is not part of this
+change. ``create()``'s own call body -- the write
+that actually stages a row -- is not delivered here either; its own
 zero-production-caller gate
-(``tests/web/services/test_task_interaction_service_production_gate.py``)
-gives that boundary a regression guard against import bindings, not an
-absolute one -- the gate's own docstring lists what it cannot see
-(dynamic access, alias/re-export chains, filename-stem exclusion, and
-code outside the scanned package tree).
+(``tests/web/services/test_task_interaction_service_create_gate.py``)
+watches both ``create()`` and ``respond()``: zero production code calls
+either name today, and the change that wires a caller is the change that
+takes the corresponding name out of the gated set. The gate gives
+``create()``'s boundary a regression guard against import bindings, not
+an absolute one -- its docstring lists what it cannot see (dynamic
+access, alias/re-export chains, filename-stem exclusion, and code outside
+the scanned package tree).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Literal, cast
 
+import sqlalchemy as sa
 from pydantic import ValidationError as _PydanticValidationError
+from sqlalchemy.exc import IntegrityError
 
 from ...core.agent.checkpoint import (
     CHECKPOINT_EVENT_TYPE,
@@ -74,26 +93,38 @@ from ...core.agent.checkpoint import (
     checkpoint_execution_id,
 )
 from ...core.tools.adapters.vibe.ask_user_tool import AskUserQuestionArgs
-from ..models.task import Task, TraceEvent
+from ..models.task import Task, TaskStatus, TaskStatusPredicate, TraceEvent
+from ..models.task_command import TaskExecutionCommand
 from ..models.task_interaction import (
     INTERACTION_PROTOCOL_VERSION,
     TaskInteractionRequest,
 )
 from .chat_history_service import get_latest_waiting_question
+from .interaction_rollout import COUNTER_LIFECYCLE_RESPONSE_CONFLICT, increment_counter
 from .ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
     CHECKPOINT_PK_ANCHOR_DANGLING,
     register_degradation,
 )
-from .task_command_transport import _normalize_command_id
+from .task_command_transport import (
+    TaskCommandKind,
+    _matches_existing,
+    _normalize_command_id,
+    notify_task_command_dispatcher,
+    stage_task_command,
+)
+from .task_execution_controller import (
+    TaskControlState,
+    apply_task_control_transition,
+)
 from .task_interaction_schema import interaction_requests_table_exists
 from .task_interaction_staging import _KIND_VOCABULARY
 from .task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
 if TYPE_CHECKING:
-    from datetime import datetime
-
     from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Principal and the shared public-chat ownership predicate
@@ -456,13 +487,12 @@ def public_chat_identity_matches(task: "Task", principal: InteractionPrincipal) 
 
 
 # ---------------------------------------------------------------------------
-# RespondOutcome: the answer-side discriminated union. Types only in this
-# delivery -- respond() itself, and every branch that could actually
-# produce most of these variants, lands with a later change (see the module
-# docstring). Defining the full union now, rather than growing it
-# incrementally alongside respond()'s call body, is what lets the reason
-# vocabulary be pinned once and the counting below be a real guard instead
-# of a moving target.
+# RespondOutcome: the answer-side discriminated union. respond() itself,
+# and the call body that produces every one of these variants, are both
+# delivered in this module (see the module docstring). Defining the full
+# union up front, rather than growing it incrementally alongside that call
+# body, is what lets the reason vocabulary be pinned once and the counting
+# below be a real guard instead of a moving target.
 # ---------------------------------------------------------------------------
 
 
@@ -492,6 +522,32 @@ class InteractionResponseReceipt:
     task_control_state: str
 
 
+# Each outcome that carries a reason declares its own closed word list as a
+# ``Literal``, so the vocabulary is the type itself rather than a separate
+# dict a reader has to trust stays in sync with the dataclasses below. A
+# reason string outside its outcome's Literal is a static type error at
+# every construction site; it is not a runtime check (dataclasses do not
+# validate their field types at construction), the same limitation a
+# runtime membership check against a dict would not have removed either,
+# since nothing in this module ever constructed one of these outcomes with
+# an unvalidated, caller-supplied reason string to begin with -- every
+# reason literal below is written by this module's own code, at a call
+# site a type checker already sees.
+RespondValidationRejectedReason = Literal[
+    "unknown_kind",
+    "unknown_protocol_version",
+    "malformed_idempotency_key",
+    "invalid_values",
+    "kind_version_mismatch",
+]
+RespondUnauthorizedReason = Literal["not_task_principal"]
+RespondUnavailableReason = Literal[
+    "task_missing", "interaction_missing", "checkpoint_unavailable"
+]
+RespondConflictReason = Literal["idempotency_key_reused"]
+RespondStaleReason = Literal["anchor_dangling"]
+
+
 @dataclass(frozen=True)
 class RespondAccepted:
     receipt: InteractionResponseReceipt
@@ -499,17 +555,17 @@ class RespondAccepted:
 
 @dataclass(frozen=True)
 class RespondValidationRejected:
-    reason: str
+    reason: RespondValidationRejectedReason
 
 
 @dataclass(frozen=True)
 class RespondUnauthorized:
-    reason: str
+    reason: RespondUnauthorizedReason
 
 
 @dataclass(frozen=True)
 class RespondUnavailable:
-    reason: str
+    reason: RespondUnavailableReason
 
 
 @dataclass(frozen=True)
@@ -519,21 +575,40 @@ class RespondReplayed:
 
 @dataclass(frozen=True)
 class RespondConflict:
-    reason: str
+    reason: RespondConflictReason
 
 
 @dataclass(frozen=True)
 class RespondStale:
-    reason: str
+    reason: RespondStaleReason
 
 
 @dataclass(frozen=True)
 class RespondOutcomeUnknown:
-    """A commit whose acknowledgment was ambiguous, reconciled against the
-    durable graph, and still unresolved after every reconciliation attempt.
-    Not an exception this service lets escape -- a stable, typed result a
-    caller can act on (e.g. surface "we could not confirm this went
-    through" rather than crash)."""
+    """A call this function could not resolve to one of the specific
+    outcomes above, for either of two reasons this build does not further
+    distinguish: the answer fence's UPDATE matched zero rows and this
+    build does not classify why (step 6 -- a future delivery may reread
+    and classify that miss the way the fence classification build does),
+    or committing raised and this build does not attempt to reconcile the
+    durable graph afterward (steps 8/9) -- the acknowledgment could have
+    been lost after the server applied the write, or a racing writer could
+    have taken the idempotency key first; either way this build reports
+    the ambiguity rather than guessing. Not an exception this service lets
+    escape -- a stable, typed result a caller can act on (e.g. surface "we
+    could not confirm this went through" rather than crash).
+
+    Retrying under the same idempotency key resolves the second reason and
+    not the first, and a caller should not be told otherwise. A retry
+    after an ambiguous commit finds the command this call staged and
+    returns ``Replayed``, and a retry after a rolled-back staging race
+    simply runs again. A retry after a fence miss re-evaluates the same
+    predicate against the same row and misses again: a terminated,
+    superseded, foreign-run, or foreign-owned row stays that way, so the
+    second ``OutcomeUnknown`` is as final as the first. Step 6 logs the
+    reread row's state for that reason -- until the fence classification
+    build lands, that log line is the only place the distinction exists.
+    """
 
 
 RespondOutcome = (
@@ -547,57 +622,24 @@ RespondOutcome = (
     | RespondOutcomeUnknown
 )
 
-# The (outcome type, reason) pairs RespondOutcome can produce once
-# respond() is implemented, keyed by outcome class name. ``None`` in the
-# reason set stands for the reason-less variants (Accepted / Replayed /
-# OutcomeUnknown carry no reason code). This is the vocabulary guard: it
-# proves the reason word list stays closed at exactly the pairs enumerated
-# here, nothing more -- it does NOT prove every pair has a test written
-# against it (several reasons are reachable from more than one triggering
-# condition, e.g. every "A" row of the design's failure matrix collapses to
-# the single (Unauthorized, not_task_principal) pair here; a guard over
-# this dict cannot and does not distinguish which condition produced a
-# given pair). Do not read "count matches" as "coverage complete".
-RESPOND_OUTCOME_REASON_VOCABULARY: dict[str, frozenset[str | None]] = {
-    "RespondAccepted": frozenset({None}),
-    "RespondValidationRejected": frozenset(
-        {
-            "unknown_kind",
-            "unknown_protocol_version",
-            "malformed_idempotency_key",
-            "invalid_values",
-            "kind_version_mismatch",
-        }
-    ),
-    "RespondUnauthorized": frozenset({"not_task_principal"}),
-    "RespondUnavailable": frozenset(
-        {"task_missing", "interaction_missing", "checkpoint_unavailable"}
-    ),
-    "RespondReplayed": frozenset({None}),
-    "RespondConflict": frozenset({"already_answered", "idempotency_key_reused"}),
-    "RespondStale": frozenset(
-        {
-            "expired",
-            "run_superseded",
-            "answered_via_chat",
-            "run_ended",
-            "foreign_run",
-            "state_version_advanced",
-            "anchor_dangling",
-        }
-    ),
-    "RespondOutcomeUnknown": frozenset({None}),
-}
-
 
 # ---------------------------------------------------------------------------
 # CreateOutcome: the create() seam's own discriminated union. Same family,
-# same style as RespondOutcome, but a separate set of classes -- the two
-# unions are not reused between each other even where a reason string
-# happens to be spelled the same way (e.g. "not_task_principal" appears in
-# both vocabularies below because both seams reuse the shared ownership
-# predicate's verdict, not because the two outcome types share a base
-# class).
+# same style as RespondOutcome, but two different mechanisms, and the
+# asymmetry is intentional rather than unfinished cleanup. Respond's
+# outcomes declare each reason as a ``Literal`` on the dataclass field, so
+# the type is the vocabulary. Create's still carry ``reason: str`` beside
+# the runtime dictionaries below, which record something a ``Literal``
+# cannot: which reasons are *producible* in this delivery as opposed to
+# merely declared, a distinction that exists only because create()'s call
+# body is not delivered yet. The two vocabularies overlap in nine strings
+# and are deliberately not shared -- ``"not_task_principal"`` appears in
+# both because both seams reuse the shared ownership predicate's verdict,
+# not because the two outcome types share a base class, and a change to
+# one side's word list must never silently move the other's. When
+# create()'s call body lands and the producible/declared distinction
+# disappears with it, that side converts to the Literal mechanism and this
+# note goes away.
 # ---------------------------------------------------------------------------
 
 
@@ -1314,3 +1356,846 @@ def materialize_compatibility_view(
             interaction.model_dump(mode="json") for interaction in parsed.interactions
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# The answer fence: the one write this module makes to an active interaction
+# row, and the shared active-row predicate's write-side counterpart the
+# module docstring on ``_active_native_row_criteria`` already commits to.
+# ---------------------------------------------------------------------------
+
+
+def _answer_fence_task_predicate(principal: InteractionPrincipal) -> list[Any]:
+    """The task-side terms of the answer fence: is this task still waiting,
+    and does ``principal`` own it -- evaluated against the same ``tasks``
+    row the fence statement joins in via ``Task.id == task_id`` (see
+    ``_answer_fence_stmt``), not a second, independently-scoped read.
+
+    The ``Task.user_id`` term requires the owner in person, on both
+    backends: step 3's authorization admits an admin acting on another
+    user's task, and the guest ownership predicate never reads
+    ``principal.user_id`` (see ``task_is_owned_by_public_principal``), so
+    for both of those callers this term is the only ownership constraint
+    in the path and the fence misses. Answering on another user's behalf
+    is not delivered in this build; whether an admin may do so is a policy
+    decision left to the change that wires the first production caller. A
+    ``principal.user_id`` of ``None`` compiles to ``tasks.user_id IS
+    NULL`` and matches nothing (the column is ``nullable=False``), so such
+    a caller fails closed here rather than matching another user's row.
+
+    Against a *concurrent* ownership change the term is redundant on
+    PostgreSQL -- step 2 of ``respond()`` already holds this row's
+    ``FOR NO KEY UPDATE`` lock -- and load-bearing on SQLite, where the
+    dialect drops every locking clause silently and nothing serializes a
+    caller until this statement, the transaction's first write (see
+    ``respond()``'s own docstring for the two backends' different
+    serialization points). Enforcing ownership at the write point rather
+    than only in ``respond()``'s step 3 is what makes the two backends
+    agree on the terms this statement actually carries -- which is not
+    every term step 3 evaluated. Three are re-asserted here: the task is
+    still ``WAITING_FOR_USER``, ``Task.user_id`` is still the principal's,
+    and, for a guest, the ``guest_id`` in ``agent_config`` still matches.
+    The rest of the guest conjunction -- ``auth_mode``, the entity binding,
+    and the channel binding -- is evaluated once in Python at step 3 and
+    not re-checked in SQL. A successful answer therefore proves the three
+    terms above held at write time and that the other three held at read
+    time, not that all six held at write time.
+
+    ``Task.status`` is compared through ``TaskStatusPredicate.eq``, never a
+    raw string literal beside the column -- this module's own convention
+    (see ``TaskStatusPredicate``'s docstring for why a raw literal is a
+    query-time failure waiting to happen, not merely a style preference).
+
+    The two entity-binding backends disagree on how a JSON key read
+    compiles (``->>`` on PostgreSQL, ``json_extract`` on SQLite) -- both are
+    exercised by ``test_task_interaction_service_postgresql.py`` and this
+    module's SQLite unit tests, deliberately, rather than assumed
+    equivalent from one compiled form.
+    """
+
+    terms: list[Any] = [
+        TaskStatusPredicate.eq(TaskStatus.WAITING_FOR_USER),
+        Task.user_id == principal.user_id,
+    ]
+    if principal.kind == "guest":
+        terms.append(Task.agent_config["guest_id"].as_string() == principal.guest_id)
+    return terms
+
+
+def _answer_fence_stmt(
+    *,
+    interaction_id: int,
+    task_id: int,
+    principal: InteractionPrincipal,
+    response_payload: dict[str, Any],
+    now: "datetime",
+    responder_user_id: int | None,
+    responder_identity: str,
+) -> Any:
+    """The Core UPDATE that is this module's one and only write to an active
+    interaction row: a compare-and-swap on row status, task state, and
+    ownership, all evaluated in the same statement's WHERE clause so that a
+    concurrent change to any one of them is what makes ``rowcount`` land on
+    zero rather than one.
+
+    ``Task.id == task_id`` pins the implicit ``FROM tasks`` join this
+    statement needs (both for the reused active-row predicate's own
+    ``Task.run_id`` comparison and for ``_answer_fence_task_predicate``'s
+    terms) to exactly one row. The ownership terms are deliberately a flat
+    conjunction here, not their own correlated ``EXISTS(...)``: a subquery
+    correlated against this UPDATE's target table auto-correlates every
+    table the two queries have in common, including
+    ``TaskInteractionRequest`` itself, which either raises
+    ``InvalidRequestError`` or -- if correlation is pinned away from
+    ``TaskInteractionRequest`` -- leaves the outer join unpinned to a
+    specific ``tasks`` row (verified empirically against both backends'
+    compiled SQL). A flat conjunction against a ``tasks`` row already pinned
+    by primary key has no such ambiguity and compiles to one join, not a
+    join plus a subquery.
+
+    The three active-row criteria (``status``, ``active_slot``, and the
+    ``run_id`` comparison against this same joined ``tasks`` row) are
+    imported from ``_active_native_row_criteria`` rather than rewritten --
+    that function's own docstring already commits every future caller
+    needing "the live row" to changing together with it.
+
+    Writes exactly the columns the model's paired CHECK constraints require
+    for an answered row: ``status``, ``active_slot`` (cleared), and,
+    together, ``response_payload`` / ``responded_at`` / responder identity.
+    Never writes ``terminated_at`` or ``terminal_reason`` -- doing so on a
+    row this statement is simultaneously marking ``answered`` trips
+    ``ck_task_interaction_requests_terminal_pairs_status`` /
+    ``ck_task_interaction_requests_terminated_at_pairs_status``, the
+    database refusing a row that claims to be both answered and
+    terminated. ``responder_user_id`` is the caller's to set correctly:
+    populated only for a ``"user"`` principal, left ``None`` for a guest
+    (see ``respond()``'s own docstring for why that column and
+    ``responder_identity`` are allowed to disagree).
+    """
+
+    return (
+        sa.update(TaskInteractionRequest)
+        .where(
+            TaskInteractionRequest.id == interaction_id,
+            TaskInteractionRequest.task_id == task_id,
+            Task.id == task_id,
+            *_active_native_row_criteria(),
+            *_answer_fence_task_predicate(principal),
+        )
+        .values(
+            status="answered",
+            active_slot=None,
+            response_payload=response_payload,
+            responded_at=now,
+            responder_user_id=responder_user_id,
+            responder_identity=responder_identity,
+            updated_at=now,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# respond(): the answer-side entry point. Everything above this point in the
+# module either already shipped (the principal, the outcome unions, create(),
+# the shared active-row predicate, the anchor resolver, the compatibility
+# view) or is this function's own supporting statement (the fence, just
+# above). What follows is the function this module was always building
+# toward, per its own docstring's "not delivered here" list -- which this
+# change retires.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RespondEnvelope:
+    """The caller-supplied answer for ``respond()``: what interaction this
+    answers, with what values, and under which idempotency key -- not yet
+    validated.
+
+    Deliberately carries no resume-locator field mirroring
+    ``CreateInteractionEnvelope``'s absence of one: the only documented
+    caller today (#1079's own AC) never hands one back, and the only thing
+    an echoed locator could prove -- "this is the same value the server
+    handed out" -- is already proven by ``interaction_id`` plus the row and
+    anchor checks ``respond()`` runs on its own account (steps 4 and 5.5).
+    """
+
+    kind: str
+    protocol_version: int
+    values: Any
+    idempotency_key: str
+
+
+def _respond_command_payload(
+    *, interaction_id: int, principal: InteractionPrincipal, values: Any
+) -> dict[str, Any]:
+    """The RESUME command payload ``respond()`` stages in step 8, and the
+    payload it re-derives at steps 5 and 8 to look an existing command up by
+    the same shape.
+
+    Carries ``responder_identity`` alongside the answer ``values`` so that
+    two different principals submitting the same idempotency key with the
+    same ``values`` are *not* treated as the same idempotent request: step
+    7's ``actor_user_id`` is the task owner for both a ``"user"`` and a
+    ``"guest"`` principal (see ``respond()``'s own docstring), so
+    ``_matches_existing``'s ``actor_user_id`` comparison alone cannot tell
+    them apart -- putting ``responder_identity`` in the payload that
+    ``_canonical_payload`` hashes is what does: two principals reusing one
+    key now canonicalize to two different payloads, which
+    ``_matches_existing`` reports as ``idempotency_key_reused``, not a
+    replay.
+    """
+
+    return {
+        "interaction_id": interaction_id,
+        "responder_identity": principal.identity_string(),
+        "values": values,
+    }
+
+
+def _respond_receipt(
+    *,
+    interaction: "TaskInteractionRequest",
+    task: "Task",
+    command_db_id: int,
+    idempotency_key: str,
+) -> InteractionResponseReceipt:
+    """Build the receipt from already-loaded, already-committed-or-about-to-
+    commit rows, never from a lazy relationship read after commit (see
+    ``InteractionResponseReceipt``'s own docstring). ``responder_identity``
+    is read from the interaction row's own column, never reconstructed from
+    a caller's ``principal`` -- that column, not ``principal``, is this
+    table's audit-authoritative record of who answered (see ``respond()``'s
+    own docstring for why ``responder_user_id`` cannot be used for the same
+    purpose). This is not the only receipt this module builds: the accept
+    path builds ``RespondAccepted``'s receipt from plain locals captured in
+    the same transaction before the commit below, including
+    ``principal.identity_string()`` for ``responder_identity`` rather than
+    a read of this row's column. The two are not competing sources of
+    truth -- the answer fence this function's own precondition depends on
+    is the statement that wrote the column from that same
+    ``principal.identity_string()`` value, so the column and the local are
+    equal by the fence write's own semantics, not by coincidence.
+
+    The only caller is ``respond()``'s idempotent-replay branch, whose
+    precondition -- a staged RESUME command this service itself committed
+    in the same transaction as the answer fence UPDATE -- implies an
+    answered row, and the paired CHECK constraints
+    (``ck_task_interaction_requests_responded_at_pairs_status`` and
+    ``ck_task_interaction_requests_responder_pairs_responded_at``) make an
+    answered row with a NULL ``responded_at`` or ``responder_identity``
+    impossible. That reasoning spans two modules, so the guard below turns
+    it into a loud failure instead of trusting it silently: a receipt must
+    never carry a coerced ``'None'`` identity or a ``None`` timestamp.
+    """
+
+    if interaction.responded_at is None or interaction.responder_identity is None:
+        raise RuntimeError(
+            f"interaction {interaction.id} on task {interaction.task_id} "
+            "matched a staged RESUME command but carries no answer; "
+            "ck_task_interaction_requests_responder_pairs_responded_at "
+            "makes this impossible"
+        )
+    return InteractionResponseReceipt(
+        interaction_id=int(interaction.id),
+        task_id=int(interaction.task_id),
+        run_id=str(interaction.run_id),
+        status=str(interaction.status),
+        responded_at=cast("datetime", interaction.responded_at),
+        responder_identity=str(interaction.responder_identity),
+        idempotency_key=idempotency_key,
+        command_db_id=command_db_id,
+        task_state_version=int(task.state_version),
+        task_control_state=str(task.control_state),
+    )
+
+
+def _retire_respond_session_best_effort(db: "Session") -> None:
+    """Release an owned Session without letting a close/invalidate failure
+    replace the transaction error that is already in flight. Same shape as
+    ``task_orchestrator._retire_turn_session_best_effort`` -- a different
+    copy because that helper is private to its own module and this
+    service's session lifecycle (see the module docstring: ``respond()``
+    owns and retires its own session) is not the turn-commit lifecycle that
+    helper is named for.
+    """
+
+    try:
+        db.close()
+        return
+    except Exception:
+        logger.warning("failed to close respond() session", exc_info=True)
+    try:
+        db.invalidate()
+    except Exception:
+        logger.warning("failed to invalidate respond() session", exc_info=True)
+
+
+def respond(
+    *,
+    interaction_id: int,
+    task_id: int,
+    principal: InteractionPrincipal,
+    envelope: RespondEnvelope,
+) -> RespondOutcome:
+    """Answer one active interaction row and stage the RESUME command that
+    lets the task's execution resume with that answer, in one all-or-
+    nothing transaction on a session this function owns end to end (opens
+    it, commits or rolls it back, and retires it -- the caller never passes
+    one in, because step 9 below needs to be able to retire it on an
+    ambiguous commit and start a fresh one to verify what actually landed).
+
+    Every rowcount-based branch below assumes READ COMMITTED (PostgreSQL's
+    default, and what this deployment uses; see the module docstring for
+    the general statement). The branch that actually depends on it is step
+    6's zero-rowcount reread: a blocked fence UPDATE re-evaluates its WHERE
+    clause once the lock holder's transaction ends, so a second caller's
+    UPDATE naturally resolves to a `rowcount` of zero that this function can
+    then classify against the row's now-current state. Under REPEATABLE
+    READ or stricter the same conflict surfaces as a serialization failure
+    instead of a rowcount of zero, and step 6's classification does not
+    hold.
+
+    `_handle_resume_task_unserialized` re-issues the same
+    `RESUME_REQUESTED` transition when it applies the command this call
+    staged (`websocket.py`, reached from `_execute_durable_task_command`).
+    `apply_task_control_transition` has no legality table, so that second
+    transition succeeds and bumps `state_version` again. Post-commit
+    verification must therefore be monotone in `state_version` and must not
+    compare `control_state`. One concrete consequence, recorded here
+    because a future reader who treats `state_version` as an operation
+    counter will be surprised by it: answering one interaction bumps
+    `state_version` twice -- once in step 7 below, once when the
+    coordinator re-applies the transition -- so a consumer that expects
+    "one answer, one version bump" will observe +2.
+
+    That second bump is not reachable today: nothing in production calls
+    `respond()`, so no RESUME command carrying this function's payload is
+    ever staged or executed. It becomes reachable with the change that
+    gives `respond()` its first production caller, and deciding which of
+    the two writers owns the transition belongs to that change, not this
+    one. Making the transition single-writer here is not an option this
+    change can take on its own: `apply_task_control_transition` is shared
+    by eight direct call sites across five modules plus five more through
+    `transition_task_control_state_sync`, and adding a legality table to it
+    is a change to the task state machine, not to this service.
+
+    `responder_user_id` and `actor_user_id` answer two different questions
+    and are allowed to disagree. `responder_user_id` (written on the
+    interaction row) records who actually answered; for a guest principal
+    it stays `NULL`, and it can also be cleared for a `"user"` principal
+    later by that user account's own deletion (`ON DELETE SET NULL`) -- see
+    the module docstring's audit-identity paragraph for why
+    `responder_identity` and not this column is this table's audit source
+    of truth. `actor_user_id` (written on the staged command, step 8)
+    records whose identity the resulting RESUME command executes as. For a
+    guest principal, and for a non-admin `"user"` principal, that is always
+    the task's owning user: a guest's turn already runs as the entity owner
+    it is chatting through, matching the existing `public_chat_access.py`
+    precedent of dispatching guest-originated work under the owner's
+    identity, and step 3's non-admin branch requires `task.user_id ==
+    principal.user_id` to even reach here. The admin branch carries no such
+    requirement -- `principal.is_admin` authorizes on its own -- so an
+    admin's `actor_user_id` is the admin's own `principal.user_id` (which
+    can be absent, or belong to someone other than the task's owner), not
+    the task owner's. Do not "fix" this into agreement; they are answers to
+    different questions.
+
+    Of the two audit-relevant columns this function fills on the interaction
+    row, `responder_identity` is the one a reader can trust to stay
+    populated across account deletion; `responder_user_id` is a convenience
+    join that account deletion can silently null out from under it. Every
+    branch below that has to report `responder_identity` (the receipt
+    builder, the durable-graph check) reads it back off the interaction
+    row's own column rather than recomputing it from `principal`.
+
+    Step 2 loads `task` as a mapped entity, not a column tuple, specifically
+    so `apply_task_control_transition` (step 7) can call `object_session(task)`
+    on it. The cost of that choice: `task` is now a live object in this
+    session's identity map, and `apply_task_control_transition` flushes it
+    (`session.flush([task])`) before issuing its own Core UPDATE. This
+    function must not assign any attribute on `task` between step 2 and
+    step 7 -- doing so would be picked up by that flush and written out
+    alongside the CAS whether or not that was intended. Nothing between
+    those two steps needs to set an attribute on `task` at all: the fence
+    (step 6) and the CAS (step 7) are both Core statements operating on
+    ``Task``/``TaskInteractionRequest`` directly, not on this loaded
+    instance's attributes.
+
+    Statement order, each step's position load-bearing:
+
+    1. Pure Python validation against ``envelope`` alone: ``kind`` checked
+       for ``str`` before it is compared against the shared vocabulary (a
+       non-``str`` -- a ``list``, a ``dict`` -- is rejected outright rather
+       than reaching a membership test that would raise ``TypeError`` on an
+       unhashable value), ``protocol_version`` checked for ``int`` and not
+       ``bool`` before it is compared against the current version (``bool``
+       is excluded explicitly because it is a subclass of ``int`` and
+       ``True == 1`` would otherwise pass; a ``float`` like ``1.0`` is
+       rejected by the ``isinstance`` check for the same reason it would
+       otherwise compare equal), ``idempotency_key`` through
+       ``_normalize_command_id``, and ``values`` required to be a ``dict``.
+       This mirrors ``stage_interaction_request``'s own type-before-value
+       order (``task_interaction_staging.py``) for the identical reason.
+       ``values``'s dict check is a structural check
+       only, not the question-side ``parse_v1_request_payload`` contract --
+       an answer's ``values`` shape is keyed by the *question's own*
+       interaction fields, which are only known once the row is read in
+       step 4, not from ``envelope`` alone.
+       A dict whose contents cannot be rendered as JSON -- a ``datetime``,
+       a ``set``, ``bytes``, or a ``nan``/infinite float -- is rejected
+       here too, by the same ``json.dumps(..., allow_nan=False)`` probe
+       the question side runs (see ``build_v1_request_payload``). Without
+       it the first two would surface as a ``StatementError`` raised
+       inside step 6's fence UPDATE, outside the ``RespondOutcome``
+       contract entirely, and the third would be stored silently as a
+       non-JSON token.
+       Validating an answer against
+       those per-field types (its ``InteractionArg.type`` /
+       ``InteractionArg.field`` definitions) is not implemented in this
+       change; a malformed-but-dict-shaped answer reaches the fence and is
+       stored as submitted.
+    2. The first SQL statement: load ``tasks`` by id with
+       ``with_for_update(key_share=True)`` (``FOR NO KEY UPDATE`` on
+       PostgreSQL) -- absent on the given id, ``Unavailable(task_missing)``.
+    3. Pure Python authorization against the row step 2 loaded: a
+       ``"user"`` principal must own the task or be an admin; a
+       ``"guest"`` principal must satisfy the shared
+       ``task_is_owned_by_public_principal`` predicate. A principal whose
+       ``kind`` is neither ``"user"`` nor ``"guest"`` is always
+       unauthorized -- there is no third branch that defaults to allow. A
+       malformed guest principal that populates zero or more than one
+       entity-binding field makes the ownership predicate raise
+       ``ValueError``; this function catches only that one exception type
+       from that one call and treats it as unauthorized -- the same
+       fail-closed-on-a-malformed-caller behavior the predicate itself
+       documents and ``create()`` applies to the same two cases. Runs
+       before the idempotency pre-read (step 5) so an unauthorized caller
+       can never use a guessed idempotency key to read back someone else's
+       receipt.
+    4. Load the interaction row by ``(id, task_id)`` -- absent,
+       ``Unavailable(interaction_missing)``. Present but its own ``kind`` /
+       ``protocol_version`` columns disagree with ``envelope``'s,
+       ``ValidationRejected(kind_version_mismatch)``.
+    5. Idempotency pre-read against ``task_execution_commands``: a hit
+       matching this call's payload is ``Replayed`` (built from the current
+       row state); a hit that does not match is
+       ``Conflict(idempotency_key_reused)``. Runs before anchor resolution:
+       an answered row's anchor is prunable, and replay recognition must
+       not depend on one.
+    5.5. Resolve the row's resume anchor via
+       ``_resolve_read_direction_anchor`` -- ``checkpoint_unavailable`` maps
+       to ``Unavailable``, ``anchor_dangling`` to ``Stale``. Never falls back
+       to a legacy scan on failure (see that resolver's own docstring for
+       why).
+    6. The answer fence UPDATE. ``rowcount == 1`` continues; ``rowcount == 0``
+       rereads the interaction row only to confirm it did not disappear out
+       from under this transaction's own row lock, then reports
+       ``OutcomeUnknown`` without further classifying why the fence missed
+       (a fine-grained classification -- already-answered replay/conflict,
+       three terminated reasons, wrong task state, foreign run, or an
+       ownership miss, reachable on both backends (see
+       ``_answer_fence_task_predicate``) -- is not delivered in this build);
+       ``rowcount > 1``
+       is a schema invariant violation (``uq_task_interaction_active_slot``)
+       and raises.
+    7. The Task CAS via ``apply_task_control_transition``, called with no
+       ``expected_run_id`` / ``expected_state_version`` -- this function
+       takes no caller-supplied optimistic-concurrency token, so neither of
+       that helper's own staleness checks can fire. ``status`` is
+       deliberately never passed either; flipping ``Task.status`` is the
+       resume coordinator's job, not this function's. The one remaining way
+       ``apply_task_control_transition`` can raise ``StaleTaskRunError`` --
+       its own atomic UPDATE matching zero rows -- is unreachable here: step
+       2's ``FOR NO KEY UPDATE`` already holds this exact ``tasks`` row for
+       the rest of the transaction, so the CAS's ``Task.id == task_id``
+       WHERE clause cannot fail to match. This call is therefore left
+       uncaught; ``StaleTaskRunError`` surfacing here would mean that
+       invariant broke, not a normal stale-answer outcome.
+    8. Stage the RESUME command, and require the result to be a row this
+       call itself created carrying this call's own payload. Two different
+       signals report the same race -- a second writer took this
+       idempotency key between step 5's pre-read and this statement -- and
+       both get the same conservative answer. An ``IntegrityError`` is
+       raised when that writer's row lands on the unique constraint;
+       ``created=False`` is returned instead when the row was already
+       committed and visible, because ``stage_task_command`` checks for an
+       existing row before inserting and returns it rather than raising. A
+       ``created=False`` result whose ``payload_matches`` is also true is
+       treated the same way rather than as a replay: step 5 is where a
+       replay is recognized, and a hit that only becomes visible after it
+       is a race. Neither case is classified further in this build (a
+       fine-grained classification via ``classify_task_command_conflict``,
+       distinguishing a genuine replay from a real conflict, is not
+       delivered here): the whole transaction rolls back, undoing this
+       call's own fence UPDATE and CAS along with it, and this call reports
+       ``OutcomeUnknown``.
+    9. Commit. A raised exception here does not mean the write failed --
+       the acknowledgment could have been lost after the server applied it
+       -- but this build does not attempt to reconcile that against the
+       durable graph (that reconciliation is not delivered here): it
+       retires its session and reports ``OutcomeUnknown`` unconditionally,
+       leaving the caller to re-check.
+    10. After a successful commit, outside any transaction:
+        ``notify_task_command_dispatcher()``. Best-effort: a raise here
+        would turn a committed answer into a reported failure, so it is
+        caught, logged as a warning, and the dispatcher's idle poll
+        delivers the command instead.
+
+    What this function lets escape, deliberately, and what it does not.
+    The eight ``RespondOutcome`` variants cover every outcome this build
+    classifies; they do not cover operational failure. Three families are
+    left to propagate rather than folded into ``OutcomeUnknown``, because
+    a caller that cannot tell "the database is down" from "your answer was
+    ambiguous" will retry the first one forever:
+
+    - Database-level failures outside the two units caught above --
+      a deadlock, a lost connection, a pool checkout timeout -- raised by
+      any statement from step 2 onward. The three catches are narrow on
+      purpose: step 8's is ``IntegrityError`` only, step 9's covers the
+      commit only, and step 10's wraps one post-commit best-effort
+      notification whose failure is logged and swallowed.
+    - ``TaskCommandOwnerStateError`` and ``TaskCommandTaskMissing`` from
+      ``stage_task_command``. Neither is an ``IntegrityError`` subclass, so
+      step 8's catch does not see them, and both mean a precondition this
+      function already checked has changed underneath it.
+    - ``RuntimeError`` from the two structural invariants asserted above:
+      a fence rowcount above one, and an interaction row that disappeared
+      while this transaction held the tasks row lock.
+
+    On every one of those paths the ``finally`` below retires the session,
+    which rolls back an uncommitted transaction, so an escaping exception
+    leaves no partial write behind. ``StaleTaskRunError`` from step 7 is
+    documented above as unreachable and is in this same category.
+    """
+
+    if not isinstance(envelope.kind, str) or envelope.kind not in _KIND_VOCABULARY:
+        return RespondValidationRejected(reason="unknown_kind")
+    if (
+        not isinstance(envelope.protocol_version, int)
+        or isinstance(envelope.protocol_version, bool)
+        or envelope.protocol_version != INTERACTION_PROTOCOL_VERSION
+    ):
+        return RespondValidationRejected(reason="unknown_protocol_version")
+    if not isinstance(envelope.idempotency_key, str):
+        return RespondValidationRejected(reason="malformed_idempotency_key")
+    try:
+        normalized_key = _normalize_command_id(envelope.idempotency_key)
+    except ValueError:
+        return RespondValidationRejected(reason="malformed_idempotency_key")
+    if not isinstance(envelope.values, dict):
+        return RespondValidationRejected(reason="invalid_values")
+    try:
+        json.dumps(envelope.values, allow_nan=False, sort_keys=True)
+    except (TypeError, ValueError):
+        # The same probe ``build_v1_request_payload`` runs on the question
+        # side (see its own docstring), applied here for the two failure
+        # modes this side has. A ``values`` dict holding a ``datetime``,
+        # ``set``, ``bytes``, or any other object the JSON encoder does not
+        # know raises ``TypeError`` at bind time, inside the fence UPDATE
+        # -- far past every typed return above, so it would leave this
+        # function through ``sqlalchemy.exc.StatementError`` instead of one
+        # of the eight ``RespondOutcome`` variants. A float that is ``nan``
+        # or an infinity is worse because it is silent: the default encoder
+        # renders it as the bare ``NaN`` / ``Infinity`` tokens, which are
+        # not JSON, and stores them. ``allow_nan=False`` turns that second
+        # case into the ``ValueError`` caught here. Structural, like every
+        # other check in step 1 -- it asks whether these values can be
+        # stored at all, not whether they answer this particular question.
+        # ``sort_keys=True`` matches ``_canonical_payload``
+        # (``task_command_transport.py``), which sorts keys recursively: a
+        # dict mixing int and str keys passes an unsorted dump (int keys
+        # are silently coerced to strings -- the same silent-corruption
+        # class as the nan case) and then raises ``TypeError`` inside the
+        # replay comparison. The probe has to be a strict superset of every
+        # serializer downstream of step 1.
+        return RespondValidationRejected(reason="invalid_values")
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    db: "Session" = SessionLocal()
+    session_retired = False
+    try:
+        task = (
+            db.execute(
+                sa.select(Task)
+                .where(Task.id == task_id)
+                .with_for_update(key_share=True)
+            )
+            .scalars()
+            .first()
+        )
+        if task is None:
+            return RespondUnavailable(reason="task_missing")
+
+        if principal.kind == "user":
+            authorized = principal.is_admin or (
+                principal.user_id is not None and task.user_id == principal.user_id
+            )
+        elif principal.kind == "guest":
+            try:
+                authorized = task_is_owned_by_public_principal(task, principal)
+            except ValueError:
+                authorized = False
+        else:
+            authorized = False
+        if not authorized:
+            return RespondUnauthorized(reason="not_task_principal")
+
+        ir = get(db, task_id=task_id, interaction_id=interaction_id)
+        if ir is None:
+            return RespondUnavailable(reason="interaction_missing")
+        if ir.kind != envelope.kind or ir.protocol_version != envelope.protocol_version:
+            return RespondValidationRejected(reason="kind_version_mismatch")
+
+        command_payload = _respond_command_payload(
+            interaction_id=interaction_id, principal=principal, values=envelope.values
+        )
+        actor_user_id = principal.user_id
+
+        # Runs before anchor resolution below, not after it. Answering
+        # clears ``active_slot``, and the checkpoint retention pruner only
+        # protects rows whose ``active_slot`` is still set
+        # (``trace_handlers.py``), so an answered row's anchor becomes
+        # prunable the moment this service answers it and the foreign key's
+        # ``ON DELETE SET NULL`` then empties the pointer. With anchor
+        # resolution first, a retry arriving after that pruning would be
+        # told ``Stale(anchor_dangling)`` about an answer that was in fact
+        # accepted, and would never reach the replay branch below. Replay
+        # recognition is a question about this call's idempotency key and
+        # the row it already wrote; it does not need a live anchor, and
+        # must not be gated on one. Still after step 3's authorization, so
+        # an unauthorized caller can never use a guessed idempotency key to
+        # read back someone else's receipt.
+        existing_command = (
+            db.query(TaskExecutionCommand)
+            .filter(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.command_id == normalized_key,
+            )
+            .first()
+        )
+        if existing_command is not None:
+            if _matches_existing(
+                existing_command,
+                actor_user_id=actor_user_id,
+                kind=TaskCommandKind.RESUME,
+                payload=command_payload,
+            ):
+                return RespondReplayed(
+                    receipt=_respond_receipt(
+                        interaction=ir,
+                        task=task,
+                        command_db_id=int(existing_command.id),
+                        idempotency_key=normalized_key,
+                    )
+                )
+            increment_counter(COUNTER_LIFECYCLE_RESPONSE_CONFLICT)
+            return RespondConflict(reason="idempotency_key_reused")
+
+        unresolved = _resolve_read_direction_anchor(db, ir)
+        if unresolved is not None:
+            if unresolved.reason == "checkpoint_unavailable":
+                return RespondUnavailable(reason="checkpoint_unavailable")
+            return RespondStale(reason="anchor_dangling")
+
+        now = datetime.now(timezone.utc)
+        responder_user_id = principal.user_id if principal.kind == "user" else None
+        fence_result = db.execute(
+            _answer_fence_stmt(
+                interaction_id=interaction_id,
+                task_id=task_id,
+                principal=principal,
+                response_payload=envelope.values,
+                now=now,
+                responder_user_id=responder_user_id,
+                responder_identity=principal.identity_string(),
+            )
+        )
+        rowcount = int(getattr(fence_result, "rowcount", 0) or 0)
+        if rowcount > 1:
+            raise RuntimeError(
+                f"answer fence updated {rowcount} rows for interaction "
+                f"{interaction_id} on task {task_id}; "
+                "uq_task_interaction_active_slot makes this impossible"
+            )
+        if rowcount == 0:
+            # The fence UPDATE's own re-evaluation just proved this session's
+            # identity map is stale for this row (rowcount 0 means the row
+            # changed since step 4's read); without expiring first, the
+            # ORM would hand this query's result back through the same
+            # already-loaded, now-stale Python object instead of the fresh
+            # row this reread exists to see. This build does not classify
+            # why the fence missed -- a fine-grained classification against
+            # the reread row's status is not delivered here -- it only
+            # confirms the row did not disappear out from under this
+            # transaction's own row lock, then reports the miss as
+            # ``OutcomeUnknown`` (see that outcome's own docstring).
+            db.expire_all()
+            reread = get(db, task_id=task_id, interaction_id=interaction_id)
+            if reread is None:
+                raise RuntimeError(
+                    f"interaction {interaction_id} on task {task_id} disappeared "
+                    "while this transaction held the tasks row lock"
+                )
+            # The reread above already has the row in hand, so recording
+            # what it found costs no extra statement. Without this line a
+            # fence miss is the one exit a retry cannot clarify on its
+            # own: the caller is told ``OutcomeUnknown``, and a retry
+            # against a terminated, superseded, or foreign-owned row
+            # produces the same miss and the same ``OutcomeUnknown`` every
+            # time, so no amount of retrying ever reveals which of them it
+            # was -- unlike the commit-exception door below, where a retry
+            # under the same idempotency key resolves the ambiguity by
+            # itself. The classification this build does not compute is
+            # exactly the set of fields logged here.
+            logger.warning(
+                "answer fence matched zero rows for interaction %s on task "
+                "%s; reread status=%s active_slot=%s terminal_reason=%s "
+                "run_id=%s responder_identity=%s",
+                interaction_id,
+                task_id,
+                reread.status,
+                reread.active_slot,
+                reread.terminal_reason,
+                reread.run_id,
+                reread.responder_identity,
+            )
+            return RespondOutcomeUnknown()
+
+        # No expected_run_id/expected_state_version to pass: this function
+        # takes no caller-supplied optimistic-concurrency token, so
+        # apply_task_control_transition's own staleness checks never fire.
+        # StaleTaskRunError from its atomic UPDATE matching zero rows is
+        # provably unreachable here -- step 2's row lock is still held --
+        # and is deliberately left uncaught (see this function's own
+        # docstring, step 7).
+        apply_task_control_transition(task, TaskControlState.RESUME_REQUESTED)
+
+        # Capture every receipt value this transaction can still commit as
+        # plain Python locals now, before the commit below. SQLAlchemy's
+        # default ``expire_on_commit=True`` invalidates every ORM attribute
+        # on ``ir``/``task`` the instant ``db.commit()`` returns -- reading
+        # ``ir.run_id`` or ``task.state_version`` afterward would silently
+        # re-issue a SELECT against a session this function is about to
+        # decide whether to keep or retire. The fence UPDATE above is a
+        # Core statement, so ``ir``'s in-memory attributes are not synced
+        # by it; ``task``'s, by contrast, already are --
+        # ``apply_task_control_transition`` re-reads it with its own
+        # ``session.refresh(task)`` right after its atomic UPDATE. Either
+        # way these locals still have to be captured now: ``expire_on_commit``
+        # is what invalidates them the instant ``db.commit()`` returns, not
+        # whether this transaction has kept them current up to this point.
+        answered_run_id = str(ir.run_id)
+        answered_responder_identity = principal.identity_string()
+        answered_responded_at = now
+        committed_state_version = int(task.state_version)
+        committed_control_state = str(task.control_state)
+
+        try:
+            staged = stage_task_command(
+                db,
+                task_id=task_id,
+                actor_user_id=actor_user_id,
+                command_id=normalized_key,
+                kind=TaskCommandKind.RESUME,
+                payload=command_payload,
+            )
+        except IntegrityError:
+            # A second writer raced this call's own insert for the same
+            # idempotency key. This build does not classify what that
+            # means (a fine-grained classification via
+            # ``classify_task_command_conflict``, distinguishing a genuine
+            # replay from a real conflict, is not delivered here): the
+            # whole transaction rolls back, undoing this call's own fence
+            # UPDATE and CAS along with it, and this call reports the
+            # ambiguity rather than guessing which case it was.
+            db.rollback()
+            return RespondOutcomeUnknown()
+
+        if not (staged.created and staged.payload_matches):
+            # The same race the IntegrityError branch above catches,
+            # arriving through the other door. ``stage_task_command`` does
+            # not raise when a row for this ``(task_id, command_id)``
+            # already exists -- it returns that row with ``created=False``
+            # -- so a writer that committed one between step 5's pre-read
+            # and this call would otherwise leave this transaction
+            # committing the fence and the CAS while the RESUME carrying
+            # this answer was never staged at all, and returning
+            # ``RespondAccepted`` naming the other writer's row. Both doors
+            # get this build's one conservative answer: roll the whole
+            # transaction back, undoing this call's own fence UPDATE and
+            # CAS, and report the ambiguity. ``created=False`` with a
+            # matching payload is folded in here rather than reported as
+            # ``Replayed`` on purpose -- step 5 is where a replay is
+            # recognized, and a hit that only appears after it is a race,
+            # not a replay.
+            db.rollback()
+            return RespondOutcomeUnknown()
+
+        command_db_id = staged.staged_db_id
+        try:
+            db.commit()
+        except Exception:
+            # A raised exception here does not mean the write failed -- the
+            # acknowledgment could have been lost after the server applied
+            # it -- but this build does not attempt to reconcile that
+            # against the durable graph (that reconciliation is not
+            # delivered here): it retires its session and reports the
+            # ambiguity, leaving the caller to re-check.
+            logger.warning(
+                "commit failed while answering interaction %s on task %s; "
+                "the write may or may not be durable -- a retry under the "
+                "same idempotency key resolves which",
+                interaction_id,
+                task_id,
+                exc_info=True,
+            )
+            session_retired = True
+            _retire_respond_session_best_effort(db)
+            return RespondOutcomeUnknown()
+
+        try:
+            notify_task_command_dispatcher()
+        except Exception:
+            # Post-commit, and the only statement here that runs after the
+            # answer is already durable. ``notify_task_command_dispatcher``
+            # reads two module globals and calls
+            # ``loop.call_soon_threadsafe`` after checking
+            # ``loop.is_closed()``; the loop can close between that check
+            # and that call, raising ``RuntimeError``. Letting it out would
+            # turn a committed answer into a raised exception -- the caller
+            # would read it as a failure, retry, land on the replay branch,
+            # and get a receipt without a second notify anyway. Skipping
+            # the wakeup costs at most ``DISPATCHER_IDLE_SECONDS`` of
+            # latency because the dispatcher's idle poll still finds the
+            # staged command; that is the documented fallback (see
+            # ``stage_task_command``'s caller obligation (a)). Narrow on
+            # purpose: this wraps one post-commit best-effort notification
+            # and nothing else -- no statement above the commit is inside
+            # it.
+            logger.warning(
+                "failed to notify the task command dispatcher after "
+                "committing the answer for interaction %s on task %s; "
+                "the dispatcher's idle poll will still pick the command up",
+                interaction_id,
+                task_id,
+                exc_info=True,
+            )
+        return RespondAccepted(
+            receipt=InteractionResponseReceipt(
+                interaction_id=interaction_id,
+                task_id=task_id,
+                run_id=answered_run_id,
+                status="answered",
+                responded_at=answered_responded_at,
+                responder_identity=answered_responder_identity,
+                idempotency_key=normalized_key,
+                command_db_id=command_db_id,
+                task_state_version=committed_state_version,
+                task_control_state=committed_control_state,
+            )
+        )
+    finally:
+        if not session_retired:
+            _retire_respond_session_best_effort(db)
