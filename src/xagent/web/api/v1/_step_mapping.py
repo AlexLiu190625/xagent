@@ -55,11 +55,20 @@ Pairing rule:
         ``tool_execution_id`` is accepted ahead of it for compatibility
         but has no current producer. A per-invocation id is the only
         safe key when the same tool is called twice in the same step.
-      - ``react_action_*`` events pair on ``step_id``.
-      - ``dag_step_*`` events pair on ``step_id``. Both families'
-        end events project their own ``data['status']``: ``"failed"``
-        stays failed, anything else (including a missing key)
-        becomes ``"completed"``.
+      - ``react_action_*`` events pair on ``step_id``. ``react_action_end``
+        has no current producer -- the (ACTION, END, REACT) combination
+        is unreachable in this codebase today -- so the rule below is
+        untested for this family, not an observed fact.
+      - ``dag_step_*`` events pair on ``step_id``. Its end events
+        project their own ``data['status']``: ``"failed"`` stays
+        failed, anything else (including a missing key) becomes
+        ``"completed"``. ``react_action_end`` would be folded through
+        this same rule if one were ever emitted, but the rest of the
+        ACTION family (``tool_execution_end``, below) instead reads
+        ``data['success']`` -- so a future ``react_action_end``
+        producer that follows that existing sibling convention rather
+        than ``dag_step_*``'s would have its failures silently
+        projected as ``"completed"``.
       - ``dag_plan_*`` events pair on ``task_id`` (single planning
         phase per task; no per-plan identifier available).
       - ``dag_execution`` events pair on ``data['phase']``: a
@@ -293,6 +302,10 @@ class PublicStepProjector:
                 # current producer but is covered by the same rule for
                 # when one appears. A missing key defaults to
                 # "completed" -- see _terminal_status_from_event.
+                # No extra_data_fn here on purpose: a failed thinking
+                # step doesn't carry an "error" field. Its data shape
+                # is the existing contract ({"phase": ...} only), unlike
+                # the tool family below, which does attach "error".
                 finalized = _finalize_pending(
                     self._pending,
                     self._finished,

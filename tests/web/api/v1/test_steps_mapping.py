@@ -145,6 +145,32 @@ def test_dag_step_end_missing_status_key_defaults_to_completed():
     assert steps[0]["status"] == "completed"
 
 
+@pytest.mark.parametrize("raw_status", ["interrupted", "cancelled", None])
+def test_dag_step_end_unrecognized_status_falls_back_to_completed(raw_status):
+    """Any ``data['status']`` other than the literal ``"failed"`` must
+    fold to ``"completed"`` -- not pass through verbatim. This pins the
+    fallback against a refactor that swaps the dedicated helper for a
+    direct ``_data_get(event, "status", "completed")`` passthrough:
+    the three existing status tests above (``"failed"``, ``"completed"``,
+    missing key) all coincide with a passthrough's output and would
+    stay green even if an unrecognized value like ``"interrupted"``
+    leaked straight into ``PublicStepStatus``, which does not accept it.
+    """
+    data = {} if raw_status is None else {"status": raw_status}
+    events = [
+        _ev("dag_step_start", step_id="s2"),
+        _ev(
+            "dag_step_end",
+            step_id="s2",
+            data=data,
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 1
+    assert steps[0]["status"] == "completed"
+
+
 def test_dag_plan_pair_becomes_thinking_planning():
     events = [
         _ev("dag_plan_start", task_id="t1"),
