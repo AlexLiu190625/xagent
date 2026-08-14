@@ -1178,9 +1178,14 @@ async def get_chat_task_steps(
     events not on the public allow-list (LLM calls, memory ops,
     visualization ticks, most DAG bookkeeping) are silently dropped --
     intentionally, so internal trace evolution doesn't break the SDK
-    contract; the exception is dag_execution's planning/replanning/
+    contract; the exceptions are dag_execution's planning/replanning/
     executing phase transitions, which project onto a planning
-    thinking step.
+    thinking step, and a literal ``status="failed"`` on
+    dag_execute_end, which closes a still-open planning step as
+    ``failed`` instead of leaving it running forever (a plan-generation
+    exception that escapes DAGPattern.run() before it emits
+    dag_execute_end still leaves the planning step running -- see
+    ``_step_mapping.py``'s module docstring).
 
     Args:
         task_id: Path parameter; the target task's primary key.

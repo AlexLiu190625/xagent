@@ -687,7 +687,13 @@ class PublicStep(BaseModel):
             "state can still contain running steps: interrupted or "
             "cancelled steps never get an end event, so terminal "
             "state is judged from the task's own status, not from "
-            "the absence of running steps."
+            "the absence of running steps. A planning ('thinking' with "
+            "data.phase='planning') step follows the same terminal-"
+            "event rule: it is marked failed only when the DAG "
+            "pattern's own run reports a literal status='failed'; an "
+            "interrupted or waiting_for_user outcome, or a plan-"
+            "generation error that never reaches a terminal event at "
+            "all, leaves it running instead."
         ),
     )
     started_at: datetime = Field(
