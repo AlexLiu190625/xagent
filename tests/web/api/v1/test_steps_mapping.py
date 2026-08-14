@@ -101,6 +101,76 @@ def test_dag_step_pair_becomes_thinking_step():
     assert steps[0]["data"]["phase"] == "step"
 
 
+def test_dag_step_end_with_failed_status_projects_failed():
+    events = [
+        _ev("dag_step_start", step_id="s2"),
+        _ev(
+            "dag_step_end",
+            step_id="s2",
+            data={"status": "failed", "error": "boom"},
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 1
+    assert steps[0]["status"] == "failed"
+
+
+def test_dag_step_end_with_completed_status_projects_completed():
+    events = [
+        _ev("dag_step_start", step_id="s2"),
+        _ev(
+            "dag_step_end",
+            step_id="s2",
+            data={"status": "completed"},
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 1
+    assert steps[0]["status"] == "completed"
+
+
+def test_dag_step_end_missing_status_key_defaults_to_completed():
+    events = [
+        _ev("dag_step_start", step_id="s2"),
+        _ev(
+            "dag_step_end",
+            step_id="s2",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 1
+    assert steps[0]["status"] == "completed"
+
+
+@pytest.mark.parametrize("raw_status", ["interrupted", "cancelled", None])
+def test_dag_step_end_unrecognized_status_falls_back_to_completed(raw_status):
+    """Any ``data['status']`` other than the literal ``"failed"`` must
+    fold to ``"completed"`` -- not pass through verbatim. This pins the
+    fallback against a refactor that swaps the dedicated helper for a
+    direct ``_data_get(event, "status", "completed")`` passthrough:
+    the three existing status tests above (``"failed"``, ``"completed"``,
+    missing key) all coincide with a passthrough's output and would
+    stay green even if an unrecognized value like ``"interrupted"``
+    leaked straight into ``PublicStepStatus``, which does not accept it.
+    """
+    data = {} if raw_status is None else {"status": raw_status}
+    events = [
+        _ev("dag_step_start", step_id="s2"),
+        _ev(
+            "dag_step_end",
+            step_id="s2",
+            data=data,
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 1
+    assert steps[0]["status"] == "completed"
+
+
 def test_dag_plan_pair_becomes_thinking_planning():
     events = [
         _ev("dag_plan_start", task_id="t1"),
@@ -727,6 +797,15 @@ _PROJECTOR_EQUIVALENCE_CASES: Dict[str, List[SimpleNamespace]] = {
             timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
         ),
     ],
+    "dag_step_failed": [
+        _ev("dag_step_start", step_id="s2f"),
+        _ev(
+            "dag_step_end",
+            step_id="s2f",
+            data={"status": "failed", "error": "boom"},
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+    ],
     "dag_plan_pair": [
         _ev("dag_plan_start", task_id="t1"),
         _ev(
@@ -1071,10 +1150,10 @@ def test_projector_equivalent_to_batch(events):
     stays a pure driver over the projector, never a second copy of
     the folding logic.
 
-    Literal output shapes per event family are already pinned by this
-    file's 23 direct-call tests above, which now exercise the
-    projector itself. What this test guards instead is that the batch
-    driver never grows a second, independent folding implementation.
+    Literal output shapes per event family are already pinned by the
+    direct-call tests above, which now exercise the projector itself.
+    What this test guards instead is that the batch driver never grows
+    a second, independent folding implementation.
     """
     expected = map_trace_events_to_public_steps(events)
     projected = PublicStepProjector.from_history(events).materialized_steps()

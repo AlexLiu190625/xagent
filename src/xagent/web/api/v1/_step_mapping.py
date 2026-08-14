@@ -55,8 +55,20 @@ Pairing rule:
         ``tool_execution_id`` is accepted ahead of it for compatibility
         but has no current producer. A per-invocation id is the only
         safe key when the same tool is called twice in the same step.
-      - ``react_action_*`` events pair on ``step_id``.
-      - ``dag_step_*`` events pair on ``step_id``.
+      - ``react_action_*`` events pair on ``step_id``. ``react_action_end``
+        has no current producer -- the (ACTION, END, REACT) combination
+        is unreachable in this codebase today -- so the rule below is
+        untested for this family, not an observed fact.
+      - ``dag_step_*`` events pair on ``step_id``. Its end events
+        project their own ``data['status']``: ``"failed"`` stays
+        failed, anything else (including a missing key) becomes
+        ``"completed"``. ``react_action_end`` would be folded through
+        this same rule if one were ever emitted, but the rest of the
+        ACTION family (``tool_execution_end``, below) instead reads
+        ``data['success']`` -- so a future ``react_action_end``
+        producer that follows that existing sibling convention rather
+        than ``dag_step_*``'s would have its failures silently
+        projected as ``"completed"``.
       - ``dag_plan_*`` events pair on ``task_id`` (single planning
         phase per task; no per-plan identifier available).
       - ``dag_execution`` events pair on ``data['phase']``: a
@@ -285,12 +297,21 @@ class PublicStepProjector:
                 self._pending[("thinking", key)] = step
                 return [step]
             if event_type.endswith("_end"):
+                # dag_step_end always carries its own data['status']
+                # ("failed" or "completed"); react_action_end has no
+                # current producer but is covered by the same rule for
+                # when one appears. A missing key defaults to
+                # "completed" -- see _terminal_status_from_event.
+                # No extra_data_fn here on purpose: a failed thinking
+                # step doesn't carry an "error" field. Its data shape
+                # is the existing contract ({"phase": ...} only), unlike
+                # the tool family below, which does attach "error".
                 finalized = _finalize_pending(
                     self._pending,
                     self._finished,
                     ("thinking", key),
                     end_event=event,
-                    status="completed",
+                    status=_terminal_status_from_event(event),
                 )
                 return [finalized] if finalized is not None else []
             # Events in these families that are neither a start nor an
@@ -642,6 +663,20 @@ def _build_message_step(event: Any, *, role: str) -> Dict[str, Any]:
 
 
 # ===== shared finalization =====
+
+
+def _terminal_status_from_event(event: Any) -> str:
+    """Project a thinking-family end event's own ``data['status']``.
+
+    ``dag_step_end`` (and, theoretically, ``react_action_end``) carries
+    the step's own terminal status: ``"failed"`` or ``"completed"``. We
+    surface it as-is, mapping anything other than the literal string
+    ``"failed"`` -- including a missing key -- to ``"completed"``. Every
+    current ``dag_step_end`` producer sets the field explicitly; the
+    completed fallback only guards a malformed or legacy event, not a
+    real failure being swallowed.
+    """
+    return "failed" if _data_get(event, "status") == "failed" else "completed"
 
 
 def _finalize_pending(

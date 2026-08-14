@@ -634,8 +634,11 @@ PublicStepType = Literal["thinking", "tool_call", "agent_delegation", "message"]
 
 # ``running`` means a start event was seen with no matching end; a
 # terminal task can still contain running steps (interrupted/cancelled
-# steps never get an end event). ``completed`` / ``failed`` reflect
-# the end event's success flag.
+# steps never get an end event). ``completed`` / ``failed`` are read
+# off the end event, but the field that carries the outcome differs by
+# family: tool events use ``success`` (or a dedicated ``*_failed``
+# event), step events use their own ``data['status']``. See the
+# ``PublicStep.status`` field description below for the full rule.
 PublicStepStatus = Literal["running", "completed", "failed"]
 
 
@@ -678,7 +681,9 @@ class PublicStep(BaseModel):
         description=(
             "running while the corresponding end event has not yet "
             "fired, completed on a normal end event, failed when the "
-            "end event carries success=false. A task in a terminal "
+            "end event reports failure (success=false or a dedicated "
+            "*_failed event for tool events, status='failed' for step "
+            "events). A task in a terminal "
             "state can still contain running steps: interrupted or "
             "cancelled steps never get an end event, so terminal "
             "state is judged from the task's own status, not from "
