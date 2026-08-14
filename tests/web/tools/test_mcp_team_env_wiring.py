@@ -27,6 +27,7 @@ throughout):
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from types import SimpleNamespace
 
@@ -69,11 +70,13 @@ def db_session() -> Iterator[Session]:
 
 @pytest.fixture(autouse=True)
 def _reset_hooks() -> Iterator[None]:
-    yield
-    connector_team_scope.set_connector_team_hooks()
-    agent_team_scope.set_agent_team_scope_hook(None)
-    mcp_runtime.set_mcp_team_env_hook(None)
-    mcp_runtime.set_mcp_shared_env_hook(None)
+    # The env hook slots restore through the module's own snapshot
+    # primitive; the two team-scope hooks below live in other modules and
+    # have no such primitive, so they are still reset by hand.
+    with mcp_runtime.mcp_env_hooks_snapshot():
+        yield
+        connector_team_scope.set_connector_team_hooks()
+        agent_team_scope.set_agent_team_scope_hook(None)
 
 
 def _create_user(db: Session, username: str) -> User:
@@ -183,6 +186,28 @@ async def _env_for(db_session, seed, server, *, connector_team_id) -> dict:
     env = dict(config["config"].get("env") or {})
     env.pop("XAGENT_MCP_CALLER_ID", None)
     return env
+
+
+def _create_http_mcp(db: Session, name: str) -> MCPServer:
+    """A team-owned server on a non-stdio transport. The env layers are a
+    stdio-only concept, so this exists to pin that they stay there."""
+    server = MCPServer(
+        name=name,
+        description=f"{name} description",
+        managed="external",
+        transport="streamable_http",
+        url="https://example.com/mcp",
+    )
+    db.add(server)
+    db.flush()
+    return server
+
+
+async def _config_for(db_session, seed, server, *, connector_team_id) -> dict:
+    cfg = _cfg(db_session, seed, connector_team_id=connector_team_id)
+    configs = await cfg._load_mcp_server_configs()
+    (config,) = [c for c in configs if c["id"] == int(server.id)]
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -588,3 +613,197 @@ async def test_hook_owned_mappings_not_mutated_by_team_rekey(db_session, seed):
     assert env.get("TEAM_KEY") == "team-value"  # the re-key did take effect
     assert shared_hook_owned == {seed.team_server.id: {"OLD_SHARED": "old-value"}}
     assert team_hook_owned == {seed.team_server.id: {"TEAM_KEY": "team-value"}}
+
+
+# ---------------------------------------------------------------------------
+# The four picks/transport cells the suite was missing: a "shared" pick
+# with the team row present, "own" and "platform" picks on a team-owned
+# server, and a team-owned server on a non-stdio transport.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_shared_pick_with_team_row_uses_the_team_row(db_session, seed):
+    """The pick="shared" + row-PRESENT combination: the team row is the
+    shared layer and the runner's own key is not merged at all. The
+    row-ABSENT half of this pick is pinned separately above."""
+    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    mcp_runtime.set_mcp_team_env_hook(
+        lambda db, *, team_id: (
+            {seed.team_server.id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
+        )
+    )
+    _link_own_env(
+        db_session,
+        user=seed.c,
+        server=seed.team_server,
+        env={"OWN_KEY": "own-value"},
+        env_source="shared",
+    )
+
+    env = await _env_for(db_session, seed, seed.team_server, connector_team_id=T1)
+
+    assert env.get("TEAM_KEY") == "team-value"
+    assert "OWN_KEY" not in env
+    assert env.get("GLOBAL") == "global-value"
+
+
+@pytest.mark.asyncio
+async def test_own_pick_on_a_team_server_ignores_the_team_row(db_session, seed):
+    """Removing the `== "shared"` condition from the degrade in the wiring
+    block would flip this pick to the legacy fallback and leak the team row
+    into an "own" run; nothing else in this file would notice."""
+    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    mcp_runtime.set_mcp_team_env_hook(
+        lambda db, *, team_id: (
+            {seed.team_server.id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
+        )
+    )
+    _link_own_env(
+        db_session,
+        user=seed.c,
+        server=seed.team_server,
+        env={"OWN_KEY": "own-value"},
+        env_source="own",
+    )
+
+    env = await _env_for(db_session, seed, seed.team_server, connector_team_id=T1)
+
+    assert env.get("OWN_KEY") == "own-value"
+    assert "TEAM_KEY" not in env
+    assert env.get("GLOBAL") == "global-value"
+
+
+@pytest.mark.asyncio
+async def test_platform_pick_on_a_team_server_stays_global_only(db_session, seed):
+    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    mcp_runtime.set_mcp_team_env_hook(
+        lambda db, *, team_id: (
+            {seed.team_server.id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
+        )
+    )
+    _link_own_env(
+        db_session,
+        user=seed.c,
+        server=seed.team_server,
+        env={"OWN_KEY": "own-value"},
+        env_source="platform",
+    )
+
+    env = await _env_for(db_session, seed, seed.team_server, connector_team_id=T1)
+
+    assert env == {"GLOBAL": "global-value"}
+
+
+@pytest.mark.asyncio
+async def test_non_stdio_team_server_never_receives_an_env_layer(db_session):
+    """The env layers are stdio-only. The re-key block itself is transport
+    agnostic -- it rewrites the map for every team-owned id -- so this pins
+    the other end: for an HTTP-transport server the map is never read, and
+    the produced config carries no env key at all."""
+    c = _create_user(db_session, "run-owner")
+    http_server = _create_http_mcp(db_session, "team-http-server")
+    seed = SimpleNamespace(c=c, team_server=http_server, personal_server=http_server)
+
+    _install_visibility(ids_by_team={T1: {int(http_server.id)}})
+    mcp_runtime.set_mcp_team_env_hook(
+        lambda db, *, team_id: (
+            {http_server.id: {"TEAM_KEY": "team-value"}} if team_id == T1 else {}
+        )
+    )
+
+    config = await _config_for(db_session, seed, http_server, connector_team_id=T1)
+
+    assert config["transport"] == "streamable_http"
+    assert "env" not in config["config"]
+
+
+# ---------------------------------------------------------------------------
+# A stored row carrying an empty env mapping must be indistinguishable
+# from no row at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_empty_team_row_behaves_exactly_like_no_row(db_session, seed):
+    """A stored row carrying an empty env mapping must be indistinguishable
+    from no row at all. Both are run here and their outcomes compared
+    directly, so the two states cannot drift apart later."""
+    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    _link_own_env(
+        db_session,
+        user=seed.c,
+        server=seed.team_server,
+        env={"OWN_KEY": "own-value"},
+        env_source="shared",
+    )
+
+    mcp_runtime.set_mcp_team_env_hook(lambda db, *, team_id: {seed.team_server.id: {}})
+    env_empty_row = await _env_for(
+        db_session, seed, seed.team_server, connector_team_id=T1
+    )
+
+    mcp_runtime.set_mcp_team_env_hook(lambda db, *, team_id: {})
+    env_no_row = await _env_for(
+        db_session, seed, seed.team_server, connector_team_id=T1
+    )
+
+    assert env_empty_row == env_no_row
+    # And the shared outcome is the degrade, not a global-only pin.
+    assert env_empty_row == {"GLOBAL": "global-value", "OWN_KEY": "own-value"}
+
+
+# ---------------------------------------------------------------------------
+# The half-installed state: connectors are shared to a team, but no
+# credential-side hook was installed, so the shared layer silently stays
+# keyed on the running user. Warns once per process.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_warns_once_when_team_connectors_exist_without_the_env_hook(
+    db_session, seed, monkeypatch, caplog
+):
+    """The half-installed state: connectors are shared to a team, but no
+    credential-side hook was installed, so the shared layer silently stays
+    keyed on the running user. The flag is reset here because it is
+    process-wide and another test in this file reaches the same state."""
+    monkeypatch.setattr(mcp_runtime, "_team_env_hook_missing_warned", False)
+    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+
+    with caplog.at_level(logging.WARNING, logger=mcp_runtime.__name__):
+        await _env_for(db_session, seed, seed.team_server, connector_team_id=T1)
+        first = [r for r in caplog.records if "team-keyed env hook" in r.message]
+        await _env_for(db_session, seed, seed.team_server, connector_team_id=T1)
+        second = [r for r in caplog.records if "team-keyed env hook" in r.message]
+
+    assert len(first) == 1
+    assert len(second) == 1  # once per process, not once per run
+
+
+@pytest.mark.asyncio
+async def test_no_warning_when_the_env_hook_is_installed(
+    db_session, seed, monkeypatch, caplog
+):
+    monkeypatch.setattr(mcp_runtime, "_team_env_hook_missing_warned", False)
+    _install_visibility(ids_by_team={T1: {int(seed.team_server.id)}})
+    mcp_runtime.set_mcp_team_env_hook(lambda db, *, team_id: {})
+
+    with caplog.at_level(logging.WARNING, logger=mcp_runtime.__name__):
+        await _env_for(db_session, seed, seed.team_server, connector_team_id=T1)
+
+    assert not [r for r in caplog.records if "team-keyed env hook" in r.message]
+
+
+@pytest.mark.asyncio
+async def test_no_warning_when_the_team_owns_no_visible_connector(
+    db_session, seed, monkeypatch, caplog
+):
+    """The condition a deployment that uses none of the team features can
+    never reach: with no visibility hook there are no team-owned ids."""
+    monkeypatch.setattr(mcp_runtime, "_team_env_hook_missing_warned", False)
+
+    with caplog.at_level(logging.WARNING, logger=mcp_runtime.__name__):
+        await _env_for(db_session, seed, seed.personal_server, connector_team_id=T1)
+
+    assert not [r for r in caplog.records if "team-keyed env hook" in r.message]

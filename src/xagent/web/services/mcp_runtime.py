@@ -148,6 +148,40 @@ def team_env_hook_installed() -> bool:
     return _get_mcp_team_env_hook is not None
 
 
+_team_env_hook_missing_warned = False
+
+
+def warn_team_env_hook_missing_once(*, team_id: int, connector_count: int) -> None:
+    """Warn, once per process, that team-owned connectors are in scope while
+    no team-keyed env hook is installed.
+
+    An application that installed the connector visibility hook but not
+    set_mcp_team_env_hook keeps the pre-existing, user-keyed shared env
+    layer for team-owned servers, which resolves on whatever that hook was
+    wired to -- typically the running user's own team, not the team that
+    owns the governing agent. That is a half-installed state, and it is the
+    only state this warns about: an application that installs neither hook
+    never reaches this call, because without the visibility hook no server
+    is ever team-owned and the caller's own scope check is already empty.
+
+    Once per process rather than once per run: the condition is an
+    installation fact that cannot change while the process is up, so
+    repeating it per run would add volume without adding signal.
+    """
+    global _team_env_hook_missing_warned
+    if _team_env_hook_missing_warned:
+        return
+    _team_env_hook_missing_warned = True
+    logging.getLogger(__name__).warning(
+        "Team-owned MCP connectors are in scope (team_id=%s, %s connector(s)) "
+        "but no team-keyed env hook is installed: their shared env layer "
+        "stays keyed on the running user, not on the team that owns the "
+        "governing agent (see set_mcp_team_env_hook)",
+        team_id,
+        connector_count,
+    )
+
+
 def _validate_team_mcp_env_answer(answer: Any) -> dict[int, dict]:
     """Validate the team-env hook's answer shape.
 

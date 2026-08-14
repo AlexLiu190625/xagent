@@ -3513,6 +3513,7 @@ class WebToolConfig(BaseToolConfig):
                 load_user_env_overrides,
                 load_user_env_sources,
                 team_env_hook_installed,
+                warn_team_env_hook_missing_once,
             )
 
             servers = self._visible_mcp_server_query(team_mcp_ids).all()
@@ -3531,50 +3532,55 @@ class WebToolConfig(BaseToolConfig):
 
             # Re-key the shared env layer, for team-owned ids only, onto the
             # governing team's own row -- never the run owner's team, and
-            # never any other team's. Guarded on all three of
-            # connector_team_id, the installed predicate, and a non-empty
-            # team_mcp_ids so a run that touches none of this pays no team
-            # query at all.
-            if (
-                self._connector_team_id is not None
-                and team_env_hook_installed()
-                and team_mcp_ids
-            ):
-                team_env_by_id = load_team_env_overrides(
-                    self.db, self._connector_team_id
-                )
-                # Never mutate the loader-returned mappings in place: either
-                # may be the object a hook keeps its own reference to.
-                # Shallow copies of the outer dict are sufficient because
-                # every downstream consumer only reads the inner per-server
-                # values -- resolve_stdio_env's lookups, and this file's own
-                # per-server env merge in _build_mcp_server_config's stdio
-                # branch (an unconditional-overwrite `{**a, **b}` merge) --
-                # neither assigns back into shared_env_by_id or
-                # env_source_by_id. (mcp_runtime.build_mcp_runtime_connection
-                # has its own caller-id merge, but this method's own call to
-                # it, in the delegated/OAuth branch above, never passes these
-                # two maps, so it never reads them at all here.)
-                shared_env_by_id = dict(shared_env_by_id)
-                env_source_by_id = dict(env_source_by_id)
-                for server_id in team_mcp_ids:
-                    if server_id in team_env_by_id:
-                        shared_env_by_id[server_id] = team_env_by_id[server_id]
-                    else:
-                        shared_env_by_id.pop(server_id, None)
-                        if env_source_by_id.get(server_id) == "shared":
-                            # Unconditional, not only when the pop above
-                            # removed something: firing it only on an actual
-                            # removal would make a non-member runner's
-                            # outcome depend on whether the RUNNER'S OWN team
-                            # happens to hold a row for this server -- the
-                            # exact cross-team influence this seam forbids,
-                            # re-entering through a side door. Unconditional,
-                            # the outcome depends on exactly three inputs:
-                            # the governing team's row, the runner's own key,
-                            # and this pick -- the runner's own team's rows
-                            # never enter the computation.
-                            del env_source_by_id[server_id]
+            # never any other team's. The outer condition is the scope test:
+            # a run with no governing team, or one whose governing team owns
+            # nothing visible here, pays no team query at all. The inner
+            # condition then decides between re-keying and reporting that
+            # the credential-side hook was never installed -- the shared
+            # layer stays user-keyed in that state, which is exactly the
+            # cross-team influence this block exists to remove.
+            if self._connector_team_id is not None and team_mcp_ids:
+                if not team_env_hook_installed():
+                    warn_team_env_hook_missing_once(
+                        team_id=self._connector_team_id,
+                        connector_count=len(team_mcp_ids),
+                    )
+                else:
+                    team_env_by_id = load_team_env_overrides(
+                        self.db, self._connector_team_id
+                    )
+                    # Never mutate the loader-returned mappings in place: either
+                    # may be the object a hook keeps its own reference to.
+                    # Shallow copies of the outer dict are sufficient because
+                    # every downstream consumer only reads the inner per-server
+                    # values -- resolve_stdio_env's lookups, and this file's own
+                    # per-server env merge in _build_mcp_server_config's stdio
+                    # branch (an unconditional-overwrite `{**a, **b}` merge) --
+                    # neither assigns back into shared_env_by_id or
+                    # env_source_by_id. (mcp_runtime.build_mcp_runtime_connection
+                    # has its own caller-id merge, but this method's own call to
+                    # it, in the delegated/OAuth branch above, never passes these
+                    # two maps, so it never reads them at all here.)
+                    shared_env_by_id = dict(shared_env_by_id)
+                    env_source_by_id = dict(env_source_by_id)
+                    for server_id in team_mcp_ids:
+                        if server_id in team_env_by_id:
+                            shared_env_by_id[server_id] = team_env_by_id[server_id]
+                        else:
+                            shared_env_by_id.pop(server_id, None)
+                            if env_source_by_id.get(server_id) == "shared":
+                                # Unconditional, not only when the pop above
+                                # removed something: firing it only on an actual
+                                # removal would make a non-member runner's
+                                # outcome depend on whether the RUNNER'S OWN team
+                                # happens to hold a row for this server -- the
+                                # exact cross-team influence this seam forbids,
+                                # re-entering through a side door. Unconditional,
+                                # the outcome depends on exactly three inputs:
+                                # the governing team's row, the runner's own key,
+                                # and this pick -- the runner's own team's rows
+                                # never enter the computation.
+                                del env_source_by_id[server_id]
         except ConnectorRuntimeError:
             raise
         except Exception as error:
