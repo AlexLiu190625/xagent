@@ -29,35 +29,118 @@ export interface FileAccessPolicy {
    * capability get the conservative blob path.
    */
   requiresBlobFetch?: boolean
+  /**
+   * Mint a short-lived, file-scoped ticket and return a URL a media
+   * element can load directly, preserving HTTP range requests even under
+   * a policy whose previewUrl otherwise requires an Authorization header.
+   * When present, this takes priority over requiresBlobFetch; failure
+   * (e.g. offline) falls back to that capability instead.
+   */
+  getStreamingUrl?: (fileId: string) => Promise<string>
 }
 
 const encodeFileId = (fileId: string) => encodeURIComponent(fileId)
 
 const buildUrl = (path: string): string => `${getApiUrl()}${path}`
 
-const defaultFileAccessPolicy: FileAccessPolicy = {
-  previewUrl: (fileId) => buildUrl(`/api/files/preview/${encodeFileId(fileId)}`),
-  downloadUrl: (fileId) => buildUrl(`/api/files/download/${encodeFileId(fileId)}`),
-  inlinePreviewUrl: (fileId) => buildUrl(`/api/files/public/preview/${encodeFileId(fileId)}`),
-  inlineDownloadUrl: (fileId) => buildUrl(`/api/files/public/download/${encodeFileId(fileId)}`),
+const STREAM_TICKET_MINT_TIMEOUT_MS = 10_000
+
+// Single source of truth for the files router's mount prefix, shared between
+// every URL builder below and the mint-response shape check -- otherwise the
+// two could drift the way files.py's own prefix derivation was written to
+// avoid on the server side.
+const FILES_API_PREFIX = "/api/files"
+
+// Exported so tests unrelated to streaming-ticket mechanics can spread this
+// and override just `getStreamingUrl` (e.g. to undefined), rather than
+// depending on an incidental mock-shape quirk (a mocked response missing
+// `.json()`) to keep a ticket mint attempt from participating in the test.
+export const defaultFileAccessPolicy: FileAccessPolicy = {
+  previewUrl: (fileId) => buildUrl(`${FILES_API_PREFIX}/preview/${encodeFileId(fileId)}`),
+  downloadUrl: (fileId) => buildUrl(`${FILES_API_PREFIX}/download/${encodeFileId(fileId)}`),
+  inlinePreviewUrl: (fileId) =>
+    buildUrl(`${FILES_API_PREFIX}/public/preview/${encodeFileId(fileId)}`),
+  inlineDownloadUrl: (fileId) =>
+    buildUrl(`${FILES_API_PREFIX}/public/download/${encodeFileId(fileId)}`),
   relativePreviewUrl: (fileId, relativePath) => {
     const url = new URL(
-      buildUrl(`/api/files/public/preview/${encodeFileId(fileId)}`),
+      buildUrl(`${FILES_API_PREFIX}/public/preview/${encodeFileId(fileId)}`),
       typeof window === "undefined" ? "http://localhost" : window.location.origin,
     )
     url.searchParams.set("relative_path", relativePath)
     return getApiUrl() ? url.toString() : `${url.pathname}${url.search}${url.hash}`
   },
-  pdfPreviewUrl: (fileId) => buildUrl(`/api/files/preview-pdf/${encodeFileId(fileId)}`),
+  pdfPreviewUrl: (fileId) => buildUrl(`${FILES_API_PREFIX}/preview-pdf/${encodeFileId(fileId)}`),
   request: apiRequest,
   listFiles: (query) => {
     const params = new URLSearchParams({ page: "1", size: "20" })
     if (query.trim()) params.set("search", query.trim())
-    return apiRequest(buildUrl(`/api/files/list?${params.toString()}`))
+    return apiRequest(buildUrl(`${FILES_API_PREFIX}/list?${params.toString()}`))
   },
   // previewUrl needs the Bearer header apiRequest attaches; media elements
-  // cannot send it, so they must go through the blob fetch.
+  // cannot send it, so they must go through the blob fetch unless a
+  // streaming ticket is available (see getStreamingUrl below).
   requiresBlobFetch: true,
+  getStreamingUrl: async (fileId) => {
+    // A hung mint request would otherwise leave a media element stuck
+    // loading indefinitely, with nothing to time it out -- the caller's own
+    // unmount handling (isCancelled checks in useResolvedMediaUrl) ignores
+    // a late response but doesn't abort the underlying request.
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), STREAM_TICKET_MINT_TIMEOUT_MS)
+    let response: Response
+    try {
+      response = await apiRequest(
+        buildUrl(`${FILES_API_PREFIX}/stream-tickets/${encodeFileId(fileId)}`),
+        { signal: controller.signal },
+      )
+    } finally {
+      clearTimeout(timeout)
+    }
+    if (!response.ok) {
+      throw new Error(`Failed to mint stream ticket: ${response.status}`)
+    }
+    // The mint endpoint's response shape is a server contract this client
+    // doesn't otherwise validate; a malformed/unexpected payload must
+    // surface as a caught rejection (so the caller falls back to the blob
+    // path) rather than silently becoming a broken `undefined`-based URL.
+    // Bound to this exact fileId, not just the generic preview prefix: a
+    // prefix-only check would pass a path with extra segments after it
+    // (e.g. a dot-segment escaping to a different route) as long as it
+    // still started with "/api/files/preview/" -- exploitability is ~nil
+    // today (this server is the sole minter, and the ticket's own file_id
+    // claim is re-checked at redemption regardless of what path string got
+    // us there), but there's no reason to accept a shape looser than what
+    // this server actually returns. Decoded and compared, not re-encoded
+    // and string-matched: the server encodes file_id with Python's
+    // urllib.parse.quote(safe=""), which escapes a different character set
+    // than encodeURIComponent does (e.g. "!*'()" round-trip unescaped
+    // through encodeURIComponent but ARE escaped by quote) -- re-encoding
+    // fileId here and comparing strings would reject a genuinely valid
+    // response for any fileId containing one of those characters.
+    // decodeURIComponent has no such mismatch: it decodes any valid
+    // percent-encoded UTF-8 sequence regardless of which safe-set the
+    // encoder chose, so it round-trips correctly against either encoder.
+    const previewPrefix = `${FILES_API_PREFIX}/preview/`
+    const data: unknown = await response.json()
+    const path =
+      data && typeof data === "object" ? (data as { path?: unknown }).path : undefined
+    if (typeof path !== "string" || !path.startsWith(previewPrefix)) {
+      throw new Error("Stream ticket response has an unexpected shape")
+    }
+    const encodedFileIdAndQuery = path.slice(previewPrefix.length)
+    const encodedFileId = encodedFileIdAndQuery.split("?")[0]
+    let decodedFileId: string
+    try {
+      decodedFileId = decodeURIComponent(encodedFileId)
+    } catch {
+      throw new Error("Stream ticket response has an unexpected shape")
+    }
+    if (decodedFileId !== fileId) {
+      throw new Error("Stream ticket response has an unexpected shape")
+    }
+    return buildUrl(path)
+  },
 }
 
 const FileAccessContext = createContext<FileAccessPolicy>(defaultFileAccessPolicy)
@@ -99,9 +182,9 @@ const appendPublicToken = (url: string, accessToken: string): string => {
 export function createPublicFileAccessPolicy(accessToken: string): FileAccessPolicy {
   const publicUrl = (path: string) => appendPublicToken(buildUrl(path), accessToken)
   const inlinePreviewUrl = (fileId: string) =>
-    publicUrl(`/api/files/public/preview/${encodeFileId(fileId)}`)
+    publicUrl(`${FILES_API_PREFIX}/public/preview/${encodeFileId(fileId)}`)
   const inlineDownloadUrl = (fileId: string) =>
-    publicUrl(`/api/files/public/download/${encodeFileId(fileId)}`)
+    publicUrl(`${FILES_API_PREFIX}/public/download/${encodeFileId(fileId)}`)
 
   return {
     previewUrl: inlinePreviewUrl,

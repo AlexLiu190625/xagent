@@ -1,18 +1,29 @@
 import asyncio
 import logging
 import os
+from datetime import timedelta
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, Optional, Tuple, cast
+from typing import Any, Dict, NamedTuple, Optional, Tuple, cast
 from urllib.parse import quote
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+)
 from fastapi.responses import (
     FileResponse,
     RedirectResponse,
     Response,
 )
+from fastapi.security import HTTPAuthorizationCredentials
+from jose import JWTError, jwt
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
@@ -21,6 +32,7 @@ from ...config import (
     get_file_delivery_accel_redirect_prefix,
     get_file_delivery_redirect_enabled,
     get_file_delivery_signed_url_ttl_seconds,
+    get_file_stream_ticket_ttl_seconds,
     get_storage_root,
     get_uploads_dir,
 )
@@ -30,7 +42,14 @@ from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.utils.svg import rasterize_svg_bytes
 from ...core.workspace import scoped_user_root
-from ..auth_dependencies import get_current_user, is_admin_user
+from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+from ..auth_dependencies import (
+    _AccessTokenRejected,
+    _validate_access_token_claim_bindability,
+    get_current_user,
+    is_admin_user,
+    optional_security,
+)
 from ..config import (
     BINARY_EXTENSIONS,
     MAX_FILE_SIZE,
@@ -38,6 +57,7 @@ from ..config import (
     get_upload_path,
     is_allowed_file,
 )
+from ..jwt_validation import has_matching_temporal_claim_conversion_failure
 from ..models.database import get_db, release_db_connection_if_clean
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
@@ -65,6 +85,7 @@ from ..services.uploaded_file_store import (
     delete_registered_preview_caches,
     register_local_uploads_sync,
 )
+from .auth import create_access_token
 from .legacy_file import (
     infer_user_id_from_legacy_path,
     is_valid_uuid,
@@ -196,10 +217,11 @@ async def _inline_preview_response(
     media type is served as-is.
 
     ``extra_headers`` lets a caller layer route-specific headers (e.g. the
-    public/tokened route's ``Cache-Control``) without changing behavior for
-    other callers — this helper is shared by both the authenticated and
-    public preview endpoints, and the authenticated in-app path relies on
-    normal browser caching for repeatedly-rendered chat images.
+    public/tokened route's or a ticket-authenticated request's
+    ``Cache-Control``) without changing behavior for other callers — this
+    helper is shared by the authenticated, public, and ticket-authenticated
+    preview endpoints, and the plain Bearer-authenticated in-app path relies
+    on normal browser caching for repeatedly-rendered chat images.
     """
 
     if media_type == "image/svg+xml":
@@ -249,6 +271,17 @@ async def _inline_preview_response(
 # its bytes to disk cache, where they can outlive the guest session. This
 # header must NOT be applied to the authenticated preview route: chat images
 # there rely on ordinary browser caching across repeated renders.
+#
+# Reused as-is (not a separate constant) for the ticket-authenticated branch
+# of the Bearer preview route below: a stream ticket rides in a URL a media
+# element auto-fetches on render too, so the same disk-cache exposure and
+# the same fix apply -- see where this is threaded through preview_file as
+# ``cache_headers``, which is the single choke point for every
+# content-serving exit of that endpoint that can serve a ticket-
+# authenticated request (the redirect fast paths included; error exits
+# raise a bare HTTPException and carry no Cache-Control at all, which is
+# fine since 404 is the only heuristically-cacheable one and no content is
+# at stake there).
 _PUBLIC_PREVIEW_CACHE_HEADERS = {"Cache-Control": "private, no-store"}
 
 
@@ -258,6 +291,7 @@ def _durable_redirect_response(
     filename: str,
     media_type: str,
     disposition: str,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> RedirectResponse | None:
     if not get_file_delivery_redirect_enabled():
         return None
@@ -276,7 +310,13 @@ def _durable_redirect_response(
     if not signed_url:
         return None
 
-    return RedirectResponse(url=signed_url, status_code=307)
+    # extra_headers (e.g. a ticket-authenticated request's Cache-Control) is
+    # best-effort on this response only: browsers don't cache a 307 without
+    # explicit caching headers regardless, and the bytes the client actually
+    # receives come from ``signed_url`` (the durable-object provider), whose
+    # own headers -- governed by its short, provider-side expiry -- are what
+    # actually controls caching for that content, not anything set here.
+    return RedirectResponse(url=signed_url, status_code=307, headers=extra_headers)
 
 
 def _accel_redirect_response(
@@ -286,6 +326,7 @@ def _accel_redirect_response(
     filename: str,
     media_type: str,
     disposition: str,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> Response | None:
     if not get_file_delivery_accel_redirect_enabled():
         return None
@@ -303,10 +344,16 @@ def _accel_redirect_response(
     internal_uri = (
         internal_prefix.rstrip("/") + "/" + quote(relative_path.as_posix(), safe="/")
     )
+    # extra_headers is best-effort here too: whether it survives nginx's
+    # internal X-Accel-Redirect (which by default regenerates the response
+    # for the internal location rather than forwarding these headers
+    # verbatim) is reverse-proxy-config-dependent, same caveat that already
+    # applies to Content-Disposition on this exact response.
     return Response(
         status_code=200,
         media_type=media_type,
         headers={
+            **(extra_headers or {}),
             "X-Accel-Redirect": internal_uri,
             "Content-Disposition": _content_disposition_header(disposition, filename),
         },
@@ -1453,12 +1500,215 @@ async def download_file(
     )
 
 
+# Media elements (<video>/<audio>) cannot attach an Authorization header, so
+# the authenticated preview route also accepts a short-lived, file-scoped
+# ticket via the ``ticket`` query param as an alternative to the Bearer
+# header. This lets those elements load the route's URL directly instead of
+# blob-fetching the whole file first, which restores HTTP range requests
+# (seek-before-download, progressive playback) on the authenticated path —
+# the public/tokened route already gets this by carrying its own token in
+# the query string; see ``createPublicFileAccessPolicy`` on the frontend.
+#
+# The ticket only proves "a recent Bearer-authenticated request minted this
+# for this exact file_id" — it resolves the *same* User the Bearer header
+# would, so it grants no privilege beyond what that user's own Bearer token
+# already grants, and _check_file_access/_is_admin_user below still enforce
+# ownership exactly as they do for the Bearer path. Binding the ticket to one
+# file_id means a leaked ticket can only be replayed against that one file,
+# not enumerated against others. Unlike a Bearer header, though, this
+# credential rides in a URL a media element loads directly — the frontend
+# (inline-file-preview.tsx) never puts the ticketed URL anywhere a user
+# could put it in the address bar, browser history, or a copied link (the
+# "Open" affordance deliberately never exposes it either), so the realistic
+# exposure is proxy/CDN/server access logs and a devtools network panel.
+# Its TTL is kept independently short regardless
+# (get_file_stream_ticket_ttl_seconds(), minutes not hours) rather than
+# matching the user's own access token, since those vectors are still real.
+FILE_STREAM_TICKET_TYPE = "file_stream_ticket"
+
+# See _PUBLIC_PREVIEW_CACHE_HEADERS above: a stream ticket rides in a URL a
+# media element auto-fetches on render too, so preview_file below reuses
+# that same constant/rationale as ``cache_headers`` whenever a ticket
+# authenticated the request, rather than a second identical constant.
+
+
+def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:
+    try:
+        claims = jwt.decode(
+            ticket,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+            options={"verify_sub": False},
+        )
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+    except (TypeError, OverflowError) as error:
+        # Mirrors _resolve_access_token_user's guard (auth_dependencies.py):
+        # python-jose can raise these from its own temporal-claim (exp/nbf/
+        # iat) comparisons instead of JWTError for a garbage-typed claim, and
+        # this server is the sole minter today so that shouldn't happen --
+        # but a bare TypeError/OverflowError propagating out of this
+        # endpoint would 500 instead of the 401 every other malformed-ticket
+        # path here returns. Re-raise anything that *doesn't* reproduce a
+        # temporal-claim failure rather than swallowing an unrelated bug.
+        if not has_matching_temporal_claim_conversion_failure(ticket, error):
+            raise
+        raise HTTPException(
+            status_code=401, detail="Invalid or expired ticket"
+        ) from None
+
+    if (
+        claims.get("type") != FILE_STREAM_TICKET_TYPE
+        or claims.get("file_id") != file_id
+    ):
+        raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+
+    # Reuse the same claim-bindability hardening access tokens get
+    # (_resolve_access_token_user in auth_dependencies.py) rather than a
+    # second, weaker copy: exact str/int typing, utf-8-strict encodability,
+    # and the Postgres NUL-byte guard all apply identically to a ticket's
+    # sub/user_id claims. This server is the sole minter, so malformed
+    # claims aren't attacker-reachable today, but a second bespoke check
+    # here would silently drift from the first if either is ever changed.
+    try:
+        username, user_id = _validate_access_token_claim_bindability(
+            claims.get("sub"), claims.get("user_id"), db
+        )
+    except _AccessTokenRejected:
+        raise HTTPException(
+            status_code=401, detail="Invalid or expired ticket"
+        ) from None
+
+    user = db.query(User).filter(User.username == username, User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+    return user
+
+
+class _AuthenticatedFileRequest(NamedTuple):
+    """Which user asked, and whether a stream ticket is what let them in.
+
+    ``via_stream_ticket`` is a plain bool, not the raw ticket string: nothing
+    downstream needs the ticket's own content again (redemption already
+    happened above), only whether the ticket path is what authenticated this
+    request -- resolve_file_path takes the user separately, and the only
+    other read site (``cache_headers`` below) only ever checks truthiness.
+    """
+
+    user: User
+    via_stream_ticket: bool
+
+
+def _user_from_bearer_or_stream_ticket(
+    file_id: str,
+    ticket: Optional[str] = Query(default=None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+    db: Session = Depends(get_db),
+) -> _AuthenticatedFileRequest:
+    """Resolve the requesting user, and echo back which credential won.
+
+    Returning ``via_stream_ticket`` alongside ``user`` lets ``preview_file``
+    below read whether a ticket authenticated this request (to decide
+    ``cache_headers``) without redeclaring its own ``ticket: Query(...)``
+    parameter -- FastAPI would resolve that redeclaration to the same value
+    from the same request every time, but two independent declarations of
+    the same query param with no shared source is the kind of thing that
+    can silently drift if one is ever edited (e.g. a default) without the
+    other.
+    """
+    if ticket:
+        # A present ticket is checked on its own and never falls through to
+        # the Bearer header below, even if the ticket is garbage/expired and
+        # a valid Bearer header is also present: a ticket is the credential
+        # this specific request opted into (e.g. a media element's src), so
+        # treating a broken one as "ignore it, try the header instead" would
+        # mask exactly the failure (expired mid-session, wrong file_id) the
+        # caller's fallback-and-remint logic (reportLoadFailure on the
+        # frontend) exists to detect and recover from.
+        return _AuthenticatedFileRequest(
+            _user_from_stream_ticket(db, ticket, file_id), True
+        )
+    if credentials is None:
+        # This endpoint predates the ticket param and used the default
+        # HTTPBearer(auto_error=True), which raises 403 "Not authenticated"
+        # -- not 401 -- when the Authorization header is absent entirely
+        # (401 is reserved for a credential that IS present but rejected: an
+        # invalid ticket above, or an invalid/expired Bearer token via
+        # get_current_user below). Switching a completely-missing credential
+        # to 401 would be an unannounced breaking change to this
+        # pre-existing endpoint's error contract. Not preserved exactly: a
+        # malformed (non-"Bearer ...") Authorization header used to get its
+        # own "Invalid authentication credentials" detail from HTTPBearer;
+        # optional_security collapses that case into this same branch, so it
+        # now reads "Not authenticated" too. Status code is unaffected
+        # (still 403); only the message text differs, which no client here
+        # parses. Whether a missing header actually gets 403 (vs. FastAPI's
+        # own default auto_error=True behavior, which changed to 401 on
+        # some later FastAPI release) depends on the installed FastAPI
+        # version: uv.lock pins 0.115.14 (403), but pyproject.toml's own
+        # constraint is an unbounded ">=0.35.0", and an environment resolved
+        # against that constraint rather than the lock file can land on a
+        # version where this is 401 instead -- confirmed empirically against
+        # fastapi==0.135.1 while writing this. This function's own explicit
+        # 403 raise below is unaffected either way; only the *other* file
+        # routes' plain Depends(get_current_user) dependencies (which rely
+        # on HTTPBearer's built-in auto_error, not a manual check like this
+        # one) are exposed to that drift for a missing header specifically
+        # -- see test_mint_endpoint_requires_a_bearer_credential, which
+        # deliberately doesn't assert a specific code for that case.
+        raise HTTPException(status_code=403, detail="Not authenticated")
+    return _AuthenticatedFileRequest(get_current_user(credentials, db), False)
+
+
+@file_router.get("/stream-tickets/{file_id:path}", response_model=None)
+async def issue_preview_stream_ticket(
+    file_id: str,
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    """Mint a short-lived ticket for streaming this one file via query param.
+
+    Deliberately a sibling route under its own ``/stream-tickets/`` prefix
+    rather than a suffix nested under ``/preview/{file_id:path}``: the
+    ``:path`` converter matches slashes, and a legacy ``file_id`` can be an
+    arbitrary relative path (e.g. ``web_task_235/output/ticket``) — nesting
+    would risk a real file literally named ``ticket`` colliding with this
+    endpoint. A disjoint URL prefix makes that collision structurally
+    impossible regardless of ``file_id`` content.
+
+    Authorization for the file itself is deferred to (and fully enforced
+    by) ``preview_file`` when the ticket is redeemed — this endpoint only
+    needs to know a Bearer-authenticated user is asking, the same
+    precondition ``preview_file`` already requires today.
+    """
+    ticket = create_access_token(
+        {
+            "type": FILE_STREAM_TICKET_TYPE,
+            "sub": user.username,
+            "user_id": user.id,
+            "file_id": file_id,
+        },
+        expires_delta=timedelta(seconds=get_file_stream_ticket_ttl_seconds()),
+    )
+    # Derived from the router's own mount prefix rather than hardcoded, so
+    # this can't silently drift from preview_file's actual path if either
+    # ever changes. Deliberately not request.url_for(...): verified it does
+    # NOT percent-encode a path-converter parameter at all (a file_id
+    # containing e.g. "?" would corrupt the query string boundary this
+    # ticket is appended to) -- quote(..., safe='') is the safe primitive
+    # here, and a Starlette round-trip confirms it handles slash-bearing
+    # legacy file_id values correctly against ``{file_id:path}``.
+    preview_path = f"{file_router.prefix}/preview/{quote(file_id, safe='')}"
+    return {"path": f"{preview_path}?ticket={ticket}"}
+
+
 @file_router.get("/preview/{file_id:path}", response_model=None)
 async def preview_file(
     file_id: str,
-    user: User = Depends(get_current_user),
+    auth: _AuthenticatedFileRequest = Depends(_user_from_bearer_or_stream_ticket),
     db: Session = Depends(get_db),
 ) -> Any:
+    user, via_stream_ticket = auth
+    cache_headers = _PUBLIC_PREVIEW_CACHE_HEADERS if via_stream_ticket else None
     file_record, full_path, owner_user_id = _resolve_file_path(
         db, file_id, _user_id_value(user)
     )
@@ -1470,12 +1720,33 @@ async def preview_file(
         file_name = str(file_record.filename)
         media_type = guess_media_type(file_name)
         local_path_is_trusted = _is_under_uploads(full_path, owner_user_id)
+        # Deliberately not gated on "not ticket": a ticket-authenticated
+        # request is a media element loading this URL for progressive
+        # playback, which is exactly the case object-storage/nginx offload
+        # matters most for. Excluding it here would force large media
+        # through the app process on every ticketed request, defeating the
+        # performance goal this ticket mechanism exists for. cache_headers
+        # (computed above, per-request, from whether a ticket was used) is
+        # still threaded through so the no-store invariant travels with the
+        # request regardless of which exit serves it.
+        #
+        # On this exit specifically, the bytes a ticketed request actually
+        # streams are governed by get_file_delivery_signed_url_ttl_seconds()
+        # (XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECONDS, default 300s) -- not
+        # the stream ticket's own TTL (default 600s) -- since the ticket
+        # only authorizes minting this redirect once; the object store's own
+        # signed URL governs everything after that first hop. The effective
+        # session for a long video is therefore min(ticket TTL at the first
+        # hop, signed-URL TTL thereafter), and an operator tuning either
+        # XAGENT_*_TTL_SECONDS knob in isolation can unexpectedly cut
+        # playback off at the other one.
         if _preview_can_redirect(full_path, media_type):
             redirect_response = _durable_redirect_response(
                 file_ref,
                 filename=file_name,
                 media_type=media_type,
                 disposition="inline",
+                extra_headers=cache_headers,
             )
             if redirect_response is not None:
                 return redirect_response
@@ -1486,6 +1757,7 @@ async def preview_file(
                     filename=file_name,
                     media_type=media_type,
                     disposition="inline",
+                    extra_headers=cache_headers,
                 )
                 if accel_response is not None:
                     return accel_response
@@ -1506,6 +1778,7 @@ async def preview_file(
                 filename=file_name,
                 media_type=media_type,
                 file_id=file_id if is_valid_uuid(file_id) else None,
+                extra_headers=cache_headers,
             )
     else:
         # For legacy files without records, check ownership
@@ -1520,12 +1793,15 @@ async def preview_file(
         raise HTTPException(status_code=404, detail="File not found")
 
     if _preview_can_redirect(full_path, media_type):
+        # See the comment on the equivalent branch above: not gated on
+        # ticket presence, for the same reason.
         accel_response = _accel_redirect_response(
             full_path,
             owner_user_id=owner_user_id,
             filename=file_name,
             media_type=media_type,
             disposition="inline",
+            extra_headers=cache_headers,
         )
         if accel_response is not None:
             return accel_response
@@ -1535,6 +1811,7 @@ async def preview_file(
         filename=file_name,
         media_type=media_type,
         file_id=file_id if is_valid_uuid(file_id) else None,
+        extra_headers=cache_headers,
     )
 
 
