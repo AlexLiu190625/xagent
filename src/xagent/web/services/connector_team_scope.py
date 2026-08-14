@@ -72,14 +72,25 @@ class TeamConnectorVisibilityHook(Protocol):
     MCP transports, a team-owned server with no personal link for the
     running user executes using the shared definition row's own stored
     credentials, not the runner's. (OAuth transports fail closed instead,
-    for lack of a token to resolve.) For stdio specifically, the shared env
-    layer a team-owned server resolves is keyed on the team this hook
-    answers for -- the team that owns the *governing agent* -- never on any
-    other team, including one the running user happens to belong to: when
-    the governing team has no stored row for that server, there is no
-    shared layer at all, and a runner whose own env-source pick is
-    "shared" falls back to their own stored key instead of silently
-    borrowing another team's row. Custom APIs are starker: there is no
+    for lack of a token to resolve.) For stdio specifically, **once an
+    application has also installed the separate, credential-side hook**
+    (``mcp_runtime.set_mcp_team_env_hook`` -- a different socket from this
+    one, installed independently), the shared env layer a team-owned
+    server resolves is keyed on the team this hook answers for -- the team
+    that owns the *governing agent* -- never on any other team, including
+    one the running user happens to belong to: when the governing team has
+    no stored row for that server, there is no shared layer at all, and a
+    runner whose own env-source pick is "shared" falls back to their own
+    stored key instead of silently borrowing another team's row. An
+    application that installs only this visibility hook, without also
+    installing ``set_mcp_team_env_hook``, gets none of that: the shared env
+    layer then still resolves however the pre-existing, user-keyed
+    ``set_mcp_shared_env_hook`` was wired, which can and typically does key
+    on the *running user's own* team rather than the governing one --
+    exactly the cross-team leak the paragraph above describes as closed.
+    Deciding to share a team-owned MCP server through this hook is a
+    visibility decision only; closing the credential leak is a second,
+    separate installation step. Custom APIs are starker: there is no
     per-member credential override layer at all, and no transport-level
     exception either -- every custom API always executes with whatever is
     stored on its shared definition row (headers, a static API key, and so

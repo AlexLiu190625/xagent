@@ -75,7 +75,10 @@ def load_user_env_sources(db: Any, user_id: int | None) -> dict[int, str]:
 # Hook signature: (db, user_id) -> {mcpserver_id: {env}}. An application layer
 # (e.g. a multi-tenant deployment) can inject a shared env layer that sits between
 # the global and per-user env via set_mcp_shared_env_hook(). The core is agnostic
-# to what "shared" means (team, org, ...); default: no shared layer.
+# to what "shared" means (team, org, ...); default: no shared layer. For team
+# semantics specifically -- keying the shared layer on the team that owns the
+# governing agent, rather than on the running user -- install the separate,
+# team-keyed socket below instead: see set_mcp_team_env_hook.
 _get_mcp_shared_env_hook: Callable[[Any, int | None], dict[int, dict]] | None = None
 
 
@@ -163,10 +166,16 @@ def _validate_team_mcp_env_answer(answer: Any) -> dict[int, dict]:
             f"got {type(answer).__name__}"
         )
     for key, value in answer.items():
-        if isinstance(key, bool) or not isinstance(key, int):
+        if isinstance(key, bool):
             raise ValueError(
                 "team env hook returned a malformed answer: key "
                 f"{key!r} is not a server id (must be int, not bool)"
+            )
+        if not isinstance(key, int):
+            raise ValueError(
+                "team env hook returned a malformed answer: key "
+                f"{key!r} is not a server id (must be int, got "
+                f"{type(key).__name__})"
             )
         if not isinstance(value, dict):
             raise ValueError(
@@ -197,12 +206,14 @@ def load_team_env_overrides(db: Any, team_id: int | None) -> dict[int, dict]:
     if team_id is None or _get_mcp_team_env_hook is None:
         return {}
     try:
-        answer = _get_mcp_team_env_hook(db, team_id=team_id)
+        answer = _get_mcp_team_env_hook(db, team_id=int(team_id))
         return _validate_team_mcp_env_answer(answer)
     except ConnectorRuntimeError:
         raise
     except Exception as exc:
-        logging.getLogger(__name__).warning("team env hook failed", exc_info=True)
+        logging.getLogger(__name__).warning(
+            "team env hook failed for team %s", team_id, exc_info=True
+        )
         raise ConnectorRuntimeError(
             ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
             "Team MCP env is unavailable.",

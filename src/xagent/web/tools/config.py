@@ -3547,12 +3547,14 @@ class WebToolConfig(BaseToolConfig):
                 # may be the object a hook keeps its own reference to.
                 # Shallow copies of the outer dict are sufficient because
                 # every downstream consumer only reads the inner per-server
-                # values -- resolve_stdio_env's lookups, this file's own
+                # values -- resolve_stdio_env's lookups, and this file's own
                 # per-server env merge in _build_mcp_server_config's stdio
-                # branch, and mcp_runtime.build_mcp_runtime_connection's
-                # caller-id env merge (both of the latter two are
-                # unconditional-overwrite `{**a, **b}` merges) -- none of
-                # them assign back into shared_env_by_id or env_source_by_id.
+                # branch (an unconditional-overwrite `{**a, **b}` merge) --
+                # neither assigns back into shared_env_by_id or
+                # env_source_by_id. (mcp_runtime.build_mcp_runtime_connection
+                # has its own caller-id merge, but this method's own call to
+                # it, in the delegated/OAuth branch above, never passes these
+                # two maps, so it never reads them at all here.)
                 shared_env_by_id = dict(shared_env_by_id)
                 env_source_by_id = dict(env_source_by_id)
                 for server_id in team_mcp_ids:
