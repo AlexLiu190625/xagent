@@ -63,17 +63,25 @@ def test_knowledge_base_team_hooks_delegate_with_none_session():
     access = kb_scope.KnowledgeBaseAccess(
         name="shared", storage_user_id=42, team_owned=True
     )
-    kb_scope.set_knowledge_base_team_hooks(
-        visibility=lambda db, user_id: [access],
-        access=lambda db, user_id, name, action: access,
-        renamed=lambda db, user_id, old, new: lifecycle_calls.append(
-            ("rename", db, user_id, old, new)
-        ),
-        deleted=lambda db, user_id, name, new: lifecycle_calls.append(
-            ("delete", db, user_id, name, new)
-        ),
+    team_access = kb_scope.KnowledgeBaseAccess(
+        name="team-doc",
+        storage_user_id=99,
+        team_owned=True,
+        can_edit=False,
+        can_delete=False,
     )
-    try:
+    with kb_scope.snapshot_knowledge_base_team_hooks():
+        kb_scope.set_knowledge_base_team_hooks(
+            visibility=lambda db, user_id: [access],
+            access=lambda db, user_id, name, action: access,
+            renamed=lambda db, user_id, old, new: lifecycle_calls.append(
+                ("rename", db, user_id, old, new)
+            ),
+            deleted=lambda db, user_id, name, new: lifecycle_calls.append(
+                ("delete", db, user_id, name, new)
+            ),
+            team_visibility=lambda db, *, team_id: [team_access],
+        )
         assert kb_scope.visible_team_knowledge_bases(None, 7) == [access]
         assert kb_scope.resolve_knowledge_base_access(None, 7, "shared") == access
         kb_scope.notify_knowledge_base_renamed(None, 42, "old", "new")
@@ -82,5 +90,12 @@ def test_knowledge_base_team_hooks_delegate_with_none_session():
             ("rename", None, 42, "old", "new"),
             ("delete", None, 42, "new", None),
         ]
-    finally:
+        assert kb_scope.team_knowledge_bases(None, team_id=5) == [team_access]
+        assert kb_scope.team_knowledge_base_hook_installed() is True
+
+        # A reset-all call clears every slot, including the team-keyed one --
+        # this is the property the snapshot primitive above restores after
+        # this block exits.
         kb_scope.set_knowledge_base_team_hooks()
+        assert kb_scope.team_knowledge_base_hook_installed() is False
+        assert kb_scope.visible_team_knowledge_bases(None, 7) == []

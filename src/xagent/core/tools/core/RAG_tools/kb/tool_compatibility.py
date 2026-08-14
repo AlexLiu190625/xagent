@@ -72,6 +72,7 @@ class KBToolCompatibilityFacade:
         tool_args: ListKnowledgeBasesArgs,
         user_id: Optional[int] = None,
         is_admin: bool = False,
+        governing_team_id: Optional[int] = None,
     ) -> ListKnowledgeBasesResult:
         from ... import document_search as core_document_search
 
@@ -80,6 +81,7 @@ class KBToolCompatibilityFacade:
                 tool_args,
                 user_id=user_id,
                 is_admin=is_admin,
+                governing_team_id=governing_team_id,
             )
 
     async def find_missing_knowledge_bases(
@@ -102,6 +104,7 @@ class KBToolCompatibilityFacade:
         tool_args: KnowledgeSearchArgs,
         user_id: Optional[int] = None,
         is_admin: bool = False,
+        governing_team_id: Optional[int] = None,
     ) -> KnowledgeSearchResult:
         from ... import document_search as core_document_search
 
@@ -110,6 +113,7 @@ class KBToolCompatibilityFacade:
                 tool_args,
                 user_id=user_id,
                 is_admin=is_admin,
+                governing_team_id=governing_team_id,
             )
 
     def get_list_knowledge_bases_tool(
@@ -117,6 +121,7 @@ class KBToolCompatibilityFacade:
         allowed_collections: Optional[list[str]] = None,
         user_id: Optional[int] = None,
         is_admin: bool = False,
+        governing_team_id: Optional[int] = None,
     ) -> ListKnowledgeBasesTool:
         from ....adapters.vibe import document_search as vibe_document_search
 
@@ -124,6 +129,7 @@ class KBToolCompatibilityFacade:
             allowed_collections=allowed_collections,
             user_id=user_id,
             is_admin=is_admin,
+            governing_team_id=governing_team_id,
         )
 
     def get_knowledge_search_tool(
@@ -133,6 +139,7 @@ class KBToolCompatibilityFacade:
         allowed_collections: Optional[list[str]] = None,
         user_id: Optional[int] = None,
         is_admin: bool = False,
+        governing_team_id: Optional[int] = None,
     ) -> KnowledgeSearchTool:
         from ....adapters.vibe import document_search as vibe_document_search
 
@@ -142,6 +149,7 @@ class KBToolCompatibilityFacade:
             allowed_collections=allowed_collections,
             user_id=user_id,
             is_admin=is_admin,
+            governing_team_id=governing_team_id,
         )
 
     async def create_knowledge_tools(

@@ -54,9 +54,11 @@ def _install_collections(
     monkeypatch: pytest.MonkeyPatch, *names: str, embeddings: int = 10
 ) -> None:
     async def _list(
-        user_id: int | None = None, is_admin: bool = False
+        user_id: int | None = None,
+        is_admin: bool = False,
+        governing_team_id: int | None = None,
     ) -> ListCollectionsResult:
-        del user_id, is_admin
+        del user_id, is_admin, governing_team_id
         listing = _collections(*names)
         for collection in listing.collections:
             collection.embeddings = embeddings
@@ -163,9 +165,11 @@ async def test_aggregation_order_totals_and_empty_collections_are_preserved(
     """Order follows the collection list and zero-embedding collections are skipped."""
 
     async def _list(
-        user_id: int | None = None, is_admin: bool = False
+        user_id: int | None = None,
+        is_admin: bool = False,
+        governing_team_id: int | None = None,
     ) -> ListCollectionsResult:
-        del user_id, is_admin
+        del user_id, is_admin, governing_team_id
         listing = _collections("alpha", "empty", "beta")
         listing.collections[1].embeddings = 0
         return listing
@@ -331,9 +335,11 @@ async def test_a_broken_collection_object_cannot_escape_into_the_gather(
             raise RuntimeError("rerank binding is corrupt")
 
     async def _list(
-        user_id: int | None = None, is_admin: bool = False
+        user_id: int | None = None,
+        is_admin: bool = False,
+        governing_team_id: int | None = None,
     ) -> ListCollectionsResult:
-        del user_id, is_admin
+        del user_id, is_admin, governing_team_id
         listing = _collections("alpha")
         listing.collections.append(_Exploding())  # type: ignore[arg-type]
         return listing

@@ -5173,6 +5173,11 @@ async def list_collections_api(
         collections_by_name = {
             collection.name: collection for collection in personal_collections
         }
+        # Runner-keyed on purpose: this endpoint answers "what can the
+        # requesting user see", the same question for every user regardless
+        # of which agent (if any) they are about to run, so it stays on the
+        # user-keyed overlay hook and never resolves against a governing
+        # agent's team.
         team_refs = visible_team_knowledge_bases(db, int(_user.id))
         refs_by_owner: dict[int, list[KnowledgeBaseAccess]] = {}
         for ref in team_refs:
