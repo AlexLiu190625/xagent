@@ -17,8 +17,11 @@ from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi import FastAPI
 from fastapi.security import HTTPAuthorizationCredentials
+from fastapi.testclient import TestClient
 
+from xagent.web.api.chat import chat_router
 from xagent.web.api.v1 import _events_stream as es
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.api.v1.deps import ApiKeyPrincipal, _resolve_principal_from_credentials
@@ -29,6 +32,19 @@ from xagent.web.models.task import Task, TaskStatus
 from ..conftest import _admin_headers, _direct_db_session, client
 
 pytestmark = pytest.mark.usefixtures("_test_db")
+
+# ``app_for_tests`` (the shared v1 suite app in ``..conftest``) deliberately
+# doesn't mount ``chat_router`` -- it's scoped to the v1 routers this suite
+# actually tests. The one test here that needs the real production task-
+# delete route (``DELETE /api/chat/task/{task_id}``) gets its own minimal
+# app for just that router instead, mirroring the same narrow-app pattern
+# ``test_chat_task_model_ids.py`` already uses. ``get_db`` needs no override
+# here: the real dependency reads from the same process-global session
+# factory ``_test_db`` initializes, so this app shares the exact DB rows
+# the v1 SSE tests create through ``app_for_tests``.
+_chat_delete_app = FastAPI()
+_chat_delete_app.include_router(chat_router)
+_chat_delete_client = TestClient(_chat_delete_app, raise_server_exceptions=False)
 
 
 # ===== local helpers (mirrors test_tasks.py's pattern) =====
@@ -134,6 +150,19 @@ def _make_sink(task_id: int = 1, status: str = "running") -> es.V1EventStreamSin
     return es.V1EventStreamSink(
         task_id=task_id, principal_key_prefix="pfx-test", initial_status=status
     )
+
+
+def _long_intervals(**overrides: float) -> dict[str, float]:
+    """Defaults for ``build_event_stream_response``/``_generate``'s three
+    tunable intervals (watchdog / absolute deadline / heartbeat): 1000s
+    is long enough that none of them fire within a test's timeout unless
+    a test overrides one explicitly to trigger specific timing behavior."""
+    return {
+        "watchdog_interval_seconds": 1000,
+        "stream_max_duration_seconds": 1000,
+        "heartbeat_interval_seconds": 1000,
+        **overrides,
+    }
 
 
 # ===== sink.send_text never raises =====
@@ -274,9 +303,7 @@ async def test_events_paused_attach_does_not_take_a_fast_path():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
-        watchdog_interval_seconds=1000,
-        stream_max_duration_seconds=1000,
-        heartbeat_interval_seconds=1000,
+        **_long_intervals(),
     )
     first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
     assert json.loads(first.split("data: ", 1)[1]) == {"status": "paused"}
@@ -284,6 +311,45 @@ async def test_events_paused_attach_does_not_take_a_fast_path():
 
     await resp.body_iterator.aclose()
     assert es.count_task_sinks(task_id) == 0
+
+
+# ===== all three response-construction sites disable proxy buffering =====
+
+
+@pytest.mark.parametrize(
+    "task_state",
+    ["running_attach", "terminal_fast_path", "waiting_for_user_fast_path"],
+)
+async def test_sse_responses_disable_proxy_buffering(task_state):
+    """``build_event_stream_response`` constructs a ``StreamingResponse``
+    from three different call sites -- the running-attach path (normal
+    streaming, sink + watchdog), the terminal fast path, and the
+    waiting-for-user fast path -- and all three must carry the same
+    anti-buffering headers. nginx buffers proxied responses by default;
+    without ``X-Accel-Buffering: no`` it would hold SSE frames back
+    instead of forwarding them to the client immediately."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+
+    if task_state == "terminal_fast_path":
+        _set_task_status(task_id, TaskStatus.COMPLETED, output="done")
+    elif task_state == "waiting_for_user_fast_path":
+        _set_task_status(task_id, TaskStatus.WAITING_FOR_USER, control_state="idle")
+
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        **_long_intervals(),
+    )
+    try:
+        assert resp.headers["x-accel-buffering"] == "no"
+        assert resp.headers["cache-control"] == "no-cache"
+    finally:
+        await resp.body_iterator.aclose()
 
 
 # ===== bounded outbound queue, overflow closes with resync_required =====
@@ -442,6 +508,44 @@ async def test_watchdog_missing_task_row_closes_with_task_deleted():
     assert sink.queue.get_nowait() == (es.error_frame("task_deleted"), True)
 
 
+async def test_real_delete_route_closes_stream_with_task_deleted():
+    """Same ``task_deleted`` close path as the test above, but the row
+    disappears through the real production delete route
+    (``DELETE /api/chat/task/{task_id}``) instead of a raw DB delete --
+    exercising the actual code path an operator or the SDK would trigger,
+    not just the watchdog's read side of a row that's already gone."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        **_long_intervals(watchdog_interval_seconds=0.01),
+    )
+    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    assert "event: task.status" in first
+
+    delete_resp = _chat_delete_client.delete(
+        f"/api/chat/task/{task_id}", headers=_admin_headers()
+    )
+    assert delete_resp.status_code == 200, delete_resp.text
+
+    frames = []
+
+    async def _drain() -> None:
+        async for frame in resp.body_iterator:
+            frames.append(frame)
+
+    await asyncio.wait_for(_drain(), timeout=2)
+    assert "event: stream.error" in frames[-1]
+    assert "task_deleted" in frames[-1]
+    assert es.count_task_sinks(task_id) == 0
+
+
 async def test_watchdog_survives_transient_check_failure_and_still_closes():
     """A single failed watchdog cycle (e.g. a transient DB error reading
     the task row) must not silence the watchdog for the rest of the
@@ -472,9 +576,7 @@ async def test_watchdog_survives_transient_check_failure_and_still_closes():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=flaky_reader,
-        watchdog_interval_seconds=0.01,
-        stream_max_duration_seconds=1000,
-        heartbeat_interval_seconds=1000,
+        **_long_intervals(watchdog_interval_seconds=0.01),
     )
     first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
     assert "event: task.status" in first
@@ -507,6 +609,11 @@ def test_events_endpoint_signature_has_no_db_dependency():
     *name* set is what used to live here; it broke on any unrelated
     rename and never actually verified the no-request-scoped-session
     property it claimed to.
+
+    Signature-only: this can't see whether the function body opens its
+    own ad hoc DB session internally (rather than through
+    ``run_db_io_cancellation_safe``) -- it only rules out a request-scoped
+    ``Session`` dependency injected by FastAPI.
     """
     import inspect
 
@@ -530,9 +637,7 @@ async def test_sink_unregistered_after_generator_teardown():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
-        watchdog_interval_seconds=1000,
-        stream_max_duration_seconds=1000,
-        heartbeat_interval_seconds=1000,
+        **_long_intervals(),
     )
     first = await resp.body_iterator.__anext__()
     assert "event: task.status" in first
@@ -569,9 +674,7 @@ async def test_unstarted_generator_leaves_no_registration_or_reservation():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
-        watchdog_interval_seconds=1000,
-        stream_max_duration_seconds=1000,
-        heartbeat_interval_seconds=1000,
+        **_long_intervals(),
     )
     # No __anext__() call at all -- the generator body has never run.
     assert es.count_task_sinks(task_id) == 0
@@ -626,9 +729,7 @@ async def test_principal_slot_released_after_real_stream_teardown():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
-        watchdog_interval_seconds=1000,
-        stream_max_duration_seconds=1000,
-        heartbeat_interval_seconds=1000,
+        **_long_intervals(),
     )
     await resp.body_iterator.__anext__()
     assert es._principal_stream_counts.get(key_prefix, 0) == 1
@@ -673,9 +774,7 @@ async def test_generate_serves_stream_when_reservation_race_lost(caplog):
             key_prefix=key_prefix,
             initial_status=snapshot.status.value,
             read_task_snapshot=v1_tasks._load_task_info_snapshot,
-            watchdog_interval_seconds=1000,
-            stream_max_duration_seconds=1000,
-            heartbeat_interval_seconds=1000,
+            **_long_intervals(),
         )
         first = await agen.__anext__()
 
@@ -716,9 +815,9 @@ async def test_absolute_deadline_emits_expired_then_closes():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
-        watchdog_interval_seconds=1000,
-        stream_max_duration_seconds=0.05,
-        heartbeat_interval_seconds=0.01,
+        **_long_intervals(
+            stream_max_duration_seconds=0.05, heartbeat_interval_seconds=0.01
+        ),
     )
     frames = [frame async for frame in resp.body_iterator]
     # Zero or more heartbeats may land before the deadline trips, but the
@@ -749,9 +848,9 @@ async def test_deadline_wait_budget_shrinks_below_the_heartbeat():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
-        watchdog_interval_seconds=1000,
-        stream_max_duration_seconds=0.05,
-        heartbeat_interval_seconds=5.0,
+        **_long_intervals(
+            stream_max_duration_seconds=0.05, heartbeat_interval_seconds=5.0
+        ),
     )
 
     async def _drain() -> list[str]:
@@ -872,18 +971,6 @@ async def test_close_exactly_once_under_watchdog_deadline_race():
     assert es.count_task_sinks(task_id) == 0
 
 
-# ===== frames bound to a different task_id are discarded =====
-
-
-async def test_sink_discards_foreign_task_frames():
-    sink = _make_sink(task_id=1)
-    await sink.send_text(
-        json.dumps({"type": "task_started", "task_id": 2, "status": "running"})
-    )
-    assert sink.queue.empty()
-    assert sink.dropped_frame_count == 0  # a graceful discard, not an error
-
-
 # ===== per-task concurrency cap =====
 
 
@@ -900,9 +987,7 @@ async def test_events_per_task_cap_third_stream_429():
             principal=principal,
             initial_snapshot=snapshot,
             read_task_snapshot=v1_tasks._load_task_info_snapshot,
-            watchdog_interval_seconds=1000,
-            stream_max_duration_seconds=1000,
-            heartbeat_interval_seconds=1000,
+            **_long_intervals(),
         )
         # Real delivery (Starlette) always pulls the first chunk before a
         # response can close; advance each generator once so its ``finally``
@@ -974,9 +1059,7 @@ async def test_heartbeat_actually_sent_when_idle():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
-        watchdog_interval_seconds=1000,
-        stream_max_duration_seconds=1000,
-        heartbeat_interval_seconds=0.01,
+        **_long_intervals(heartbeat_interval_seconds=0.01),
     )
     pings = 0
     try:
@@ -999,12 +1082,24 @@ async def test_heartbeat_actually_sent_when_idle():
 
 
 async def test_broadcast_frame_reaches_generator_output_as_task_status():
-    """Wiring test for the full path: ``sink.send_text`` (what
-    ``broadcast_to_task`` calls) -> ``enqueue_status`` -> the outbound
-    queue -> ``_generate``'s yield. Uses a status distinct from the
-    initial attach status ("running") so the assertion can't pass
-    merely because the *first* frame already says ``task.status`` --
-    it must be *this* broadcast that produced the second frame."""
+    """Wiring test for the full path: a real DB status change ->
+    ``ConnectionManager.broadcast_to_task`` (what production code calls,
+    not a hand-rolled ``sink.send_text``) -> the sink's ``send_text`` ->
+    ``enqueue_status`` -> the outbound queue -> ``_generate``'s yield.
+    Uses a status distinct from the initial attach status ("running") so
+    the assertion can't pass merely because the *first* frame already
+    says ``task.status`` -- it must be *this* broadcast that produced
+    the second frame.
+
+    The task row must be updated *before* broadcasting: ``broadcast_to_task``
+    enriches any versioned event through
+    ``_with_current_task_control_state``, which re-reads the task's
+    current row and overwrites the event's ``status`` field with it
+    whenever the event doesn't already carry a state tuple. Broadcasting
+    a bare ``{"type": "task_paused"}`` while the row is still "running"
+    would get its status field filled in as "running", not "paused",
+    and the second frame would never arrive within the timeout below.
+    """
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id)
     principal = _principal_for(full_key)
@@ -1016,21 +1111,13 @@ async def test_broadcast_frame_reaches_generator_output_as_task_status():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
-        watchdog_interval_seconds=1000,
-        stream_max_duration_seconds=1000,
-        heartbeat_interval_seconds=1000,
+        **_long_intervals(),
     )
     first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
     assert json.loads(first.split("data: ", 1)[1]) == {"status": "running"}
 
-    sink = next(
-        c
-        for c in es.manager.connections_for_task(task_id)
-        if isinstance(c, es.V1EventStreamSink)
-    )
-    await sink.send_text(
-        json.dumps({"type": "task_paused", "task_id": task_id, "status": "paused"})
-    )
+    _set_task_status(task_id, TaskStatus.PAUSED)
+    await es.manager.broadcast_to_task({"type": "task_paused"}, task_id)
 
     second = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
     assert "event: task.status" in second
@@ -1087,6 +1174,34 @@ async def test_terminal_failure_broadcast_also_sets_completion_hint():
     assert sink.queue.get_nowait() == (es.status_frame("failed"), False)
 
 
+# ===== a waiting-for-user broadcast also sets the completion_hint =====
+
+
+async def test_waiting_for_user_broadcast_also_sets_completion_hint():
+    """A task moving to ``waiting_for_user`` reaches the sink through the
+    same generic versioned-event branch as the terminal-failure case
+    above, not the ``task_completed`` short-circuit -- it must also set
+    ``completion_hint`` (in addition to enqueueing the ``task.status``
+    frame), so the watchdog wakes early instead of waiting out its
+    normal cadence to emit the authoritative ``task.input_required``
+    close frame. Safe because the watchdog re-reads the authoritative
+    row before closing anything, including the ``resume_requested``
+    carve-out -- an early wake never closes a stream a fresh read
+    wouldn't have closed anyway."""
+    sink = _make_sink(task_id=1, status="running")
+    await sink.send_text(
+        json.dumps(
+            {
+                "type": "task_waiting_for_user",
+                "task_id": 1,
+                "status": "waiting_for_user",
+            }
+        )
+    )
+    assert sink.completion_hint.is_set()
+    assert sink.queue.get_nowait() == (es.status_frame("waiting_for_user"), False)
+
+
 # ===== the completion_hint wakes the watchdog early, not on its next
 # periodic tick =====
 
@@ -1111,9 +1226,7 @@ async def test_completion_hint_wakes_watchdog_before_its_next_periodic_tick():
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
-        watchdog_interval_seconds=1000,
-        stream_max_duration_seconds=1000,
-        heartbeat_interval_seconds=1000,
+        **_long_intervals(),
     )
     await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
 

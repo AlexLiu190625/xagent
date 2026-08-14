@@ -1237,13 +1237,21 @@ async def stream_chat_task_events(
         line is sent whenever 15s pass without any other frame going
         out, to keep the connection alive -- not on a fixed 15s
         cadence regardless of activity.
+      - Frame sequence into ``task.completed``: a task that fails emits
+        ``task.status`` (``"failed"``) from the failure broadcast first,
+        then the watchdog's authoritative ``task.completed`` close
+        frame. A task that succeeds has no such intermediate broadcast,
+        so it goes straight to ``task.completed`` with no preceding
+        ``task.status``. Attaching to a task that's already terminal
+        (the fast path below) always sends both frames regardless.
       - Attaching to an already-finished task is not an error: the
         stream opens, emits ``task.status`` then ``task.completed``,
         and closes immediately.
       - The stream force-closes with ``task.input_required``
         (``prompt`` always ``null`` at this stage) if the task is
         found waiting on user input; with ``stream.error`` if the
-        API key is revoked/paused, the task row disappears, the
+        API key is revoked/paused, the task row disappears (within one
+        watchdog cycle, 30s in production, of the delete), the
         client can't keep up (``resync_required``), or the stream has
         been open for the 1-hour maximum (``stream_expired``, emitted
         before the connection closes so it's distinguishable from a
@@ -1279,7 +1287,13 @@ async def stream_chat_task_events(
             it checks before it increments; it's specifically the
             count of open streams that can run ahead of it. No stream
             is aborted once opened; both counts self-heal as open
-            streams close.
+            streams close. Both caps are per-process: a multi-worker
+            deployment counts independently in each worker process, so
+            the effective cluster-wide limit is the per-process cap
+            times the worker count. An attach that takes the terminal
+            or waiting-for-user fast path (see Behavior above) never
+            registers a sink at all, so it never counts toward either
+            cap.
     """
     snapshot = await run_db_io_cancellation_safe(
         lambda: _load_task_info_snapshot(task_id, principal)

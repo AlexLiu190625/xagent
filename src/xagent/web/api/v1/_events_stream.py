@@ -150,7 +150,7 @@ _ERROR_MESSAGES = {
     "resync_required": (
         "The output queue overflowed; call steps() to resync, then re-attach."
     ),
-    "unauthorized": "The API key used to open this stream is no longer valid.",
+    "unauthorized": "The API key used to open this stream has been revoked or paused.",
     "task_deleted": "The task no longer exists.",
     "stream_expired": "This stream reached its maximum allowed duration.",
 }
@@ -263,12 +263,12 @@ class V1EventStreamSink:
     async def send_text(self, text: str) -> None:
         """Receive one broadcast frame. Duck-types ``WebSocket.send_text``.
 
-        Must never raise. ``broadcast_to_task`` (``websocket.py:4504-4532``)
+        Must never raise. ``ConnectionManager.broadcast_to_task``
         catches network errors from a connection's ``send_text`` and drops
-        the connection, but re-raises anything else (``:4525-4532``) --
-        that re-raise happens on the *task's own* outbound event path, so
-        an uncaught exception here would abort the broadcast for every
-        other listener on the task, not just this stream. This is the
+        the connection, but re-raises anything else -- that re-raise
+        happens on the *task's own* outbound event path, so an uncaught
+        exception here would abort the broadcast for every other
+        listener on the task, not just this stream. This is the
         one deliberate blanket ``except Exception`` in this module; every
         drop is logged via ``logger.exception`` below, and also counted
         on ``dropped_frame_count`` for tests to assert against (no
