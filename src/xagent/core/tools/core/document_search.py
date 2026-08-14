@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from ....config import get_kb_search_timeout_seconds
 from .knowledge_base_scope import KnowledgeBaseScopeError
-from .RAG_tools.core.schemas import ListCollectionsResult
+from .RAG_tools.core.schemas import CollectionInfo, ListCollectionsResult
 from .RAG_tools.management.collections import list_collections
 from .RAG_tools.pipelines.document_search import run_document_search
 
@@ -22,6 +22,25 @@ logger = logging.getLogger(__name__)
 # filter silently stops matching - the readonly notice reappears in summaries,
 # which the readonly tests in test_document_search_collection_concurrency catch.
 _READONLY_WARNING_PREFIX = "READONLY_MODE:"
+
+# The fixed, unparaphrasable strings a team-governed search reports through.
+# See the module's callers for when each one is used; the wording itself is
+# a reviewed user-facing contract and must not be edited casually.
+_UNSHARED_CREATOR_KB_MESSAGE = (
+    "{name} is a personal knowledge base belonging to this agent's creator and has not "
+    "been shared with the team. Ask the agent's owner to share it with the team to make "
+    "it available here."
+)
+_PARTIAL_FAILURE_NOTE = (
+    "Note: {names} could not be resolved for this agent. The agent's other knowledge "
+    "bases were searched normally."
+)
+# The terminal counterpart of the note above, for the one case the certainty
+# wording would be a falsehood: the creator-collection lookup raised, so
+# nothing established that these names are absent -- only that they could not
+# be classified. Reuses the note's hedge; nothing was searched, so it does not
+# borrow the note's second sentence.
+_TERMINAL_UNRESOLVABLE_MESSAGE = "Error: {names} could not be resolved for this agent."
 
 if TYPE_CHECKING:
     from .RAG_tools.kb import KBToolCompatibilityFacade
@@ -233,12 +252,13 @@ async def _list_knowledge_bases_impl(
             builds the search tool alone, and an empty list builds no
             knowledge tool at all -- and both chat call sites derive that
             value and the declaration from the same stored field, so on this
-            path there is no declared name to classify at all. See
-            ``declared_knowledge_bases`` below.
+            path there is no declared name to classify as "unshared" versus
+            "missing". See ``declared_knowledge_bases`` below.
         declared_knowledge_bases: Accepted for signature symmetry and never
             read here, for the same reason. This function reports "here is
             what is available" -- an unresolved declared name simply does
-            not appear in the list, with no separate message field.
+            not appear in the list, with no separate message field, and
+            never triggers the creator-existence probe.
 
     Returns:
         ListKnowledgeBasesResult containing knowledge base information
@@ -337,6 +357,148 @@ async def search_knowledge_base(
     )
 
 
+class _Unresolved:
+    """Sentinel: a declared name the governing team does not own, and the
+    runner is not the agent's creator.
+
+    Distinguishes "needs the creator-existence probe" from "resolved to a
+    collection" (any other object) and from "give up, report missing"
+    (``None``), without conflating either with a real ``CollectionInfo``.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<unresolved>"
+
+
+_UNRESOLVED = _Unresolved()
+
+
+def _resolve_declared_name(
+    name: str,
+    resolved: Dict[str, CollectionInfo],
+    *,
+    governing_team_id: Optional[int],
+    agent_creator_user_id: Optional[int],
+    runner_id: Optional[int],
+    declared_names: "set[str] | frozenset[str]",
+) -> "CollectionInfo | _Unresolved | None":
+    """Governing team, then creator, then declared-name membership, in that
+    order. Returns a collection, ``_UNRESOLVED`` (needs the
+    creator-existence probe), or ``None`` (nothing to search).
+
+    ``declared_names`` is the agent's STORED ``knowledge_bases`` list, never
+    ``allowed_collections`` and never ``tool_args.collections`` -- both of
+    those live on the model-supplied ``tool_args`` and can be overwritten by
+    the model itself, so neither can be trusted as the boundary of what may
+    be probed. See the ``name not in declared_names`` check below.
+    """
+    if governing_team_id is None:
+        # No governing team: today's behaviour, untouched.
+        return resolved.get(name)
+
+    entry = resolved.get(name)
+    if entry is not None and entry.ownership == "team":
+        # A name the governing team owns is resolved here and never reaches
+        # the creator check below. This test is trustworthy only because
+        # ``_list_visible_collections`` guarantees the sole source of an
+        # ``ownership == "team"`` entry is the governing team resolved
+        # above -- never the runner's own team memberships.
+        return entry
+
+    if runner_id is not None and runner_id == agent_creator_user_id:
+        # The team does not own this name, but the runner is the agent's
+        # creator: their own personal collection (if any) still resolves,
+        # exactly as it would with no governing team at all.
+        return entry
+
+    if name not in declared_names:
+        # On the one caller today, this is always False: the caller's loop
+        # iterates ``declared_names_for_this_run`` itself, so ``name`` is
+        # already a member of ``declared_names`` (built from that same
+        # list) by construction -- the iteration source is what actually
+        # binds the probe to the agent's stored configuration here. This
+        # check is a second guard for any future caller that classifies a
+        # name from somewhere else: without it, a model-supplied name could
+        # reach the probe below, and the two distinct outcomes it produces
+        # would become an enumeration oracle over the creator's private
+        # collection names.
+        return None
+
+    return _UNRESOLVED
+
+
+class _CreatorCollectionProbe:
+    """Memoised lookup of the agent creator's own collection names.
+
+    At most one ``list_collections`` call for the creator's id per search
+    call, regardless of how many declared names need classifying -- the
+    lookup result is cached after the first call, including a failure
+    (cached as "nothing"). A failure degrades to "not held" and never
+    raises: a probe that cannot complete must not block the search, and
+    must not be distinguishable from "the creator does not have this
+    collection" (see the module docstring's identity-disclosure limits).
+
+    A failure is still not distinguishable per name -- it hits every name
+    this run classifies alike -- so the enumeration oracle stays closed;
+    what the caller does with ``lookup_failed`` is choose a report that does
+    not assert an absence, not reveal one.
+
+    This still leaves a costlier existence-only side channel open to
+    anyone who can edit the agent, not only the creator: the stored
+    ``knowledge_bases`` declaration this probe classifies against is
+    itself editable by any same-team member, not just the creator --
+    ``agent_store.get_owned_agent`` (via ``owned_agent_clause``) lets a
+    non-admin team member update any team agent whose ``visibility ==
+    'team'``, including its ``knowledge_bases`` list. A team member can
+    therefore add a personal-collection-shaped name of their choosing to
+    the declaration, run the agent, and read the sharing-gap sentence
+    versus the generic "does not exist" outcome off the summary to learn
+    whether the creator holds a same-named private collection -- at the
+    cost of an agent edit per name probed, and revealing only that
+    existence, never the collection's contents.
+    """
+
+    def __init__(self, agent_creator_user_id: Optional[int]) -> None:
+        self._agent_creator_user_id = agent_creator_user_id
+        self._names: Optional[set] = None
+        # Whether the one lookup this probe makes raised. Read by the caller
+        # to tell "the creator does not hold this name" apart from "nobody
+        # asked" -- the failure degrades to "not held" for the search
+        # decision (unchanged), but the report must not claim an absence
+        # that was never established.
+        self.lookup_failed = False
+
+    async def holds(self, name: str) -> bool:
+        if self._agent_creator_user_id is None:
+            return False
+        if self._names is None:
+            try:
+                creator_result = await list_collections(
+                    user_id=self._agent_creator_user_id, is_admin=False
+                )
+                self._names = {c.name for c in creator_result.collections}
+            except Exception:
+                logger.warning(
+                    "Failed to resolve creator's personal collections while "
+                    "classifying an unshared knowledge base",
+                    exc_info=True,
+                )
+                self._names = set()
+                self.lookup_failed = True
+        return name in self._names
+
+
+def _render_unshared_names(names: List[str]) -> str:
+    """One sentence per name, space-joined, in declaration order."""
+    return " ".join(_UNSHARED_CREATOR_KB_MESSAGE.format(name=name) for name in names)
+
+
+def _render_missing_names_note(names: List[str]) -> str:
+    return _PARTIAL_FAILURE_NOTE.format(names=", ".join(names))
+
+
 async def _search_knowledge_base_impl(
     tool_args: KnowledgeSearchArgs,
     user_id: Optional[int] = None,
@@ -351,22 +513,15 @@ async def _search_knowledge_base_impl(
         tool_args: Search configuration including query, collections, and search parameters
         user_id: Optional user ID for multi-tenancy filtering
         is_admin: Whether the user has admin privileges
-        governing_team_id: The governing agent's owning team, if any. Only
-            affects *which* collections are visible; see
-            ``_list_visible_collections``.
-        agent_creator_user_id: The governing agent's creator, if any.
-            Carried to this function but not read by it: the rule that
-            tells the agent's own creator apart from every other runner of
-            a team-governed agent arrives separately.
+        governing_team_id: The governing agent's owning team, if any.
+        agent_creator_user_id: The governing agent's creator, if any. Used
+            to tell the agent's own creator apart from every other runner
+            of a team-governed agent.
         declared_knowledge_bases: The governing agent's STORED
             ``knowledge_bases`` declaration, if any -- never
             ``tool_args.allowed_collections`` and never
             ``tool_args.collections``, both of which are model-authored on
             every path (a declared schema field the model can overwrite).
-            Carried here but not read yet, for the same reason as
-            ``agent_creator_user_id``; keeping the two apart all the way to
-            this function is what lets the rule land without re-threading
-            anything.
 
     Returns:
         KnowledgeSearchResult with formatted search results
@@ -384,7 +539,81 @@ async def _search_knowledge_base_impl(
             governing_team_id=governing_team_id,
         )
 
-        if not collections_result.collections:
+        # The agent's stored declaration, de-duplicated with insertion order
+        # kept (a stored declaration may legitimately contain a name twice --
+        # nothing normalises Agent.knowledge_bases into a set -- and an
+        # un-de-duplicated iteration would probe, and report, a duplicate
+        # name twice).
+        declared_names_for_this_run = list(
+            dict.fromkeys(declared_knowledge_bases or [])
+        )
+
+        from ....web.services.knowledge_base_team_scope import (
+            team_knowledge_base_hook_installed,
+        )
+
+        # Team-governed run WITH a declaration, on a deployment that has
+        # actually installed the team-keyed hook: the declaration is the
+        # authority for both what may be searched and what gets reported.
+        # Gated on this three-way conjunction, not merely on
+        # governing_team_id being set, for two independent reasons:
+        #
+        # - an empty declaration (the case where agent_config carried no
+        #   agent at all) has nothing to authorise or verdict-derive against,
+        #   so the declared-name rule does not apply and the search falls
+        #   through to the existing "search everything visible" branch
+        #   below. The governing team's own knowledge bases stay in that
+        #   visible set -- ``_list_visible_collections`` resolves the team
+        #   layer onto the governing team whenever one is set and the hook
+        #   is installed, independently of whether anything was declared --
+        #   so an empty declaration still searches the runner's own
+        #   material *and* the governing team's, the same as it always has;
+        #   only which team the team layer resolves against changes. This
+        #   conjunct is defensive rather than a live production case:
+        #   knowledge_tools.py builds no knowledge tool at all when the
+        #   agent's allowed collections are an empty list, and the two chat
+        #   call sites derive that list and this declaration from the same
+        #   expression, so a declaring-nothing agent never reaches a search;
+        #   the remaining way in is an absent declaration, which on those
+        #   call sites also means an absent governing team. Kept so a future
+        #   caller that does supply a governing team without a declaration
+        #   inherits today's behaviour instead of an empty search set;
+        # - a deployment that has not installed the team-keyed hook must
+        #   stay on today's behaviour byte for byte, the same way the team
+        #   layer itself falls back in ``_list_visible_collections``. An
+        #   upstream change must be safe to ship ahead of any downstream
+        #   hook installation: selecting on "is a governing team id present"
+        #   instead of "is the hook actually installed" would turn on the
+        #   declared-name rule (and its two new report messages) for a
+        #   deployment whose team layer still resolves the old, runner-keyed
+        #   way -- a half-migrated state nothing asked for.
+        #
+        # This gate and the team layer's own gate in
+        # ``_list_visible_collections`` are not the same predicate: they
+        # share ``governing_team_id is not None and
+        # team_knowledge_base_hook_installed()``, but this one adds a third
+        # conjunct (``declared_names_for_this_run``) that the team layer's
+        # gate does not read. That is intentional, not a mismatch to close --
+        # the team layer's job is only "resolve onto the governing team",
+        # which an empty declaration does not change; this gate's job is
+        # "does the declared-name rule apply at all", which an empty
+        # declaration answers no to.
+        declared_name_rule_applies = (
+            governing_team_id is not None
+            and team_knowledge_base_hook_installed()
+            and bool(declared_names_for_this_run)
+        )
+
+        # The inherited empty-visible-set guard, now skipped for exactly the
+        # runs the declared-name rule owns the reporting of. With a governing
+        # team, an installed hook and a non-empty declaration, every declared
+        # name must still get its own verdict and its own sentence even when
+        # nothing at all is visible: a team that owns nothing plus a runner
+        # who owns nothing is a legitimate answer, and returning here would
+        # make it indistinguishable from a platform with no knowledge bases.
+        # Every other input -- no governing team, hook not installed, empty
+        # declaration -- keeps this guard exactly as it is today.
+        if not collections_result.collections and not declared_name_rule_applies:
             return KnowledgeSearchResult(
                 results=[],
                 summary="No knowledge bases available. Please create a knowledge base and upload documents first.",
@@ -402,11 +631,169 @@ async def _search_knowledge_base_impl(
         if tool_args.allowed_collections:
             logger.info(f"   - Allowed collections: {tool_args.allowed_collections}")
 
-        if tool_args.collections:
-            # User specified collections - validate against allowed_collections
+        if declared_name_rule_applies:
+            resolved_by_name = {c.name: c for c in collections_result.collections}
+            authorised = set(declared_names_for_this_run)
+
+            explicit_request: Optional[set] = None
+            if tool_args.collections:
+                requested_set = set(tool_args.collections)
+                # The re-based "not allowed" gate (wording unchanged): the
+                # authority is the agent's stored declaration, not
+                # tool_args.allowed_collections, because that field is
+                # model-authored on every path and setdefault lets a
+                # model-supplied value win outright over the agent's own
+                # configured one.
+                disallowed = requested_set - authorised
+                if disallowed:
+                    return KnowledgeSearchResult(
+                        results=[],
+                        summary=f"Error: The following collections are not allowed: {', '.join(sorted(disallowed))}. "
+                        f"Allowed collections: {', '.join(sorted(authorised & available_names))}",
+                    )
+                explicit_request = requested_set
+                logger.info(f"Searching specific collections: {sorted(requested_set)}")
+
+            to_search: List[CollectionInfo] = []
+            unshared_names: List[str] = []
+            missing_names: List[str] = []
+            unresolvable_names: List[str] = []
+            creator_probe = _CreatorCollectionProbe(agent_creator_user_id)
+
+            # One pass over the agent's stored declaration; every declared
+            # name gets exactly one verdict, and the two report sets plus
+            # the search set are all built from the verdicts -- never from
+            # an intersection with available_names. That expression is what
+            # would let the runner's own same-named personal collection back
+            # in: available_names already contains it (the base union seeds
+            # the runner's own collections), so a rule hung off its
+            # complement would never see the very name it exists to reject.
+            for name in declared_names_for_this_run:
+                verdict = _resolve_declared_name(
+                    name,
+                    resolved_by_name,
+                    governing_team_id=governing_team_id,
+                    agent_creator_user_id=agent_creator_user_id,
+                    runner_id=user_id,
+                    declared_names=authorised,
+                )
+                if verdict is None:
+                    missing_names.append(name)
+                elif isinstance(verdict, _Unresolved):
+                    if await creator_probe.holds(name):
+                        unshared_names.append(name)
+                    elif creator_probe.lookup_failed:
+                        # Not "missing": the lookup that would have decided
+                        # raised. The search outcome is the same either way
+                        # (nothing resolves), only the report differs.
+                        unresolvable_names.append(name)
+                    else:
+                        missing_names.append(name)
+                else:
+                    to_search.append(verdict)
+
+            # Every name the verdict loop admitted, captured before the
+            # explicit-request narrowing below. This -- never the visible
+            # union ``available_names`` -- is what the terminal messages
+            # report as available. A name only lands here after resolving to
+            # a collection this run may actually search, so the runner's own
+            # same-named personal copy (which the union does carry, and which
+            # the rule exists to reject) can never be reported as available.
+            admitted_names = {c.name for c in to_search}
+
+            if explicit_request is not None:
+                # The model may narrow the search to a subset of what the
+                # verdicts admitted; it may never widen it past that set.
+                to_search = [c for c in to_search if c.name in explicit_request]
+
+            if not to_search:
+                # Every declared name failed to resolve. Reached through
+                # this guard, not one keyed on the raw requested/allowed
+                # set: a guard keyed on the requested/allowed names alone
+                # stays non-empty even when every one of them failed to
+                # resolve to a real collection, as long as the runner
+                # happens to hold a same-named personal copy of each one --
+                # which would fall through to the generic search-miss text
+                # below instead of the two outcomes this branch exists to
+                # report.
+                # Both branches list "Available" from the verdict-admitted
+                # names, never from ``authorised & available_names``. That
+                # intersection reports two sets of names it must not: the
+                # governing team's collections the agent never declared
+                # (``_list_visible_collections`` merges the team's full
+                # catalogue in before any declared-name filter runs), and --
+                # on this branch specifically -- the runner's own same-named
+                # personal copies, which seed the union and are precisely the
+                # collections the rule refuses to search. On the no-explicit
+                # branch nothing was admitted, so the clause renders empty;
+                # on the explicit branch the admitted set is the one taken
+                # before the narrowing above, so a run whose requested names
+                # all failed still tells the model what it may ask for.
+                if unresolvable_names:
+                    # The creator-collection lookup raised during this call,
+                    # so every unresolved declared name is unclassified, not
+                    # established absent. Reported as one undifferentiated
+                    # outcome for all of them -- a lookup failure is not
+                    # per-name, so this sentence still says nothing about
+                    # which names the creator holds. ``unshared_names`` is
+                    # necessarily empty here: the first failure caches the
+                    # creator's name set as empty, so no later name can be
+                    # classified as held.
+                    summary = _TERMINAL_UNRESOLVABLE_MESSAGE.format(
+                        names=", ".join(unresolvable_names)
+                    )
+                    failed_unshared_names: List[str] = []
+                elif explicit_request is not None:
+                    summary = (
+                        f"Error: The following collections do not exist: {', '.join(sorted(explicit_request))}. "
+                        f"Available collections: {', '.join(sorted(admitted_names))}"
+                    )
+                    failed_unshared_names = [
+                        name for name in unshared_names if name in explicit_request
+                    ]
+                else:
+                    summary = (
+                        f"Error: None of the allowed collections exist. "
+                        f"Allowed: {', '.join(sorted(authorised))}. "
+                        f"Available: {', '.join(sorted(admitted_names))}"
+                    )
+                    failed_unshared_names = unshared_names
+                # A total failure keeps the existing terminal wording
+                # unchanged (above) -- this branch does not decide whether
+                # a failed name happened to be the creator's own unshared
+                # collection, it only decides that nothing is searchable.
+                # Whichever of the failed names the verdict loop already
+                # classified as the creator's own unshared collection still
+                # gets that message appended, with the "Error:" prefix and
+                # the empty result set both preserved: this is the terminal
+                # path, not the partial-failure warnings channel, so it
+                # does not fold through collection_warnings.
+                if failed_unshared_names:
+                    # A bare space here would leave the appended sentence
+                    # reading like one more entry in the comma-separated
+                    # "Available: ..." list the base text ends with -- both
+                    # to a human reader and to the model consuming this
+                    # summary. The period closes that list before the new
+                    # sentence starts.
+                    summary = (
+                        summary + ". " + _render_unshared_names(failed_unshared_names)
+                    )
+                return KnowledgeSearchResult(results=[], summary=summary)
+
+            collections_to_iterate: List[CollectionInfo] = to_search
+            partial_failure_notes = []
+            if unshared_names:
+                partial_failure_notes.append(_render_unshared_names(unshared_names))
+            if missing_names or unresolvable_names:
+                partial_failure_notes.append(
+                    _render_missing_names_note(missing_names + unresolvable_names)
+                )
+        elif tool_args.collections:
+            # No governing team, and the empty-declaration fallback, share
+            # this branch: byte-for-byte today's behaviour, including its
+            # allowed_collections-is-None skip below.
             requested_set = set(tool_args.collections)
 
-            # If allowed_collections is set, verify requested is a subset
             if tool_args.allowed_collections is not None:
                 allowed_set = set(tool_args.allowed_collections)
                 disallowed = requested_set - allowed_set
@@ -422,7 +809,6 @@ async def _search_knowledge_base_impl(
             else:
                 collections_set = requested_set
 
-            # Check if collections exist
             invalid_names = collections_set - available_names
             if invalid_names:
                 return KnowledgeSearchResult(
@@ -434,9 +820,9 @@ async def _search_knowledge_base_impl(
             collections_to_iterate = [
                 c for c in collections_result.collections if c.name in collections_set
             ]
+            partial_failure_notes = []
             logger.info(f"Searching specific collections: {sorted(collections_set)}")
         elif tool_args.allowed_collections is not None:
-            # Use allowed_collections as default
             allowed_set = set(tool_args.allowed_collections)
 
             if not allowed_set:
@@ -457,9 +843,11 @@ async def _search_knowledge_base_impl(
             collections_to_iterate = [
                 c for c in collections_result.collections if c.name in valid_collections
             ]
+            partial_failure_notes = []
             logger.info(f"Searching allowed collections: {sorted(valid_collections)}")
         else:
             collections_to_iterate = collections_result.collections
+            partial_failure_notes = []
             logger.info("Searching all collections")
 
         # Build base search config (per-collection overrides happen below)
@@ -493,7 +881,7 @@ async def _search_knowledge_base_impl(
         # Search across collections and aggregate results
         all_results = []
         collection_errors: list[str] = []
-        collection_warnings: list[str] = []
+        collection_warnings: list[str] = list(partial_failure_notes)
         total_searched = 0
         search_timeout_seconds = get_kb_search_timeout_seconds()
 
