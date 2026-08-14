@@ -3549,18 +3549,20 @@ class WebToolConfig(BaseToolConfig):
                     team_env_by_id = load_team_env_overrides(
                         self.db, self._connector_team_id
                     )
-                    # Never mutate the loader-returned mappings in place: either
-                    # may be the object a hook keeps its own reference to.
-                    # Shallow copies of the outer dict are sufficient because
-                    # every downstream consumer only reads the inner per-server
-                    # values -- resolve_stdio_env's lookups, and this file's own
-                    # per-server env merge in _build_mcp_server_config's stdio
-                    # branch (an unconditional-overwrite `{**a, **b}` merge) --
-                    # neither assigns back into shared_env_by_id or
-                    # env_source_by_id. (mcp_runtime.build_mcp_runtime_connection
-                    # has its own caller-id merge, but this method's own call to
-                    # it, in the delegated/OAuth branch above, never passes these
-                    # two maps, so it never reads them at all here.)
+                    # Both copies are load-bearing, for different reasons.
+                    # shared_env_by_id: load_shared_env_overrides hands back the
+                    # installing application's own object unwrapped, so writing
+                    # into it below would mutate the hook's dict.
+                    # env_source_by_id: load_user_env_sources always builds a
+                    # fresh dict, so no hook holds it -- but the degrade below
+                    # removes entries from it in place (`del ...[server_id]`),
+                    # and the loader's result is not this block's to shrink.
+                    # Shallow outer copies suffice for both: every downstream
+                    # consumer only reads the inner per-server values --
+                    # resolve_stdio_env's lookups and this file's own per-server
+                    # env merge in _build_mcp_server_config's stdio branch (an
+                    # unconditional-overwrite `{**a, **b}` merge) -- and neither
+                    # assigns back into either map.
                     shared_env_by_id = dict(shared_env_by_id)
                     env_source_by_id = dict(env_source_by_id)
                     for server_id in team_mcp_ids:
