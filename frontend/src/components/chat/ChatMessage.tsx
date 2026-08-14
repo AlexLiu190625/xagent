@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { Bot, ChevronDown, ChevronUp, Copy, Check, Laptop } from "lucide-react";
+import { ChevronDown, ChevronUp, Copy, Check, Laptop } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { TraceEventRenderer, type AgentExecutionSummary } from "./TraceEventRenderer";
@@ -448,14 +448,12 @@ export function ChatMessage({
   return (
     <div className="w-full space-y-2 animate-fade-in group">
       {shouldShowProcess && !isUser && (
-        <div className={cn("pl-7")}>
-          <TraceEventRenderer
-            events={traceEvents}
-            taskStatus={resolvedProcessStatus}
-            onOpenExecutionPlan={onOpenExecutionPlan}
-            onAgentExecutionClick={onAgentExecutionClick}
-          />
-        </div>
+        <TraceEventRenderer
+          events={traceEvents}
+          taskStatus={resolvedProcessStatus}
+          onOpenExecutionPlan={onOpenExecutionPlan}
+          onAgentExecutionClick={onAgentExecutionClick}
+        />
       )}
 
       {!isProcessOnlyMessage && (
@@ -467,25 +465,13 @@ export function ChatMessage({
         >
           <div
             className={cn(
-              "flex gap-4 transition-all duration-300",
               isUser
-                ? "max-w-[85%] bg-secondary text-secondary-foreground p-3 rounded-2xl flex-row-reverse items-center"
+                ? "max-w-[85%] bg-secondary text-secondary-foreground p-3 rounded-2xl"
                 : "bg-transparent p-0 w-full max-w-full"
             )}
           >
-            {/* Avatar */}
-            {!isUser && (
-              <div
-                className={cn(
-                  "flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center shadow-md bg-transparent"
-                )}
-              >
-                <Bot className="w-5 h-5 text-muted-foreground" />
-              </div>
-            )}
-
             {/* Message content */}
-            <div className={cn("flex-1 min-w-0")}>
+            <div>
               {isAssistantFailure ? (
                 <div className="py-3 text-sm leading-relaxed text-red-500 break-words [overflow-wrap:anywhere]">
                   {displayCopyableContent}
@@ -558,7 +544,7 @@ export function ChatMessage({
         <div
           className={cn(
             "flex items-center gap-1.5 text-xs text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity duration-200",
-            isUser ? "justify-end mr-1" : "justify-start ml-14"
+            isUser ? "justify-end mr-1" : "justify-start"
           )}
         >
           <button
