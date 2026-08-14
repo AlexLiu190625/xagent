@@ -73,6 +73,8 @@ class KBToolCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
         governing_team_id: Optional[int] = None,
+        agent_creator_user_id: Optional[int] = None,
+        declared_knowledge_bases: Optional[list[str]] = None,
     ) -> ListKnowledgeBasesResult:
         from ... import document_search as core_document_search
 
@@ -82,6 +84,8 @@ class KBToolCompatibilityFacade:
                 user_id=user_id,
                 is_admin=is_admin,
                 governing_team_id=governing_team_id,
+                agent_creator_user_id=agent_creator_user_id,
+                declared_knowledge_bases=declared_knowledge_bases,
             )
 
     async def find_missing_knowledge_bases(
@@ -105,6 +109,8 @@ class KBToolCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
         governing_team_id: Optional[int] = None,
+        agent_creator_user_id: Optional[int] = None,
+        declared_knowledge_bases: Optional[list[str]] = None,
     ) -> KnowledgeSearchResult:
         from ... import document_search as core_document_search
 
@@ -114,6 +120,8 @@ class KBToolCompatibilityFacade:
                 user_id=user_id,
                 is_admin=is_admin,
                 governing_team_id=governing_team_id,
+                agent_creator_user_id=agent_creator_user_id,
+                declared_knowledge_bases=declared_knowledge_bases,
             )
 
     def get_list_knowledge_bases_tool(
@@ -122,6 +130,8 @@ class KBToolCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
         governing_team_id: Optional[int] = None,
+        agent_creator_user_id: Optional[int] = None,
+        declared_knowledge_bases: Optional[list[str]] = None,
     ) -> ListKnowledgeBasesTool:
         from ....adapters.vibe import document_search as vibe_document_search
 
@@ -130,6 +140,8 @@ class KBToolCompatibilityFacade:
             user_id=user_id,
             is_admin=is_admin,
             governing_team_id=governing_team_id,
+            agent_creator_user_id=agent_creator_user_id,
+            declared_knowledge_bases=declared_knowledge_bases,
         )
 
     def get_knowledge_search_tool(
@@ -140,6 +152,8 @@ class KBToolCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
         governing_team_id: Optional[int] = None,
+        agent_creator_user_id: Optional[int] = None,
+        declared_knowledge_bases: Optional[list[str]] = None,
     ) -> KnowledgeSearchTool:
         from ....adapters.vibe import document_search as vibe_document_search
 
@@ -150,6 +164,8 @@ class KBToolCompatibilityFacade:
             user_id=user_id,
             is_admin=is_admin,
             governing_team_id=governing_team_id,
+            agent_creator_user_id=agent_creator_user_id,
+            declared_knowledge_bases=declared_knowledge_bases,
         )
 
     async def create_knowledge_tools(

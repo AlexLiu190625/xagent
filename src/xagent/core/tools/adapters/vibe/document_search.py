@@ -36,12 +36,16 @@ class ListKnowledgeBasesTool(AbstractBaseTool):
         user_id: Optional[int] = None,
         is_admin: bool = False,
         governing_team_id: Optional[int] = None,
+        agent_creator_user_id: Optional[int] = None,
+        declared_knowledge_bases: Optional[list[str]] = None,
     ) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self.allowed_collections = allowed_collections
         self.user_id = user_id
         self.is_admin = is_admin
         self.governing_team_id = governing_team_id
+        self.agent_creator_user_id = agent_creator_user_id
+        self.declared_knowledge_bases = declared_knowledge_bases
 
     @property
     def name(self) -> str:
@@ -79,6 +83,8 @@ class ListKnowledgeBasesTool(AbstractBaseTool):
             user_id=self.user_id,
             is_admin=self.is_admin,
             governing_team_id=self.governing_team_id,
+            agent_creator_user_id=self.agent_creator_user_id,
+            declared_knowledge_bases=self.declared_knowledge_bases,
         )
 
 
@@ -87,6 +93,8 @@ def get_list_knowledge_bases_tool(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     governing_team_id: Optional[int] = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[list[str]] = None,
 ) -> ListKnowledgeBasesTool:
     """Create a tool to list all knowledge bases through the tool facade."""
     return _get_tool_compatibility_facade().get_list_knowledge_bases_tool(
@@ -94,6 +102,8 @@ def get_list_knowledge_bases_tool(
         user_id=user_id,
         is_admin=is_admin,
         governing_team_id=governing_team_id,
+        agent_creator_user_id=agent_creator_user_id,
+        declared_knowledge_bases=declared_knowledge_bases,
     )
 
 
@@ -102,6 +112,8 @@ def _get_list_knowledge_bases_tool_impl(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     governing_team_id: Optional[int] = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[list[str]] = None,
 ) -> ListKnowledgeBasesTool:
     """Create a tool to list all knowledge bases.
 
@@ -110,6 +122,9 @@ def _get_list_knowledge_bases_tool_impl(
         user_id: Optional user ID for multi-tenancy filtering.
         is_admin: Whether the user has admin privileges.
         governing_team_id: The governing agent's owning team, if any.
+        agent_creator_user_id: The governing agent's creator, if any.
+        declared_knowledge_bases: The governing agent's stored knowledge-base
+            declaration, if any.
 
     Returns:
         ListKnowledgeBasesTool instance
@@ -119,6 +134,8 @@ def _get_list_knowledge_bases_tool_impl(
         user_id=user_id,
         is_admin=is_admin,
         governing_team_id=governing_team_id,
+        agent_creator_user_id=agent_creator_user_id,
+        declared_knowledge_bases=declared_knowledge_bases,
     )
 
 
@@ -135,6 +152,8 @@ class KnowledgeSearchTool(AbstractBaseTool):
         user_id: Optional[int] = None,
         is_admin: bool = False,
         governing_team_id: Optional[int] = None,
+        agent_creator_user_id: Optional[int] = None,
+        declared_knowledge_bases: Optional[list[str]] = None,
     ) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self.embedding_model_id = embedding_model_id
@@ -143,6 +162,8 @@ class KnowledgeSearchTool(AbstractBaseTool):
         self.user_id = user_id
         self.is_admin = is_admin
         self.governing_team_id = governing_team_id
+        self.agent_creator_user_id = agent_creator_user_id
+        self.declared_knowledge_bases = declared_knowledge_bases
 
     @property
     def name(self) -> str:
@@ -195,6 +216,8 @@ class KnowledgeSearchTool(AbstractBaseTool):
             user_id=self.user_id,
             is_admin=self.is_admin,
             governing_team_id=self.governing_team_id,
+            agent_creator_user_id=self.agent_creator_user_id,
+            declared_knowledge_bases=self.declared_knowledge_bases,
         )
 
 
@@ -205,6 +228,8 @@ def get_knowledge_search_tool(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     governing_team_id: Optional[int] = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[list[str]] = None,
 ) -> KnowledgeSearchTool:
     """Create a knowledge base search tool through the tool facade."""
     return _get_tool_compatibility_facade().get_knowledge_search_tool(
@@ -214,6 +239,8 @@ def get_knowledge_search_tool(
         user_id=user_id,
         is_admin=is_admin,
         governing_team_id=governing_team_id,
+        agent_creator_user_id=agent_creator_user_id,
+        declared_knowledge_bases=declared_knowledge_bases,
     )
 
 
@@ -224,6 +251,8 @@ def _get_knowledge_search_tool_impl(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     governing_team_id: Optional[int] = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[list[str]] = None,
 ) -> KnowledgeSearchTool:
     """Create a knowledge base search tool for Vibe agents.
 
@@ -234,6 +263,9 @@ def _get_knowledge_search_tool_impl(
         user_id: Optional user ID for multi-tenancy filtering.
         is_admin: Whether the user has admin privileges.
         governing_team_id: The governing agent's owning team, if any.
+        agent_creator_user_id: The governing agent's creator, if any.
+        declared_knowledge_bases: The governing agent's stored knowledge-base
+            declaration, if any.
 
     Returns:
         KnowledgeSearchTool instance
@@ -245,4 +277,6 @@ def _get_knowledge_search_tool_impl(
         user_id=user_id,
         is_admin=is_admin,
         governing_team_id=governing_team_id,
+        agent_creator_user_id=agent_creator_user_id,
+        declared_knowledge_bases=declared_knowledge_bases,
     )

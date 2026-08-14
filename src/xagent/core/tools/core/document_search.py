@@ -192,6 +192,8 @@ async def list_knowledge_bases(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     governing_team_id: Optional[int] = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[List[str]] = None,
 ) -> ListKnowledgeBasesResult:
     """List all available knowledge bases through the tool compatibility facade."""
     return await _get_tool_compatibility_facade().list_knowledge_bases(
@@ -199,6 +201,8 @@ async def list_knowledge_bases(
         user_id=user_id,
         is_admin=is_admin,
         governing_team_id=governing_team_id,
+        agent_creator_user_id=agent_creator_user_id,
+        declared_knowledge_bases=declared_knowledge_bases,
     )
 
 
@@ -207,6 +211,8 @@ async def _list_knowledge_bases_impl(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     governing_team_id: Optional[int] = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[List[str]] = None,
 ) -> ListKnowledgeBasesResult:
     """List all available knowledge bases with their statistics.
 
@@ -218,6 +224,19 @@ async def _list_knowledge_bases_impl(
             affects *which* collections are visible (the team layer resolves
             on this team instead of the runner's own team memberships); see
             ``_list_visible_collections``.
+        agent_creator_user_id: Accepted for signature symmetry with
+            ``_search_knowledge_base_impl`` and never read here.
+            ``knowledge_tools.py`` builds the list tool only when the
+            agent's allowed collections are ``None`` -- a non-empty list
+            builds the search tool alone, and an empty list builds no
+            knowledge tool at all -- and both chat call sites derive that
+            value and the declaration from the same stored field, so on this
+            path there is no declared name to classify at all. See
+            ``declared_knowledge_bases`` below.
+        declared_knowledge_bases: Accepted for signature symmetry and never
+            read here, for the same reason. This function reports "here is
+            what is available" -- an unresolved declared name simply does
+            not appear in the list, with no separate message field.
 
     Returns:
         ListKnowledgeBasesResult containing knowledge base information
@@ -302,6 +321,8 @@ async def search_knowledge_base(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     governing_team_id: Optional[int] = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[List[str]] = None,
 ) -> KnowledgeSearchResult:
     """Search across knowledge bases through the tool compatibility facade."""
     return await _get_tool_compatibility_facade().search_knowledge_base(
@@ -309,6 +330,8 @@ async def search_knowledge_base(
         user_id=user_id,
         is_admin=is_admin,
         governing_team_id=governing_team_id,
+        agent_creator_user_id=agent_creator_user_id,
+        declared_knowledge_bases=declared_knowledge_bases,
     )
 
 
@@ -317,6 +340,8 @@ async def _search_knowledge_base_impl(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     governing_team_id: Optional[int] = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[List[str]] = None,
 ) -> KnowledgeSearchResult:
     """Search across knowledge base collections.
 
@@ -327,6 +352,19 @@ async def _search_knowledge_base_impl(
         governing_team_id: The governing agent's owning team, if any. Only
             affects *which* collections are visible; see
             ``_list_visible_collections``.
+        agent_creator_user_id: The governing agent's creator, if any.
+            Carried to this function but not read by it: the rule that
+            tells the agent's own creator apart from every other runner of
+            a team-governed agent arrives separately.
+        declared_knowledge_bases: The governing agent's STORED
+            ``knowledge_bases`` declaration, if any -- never
+            ``tool_args.allowed_collections`` and never
+            ``tool_args.collections``, both of which are model-authored on
+            every path (a declared schema field the model can overwrite).
+            Carried here but not read yet, for the same reason as
+            ``agent_creator_user_id``; keeping the two apart all the way to
+            this function is what lets the rule land without re-threading
+            anything.
 
     Returns:
         KnowledgeSearchResult with formatted search results

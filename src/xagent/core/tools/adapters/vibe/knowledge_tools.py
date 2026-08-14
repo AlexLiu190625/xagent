@@ -49,8 +49,12 @@ async def _create_knowledge_tools_impl(config: "BaseToolConfig") -> List[Any]:
         # :2078, :3530, :3546, :3592), none of which an accessor added here
         # would convert; a seventh reader asking the same question a seventh
         # way is a second convention nothing else adopts, and the next reader
-        # then has to learn which of the two is authoritative.
+        # then has to learn which of the two is authoritative. The two
+        # genuinely new values below get accessors because they have no
+        # existing readers to be inconsistent with.
         governing_team_id = getattr(config, "_connector_team_id", None)
+        agent_creator_user_id = config.get_agent_creator_user_id()
+        declared_knowledge_bases = config.get_declared_knowledge_bases()
 
         if allowed_collections is not None and len(allowed_collections) == 0:
             return []
@@ -61,6 +65,8 @@ async def _create_knowledge_tools_impl(config: "BaseToolConfig") -> List[Any]:
                 user_id=user_id,
                 is_admin=is_admin,
                 governing_team_id=governing_team_id,
+                agent_creator_user_id=agent_creator_user_id,
+                declared_knowledge_bases=declared_knowledge_bases,
             )
             tools.append(list_tool)
 
@@ -73,6 +79,8 @@ async def _create_knowledge_tools_impl(config: "BaseToolConfig") -> List[Any]:
             user_id=user_id,
             is_admin=is_admin,
             governing_team_id=governing_team_id,
+            agent_creator_user_id=agent_creator_user_id,
+            declared_knowledge_bases=declared_knowledge_bases,
         )
         tools.append(knowledge_tool)
     except KnowledgeBaseScopeError:

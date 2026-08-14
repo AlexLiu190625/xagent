@@ -1190,6 +1190,8 @@ class WebToolConfig(BaseToolConfig):
         mcp_load_summary_tracer: Optional[Any] = None,
         mcp_load_summary_trace_task_id: Optional[str] = None,
         connector_team_id: Optional[int] = None,
+        agent_creator_user_id: Optional[int] = None,
+        declared_knowledge_bases: Optional[List[str]] = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -1205,6 +1207,18 @@ class WebToolConfig(BaseToolConfig):
         # path ever supplies this directly, it is read off a loaded ``Agent``
         # row (or a frozen snapshot of one) by the caller.
         self._connector_team_id = connector_team_id
+        # The governing agent's creator -- always the same agent as
+        # ``_connector_team_id`` above, populated by the same caller. Used by
+        # the knowledge-base resolution path to tell the agent's creator
+        # apart from any other runner of a team-governed agent.
+        self._agent_creator_user_id = agent_creator_user_id
+        # The governing agent's own STORED ``knowledge_bases`` declaration --
+        # never the model-supplied value on a search request. Read from the
+        # same place ``allowed_collections`` above already is; kept as a
+        # separate field because ``allowed_collections`` on a tool_args
+        # object can be overwritten by the model, and this value must not
+        # be confusable with that one at the resolution point.
+        self._declared_knowledge_bases = declared_knowledge_bases
         self._task_runtime_contribution: Any = None
         self._task_runtime_workspace: Any = None
         self._live_db = db
@@ -1891,6 +1905,21 @@ class WebToolConfig(BaseToolConfig):
     def get_allowed_collections(self) -> Optional[List[str]]:
         """Get allowed knowledge base collections. None means all collections are allowed."""
         return self._allowed_collections
+
+    def get_agent_creator_user_id(self) -> Optional[int]:
+        """Get the governing agent's creator, for the knowledge-base seam."""
+        return self._agent_creator_user_id
+
+    def get_declared_knowledge_bases(self) -> Optional[List[str]]:
+        """Get the governing agent's stored knowledge-base declaration.
+
+        Distinct from ``get_allowed_collections()``: both are populated from
+        the same agent configuration today, but this value is threaded
+        through to the knowledge-base resolution point as its own input and
+        must never be conflated with a tool-args field a model can
+        overwrite.
+        """
+        return self._declared_knowledge_bases
 
     def get_allowed_skills(self) -> Optional[List[str]]:
         """Get allowed skill names. None means all skills are allowed."""

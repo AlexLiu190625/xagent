@@ -669,6 +669,12 @@ class AgentService:
                 def get_allowed_collections(self) -> list[Any] | None:
                     return None
 
+                # get_agent_creator_user_id / get_declared_knowledge_bases are
+                # not overridden here: ToolConfig already gives both a
+                # fail-closed ``None`` default (see config.py), which is
+                # exactly what this default, non-team-governed tool config
+                # needs.
+
                 def get_allowed_skills(self) -> list[Any] | None:
                     return None
 
