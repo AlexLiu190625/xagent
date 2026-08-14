@@ -246,11 +246,11 @@ def _delete_user_rows_sync(*, user_id: int) -> bool:
 async def get_users(
     page: int = Query(1, ge=1, description="Page number"),
     size: int = Query(20, ge=1, le=100, description="Page size"),
-    search: str = Query("", description="Search username"),
+    search: str = Query("", description="Search username or email"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> UserListResponse:
-    """Get paginated list of users (admin only)"""
+    """Get an admin-only user list with email for human-facing labels."""
     if not current_user.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required")
 
@@ -263,9 +263,12 @@ async def get_users(
     if hidden:
         query = query.filter(User.id.notin_(hidden))
 
-    # Apply search filter
+    # Match account identifiers without exposing SQL LIKE wildcards from user input.
     if search:
-        query = query.filter(User.username.like(f"%{search}%"))
+        query = query.filter(
+            User.username.icontains(search, autoescape=True)
+            | User.email.icontains(search, autoescape=True)
+        )
 
     # Get total count
     total = query.count()
@@ -371,7 +374,7 @@ async def delete_user(
             # no DB-visible marker, and a retry that re-dispatches them.
             settled: list[tuple[int, tuple[str, ...]]] = []
             cleanup_failures: list[tuple[int, BaseException]] = []
-            for (context, bindings), result in zip(
+            for (context, _bindings), result in zip(
                 bound_page, cleanup_results, strict=True
             ):
                 if isinstance(result, TaskRuntimeExtensionError):

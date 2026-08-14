@@ -13,6 +13,7 @@ import { useApp } from "@/contexts/app-context-chat"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { getChannelTooltip, getCompactChannelName } from "@/lib/channel-display"
+import { userDisplayLabel } from "@/lib/user-display"
 import { toast } from "@/components/ui/sonner"
 import extraNav from "@/lib/extra-nav"
 import {
@@ -139,6 +140,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
   const branding = getBrandingFromEnv()
   const { t } = useI18n()
   const { state } = useApp()
+  const userLabel = userDisplayLabel(user, t("sidebar.user.defaultName"))
   const githubUrl = process.env.NEXT_PUBLIC_GITHUB_URL || "https://github.com/xorbitsai/xagent"
   const normalizedGithubUrl = githubUrl.replace(/\.git$/, "").replace(/\/$/, "")
   const githubRepoDisplay = normalizedGithubUrl.replace(/^https?:\/\/github\.com\//i, "")
@@ -688,10 +690,10 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
           <button
             onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
             className="flex items-center justify-center w-full p-2 hover:bg-accent rounded-[7px] transition-colors"
-            title={user?.username || t('sidebar.user.defaultName')}
+            title={userLabel}
           >
             <div className="h-7 w-7 rounded-full bg-primary flex items-center justify-center text-xs font-semibold text-white uppercase shrink-0">
-              {(user?.username || t('sidebar.user.defaultName')).charAt(0)}
+              {userLabel.charAt(0)}
             </div>
           </button>
         </div>
@@ -1085,10 +1087,10 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
           className="flex w-full items-center gap-2.5 hover:bg-accent px-2 py-2 rounded-[7px] transition-colors text-left"
         >
           <div className="h-8 w-8 rounded-full bg-primary flex items-center justify-center text-xs font-semibold text-white uppercase shrink-0">
-            {(user?.username || t('sidebar.user.defaultName')).charAt(0)}
+            {userLabel.charAt(0)}
           </div>
           <div className="flex-1 min-w-0">
-            <p className="text-[13px] font-semibold text-foreground truncate">{user?.username || t('sidebar.user.defaultName')}</p>
+            <p className="text-[13px] font-semibold text-foreground truncate">{userLabel}</p>
           </div>
           <ChevronsUpDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
         </button>

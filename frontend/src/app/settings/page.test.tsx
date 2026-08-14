@@ -6,7 +6,7 @@ import SettingsPage from "./page"
 import { claimAuthLoginIntent, createAuthSession, inspectAuthSession, updateAuthSessionUser, type AuthSessionSnapshot, type AuthTokenPayload } from "@/lib/auth-cache"
 
 const authState = vi.hoisted(() => ({
-  user: { id: "1", username: "alice", email: "old@example.com" },
+  user: { id: "1", username: "alice", email: "old@example.com" as string | null },
   session: null as AuthSessionSnapshot | null,
 }))
 const apiRequest = vi.hoisted(() => vi.fn())
@@ -49,6 +49,7 @@ describe("SettingsPage auth profile synchronization", () => {
   beforeEach(async () => {
     localStorage.clear()
     apiRequest.mockReset()
+    authState.user = { id: "1", username: "alice", email: "old@example.com" }
     Object.defineProperty(navigator, "locks", {
       configurable: true,
       value: { request: vi.fn(async (_name: string, callback: () => Promise<unknown>) => callback()) },
@@ -60,6 +61,38 @@ describe("SettingsPage auth profile synchronization", () => {
     })
     if (created.status !== "created") throw new Error("expected session")
     authState.session = created.projection.snapshot
+  })
+
+  it("does not render the username when an email label is available", async () => {
+    apiRequest.mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      user: authState.user,
+    }), { headers: { "Content-Type": "application/json" } }))
+
+    render(<SettingsPage />)
+
+    await waitFor(() => expect(apiRequest).toHaveBeenCalledOnce())
+    expect(screen.queryByDisplayValue("alice")).not.toBeInTheDocument()
+    expect(screen.getByDisplayValue("old@example.com")).toBeInTheDocument()
+  })
+
+  it("retains the username label for an email-less account", async () => {
+    authState.user = { id: "1", username: "legacy-admin", email: null }
+    const replacement = await createSession({
+      user: authState.user,
+      access_token: "legacy-access",
+      refresh_token: "legacy-refresh",
+    })
+    if (replacement.status !== "created") throw new Error("expected replacement")
+    authState.session = replacement.projection.snapshot
+    apiRequest.mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      user: authState.user,
+    }), { headers: { "Content-Type": "application/json" } }))
+
+    render(<SettingsPage />)
+
+    expect(screen.getByDisplayValue("legacy-admin")).toBeInTheDocument()
   })
 
   it("renders the distribution task runtime settings slot", async () => {

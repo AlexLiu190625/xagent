@@ -87,6 +87,100 @@ async def test_hidden_users_excluded_from_admin_list_and_delete():
 
 
 @pytest.mark.asyncio
+async def test_admin_users_include_email_and_support_email_search():
+    _admin_headers()
+    opaque_username = "acct_0123456789abcdef0123456789abcdef"
+    _register_second_user(opaque_username, "opaque-password")
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        target = db.query(User).filter(User.username == opaque_username).one()
+        target.email = "display@example.com"
+        db.commit()
+
+        result = await get_users(1, 100, "display@example.com", admin, db)
+
+        assert len(result.users) == 1
+        assert result.users[0].username == opaque_username
+        assert result.users[0].email == "display@example.com"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_user_search_still_matches_username():
+    _admin_headers()
+    username = "searchable-user"
+    _register_second_user(username, "search-password")
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+
+        result = await get_users(1, 100, username, admin, db)
+
+        assert [user.username for user in result.users] == [username]
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_user_list_serializes_null_email():
+    _admin_headers()
+    username = "email-less-user"
+    _register_second_user(username, "search-password")
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        target = db.query(User).filter(User.username == username).one()
+        target.email = None
+        db.commit()
+
+        result = await get_users(1, 100, username, admin, db)
+
+        assert len(result.users) == 1
+        assert result.users[0].email is None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_user_email_search_is_case_insensitive():
+    _admin_headers()
+    opaque_username = "acct_0123456789abcdef0123456789abcdef"
+    _register_second_user(opaque_username, "opaque-password")
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        target = db.query(User).filter(User.username == opaque_username).one()
+        target.email = "display@example.com"
+        db.commit()
+        db.execute(text("PRAGMA case_sensitive_like = ON"))
+
+        result = await get_users(1, 100, "DISPLAY@EXAMPLE.COM", admin, db)
+
+        assert [user.id for user in result.users] == [target.id]
+    finally:
+        db.execute(text("PRAGMA case_sensitive_like = OFF"))
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_user_search_treats_wildcards_as_literal_text():
+    _admin_headers()
+    _register_second_user("search-user", "search-password")
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+
+        result = await get_users(1, 100, "%_", admin, db)
+
+        assert result.users == []
+        assert result.total == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_admin_user_delete_runs_runtime_cleanup_before_task_delete():
     _admin_headers()
     _register_second_user("runtime-user", "runtimepass1")

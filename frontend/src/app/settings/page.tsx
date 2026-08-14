@@ -133,14 +133,12 @@ export default function SettingsPage() {
               </Alert>
             )}
 
-            <div className="space-y-2">
-              <Label htmlFor="account-username">{t("settings.email.username")}</Label>
-              <Input
-                id="account-username"
-                value={user?.username || ""}
-                disabled
-              />
-            </div>
+            {!user?.email?.trim() && user?.username?.trim() && (
+              <div className="space-y-2">
+                <Label htmlFor="account-username">{t("settings.email.username")}</Label>
+                <Input id="account-username" value={user.username} disabled />
+              </div>
+            )}
 
             <div className="space-y-2">
               <Label htmlFor="account-email">{t("settings.email.current")}</Label>

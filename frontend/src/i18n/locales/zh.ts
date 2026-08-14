@@ -772,10 +772,10 @@ const zh = {
     list: {
       title: "用户列表",
       description: "查看和管理系统中的所有用户",
-      search_placeholder: "搜索用户名...",
+      search_placeholder: "搜索邮箱或用户名...",
       table: {
         id: "ID",
-        username: "用户名",
+        account: "账户",
         role: "角色",
         created_at: "创建时间",
         updated_at: "最后更新",
@@ -2869,6 +2869,7 @@ const zh = {
               title: "Token Refresh 演示",
               labels: {
                 currentUser: "当前用户:",
+                defaultUser: "用户",
                 accessTokenStatus: "Access Token状态:",
                 refreshTokenStatus: "Refresh Token状态:",
                 wsStatus: "WebSocket状态:",

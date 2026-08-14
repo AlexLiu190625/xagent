@@ -67,6 +67,21 @@ describe("translations", () => {
     assertTranslationTreeParity(translations.en, translations.zh)
   })
 
+  it("describes the admin account label and searchable identities", () => {
+    expect(translations.en.userManagement.list).toEqual(
+      expect.objectContaining({
+        search_placeholder: "Search email or username...",
+        table: expect.objectContaining({ account: "Account" }),
+      }),
+    )
+    expect(translations.zh.userManagement.list).toEqual(
+      expect.objectContaining({
+        search_placeholder: "搜索邮箱或用户名...",
+        table: expect.objectContaining({ account: "账户" }),
+      }),
+    )
+  })
+
   it("describes deployment configuration failure without a browser fallback", () => {
     expect(translations.zh.deployment_config.messages.load_failed).toBe(
       "部署配置加载失败。复制部署信息前请重试。",

@@ -7,7 +7,14 @@ import type { NavigationGroup } from "@/lib/sidebar-navigation"
 
 import { Sidebar } from "./sidebar"
 
-const authState = vi.hoisted(() => ({ logout: vi.fn<() => Promise<boolean>>(), user: { id: "1", username: "alice" } }))
+const authState = vi.hoisted(() => ({
+  logout: vi.fn<() => Promise<boolean>>(),
+  user: {
+    id: "1",
+    username: "acct_0123456789abcdef0123456789abcdef",
+    email: "alice@example.com",
+  },
+}))
 const toast = vi.hoisted(() => ({ error: vi.fn() }))
 const routeState = vi.hoisted(() => ({ pathname: "/task" }))
 const navState = vi.hoisted(() => ({ groups: [] as unknown[] }))
@@ -41,7 +48,9 @@ describe("Sidebar logout", () => {
 
   it("keeps the menu open and reports a localized failure when logout cannot clear auth", async () => {
     render(<Sidebar />)
-    fireEvent.click(screen.getByRole("button", { name: /alice/i }))
+    const userMenu = screen.getByRole("button", { name: /alice@example\.com/i })
+    expect(screen.queryByText("acct_0123456789abcdef0123456789abcdef")).not.toBeInTheDocument()
+    fireEvent.click(userMenu)
     fireEvent.click(screen.getByRole("button", { name: "sidebar.user.logoutTitle" }))
     await waitFor(() => expect(authState.logout).toHaveBeenCalledOnce())
     expect(toast.error).toHaveBeenCalledWith("sidebar.user.logoutFailed")
