@@ -83,6 +83,37 @@ _MIN_WAIT_BUDGET_SECONDS = 0.05
 
 _TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
 _TERMINAL_STATUS_VALUES = {status.value for status in _TERMINAL_STATUSES}
+# A task moving to ``waiting_for_user`` also warrants an early watchdog
+# wake, same as a terminal one -- both are broadcasts that make the
+# authoritative row read (by the watchdog, or the attach-time snapshot)
+# worth re-running sooner than the next scheduled cycle.
+_EARLY_WAKE_STATUS_VALUES = _TERMINAL_STATUS_VALUES | {
+    TaskStatus.WAITING_FOR_USER.value
+}
+
+
+def _stream_close_reason(status: TaskStatus, control_state: str | None) -> str | None:
+    """Shared close determination for a task's authoritative row state.
+
+    Both the watchdog (``watchdog_check_once``, polling) and the
+    attach-time fast path (``build_event_stream_response``, one-shot at
+    open) need to reach the same conclusion from the same two fields, so
+    they call this instead of duplicating the condition. Returns
+    ``"terminal"`` when the task is completed/failed, ``"input_required"``
+    when it's stuck waiting on user input (and not mid-resume), or
+    ``None`` when the stream should keep going. Each caller still builds
+    its own output from the category -- a close frame on the watchdog's
+    already-open stream, or a fast-path response before one ever opens.
+    """
+    if status in _TERMINAL_STATUSES:
+        return "terminal"
+    if (
+        status is TaskStatus.WAITING_FOR_USER
+        and control_state != TaskControlState.RESUME_REQUESTED.value
+    ):
+        return "input_required"
+    return None
+
 
 # A sync callable: (task_id, principal) -> ``_TaskInfoSnapshot``-shaped
 # object (duck-typed: ``.status`` / ``.control_state`` / ``.output`` /
@@ -250,8 +281,6 @@ class V1EventStreamSink:
             message = json.loads(text)
             if not isinstance(message, dict):
                 return
-            if not self._binding_matches(message):
-                return
             if message.get("type") == "task_completed":
                 # Acceleration signal only: the authoritative completion
                 # frame still comes from the watchdog reading the task
@@ -264,11 +293,18 @@ class V1EventStreamSink:
                 status = message.get("status")
                 if isinstance(status, str):
                     self.enqueue_status(status)
-                    if status in _TERMINAL_STATUS_VALUES:
+                    if status in _EARLY_WAKE_STATUS_VALUES:
                         # A failed task's broadcast (``task_error``) never
-                        # carries ``type == "task_completed"``, so it would
-                        # otherwise miss the acceleration signal above and
-                        # wait out the watchdog's normal cadence.
+                        # carries ``type == "task_completed"``, and a task
+                        # moving to ``waiting_for_user`` never does either,
+                        # so both would otherwise miss the acceleration
+                        # signal above and wait out the watchdog's normal
+                        # cadence. Safe to wake early on either: the
+                        # watchdog re-reads the authoritative row (via
+                        # ``_stream_close_reason``) before closing anything,
+                        # including the ``resume_requested`` carve-out, so
+                        # an early wake never closes a stream that a fresh
+                        # read wouldn't have closed anyway.
                         self.completion_hint.set()
         except Exception:
             self.dropped_frame_count += 1
@@ -276,7 +312,7 @@ class V1EventStreamSink:
                 "v1 SSE sink dropped a broadcast frame for task %s", self.task_id
             )
 
-    async def close(self, *args: Any, **kwargs: Any) -> None:
+    async def close(self) -> None:
         """No-op. Duck-types ``WebSocket.close`` -- task deletion
         (``chat.py``'s ``_cleanup_runtime_state``) calls ``close()`` on every
         connection still registered for the task, and a missing method here
@@ -285,23 +321,6 @@ class V1EventStreamSink:
         ``finally`` block is what actually tears the stream down.
         """
         return None
-
-    def _binding_matches(self, message: dict[str, Any]) -> bool:
-        """Drop frames whose task_id doesn't match this stream's binding
-        (defense in depth -- ``manager`` already scopes delivery to this
-        task's connections, so this only matters if a connection is ever
-        reassigned via ``move_connection``)."""
-        candidate = message.get("task_id")
-        if candidate is None and message.get("type") == "task_completed":
-            task_obj = message.get("task")
-            if isinstance(task_obj, dict):
-                candidate = task_obj.get("id")
-        if candidate is None:
-            return True
-        try:
-            return int(candidate) == self.task_id
-        except (TypeError, ValueError):
-            return False
 
 
 # -- Per-principal concurrency accounting --------------------------------
@@ -397,7 +416,8 @@ async def watchdog_check_once(
         raise
 
     status = snapshot.status
-    if status in _TERMINAL_STATUSES:
+    close_reason = _stream_close_reason(status, snapshot.control_state)
+    if close_reason == "terminal":
         return sink.enqueue_close(
             completed_frame(
                 status=status.value,
@@ -405,10 +425,7 @@ async def watchdog_check_once(
                 error=snapshot.error,
             )
         )
-    if (
-        status is TaskStatus.WAITING_FOR_USER
-        and snapshot.control_state != TaskControlState.RESUME_REQUESTED.value
-    ):
+    if close_reason == "input_required":
         return sink.enqueue_close(input_required_frame(task_id))
     if status is TaskStatus.PAUSED:
         # SDK wait() semantics: PAUSED keeps waiting, doesn't close.
@@ -435,8 +452,8 @@ async def _watchdog_loop(
     interval_seconds: float,
 ) -> None:
     """Runs every ``interval_seconds`` and also wakes early on a
-    completion hint from a terminal (completed or failed) broadcast:
-    same check, just run sooner.
+    completion hint from a terminal (completed or failed) or
+    waiting-for-user broadcast: same check, just run sooner.
 
     A single failed check (e.g. a transient DB error) must not end
     watchdog coverage for the rest of the stream's lifetime -- that
@@ -469,6 +486,15 @@ async def _watchdog_loop(
 
 
 # -- Response assembly ----------------------------------------------------
+
+# nginx buffers proxied responses by default; X-Accel-Buffering is the
+# per-response override that keeps SSE frames flowing immediately instead
+# of waiting for the proxy buffer to fill.
+_SSE_HEADERS = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+
+
+def _sse_response(body: AsyncIterator[str]) -> StreamingResponse:
+    return StreamingResponse(body, media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 async def _terminal_snapshot_stream(
@@ -658,20 +684,14 @@ async def build_event_stream_response(
     per-principal reservation) ever exists, so a rejected attach never
     touches ``manager`` or the per-principal counter.
     """
-    if initial_snapshot.status in _TERMINAL_STATUSES:
-        return StreamingResponse(
-            _terminal_snapshot_stream(initial_snapshot),
-            media_type="text/event-stream",
-        )
+    close_reason = _stream_close_reason(
+        initial_snapshot.status, initial_snapshot.control_state
+    )
+    if close_reason == "terminal":
+        return _sse_response(_terminal_snapshot_stream(initial_snapshot))
 
-    if (
-        initial_snapshot.status is TaskStatus.WAITING_FOR_USER
-        and initial_snapshot.control_state != TaskControlState.RESUME_REQUESTED.value
-    ):
-        return StreamingResponse(
-            _input_required_snapshot_stream(initial_snapshot),
-            media_type="text/event-stream",
-        )
+    if close_reason == "input_required":
+        return _sse_response(_input_required_snapshot_stream(initial_snapshot))
 
     if count_task_sinks(task_id) >= PER_TASK_STREAM_CAP:
         raise V1ApiError(V1ErrorCode.RATE_LIMITED, 429)
@@ -680,7 +700,7 @@ async def build_event_stream_response(
     if not principal_slot_available(key_prefix):
         raise V1ApiError(V1ErrorCode.RATE_LIMITED, 429)
 
-    return StreamingResponse(
+    return _sse_response(
         _generate(
             task_id,
             principal,
@@ -690,6 +710,5 @@ async def build_event_stream_response(
             watchdog_interval_seconds=watchdog_interval_seconds,
             stream_max_duration_seconds=stream_max_duration_seconds,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
-        ),
-        media_type="text/event-stream",
+        )
     )
