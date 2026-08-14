@@ -1130,6 +1130,10 @@ const zh = {
         selected: "已选 {count} 个",
         connect: "连接",
         connecting: "连接中...",
+        // Card-level trigger for the per-server OAuth flow of an unauthorized
+        // custom mcp_oauth connector. Deliberately not "Connect": the select
+        // mode footer already uses that label to commit the selection.
+        authorize: "授权",
         apiKeyOptionalHint: "输入你的 API key 以连接。",
         apiKeyOverrideHint: "或填写你自己的 key 覆盖共享密钥。",
         sharedKeyConfigured: "已配置共享 key,可直接使用连接。",

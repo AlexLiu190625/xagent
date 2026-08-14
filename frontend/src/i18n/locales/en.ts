@@ -1130,6 +1130,10 @@ Build when you need.`,
         selected: "{count} selected",
         connect: "Connect",
         connecting: "Connecting...",
+        // Card-level trigger for the per-server OAuth flow of an unauthorized
+        // custom mcp_oauth connector. Deliberately not "Connect": the select
+        // mode footer already uses that label to commit the selection.
+        authorize: "Authorize",
         apiKeyOptionalHint: "Enter your API key to connect.",
         apiKeyOverrideHint: "Or enter your own key to override the shared one.",
         sharedKeyConfigured: "A shared key is already configured — you can connect with it directly.",
