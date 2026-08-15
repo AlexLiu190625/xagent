@@ -11,19 +11,19 @@ in this delivery that a SQLite-backed test cannot actually exercise:
   backends agree. (The TaskStatus-bind-parameter structural guard this
   bullet used to also cover needs no database at all and lives in the
   sibling SQLite-backed file instead.)
-- The three answered-row CHECK constraints. (This build does not classify
-  a rowcount=0 fence miss -- see ``RespondOutcomeUnknown``'s own
-  docstring -- so the six non-active-row classification cells a more
-  detailed build would need proven against a real PostgreSQL server are
-  not delivered here either.)
+- ``respond()``'s six fence-miss (rowcount=0) classifications -- four of
+  them from a non-active interaction row (already answered, or terminated
+  for one of three reasons), the other two from a row that is still
+  ``active`` but whose *task* has moved on -- and the three answered-row
+  CHECK constraints, run against a real PostgreSQL server rather than as a
+  second copy of the SQLite-backed cell tests -- the point here is the
+  backend, not new behavior coverage.
 - Four genuinely concurrent tests, each opening a second real connection:
   the ownership-change TOCTOU window that PostgreSQL's row lock closes
   (which SQLite's single-writer model cannot reproduce), two
   ``respond()`` calls serializing on the same ``tasks`` row, and two
   lock-order deadlock regressions (``respond()`` racing a staging
-  reclaim, and ``respond()`` racing a concurrent purge) -- both
-  deadlock regressions assert this build's own conservative outcome
-  where their more detailed sibling would assert a specific reason.
+  reclaim, and ``respond()`` racing a concurrent purge).
 - One sequential (not concurrent) test running both
   ``respond()``-vs-``purge_task_rows`` orderings one after another --
   each ordering runs to completion and commits before the next
@@ -362,10 +362,9 @@ def test_answer_fence_guest_entity_binding_matches_on_postgresql(db_session) -> 
 
 
 # ---------------------------------------------------------------------------
-# Fixtures shared by every real svc.respond() call in this file, plus the
-# CHECK-guarded answered-row shape. (The six rowcount=0 classification
-# cells this build does not classify are not exercised here -- see this
-# file's own module docstring.)
+# The six rowcount=0 classification cells, exercised through a real
+# svc.respond() call against PostgreSQL, plus the CHECK-guarded answered-row
+# shape.
 # ---------------------------------------------------------------------------
 
 
@@ -432,6 +431,116 @@ def _pg_envelope(idempotency_key: str) -> svc.RespondEnvelope:
         values={"env": "prod"},
         idempotency_key=idempotency_key,
     )
+
+
+def test_answer_fence_rowcount_across_six_fence_miss_states(_respond_pg) -> None:
+    """Each of the six ways the fence UPDATE can land on rowcount=0,
+    exercised sequentially (one ``svc.respond()`` call after another, no
+    concurrent writer) against a real PostgreSQL server rather than SQLite --
+    the point of running this here instead of in the SQLite-backed sibling
+    file is the backend, not concurrency. Only cases 1-4 below put the
+    interaction row itself in a non-active state (answered, or terminated
+    for one of three reasons); cases 5 and 6 leave the row ``active`` and
+    move the *task* on instead (off ``WAITING_FOR_USER``, and onto a
+    different run), which is what still lands the fence on rowcount=0 for
+    those two. Each case runs through ``svc.respond()`` end to end rather
+    than the fence statement in isolation. Actual concurrent-writer
+    coverage lives in the dedicated tests below this one
+    (``test_concurrent_ownership_change_is_blocked...``,
+    ``test_two_concurrent_respond_calls_serialize...``, and the
+    deadlock/residue tests), which do open a second connection."""
+
+    # 1. Already answered, fresh key -> Conflict(already_answered).
+    user_id, task_id = _pg_waiting_task(_respond_pg)
+    interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
+    db = _respond_pg()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == interaction_id)
+            .first()
+        )
+        row.status = "answered"
+        row.active_slot = None
+        row.response_payload = {"env": "prod"}
+        row.responded_at = _now()
+        row.responder_identity = _pg_owning_principal(user_id).identity_string()
+        db.commit()
+    finally:
+        db.close()
+    outcome = svc.respond(
+        interaction_id=interaction_id,
+        task_id=task_id,
+        principal=_pg_owning_principal(user_id),
+        envelope=_pg_envelope("pg-already-answered"),
+    )
+    assert outcome == svc.RespondConflict(reason="already_answered")
+
+    # 2/3/4. Terminated, three reasons.
+    for terminal_reason, expected in (
+        ("deadline_elapsed", "expired"),
+        ("run_superseded", "run_superseded"),
+        ("answered_via_legacy_resume", "answered_via_chat"),
+    ):
+        user_id, task_id = _pg_waiting_task(_respond_pg)
+        interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
+        db = _respond_pg()
+        try:
+            row = (
+                db.query(TaskInteractionRequest)
+                .filter(TaskInteractionRequest.id == interaction_id)
+                .first()
+            )
+            row.status = "terminated"
+            row.active_slot = None
+            row.terminal_reason = terminal_reason
+            row.terminated_at = _now()
+            db.commit()
+        finally:
+            db.close()
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=_pg_owning_principal(user_id),
+            envelope=_pg_envelope(f"pg-terminated-{terminal_reason}"),
+        )
+        assert outcome == svc.RespondStale(reason=expected)
+
+    # 5. Still active, task not WAITING.
+    user_id, task_id = _pg_waiting_task(_respond_pg)
+    interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
+    db = _respond_pg()
+    try:
+        db.query(Task).filter(Task.id == task_id).update({"status": TaskStatus.RUNNING})
+        db.commit()
+    finally:
+        db.close()
+    outcome = svc.respond(
+        interaction_id=interaction_id,
+        task_id=task_id,
+        principal=_pg_owning_principal(user_id),
+        envelope=_pg_envelope("pg-not-waiting"),
+    )
+    assert outcome == svc.RespondStale(reason="run_ended")
+
+    # 6. Still active, waiting, but a foreign run. Both helpers build on
+    # "run-a", so the task alone is advanced afterwards -- neither carries
+    # a run_id parameter.
+    user_id, task_id = _pg_waiting_task(_respond_pg)
+    interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
+    db = _respond_pg()
+    try:
+        db.query(Task).filter(Task.id == task_id).update({"run_id": "run-current"})
+        db.commit()
+    finally:
+        db.close()
+    outcome = svc.respond(
+        interaction_id=interaction_id,
+        task_id=task_id,
+        principal=_pg_owning_principal(user_id),
+        envelope=_pg_envelope("pg-foreign-run"),
+    )
+    assert outcome == svc.RespondStale(reason="foreign_run")
 
 
 # ---------------------------------------------------------------------------
@@ -565,14 +674,25 @@ def test_concurrent_ownership_change_is_blocked_until_respond_commits(
 
 def test_two_concurrent_respond_calls_serialize_on_the_tasks_row(_respond_pg) -> None:
     """Two real connections answering the same row with different
-    idempotency keys must never both win: step 2's row lock serializes
-    them, and the loser's fence UPDATE matches zero rows once the winner
-    commits. This build does not classify why the loser's fence missed
-    (see ``RespondOutcomeUnknown``'s own docstring) -- a more detailed
-    build's loser would land on ``Stale`` or ``Conflict``, this build's
-    lands on ``OutcomeUnknown`` -- so the loser is accepted here as any
-    non-``Accepted`` outcome; the invariant this test exists to pin is
-    "never both win", not which label the loser gets."""
+    idempotency keys must never both win: step 2's ``FOR NO KEY UPDATE``
+    row lock blocks the loser at its own step 2 until the winner's entire
+    transaction -- fence UPDATE, Task CAS, staged command, and commit --
+    has gone through, so the loser's own fence UPDATE only ever runs
+    against an already-answered row. That ordering makes the loser's path
+    deterministic, not merely "some Stale or Conflict": the winner's CAS
+    (``apply_task_control_transition``, step 7) never touches
+    ``Task.status``, only ``state_version``/``control_state``, so the
+    loser's own fence still finds ``Task.status`` at ``WAITING_FOR_USER``
+    and only the interaction row's own active-row criteria fail; nothing
+    in this test reclaims the interaction's resume anchor between the two
+    calls, so the loser's step 5.5 still resolves it; and the winner's
+    idempotency key is not the loser's own, so the loser's reread finds no
+    command staged under its key. Every one of those is what the loser's
+    fence-miss classification (step 6) needs to land on
+    ``Conflict(already_answered)`` specifically. The assertion below still
+    only checks that exactly one call lands outside ``Accepted``, without
+    pinning that specific reason -- the invariant this test exists to pin
+    is "never both win", not the loser's exact outcome."""
 
     user_id, task_id = _pg_waiting_task(_respond_pg)
     interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
@@ -598,11 +718,7 @@ def test_two_concurrent_respond_calls_serialize_on_the_tasks_row(_respond_pg) ->
 
     accepted = [o for o in outcomes if isinstance(o, svc.RespondAccepted)]
     stale_or_conflict = [
-        o
-        for o in outcomes
-        if isinstance(
-            o, (svc.RespondStale, svc.RespondConflict, svc.RespondOutcomeUnknown)
-        )
+        o for o in outcomes if isinstance(o, (svc.RespondStale, svc.RespondConflict))
     ]
     assert len(accepted) == 1, outcomes
     assert len(stale_or_conflict) == 1, outcomes
@@ -768,16 +884,12 @@ def test_respond_vs_staging_reclaim_does_not_deadlock(_respond_pg, engine) -> No
     # The reclaim's UPDATE lands, uncommitted, before respond()'s own fence
     # UPDATE reaches the same row; respond() blocks on it (a plain row lock,
     # not the tasks lock this test is about), resumes once the reclaim
-    # commits, and correctly reports the miss rather than timing out or
-    # raising -- the interesting fact this test pins is that neither thread
-    # deadlocks getting there, not which of them "wins". This build does
-    # not classify why the fence missed (a more detailed build's sibling
-    # asserts the specific ``Stale(run_superseded)`` this scenario produces
-    # -- see ``RespondOutcomeUnknown``'s own docstring for why this build
-    # reports the ambiguity instead).
-    assert isinstance(results.get("respond_outcome"), svc.RespondOutcomeUnknown), (
-        results
-    )
+    # commits, and correctly reports the row as superseded rather than
+    # timing out or raising -- the interesting fact this test pins is that
+    # neither thread deadlocks getting there, not which of them "wins".
+    assert results.get("respond_outcome") == svc.RespondStale(
+        reason="run_superseded"
+    ), results
 
 
 # ---------------------------------------------------------------------------
