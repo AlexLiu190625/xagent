@@ -14,6 +14,13 @@ out of reach of a fast unit test. ``test_chat_team_scope_wiring_static.py``
 (source-level guards) and ``test_chat_team_scope_wiring_behavioral.py``
 (driving both call sites with a fake ``TaskSetupSnapshot`` and a spy on
 ``create_default_tools``) close that gap instead.
+
+The arguments below are chosen to isolate forwarding, not to describe a
+production call: both real call sites derive ``allowed_collections`` and
+``declared_knowledge_bases`` from the same stored agent field, so the two
+are equal by construction there. Passing a declaration while leaving
+``allowed_collections`` unset keeps a dropped keyword from being masked by
+a value that happens to arrive through the other one.
 """
 
 from __future__ import annotations

@@ -31,12 +31,19 @@ class KnowledgeBaseScopeError(RuntimeError):
     ``ConnectorRuntimeError`` (``core/tools/adapters/vibe/connector_runtime.py``),
     the equivalent typed error on the connector team-scope seam, whose
     ``.safe_message`` is what its own catch site (``chat.py``) reads to
-    build the HTTP response. Nothing in this codebase currently reads
-    ``code``, ``status_code``, ``details``, or ``safe_message`` off this
-    class -- both run-path handlers re-raise it unchanged rather than
-    unpacking it -- but a future HTTP-facing catch site should find the
-    same attribute name on either error, not two conventions for the same
-    shape.
+    build the HTTP response. This error is unpacked the same way, at the
+    same place: the ``create_task`` handler in ``web/api/chat.py`` answers
+    ``status_code`` with ``safe_message`` as the detail, directly alongside
+    its ``ConnectorRuntimeError`` arm, and logs ``code``/``details`` rather
+    than returning them. The other handlers re-raise it unchanged rather
+    than unpacking it: the two on the run path hand it to run orchestration
+    and the two on the tool-build path hand it to whoever is building the
+    tools, so in each case the status and code reach that caller instead of
+    being flattened into a bare ``RuntimeError``. The creator-collection
+    probe in ``document_search`` is the one deliberate exception -- it
+    catches every exception, this type included, because its answer chooses
+    how a report is worded and never what is searched or by whom, so a
+    failure there must hedge rather than abort the search.
     """
 
     def __init__(

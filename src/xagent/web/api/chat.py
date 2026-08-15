@@ -47,6 +47,7 @@ from ...core.tools.adapters.vibe.config import (
 )
 from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
+from ...core.tools.core.knowledge_base_scope import KnowledgeBaseScopeError
 from ...sandbox import SandboxMountIntent
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
@@ -4208,6 +4209,44 @@ async def create_task(
     except HTTPException:
         raise
     except ConnectorRuntimeError as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
+    except KnowledgeBaseScopeError as exc:
+        # Symmetric with the ConnectorRuntimeError arm above, and the only
+        # place anything reads this error's status_code/safe_message: the
+        # typed knowledge-base scope error already carries the status it
+        # wants (503, "resolution failed", retryable) and a message that is
+        # safe to hand a caller, so map both through rather than let the
+        # blanket handler below flatten it into a 500 built from str(exc).
+        # ``exc.code``/``exc.details`` are diagnostic and go to the log only.
+        #
+        # No step inside this endpoint resolves the team knowledge-base
+        # layer today (resolution happens per search call, on the run path),
+        # so this arm mirrors the two typed re-raises on the tool-build path
+        # in ``factory.py`` and ``knowledge_tools.py``: it exists so that a
+        # future in-request resolution surfaces the seam's own 503 instead
+        # of being silently reclassified as an internal error.
+        #
+        # The asymmetry with the ConnectorRuntimeError arm above is real
+        # and deliberate: that arm has a live producer inside this endpoint
+        # (``prepare_connector_runtime_selection_snapshot``), this one has
+        # none. It is kept because what the two arms share is the
+        # failure-path contract, not the producer: both errors carry their
+        # own status and a caller-safe message, and the blanket handler
+        # below turns anything it does not name into a 500 built from
+        # ``str(exc)``. Dropping this arm would make the first in-request
+        # producer -- the run-path resolution moving earlier, or a
+        # save-time validation added here -- answer 500 with a raw
+        # exception string, silently. The test beside it injects the raise
+        # for the same reason: what is pinned is this funnel's
+        # classification, not any particular producer.
+        logger.warning(
+            "Knowledge base scope unavailable during task creation "
+            "(code=%s, details=%s)",
+            exc.code,
+            exc.details,
+        )
         raise HTTPException(
             status_code=exc.status_code, detail=exc.safe_message
         ) from exc
