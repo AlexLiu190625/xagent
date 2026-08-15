@@ -162,7 +162,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
         Args:
             include_workspace_files: Whether to include current workspace files
             limit: Maximum number of registered uploads to return (default: 50)
-            offset: Number of registered uploads to skip for pagination
+            offset: Number of registered uploads to skip for pagination (default: 0)
 
         Returns:
             Dictionary of files with file_id, filename, size and mime_type, with
@@ -276,7 +276,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.list_all_user_files,
                 name="list_all_user_files",
-                description="List the user's files within this task's reach: this task's own uploads and nothing else. Files belonging to the user's other tasks are left out, as are files left behind by a task that was deleted, and no filesystem path to any of them is returned here. Registered uploads are returned newest-first in slices of limit (50 by default) at offset; raise the offset to see older ones. Current-workspace files are appended outside that slicing when include_workspace_files is on, and the unregistered ones among them have no file_id — read those by their relative path. Returns file_id, filename, size, mime_type, and whether a file is in the current workspace; open a listed upload by passing its file_id to read_file.",
+                description="List the user's files so you can find one they named that has no file_id in the current context, such as an attachment from an earlier turn; attachments are injected per turn. Scan the returned page yourself — there is no search parameter — and expect only what is within this task's reach: this task's own uploads and nothing else. Files belonging to the user's other tasks are left out, as are files left behind by a task that was deleted, and no filesystem path to any of them is returned here. Registered uploads come back newest-first in slices of limit (50 by default) starting at offset, and a slice can be short without being the last one, so raise the offset before concluding a named file does not exist — but stop once offset reaches total_count, which is the whole upload count and the point past which no upload remains to find. When include_workspace_files is on, current-workspace files are appended to every page outside that slicing, so they repeat as you page; the unregistered ones among them have no file_id, so read those by their relative path; when total_count is 0 they are all you get and paging further returns the same rows. Do not call this to discover the current turn's inputs, to hunt for reference material nobody gave you, or to take inventory before starting work. Returns file_id, filename, size, mime_type, and whether a file is in the current workspace; open a listed upload by passing its file_id to read_file.",
             ),
             FileTool(
                 self.edit_file,

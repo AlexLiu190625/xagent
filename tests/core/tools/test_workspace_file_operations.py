@@ -556,7 +556,7 @@ class TestWorkspaceFileOperations:
             ]
         )
 
-    def test_list_all_user_files_description_states_the_limit(
+    def test_list_all_user_files_description_forbids_discovery(
         self, public_file_scope_context
     ):
         tools = WorkspaceFileTools(public_file_scope_context.workspace)
@@ -566,6 +566,16 @@ class TestWorkspaceFileOperations:
             if tool.metadata.name == "list_all_user_files"
         ).description
 
+        assert "attachments are injected per turn" in description
+        # "turn", not "task": an earlier turn's attachment of this task is the one
+        # sanctioned reason to call this.
+        assert "Do not call this to discover the current turn's inputs" in description
+        assert "to hunt for reference material nobody gave you" in description
+        assert "to take inventory before starting work" in description
+        # There is no search parameter; promising one would have the model expect
+        # a lookup the callable cannot do.
+        assert "there is no search parameter" in description
+        assert "filtering" not in description
         assert "within this task's reach" in description
         # Rows whose reads always fail must not be offered at all.
         assert "no filesystem path to any of them is returned here" in description
@@ -573,11 +583,18 @@ class TestWorkspaceFileOperations:
         # description must not promise task-less uploads are still listed.
         assert "left behind by a task that was deleted" in description
         assert "not tied to a task" not in description
-        # Paging and the two kinds of row the model can receive.
-        assert "raise the offset to see older ones" in description
-        assert "appended outside that slicing" in description
+        # Workspace rows are appended outside limit/offset, so paging advice that
+        # ignores them sends the model round in circles.
+        assert "newest-first in slices of limit (50 by default)" in description
+        assert "raise the offset before concluding" in description
+        # Without a terminal condition the model pages forever on an absent file.
+        assert "stop once offset reaches total_count" in description
+        assert "appended to every page outside that slicing" in description
         assert "have no file_id" in description
-        assert "(50 by default)" in description
+        # total_count 0 means the DB branch never ran, so paging cannot help.
+        assert "paging further returns the same rows" in description
+        assert "Returns file_id, filename, size, mime_type" in description
+        assert "storage_path" not in description
 
     def test_delegated_marked_workspace_reads_exact_record_under_owner_base(
         self, public_file_scope_context

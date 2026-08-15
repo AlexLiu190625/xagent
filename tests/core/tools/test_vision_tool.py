@@ -490,6 +490,25 @@ class TestVisionToolUnderstandImages:
 class TestVisionToolUnderstandMedia:
     """Tests for the public image/video understanding entrypoint."""
 
+    def test_description_rejects_file_type_probing(self, vision_tool_without_workspace):
+        tools = vision_tool_without_workspace.get_tools()
+        description = next(
+            tool for tool in tools if tool.metadata.name == "understand_media"
+        ).description
+
+        assert "accepts images and videos only" in description
+        assert "unfamiliar file by the extension" in description
+        assert "text or code with read_file" in description
+        # SVG is text by extension, but this tool is the sanctioned way to inspect
+        # the design it encodes, so the extension rule needs the carve-out.
+        assert "plus SVG" in description
+        # The incident behind this: a bare file_id has no filename to judge.
+        assert "bare file_id carries no" in description
+        flat = " ".join(description.split())
+        assert "take the name from the same task's get_file_info" in flat
+        assert "from the file listing that gave you the id" in flat
+        assert "skip the id rather than" in description
+
     @pytest.mark.asyncio
     async def test_understand_svg_sends_source_without_rasterizing(
         self, vision_tool_without_workspace, mock_vision_model, tmp_path
