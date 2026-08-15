@@ -1,16 +1,19 @@
-"""Behavioral pins for the two ``create_default_tools`` call sites the
-source-level guard (``test_chat_team_scope_wiring_static.py``) cannot
-reach: that guard only proves neither call site passes a literal
-``None``, so it cannot catch a call site that derives the *wrong*
-non-``None`` value (e.g. the running user's id instead of the agent
-creator's), or one that hardcodes an empty list where the agent's own
-declaration belongs.
+"""Behavioral pins for the team-scope values ``chat.py`` forwards into
+``create_default_tools``, covering what the source-level guard
+(``test_chat_team_scope_wiring_static.py``) cannot reach: that guard only
+proves no derivation point passes a literal ``None``, so it cannot catch
+one that derives the *wrong* non-``None`` value (e.g. the running user's
+id instead of the agent creator's), or one that hardcodes an empty list
+where the agent's own declaration belongs.
 
 These tests drive the real methods (``AgentServiceManager._build_tools_for_task``
-and ``AgentServiceManager.get_agent_for_task``) with a fake ``TaskSetupSnapshot``
-and assert the values forwarded to ``create_default_tools`` equal the
-snapshot's own agent fields -- not merely "not None" -- so a swap to the
-runner's id, or a hardcoded ``[]``, fails the assertion.
+and ``AgentServiceManager.get_agent_for_task``) and assert the values
+forwarded to ``create_default_tools`` equal the agent's own fields -- not
+merely "not None" -- so a swap to the runner's id, or a hardcoded ``[]``,
+fails the assertion. All three derivation points are covered: the two
+snapshot branches, driven with a fake ``TaskSetupSnapshot``, and
+``_build_tools_for_task``'s snapshot-less branch, driven with a fake
+session that returns a live ``Agent`` row.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from xagent.web.api.chat import AgentServiceManager
-from xagent.web.models.agent import AgentStatus
+from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.llm_utils import AgentRuntimeFields
@@ -177,3 +180,73 @@ async def test_get_agent_for_task_forwards_snapshot_declaration_not_empty() -> N
     assert kwargs.get("agent_creator_user_id") == _CREATOR_USER_ID
     assert kwargs.get("declared_knowledge_bases") == _DECLARED_KBS
     assert kwargs.get("declared_knowledge_bases") != []
+
+
+@pytest.mark.asyncio
+async def test_build_tools_for_task_live_orm_branch_reads_the_agent_row() -> None:
+    """Pins the third derivation point: the snapshot-less branch of
+    ``_build_tools_for_task``, which reads the creator off a live ``Agent``
+    row instead of a frozen snapshot.
+
+    The static guard only proves this branch does not hardcode ``None``,
+    which leaves the same swap the other two branches are pinned against
+    wide open: reading the *task's* ``user_id`` (whoever is running the
+    task) where the *agent row's* ``user_id`` (whoever created the agent)
+    belongs. The two ids differ in this fixture, so that swap is visible.
+
+    The branch is not reachable from production today -- the only caller
+    always supplies a snapshot -- but the team-scope rule now consumes
+    ``agent_creator_user_id`` to decide which declared knowledge-base names
+    a runner may resolve, so a snapshot-less path added later would widen
+    or narrow that resolution silently if it derived the value wrongly.
+    """
+    manager = AgentServiceManager()
+    snapshot = _make_snapshot()
+
+    # Deliberately owned by the runner, while the agent row below is owned
+    # by the creator: the forwarded value must follow the agent, not the task.
+    task_row = Task(
+        id=42,
+        user_id=_RUNNER_USER_ID,
+        title="live-orm-branch",
+        description="live-orm-branch",
+        status=TaskStatus.PENDING,
+        agent_id=7,
+        agent_type="standard",
+    )
+    agent_row = Agent(
+        id=7,
+        user_id=_CREATOR_USER_ID,
+        team_id=_TEAM_ID,
+        name="gov-agent",
+        status=AgentStatus.PUBLISHED,
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = agent_row
+
+    with (
+        patch(
+            "xagent.web.api.chat.create_default_tools",
+            new=AsyncMock(return_value=([], MagicMock())),
+        ) as create_tools_mock,
+        patch("xagent.web.api.chat.resolve_workforce_task_runtime", return_value=None),
+        patch.object(
+            manager, "_get_or_create_task_sandbox", AsyncMock(return_value=None)
+        ),
+    ):
+        await manager._build_tools_for_task(
+            task_id=42,
+            task=task_row,
+            db=db,
+            user=snapshot.runtime_user,
+            agent_config=snapshot.agent_config,
+            task_llm=None,
+            task_vision_llm=None,
+            task_setup_snapshot=None,
+        )
+
+    kwargs = create_tools_mock.call_args.kwargs
+    assert kwargs.get("agent_creator_user_id") == _CREATOR_USER_ID
+    assert kwargs.get("agent_creator_user_id") != _RUNNER_USER_ID
+    assert kwargs.get("connector_team_id") == _TEAM_ID
+    assert kwargs.get("declared_knowledge_bases") == _DECLARED_KBS

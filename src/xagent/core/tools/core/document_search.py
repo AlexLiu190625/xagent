@@ -250,15 +250,21 @@ async def _list_knowledge_bases_impl(
             ``knowledge_tools.py`` builds the list tool only when the
             agent's allowed collections are ``None`` -- a non-empty list
             builds the search tool alone, and an empty list builds no
-            knowledge tool at all -- and both chat call sites derive that
-            value and the declaration from the same stored field, so on this
-            path there is no declared name to classify as "unshared" versus
-            "missing". See ``declared_knowledge_bases`` below.
+            knowledge tool at all -- and both chat call sites derive the
+            allowed collections and the declaration from the same stored
+            field, so in production a list tool is built with no declared
+            name to classify as "unshared" versus "missing". A test may
+            still hand this function a declaration alongside ``None``
+            allowed collections; that combination is constructed to isolate
+            forwarding, not something a call site produces. See
+            ``declared_knowledge_bases`` below.
         declared_knowledge_bases: Accepted for signature symmetry and never
             read here, for the same reason. This function reports "here is
             what is available" -- an unresolved declared name simply does
             not appear in the list, with no separate message field, and
-            never triggers the creator-existence probe.
+            never triggers the creator-existence probe. That holds whatever
+            is passed, so an artificially constructed declaration changes
+            nothing about the answer.
 
     Returns:
         ListKnowledgeBasesResult containing knowledge base information
@@ -522,6 +528,11 @@ async def _search_knowledge_base_impl(
             ``tool_args.allowed_collections`` and never
             ``tool_args.collections``, both of which are model-authored on
             every path (a declared schema field the model can overwrite).
+            Both chat call sites derive this and the tool's allowed
+            collections from that one stored field, so in production the
+            two are equal by construction; a test that pairs a declaration
+            with different allowed collections is isolating forwarding, and
+            this function's behaviour is defined for that pairing too.
 
     Returns:
         KnowledgeSearchResult with formatted search results
