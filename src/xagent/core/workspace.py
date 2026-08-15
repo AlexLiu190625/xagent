@@ -2063,13 +2063,18 @@ class TaskWorkspace:
         offset: int = 0,
         *,
         _exact_task_scope: bool = False,
+        openable_only: bool = False,
     ) -> Dict[str, Any]:
-        """List all user files across all workspaces and uploaded files.
+        """List the user's uploaded files, narrowed by scope and by the flags.
 
         Args:
             include_workspace_files: Whether to include current workspace files
             limit: Maximum number of files to return (default: 50)
             offset: Number of files to skip for pagination (default: 0)
+            openable_only: Narrow to this task's own uploads before counting and
+                slicing. Narrower than the read authority, which also grants
+                task-less records; off by default so callers that carry their own
+                authority keep the full listing.
 
         Returns:
             Dictionary with list of all user files with metadata including file_id,
@@ -2171,6 +2176,10 @@ class TaskWorkspace:
                             *local_storage_filters,
                         ),
                     )
+                if openable_only and self.owner_user_id is not None:
+                    # Before count and the slice, or later pages become unreachable.
+                    # Task-bound only: deleting a task detaches its files, not drops them.
+                    query = query.filter(UploadedFile.task_id == self.current_task_id)
                 total_count = query.count()
                 files = (
                     query.order_by(UploadedFile.id.desc())

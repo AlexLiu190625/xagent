@@ -692,16 +692,19 @@ class WorkspaceFileOperations:
         include_workspace_files: bool = True,
         limit: int = DEFAULT_USER_FILE_LIST_LIMIT,
         offset: int = 0,
+        *,
+        openable_only: bool = False,
     ) -> Dict[str, Any]:
-        """List all user files across all workspaces and uploaded files.
+        """List the user's files, as far as this workspace's scope reaches.
 
         Args:
             include_workspace_files: Whether to include current workspace files
-            limit: Maximum number of files to return (default: 50)
-            offset: Number of files to skip for pagination (default: 0)
+            limit: Maximum number of registered uploads to return (default: 50)
+            offset: Number of registered uploads to skip for pagination
+            openable_only: Drop records this workspace could not open anyway
 
         Returns:
-            Dictionary with list of all user files with metadata including file_id,
+            Dictionary with list of user files with metadata including file_id,
             filename, storage_path, size, mime_type, etc.
         """
         try:
@@ -721,6 +724,7 @@ class WorkspaceFileOperations:
                 limit,
                 offset,
                 _exact_task_scope=exact_scope,
+                openable_only=openable_only,
             )
         except RuntimeError as exc:
             if not exact_scope:
