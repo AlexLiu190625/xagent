@@ -647,10 +647,24 @@ async def test_other_teams_kb_hosted_on_creator_tenant_is_not_personal(
     personal collection, so classifying off the listing alone calls a whole
     other team's knowledge base "a personal knowledge base belonging to
     this agent's creator" and aims the remediation at the wrong person.
+
+    That same other team also owns "really-mine", which lives in a
+    different member's namespace and shares its name with a collection the
+    creator genuinely owns. Only the rows physically hosted on the
+    creator's tenant may be discounted: a name-only exclusion would take
+    the creator's own collection with it and report it as absent.
     """
+    other_member_tenant = 500
     otherteam_kb = kb_scope.KnowledgeBaseAccess(
         name="otherteam-kb",
         storage_user_id=CREATOR,
+        team_owned=True,
+        can_edit=False,
+        can_delete=False,
+    )
+    same_name_on_another_tenant = kb_scope.KnowledgeBaseAccess(
+        name="really-mine",
+        storage_user_id=other_member_tenant,
         team_owned=True,
         can_edit=False,
         can_delete=False,
@@ -660,7 +674,9 @@ async def test_other_teams_kb_hosted_on_creator_tenant_is_not_personal(
         return []
 
     def _creator_own_team_visibility(db: Any, user_id: int) -> list:
-        return [otherteam_kb] if user_id == CREATOR else []
+        if user_id != CREATOR:
+            return []
+        return [otherteam_kb, same_name_on_another_tenant]
 
     kb_scope.set_knowledge_base_team_hooks(
         team_visibility=_governing_team_visibility,
@@ -683,7 +699,9 @@ async def test_other_teams_kb_hosted_on_creator_tenant_is_not_personal(
     assert "otherteam-kb is a personal knowledge base" not in gap_clause
     assert "otherteam-kb" in result.summary  # reported, as absent
     # The creator's genuine personal collection is still classified as one:
-    # the filter must remove the team's row, not everything on the tenant.
+    # the team owns a row by that name too, but it is hosted elsewhere, so
+    # discounting it here would describe a collection the creator really
+    # does hold as absent.
     assert "really-mine is a personal knowledge base" in result.summary
 
 
