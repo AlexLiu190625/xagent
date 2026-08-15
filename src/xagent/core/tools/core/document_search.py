@@ -537,7 +537,6 @@ class _CreatorCollectionProbe:
                 # restore exactly the misclassification this call exists to
                 # remove.
                 team_hosted = await _team_names_hosted_on(self._agent_creator_user_id)
-                self._names = {c.name for c in creator_result.collections} - team_hosted
             except Exception:
                 logger.warning(
                     "Failed to resolve creator's personal collections while "
@@ -546,6 +545,28 @@ class _CreatorCollectionProbe:
                 )
                 self._names = set()
                 self.lookup_failed = True
+            else:
+                if creator_result.status == "success":
+                    self._names = {
+                        c.name for c in creator_result.collections
+                    } - team_hosted
+                else:
+                    # The listing reports an infrastructure failure by
+                    # returning status="error" with an empty collection list
+                    # instead of raising (RAG_tools/management/collections).
+                    # Read as a plain answer, that empty list says "the
+                    # creator holds nothing", and the caller would assert
+                    # the certain "does not exist" wording off a lookup that
+                    # never completed. Same treatment as a raised failure:
+                    # nothing is established, so the report must hedge.
+                    logger.warning(
+                        "Creator collection listing reported status=%s while "
+                        "classifying an unshared knowledge base: %s",
+                        creator_result.status,
+                        creator_result.message,
+                    )
+                    self._names = set()
+                    self.lookup_failed = True
         return name in self._names
 
 
@@ -619,9 +640,16 @@ async def _search_knowledge_base_impl(
         # Team-governed run WITH a declaration, on a deployment that has
         # actually installed the team-keyed hook: the declaration is the
         # authority for both what may be searched and what gets reported.
-        # Gated on this three-way conjunction, not merely on
-        # governing_team_id being set, for two independent reasons:
+        # Gated on this four-way conjunction, not merely on
+        # governing_team_id being set, for three independent reasons:
         #
+        # - an unauthenticated call (``user_id`` is None) never had a team
+        #   layer resolved for it at all: ``_list_visible_collections``
+        #   returns before any team resolution when the runner id is absent,
+        #   so the visible set it produced is the plain listing. Running the
+        #   rule on top of that would classify every declared name through a
+        #   creator probe made on nobody's behalf. Both chat call sites carry
+        #   a real runner id today; this conjunct keeps it that way;
         # - an empty declaration (the case where agent_config carried no
         #   agent at all) has nothing to authorise or verdict-derive against,
         #   so the declared-name rule does not apply and the search falls
@@ -655,15 +683,17 @@ async def _search_knowledge_base_impl(
         # This gate and the team layer's own gate in
         # ``_list_visible_collections`` are not the same predicate: they
         # share ``governing_team_id is not None and
-        # team_knowledge_base_hook_installed()``, but this one adds a third
-        # conjunct (``declared_names_for_this_run``) that the team layer's
-        # gate does not read. That is intentional, not a mismatch to close --
+        # team_knowledge_base_hook_installed()``, but this one adds two more
+        # conjuncts (``user_id is not None`` and
+        # ``declared_names_for_this_run``) that the team layer's gate does
+        # not read. That is intentional, not a mismatch to close --
         # the team layer's job is only "resolve onto the governing team",
         # which an empty declaration does not change; this gate's job is
         # "does the declared-name rule apply at all", which an empty
         # declaration answers no to.
         declared_name_rule_applies = (
-            governing_team_id is not None
+            user_id is not None
+            and governing_team_id is not None
             and team_knowledge_base_hook_installed()
             and bool(declared_names_for_this_run)
         )
@@ -817,37 +847,76 @@ async def _search_knowledge_base_impl(
                 ]
 
                 if unresolvable_names:
-                    # The creator-collection lookup raised during this call,
-                    # so every unresolved declared name is unclassified, not
-                    # established absent. Reported as one undifferentiated
-                    # outcome for all of them -- a lookup failure is not
+                    # The creator-collection lookup did not complete during
+                    # this call, so every unresolved declared name is
+                    # unclassified, not established absent. Reported as one
+                    # undifferentiated outcome -- a lookup failure is not
                     # per-name, so this sentence still says nothing about
-                    # which names the creator holds. The other two report
-                    # sets are necessarily empty here: the first failure
-                    # caches the creator's name set as empty and marks the
-                    # probe failed, so every later unresolved name takes
-                    # this same classification, and a name reaches the
-                    # missing set only on a run whose runner is the creator
-                    # -- which never calls the probe at all.
-                    summary = _TERMINAL_UNRESOLVABLE_MESSAGE.format(
-                        names=", ".join(unresolvable_names)
-                    )
+                    # which names the creator holds -- and scoped like the
+                    # other two report sets, so an explicit request is
+                    # answered about the names it asked for.
+                    #
+                    # The narrowed list cannot come out empty: with an
+                    # explicit request, reaching this branch means every
+                    # requested name was unresolved, because a requested
+                    # name the verdict loop admitted would have survived the
+                    # narrowing and left the search set non-empty; without
+                    # one, the scope is the whole declaration.
+                    #
+                    # The other two report sets are necessarily empty here:
+                    # the first failure caches the creator's name set as
+                    # empty and marks the probe failed, so every later
+                    # unresolved name takes this same classification, and a
+                    # name reaches the missing set only on a run whose
+                    # runner is the creator -- which never calls the probe
+                    # at all.
+                    #
+                    # The admitted clause renders on the same condition as
+                    # the mixed branch below, so a request narrowed away to
+                    # nothing still says what could have been asked for.
+                    failed_unresolvable_names = [
+                        name for name in unresolvable_names if name in reported_scope
+                    ]
+                    unresolvable_segments = [
+                        _TERMINAL_UNRESOLVABLE_MESSAGE.format(
+                            names=", ".join(failed_unresolvable_names)
+                        )
+                    ]
+                    if admitted_names:
+                        unresolvable_segments.append(
+                            "Available collections: "
+                            f"{', '.join(sorted(admitted_names))}."
+                        )
+                    summary = " ".join(unresolvable_segments)
                 elif not failed_unshared_names:
                     # Nothing in scope is the creator's own collection, so
                     # the two inherited terminal sentences are true as
                     # written and each renders byte for byte on its own
-                    # call style.
+                    # call style. The availability clause they carry is
+                    # dropped when the verdict loop admitted nothing, the
+                    # same as the mixed branch below: its source is the
+                    # admitted set, which this rule can empty where the
+                    # visible union it replaced never could, and a label
+                    # with an empty list after it tells the model nothing.
                     if explicit_request is not None:
                         summary = (
-                            f"Error: The following collections do not exist: {', '.join(sorted(explicit_request))}. "
-                            f"Available collections: {', '.join(sorted(admitted_names))}"
+                            "Error: The following collections do not exist: "
+                            f"{', '.join(sorted(explicit_request))}."
                         )
+                        if admitted_names:
+                            summary += (
+                                " Available collections: "
+                                f"{', '.join(sorted(admitted_names))}"
+                            )
                     else:
                         summary = (
-                            f"Error: None of the allowed collections exist. "
-                            f"Allowed: {', '.join(sorted(authorised))}. "
-                            f"Available: {', '.join(sorted(admitted_names))}"
+                            "Error: None of the allowed collections exist. "
+                            f"Allowed: {', '.join(sorted(authorised))}."
                         )
+                        if admitted_names:
+                            summary += (
+                                f" Available: {', '.join(sorted(admitted_names))}"
+                            )
                 else:
                     # At least one failed name is the creator's own
                     # collection, which does exist. Neither inherited

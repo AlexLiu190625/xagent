@@ -781,12 +781,53 @@ async def test_total_kb_failure_with_same_named_personal_copies_reports_generic_
     # pre-verdict visible union and neither is searchable. Reporting either
     # as available would tell the model the exact opposite of what the rule
     # just decided.
-    available_clause = result.summary.split("Available:", 1)[1]
-    assert "handbook" not in available_clause
-    assert "policies" not in available_clause
+    #
+    # Nothing was admitted, so the clause is dropped rather than rendered
+    # with an empty list -- which is the stronger form of the same pin:
+    # neither personal copy may be reported as available.
+    assert "Available" not in result.summary
     # The declared names still appear -- in the "Allowed:" clause, which is
     # what the agent configured, not what resolved.
     assert "Allowed: handbook, policies" in result.summary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_terminal_summary_omits_the_availability_clause_when_nothing_was_admitted(
+    monkeypatch: pytest.MonkeyPatch, explicit: bool
+) -> None:
+    """The runner holds a same-named personal copy of the one declared
+    name, and neither the governing team nor the creator holds it -- so the
+    visible union is non-empty (the runner's own copy is in it) but nothing
+    was admitted (the rule refuses to search the runner's own same-named
+    copy). Before this pin the two uniform terminal sentences always
+    rendered an "Available:" / "Available collections:" label followed by
+    nothing; the label itself must now be omitted, byte for byte, and the
+    "Allowed:" half of the default-style sentence must still render.
+    """
+    _install_team(monkeypatch, {TEAM: []})
+    _install_collections(
+        monkeypatch,
+        {MEMBER: [_kb("handbook")], CREATOR: []},
+    )
+    _install_search(monkeypatch)
+
+    result = await _search(
+        monkeypatch,
+        runner_id=MEMBER,
+        declared=["handbook"],
+        collections=["handbook"] if explicit else None,
+    )
+
+    if explicit:
+        assert result.summary == (
+            "Error: The following collections do not exist: handbook."
+        )
+    else:
+        assert result.summary == (
+            "Error: None of the allowed collections exist. Allowed: handbook."
+        )
+    assert "Available" not in result.summary
 
 
 @pytest.mark.asyncio
@@ -1169,6 +1210,35 @@ async def test_declared_name_rule_inert_until_hook_installed(
     assert "could not be resolved" not in result.summary
 
 
+@pytest.mark.asyncio
+async def test_rule_stays_off_without_an_authenticated_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A governing team, an installed hook and a non-empty declaration are
+    not enough on their own: an unauthenticated call (no runner id) never
+    had a team layer resolved for it -- ``_list_visible_collections``
+    returns before any team resolution when the runner id is absent -- so
+    the declared-name rule must stay off rather than run a creator probe on
+    nobody's behalf.
+    """
+    _install_team(monkeypatch, {TEAM: []})
+    spy = _install_collections(monkeypatch, {None: [], CREATOR: [_kb("handbook")]})
+    _install_search(monkeypatch)
+
+    result = await _search(monkeypatch, runner_id=None, declared=["handbook"])
+
+    # No probe on nobody's behalf: the creator-existence lookup is never
+    # requested, even though the creator genuinely holds "handbook".
+    assert spy.calls_for(CREATOR) == 0
+    assert "shared with the team" not in result.summary
+    # Byte-for-byte the pre-rule behaviour for an unauthenticated call: the
+    # inherited empty-visible-set guard, not a declared-name rule outcome.
+    assert result.summary == (
+        "No knowledge bases available. Please create a knowledge base and "
+        "upload documents first."
+    )
+
+
 # ---------------------------------------------------------------------------
 # The creator-collection lookup failing degrades to the generic
 # outcome and never raises.
@@ -1215,6 +1285,191 @@ async def test_creator_listing_failure_reports_unresolved_not_absent(
     # The certainty wording is exactly what must not appear.
     assert "None of the allowed collections exist" not in result.summary
     assert "do not exist" not in result.summary
+
+
+@pytest.mark.asyncio
+async def test_creator_listing_error_status_reports_unresolved_not_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The creator-collection lookup does not raise this time -- it returns
+    a result whose status reports an infrastructure failure, with an empty
+    collection list, the way a real failure degrades in
+    ``_list_collections_impl``. Read as a plain answer, that empty list
+    says "the creator holds nothing", so the probe must treat it the same
+    way it treats a raised failure: hedge, not assert an absence no lookup
+    ever established.
+    """
+    _install_team(monkeypatch, {TEAM: []})
+
+    async def _erroring_list_collections(
+        user_id=None, is_admin=None, force_realtime=False
+    ):
+        if user_id == CREATOR:
+            return ListCollectionsResult(
+                status="error",
+                collections=[],
+                total_count=0,
+                message="storage unavailable",
+            )
+        if user_id == MEMBER:
+            return _collections(_kb("unrelated-own-doc"))
+        return _collections()
+
+    monkeypatch.setattr(document_search, "list_collections", _erroring_list_collections)
+    _install_search(monkeypatch)
+
+    result = await _search(monkeypatch, runner_id=MEMBER, declared=["handbook"])
+
+    assert result.results == []
+    assert "handbook could not be resolved for this agent" in result.summary
+    # The certainty wording is exactly what must not appear.
+    assert "do not exist" not in result.summary
+    assert "None of the allowed collections exist" not in result.summary
+
+
+# ---------------------------------------------------------------------------
+# The unresolvable terminal branch reports the same two things its sibling
+# branches report: the names actually asked about, and what the run could
+# still have asked for.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_terminal_still_reports_what_was_admitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The agent declares two names: "good", which the governing team owns
+    and hosts on a tenant other than the creator's, and "handbook", which
+    needs the creator probe to classify. The model's explicit request names
+    only "handbook", and the creator lookup raises. The verdict loop still
+    admitted "good" before the narrowing -- resolving a team-owned name
+    never touches the creator probe, so the probe's failure cannot take it
+    down too -- and the unresolvable branch must say so, the same way the
+    mixed branch already does.
+    """
+    third_tenant = 700
+    team_kb = kb_scope.KnowledgeBaseAccess(
+        name="good",
+        storage_user_id=third_tenant,
+        team_owned=True,
+        can_edit=False,
+        can_delete=False,
+    )
+    _install_team(monkeypatch, {TEAM: [team_kb]})
+
+    async def _list_collections_with_creator_failure(
+        user_id=None, is_admin=None, force_realtime=False
+    ):
+        if user_id == CREATOR:
+            raise RuntimeError("storage unavailable")
+        if user_id == third_tenant:
+            return _collections(_kb("good"))
+        return _collections()
+
+    monkeypatch.setattr(
+        document_search, "list_collections", _list_collections_with_creator_failure
+    )
+    search_spy = _install_search(monkeypatch)
+
+    result = await _search(
+        monkeypatch,
+        runner_id=MEMBER,
+        declared=["good", "handbook"],
+        collections=["handbook"],
+    )
+
+    assert search_spy.searched == []
+    assert result.results == []
+    assert result.summary == (
+        "Error: handbook could not be resolved for this agent. "
+        "Available collections: good."
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_failure_hedges_when_the_creator_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same fixture as above, no explicit request: "good" is admitted and
+    searched, "handbook" is left unclassified by the failed creator lookup.
+    This is the partial-failure path, not the terminal one, and its note
+    must carry the hedged wording rather than assert that "handbook" is
+    absent -- no lookup established that.
+    """
+    third_tenant = 700
+    team_kb = kb_scope.KnowledgeBaseAccess(
+        name="good",
+        storage_user_id=third_tenant,
+        team_owned=True,
+        can_edit=False,
+        can_delete=False,
+    )
+    _install_team(monkeypatch, {TEAM: [team_kb]})
+
+    async def _list_collections_with_creator_failure(
+        user_id=None, is_admin=None, force_realtime=False
+    ):
+        if user_id == CREATOR:
+            raise RuntimeError("storage unavailable")
+        if user_id == third_tenant:
+            return _collections(_kb("good"))
+        return _collections()
+
+    monkeypatch.setattr(
+        document_search, "list_collections", _list_collections_with_creator_failure
+    )
+    search_spy = _install_search(monkeypatch)
+
+    result = await _search(
+        monkeypatch,
+        runner_id=MEMBER,
+        declared=["good", "handbook"],
+    )
+
+    assert search_spy.searched == [("good", third_tenant, False)]
+    assert result.results
+    assert not result.summary.startswith("Error:")
+    assert (
+        "Note: handbook could not be resolved for this agent. The agent's "
+        "other knowledge bases were searched normally." in result.summary
+    )
+    assert "do not exist" not in result.summary
+    assert "None of the allowed collections exist" not in result.summary
+    assert "shared with the team" not in result.summary
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_terminal_reports_only_the_requested_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three declared names all fail to classify because the creator lookup
+    raises, and the model's explicit request narrows to just one of them.
+    The unresolvable branch must report only the requested name -- the
+    other two, which this call never asked about, must not appear.
+    """
+    _install_team(monkeypatch, {TEAM: []})
+
+    async def _broken_list_collections(
+        user_id=None, is_admin=None, force_realtime=False
+    ):
+        if user_id == CREATOR:
+            raise RuntimeError("storage unavailable")
+        return _collections()
+
+    monkeypatch.setattr(document_search, "list_collections", _broken_list_collections)
+    search_spy = _install_search(monkeypatch)
+
+    result = await _search(
+        monkeypatch,
+        runner_id=MEMBER,
+        declared=["alpha-notes", "beta-notes", "gamma-notes"],
+        collections=["gamma-notes"],
+    )
+
+    assert search_spy.searched == []
+    assert result.summary == "Error: gamma-notes could not be resolved for this agent."
+    assert "alpha-notes" not in result.summary
+    assert "beta-notes" not in result.summary
 
 
 # ---------------------------------------------------------------------------
