@@ -127,6 +127,40 @@ def _install_search(monkeypatch: pytest.MonkeyPatch) -> _SearchSpy:
     return spy
 
 
+_THIRD_TENANT = 700
+
+
+def _install_team_kb_off_creator_tenant_with_broken_creator_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> _SearchSpy:
+    """The governing team owns "good", hosted on a tenant that is neither the
+    runner's nor the creator's, and the creator's own listing raises. Resolving
+    a team-owned name never touches the creator probe, so "good" is admitted
+    while every name the probe would have classified is left unresolved."""
+    team_kb = kb_scope.KnowledgeBaseAccess(
+        name="good",
+        storage_user_id=_THIRD_TENANT,
+        team_owned=True,
+        can_edit=False,
+        can_delete=False,
+    )
+    _install_team(monkeypatch, {TEAM: [team_kb]})
+
+    async def _list_collections_with_creator_failure(
+        user_id=None, is_admin=None, force_realtime=False
+    ):
+        if user_id == CREATOR:
+            raise RuntimeError("storage unavailable")
+        if user_id == _THIRD_TENANT:
+            return _collections(_kb("good"))
+        return _collections()
+
+    monkeypatch.setattr(
+        document_search, "list_collections", _list_collections_with_creator_failure
+    )
+    return _install_search(monkeypatch)
+
+
 async def _search(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1347,29 +1381,9 @@ async def test_unresolvable_terminal_still_reports_what_was_admitted(
     down too -- and the unresolvable branch must say so, the same way the
     mixed branch already does.
     """
-    third_tenant = 700
-    team_kb = kb_scope.KnowledgeBaseAccess(
-        name="good",
-        storage_user_id=third_tenant,
-        team_owned=True,
-        can_edit=False,
-        can_delete=False,
+    search_spy = _install_team_kb_off_creator_tenant_with_broken_creator_lookup(
+        monkeypatch
     )
-    _install_team(monkeypatch, {TEAM: [team_kb]})
-
-    async def _list_collections_with_creator_failure(
-        user_id=None, is_admin=None, force_realtime=False
-    ):
-        if user_id == CREATOR:
-            raise RuntimeError("storage unavailable")
-        if user_id == third_tenant:
-            return _collections(_kb("good"))
-        return _collections()
-
-    monkeypatch.setattr(
-        document_search, "list_collections", _list_collections_with_creator_failure
-    )
-    search_spy = _install_search(monkeypatch)
 
     result = await _search(
         monkeypatch,
@@ -1396,29 +1410,9 @@ async def test_partial_failure_hedges_when_the_creator_lookup_fails(
     must carry the hedged wording rather than assert that "handbook" is
     absent -- no lookup established that.
     """
-    third_tenant = 700
-    team_kb = kb_scope.KnowledgeBaseAccess(
-        name="good",
-        storage_user_id=third_tenant,
-        team_owned=True,
-        can_edit=False,
-        can_delete=False,
+    search_spy = _install_team_kb_off_creator_tenant_with_broken_creator_lookup(
+        monkeypatch
     )
-    _install_team(monkeypatch, {TEAM: [team_kb]})
-
-    async def _list_collections_with_creator_failure(
-        user_id=None, is_admin=None, force_realtime=False
-    ):
-        if user_id == CREATOR:
-            raise RuntimeError("storage unavailable")
-        if user_id == third_tenant:
-            return _collections(_kb("good"))
-        return _collections()
-
-    monkeypatch.setattr(
-        document_search, "list_collections", _list_collections_with_creator_failure
-    )
-    search_spy = _install_search(monkeypatch)
 
     result = await _search(
         monkeypatch,
@@ -1426,7 +1420,7 @@ async def test_partial_failure_hedges_when_the_creator_lookup_fails(
         declared=["good", "handbook"],
     )
 
-    assert search_spy.searched == [("good", third_tenant, False)]
+    assert search_spy.searched == [("good", _THIRD_TENANT, False)]
     assert result.results
     assert not result.summary.startswith("Error:")
     assert (

@@ -36,9 +36,10 @@ _PARTIAL_FAILURE_NOTE = (
     "bases were searched normally."
 )
 # The terminal counterpart of the note above, for the one case the certainty
-# wording would be a falsehood: the creator-collection lookup raised, so
-# nothing established that these names are absent -- only that they could not
-# be classified. Reuses the note's hedge; nothing was searched, so it does not
+# wording would be a falsehood: the creator-collection lookup did not
+# complete -- it raised, or returned a result whose status reports failure --
+# so nothing established that these names are absent, only that they could
+# not be classified. Reuses the note's hedge; nothing was searched, so it does not
 # borrow the note's second sentence.
 _TERMINAL_UNRESOLVABLE_MESSAGE = "Error: {names} could not be resolved for this agent."
 
@@ -532,7 +533,8 @@ class _CreatorCollectionProbe:
     def __init__(self, agent_creator_user_id: Optional[int]) -> None:
         self._agent_creator_user_id = agent_creator_user_id
         self._names: Optional[set] = None
-        # Whether the one lookup this probe makes raised. Read by the caller
+        # Whether the one lookup this probe makes failed -- raised, or
+        # returned a result whose status reports failure. Read by the caller
         # to tell "the creator does not hold this name" apart from "nobody
         # asked" -- the failure degrades to "not held" for the search
         # decision (unchanged), but the report must not claim an absence
@@ -821,7 +823,8 @@ async def _search_knowledge_base_impl(
                         unshared_names.append(name)
                     elif creator_probe.lookup_failed:
                         # Not "missing": the lookup that would have decided
-                        # raised. The search outcome is the same either way
+                        # did not complete (raised, or reported failure
+                        # through its status). The search outcome is the same either way
                         # (nothing resolves), only the report differs.
                         unresolvable_names.append(name)
                     else:
