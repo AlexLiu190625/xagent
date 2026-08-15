@@ -131,6 +131,7 @@ async def _search(
     monkeypatch: pytest.MonkeyPatch,
     *,
     runner_id: int,
+    is_admin: bool = False,
     team_id: Optional[int] = TEAM,
     creator_id: Optional[int] = CREATOR,
     declared: Optional[list[str]] = None,
@@ -145,7 +146,7 @@ async def _search(
     return await document_search._search_knowledge_base_impl(
         tool_args,
         user_id=runner_id,
-        is_admin=False,
+        is_admin=is_admin,
         governing_team_id=team_id,
         agent_creator_user_id=creator_id,
         declared_knowledge_bases=declared,
@@ -565,6 +566,173 @@ async def test_total_failure_of_a_single_unshared_name_still_reports_the_gap(
     assert result.summary.startswith("Error:")
     assert "has not" in result.summary and "shared with the team" in result.summary
     assert "private-notes" in result.summary
+    # The sharing-gap sentence says the creator holds this collection; the
+    # same summary must not also assert it is absent.
+    assert "do not exist" not in result.summary
+    assert "None of the allowed collections exist" not in result.summary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_mixed_terminal_failure_lists_each_name_once(
+    monkeypatch: pytest.MonkeyPatch, explicit: bool
+) -> None:
+    """Two declared names fail for different reasons and nothing resolves:
+    "private-notes" is the creator's own unshared collection, "ghost" is
+    nobody's. The absence sentence may name only "ghost" -- naming
+    "private-notes" there would contradict the sharing-gap sentence in the
+    same summary, and the default call style's blanket "None of the allowed
+    collections exist" would assert the same falsehood about both.
+    """
+    _install_team(monkeypatch, {TEAM: []})
+    _install_collections(monkeypatch, {MEMBER: [], CREATOR: [_kb("private-notes")]})
+    search_spy = _install_search(monkeypatch)
+
+    declared = ["private-notes", "ghost"]
+    result = await _search(
+        monkeypatch,
+        runner_id=MEMBER,
+        declared=declared,
+        collections=declared if explicit else None,
+    )
+
+    assert search_spy.searched == []
+    assert result.results == []
+    assert result.summary.startswith("Error:")
+    assert "has not" in result.summary and "shared with the team" in result.summary
+    assert "None of the allowed collections exist" not in result.summary
+    absence_clause = result.summary.split("do not exist:", 1)[1].split(".", 1)[0]
+    assert "ghost" in absence_clause
+    assert "private-notes" not in absence_clause
+
+
+@pytest.mark.asyncio
+async def test_all_unshared_terminal_still_reports_what_was_admitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The team owns "good", so the verdict loop admits it, but the model's
+    explicit request names only the creator's unshared "private-notes" --
+    the narrowing empties the search set. The summary must still say what
+    the run could have searched, which is the whole reason the admitted set
+    is captured before the narrowing.
+    """
+    team_kb = kb_scope.KnowledgeBaseAccess(
+        name="good",
+        storage_user_id=CREATOR,
+        team_owned=True,
+        can_edit=False,
+        can_delete=False,
+    )
+    _install_team(monkeypatch, {TEAM: [team_kb]})
+    _install_collections(
+        monkeypatch, {MEMBER: [], CREATOR: [_kb("good"), _kb("private-notes")]}
+    )
+    _install_search(monkeypatch)
+
+    result = await _search(
+        monkeypatch,
+        runner_id=MEMBER,
+        declared=["private-notes", "good"],
+        collections=["private-notes"],
+    )
+
+    assert result.results == []
+    assert result.summary.startswith("Error:")
+    assert "shared with the team" in result.summary
+    assert "do not exist" not in result.summary
+    assert "Available collections: good" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_other_teams_kb_hosted_on_creator_tenant_is_not_personal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A team the creator belongs to -- not the governing one -- owns
+    "otherteam-kb", physically stored in the creator's own namespace. A raw
+    listing of that namespace returns it next to the creator's real
+    personal collection, so classifying off the listing alone calls a whole
+    other team's knowledge base "a personal knowledge base belonging to
+    this agent's creator" and aims the remediation at the wrong person.
+    """
+    otherteam_kb = kb_scope.KnowledgeBaseAccess(
+        name="otherteam-kb",
+        storage_user_id=CREATOR,
+        team_owned=True,
+        can_edit=False,
+        can_delete=False,
+    )
+
+    def _governing_team_visibility(db: Any, *, team_id: int) -> list:
+        return []
+
+    def _creator_own_team_visibility(db: Any, user_id: int) -> list:
+        return [otherteam_kb] if user_id == CREATOR else []
+
+    kb_scope.set_knowledge_base_team_hooks(
+        team_visibility=_governing_team_visibility,
+        visibility=_creator_own_team_visibility,
+    )
+    _install_collections(
+        monkeypatch,
+        {MEMBER: [], CREATOR: [_kb("otherteam-kb"), _kb("really-mine")]},
+    )
+    search_spy = _install_search(monkeypatch)
+
+    result = await _search(
+        monkeypatch,
+        runner_id=MEMBER,
+        declared=["otherteam-kb", "really-mine"],
+    )
+
+    assert search_spy.searched == []
+    gap_clause = result.summary.split("Error:", 1)[1]
+    assert "otherteam-kb is a personal knowledge base" not in gap_clause
+    assert "otherteam-kb" in result.summary  # reported, as absent
+    # The creator's genuine personal collection is still classified as one:
+    # the filter must remove the team's row, not everything on the tenant.
+    assert "really-mine is a personal knowledge base" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_not_allowed_clause_lists_the_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The clause tells the model what it may ask for, so it must be the
+    agent's declaration -- not the declaration intersected with what is
+    visible right now. "offsite-notes" is declared and currently resolves
+    to nothing; dropping it from the clause tells the model it may not ask
+    for a name the agent is configured with. The governing team's other,
+    undeclared knowledge bases must not appear either.
+    """
+    team_kbs = [
+        kb_scope.KnowledgeBaseAccess(
+            name=name,
+            storage_user_id=CREATOR,
+            team_owned=True,
+            can_edit=False,
+            can_delete=False,
+        )
+        for name in ("handbook", "board-minutes")
+    ]
+    _install_team(monkeypatch, {TEAM: team_kbs})
+    _install_collections(
+        monkeypatch,
+        {MEMBER: [], CREATOR: [_kb("handbook"), _kb("board-minutes")]},
+    )
+    search_spy = _install_search(monkeypatch)
+
+    result = await _search(
+        monkeypatch,
+        runner_id=MEMBER,
+        declared=["handbook", "offsite-notes"],
+        collections=["victim"],
+    )
+
+    assert search_spy.searched == []
+    assert "not allowed" in result.summary
+    clause = result.summary.split("Allowed collections:", 1)[1].strip()
+    assert clause == "handbook, offsite-notes"
+    assert "board-minutes" not in result.summary
 
 
 @pytest.mark.asyncio

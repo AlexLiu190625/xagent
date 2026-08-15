@@ -435,13 +435,59 @@ def _resolve_declared_name(
     return _UNRESOLVED
 
 
+async def _team_names_hosted_on(storage_user_id: int) -> set:
+    """Names on ``storage_user_id``'s tenant that a team owns, not the user.
+
+    A team's knowledge base lives in some member's storage namespace, so a
+    raw ``list_collections`` for that member returns the team's rows
+    alongside their own, and nothing on the row itself separates them:
+    ``CollectionInfo.ownership`` is ``"personal"`` on every row
+    ``list_collections`` produces -- the one place it becomes ``"team"`` is
+    the overlay in ``_list_visible_collections``, which reads the very hook
+    this function reads.
+
+    Asked through the runner-keyed visibility hook, called with the
+    tenant's own id, because it is the only seam that answers "which
+    knowledge bases does a team own" for a team other than the governing
+    one. The answer only ever narrows what may be called this user's own,
+    and is never rendered: a name it removes is reported as absent instead
+    of as the creator's, so the report can say less about the creator than
+    before, never more.
+
+    Bounded by what the seam can answer: it reports the teams this user is
+    a member of *now*, so a team's row hosted on the tenant of someone who
+    has since left that team still counts as personal. Closing that would
+    need a "which team owns this name" question the hook contract does not
+    have, and answering it would widen what a run can learn.
+    """
+    from ....web.services.db_runtime import run_db_io_cancellation_safe
+    from ....web.services.knowledge_base_team_scope import (
+        has_knowledge_base_visibility_hook,
+        visible_team_knowledge_bases,
+    )
+
+    if not has_knowledge_base_visibility_hook():
+        # Standalone xagent, and any deployment that installed only the
+        # team-keyed hook: no team owns anything here, so every row on the
+        # tenant is the user's own.
+        return set()
+    refs = await run_db_io_cancellation_safe(
+        lambda: visible_team_knowledge_bases(None, int(storage_user_id))
+    )
+    # Only the rows physically hosted on this tenant. A team row stored
+    # elsewhere never appeared in this tenant's listing, and excluding its
+    # name would drop a same-named collection this user really does own.
+    return {ref.name for ref in refs if ref.storage_user_id == storage_user_id}
+
+
 class _CreatorCollectionProbe:
     """Memoised lookup of the agent creator's own collection names.
 
-    At most one ``list_collections`` call for the creator's id per search
-    call, regardless of how many declared names need classifying -- the
-    lookup result is cached after the first call, including a failure
-    (cached as "nothing"). A failure degrades to "not held" and never
+    At most one creator lookup per search call -- one collection listing
+    and one team-ownership question, both memoised together -- regardless
+    of how many declared names need classifying. The lookup result is
+    cached after the first call, including a failure (cached as
+    "nothing"). A failure degrades to "not held" and never
     raises: a probe that cannot complete must not block the search, and
     must not be distinguishable from "the creator does not have this
     collection" (see the module docstring's identity-disclosure limits).
@@ -484,7 +530,14 @@ class _CreatorCollectionProbe:
                 creator_result = await list_collections(
                     user_id=self._agent_creator_user_id, is_admin=False
                 )
-                self._names = {c.name for c in creator_result.collections}
+                # Inside the same try on purpose: if the team lookup fails,
+                # which of these rows are the creator's own is unknown, and
+                # the caller must hedge rather than assert the creator
+                # holds them. Falling back to the unfiltered listing would
+                # restore exactly the misclassification this call exists to
+                # remove.
+                team_hosted = await _team_names_hosted_on(self._agent_creator_user_id)
+                self._names = {c.name for c in creator_result.collections} - team_hosted
             except Exception:
                 logger.warning(
                     "Failed to resolve creator's personal collections while "
@@ -660,7 +713,14 @@ async def _search_knowledge_base_impl(
                     return KnowledgeSearchResult(
                         results=[],
                         summary=f"Error: The following collections are not allowed: {', '.join(sorted(disallowed))}. "
-                        f"Allowed collections: {', '.join(sorted(authorised & available_names))}",
+                        # The clause lists the declaration itself, not its
+                        # intersection with the visible union: that union
+                        # seeds the runner's own same-named personal
+                        # collections, which the verdict loop below then
+                        # refuses to search -- advertising them here as
+                        # allowed and rejecting them one step later is the
+                        # same contradiction the terminal branch avoids.
+                        f"Allowed collections: {', '.join(sorted(authorised))}",
                     )
                 explicit_request = requested_set
                 logger.info(f"Searching specific collections: {sorted(requested_set)}")
@@ -727,68 +787,89 @@ async def _search_knowledge_base_impl(
                 # which would fall through to the generic search-miss text
                 # below instead of the two outcomes this branch exists to
                 # report.
-                # Both branches list "Available" from the verdict-admitted
-                # names, never from ``authorised & available_names``. That
-                # intersection reports two sets of names it must not: the
-                # governing team's collections the agent never declared
-                # (``_list_visible_collections`` merges the team's full
-                # catalogue in before any declared-name filter runs), and --
-                # on this branch specifically -- the runner's own same-named
-                # personal copies, which seed the union and are precisely the
-                # collections the rule refuses to search. On the no-explicit
-                # branch nothing was admitted, so the clause renders empty;
-                # on the explicit branch the admitted set is the one taken
-                # before the narrowing above, so a run whose requested names
-                # all failed still tells the model what it may ask for.
+                # The summary is derived from the verdicts, one report set
+                # per verdict class, so no name is described twice and none
+                # is described as both absent and held. "Available" is
+                # always the verdict-admitted set, never
+                # ``authorised & available_names``: that intersection
+                # reports two sets of names it must not -- the governing
+                # team's collections the agent never declared, and the
+                # runner's own same-named personal copies, which seed the
+                # visible union and are precisely what the rule refuses to
+                # search. The admitted set is the one taken before the
+                # narrowing above, so a run whose requested names all
+                # failed still tells the model what it may ask for.
+                reported_scope = (
+                    explicit_request
+                    if explicit_request is not None
+                    else set(declared_names_for_this_run)
+                )
+                failed_unshared_names = [
+                    name for name in unshared_names if name in reported_scope
+                ]
+                failed_missing_names = [
+                    name for name in missing_names if name in reported_scope
+                ]
+
                 if unresolvable_names:
                     # The creator-collection lookup raised during this call,
                     # so every unresolved declared name is unclassified, not
                     # established absent. Reported as one undifferentiated
                     # outcome for all of them -- a lookup failure is not
                     # per-name, so this sentence still says nothing about
-                    # which names the creator holds. ``unshared_names`` is
-                    # necessarily empty here: the first failure caches the
-                    # creator's name set as empty, so no later name can be
-                    # classified as held.
+                    # which names the creator holds. The other two report
+                    # sets are necessarily empty here: the first failure
+                    # caches the creator's name set as empty and marks the
+                    # probe failed, so every later unresolved name takes
+                    # this same classification, and a name reaches the
+                    # missing set only on a run whose runner is the creator
+                    # -- which never calls the probe at all.
                     summary = _TERMINAL_UNRESOLVABLE_MESSAGE.format(
                         names=", ".join(unresolvable_names)
                     )
-                    failed_unshared_names: List[str] = []
-                elif explicit_request is not None:
-                    summary = (
-                        f"Error: The following collections do not exist: {', '.join(sorted(explicit_request))}. "
-                        f"Available collections: {', '.join(sorted(admitted_names))}"
-                    )
-                    failed_unshared_names = [
-                        name for name in unshared_names if name in explicit_request
-                    ]
+                elif not failed_unshared_names:
+                    # Nothing in scope is the creator's own collection, so
+                    # the two inherited terminal sentences are true as
+                    # written and each renders byte for byte on its own
+                    # call style.
+                    if explicit_request is not None:
+                        summary = (
+                            f"Error: The following collections do not exist: {', '.join(sorted(explicit_request))}. "
+                            f"Available collections: {', '.join(sorted(admitted_names))}"
+                        )
+                    else:
+                        summary = (
+                            f"Error: None of the allowed collections exist. "
+                            f"Allowed: {', '.join(sorted(authorised))}. "
+                            f"Available: {', '.join(sorted(admitted_names))}"
+                        )
                 else:
-                    summary = (
-                        f"Error: None of the allowed collections exist. "
-                        f"Allowed: {', '.join(sorted(authorised))}. "
-                        f"Available: {', '.join(sorted(admitted_names))}"
-                    )
-                    failed_unshared_names = unshared_names
-                # A total failure keeps the existing terminal wording
-                # unchanged (above) -- this branch does not decide whether
-                # a failed name happened to be the creator's own unshared
-                # collection, it only decides that nothing is searchable.
-                # Whichever of the failed names the verdict loop already
-                # classified as the creator's own unshared collection still
-                # gets that message appended, with the "Error:" prefix and
-                # the empty result set both preserved: this is the terminal
-                # path, not the partial-failure warnings channel, so it
-                # does not fold through collection_warnings.
-                if failed_unshared_names:
-                    # A bare space here would leave the appended sentence
-                    # reading like one more entry in the comma-separated
-                    # "Available: ..." list the base text ends with -- both
-                    # to a human reader and to the model consuming this
-                    # summary. The period closes that list before the new
-                    # sentence starts.
-                    summary = (
-                        summary + ". " + _render_unshared_names(failed_unshared_names)
-                    )
+                    # At least one failed name is the creator's own
+                    # collection, which does exist. Neither inherited
+                    # sentence can carry that: one is a statement about
+                    # every allowed collection, the other enumerates the
+                    # whole request, and both would assert the absence of a
+                    # name this same summary goes on to say the creator
+                    # holds. The absence sentence therefore enumerates only
+                    # the names actually classified missing and is dropped
+                    # when there are none; the availability clause is
+                    # dropped when nothing was admitted rather than
+                    # rendering an empty list. Same shape on both call
+                    # styles: each report set lists only its own names, and
+                    # a name appears in exactly one of them.
+                    segments: List[str] = []
+                    if failed_missing_names:
+                        segments.append(
+                            "The following collections do not exist: "
+                            f"{', '.join(sorted(failed_missing_names))}."
+                        )
+                    segments.append(_render_unshared_names(failed_unshared_names))
+                    if admitted_names:
+                        segments.append(
+                            "Available collections: "
+                            f"{', '.join(sorted(admitted_names))}."
+                        )
+                    summary = "Error: " + " ".join(segments)
                 return KnowledgeSearchResult(results=[], summary=summary)
 
             collections_to_iterate: List[CollectionInfo] = to_search
