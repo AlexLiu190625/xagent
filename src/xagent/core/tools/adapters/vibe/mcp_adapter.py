@@ -1192,6 +1192,20 @@ async def _load_direct_mcp_tools(
                     error_type,
                 )
                 await asyncio.sleep(1)
+            else:
+                # DEBUG, not WARNING: same secret-leak concern as the
+                # sandboxed-load handler below -- a session-start/initialize
+                # /list-tools failure can carry secrets from the connection
+                # (e.g. an oauth-authenticated request's URL or headers
+                # surfacing in the exception message). Opt-in: set
+                # XAGENT_LOG_LEVEL=DEBUG (or run with --debug) to capture it
+                # when reproducing a failure.
+                logger.debug(
+                    "Exhausted retries loading tools from MCP server %s during %s",
+                    server_name,
+                    current_phase.value,
+                    exc_info=True,
+                )
     else:
         return MCPLoadResult(
             tools=(),
@@ -1485,6 +1499,19 @@ async def load_mcp_tools_as_agent_tools(
                         server_name,
                         error_type,
                     )
+                    # DEBUG, not ERROR: the sandboxed process's raw error
+                    # (e.g. its stderr) can carry secrets that flowed into
+                    # the MCP connection, so the always-on ERROR log above
+                    # deliberately keeps only the exception's class name
+                    # (see test_sandbox_list_failure_is_preserved_without_secret).
+                    # This traceback is opt-in -- set XAGENT_LOG_LEVEL=DEBUG
+                    # (or run with --debug) to capture it when reproducing a
+                    # failure.
+                    logger.debug(
+                        "Sandboxed MCP tool listing failure detail for server %s",
+                        server_name,
+                        exc_info=True,
+                    )
                     failures.append(
                         MCPServerLoadFailure(
                             server_name=server_name,
@@ -1554,6 +1581,19 @@ async def load_mcp_tools_as_agent_tools(
                 "Unexpected failure loading tools from MCP server %s (%s)",
                 server_name,
                 error_type,
+            )
+            # DEBUG, not ERROR, for the same secret-leak reason as the
+            # handlers above. This outer handler mostly catches
+            # _load_server_tools_bounded's wall-clock TimeoutError (a
+            # fixed-format message with no secret) or a genuine bug escaping
+            # the loop -- per-server session/initialize/list-tools failures
+            # for direct transports are handled, and logged, inside
+            # _load_direct_mcp_tools's retry loop instead. Opt-in: set
+            # XAGENT_LOG_LEVEL=DEBUG (or run with --debug) to capture it.
+            logger.debug(
+                "MCP server load failure detail for server %s",
+                server_name,
+                exc_info=True,
             )
             failures.append(
                 MCPServerLoadFailure(
