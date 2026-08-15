@@ -668,3 +668,31 @@ def test_sp5_integrity_error_poisons_transaction_until_savepoint_rollback(
         )
     ).first()
     assert still_usable is None
+
+
+def test_server_default_isolation_level_is_read_committed(db_session) -> None:
+    """``stage_interaction_request``'s post-conflict re-check (step 6 of its
+    docstring) needs READ COMMITTED to see a competing session's commit
+    between its own pre-read and its INSERT; under REPEATABLE READ or
+    SERIALIZABLE it would reuse its original snapshot and misclassify a
+    legitimate replay as a slot conflict.
+
+    This test's own boundary: ``db_session`` here comes from this file's
+    ``engine`` fixture, which opens its connection with a bare
+    ``sa.create_engine(url, connect_args=...)`` -- never through
+    ``configure_db`` (``xagent.web.models.database``). So this only proves
+    what a stock PostgreSQL server defaults new sessions to; it says
+    nothing about whether ``configure_db`` (or ``get_db_pool_kwargs``, which
+    feeds keyword arguments into ``configure_db``'s own ``create_engine``
+    call) overrides that default for the engines this codebase actually
+    runs. ``test_configure_db_sets_no_isolation_level_on_either_engine``
+    (``test_interaction_staging.py``) statically scans both of those
+    instead, over their own source, but scanning source and observing a
+    live session are two different kinds of evidence -- neither test
+    substitutes for a probe against a real ``configure_db``-built engine.
+    """
+
+    (level,) = db_session.execute(
+        sa.text("SELECT current_setting('transaction_isolation')")
+    ).one()
+    assert level == "read committed"

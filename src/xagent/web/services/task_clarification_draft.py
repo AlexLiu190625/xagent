@@ -101,7 +101,12 @@ from .ops_signals import (
     register_degradation,
 )
 from .task_interaction_staging import InteractionAnchor
-from .task_lease_service import TaskLease
+from .task_lease_service import (
+    TaskLease,
+    lease_is_fenced,
+    task_row_matches_lease_attempt,
+    task_row_matches_lease_owner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -292,7 +297,28 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
     key, or changing what an existing key means requires bumping the
     protocol version and giving :func:`parse_clarification_payload` an
     explicit branch for the old shape -- never a silent redefinition of what
-    v1 means.
+    v1 means. The one exception already taken under this promise is the
+    ``question`` -> ``message`` rename below: it shipped without a version
+    bump only because the table this payload is written to held no rows at
+    the time, so there was no persisted v1 shape to keep reading. Any
+    later rename, once the table has writers, must bump the version like
+    every other case above.
+
+    The free-text field is called ``message``, not ``question``, because
+    the persisted row's reader is ``parse_v1_request_payload``
+    (``task_interaction_service.py``), which validates against
+    ``AskUserQuestionArgs`` (``core/tools/adapters/vibe/ask_user_tool.py``),
+    whose required fields are ``message`` and ``interactions`` (neither has
+    a default). That model is also the
+    ``ask_user_question`` tool's own argument schema, so it is the fixed
+    side of this pairing: this builder aligns to it, never the reverse. A
+    payload keyed ``question`` fails that validation, and the reader
+    (``materialize_compatibility_view``) falls back to the legacy
+    transcript, logging the validation error at warning level -- but still
+    with no degradation signal and no counter, so a caller reading only
+    ``/health`` or a metric would not notice this is happening. That
+    remaining gap is why the round-trip test below crosses both modules
+    instead of checking this function against itself.
     """
 
     original_question = draft.message
@@ -300,7 +326,7 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
     stripped_characters = len(original_question) - len(cleaned_question)
 
     if not cleaned_question:
-        logger.error(
+        logger.warning(
             "clarification question was empty after removing control characters",
             extra={
                 "original_length": len(original_question),
@@ -308,7 +334,7 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
             },
         )
 
-    question_truncated = False
+    message_truncated = False
     question = cleaned_question
     if len(cleaned_question.encode("utf-8")) > _QUESTION_MAX_BYTES:
         suffix_bytes = len(_QUESTION_TRUNCATION_SUFFIX.encode("utf-8"))
@@ -318,7 +344,7 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
             )
             + _QUESTION_TRUNCATION_SUFFIX
         )
-        question_truncated = True
+        message_truncated = True
 
     interactions_cleaned = [_clean_leaves(dict(item)) for item in draft.interactions]
     interactions_dropped = False
@@ -328,20 +354,20 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
         interactions_dropped = True
 
     payload: dict[str, Any] = {
-        "question": question,
+        "message": question,
         "interactions": interactions_payload,
         "message_type": _strip_control_characters(draft.message_type),
         "source": draft.source,
         "requests": [_clean_leaves(item.to_dict()) for item in draft.requests],
     }
-    if question_truncated:
-        payload["question_truncated"] = True
+    if message_truncated:
+        payload["message_truncated"] = True
     if interactions_dropped:
         payload["interactions_dropped"] = True
 
     total_bytes = _serialized_byte_length(payload)
     if total_bytes > _TOTAL_PAYLOAD_MAX_BYTES:
-        logger.error(
+        logger.warning(
             "clarification payload exceeded the maximum size even after truncation",
             extra={"serialized_length": total_bytes},
         )
@@ -378,14 +404,20 @@ def parse_clarification_payload(
     deliberately, so a caller checking "did this turn have interactions"
     never has to handle two different falsy shapes.
 
-    This is the one place allowed to know what a payload's version implies:
-    a reader elsewhere in the codebase must call this function rather than
-    reach into ``payload["question"]`` itself, so that a future protocol
-    version bump only needs a new branch here, not a new branch at every
-    call site.
+    This function and ``parse_v1_request_payload``
+    (``task_interaction_service.py``) are two readers of the same v1 shape,
+    not two competing authorities. That one validates the whole envelope
+    against ``AskUserQuestionArgs`` and is what the read surface
+    (``materialize_compatibility_view``) uses on a persisted row. This one
+    is the lossy projection down to the legacy ``(question, interactions)``
+    tuple ``get_latest_waiting_question`` (``chat_history_service.py``)
+    returns, for callers that need that tuple and nothing else. Both read
+    the same key, ``message``; neither may reach into ``payload["message"]``
+    at a call site, so that a future protocol version bump needs a new
+    branch in these two functions and nowhere else.
     """
 
-    question = payload.get("question")
+    question = payload.get("message")
     interactions = payload.get("interactions")
     return (
         question if isinstance(question, str) else None,
@@ -431,6 +463,13 @@ def resolve_publishable_clarification(
        claimed the row, and this settlement must be discarded wholesale
        rather than degrade -- an attempt that is no longer current has no
        business writing anything at all.
+
+       Guards 2 through 4 evaluate ``lease_is_fenced``,
+       ``task_row_matches_lease_owner`` and ``task_row_matches_lease_attempt``
+       (``task_lease_service.py``). The booleans are shared with the
+       interaction handoff's own re-check so the two cannot drift; the
+       fail-closed classification each one produces here is this function's
+       alone.
     5. ``anchor is not None`` -- no resume anchor means this run's most
        recent checkpoint was never one a structured interaction can resume
        against; this degrades, it does not fail the round.
@@ -484,7 +523,7 @@ def resolve_publishable_clarification(
     is_waiting = status == "waiting_for_user"
 
     if is_waiting and draft is None:
-        logger.error(
+        logger.warning(
             "a waiting run produced no clarification draft to publish",
             extra={"task_id": task.id, "run_id": lease.run_id},
         )
@@ -495,6 +534,12 @@ def resolve_publishable_clarification(
         return FailClosed("missing_draft")
 
     if not is_waiting and draft is not None:
+        # Still error level, unlike the three warnings above: those three sit
+        # on paths that degrade and let the round proceed, while this one is
+        # only reachable when a caller hands this function two different
+        # runs' results mixed together -- a programming error the core
+        # pattern layer cannot produce (see guard 1 in this function's
+        # docstring), not a degradation.
         logger.error(
             "a non-waiting run carried a clarification draft; discarding it",
             extra={"task_id": task.id, "run_id": lease.run_id, "status": status},
@@ -506,13 +551,13 @@ def resolve_publishable_clarification(
 
     assert draft is not None  # narrowed by the two branches above
 
-    if lease.run_id is None:
+    if not lease_is_fenced(lease):
         return FailClosed("unfenced_lease")
 
-    if task.runner_id != lease.runner_id or task.run_id != lease.run_id:
+    if not task_row_matches_lease_owner(task, lease):
         return FailClosed("ownership_changed")
 
-    if lease.attempt_id is not None and task.lease_attempt_id != lease.attempt_id:
+    if not task_row_matches_lease_attempt(task, lease):
         return FailClosed("attempt_mismatch")
 
     if anchor is None:
@@ -520,7 +565,7 @@ def resolve_publishable_clarification(
 
     payload = build_clarification_payload(draft)
 
-    if not payload["question"].strip():
+    if not payload["message"].strip():
         return NotApplicable("empty_question")
 
     if _serialized_byte_length(payload) > _TOTAL_PAYLOAD_MAX_BYTES:

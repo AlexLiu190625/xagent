@@ -121,6 +121,8 @@ from .task_interaction_schema import interaction_requests_table_exists
 from .task_interaction_staging import _KIND_VOCABULARY
 from .task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
@@ -772,6 +774,16 @@ CREATE_OUTCOME_REASON_VOCABULARY: dict[str, frozenset[str]] = {
 # payload the write path stages and the payload the read path
 # (``materialize_compatibility_view``) decodes come from the same function
 # pair, not two independently maintained copies.
+#
+# There is a second producer of this same shape that does NOT go through
+# ``build_v1_request_payload``: ``build_clarification_payload``
+# (``task_clarification_draft.py``) builds a v1 payload directly from a
+# clarification draft, because it also has to filter and truncate that
+# draft's free text before anything is staged. Its output must satisfy
+# ``parse_v1_request_payload`` below -- that is a cross-module contract with
+# no shared type to enforce it, pinned by the round-trip test named in that
+# function's own docstring. Anything changed here about what v1 accepts has
+# to be changed there in the same commit.
 # ---------------------------------------------------------------------------
 
 
@@ -1180,10 +1192,11 @@ def _resolve_read_direction_anchor(
       this into "no active row" and retrying legacy is prohibited outright.
 
     A further divergence, this one against the write-direction ("finalizer
-    side") anchor resolver a later change supplies rather than against
-    trace_handlers: that resolver treats a legacy checkpoint type as "no
-    anchor available" and never stages an active row anchored to one at
-    all. This resolver, by contrast, accepts every member of
+    side") resolver ``resolve_interaction_anchor``
+    (``task_interaction_anchor.py``) rather than against trace_handlers:
+    that resolver treats a legacy checkpoint type as "no anchor available"
+    (its own step 5) and never stages an active row anchored to one at all.
+    This resolver, by contrast, accepts every member of
     ``READABLE_CHECKPOINT_TYPES`` -- the current type and the legacy ones
     -- exactly as trace_handlers does. The two disagreeing is not a bug to
     reconcile: because the write side never produces an active row
@@ -1337,7 +1350,20 @@ def materialize_compatibility_view(
 
     try:
         parsed = parse_v1_request_payload(row.request_payload)
-    except _PydanticValidationError:
+    except _PydanticValidationError as exc:
+        # This is the unreadable-payload fallback: an active native row
+        # exists but its stored request_payload does not parse against the
+        # v1 shape this reader expects, so the caller silently gets the T1
+        # legacy transcript instead of the native projection. Logging here
+        # only guarantees the degradation is not silent; what the read
+        # surface does with it -- a dedicated ops_signals degradation
+        # constant, a counter, or something else -- is that surface's own
+        # call to make, not this module's.
+        logger.warning(
+            "active native interaction row failed v1 payload validation; "
+            "falling back to the legacy transcript",
+            extra={"task_id": task_id, "validation_error": str(exc)[:500]},
+        )
         return _legacy_view(db, task_id)
 
     unresolved = _resolve_read_direction_anchor(db, row)

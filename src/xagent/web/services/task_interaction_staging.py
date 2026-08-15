@@ -156,7 +156,7 @@ from .ops_signals import (
     register_degradation,
 )
 from .task_command_transport import COMMAND_ID_PATTERN
-from .task_lease_service import TaskLease
+from .task_lease_service import TaskLease, task_row_matches_lease_attempt
 
 logger = logging.getLogger(__name__)
 
@@ -861,6 +861,32 @@ def _replay_or_raise_closed(
     so that decision stays with the caller. Extracted so the two sites cannot
     classify the same row state differently; behavior-preserving, including
     the exact exception message text.
+
+    A replay hit is matched on identity alone. Nothing here compares the
+    stored row's ``request_payload``, ``expires_at`` or anchor fields
+    against what this call passed in, and ``StagedInteractionRequest``
+    carries no field reporting whether they agree. That is a contract, not
+    an omission, and it rests entirely on how the idempotency key is
+    derived: a key must be a function of the waiting turn's own identity,
+    so that two calls presenting the same key are by construction two
+    snapshots of the same waiting turn, and the fields that could
+    disagree cannot. The one key derivation that exists today,
+    ``clarification_idempotency_key`` (``task_clarification_draft.py``),
+    honours this by hashing only ``ClarificationDraft.turn_marker``, which
+    is composed from the turn's message count, origin step and ordered
+    pending-request ids and from nothing else -- deliberately not from the
+    message text, so reshaping the payload cannot move the key.
+
+    This is the obligation any future key derivation inherits. A key
+    derived from anything that can change while the waiting turn stays the
+    same (a timestamp, a retry counter, the payload text) breaks the
+    contract silently: the replay branch would then return a row bound to a
+    different anchor than the caller believes it staged, with no error and
+    no observable difference at the call site. If a derivation like that is
+    ever needed, this function has to grow content comparison first --
+    following ``task_command_transport``'s precedent of reporting the
+    comparison result as a field and letting the caller decide -- rather
+    than the contract being quietly relaxed.
     """
 
     if row is None:
@@ -959,8 +985,15 @@ def stage_interaction_request(
     That is a degradation, not a corruption: ``InteractionSlotTaken`` is
     swallowed, so the caller's turn survives and the question is lost.
     READ COMMITTED is PostgreSQL's default and this codebase sets no
-    ``isolation_level`` on its engine; the change that wires the first
-    production caller should assert that rather than continue to assume it.
+    ``isolation_level`` on its engine. Both halves of that are asserted,
+    not assumed: one test reads the server's effective
+    ``transaction_isolation`` on a real PostgreSQL session
+    (``test_interaction_staging_postgresql.py``), and one statically pins
+    that neither ``create_engine`` call in
+    ``xagent.web.models.database`` passes an ``isolation_level``
+    (``test_interaction_staging.py``). Setting one turns both red, which
+    is the point: this paragraph's failure mode has to be re-decided at
+    that moment, not discovered later.
 
     ``SELECT ... FOR UPDATE`` on the task row was considered, as an
     alternative to the savepoint-plus-re-check design above, and rejected:
@@ -1150,20 +1183,15 @@ class InteractionHandoff:
         self.staged: StagedInteractionRequest | None = None
 
     def _assert_current_attempt(self) -> None:
-        """``lease.attempt_id is None`` is a fail-open sentinel (a
-        pre-attempt-column lease, or the permanent-``None`` ambient snapshot
-        ``_task_lease_snapshot`` builds in ``websocket.py``) and must be
-        treated as "cannot prove attempt identity", not as "matches" --
-        skipping this assertion, never failing it. See
-        ``TaskLease.attempt_id``'s docstring (``task_lease_service.py``) for
-        the two distinct sources of that ``None``.
+        """Raise unless the task row's current attempt is this lease's.
 
-        This is a plain Python object comparison, not a SQL expression: the
-        `` == None`` -> ``IS NULL`` folding that affects a SQLAlchemy
-        column comparison compiled to SQL does not apply here.
+        The comparison itself, and why ``lease.attempt_id is None`` skips
+        the check rather than failing it, live with the predicate
+        (``task_row_matches_lease_attempt``, ``task_lease_service.py``).
 
-        This reads ``self.task.lease_attempt_id`` from whatever snapshot of
-        the task row the caller already loaded. Whether that attribute
+        What stays here is what the predicate cannot know: this reads
+        ``self.task.lease_attempt_id`` from whatever snapshot of the task
+        row the caller already loaded. Whether that attribute
         access itself touches the database is conditional on the object's
         own session-bound state, not a fixed property of this line: if
         SQLAlchemy has expired ``task`` (its default behavior after every
@@ -1190,10 +1218,7 @@ class InteractionHandoff:
         locking here is assuming something SQLite does not provide.
         """
 
-        if (
-            self.lease.attempt_id is not None
-            and self.task.lease_attempt_id != self.lease.attempt_id
-        ):
+        if not task_row_matches_lease_attempt(self.task, self.lease):
             raise InteractionAttemptMismatch(
                 f"task {self.task.id}'s current attempt "
                 f"({self.task.lease_attempt_id!r}) does not match this "

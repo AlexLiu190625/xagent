@@ -18,11 +18,13 @@ than checking this module's own output against itself.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -40,6 +42,7 @@ from xagent.core.agent.clarification import (
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task
+from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import ops_signals
 from xagent.web.services.chat_history_service import (
     get_latest_waiting_question,
@@ -56,9 +59,14 @@ from xagent.web.services.task_clarification_draft import (
     resolve_publishable_clarification,
 )
 from xagent.web.services.task_command_transport import COMMAND_ID_PATTERN
+from xagent.web.services.task_interaction_service import (
+    materialize_compatibility_view,
+    parse_v1_request_payload,
+)
 from xagent.web.services.task_interaction_staging import (
     InteractionAnchor,
     interaction_handoff,
+    stage_interaction_request,
 )
 from xagent.web.services.task_lease_service import TaskLease
 
@@ -167,6 +175,33 @@ def test_waiting_without_draft_fails_closed_as_missing_draft() -> None:
     assert resolution.fail_closed_reason == "missing_draft"
 
 
+def test_missing_draft_logs_at_warning_not_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """This is a degrade-and-proceed path (the caller's non-native handling
+    of the waiting status is untouched, only the structured row is skipped),
+    which is why it logs at warning rather than error -- unlike the
+    non-waiting-with-draft guard just below, which stays at error because it
+    is only reachable through a caller's own programming mistake. Nothing
+    in this suite pinned the level before, so a regression back to error
+    would have passed silently."""
+
+    caplog.set_level(
+        logging.WARNING, logger="xagent.web.services.task_clarification_draft"
+    )
+    result = {"status": "waiting_for_user"}
+    resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
+    )
+    matching = [
+        record
+        for record in caplog.records
+        if "waiting run produced no clarification draft" in record.message
+    ]
+    assert len(matching) == 1
+    assert matching[0].levelno == logging.WARNING
+
+
 def test_non_waiting_with_draft_fails_closed_as_draft_status_mismatch() -> None:
     result = {"status": "completed", "clarification_draft": _draft()}
     resolution = resolve_publishable_clarification(
@@ -205,6 +240,25 @@ def test_ownership_changed_fails_closed() -> None:
     resolution = resolve_publishable_clarification(
         result,
         task=_task(runner_id="someone-else"),
+        lease=_lease(),
+        anchor=_anchor(),
+        now=_now(),
+    )
+    assert isinstance(resolution, FailClosed)
+    assert resolution.fail_closed_reason == "ownership_changed"
+
+
+def test_run_changed_fails_closed() -> None:
+    """Same runner, different run: ``task_row_matches_lease_owner`` compares
+    both ``runner_id`` and ``run_id``, so a runner that moved to a new run
+    without a matching runner change must fail closed too, not just the
+    runner-changed half covered by ``test_ownership_changed_fails_closed``
+    above."""
+
+    result = {"status": "waiting_for_user", "clarification_draft": _draft()}
+    resolution = resolve_publishable_clarification(
+        result,
+        task=_task(run_id="a-later-run"),
         lease=_lease(),
         anchor=_anchor(),
         now=_now(),
@@ -513,6 +567,252 @@ def test_payload_round_trip_diverges_from_the_legacy_reader_for_an_empty_form_as
         engine.dispose()
 
 
+def test_built_payload_round_trips_through_a_staged_row_and_the_v1_reader(
+    tmp_path: Path,
+) -> None:
+    """The pairing this module and ``parse_v1_request_payload``
+    (``task_interaction_service.py``) both describe in their docstrings --
+    a builder producing a shape the reader can validate -- had no test
+    crossing both modules: every existing payload assertion here checks
+    this module's own dict literal, never a real row read back through the
+    reader ``materialize_compatibility_view`` actually uses. A key mismatch
+    between the two (``question`` written, ``message`` required) validated
+    against an in-memory dict just as cleanly as against a real row, so it
+    stayed invisible until a persisted row was read back through the
+    reader for real, which is what this test does.
+
+    The anchor below is built directly with :class:`InteractionAnchor`
+    rather than through the full checkpoint-shaped
+    ``materialize_compatibility_view`` chain (``event_type`` /
+    ``checkpoint_type`` / ``_task_run_id``): ``stage_interaction_request``
+    only needs an anchor whose ``trace_event_id`` satisfies the foreign key
+    and does not itself inspect the referenced row's ``data``, so a plain
+    ``make_trace_event`` row is enough. Covering the checkpoint-shaped read
+    path is a separate concern.
+    """
+
+    engine = _engine(tmp_path)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = session_factory()
+    try:
+        user_id = make_user(db)
+        task_id = make_task(db, user_id=user_id)
+        trace_event_id = make_trace_event(db, task_id=task_id)
+
+        interactions = (
+            {"type": "text_input", "field": "color", "label": "Favorite color"},
+        )
+        draft = _draft(
+            message="what is your favorite color?", interactions=interactions
+        )
+        payload = build_clarification_payload(draft)
+
+        anchor = InteractionAnchor(
+            trace_event_id=trace_event_id,
+            resume_event_id="resume-event-1",
+            resume_execution_id="resume-exec-1",
+            resume_run_partition="run-a",
+        )
+        staged = stage_interaction_request(
+            db,
+            task_id=task_id,
+            run_id=anchor.resume_run_partition,
+            anchor=anchor,
+            kind="clarification",
+            protocol_version=1,
+            origin="internal",
+            request_payload=payload,
+            request_idempotency_key=clarification_idempotency_key(draft),
+            expires_at=_now() + timedelta(hours=1),
+            now=_now(),
+        )
+        db.commit()
+        assert staged.created is True
+
+        row = db.get(TaskInteractionRequest, staged.staged_db_id)
+        assert row is not None
+        parsed = parse_v1_request_payload(row.request_payload)
+
+        assert parsed.message == draft.message
+        assert parsed.interactions is not None
+        assert len(parsed.interactions) == len(draft.interactions)
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_select_control_payload_round_trips_with_its_options_intact(
+    tmp_path: Path,
+) -> None:
+    """A second real shape through the same builder -> stage -> read-back ->
+    parse round trip as the test above, this time with a ``select_one``
+    control that carries ``options`` -- the nested-list field none of the
+    other payload tests exercise end to end. Catches the same class of bug
+    the ``question``/``message`` key mismatch was: a control field that
+    looks fine as this module's own dict literal but fails
+    ``AskUserQuestionArgs`` validation once read back for real, because
+    something about its shape (here, the nested ``InteractionOption`` list)
+    was never actually round-tripped through the reader.
+    """
+
+    engine = _engine(tmp_path)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = session_factory()
+    try:
+        user_id = make_user(db)
+        task_id = make_task(db, user_id=user_id)
+        trace_event_id = make_trace_event(db, task_id=task_id)
+
+        interactions = (
+            {
+                "type": "select_one",
+                "field": "color",
+                "label": "Favorite color",
+                "options": [
+                    {"label": "Red", "value": "red"},
+                    {"label": "Blue", "value": "blue"},
+                ],
+            },
+        )
+        draft = _draft(
+            message="what is your favorite color?", interactions=interactions
+        )
+        payload = build_clarification_payload(draft)
+
+        anchor = InteractionAnchor(
+            trace_event_id=trace_event_id,
+            resume_event_id="resume-event-1",
+            resume_execution_id="resume-exec-1",
+            resume_run_partition="run-a",
+        )
+        staged = stage_interaction_request(
+            db,
+            task_id=task_id,
+            run_id=anchor.resume_run_partition,
+            anchor=anchor,
+            kind="clarification",
+            protocol_version=1,
+            origin="internal",
+            request_payload=payload,
+            request_idempotency_key=clarification_idempotency_key(draft),
+            expires_at=_now() + timedelta(hours=1),
+            now=_now(),
+        )
+        db.commit()
+        assert staged.created is True
+
+        row = db.get(TaskInteractionRequest, staged.staged_db_id)
+        assert row is not None
+        parsed = parse_v1_request_payload(row.request_payload)
+
+        assert parsed.message == draft.message
+        assert parsed.interactions is not None
+        assert len(parsed.interactions) == 1
+        control = parsed.interactions[0]
+        assert control.type == "select_one"
+        assert control.field == "color"
+        assert control.label == "Favorite color"
+        assert control.options is not None
+        assert [(o.label, o.value) for o in control.options] == [
+            ("Red", "red"),
+            ("Blue", "blue"),
+        ]
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_a_payload_missing_interaction_fields_fails_v1_validation_and_the_materialize_fallback_logs_it(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Pins the second path to an unreadable payload: a
+    ``request_payload`` written by something other than
+    ``build_clarification_payload`` -- here, one hand-built with an
+    ``interactions`` entry that has only ``field`` and neither of
+    ``InteractionArg``'s two other required fields, ``type`` and
+    ``label`` -- fails ``AskUserQuestionArgs`` validation exactly like the
+    ``question``/``message`` key mismatch this module's other round-trip
+    tests are pinned against, just via a different malformed shape. Per-
+    field validation of ``interactions`` entries at the write side is
+    tracked in #1368; this test only pins today's failure mode at the read
+    side, not a fix for the write side.
+
+    The row is staged through the real ``stage_interaction_request``, not
+    a bare ORM insert: ``request_payload`` is a JSON column with no
+    ``AskUserQuestionArgs``-shape CHECK constraint, so a row this shape can
+    reach the table for real, the same way
+    ``test_t1_falls_back_to_legacy_when_request_payload_does_not_parse``
+    (``test_task_interaction_service.py``) already established for a
+    differently-malformed payload.
+    """
+
+    malformed_payload = {
+        "message": "what is your favorite color?",
+        "interactions": [{"field": "color"}],
+    }
+    with pytest.raises(ValidationError):
+        parse_v1_request_payload(malformed_payload)
+
+    engine = _engine(tmp_path)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = session_factory()
+    try:
+        user_id = make_user(db)
+        task_id = make_task(db, user_id=user_id)
+        trace_event_id = make_trace_event(db, task_id=task_id)
+
+        anchor = InteractionAnchor(
+            trace_event_id=trace_event_id,
+            resume_event_id="resume-event-1",
+            resume_execution_id="resume-exec-1",
+            resume_run_partition="run-a",
+        )
+        draft = _draft()
+        staged = stage_interaction_request(
+            db,
+            task_id=task_id,
+            run_id=anchor.resume_run_partition,
+            anchor=anchor,
+            kind="clarification",
+            protocol_version=1,
+            origin="internal",
+            request_payload=malformed_payload,
+            request_idempotency_key=clarification_idempotency_key(draft),
+            expires_at=_now() + timedelta(hours=1),
+            now=_now(),
+        )
+        assert staged.created is True
+
+        # _active_native_row_criteria() joins on
+        # TaskInteractionRequest.run_id == Task.run_id; make_task() leaves
+        # a task's run_id NULL, which the staged row above (run_id="run-a")
+        # would never match, so materialize_compatibility_view would take
+        # the earlier "no active row" exit instead of reaching the
+        # payload-parse guard this test targets.
+        task = db.get(Task, task_id)
+        assert task is not None
+        task.run_id = anchor.resume_run_partition
+        db.commit()
+
+        caplog.set_level(
+            logging.WARNING, logger="xagent.web.services.task_interaction_service"
+        )
+        view = materialize_compatibility_view(db, task_id)
+        assert view.tier == "legacy"
+
+        matching = [
+            record
+            for record in caplog.records
+            if "failed v1 payload validation" in record.message
+        ]
+        assert len(matching) == 1
+        assert matching[0].levelno == logging.WARNING
+    finally:
+        db.close()
+        engine.dispose()
+
+
 def test_idempotency_key_matches_the_command_id_pattern() -> None:
     draft = _draft()
     key = clarification_idempotency_key(draft)
@@ -530,15 +830,37 @@ def test_idempotency_key_ignores_message_content() -> None:
     assert clarification_idempotency_key(base) == clarification_idempotency_key(changed)
 
 
+def test_idempotency_key_ignores_source() -> None:
+    """``turn_marker`` is composed from ``turn_message_count``,
+    ``origin_step_id``, and ``requests`` only (see ``_compose_turn_marker``);
+    ``source`` is not one of its inputs. Two drafts differing only in
+    ``source`` -- e.g. the same turn reported by ``send_message`` versus
+    ``ask_user_question`` -- must therefore produce the same key."""
+
+    base = _draft(source="send_message")
+    changed = _draft(source="ask_user_question")
+    assert clarification_idempotency_key(base) == clarification_idempotency_key(changed)
+
+
+def test_idempotency_key_ignores_origin_execution_id() -> None:
+    """Same reasoning as ``test_idempotency_key_ignores_source`` above:
+    ``origin_execution_id`` is not one of ``_compose_turn_marker``'s inputs
+    either, so two drafts differing only in it must produce the same key."""
+
+    base = _draft(origin_execution_id="exec-1")
+    changed = _draft(origin_execution_id="exec-2")
+    assert clarification_idempotency_key(base) == clarification_idempotency_key(changed)
+
+
 def test_oversized_question_is_truncated_and_the_idempotency_key_is_unaffected() -> (
     None
 ):
     long_question = "q" * (32 * 1024)
     draft = _draft(message=long_question)
     payload = build_clarification_payload(draft)
-    assert payload["question_truncated"] is True
-    assert len(payload["question"].encode("utf-8")) <= 16 * 1024
-    assert payload["question"] != long_question
+    assert payload["message_truncated"] is True
+    assert len(payload["message"].encode("utf-8")) <= 16 * 1024
+    assert payload["message"] != long_question
 
     key_before = clarification_idempotency_key(draft)
     truncated_variant = _draft(message=long_question[: len(long_question) // 2])
@@ -557,13 +879,13 @@ def test_oversized_multi_byte_question_truncates_on_a_character_boundary() -> No
     draft = _draft(message=long_question)
     payload = build_clarification_payload(draft)
 
-    assert payload["question_truncated"] is True
-    encoded = payload["question"].encode("utf-8")
+    assert payload["message_truncated"] is True
+    encoded = payload["message"].encode("utf-8")
     assert len(encoded) <= 16 * 1024
     # Round-trips cleanly and introduces no U+FFFD replacement character --
     # a mid-character byte slice would either raise here or leave one.
-    assert encoded.decode("utf-8") == payload["question"]
-    assert "�" not in payload["question"]
+    assert encoded.decode("utf-8") == payload["message"]
+    assert "�" not in payload["message"]
 
 
 def test_oversized_interactions_are_dropped_entirely() -> None:
@@ -572,7 +894,7 @@ def test_oversized_interactions_are_dropped_entirely() -> None:
     payload = build_clarification_payload(draft)
     assert payload["interactions_dropped"] is True
     assert payload["interactions"] == []
-    assert payload["question"] == draft.message
+    assert payload["message"] == draft.message
 
 
 def test_request_leaf_control_characters_are_stripped_from_the_payload() -> None:
@@ -639,14 +961,27 @@ def test_interaction_leaf_control_characters_are_stripped_through_full_payload_a
     assert payload["interactions"] == [{"prompt": "pickone", "id": "opt-1"}]
 
 
-def test_payload_still_too_large_after_truncation_is_not_applicable() -> None:
+def test_payload_still_too_large_after_truncation_is_not_applicable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Only ``tool_waiting`` -- the multi-tool waiting point -- can
     realistically produce thousands of ``requests`` entries;
     ``send_message`` and ``ask_user_question`` always contribute exactly
     one (see ``ClarificationDraft.requests``'s docstring), so a
     ``send_message`` draft with 6000 requests is not a shape production
-    can ever hand this function."""
+    can ever hand this function.
 
+    Also pins the level of ``build_clarification_payload``'s
+    still-oversized-after-truncation log at warning, the same degrade-
+    and-proceed reasoning as ``test_missing_draft_logs_at_warning_not_error``
+    above: this guard lets the round proceed as ``NotApplicable`` rather
+    than failing it, so a regression to error would misclassify a routine
+    degradation as a fault.
+    """
+
+    caplog.set_level(
+        logging.WARNING, logger="xagent.web.services.task_clarification_draft"
+    )
     many_requests = tuple(
         ClarificationRequestItem(f"tool-{i}", f"call-{i}", f"call-{i}")
         for i in range(6000)
@@ -658,9 +993,29 @@ def test_payload_still_too_large_after_truncation_is_not_applicable() -> None:
     )
     assert isinstance(resolution, NotApplicable)
     assert resolution.reason == "payload_too_large"
+    matching = [
+        record
+        for record in caplog.records
+        if "exceeded the maximum size even after truncation" in record.message
+    ]
+    assert len(matching) == 1
+    assert matching[0].levelno == logging.WARNING
 
 
-def test_question_emptied_by_character_filtering_is_not_applicable() -> None:
+def test_question_emptied_by_character_filtering_is_not_applicable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Also pins the level of ``build_clarification_payload``'s
+    empty-after-filtering log at warning, the same degrade-and-proceed
+    reasoning as ``test_missing_draft_logs_at_warning_not_error`` above:
+    this guard lets the round proceed as ``NotApplicable`` rather than
+    failing it, so a regression to error would misclassify a routine
+    degradation as a fault.
+    """
+
+    caplog.set_level(
+        logging.WARNING, logger="xagent.web.services.task_clarification_draft"
+    )
     draft = _draft(message="\x00\x01\x02\x1f")
     result = {"status": "waiting_for_user", "clarification_draft": draft}
     resolution = resolve_publishable_clarification(
@@ -668,6 +1023,13 @@ def test_question_emptied_by_character_filtering_is_not_applicable() -> None:
     )
     assert isinstance(resolution, NotApplicable)
     assert resolution.reason == "empty_question"
+    matching = [
+        record
+        for record in caplog.records
+        if "empty after removing control characters" in record.message
+    ]
+    assert len(matching) == 1
+    assert matching[0].levelno == logging.WARNING
 
 
 def test_whitespace_only_question_is_not_applicable() -> None:
