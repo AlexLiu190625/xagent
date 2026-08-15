@@ -154,12 +154,6 @@ async def _search(
 
 
 # ---------------------------------------------------------------------------
-# A name the governing team owns resolves to the team's storage tenant,
-# for every runner.
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # A same-named row of the runner's OTHER team never participates.
 # ---------------------------------------------------------------------------
 
@@ -1118,12 +1112,6 @@ async def test_creator_probe_memoised_at_most_once_per_search(
 
 
 # ---------------------------------------------------------------------------
-# No governing team => the team-keyed hook is never invoked and the
-# creator check never runs.
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # Team hook not installed => legacy runner-keyed overlay, selection
 # on the predicate, never on an empty return.
 # ---------------------------------------------------------------------------
@@ -1164,56 +1152,23 @@ async def test_declared_name_rule_inert_until_hook_installed(
 
 
 # ---------------------------------------------------------------------------
-# The typed error survives the run-path re-wrap; the build-frame
-# narrowings are defence in depth only.
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # The creator-collection lookup failing degrades to the generic
 # outcome and never raises.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("explicit", [False, True])
 async def test_creator_listing_failure_reports_unresolved_not_absent(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, explicit: bool
 ) -> None:
     """The creator-collection lookup raises. The search decision is
     unchanged -- nothing resolves, nothing is searched -- but the report
     must not claim the name does not exist: no lookup ever established
     that. The hedged wording is accurate whether or not the creator holds
-    it, which is also what keeps the two outcomes indistinguishable.
+    it, which is also what keeps the two outcomes indistinguishable. Holds
+    on both call styles.
     """
-    _install_team(monkeypatch, {TEAM: []})
-
-    async def _broken_list_collections(
-        user_id=None, is_admin=None, force_realtime=False
-    ):
-        if user_id == CREATOR:
-            raise RuntimeError("storage unavailable")
-        if user_id == MEMBER:
-            return _collections(_kb("unrelated-own-doc"))
-        return _collections()
-
-    monkeypatch.setattr(document_search, "list_collections", _broken_list_collections)
-    _install_search(monkeypatch)
-
-    result = await _search(monkeypatch, runner_id=MEMBER, declared=["handbook"])
-
-    assert result.results == []
-    assert "Error:" in result.summary
-    assert "shared with the team" not in result.summary
-    assert "handbook could not be resolved for this agent" in result.summary
-    # The certainty wording is exactly what must not appear.
-    assert "None of the allowed collections exist" not in result.summary
-    assert "do not exist" not in result.summary
-
-
-@pytest.mark.asyncio
-async def test_creator_listing_failure_hedges_on_the_explicit_call_style_too(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
     _install_team(monkeypatch, {TEAM: []})
 
     async def _broken_list_collections(
@@ -1232,23 +1187,16 @@ async def test_creator_listing_failure_hedges_on_the_explicit_call_style_too(
         monkeypatch,
         runner_id=MEMBER,
         declared=["handbook"],
-        collections=["handbook"],
+        collections=["handbook"] if explicit else None,
     )
 
     assert result.results == []
+    assert "Error:" in result.summary
+    assert "shared with the team" not in result.summary
     assert "handbook could not be resolved for this agent" in result.summary
+    # The certainty wording is exactly what must not appear.
+    assert "None of the allowed collections exist" not in result.summary
     assert "do not exist" not in result.summary
-
-
-# ---------------------------------------------------------------------------
-# user_id is None returns before any team resolution.
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# The save-time validation consumer (find_missing_knowledge_bases) stays
-# runner-keyed.
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -1299,7 +1247,99 @@ async def test_team_governed_run_without_agent_config_uses_governing_team_layer(
     assert ("own-material", MEMBER, False) in search_spy.searched
 
 
-# ---------------------------------------------------------------------------
-# The list tool is built only when the agent declares nothing, and
-# there are exactly two ListKnowledgeBasesTool( construction sites.
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_team_owned_undeclared_name_in_explicit_request_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The governing team owns "team-secret", and the runner is a member of
+    that team, so it is visible to this run -- but the agent never declared
+    it. Being team-owned is not authorisation: the gate is keyed on the
+    agent's declaration, and a change that whitelists team-owned names
+    would hand the model a knowledge base the agent was never configured
+    with.
+    """
+    team_kbs = [
+        kb_scope.KnowledgeBaseAccess(
+            name=name,
+            storage_user_id=CREATOR,
+            team_owned=True,
+            can_edit=False,
+            can_delete=False,
+        )
+        for name in ("handbook", "team-secret")
+    ]
+    _install_team(monkeypatch, {TEAM: team_kbs})
+    _install_collections(
+        monkeypatch,
+        {MEMBER: [], CREATOR: [_kb("handbook"), _kb("team-secret")]},
+    )
+    search_spy = _install_search(monkeypatch)
+
+    result = await _search(
+        monkeypatch,
+        runner_id=MEMBER,
+        declared=["handbook"],
+        collections=["team-secret"],
+    )
+
+    assert search_spy.searched == []
+    assert result.results == []
+    assert "not allowed" in result.summary
+    clause = result.summary.split("Allowed collections:", 1)[1].strip()
+    assert clause == "handbook"
+
+
+@pytest.mark.asyncio
+async def test_admin_governed_run_resolves_on_the_governing_team(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An admin's collection listing is platform-wide, so it carries every
+    tenant's collections -- including the creator's unshared one and other
+    users' entirely unrelated ones. The declared-name rule still applies:
+    the team's copy is searched against the team's tenant with is_admin
+    dropped, the creator's unshared collection is still refused, and the
+    summary still names nothing the agent did not declare.
+    """
+    ADMIN = 400
+    team_kb = kb_scope.KnowledgeBaseAccess(
+        name="gov-kb",
+        storage_user_id=999,
+        team_owned=True,
+        can_edit=False,
+        can_delete=False,
+    )
+    _install_team(monkeypatch, {TEAM: [team_kb]})
+
+    async def _platform_wide_list_collections(
+        user_id=None, is_admin=None, force_realtime=False
+    ):
+        if is_admin:
+            return _collections(
+                _kb("gov-kb"), _kb("private-notes"), _kb("someone-elses-doc")
+            )
+        if user_id == 999:
+            return _collections(_kb("gov-kb"))
+        if user_id == CREATOR:
+            return _collections(_kb("private-notes"))
+        return _collections()
+
+    monkeypatch.setattr(
+        document_search, "list_collections", _platform_wide_list_collections
+    )
+    search_spy = _install_search(monkeypatch)
+
+    result = await _search(
+        monkeypatch,
+        runner_id=ADMIN,
+        is_admin=True,
+        declared=["gov-kb", "private-notes"],
+    )
+
+    # The team's copy is searched against the team's tenant, and the run's
+    # own admin flag does not travel into a team collection's search.
+    assert search_spy.searched == [("gov-kb", 999, False)]
+    # Visible platform-wide, still refused: the rule is not a visibility
+    # filter.
+    assert "private-notes" in result.summary
+    assert "has not" in result.summary and "shared with the team" in result.summary
+    assert "someone-elses-doc" not in result.summary

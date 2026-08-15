@@ -164,7 +164,7 @@ class KnowledgeSearchArgs(BaseModel):
     query: str = Field(description="The search query or question")
     collections: List[str] = Field(
         default=[],
-        description="Specific knowledge base collection names to search. Empty list uses allowed_collections if set, otherwise searches all collections.",
+        description="Specific knowledge base collection names to search. Empty list searches every knowledge base this agent is configured with: allowed_collections when set, all collections when not, and for an agent owned by a team, that agent's own stored knowledge base list.",
     )
     search_type: str = Field(
         default="hybrid",
@@ -183,7 +183,7 @@ class KnowledgeSearchArgs(BaseModel):
     )
     allowed_collections: Optional[List[str]] = Field(
         default=None,
-        description="Optional list of allowed collection names. Used as default when collections is empty.",
+        description="Optional list of allowed collection names. Used as default when collections is empty. Ignored for an agent owned by a team, whose own stored knowledge base list is the authority.",
     )
 
 
@@ -695,6 +695,11 @@ async def _search_knowledge_base_impl(
         if tool_args.allowed_collections:
             logger.info(f"   - Allowed collections: {tool_args.allowed_collections}")
 
+        # Collected by whichever branch below resolves the search set; a
+        # partial failure warns without stopping the rest of the agent's
+        # knowledge bases from being searched normally.
+        partial_failure_notes = []
+
         if declared_name_rule_applies:
             resolved_by_name = {c.name: c for c in collections_result.collections}
             authorised = set(declared_names_for_this_run)
@@ -872,8 +877,7 @@ async def _search_knowledge_base_impl(
                     summary = "Error: " + " ".join(segments)
                 return KnowledgeSearchResult(results=[], summary=summary)
 
-            collections_to_iterate: List[CollectionInfo] = to_search
-            partial_failure_notes = []
+            collections_to_iterate = to_search
             if unshared_names:
                 partial_failure_notes.append(_render_unshared_names(unshared_names))
             if missing_names or unresolvable_names:
@@ -912,7 +916,6 @@ async def _search_knowledge_base_impl(
             collections_to_iterate = [
                 c for c in collections_result.collections if c.name in collections_set
             ]
-            partial_failure_notes = []
             logger.info(f"Searching specific collections: {sorted(collections_set)}")
         elif tool_args.allowed_collections is not None:
             allowed_set = set(tool_args.allowed_collections)
@@ -935,11 +938,9 @@ async def _search_knowledge_base_impl(
             collections_to_iterate = [
                 c for c in collections_result.collections if c.name in valid_collections
             ]
-            partial_failure_notes = []
             logger.info(f"Searching allowed collections: {sorted(valid_collections)}")
         else:
             collections_to_iterate = collections_result.collections
-            partial_failure_notes = []
             logger.info("Searching all collections")
 
         # Build base search config (per-collection overrides happen below)
