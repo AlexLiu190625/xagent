@@ -86,19 +86,28 @@ Pairing rule:
         entry. ``dag_execute_end`` instead reaches into whichever
         ``dag_execution`` planning key is currently open and closes it
         as ``"failed"`` -- but only when ``data['status']`` is the
-        literal string ``"failed"``. ``"interrupted"``,
-        ``"waiting_for_user"``, ``"completed"``, a missing key, and
-        ``None`` all leave the planning step running instead, the
-        opposite fallback direction from ``dag_step_*`` above (which
-        cannot be reused here for exactly that reason). A plan-
+        literal string ``"failed"``. This branch only has a key left
+        to close while plan generation itself is still open: the
+        ``dag_execution`` ``executing``-phase event already clears
+        the key the moment plan generation finishes, so an
+        ``"interrupted"`` or ``"waiting_for_user"`` round reported
+        from that point on (during step execution) can't reach back
+        here. Only a round that is interrupted (or reports
+        ``"waiting_for_user"``, ``"completed"``, a missing key, or
+        ``None``) *during plan generation* leaves the planning step
+        running, the opposite fallback direction from ``dag_step_*``
+        above (which cannot be reused here for exactly that reason). A plan-
         generation exception that escapes ``DAGPattern.run()``
         before it ever calls ``on_pattern_end`` emits no
         ``dag_execute_end`` at all, so the planning step is left
         running indefinitely too -- out of scope for this module.
         ``dag_execute_start`` clears a stale open planning key left by
-        a prior ``DAGPattern.run()`` invocation that never reached a terminal
-        event, so a later round's failure can't reach back and close
-        an unrelated stranded step.
+        a prior round that ended with any non-``"failed"`` status
+        (typically ``"interrupted"`` -- that round did reach a
+        terminal ``dag_execute_end``, it just wasn't the literal
+        ``"failed"`` this module closes on), or whose terminal event
+        was itself dropped, so a later round's failure can't reach
+        back and close an unrelated stranded step.
 
     Orphan ends (end with no matching start) are dropped -- they
     represent malformed data and the SDK contract is "every step has
@@ -148,8 +157,11 @@ class PublicStepProjector:
     """Incremental folding state machine: trace events -> public steps.
 
     Holds all the folding state a fold needs -- the pending
-    (start-seen, end-not-yet-seen) pairing table and the ``dag_plan_*``
-    counter/open-key used to disambiguate replan. The batch driver
+    (start-seen, end-not-yet-seen) pairing table, the ``dag_plan_*``
+    counter/open-key used to disambiguate replan, and the
+    ``dag_execution`` counter/open-key (``_dag_execution_counter`` /
+    ``_open_dag_execution_key``) that tracks the same planning phase
+    from its second, independent event source. The batch driver
     (``map_trace_events_to_public_steps``) keeps none of its own: it
     builds one instance and reads back the result. Holding this state
     on an instance is what lets a caller feed a live event stream one
@@ -484,8 +496,11 @@ class PublicStepProjector:
         # the module docstring's "Pairing rule" section for the full
         # rationale. =====
         if event_type == "dag_execute_start":
-            # Drop a stale open key from a prior DAGPattern.run() round that
-            # never reached a terminal event; the stale pending step
+            # Drop a stale open key left by a prior round that ended with
+            # any non-"failed" status (typically "interrupted" -- that
+            # round did reach a terminal dag_execute_end, it just wasn't
+            # the literal "failed" this module closes on), or whose
+            # terminal event was itself dropped. The stale pending step
             # itself is left as-is (still "running").
             self._open_dag_execution_key = None
             return []
