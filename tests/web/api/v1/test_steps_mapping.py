@@ -1146,6 +1146,35 @@ _PROJECTOR_EQUIVALENCE_CASES: Dict[str, List[SimpleNamespace]] = {
         _ev("task_completion"),
         _ev("trace_error"),
     ],
+    "dag_execute_end_interrupted_does_not_leak_key_to_next_round": [
+        _ev(
+            "dag_execute_start",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _dag_exec_ev(
+            "planning",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "dag_execute_end",
+            task_id="t1",
+            data={"status": "interrupted"},
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+        # Round two's dag_execute_start/planning events are lost --
+        # only the terminal failure survives. The interrupted round
+        # one end above must have already cleared the open key, or
+        # this failure would reach back and close round one's
+        # stranded planning step instead of being a no-op.
+        _ev(
+            "dag_execute_end",
+            task_id="t1",
+            data={"status": "failed"},
+            timestamp=datetime(2026, 1, 1, 12, 0, 3, tzinfo=timezone.utc),
+        ),
+    ],
     "empty_event_list": [],
 }
 
@@ -1634,3 +1663,138 @@ def test_dag_execute_start_clears_stale_open_planning_key():
     assert len(steps) == 1
     assert steps[0]["status"] == "running"
     assert steps[0]["completed_at"] is None
+
+
+def test_dag_execute_start_planning_end_failed_closes_within_round():
+    """Pin the in-round production order: start -> planning ->
+    end(failed) closes the planning step opened by that same round.
+    Guards the failed-closes path; complements the non-failed
+    key-clearing coverage in the surrounding tests.
+    """
+    start = _ev(
+        "dag_execute_start",
+        task_id="t1",
+        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    planning = _dag_exec_ev(
+        "planning",
+        task_id="t1",
+        timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+    )
+    end = _ev(
+        "dag_execute_end",
+        task_id="t1",
+        data={"status": "failed"},
+        timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+    )
+    steps = map_trace_events_to_public_steps([start, planning, end])
+    assert len(steps) == 1
+    assert steps[0]["status"] == "failed"
+    assert steps[0]["completed_at"] is not None
+
+
+def test_dag_execute_end_interrupted_does_not_misattribute_next_rounds_failure():
+    """Round one is interrupted (its dag_execute_end status is not the
+    literal "failed", so its planning step is deliberately left
+    running), and round two's own dag_execute_start and planning
+    events are lost -- only round two's terminal dag_execute_end
+    (failed) survives.
+
+    ``_open_dag_execution_key`` is scoped to the round that opened it:
+    any dag_execute_end -- close or not -- clears it, since that
+    round has now ended one way or another. Without that clearing, a
+    non-"failed" end would leave the key pointing at round one's
+    still-pending planning step, and round two's failure would reach
+    back through it and close round one's step as "failed" --
+    attributing round two's failure to round one's stranded step.
+    With the key cleared, round two's failure finds no open key and is
+    a no-op, leaving round one's step running as designed.
+    """
+    round_one_start = _ev(
+        "dag_execute_start",
+        task_id="t1",
+        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    round_one_planning = _dag_exec_ev(
+        "planning",
+        task_id="t1",
+        timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+    )
+    round_one_end = _ev(
+        "dag_execute_end",
+        task_id="t1",
+        data={"status": "interrupted"},
+        timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+    )
+    # Round two's start and planning events are lost -- only its
+    # terminal failure arrives.
+    round_two_end = _ev(
+        "dag_execute_end",
+        task_id="t1",
+        data={"status": "failed"},
+        timestamp=datetime(2026, 1, 1, 12, 0, 3, tzinfo=timezone.utc),
+    )
+    steps = map_trace_events_to_public_steps(
+        [round_one_start, round_one_planning, round_one_end, round_two_end]
+    )
+    assert len(steps) == 1
+    assert steps[0]["status"] == "running"
+    assert steps[0]["completed_at"] is None
+
+
+def test_two_full_rounds_interrupted_then_failed_close_independently():
+    """Two complete rounds -- neither drops any event -- each close on
+    their own terms: round one (interrupted) stays running, round two
+    (failed) closes as failed. Guards the case where both rounds emit
+    their full start/planning/end triple, which the key clearing must
+    leave untouched.
+    """
+    round_one_start = _ev(
+        "dag_execute_start",
+        task_id="t1",
+        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    round_one_planning = _dag_exec_ev(
+        "planning",
+        task_id="t1",
+        timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+    )
+    round_one_end = _ev(
+        "dag_execute_end",
+        task_id="t1",
+        data={"status": "interrupted"},
+        timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+    )
+    round_two_start = _ev(
+        "dag_execute_start",
+        task_id="t1",
+        timestamp=datetime(2026, 1, 1, 12, 0, 3, tzinfo=timezone.utc),
+    )
+    round_two_planning = _dag_exec_ev(
+        "planning",
+        task_id="t1",
+        timestamp=datetime(2026, 1, 1, 12, 0, 4, tzinfo=timezone.utc),
+    )
+    round_two_end = _ev(
+        "dag_execute_end",
+        task_id="t1",
+        data={"status": "failed"},
+        timestamp=datetime(2026, 1, 1, 12, 0, 5, tzinfo=timezone.utc),
+    )
+    steps = map_trace_events_to_public_steps(
+        [
+            round_one_start,
+            round_one_planning,
+            round_one_end,
+            round_two_start,
+            round_two_planning,
+            round_two_end,
+        ]
+    )
+    assert len(steps) == 2
+    round_one_step = next(s for s in steps if s["id"] == "thinking:planning:t1:1")
+    round_two_step = next(s for s in steps if s["id"] == "thinking:planning:t1:2")
+    assert round_one_step["status"] == "running"
+    assert round_one_step["completed_at"] is None
+    assert round_two_step["status"] == "failed"
+    assert round_two_step["completed_at"] is not None
