@@ -3,10 +3,14 @@ import re
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from mcp.types import CallToolResult, TextContent
+from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_camel
 
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe.agent_tool_names import MAX_AGENT_TOOL_NAME_LENGTH
@@ -40,6 +44,21 @@ def _mcp_tool(name: str = "echo") -> SimpleNamespace:
         description=f"{name} tool",
         inputSchema={"type": "object", "properties": {}},
     )
+
+
+class _SdkV2CallToolResult(BaseModel):
+    """Mirrors mcp SDK 2.0.0's ``CallToolResult`` field naming (snake_case
+    Python attributes with camelCase wire aliases), unlike the currently
+    locked mcp 1.19.0's plain camelCase attributes. Guards against the
+    adapter silently regressing to dropping structured_content/is_error
+    if the SDK constraint ever allows resolving mcp>=2.
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    content: list[Any] = []
+    structured_content: Any = None
+    is_error: bool = False
 
 
 def test_mcp_server_load_failure_is_immutable():
@@ -525,6 +544,222 @@ def test_mcp_return_value_as_string_keeps_malformed_scalar_content_together():
     assert _mcp_return_value_as_string({"content": "error"}) == "error"
 
 
+def test_mcp_return_value_as_string_surfaces_structured_content():
+    value = {
+        "content": [{"text": "I'll wait for the background agents to complete."}],
+        "structured_content": {"status": "completed", "run_id": "abc"},
+        "is_error": False,
+    }
+
+    rendered = _mcp_return_value_as_string(value)
+
+    assert "I'll wait for the background agents to complete." in rendered
+    assert "completed" in rendered
+    assert "abc" in rendered
+
+
+def test_mcp_return_value_as_string_omits_structured_content_when_absent():
+    value = {"content": [{"text": "ok"}], "is_error": False}
+
+    assert _mcp_return_value_as_string(value) == "ok"
+
+
+def test_mcp_return_value_as_string_omits_no_content_placeholder_when_structured_content_present():
+    value = {
+        "content": [],
+        "structured_content": {"status": "completed"},
+        "is_error": False,
+    }
+
+    rendered = _mcp_return_value_as_string(value)
+
+    assert "No content returned" not in rendered
+    assert "completed" in rendered
+
+
+@pytest.mark.asyncio
+async def test_execute_mcp_call_forwards_structured_content(monkeypatch):
+    mcp_tool = _mcp_tool("status")
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(
+                content=[],
+                isError=False,
+                structuredContent={"status": "completed", "run_id": "abc"},
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter._execute_mcp_call(adapter.connection, {}, {})
+
+    assert result["structured_content"] == {"status": "completed", "run_id": "abc"}
+
+
+@pytest.mark.asyncio
+async def test_execute_mcp_call_structured_content_defaults_to_none(monkeypatch):
+    mcp_tool = _mcp_tool("echo")
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter._execute_mcp_call(adapter.connection, {}, {})
+
+    assert result["structured_content"] is None
+
+
+@pytest.mark.asyncio
+async def test_execute_mcp_call_reads_snake_case_sdk_structured_content(monkeypatch):
+    """Guards against the adapter silently regressing on an mcp SDK version
+    (e.g. 2.0.0) whose CallToolResult exposes structured_content instead of
+    structuredContent as the Python attribute name."""
+    mcp_tool = _mcp_tool("status")
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return _SdkV2CallToolResult(
+                content=[],
+                structured_content={"status": "completed", "run_id": "abc"},
+                is_error=False,
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter._execute_mcp_call(adapter.connection, {}, {})
+
+    assert result["structured_content"] == {"status": "completed", "run_id": "abc"}
+
+
+@pytest.mark.asyncio
+async def test_execute_mcp_call_reads_snake_case_sdk_error_flag(monkeypatch):
+    """Same regression guard as above, for the error flag: a hasattr-based
+    read on ``isError`` would silently report success on an SDK version
+    whose attribute is ``is_error`` instead."""
+    mcp_tool = _mcp_tool("status")
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return _SdkV2CallToolResult(content=[], is_error=True)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter._execute_mcp_call(adapter.connection, {}, {})
+
+    assert result["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_mcp_call_structured_content_reaches_the_model_observation(
+    monkeypatch,
+):
+    """The seam test: proves structured_content actually reaches the string
+    the LLM reads, by running it through the real _execute_mcp_call and then
+    the real ExecutionContext.add_tool_result -- not just that a hand-built
+    dict happens to render correctly."""
+    from xagent.core.agent.context import ExecutionContext
+
+    mcp_tool = _mcp_tool("coding_agent_status")
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(
+                content=[],
+                structuredContent={"status": "completed", "run_id": "abc"},
+                isError=False,
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter._execute_mcp_call(adapter.connection, {}, {})
+
+    context = ExecutionContext()
+    message = context.add_tool_result(
+        "coding_agent_status", result, tool_call_id="tool-1"
+    )
+
+    assert message.content.startswith("Tool coding_agent_status returned: ")
+    assert "completed" in message.content
+    assert "abc" in message.content
+
+
+def test_return_type_declares_structured_content_field():
+    mcp_tool = SimpleNamespace(
+        name="status",
+        description="status tool",
+        inputSchema={"type": "object", "properties": {}},
+        outputSchema={
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    return_model = adapter.return_type()
+
+    assert "structured_content" in return_model.model_fields
+
+
 def test_build_mcp_tool_adapter_honors_concurrent_tool_allowlist():
     safe_tool = SimpleNamespace(
         name="list_messages",
@@ -739,7 +974,7 @@ async def test_runtime_bindings_hide_and_inject_mcp_meta_and_tool_arguments(
             captured["name"] = name
             captured["arguments"] = arguments
             captured["kwargs"] = kwargs
-            return SimpleNamespace(content=[], isError=False)
+            return CallToolResult(content=[], isError=False)
 
     @asynccontextmanager
     async def _fake_create_session(_connection):
@@ -1062,6 +1297,7 @@ async def test_real_mcp_session_retries_nested_resolver_401_once(monkeypatch, ca
                 "meta": None,
             }
         ],
+        "structured_content": None,
         "is_error": False,
     }
     assert initial_client_builds == 1
@@ -1555,8 +1791,8 @@ async def test_delegated_authorization_401_refreshes_connection_once(monkeypatch
                 raise RuntimeError("HTTP 401 Unauthorized")
 
         async def call_tool(self, name, arguments, **kwargs):
-            return SimpleNamespace(
-                content=[SimpleNamespace(model_dump=lambda: {"text": "ok"})],
+            return CallToolResult(
+                content=[TextContent(type="text", text="ok")],
                 isError=False,
             )
 
@@ -1572,7 +1808,18 @@ async def test_delegated_authorization_401_refreshes_connection_once(monkeypatch
 
     result = await adapter.run_json_async({})
 
-    assert result == {"content": [{"text": "ok"}], "is_error": False}
+    assert result == {
+        "content": [
+            {
+                "type": "text",
+                "text": "ok",
+                "annotations": None,
+                "meta": None,
+            }
+        ],
+        "structured_content": None,
+        "is_error": False,
+    }
     assert refresh_calls == 1
     assert [item["headers"]["Authorization"] for item in connections] == [
         "Bearer expired-token",

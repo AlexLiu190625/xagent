@@ -6,6 +6,7 @@ enabling MCP tools to be used in DAG plan-execute patterns and other agent workf
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 import re
@@ -305,20 +306,38 @@ def _mcp_access_denied_result(user_id: Optional[str], tool_name: str) -> dict[st
 
 
 def _mcp_return_value_as_string(value: Any) -> str:
+    """Renders an MCP result dict for the ``AbstractBaseTool.return_value_as_string``
+    interface, used only by the tool wrappers (e.g. output-filter/sandboxed
+    wrappers). This is NOT the path the LLM's observation text is built from
+    for MCP tool calls in ReAct -- that is
+    ``ExecutionContext._format_tool_result`` (execution.py), which
+    stringifies the whole result dict returned by ``_execute_mcp_call``
+    directly. Keep this renderer lossless anyway, since any future caller
+    of ``return_value_as_string`` should see the same fields.
+    """
     try:
         if isinstance(value, dict):
+            texts = []
             content = value.get("content", [])
             if isinstance(content, list) and content:
-                texts = []
                 for item in content:
                     if isinstance(item, dict) and "text" in item:
                         texts.append(item["text"])
                     else:
                         texts.append(str(item))
-                return "\n".join(texts)
-            if content:
-                return str(content)
-            return "No content returned"
+            elif content:
+                texts.append(str(content))
+
+            structured_content = value.get("structured_content")
+            if structured_content is not None:
+                texts.append(
+                    "Structured result: " + json.dumps(structured_content, default=str)
+                )
+
+            if not texts:
+                texts.append("No content returned")
+
+            return "\n".join(texts)
         return str(value)
     except Exception as e:
         logger.warning(f"Failed to convert return value to string: {e}")
@@ -535,6 +554,13 @@ class MCPToolAdapter(AbstractBaseTool):
         class MCPToolResult(BaseModel):
             content: List[Dict[str, Any]] = Field(
                 default_factory=list, description="Tool execution result content"
+            )
+            structured_content: Any = Field(
+                default=None,
+                description=(
+                    "Structured JSON result of the tool call, if the server "
+                    "returned one."
+                ),
             )
             is_error: bool = Field(
                 default=False,
@@ -785,9 +811,20 @@ class MCPToolAdapter(AbstractBaseTool):
                     else:
                         content.append({"text": str(content_item)})
 
+            # Read by wire name (by_alias=True), not by Python attribute name:
+            # the mcp SDK's CallToolResult field naming has changed across
+            # major versions (1.x uses plain camelCase attributes, 2.x uses
+            # snake_case attributes with a camelCase alias), but the MCP
+            # wire/JSON field names ("structuredContent", "isError") are
+            # spec-fixed and stable across both. `content` is excluded and
+            # handled by the loop above instead, since by_alias=True would
+            # also rename each content item's `meta` field to `_meta`.
+            other_fields = result.model_dump(by_alias=True, exclude={"content"})
+
             return {
                 "content": content,
-                "is_error": result.isError if hasattr(result, "isError") else False,
+                "structured_content": other_fields.get("structuredContent"),
+                "is_error": bool(other_fields.get("isError")),
             }
 
     async def _retry_after_authorization_failure(

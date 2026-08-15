@@ -120,6 +120,27 @@ def test_add_tool_result_sanitizes_path_metadata_without_artifacts() -> None:
     assert raw_result["file_ref"]["relative_path"] == "output/deck.pptx"
 
 
+def test_format_tool_result_preserves_unknown_result_keys() -> None:
+    """MCP tool results carry a structured_content key that
+    _format_tool_result has no dedicated handling for -- it must still
+    surface it via the generic dict fallback, since this is the actual
+    mechanism (not the MCP adapter's own string-rendering helper) that
+    gets structured MCP results in front of the model."""
+    ctx = ExecutionContext()
+
+    content = ctx._format_tool_result(
+        "mcp_tool",
+        {
+            "content": [],
+            "structured_content": {"status": "completed", "run_id": "abc"},
+            "is_error": False,
+        },
+    )
+
+    assert "completed" in content
+    assert "abc" in content
+
+
 def test_format_tool_result_uses_shared_image_artifact_observation() -> None:
     ctx = ExecutionContext()
 
