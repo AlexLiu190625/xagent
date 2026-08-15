@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -20,6 +21,7 @@ from xagent.core.agent import (
     ToolCallRecord,
 )
 from xagent.core.agent.result import tool_result_succeeded
+from xagent.core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
@@ -43,6 +45,10 @@ class SearchArgs(BaseModel):
     count: int = 10
 
 
+class EmptyArgs(BaseModel):
+    pass
+
+
 class FakeTool:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -60,6 +66,18 @@ class FakeTool:
         self.calls.append(args)
         expression = args["expression"]
         return {"result": eval(expression), "expression": expression}  # noqa: S307
+
+
+class FakeWorkspaceOutputTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = WORKSPACE_OUTPUT_FILES_TOOL_NAME
+            description = "List output files from the current workspace."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return EmptyArgs
 
 
 class FakeWriteFileTool:
@@ -1090,6 +1108,10 @@ async def test_react_pattern_streams_only_final_answer_after_tool_call() -> None
     assert [tool["function"]["name"] for tool in llm.stream_calls[1]["tools"]] == [
         "final_answer"
     ]
+    forced_answer_description = llm.stream_calls[1]["tools"][0]["function"][
+        "parameters"
+    ]["properties"]["answer"]["description"]
+    assert "get_workspace_output_files" not in forced_answer_description
     assert llm.stream_calls[1]["tool_choice"] == "required"
     assert [event["type"] for event in outbound.events] == [
         "final_answer_start",
@@ -1342,15 +1364,29 @@ def test_react_grounding_rule_present_in_both_answer_paths() -> None:
     tool_prompt = pattern._messages_for_llm(
         context, has_tools=True, tool_names=["calculator"]
     )[0]["content"]
+    lookup_tool_prompt = pattern._messages_for_llm(
+        context,
+        has_tools=True,
+        tool_names=[WORKSPACE_OUTPUT_FILES_TOOL_NAME, "final_answer"],
+    )[0]["content"]
     forced_prompt = pattern._messages_for_llm(
         context, has_tools=True, force_final_answer=True, tool_names=["final_answer"]
     )[0]["content"]
 
-    for prompt in (tool_prompt, forced_prompt):
+    for prompt in (tool_prompt, lookup_tool_prompt, forced_prompt):
         assert "quantitative data" in prompt
         assert "illustrative placeholders" in prompt
     assert "use an appropriate tool to verify" in tool_prompt
     assert "use an appropriate tool" not in forced_prompt
+    assert "## FINAL DELIVERABLE FILE REFERENCES" not in tool_prompt
+    assert "exact markdown_link" in tool_prompt
+    assert "lookup is unavailable" in tool_prompt
+    assert "call get_workspace_output_files once before finalizing" not in tool_prompt
+    assert (
+        "call get_workspace_output_files once before finalizing" in lookup_tool_prompt
+    )
+    assert forced_prompt.count("## FINAL DELIVERABLE FILE REFERENCES") == 1
+    assert "call get_workspace_output_files once before finalizing" not in forced_prompt
 
 
 @pytest.mark.asyncio
@@ -3099,6 +3135,24 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     answer_schema = final_answer_schema["parameters"]["properties"]["answer"]
     assert "response_language" in answer_schema["description"]
     assert "tool results, source documents" in answer_schema["description"]
+    assert "## FINAL DELIVERABLE FILE REFERENCES" not in answer_schema["description"]
+    assert "exact markdown_link" in answer_schema["description"]
+    assert "get_workspace_output_files" not in answer_schema["description"]
+
+
+def test_react_final_answer_lookup_instruction_tracks_active_workspace_tool() -> None:
+    pattern = ReActPattern()
+
+    assert not inspect.signature(pattern._final_answer_tool_schema).parameters
+    schemas = pattern._tool_schemas_with_builtin_controls([FakeWorkspaceOutputTool()])
+    final_answer_schema = next(
+        schema for schema in schemas if schema["function"]["name"] == "final_answer"
+    )
+    answer_description = final_answer_schema["function"]["parameters"]["properties"][
+        "answer"
+    ]["description"]
+
+    assert "get_workspace_output_files" in answer_description
 
 
 @pytest.mark.asyncio

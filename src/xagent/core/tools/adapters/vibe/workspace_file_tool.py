@@ -9,6 +9,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any, Dict, List
 
+from .....core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
 from .....core.workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
 from ...core.workspace_file_tool import FileInfo, WorkspaceFileOperations
 from .base import ToolCategory
@@ -270,7 +271,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             ),
             FileTool(
                 self.get_workspace_output_files,
-                name="get_workspace_output_files",
+                name=WORKSPACE_OUTPUT_FILES_TOOL_NAME,
                 description="Get output file list from current workspace",
             ),
             FileTool(

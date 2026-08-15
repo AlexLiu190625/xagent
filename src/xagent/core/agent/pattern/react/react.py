@@ -42,6 +42,10 @@ from datetime import timezone
 from enum import Enum
 from typing import Any, cast
 
+from ....file_ref import (
+    WORKSPACE_OUTPUT_FILES_TOOL_NAME,
+    final_deliverable_file_reference_instructions,
+)
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
 from ....tools.user_interaction import (
@@ -823,11 +827,16 @@ class ReActPattern(AgentPattern):
                 "tool-call markup as plain text. Set outcome=completed only when "
                 "every requested action or verification succeeded; otherwise set "
                 "outcome=partial or outcome=blocked and say what remains. "
-                f"{grounding_rule(can_call_tools=False)} "
+                f"{grounding_rule(can_call_tools=False)}\n\n"
+                f"{final_deliverable_file_reference_instructions(can_lookup=False)}\n\n"
                 f"{final_answer_language_rule()}"
             )
         elif has_tools:
-            available_tools = ", ".join(tool_names or []) or "(none)"
+            active_tool_names = tool_names or []
+            available_tools = ", ".join(active_tool_names) or "(none)"
+            can_lookup_output_files = (
+                WORKSPACE_OUTPUT_FILES_TOOL_NAME in active_tool_names
+            )
             current_date = (
                 context.created_at.astimezone(timezone.utc).date().isoformat()
             )
@@ -850,7 +859,10 @@ class ReActPattern(AgentPattern):
                 "instruction for follow-up requests. If the user corrects a previous "
                 "assumption, especially about dates or freshness, revise the answer "
                 "instead of restating prior content. "
-                f"{grounding_rule()} "
+                f"{grounding_rule()}\n\n"
+                "When writing any final user-facing response, including plain "
+                "assistant text: "
+                f"{final_deliverable_file_reference_instructions(can_lookup=can_lookup_output_files, include_heading=False)}\n\n"
                 f"Current date (UTC): {current_date}. "
                 "For recent, latest, current, or time-sensitive requests, use this "
                 "date when forming search queries and judging source relevance. Only call "
@@ -1665,7 +1677,9 @@ class ReActPattern(AgentPattern):
                 )
         return compacted
 
-    def _builtin_tool_schemas(self) -> list[dict[str, Any]]:
+    def _builtin_tool_schemas(
+        self, *, can_lookup_output_files: bool = False
+    ) -> list[dict[str, Any]]:
         return [
             {
                 "type": "function",
@@ -1697,6 +1711,7 @@ class ReActPattern(AgentPattern):
                                 "description": (
                                     "Complete user-facing answer. It must be "
                                     "non-empty and must match response_language. "
+                                    f"{final_deliverable_file_reference_instructions(can_lookup=can_lookup_output_files, include_heading=False)} "
                                     f"{final_answer_language_rule()}"
                                 ),
                             },
@@ -1828,7 +1843,16 @@ class ReActPattern(AgentPattern):
             for tool in tools
             if self._tool_name(tool) not in control_tool_names
         ]
-        return [*external_tools, *self._builtin_tool_schemas()]
+        can_lookup_output_files = any(
+            schema.get("function", {}).get("name") == WORKSPACE_OUTPUT_FILES_TOOL_NAME
+            for schema in external_tools
+        )
+        return [
+            *external_tools,
+            *self._builtin_tool_schemas(
+                can_lookup_output_files=can_lookup_output_files
+            ),
+        ]
 
     def _control_tool_names(self) -> set[str]:
         return set(CONTROL_TOOL_NAMES)

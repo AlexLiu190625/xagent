@@ -5,6 +5,53 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
+WORKSPACE_OUTPUT_FILES_TOOL_NAME = "get_workspace_output_files"
+
+_FINAL_DELIVERABLE_FILE_LOOKUP_INSTRUCTIONS = f"""If a generated final deliverable exists but no trusted file_id remains in the current
+context, call {WORKSPACE_OUTPUT_FILES_TOOL_NAME} once before finalizing. Match the exact
+deliverable path and filename, then use only a returned non-null file_id and render [filename](file:file_id)
+with the exact returned filename; this matches the markdown_link form.
+If the lookup has no registered file_id, do not repeat the lookup, invent a link,
+or claim delivery.
+
+"""
+
+_FINAL_DELIVERABLE_NO_LOOKUP_INSTRUCTIONS = """If no trusted link or prescribed rendering remains in context and lookup is unavailable,
+do not reconstruct one or claim delivery; state that the deliverable link is unavailable.
+
+"""
+
+
+def final_deliverable_file_reference_instructions(
+    *, can_lookup: bool, include_heading: bool = True
+) -> str:
+    """Build final-deliverable rules for the current prompt location.
+
+    Final-only protocol turns cannot call workspace tools. Omitting lookup advice
+    there prevents the prompt from requiring a tool call that the active schema
+    rejects. Schema descriptions also omit the Markdown heading because they
+    embed these rules inline after existing prose.
+    """
+    lookup_instructions = (
+        _FINAL_DELIVERABLE_FILE_LOOKUP_INSTRUCTIONS
+        if can_lookup
+        else _FINAL_DELIVERABLE_NO_LOOKUP_INSTRUCTIONS
+    )
+    heading = "## FINAL DELIVERABLE FILE REFERENCES\n" if include_heading else ""
+    return f"""{heading}If a successful tool result produced a file (or a trusted non-internal FileRef references one)
+that satisfies the user's requested final deliverable, the final answer MUST include
+the exact markdown_link returned for that file, unless the successful tool result
+prescribes a different exact user-facing rendering, such as inline_markdown for screenshots,
+or the FileRef rules require inline image Markdown for an image intended for inline display.
+
+{lookup_instructions}Copy the selected rendering verbatim and preserve its original filename and extension.
+Preserve every returned file_id exactly.
+
+Include only user-requested final deliverables. Do not include intermediate,
+supporting, or temporary files unless the user explicitly requested them as
+deliverables. Never include internal FileRefs in user-facing output."""
+
+
 FILE_REF_OUTPUT_INSTRUCTIONS = """## FILE REFERENCE OUTPUTS
 When mentioning a generated or uploaded file that has a file_id, render it as a Markdown file reference:
 - Files: [filename](file:file_id)
@@ -14,6 +61,7 @@ Do not mention only the filename when a file_id or markdown_link is available. P
 File delivery integrity:
 - Internal FileRefs (`internal: true`) are runtime context only. Never render or expose a `file:` link for them.
 - Never invent, guess, or construct a file_id or `file:` link. Use only a trusted FileRef supplied for an existing input/attachment, or the exact FileRef or markdown_link returned by a successful tool result. A link mentioned only in prior assistant prose is not provenance.
+- An exact non-null file_id and filename returned together by get_workspace_output_files are trusted provenance for rendering a file link.
 - When the user requests a new file or file-based artifact, it is not delivered until a successful tool result returns its registered FileRef or markdown_link.
 - Do not call final_answer claiming that a file was created or delivered unless that result exists."""
 

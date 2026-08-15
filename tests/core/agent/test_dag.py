@@ -391,6 +391,15 @@ def test_dag_completion_assessment_prompt_includes_grounding_rule() -> None:
     assert "quantitative data" in system_prompt
     assert "illustrative placeholders" in system_prompt
     assert "use an appropriate tool" not in system_prompt
+    assert system_prompt.count("## FINAL DELIVERABLE FILE REFERENCES") == 1
+    assert "get_workspace_output_files" not in system_prompt
+
+    answer_description = pattern._completion_assessment_tool_schema()["function"][
+        "parameters"
+    ]["properties"]["answer"]["description"]
+    assert "## FINAL DELIVERABLE FILE REFERENCES" not in answer_description
+    assert "exact markdown_link" in answer_description
+    assert "get_workspace_output_files" not in answer_description
 
 
 def test_dag_waiting_response_preserves_active_step_state() -> None:

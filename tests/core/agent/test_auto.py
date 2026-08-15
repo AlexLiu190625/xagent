@@ -1092,6 +1092,19 @@ async def test_auto_decision_prompt_includes_grounding_rule() -> None:
     assert "quantitative data" in decision_prompt
     assert "illustrative placeholders" in decision_prompt
     assert "invented values" in decision_prompt
+    assert decision_prompt.count("## FINAL DELIVERABLE FILE REFERENCES") == 1
+    assert decision_prompt.index(
+        "If the answer would need such unsupported specifics"
+    ) < decision_prompt.index("## FINAL DELIVERABLE FILE REFERENCES")
+    assert "get_workspace_output_files" not in decision_prompt
+    assert "You must classify whether" in decision_prompt
+    assert "You must also classify whether" not in decision_prompt
+    answer_description = pattern._decision_tool_schema()["function"]["parameters"][
+        "properties"
+    ]["answer"]["description"]
+    assert "## FINAL DELIVERABLE FILE REFERENCES" not in answer_description
+    assert "exact markdown_link" in answer_description
+    assert "get_workspace_output_files" not in answer_description
     # Routes through the classification field so _normalize_decision's
     # deterministic fallback catches it, not just the model's routing choice.
     assert "set existing_context_sufficient=false and choose react" in decision_prompt

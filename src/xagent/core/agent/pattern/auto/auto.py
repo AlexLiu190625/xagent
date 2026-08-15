@@ -8,6 +8,7 @@ from typing import Any
 
 from json_repair import loads as repair_json_loads
 
+from ....file_ref import final_deliverable_file_reference_instructions
 from ....model.chat.exceptions import LLMToolProtocolError
 from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
@@ -1311,8 +1312,9 @@ class AutoPattern(AgentPattern):
             f"When writing that answer field: {grounding_rule(can_call_tools=False)} "
             "If the answer would need such unsupported specifics, set "
             "existing_context_sufficient=false and choose react so the agent can "
-            "verify them with tools. "
-            "You must also classify whether "
+            "verify them with tools.\n\n"
+            f"{final_deliverable_file_reference_instructions(can_lookup=False)}\n\n"
+            "You must classify whether "
             "the latest request requires current or external facts, and whether "
             "the existing context is sufficient evidence for those facts. "
             "Set response_language to the natural language that user-facing prose "
@@ -1446,7 +1448,8 @@ class AutoPattern(AgentPattern):
                                 "Required for every decision. When action is "
                                 "final_answer, provide the complete non-empty final "
                                 "response to the user. Use an empty string for react "
-                                f"or plan_execute. {final_answer_language_rule()}"
+                                f"or plan_execute. {final_deliverable_file_reference_instructions(can_lookup=False, include_heading=False)} "
+                                f"{final_answer_language_rule()}"
                             ),
                         },
                         "requires_current_or_external_facts": {
