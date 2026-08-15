@@ -1,7 +1,33 @@
-FROM node:22-slim
+# syntax=docker/dockerfile:1.6
+ARG UV_VERSION=0.11.10
+
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
+############################
+# Locked sandbox requirements
+############################
+FROM python:3.11-slim AS sandbox-requirements
+
+ENV UV_PYTHON_DOWNLOADS=0
+
+COPY --from=uv /uv /uvx /usr/local/bin/
+WORKDIR /build
+COPY pyproject.toml uv.lock ./
+
+# Export only the dedicated sandbox dependency group. The lock metadata stays
+# in this build stage instead of becoming part of the runtime image.
+RUN uv export --quiet --locked --only-group sandbox --no-emit-project \
+    --output-file /sandbox-requirements.txt
+
+############################
+# Sandbox runtime
+############################
+FROM node:22-slim AS sandbox
 
 LABEL maintainer="xagent"
 LABEL description="Full sandbox image with all tools"
+
+COPY --from=uv /uv /uvx /usr/local/bin/
 
 ######################## python 3.11 install (apt)
 
@@ -21,13 +47,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ######################## tools dependencies
 
-COPY docker/sandbox-requirements.txt /tmp/sandbox-requirements.txt
+COPY --from=sandbox-requirements /sandbox-requirements.txt /tmp/sandbox-requirements.txt
 
-# Install tools dependencies
-RUN pip install --no-cache-dir --break-system-packages -r /tmp/sandbox-requirements.txt \
-    && rm /tmp/sandbox-requirements.txt
+# Install the exact versions exported from uv.lock. The import check fails the
+# build if a supported runtime package is missing from the resulting image.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system --break-system-packages \
+        -r /tmp/sandbox-requirements.txt \
+    && rm /tmp/sandbox-requirements.txt \
+    && uvx --version \
+    && python -c "import cloudpickle, fsspec, matplotlib, mcp; import numpy, openpyxl, pandas, pydantic, pydantic_settings"
 
-# Allow pip install without --break-system-packages globally
+# Allow pip install without --break-system-packages globally. Sandboxed tools
+# can install their explicitly declared runtime dependencies as an unprivileged
+# user after the container starts.
 RUN printf '[global]\nbreak-system-packages = true\n' > /etc/pip.conf
 
 ########################

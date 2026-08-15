@@ -163,6 +163,21 @@ all = [
 ]
 
 [dependency-groups]
+# Runtime dependencies available to untrusted code in the separately published
+# sandbox image. Dockerfile.sandbox exports only this group from uv.lock so the
+# Python dependency set stays reproducible without inheriting the backend's larger set.
+sandbox = [
+  "pydantic>=2.11.7",
+  "pydantic-settings",
+  "cloudpickle>=3.0.0",
+  "mcp>=1.12.4",
+  "pandas>=1.3.0",
+  "numpy>=1.21.0",
+  "matplotlib>=3.5.0",
+  "openpyxl>=3.1.0",
+  "fsspec>=2024.0.0",
+]
+
 backend-image = [
   "unstructured>=0.15.0",
   "numba>=0.64.0",

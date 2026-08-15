@@ -14,6 +14,9 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper im
     list_tools_in_sandbox,
     should_sandbox_mcp_connection,
 )
+from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
+    SANDBOX_BASE_DEPENDENCIES,
+)
 from xagent.core.tools.core.mcp.sessions import Connection
 
 
@@ -37,6 +40,27 @@ class TestShouldSandboxMcpConnection:
 
 class TestListToolsInSandbox:
     """Tests for sandbox-side MCP list_tools helper."""
+
+    @pytest.mark.asyncio
+    async def test_requirements_preserve_mcp_without_reinstalling_uv(self):
+        sandbox = AsyncMock()
+        sandbox.exec.side_effect = [
+            MagicMock(exit_code=0, stderr="", error_message=None),
+            MagicMock(exit_code=0),
+        ]
+        sandbox.read_file.return_value = "[]"
+
+        with patch(
+            "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.SandboxDependencyManager.ensure_requirements",
+            new=AsyncMock(),
+        ) as mock_ensure_requirements:
+            await list_tools_in_sandbox(
+                sandbox,
+                {"transport": "stdio", "command": "uvx", "args": ["demo"]},
+            )
+
+        requirements = mock_ensure_requirements.await_args.args[1]
+        assert requirements == [*SANDBOX_BASE_DEPENDENCIES, "mcp>=1.12.4"]
 
     @pytest.mark.asyncio
     async def test_reads_result_file_and_builds_tools(self):
