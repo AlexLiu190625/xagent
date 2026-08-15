@@ -4227,6 +4227,20 @@ async def create_task(
         # in ``factory.py`` and ``knowledge_tools.py``: it exists so that a
         # future in-request resolution surfaces the seam's own 503 instead
         # of being silently reclassified as an internal error.
+        #
+        # The asymmetry with the ConnectorRuntimeError arm above is real
+        # and deliberate: that arm has a live producer inside this endpoint
+        # (``prepare_connector_runtime_selection_snapshot``), this one has
+        # none. It is kept because what the two arms share is the
+        # failure-path contract, not the producer: both errors carry their
+        # own status and a caller-safe message, and the blanket handler
+        # below turns anything it does not name into a 500 built from
+        # ``str(exc)``. Dropping this arm would make the first in-request
+        # producer -- the run-path resolution moving earlier, or a
+        # save-time validation added here -- answer 500 with a raw
+        # exception string, silently. The test beside it injects the raise
+        # for the same reason: what is pinned is this funnel's
+        # classification, not any particular producer.
         logger.warning(
             "Knowledge base scope unavailable during task creation "
             "(code=%s, details=%s)",

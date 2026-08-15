@@ -35,9 +35,15 @@ class KnowledgeBaseScopeError(RuntimeError):
     same place: the ``create_task`` handler in ``web/api/chat.py`` answers
     ``status_code`` with ``safe_message`` as the detail, directly alongside
     its ``ConnectorRuntimeError`` arm, and logs ``code``/``details`` rather
-    than returning them. Every other handler -- the two run-path ones and
-    the two tool-build ones -- re-raises it unchanged so those attributes
-    survive to that single HTTP-facing site.
+    than returning them. The other handlers re-raise it unchanged rather
+    than unpacking it: the two on the run path hand it to run orchestration
+    and the two on the tool-build path hand it to whoever is building the
+    tools, so in each case the status and code reach that caller instead of
+    being flattened into a bare ``RuntimeError``. The creator-collection
+    probe in ``document_search`` is the one deliberate exception -- it
+    catches every exception, this type included, because its answer chooses
+    how a report is worded and never what is searched or by whom, so a
+    failure there must hedge rather than abort the search.
     """
 
     def __init__(

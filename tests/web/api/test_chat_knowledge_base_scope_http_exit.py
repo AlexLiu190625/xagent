@@ -3,9 +3,9 @@ status and message the error itself carries, instead of letting its blanket
 handler reclassify it as an internal error.
 
 This is the one place anything reads ``status_code``/``safe_message`` off
-the knowledge-base scope seam's typed error; every other handler (the two
-on the run path, the two on the tool-build path) re-raises it unchanged so
-those attributes survive to here. The arm sits directly beside the
+the knowledge-base scope seam's typed error. The handlers on the run path
+and on the tool-build path re-raise it unchanged, each to its own caller,
+rather than unpacking it here. The arm sits directly beside the
 ``ConnectorRuntimeError`` arm that already does the same thing, and pins
 the same three properties for it:
 
@@ -53,6 +53,8 @@ def _scope_error() -> KnowledgeBaseScopeError:
 async def test_create_task_answers_knowledge_base_scope_error_with_its_own_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """One raise, three properties: the status and the detail come off the
+    error, and its diagnostic half is logged rather than returned."""
     from xagent.web.api import chat as chat_module
 
     def _raise(*args: object, **kwargs: object) -> None:
@@ -70,28 +72,6 @@ async def test_create_task_answers_knowledge_base_scope_error_with_its_own_statu
 
     assert excinfo.value.status_code == 503
     assert excinfo.value.detail == _SAFE_MESSAGE
-
-
-@pytest.mark.asyncio
-async def test_create_task_keeps_knowledge_base_scope_details_out_of_the_response(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The diagnostic half of the error is logged, never returned."""
-    from xagent.web.api import chat as chat_module
-
-    def _raise(*args: object, **kwargs: object) -> None:
-        raise _scope_error()
-
-    monkeypatch.setattr(chat_module, "validate_task_extension_requests", _raise)
-
-    with pytest.raises(HTTPException) as excinfo:
-        await chat_module.create_task(
-            TaskCreateRequest(title="kb-scope-http-exit"),
-            http_request=None,
-            db=MagicMock(),
-            user=MagicMock(id=1, is_admin=False),
-        )
-
     detail = str(excinfo.value.detail)
     assert _PRIVATE_DETAIL not in detail
     assert _ERROR_CODE not in detail

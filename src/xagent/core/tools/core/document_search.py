@@ -164,7 +164,7 @@ class KnowledgeSearchArgs(BaseModel):
     query: str = Field(description="The search query or question")
     collections: List[str] = Field(
         default=[],
-        description="Specific knowledge base collection names to search. Empty list searches every knowledge base this agent is configured with: allowed_collections when set, all collections when not, and for an agent owned by a team, that agent's own stored knowledge base list.",
+        description="Specific knowledge base collection names to search. Empty list searches the agent's default set: its own stored knowledge base list when the agent is owned by a team and that list is non-empty, otherwise allowed_collections when set, and every collection visible to this run when not.",
     )
     search_type: str = Field(
         default="hybrid",
@@ -183,7 +183,7 @@ class KnowledgeSearchArgs(BaseModel):
     )
     allowed_collections: Optional[List[str]] = Field(
         default=None,
-        description="Optional list of allowed collection names. Used as default when collections is empty. Ignored for an agent owned by a team, whose own stored knowledge base list is the authority.",
+        description="Optional list of allowed collection names. Used as default when collections is empty. Ignored when the agent is owned by a team and its stored knowledge base list is non-empty, which is then the authority.",
     )
 
 
@@ -467,9 +467,17 @@ async def _team_names_hosted_on(storage_user_id: int) -> set:
     )
 
     if not has_knowledge_base_visibility_hook():
-        # Standalone xagent, and any deployment that installed only the
-        # team-keyed hook: no team owns anything here, so every row on the
-        # tenant is the user's own.
+        # Without the runner-keyed hook this question cannot be asked, so
+        # every row on the tenant is treated as the user's own. Exact on
+        # standalone xagent, where no team owns anything at all. On a
+        # deployment that installed only the team-keyed hook it is not:
+        # teams do exist there, and a team's row hosted on the creator's
+        # tenant is classified as the creator's personal collection, so the
+        # sharing-gap sentence can name a knowledge base another team owns.
+        # Search decisions are unaffected -- the name is not searched under
+        # either classification -- and the ask stops here rather than
+        # falling back to the team-keyed hook, which answers only for the
+        # governing team and so cannot answer this question.
         return set()
     refs = await run_db_io_cancellation_safe(
         lambda: visible_team_knowledge_bases(None, int(storage_user_id))
@@ -490,15 +498,17 @@ class _CreatorCollectionProbe:
     "nothing"). A failure degrades to "not held" and never
     raises: a probe that cannot complete must not block the search, and
     must not be distinguishable from "the creator does not have this
-    collection" (see the module docstring's identity-disclosure limits).
+    collection"; what that costs, and where the guarantee stops, is stated
+    in the two paragraphs below.
 
     A failure is still not distinguishable per name -- it hits every name
     this run classifies alike -- so the enumeration oracle stays closed;
     what the caller does with ``lookup_failed`` is choose a report that does
     not assert an absence, not reveal one.
 
-    This still leaves a costlier existence-only side channel open to
-    anyone who can edit the agent, not only the creator: the stored
+    On a deployment that does not install the save-time knowledge-base
+    validator, this still leaves a costlier existence-only side channel
+    open to anyone who can edit the agent, not only the creator: the stored
     ``knowledge_bases`` declaration this probe classifies against is
     itself editable by any same-team member, not just the creator --
     ``agent_store.get_owned_agent`` (via ``owned_agent_clause``) lets a
@@ -509,7 +519,14 @@ class _CreatorCollectionProbe:
     versus the generic "does not exist" outcome off the summary to learn
     whether the creator holds a same-named private collection -- at the
     cost of an agent edit per name probed, and revealing only that
-    existence, never the collection's contents.
+    existence, never the collection's contents. The reference deployment
+    does install that validator, and the edit this channel needs never
+    lands there: an update whose declaration names a knowledge base the
+    team does not own is rejected at save time (``agent_store`` ->
+    ``validate_team_agent_knowledge_bases`` ->
+    ``UnsharedKnowledgeBasesError``). With no validator installed that
+    call returns an empty list and the edit is accepted, which is the
+    configuration the paragraph above describes.
     """
 
     def __init__(self, agent_creator_user_id: Optional[int]) -> None:
@@ -538,6 +555,20 @@ class _CreatorCollectionProbe:
                 # remove.
                 team_hosted = await _team_names_hosted_on(self._agent_creator_user_id)
             except Exception:
+                # Deliberately blanket, the seam's typed
+                # KnowledgeBaseScopeError included. Nothing inside this try
+                # produces that type today: the listing reports failure
+                # through its status instead of raising, and the
+                # runner-keyed hook is called directly, without the wrapper
+                # that mints it. If a typed producer is ever added here,
+                # swallowing stays right for this one site: the probe's
+                # answer chooses how a failure is worded and never what is
+                # searched or by whom, and its contract is to degrade to
+                # "not held" rather than abort a search that can still
+                # succeed for the agent's other knowledge bases. Every
+                # other handler of that type re-raises it; this one must
+                # not, and a change of mind here is a change to the probe's
+                # documented never-raise contract above.
                 logger.warning(
                     "Failed to resolve creator's personal collections while "
                     "classifying an unshared knowledge base",
