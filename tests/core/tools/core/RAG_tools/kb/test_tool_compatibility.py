@@ -91,8 +91,6 @@ async def test_public_list_knowledge_bases_routes_through_tool_facade(monkeypatc
             user_id: Optional[int] = None,
             is_admin: bool = False,
             governing_team_id: Optional[int] = None,
-            agent_creator_user_id: Optional[int] = None,
-            declared_knowledge_bases: Optional[list] = None,
         ) -> object:
             calls.append(
                 (
@@ -100,8 +98,6 @@ async def test_public_list_knowledge_bases_routes_through_tool_facade(monkeypatc
                     user_id or 0,
                     is_admin,
                     governing_team_id,
-                    agent_creator_user_id,
-                    declared_knowledge_bases,
                 )
             )
             return sentinel
@@ -114,15 +110,13 @@ async def test_public_list_knowledge_bases_routes_through_tool_facade(monkeypatc
         user_id=7,
         is_admin=True,
         governing_team_id=42,
-        agent_creator_user_id=99,
-        declared_knowledge_bases=["kb1", "kb2"],
     )
 
     assert result is sentinel
-    # All three new values must reach the facade call unmodified -- a
-    # facade-layer bug that drops any one of them would leave a
-    # team-governed search silently resolving as if it were personal.
-    assert calls == [(args, 7, True, 42, 99, ["kb1", "kb2"])]
+    # The governing team id must reach the facade call unmodified -- a
+    # facade-layer bug that drops it would leave a team-governed listing
+    # silently resolving against the runner's own team memberships.
+    assert calls == [(args, 7, True, 42)]
 
 
 @pytest.mark.asyncio
