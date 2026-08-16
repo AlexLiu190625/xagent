@@ -60,13 +60,14 @@ async def _create_knowledge_tools_impl(config: "BaseToolConfig") -> List[Any]:
             return []
 
         if allowed_collections is None:
+            # No creator and no declaration here: the list tool only reports
+            # which collections are available, classifies no individual
+            # declared name, and never runs the creator-existence probe.
             list_tool = get_list_knowledge_bases_tool(
                 allowed_collections=allowed_collections,
                 user_id=user_id,
                 is_admin=is_admin,
                 governing_team_id=governing_team_id,
-                agent_creator_user_id=agent_creator_user_id,
-                declared_knowledge_bases=declared_knowledge_bases,
             )
             tools.append(list_tool)
 

@@ -2,7 +2,9 @@
 declaration must actually reach the knowledge-base tool instances that
 ``knowledge_tools.py`` builds -- not just exist as parameters somewhere in
 the call chain. Each test here breaks one link of that chain and would go
-red if that link silently dropped its value.
+red if that link silently dropped its value. The list tool takes only the
+governing-team id; the creator and the declaration belong to the search
+tool alone.
 """
 
 from __future__ import annotations
@@ -79,8 +81,10 @@ async def test_missing_governing_team_id_leaves_tools_untouched_by_default() -> 
 
     assert list_tool.governing_team_id is None
     assert search_tool.governing_team_id is None
-    assert list_tool.agent_creator_user_id is None
     assert search_tool.agent_creator_user_id is None
+    # The list tool carries no creator at all: it reports what is available
+    # and classifies no individual declared name.
+    assert not hasattr(list_tool, "agent_creator_user_id")
 
 
 @pytest.mark.asyncio
@@ -126,9 +130,14 @@ async def test_running_the_search_tool_forwards_all_three_values_through_the_rea
 
 
 @pytest.mark.asyncio
-async def test_running_the_list_tool_forwards_all_three_values_through_the_real_facade(
+async def test_running_the_list_tool_forwards_only_the_governing_team_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The governing team id must survive the same whole chain for the list
+    tool, and nothing else must ride along with it: the config below does
+    carry a creator and a declaration (the search tool reads both), so this
+    also pins that the list path leaves them behind.
+    """
     from xagent.core.tools.core import document_search as core_document_search
 
     captured: dict = {}
@@ -155,5 +164,5 @@ async def test_running_the_list_tool_forwards_all_three_values_through_the_real_
     await list_tool.run_json_async({})
 
     assert captured.get("governing_team_id") == 42
-    assert captured.get("agent_creator_user_id") == 99
-    assert captured.get("declared_knowledge_bases") == ["kb1"]
+    assert "agent_creator_user_id" not in captured
+    assert "declared_knowledge_bases" not in captured
