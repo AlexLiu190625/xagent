@@ -7563,18 +7563,25 @@ async def _handle_pause_task_unserialized(
             logger.info("Agent supports pause_execution, calling it...")
             pause_result = await agent_service.pause_execution()
             if pause_result is False:
-                message_data["_durable_command_error"] = (
-                    "No live execution found to pause"
+                # ``pause_execution`` reports on the live run only, so it says
+                # "no" both for a task that is already paused and for one that
+                # is not running at all. Those read very differently to a user,
+                # so the persisted status picks the message.
+                pause_failure = (
+                    "Task is already paused"
+                    if task_fields.status == TaskStatus.PAUSED
+                    else "No live execution found to pause"
                 )
+                message_data["_durable_command_error"] = pause_failure
                 error_payload = await _read_task_error_payload_offloop(
                     task_id,
-                    "No live execution found to pause",
+                    pause_failure,
                 )
                 await manager.send_personal_message(
                     error_payload,
                     websocket,
                 )
-                logger.warning(f"No live execution found to pause for task {task_id}")
+                logger.warning("%s for task %s", pause_failure, task_id)
                 return
             logger.info("Agent pause_execution completed")
             pause_applied = await run_db_io_cancellation_safe(
@@ -8010,47 +8017,13 @@ async def _handle_resume_task_unserialized(
             logger.info(f"Task {task_id} v2 resume scheduled")
             return
 
-        # Check if agent supports resume functionality
-        if hasattr(agent_service, "resume_execution"):
-            resume_snapshot = await task_execution_controller.transition(
-                task_id,
-                TaskControlState.RESUME_REQUESTED,
-                expected_run_id=task_fields.run_id,
-            )
-            await agent_service.resume_execution()
-            await task_execution_controller.transition(
-                task_id,
-                TaskControlState.RUNNING,
-                status=TaskStatus.RUNNING,
-                expected_run_id=resume_snapshot.run_id,
-            )
-
-            # Send resume confirmation
-            await manager.broadcast_to_task(
-                {
-                    "type": "task_resumed",
-                    "task_id": task_id,
-                    "message": "Task resumed",
-                    "timestamp": datetime.now(timezone.utc).timestamp(),
-                },
-                task_id,
-            )
-            logger.info(f"Task {task_id} resumed successfully")
-        else:
-            # If resume not supported, send error message
-            message_data["_durable_command_error"] = (
-                "Current agent does not support resume functionality"
-            )
-            await manager.send_personal_message(
-                {
-                    "type": "error",
-                    "message": "Current agent does not support resume functionality",
-                },
-                websocket,
-            )
-            logger.warning(
-                f"Agent for task {task_id} does not support resume functionality"
-            )
+        # Unreachable: ``supports_live_control`` is defined once, on
+        # ``AgentService``, and returns True unconditionally, so the block above
+        # always returns or raises. Kept as a loud failure rather than a silent
+        # fallthrough in case a future agent type opts out of live control.
+        raise RuntimeError(
+            f"Agent for task {task_id} does not support live execution control"
+        )
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error

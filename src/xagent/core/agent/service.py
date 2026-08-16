@@ -128,9 +128,6 @@ class AgentService:
                     name,
                     exc,
                 )
-        self._is_paused = False
-        self._pause_event = None
-        self._current_runner = None
         self._execution_adapter: Any | None = None
         self._outbound_message_handler: Callable[[dict[str, Any]], Any] | None = None
         self._interrupt_checker: Callable[[], Any] | None = None
@@ -267,16 +264,19 @@ class AgentService:
         return result
 
     async def pause_execution(self) -> bool:
-        if self._is_paused:
-            logger.warning("Agent '%s' is already paused", self.name)
-            return True
+        """Request an interrupt for whichever run is live right now.
+
+        Deliberately stateless: whether a run is interruptible is owned by the
+        runner/registry and is scoped to a single run, while this service is
+        cached per task and outlives every run it starts. Caching that answer
+        here made a second stop short-circuit against the first stop's run.
+        """
 
         execution_id = self._current_task_id or self.id
         paused = self.pause_execution_by_id(
             str(execution_id), reason="paused by websocket"
         )
         if paused:
-            self._is_paused = True
             logger.info(
                 "Agent '%s' agent execution %s pause requested",
                 self.name,
@@ -289,15 +289,6 @@ class AgentService:
             execution_id,
         )
         return False
-
-    async def resume_execution(self) -> None:
-        if not self._is_paused:
-            logger.warning("Agent '%s' is not paused", self.name)
-            return
-        self._is_paused = False
-
-    def is_paused(self) -> bool:
-        return self._is_paused
 
     def handle_websocket_input(self, user_input: str) -> bool:
         logger.info(
@@ -361,7 +352,6 @@ class AgentService:
         execution_id: str,
         **kwargs: Any,
     ) -> dict[str, Any] | None:
-        self._is_paused = False
         await self._ensure_tools_initialized()
         if self._execution_adapter is None:
             self._execution_adapter = self._build_execution_adapter()
