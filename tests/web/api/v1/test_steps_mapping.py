@@ -1693,9 +1693,12 @@ def test_dag_execute_start_planning_end_failed_closes_within_round():
     assert steps[0]["completed_at"] is not None
 
 
-def test_dag_execute_end_interrupted_does_not_misattribute_next_rounds_failure():
-    """Round one is interrupted (its dag_execute_end status is not the
-    literal "failed", so its planning step is deliberately left
+@pytest.mark.parametrize("round_one_status", ["interrupted", "waiting_for_user"])
+def test_dag_execute_end_interrupted_does_not_misattribute_next_rounds_failure(
+    round_one_status,
+):
+    """Round one ends non-"failed" (its dag_execute_end status is not
+    the literal "failed", so its planning step is deliberately left
     running), and round two's own dag_execute_start and planning
     events are lost -- only round two's terminal dag_execute_end
     (failed) survives.
@@ -1708,7 +1711,10 @@ def test_dag_execute_end_interrupted_does_not_misattribute_next_rounds_failure()
     back through it and close round one's step as "failed" --
     attributing round two's failure to round one's stranded step.
     With the key cleared, round two's failure finds no open key and is
-    a no-op, leaving round one's step running as designed.
+    a no-op, leaving round one's step running as designed. Parametrized
+    over the status, since the key clearing is unconditional on status
+    -- a status-scoped clear (e.g. "interrupted" only) would have
+    passed this test just as well.
     """
     round_one_start = _ev(
         "dag_execute_start",
@@ -1723,7 +1729,7 @@ def test_dag_execute_end_interrupted_does_not_misattribute_next_rounds_failure()
     round_one_end = _ev(
         "dag_execute_end",
         task_id="t1",
-        data={"status": "interrupted"},
+        data={"status": round_one_status},
         timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
     )
     # Round two's start and planning events are lost -- only its

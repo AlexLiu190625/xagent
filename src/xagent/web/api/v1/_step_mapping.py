@@ -494,18 +494,24 @@ class PublicStepProjector:
             # Other phases (e.g. completion_assessment): not exposed.
             return []
 
-        # ===== dag_execute_start / dag_execute_end: close an open
-        # dag_execution planning step on outright plan failure. See
-        # the module docstring's "Pairing rule" section for the full
+        # ===== dag_execute_start / dag_execute_end: clear the
+        # dag_execution planning key at each round boundary, closing
+        # the planning step only on outright plan failure. See the
+        # module docstring's "Pairing rule" section for the full
         # rationale. =====
         if event_type == "dag_execute_start":
             # Drop a stale open key left by a prior round whose
-            # terminal dag_execute_end was itself dropped (never
-            # reached this projector at all). A round whose
-            # dag_execute_end did arrive -- whatever its status --
-            # already cleared its own key below; this guard only
-            # catches the dropped-terminal-event case. The stale
-            # pending step itself is left as-is (still "running").
+            # terminal dag_execute_end never reached this projector.
+            # The only live path to that today is a plan-generation
+            # exception other than RequiredToolCallError escaping
+            # DAGPattern.run(): it re-raises past the try/except
+            # instead of going through on_pattern_end, so no
+            # dag_execute_end is ever emitted for that round. A round
+            # whose dag_execute_end did arrive -- whatever its status
+            # -- already cleared its own key below; this guard only
+            # catches that never-emitted-terminal-event case. The
+            # stale pending step itself is left as-is (still
+            # "running").
             self._open_dag_execution_key = None
             return []
         if event_type == "dag_execute_end":
