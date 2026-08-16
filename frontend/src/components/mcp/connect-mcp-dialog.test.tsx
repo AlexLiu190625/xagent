@@ -818,6 +818,184 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     }
   })
 
+  it("fires exactly one oauth/connect POST when a custom mcp_oauth connect is double-clicked in the same tick", async () => {
+    // #1330: the DCR case. This server has no configured client_id, so each
+    // POST that reaches the backend and finds no MCPOAuthClient row performs a
+    // *real* dynamic client registration at the third-party authorization
+    // server. The loser is discarded locally by the registration_lookup_hash
+    // IntegrityError fallback, but the registration it created at the provider
+    // stays there — which is why the second POST has to be stopped in the
+    // browser, not reconciled afterwards. disabled={isConnecting} can't do it:
+    // it reads loadingApps, React state, so it lags a commit cycle behind two
+    // clicks fired back to back before any render flushes.
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    let connectCalls = 0
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        if (url === "http://api.local/api/mcp/9/oauth/connect") {
+          connectCalls += 1
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.example.com/authorize" }),
+          })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      renderDialog()
+      const connectButton = screen.getByRole("button", { name: "connect-records" })
+      // The settings-dialog mock's trigger carries no disabled prop, so both
+      // clicks reach the handler — which is the point: this asserts the
+      // handler's own guard, the one that exists precisely because the real
+      // trigger's disabled prop cannot be relied on to have committed yet.
+      fireEvent.click(connectButton)
+      fireEvent.click(connectButton)
+
+      await waitFor(() => {
+        expect(popup.location.href).toBe("https://auth.example.com/authorize")
+      })
+      expect(connectCalls).toBe(1)
+      // One popup, not two aliases of the same shared window name.
+      expect(openSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      openSpy.mockRestore()
+    }
+  })
+
+  it("fires exactly one oauth/connect POST when a catalog mcp_oauth connect is double-clicked in the same tick", async () => {
+    // Same window as the custom-server case above, through the catalog route.
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    let connectCalls = 0
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          connectCalls += 1
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.granola.ai/authorize" }),
+          })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      renderDialog()
+      const connectButton = screen.getByRole("button", { name: "connect-granola" })
+      fireEvent.click(connectButton)
+      fireEvent.click(connectButton)
+
+      await waitFor(() => {
+        expect(popup.location.href).toBe("https://auth.granola.ai/authorize")
+      })
+      expect(connectCalls).toBe(1)
+      expect(openSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      openSpy.mockRestore()
+    }
+  })
+
+  it("opens one popup and registers one message listener when a builtin_oauth connect is double-clicked in the same tick", async () => {
+    // #1330: the builtin flow has no provider-side registration to duplicate,
+    // but an unguarded second click opens a second provider popup and adds a
+    // second postMessage listener — so one 'oauth-success' message would fire
+    // onSuccess and loadApps() twice.
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const addListenerSpy = vi.spyOn(window, "addEventListener")
+    const onSuccess = vi.fn()
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+      const connectButton = screen.getByRole("button", { name: "connect-builtin" })
+      fireEvent.click(connectButton)
+      fireEvent.click(connectButton)
+
+      expect(openSpy).toHaveBeenCalledTimes(1)
+      const messageListeners = addListenerSpy.mock.calls.filter(([type]) => type === "message")
+      expect(messageListeners).toHaveLength(1)
+
+      await act(async () => {
+        window.dispatchEvent(
+          Object.assign(new Event("message"), { data: { type: "oauth-success" } }),
+        )
+      })
+      expect(onSuccess).toHaveBeenCalledTimes(1)
+    } finally {
+      addListenerSpy.mockRestore()
+      openSpy.mockRestore()
+    }
+  })
+
+  it("frees the app's connect slot when the dialog closes mid-OAuth-flow, so it stays connectable", async () => {
+    // #1330's trap: a bespoke per-handler in-flight ref would be released only
+    // by handleConnectMcpOAuthApp's own exit points, and clearMcpOauthPollState
+    // — which drops loadingApps wholesale when the dialog closes — knows
+    // nothing about one. Abandoning an OAuth flow by closing the dialog would
+    // then leave the app permanently unconnectable until a page reload. The
+    // guard shadows loadingApps precisely so every path that clears the
+    // spinner also frees the slot.
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    let connectCalls = 0
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        if (url === "http://api.local/api/mcp/9/oauth/connect") {
+          connectCalls += 1
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.example.com/authorize" }),
+          })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      const props = {
+        onOpenChange: vi.fn(),
+        selectedMcpServers,
+      }
+      const { rerender } = render(<ConnectMcpDialog open {...props} />)
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "connect-records" }))
+      })
+      expect(connectCalls).toBe(1)
+
+      // The user closes the dialog while the popup is still waiting for
+      // consent, then reopens it and tries again.
+      rerender(<ConnectMcpDialog open={false} {...props} />)
+      rerender(<ConnectMcpDialog open {...props} />)
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "connect-records" }))
+      })
+      expect(connectCalls).toBe(2)
+    } finally {
+      openSpy.mockRestore()
+    }
+  })
+
   it("fires exactly one POST when a keyless connect is double-clicked in the same tick", async () => {
     // Round-9: keylessConnectsRef's guard had zero test coverage — removing
     // its .has()/.add() calls would leave every other test green. Without

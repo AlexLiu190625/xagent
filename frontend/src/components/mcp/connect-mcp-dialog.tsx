@@ -121,16 +121,46 @@ export function ConnectMcpDialog({
   // round 4, round 5 M1) because per-call-site match-guards on a shared slot
   // don't compose; this retires all of them at once.
   const [loadingApps, setLoadingApps] = useState<Set<string>>(new Set())
+  // #1330: synchronous shadow of loadingApps. Every connect handler's first
+  // statement is markAppLoading — a setState — and the only guard on the
+  // triggers is `disabled={isConnecting}`, fed from loadingApps, so it lags a
+  // commit cycle behind two clicks landing in the same tick.
+  // A shadow of the shared slot rather than a per-handler in-flight ref: the
+  // mcp_oauth flow holds its loading state for the entire 5-minute popup wait,
+  // and clearMcpOauthPollState() drops loadingApps wholesale on dialog close
+  // without knowing about any bespoke ref — an app whose connect was released
+  // only by its own handler's six exit points would stay unconnectable until a
+  // page reload if the dialog was closed mid-flow. Writing it from the same
+  // three functions that write loadingApps (here, clearAppLoading, and
+  // clearMcpOauthPollState) is one invariant instead of six, matching the
+  // argument the comment above already makes for the shared slot itself.
+  const loadingAppsRef = React.useRef<Set<string>>(new Set())
   const markAppLoading = (appId: string) => {
+    loadingAppsRef.current.add(appId)
     setLoadingApps(prev => (prev.has(appId) ? prev : new Set(prev).add(appId)))
   }
   const clearAppLoading = (appId: string) => {
+    loadingAppsRef.current.delete(appId)
     setLoadingApps(prev => {
       if (!prev.has(appId)) return prev
       const next = new Set(prev)
       next.delete(appId)
       return next
     })
+  }
+  // Claim this app's connect slot, synchronously. Returns false when a connect
+  // for it is already in flight, so the caller can bail before issuing any
+  // request. The case that justifies it is the mcp_oauth (DCR) path: with no
+  // configured client_id, two concurrent POSTs both find no MCPOAuthClient row
+  // and both call register_mcp_oauth_public_client, so two dynamic client
+  // registrations are really created at the third-party authorization server.
+  // _upsert_mcp_oauth_client's registration_lookup_hash IntegrityError
+  // fallback then discards one — but only the local row; the registration at
+  // the provider is a side effect nothing here can withdraw.
+  const beginAppConnect = (appId: string) => {
+    if (loadingAppsRef.current.has(appId)) return false
+    markAppLoading(appId)
+    return true
   }
   const [isLoadingApps, setIsLoadingApps] = useState(false)
   const [activeCategory, setActiveCategory] = useState("All")
@@ -370,7 +400,10 @@ export function ConnectMcpDialog({
     mcpOauthMessageListenersRef.current.clear()
     // This teardown abandons every timer/listener tracked above regardless
     // of which app(s) they belonged to, so it clears every in-flight app,
-    // not just one.
+    // not just one. The synchronous shadow has to be released here too
+    // (#1330), or an app whose OAuth flow was abandoned by a dialog close
+    // would keep its claimed slot and never be connectable again.
+    loadingAppsRef.current.clear()
     setLoadingApps(new Set())
     // F5 (close case): bump so any handleConnectMcpOAuthApp call that
     // captured the generation before this teardown ran can detect it's
@@ -816,19 +849,16 @@ export function ConnectMcpDialog({
   // can't: loadingApps is React state, so disabled={} lags a commit cycle,
   // and a double-click landing in the same tick would fire two POSTs. The
   // backend recovers idempotently, so this only saves a wasted duplicate
-  // request — a ref is synchronous, closing the window outright.
-  const keylessConnectsRef = React.useRef<Set<string>>(new Set())
+  // request — a ref is synchronous, closing the window outright. It used to
+  // be a keyless-only ref; #1330 needed the same guard on two more handlers,
+  // so it is now the shared loadingAppsRef claim. connectCatalogApp's finally
+  // always runs setLoading(false), which releases the slot on every exit path.
   const submitKeylessConnect = async (app: AppIntegration, autoSelect: boolean) => {
-    if (keylessConnectsRef.current.has(app.id)) return
-    keylessConnectsRef.current.add(app.id)
-    try {
-      await connectCatalogApp(app, { is_active: true }, {
-        autoSelect,
-        setLoading: (loading) => (loading ? markAppLoading(app.id) : clearAppLoading(app.id)),
-      })
-    } finally {
-      keylessConnectsRef.current.delete(app.id)
-    }
+    if (!beginAppConnect(app.id)) return
+    await connectCatalogApp(app, { is_active: true }, {
+      autoSelect,
+      setLoading: (loading) => (loading ? markAppLoading(app.id) : clearAppLoading(app.id)),
+    })
   }
 
   // A user-added (custom) MCP server is authorized per server row, not per
@@ -844,6 +874,9 @@ export function ConnectMcpDialog({
   // custom-mcp-form's handleConnectMcpOAuth. Serves both a catalog app
   // (e.g. Granola), keyed by app_id, and a custom server, keyed by server id.
   const handleConnectMcpOAuthApp = async (app: AppIntegration, autoSelect: boolean) => {
+    // #1330: claim the slot before anything else — this is the DCR path, so a
+    // second same-tick call would register a second client at the provider.
+    if (!beginAppConnect(app.id)) return
     // F5 (close case): captured before the popup opens and before any await,
     // so it reflects poll state as of this click — not a stale closure value
     // read after the dialog has since closed and reopened.
@@ -856,7 +889,6 @@ export function ConnectMcpDialog({
     // entry came from: a custom server only appears under location=local, so
     // asking for remote would report every custom connect as a failure.
     const refreshLocation = serverId === null ? "remote" : "local"
-    markAppLoading(app.id)
     // Open the popup synchronously on the click, before any await — popup
     // blockers reject windows opened outside direct user-gesture handling.
     // The window-features string matters: without it, browsers open a full
@@ -988,7 +1020,11 @@ export function ConnectMcpDialog({
       return;
     }
 
-    markAppLoading(app.id)
+    // #1330: same same-tick window as the mcp_oauth handler above. There is no
+    // provider-side registration here (the client is static), but two calls
+    // would open two provider popups and register two postMessage listeners,
+    // each firing its own onSuccess/loadApps.
+    if (!beginAppConnect(app.id)) return
     // Open OAuth in a popup window to handle the callback smoothly
     const width = 600;
     const height = 700;
