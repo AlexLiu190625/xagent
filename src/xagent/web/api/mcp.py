@@ -1570,6 +1570,51 @@ def _app_lookup_keys(*values: object) -> list[str]:
     return keys
 
 
+def _catalog_app_keys(app: dict) -> list[str]:
+    """The normalized keys a catalog app's shared server row may be named after.
+
+    Both, because two provisioning paths disagree: the catalog-connect helpers
+    name the row after the app_id (_ensure_catalog_app_server,
+    _ensure_catalog_mcp_oauth_server) while the builtin_oauth path names it
+    after the display name (_ensure_user_mcp_server). Single-sourced so every
+    caller asking "which row is this app's" — the connected-state and shared-row
+    lookups, the names a custom server may not take, the rows the connector
+    listing must not re-emit, and the rows that carry a platform key — cannot
+    drift apart; one such drift is exactly what #1346 was.
+
+    Normalized keys only. The raw id/name strings stay in use where a value
+    reaches the database — the shared-row prefetch query below, and the two
+    provisioning helpers that write `MCPServer.name` — because rows store names
+    unnormalized; those spellings are what this function's keys are derived
+    from, not a competing definition of them.
+    """
+    return _app_lookup_keys(app.get("id"), app.get("name"))
+
+
+def _server_catalog_keys(server: MCPServer) -> list[str]:
+    """The keys a stored row could be some catalog app's shared row under.
+
+    The row's name covers both naming conventions above. An oauth row also
+    carries its app_id in `auth`, which is what the catalog branch resolves it
+    by (_oauth_server_lookup_keys), so include that too: an admin renaming a
+    non-builtin oauth app leaves the row under its old display name, which the
+    name key alone would stop matching. Scoped to transport == "oauth" because
+    that shape's auth is written by us; a custom row's auth is caller-authored
+    and must not be able to claim a catalog identity.
+
+    That borrows _oauth_server_lookup_keys' provider fallback, which reaches
+    across namespaces: a legacy row carrying only `auth.provider` is matched
+    against catalog *ids*, so one whose provider happens to equal some app's id
+    is skipped even if it belongs to another app. Kept on purpose, because the
+    catalog branch claims such a row by provider too (_is_oauth_server_for_app)
+    — a key this misses is a #1346 duplicate, while a key it over-matches only
+    moves a legacy row to the Remote tab, still editable via /api/mcp/servers.
+    """
+    if _normalize_app_key(server.transport) != "oauth":
+        return _app_lookup_keys(server.name)
+    return _app_lookup_keys(server.name, *_oauth_server_lookup_keys(server))
+
+
 def _is_reserved_catalog_name(db: Session, name: object) -> bool:
     """Whether a server name collides (normalized) with a catalog app id/name.
 
@@ -1580,10 +1625,7 @@ def _is_reserved_catalog_name(db: Session, name: object) -> bool:
     key = _normalize_app_key(name)
     if not key:
         return False
-    return any(
-        key in _app_lookup_keys(app.get("id"), app.get("name"))
-        for app in get_all_mcp_apps(db)
-    )
+    return any(key in _catalog_app_keys(app) for app in get_all_mcp_apps(db))
 
 
 def _oauth_account_can_connect(oauth_account: object) -> bool:
@@ -1616,7 +1658,6 @@ def _is_oauth_server_for_app(server: MCPServer, app: dict) -> bool:
         return False
 
     app_id = _normalize_app_key(app.get("id"))
-    app_name = _normalize_app_key(app.get("name"))
     provider = _normalize_app_key(app.get("provider"))
     server_name = _normalize_app_key(server.name)
 
@@ -1632,8 +1673,9 @@ def _is_oauth_server_for_app(server: MCPServer, app: dict) -> bool:
         if auth_app_id or auth_provider:
             return True
 
-    # Legacy OAuth server rows created before app metadata was stored in auth.
-    return bool(server_name and server_name in {app_id, app_name})
+    # Legacy OAuth server rows created before app metadata was stored in auth,
+    # matched on the same key set every other caller uses.
+    return bool(server_name and server_name in _catalog_app_keys(app))
 
 
 def _connected_oauth_server_for_app(
@@ -1742,7 +1784,7 @@ def _shared_server_for_app(
 ) -> Optional[MCPServer]:
     """Resolve an app's shared server via the same normalized id/name keys the
     connected-state lookup uses, so key-source flags stay consistent with it."""
-    for app_key in _app_lookup_keys(app.get("id"), app.get("name")):
+    for app_key in _catalog_app_keys(app):
         server = server_by_key.get(app_key)
         if server is not None:
             return server
@@ -1813,7 +1855,7 @@ def _connected_non_oauth_server_for_app(
     server = next(
         (
             non_oauth_server_lookup[(app_transport, app_key)]
-            for app_key in _app_lookup_keys(app.get("id"), app.get("name"))
+            for app_key in _catalog_app_keys(app)
             if (app_transport, app_key) in non_oauth_server_lookup
         ),
         None,
@@ -2149,9 +2191,35 @@ def list_mcp_apps(
                 .all()
             )
 
-        library_names = {app["name"].lower() for app in library_apps}
+        # Skip the rows a catalog app's entry already speaks for, resolving the
+        # row's connector identity the way _catalog_app_keys defines it. The old
+        # skip compared raw lowercased names against display names only, which
+        # missed a catalog row on two independent counts (#1346): the row is
+        # named after the app_id, which normalizes whitespace to hyphens, so
+        # "Google Maps" never matched its own row named `google-maps`; and an
+        # app_id that is not a hyphenated spelling of its name (chrome-devtools/
+        # "Chrome") has no name to match at all. Either miss re-emitted the app
+        # as a second, is_custom entry: a Configure button pointed at the
+        # custom-server edit form, a Delete surfaced as "Delete Service", and,
+        # for the mcp_oauth shape, an entry the picker treats as attachable with
+        # no grant behind it.
+        #
+        # Deliberately broader than the catalog branch's own claim, which is
+        # further qualified by transport, is_active and is_visible_in_connector:
+        # a row under a catalog key that the branch declines to claim (a legacy
+        # row on the wrong transport, or one belonging to a hidden app) is
+        # suppressed here rather than falling through to a custom entry. Hiding
+        # it is the point for the hidden-app case ("Strong hide mode" above),
+        # and /api/mcp/servers still lists, edits and deletes every such row.
+        # The cost lands on legacy rows only: one on the wrong transport is
+        # suppressed here while the catalog entry still offers Connect, which
+        # 409s on the config mismatch (_ensure_catalog_app_server) — visible and
+        # fixable from the Tools page, unreachable from the picker. A team-shared
+        # catalog connector loses its only picker entry the same way, which is
+        # pre-existing for most apps and tracked in #1387.
+        library_keys = {key for app in library_apps for key in _catalog_app_keys(app)}
         for server, user_mcp in local_mcps:
-            if server.name.lower() in library_names:
+            if library_keys.intersection(_server_catalog_keys(server)):
                 continue
 
             if search:
@@ -3240,7 +3308,7 @@ def _catalog_server_has_platform_key(db: Session, server: MCPServer) -> bool:
     if not key:
         return False
     for app in get_all_mcp_apps(db):
-        if key in _app_lookup_keys(app.get("id"), app.get("name")):
+        if key in _catalog_app_keys(app):
             required = (app.get("launch_config") or {}).get("required_env") or []
             return _env_covers_required(env, required)
     return False
