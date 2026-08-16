@@ -81,8 +81,30 @@ vi.mock("@/components/ui/tabs", () => ({
 }))
 
 vi.mock("./custom-api-form", () => ({
-  CustomApiForm: ({ mcpFormData }: { mcpFormData: { name?: string } }) => (
-    <output data-testid="custom-api-edit-name">{mcpFormData.name ?? ""}</output>
+  CustomApiForm: ({
+    mcpFormData,
+    setMcpFormData,
+  }: {
+    mcpFormData: { name?: string }
+    setMcpFormData: React.Dispatch<React.SetStateAction<Record<string, unknown>>>
+  }) => (
+    <div>
+      <output data-testid="custom-api-edit-name">{mcpFormData.name ?? ""}</output>
+      {/* Fills the two fields handleSaveCustomMcp requires before it will
+          POST a create (name, url), for the #1390 custom_api create path. */}
+      <button
+        type="button"
+        onClick={() => setMcpFormData((previous) => ({
+          ...previous,
+          name: "records-mcp",
+          transport: "custom_api",
+          url: "https://api.example.com",
+          method: "POST",
+        }))}
+      >
+        name-new-custom-api
+      </button>
+    </div>
   ),
 }))
 
@@ -104,6 +126,20 @@ vi.mock("./custom-mcp-form", () => ({
         }))}
       >
         change-mcp-description
+      </button>
+      {/* The create path has no detail fetch to hydrate the form, so the
+          #1390 tests fill in the one field handleSaveCustomMcp validates
+          (and the one the post-create lookup matches the listing on). */}
+      <button
+        type="button"
+        onClick={() => setMcpFormData((previous) => ({
+          ...previous,
+          name: "records-mcp",
+          transport: "streamable_http",
+          config: { url: "https://mcp.example.com" },
+        }))}
+      >
+        name-new-mcp
       </button>
       <button
         type="button"
@@ -412,6 +448,17 @@ function renderDialog() {
 function saveMcpEditor() {
   const editor = screen.getByTestId("mcp-edit-state").closest(".max-w-2xl")
   if (!editor) throw new Error("MCP editor container was not rendered")
+  fireEvent.click(within(editor as HTMLElement).getByRole("button", {
+    name: "tools.mcp.buttons.save",
+  }))
+}
+
+// The Custom API tab's own Save, which is a different button under a
+// different container from the MCP editor's — both tabs render at once
+// under the stubbed Tabs, so the container has to be the anchor.
+function saveCustomApiEditor() {
+  const editor = screen.getByTestId("custom-api-edit-name").closest(".max-w-2xl")
+  if (!editor) throw new Error("Custom API editor container was not rendered")
   fireEvent.click(within(editor as HTMLElement).getByRole("button", {
     name: "tools.mcp.buttons.save",
   }))
@@ -1889,6 +1936,199 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     fireEvent.click(
       within(screen.getByTestId("connector-card-records")).getByText("Records MCP"),
     )
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
+  // #1390: the create path into the selection, which ignored can_attach
+  // entirely while the click path above enforces it. Saves the create form of
+  // whichever connector type is under test and answers the post-create lookup
+  // with `localListing` — the filtered listing loadApps() sends (location=
+  // remote, the sidebar default still in force when the save starts)
+  // deliberately answers empty, which is exactly why the lookup cannot
+  // reuse it.
+  //
+  // `pendingLookup`, when given, holds the lookup open so a caller can assert
+  // on the window in which the save has succeeded but the decision has not
+  // landed yet; its `resolve` finishes the create.
+  async function createInSelectMode(
+    localListing: object[] | null,
+    onConnectSelected: () => void,
+    options: { customApi?: boolean; pendingLookup?: Deferred<unknown> } = {},
+  ) {
+    const listingResponse = localListing
+      ? { ok: true, json: async () => localListing }
+      // A null listing models the lookup itself failing, the case that has to
+      // read as "not attachable" rather than falling through.
+      : { ok: false, status: 500, json: async () => ({}) }
+    const createUrl = options.customApi
+      ? "http://api.local/api/custom-apis"
+      : "http://api.local/api/mcp/servers"
+
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string }) => {
+      // Only the lookup carries an abort signal; the sidebar's own refresh of
+      // the same URL does not. Matching on it keeps this stub — and the wait
+      // below — pinned to the request under test.
+      if (url === "http://api.local/api/mcp/apps?location=local" && init && "signal" in init) {
+        return options.pendingLookup
+          ? options.pendingLookup.promise.then(() => listingResponse)
+          : Promise.resolve(listingResponse)
+      }
+      // The sidebar's own refresh of that same URL, fired by the switch to
+      // the local tab. Serves the listing so the cards render, but cannot
+      // stand in for the lookup: every other filter combination this dialog
+      // sends — location=remote before the switch, plus any search/category
+      // narrowing — answers empty, which is the whole reason the lookup
+      // cannot reuse it.
+      if (url === "http://api.local/api/mcp/apps?location=local") {
+        return Promise.resolve({ ok: true, json: async () => localListing ?? [] })
+      }
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url === createUrl && init?.method === "POST") {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ id: 9 }) })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    render(
+      <ConnectMcpDialog
+        open
+        onOpenChange={vi.fn()}
+        selectedMcpServers={selectedMcpServers}
+        onConnectSelected={onConnectSelected}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", {
+      name: options.customApi ? "name-new-custom-api" : "name-new-mcp",
+    }))
+    await act(async () => {
+      options.customApi ? saveCustomApiEditor() : saveMcpEditor()
+    })
+    // The create POST must have gone to the endpoint for this connector type,
+    // carrying the name the lookup then matches the listing on.
+    await waitFor(() =>
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        createUrl,
+        expect.objectContaining({
+          method: "POST",
+          body: expect.stringContaining('"name":"records-mcp"'),
+        }),
+      ),
+    )
+    await waitFor(() =>
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/mcp/apps?location=local",
+        expect.objectContaining({ signal: expect.anything() }),
+      ),
+    )
+    // Let the lookup's own response settle, so the selection state the
+    // callers assert on has committed either way.
+    if (!options.pendingLookup) await act(async () => {})
+  }
+
+  it("does not auto-select a just-created connector the listing reports unattachable (#1390)", async () => {
+    // create_mcp_server writes the association long before any grant exists,
+    // so a custom mcp_oauth server lists with can_attach false the moment it
+    // is created. Selecting it here would commit a connector whose run fails
+    // with "MCP server credentials are unavailable" — the failure can_attach
+    // exists to prevent, reached through create instead of a card click.
+    const onConnectSelected = vi.fn()
+    await createInSelectMode(
+      [{ ...unauthorizedCustomMcp(), id: "records-mcp", name: "records-mcp" }],
+      onConnectSelected,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+
+    // Created-but-unselected, not a dead end: the entry carries
+    // can_authorize, so the local tab this switched to offers the recovery.
+    await screen.findByRole("button", { name: "tools.mcp.dialog.authorize" })
+  })
+
+  it("still auto-selects a just-created connector the listing reports attachable (#1390)", async () => {
+    // The other half of the gate: every non-mcp_oauth shape carries its
+    // credentials on the server row, lists attachable immediately, and must
+    // keep landing in the selection without a second click.
+    const onConnectSelected = vi.fn()
+    await createInSelectMode([mcpApp(9, "records-mcp")], onConnectSelected)
+
+    await screen.findByText("tools.mcp.dialog.selected")
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith(["records-mcp"])
+  })
+
+  it("reads the created connector's own row when a Custom API shares its name (#1390)", async () => {
+    // Name is unique per table, not across the listing: an MCP server and a
+    // Custom API may both be called records-mcp. Matching on name alone would
+    // let the wrong row answer the attachability question — here the Custom
+    // API, listed first and attachable, would mask the mcp_oauth server this
+    // save actually created. The transport discriminator is what keeps the
+    // two apart.
+    const onConnectSelected = vi.fn()
+    await createInSelectMode(
+      [
+        customApiApp(4, "records-mcp"),
+        { ...unauthorizedCustomMcp(), id: "records-mcp", name: "records-mcp" },
+      ],
+      onConnectSelected,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
+  it("reads the created Custom API's own row when an MCP server shares its name (#1390)", async () => {
+    // The same collision in the direction the backend actually produces:
+    // list_mcp_apps appends every MCP server before the first Custom API, so
+    // a name-only match always reaches the MCP row first. Creating the Custom
+    // API must still be decided by the Custom API's own can_attach, not by
+    // the unattachable mcp_oauth server that happens to share its name.
+    const onConnectSelected = vi.fn()
+    await createInSelectMode(
+      [
+        { ...unauthorizedCustomMcp(), id: "records-mcp", name: "records-mcp" },
+        customApiApp(4, "records-mcp"),
+      ],
+      onConnectSelected,
+      { customApi: true },
+    )
+
+    await screen.findByText("tools.mcp.dialog.selected")
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith(["records-mcp"])
+  })
+
+  it("refuses to commit the selection while the attachability lookup is pending (#1390)", async () => {
+    // A successful save returns to the library tab immediately, so the footer
+    // is on screen while the lookup that may still add the new connector is
+    // in flight. Committing there would snapshot the selection one entry
+    // short — the same staleness the catalog-connect guard exists for.
+    const pendingLookup = deferred<unknown>()
+    const onConnectSelected = vi.fn()
+    await createInSelectMode([mcpApp(9, "records-mcp")], onConnectSelected, { pendingLookup })
+
+    expect(screen.getByRole("button", { name: "tools.mcp.dialog.connect" })).toBeDisabled()
+
+    await act(async () => {
+      pendingLookup.resolve(undefined)
+      await pendingLookup.promise
+    })
+
+    await screen.findByText("tools.mcp.dialog.selected")
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith(["records-mcp"])
+  })
+
+  it("leaves a just-created connector unselected when the lookup fails (#1390)", async () => {
+    // No answer is not a yes: the click path needs an affirmative can_attach
+    // too, and the local tab this switches to keeps the card one click away.
+    const onConnectSelected = vi.fn()
+    await createInSelectMode(null, onConnectSelected)
+
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
   })

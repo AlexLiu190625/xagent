@@ -263,6 +263,36 @@ export function ConnectMcpDialog({
     }
   }
 
+  // One-off listing read for a single location, independent of the sidebar
+  // filters loadApps() sends and of the `apps` state it writes. Both callers
+  // need one specific entry that the *current* filters routinely exclude: the
+  // post-consent recheck runs against whichever branch the entry came from
+  // while the user may have narrowed the catalog, and the post-create lookup
+  // in handleSaveResponse runs while activeLocation is still the tab the form
+  // was opened from ("remote" by default). Null on any failure, so callers can
+  // tell "the backend did not answer" apart from "answered, entry absent".
+  //
+  // Bounded, unlike the sidebar's own loadApps(): both callers have work
+  // sequenced behind this request rather than merely rendering its result — a
+  // post-create save that still owes the user its spinner teardown and form
+  // reset, and a post-consent poll callback that owes an apps refresh. A
+  // never-settling GET would strand either one indefinitely, so it fails as a
+  // null answer on the same 30s bound the catalog connect POST uses.
+  const fetchAppsByLocation = async (
+    location: string,
+  ): Promise<AppIntegration[] | null> => {
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/apps?location=${location}`, {
+        signal: AbortSignal.timeout(CATALOG_CONNECT_TIMEOUT_MS),
+      })
+      if (!response.ok) return null
+      return sanitizeAppIntegrations(await response.json())
+    } catch (error) {
+      console.error("Failed to load apps:", error)
+      return null
+    }
+  }
+
   // Batch-fetch team-sharing status for connected connectors and merge it into
   // the apps list so cards/settings can show Shared/Private/Needs-config.
   const loadSharingStatus = async (list: AppIntegration[]) => {
@@ -596,12 +626,55 @@ export function ConnectMcpDialog({
 
       // If in select mode (agent builder), switch to local tab and select the new server
       if (isSelectMode) {
-        if (!editingCustomServerId) {
-          const newServerName = mcpFormData.name;
-          setLocalSelectedServers(prev => prev.includes(newServerName) ? prev : [...prev, newServerName]);
-          setActiveLocation("local");
-        }
+        // Both view switches run before the lookup below, not after it: they
+        // are what the user is waiting to see once a save succeeds, and
+        // sequencing them behind an unbounded GET would leave them staring at
+        // the form (spinner and all) for as long as that request takes. Only
+        // the selection decision genuinely needs the listing.
         setActiveTab("library");
+        if (!editingCustomServerId) {
+          setActiveLocation("local");
+          const newServerName = mcpFormData.name;
+          // #1390: this used to append the name unconditionally, while the
+          // card-click path gates on the backend's can_attach — and the two
+          // disagreed on exactly one shape. create_mcp_server writes an active
+          // server row with no MCPOAuthGrant (only the OAuth callback writes
+          // one), so a custom mcp_oauth connector lists with can_attach false
+          // the moment it is created; auto-selecting it produced the run-time
+          // "MCP server credentials are unavailable" failure that #1347 added
+          // the field to prevent, reached through the create path rather than
+          // the click path. Not a dead end: the same entry carries
+          // can_authorize, so its card offers Authorize, whose completion
+          // flips can_attach and makes it selectable.
+          //
+          // Looked up through its own location=local read rather than the
+          // loadApps() refresh above: that one sends the library sidebar's
+          // filters, whose location was still "remote" by default when it
+          // fired, plus any search/category narrowing — and the refresh the
+          // switch above triggers carries the same search/category narrowing.
+          // Either response routinely omits the very entry this
+          // has to decide on. Matching on name is what the listing supports: a
+          // local entry's id *is* its name, and both create endpoints store
+          // the submitted name verbatim (neither side trims). Name alone is
+          // not unique across the two halves of that listing though — the MCP
+          // and Custom API tables enforce uniqueness separately, and MCP rows
+          // are appended first — so the same transport discriminator this
+          // function already dispatched the POST on narrows it to one row.
+          //
+          // Silence (request failed, or an entry the listing does not show)
+          // leaves the connector created-but-unselected, same as an explicit
+          // false. The click path also requires an affirmative can_attach, and
+          // the local tab this switches to puts the card one click away.
+          const createdCustomApi = mcpFormData.transport === "custom_api";
+          const listing = await fetchAppsByLocation("local");
+          const created = listing?.find(entry =>
+            entry.name === newServerName
+            && (entry.transport === "custom_api") === createdCustomApi
+          );
+          if (created && isAttachable(created)) {
+            setLocalSelectedServers(prev => prev.includes(newServerName) ? prev : [...prev, newServerName]);
+          }
+        }
       } else {
         // If in standalone tools page, just close the dialog
         requestClose();
@@ -869,18 +942,13 @@ export function ConnectMcpDialog({
         return
       }
       void (async () => {
-        let connected = false
-        try {
-          const response = await apiRequest(`${getApiUrl()}/api/mcp/apps?location=${refreshLocation}`)
-          if (response.ok) {
-            const data = sanitizeAppIntegrations(await response.json())
-            connected = data.some(
-              (candidate) => candidate.id === app.id && candidate.is_connected,
-            )
-          }
-        } catch (error) {
-          console.error("Failed to refresh apps after the OAuth popup closed:", error)
-        }
+        // A failed recheck reads as "not connected", same as before this
+        // shared helper existed: the success actions below stay gated on a
+        // positive answer, never on the absence of a negative one.
+        const listing = await fetchAppsByLocation(refreshLocation)
+        const connected = (listing ?? []).some(
+          (candidate) => candidate.id === app.id && candidate.is_connected,
+        )
         loadApps()
         if (!connected) return
         if (onSuccess) onSuccess()
@@ -1546,7 +1614,16 @@ export function ConnectMcpDialog({
               // wouldn't even close the dialog after committing it. Disable
               // the trigger instead of letting it commit early; same signal
               // requestClose already gates on.
-              disabled={catalogConnectsInFlight > 0}
+              //
+              // isSavingCustom is the same hazard reached the other way
+              // (#1390): a select-mode save switches back to this tab as soon
+              // as it succeeds, so the footer is on screen while the
+              // attachability lookup that decides whether to add the new
+              // connector is still in flight. Committing there would snapshot
+              // the selection one entry short. Not extended to requestClose,
+              // which handleSaveResponse itself calls while this flag is still
+              // set (the tools-page self-close) — that path must keep working.
+              disabled={catalogConnectsInFlight > 0 || isSavingCustom}
               onClick={() => {
                 if (onConnectSelected) {
                   onConnectSelected(localSelectedServers);
