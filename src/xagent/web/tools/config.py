@@ -174,6 +174,25 @@ def _get_oauth_token_resolver_hook() -> tuple[TokenResolver | None, int]:
     return _oauth_token_resolver_hook, _oauth_token_resolver_generation
 
 
+def oauth_token_resolver_installed() -> bool:
+    """Whether an embedding application registered a token resolver hook.
+
+    Deployment-level, not per-connector: the resolver is keyed on provider and
+    end user and is embedder-implemented, so the only question answerable
+    without calling it -- once per listed connector, on a list request, with
+    unknown side effects -- is whether one exists at all. Read by
+    ``list_mcp_apps`` to decide whether an mcp_oauth connector can plausibly
+    obtain credentials without an ``MCPOAuthGrant``, and whether advertising
+    interactive consent for it is meaningful (#1347).
+
+    Selection is on hook presence, mirroring ``team_env_hook_installed``: an
+    installed resolver that answers ``None`` for a given provider is a
+    legitimate answer, not an absent hook.
+    """
+    resolver, _ = _get_oauth_token_resolver_hook()
+    return resolver is not None
+
+
 def _oauth_token_resolver_registration_matches(
     resolver: TokenResolver, registration_generation: int
 ) -> bool:

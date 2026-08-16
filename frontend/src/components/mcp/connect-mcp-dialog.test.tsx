@@ -205,6 +205,13 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve }
 }
 
+// The fixtures below carry the can_attach/can_authorize pair list_mcp_apps
+// emits for each shape (#1347). They are the picker's only inputs for both
+// decisions now, so any fixture reaching a select-mode assertion must carry
+// them — omitting the pair models a connector the backend never emits, and
+// renders the card unattachable with no other symptom. Inline literals in
+// tests that never enter select mode (the connect-flow tests below) are
+// exempt, and are left as they are rather than gaining two inert keys each.
 function customApiApp(id: number, name: string) {
   return {
     id: name,
@@ -216,6 +223,9 @@ function customApiApp(id: number, name: string) {
     is_local: true,
     server_id: id,
     transport: "custom_api",
+    // A Custom API has no OAuth consent step of any kind.
+    can_attach: true,
+    can_authorize: false,
   }
 }
 
@@ -230,6 +240,8 @@ function mcpApp(id: number, name: string) {
     is_local: true,
     server_id: id,
     transport: "streamable_http",
+    can_attach: true,
+    can_authorize: false,
   }
 }
 
@@ -244,6 +256,12 @@ function mcpOauthApp() {
     is_connected: false,
     transport: "streamable_http",
     auth_type: "mcp_oauth",
+    // Unconnected catalog app: no association row exists for this user, so
+    // there is no connector to attach. can_authorize is false for every
+    // catalog entry — their Connect is dispatched on auth_type, through
+    // /apps/{id}/oauth/connect rather than the per-server route.
+    can_attach: false,
+    can_authorize: false,
   }
 }
 
@@ -263,6 +281,11 @@ function customMcpOauthApp() {
     server_id: 9,
     transport: "streamable_http",
     auth_type: "mcp_oauth",
+    // Standalone shape: nothing can supply tokens for a server whose consent
+    // was never completed, so attaching it would fail at run time — but the
+    // consent flow itself is available and is the recovery.
+    can_attach: false,
+    can_authorize: true,
   }
 }
 
@@ -277,6 +300,10 @@ function keylessApp(id = "chrome", name = "Chrome") {
     is_connected: false,
     transport: "stdio",
     auth_type: "keyless",
+    // Every unconnected catalog entry: no association row, so nothing to
+    // attach, and its Connect is dispatched on auth_type, not can_authorize.
+    can_attach: false,
+    can_authorize: false,
   }
 }
 
@@ -291,6 +318,8 @@ function builtinOauthApp() {
     transport: "oauth",
     auth_type: "builtin_oauth",
     provider: "zoom",
+    can_attach: false,
+    can_authorize: false,
   }
 }
 
@@ -307,6 +336,8 @@ function apiKeyApp() {
     transport: "stdio",
     auth_type: "api_key",
     launch_config: { required_env: ["GOOGLE_MAPS_API_KEY"] },
+    can_attach: false,
+    can_authorize: false,
   }
 }
 
@@ -1678,6 +1709,8 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
               is_connected: true,
               transport: "stdio",
               auth_type: "keyless",
+              can_attach: true,
+              can_authorize: false,
             },
           ],
         })
@@ -1714,14 +1747,54 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     expect(onConnectSelected).toHaveBeenCalledWith([])
   })
 
-  // A custom mcp_oauth connector whose access tokens are supplied out of band
-  // through set_oauth_token_resolver_hook: is_connected stays false forever
-  // because no MCPOAuthGrant is ever written for the editor, so gating the
-  // select-mode toggle on it made the connector permanently unattachable —
-  // even though the agent endpoints accept its selector with no
-  // connected-state check and the runtime resolves credentials without a
-  // grant (#1332).
+  // The two populations the split in #1347 exists to separate. Both are
+  // custom mcp_oauth connectors the editor holds no MCPOAuthGrant for, so
+  // is_connected is false for both and the old predicate could not tell them
+  // apart -- it attached both, and offered both an Authorize button.
+  //
+  // Tokens supplied out of band through set_oauth_token_resolver_hook: no
+  // grant row is ever written, there is no interactive consent, and no
+  // identity the editor could sign in as. Attachable; nothing to authorize.
+  const hookResolvedCustomMcp = () => ({
+    ...customMcpOauthApp(),
+    name: "Records MCP",
+    can_attach: true,
+    can_authorize: false,
+  })
+
+  // Consent simply never started (create_mcp_server writes the association row
+  // long before it). Nothing can supply its tokens in a standalone
+  // deployment, so attaching it would fail at run time with "MCP server
+  // credentials are unavailable" -- refused here instead, with consent
+  // advertised as the one-click recovery.
   const unauthorizedCustomMcp = () => ({ ...customMcpOauthApp(), name: "Records MCP" })
+
+  // Deactivated *after* consent: toggle_mcp_server never revokes the grant, so
+  // this still lists as connected (checkmark + Configure) while the runtime's
+  // is_active filter drops it — can_attach is the only field that can say so.
+  // The grant survives; the auth_type hint does not.
+  const deactivatedCustomMcp = () => {
+    // No auth_type: the backend emits it only alongside an *active* personal
+    // association (_local_mcp_consent_association_ok), so a deactivated entry
+    // never carries one however its consent went. Deleted rather than omitted
+    // because the base factory is the connected shape, which does carry it.
+    const entry: Record<string, unknown> = {
+      ...unauthorizedCustomMcp(),
+      is_connected: true,
+      can_attach: false,
+      can_authorize: false,
+    }
+    delete entry.auth_type
+    return entry
+  }
+
+  // Deactivated *before* any consent: the same shape with is_connected false
+  // too, so the card carries no button at all. The detail modal is reachable
+  // but offers no recovery — its Connect has no auth_type to dispatch on.
+  const dormantBeforeConsent = () => ({
+    ...deactivatedCustomMcp(),
+    is_connected: false,
+  })
 
   // Shared by renderSelectModeWith below and the non-select-mode card-click
   // test, which otherwise duplicated this exact mockImplementation block.
@@ -1746,14 +1819,17 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     )
   }
 
-  it("selects and deselects a custom mcp_oauth connector the editor holds no grant for (#1332)", async () => {
+  it("selects and deselects a hook-resolved custom mcp_oauth connector (#1332)", async () => {
     const onConnectSelected = vi.fn()
-    renderSelectModeWith([unauthorizedCustomMcp()], onConnectSelected)
+    renderSelectModeWith([hookResolvedCustomMcp()], onConnectSelected)
     await screen.findByText("Records MCP")
 
     fireEvent.click(screen.getByText("Records MCP"))
     // The click must toggle the selection, not divert to the detail modal.
     expect(screen.getByTestId("settings-open-app").textContent).toBe("")
+    // And no Authorize trigger: there is no consent flow behind it, so the
+    // label would assert a step this connector does not have (#1347).
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
     // Becoming attachable must not change connected-state display: this
     // connector is still unconnected (is_connected: false), so it must stay
     // unchecked. Scoped through the card: connected-check is non-unique
@@ -1772,11 +1848,16 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
   })
 
   it("shows Configure and the connected checkmark, not Authorize, for a connected custom mcp_oauth entry (#1332)", async () => {
-    // isAttachable widening the select-mode gate must not disturb the
-    // isGloballyConnected branch of the footer ternary: a connected entry
-    // has to keep showing Configure plus the checkmark, never Authorize.
+    // The isGloballyConnected branch of the footer ternary is checked first
+    // and must keep winning: a connected entry shows Configure plus the
+    // checkmark, never Authorize -- including now that can_authorize is true
+    // for it (re-consent is legitimate; the picker suppresses the trigger on
+    // connected state itself, which is why the backend does not).
     const onConnectSelected = vi.fn()
-    renderSelectModeWith([{ ...unauthorizedCustomMcp(), is_connected: true }], onConnectSelected)
+    renderSelectModeWith(
+      [{ ...unauthorizedCustomMcp(), is_connected: true, can_attach: true }],
+      onConnectSelected,
+    )
     await screen.findByText("Records MCP")
 
     // getBy* throws when absent, so the bare calls are the assertions.
@@ -1788,11 +1869,10 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     within(screen.getByTestId("connector-card-records")).getByTestId("connected-check")
   })
 
-  it("keeps the per-server OAuth flow reachable from the card in select mode (#1323)", async () => {
-    // The card click no longer opens the detail modal for these entries, so
-    // the Connect button repaired in #1323 needs its own trigger — otherwise
-    // relaxing the gate would strip the interactive flow from editors who do
-    // authorize personally.
+  it("offers Authorize, and refuses selection, for a connector whose consent was never started (#1323)", async () => {
+    // The fail-early half of #1347: attaching this connector would load zero
+    // tools, so the card is not selectable -- but the flow repaired in #1323
+    // has to stay one click away, or the refusal would be a dead end.
     const onConnectSelected = vi.fn()
     renderSelectModeWith([unauthorizedCustomMcp()], onConnectSelected)
     await screen.findByText("Records MCP")
@@ -1803,18 +1883,51 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     // Opening the modal must not have counted as a selection toggle.
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
+
+    // The card click itself must not attach it either. Scoped through the
+    // card: the stub settings dialog now also renders this name.
+    fireEvent.click(
+      within(screen.getByTestId("connector-card-records")).getByText("Records MCP"),
+    )
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
+  it("attaches a team-owned mcp_oauth connector without advertising a flow that would 404", async () => {
+    // The #1338 population, and the case that motivated splitting the two
+    // fields: the member holds no personal association, so
+    // /{server_id}/oauth/connect would 404 -- but the team overlay listed the
+    // connector precisely so members could attach it. Withholding auth_type
+    // was the only way to say "not authorizable", and it said "not
+    // attachable" too, which is why this entry carries no auth_type at all.
+    const onConnectSelected = vi.fn()
+    const teamOwned: Record<string, unknown> = {
+      ...hookResolvedCustomMcp(),
+      name: "Team Records",
+      id: "team-records",
+    }
+    delete teamOwned.auth_type
+    renderSelectModeWith([teamOwned], onConnectSelected)
+    await screen.findByText("Team Records")
+
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
+    fireEvent.click(screen.getByText("Team Records"))
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("")
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith(["Team Records"])
   })
 
   it("still gates selection on connected state for unconnected catalog apps", async () => {
-    // Only local/custom entries are relaxed. mcpOauthApp() (Granola) is the
-    // load-bearing fixture here: it carries the exact same auth_type as the
-    // custom mcp_oauth population this predicate widens, but it is a
+    // mcpOauthApp() (Granola) is the load-bearing fixture: it carries the
+    // exact same auth_type as the custom mcp_oauth population, but it is a
     // *catalog* entry, so its is_connected: false means the user has no
-    // association row for it at all — connecting really is a prerequisite,
-    // and dropping the is_custom conjunct would wrongly attach it. keylessApp
-    // (Chrome) is included alongside it as a non-mcp_oauth catalog control.
-    // Both must keep routing the card click to the detail modal instead of
-    // attaching a connector that does not exist for them.
+    // association row for it at all — connecting really is a prerequisite.
+    // This used to be decided here by is_custom being absent from catalog
+    // entries, an emission rule the backend never stated; can_attach: false
+    // now says it outright (#1347). keylessApp (Chrome) is included as a
+    // non-mcp_oauth catalog control. Both must keep routing the card click to
+    // the detail modal instead of attaching a connector that does not exist
+    // for them.
     const onConnectSelected = vi.fn()
     renderSelectModeWith([mcpOauthApp(), keylessApp()], onConnectSelected)
     await screen.findByText("Chrome")
@@ -1826,36 +1939,33 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     fireEvent.click(screen.getByText("Chrome"))
     expect(screen.getByTestId("settings-open-app").textContent).toBe("Chrome")
 
-    // No card-level Authorize trigger for either: is_custom is required too.
+    // No card-level Authorize trigger for either: a catalog entry's Connect
+    // is dispatched on auth_type from the detail modal, so can_authorize is
+    // false for the whole catalog branch.
     expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
 
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
   })
 
-  it("still gates selection on a custom mcp_oauth entry whose association was deactivated before consent completed", async () => {
-    // list_mcp_apps' local loop does not filter is_active, and emits auth_type
-    // only while the association *is* active — so a deactivated mcp_oauth
-    // server with no completed grant is listed as is_connected: false with no
-    // auth_type. (toggle_mcp_server never revokes a completed grant, so this
-    // only holds pre-consent: deactivating *after* consent instead lists
-    // is_connected: true and is attachable through the first disjunct, with
-    // the checkmark and Configure. No test renders that exact shape — it is
-    // indistinguishable here from an ordinary connected entry, and the
-    // regression it would guard against, replacing the first disjunct with
-    // one that also demands auth_type, already fails the seeded keyless
-    // test below.)
-    // The runtime's server query drops inactive associations outright, so
-    // attaching this one would silently load zero tools — hence it must keep
-    // its card-click route to the detail modal rather than becoming
-    // selectable. That route offers no recovery today either; see the
-    // isAttachable comment.
+  it("refuses a deactivated association even when it lists as connected", async () => {
+    // toggle_mcp_server flips is_active and never revokes a completed grant,
+    // so a connector deactivated *after* consent still lists as
+    // is_connected: true — indistinguishable from an ordinary connected entry
+    // in the one field the old predicate's first disjunct read, and attachable
+    // through it. (auth_type is withheld here, but the old predicate never
+    // reached its second disjunct for a connected entry.) The runtime's server query drops inactive
+    // associations outright, so attaching it would silently load zero tools.
+    // can_attach is the only field that can carry this (#1347), and
+    // can_authorize is false alongside it because the per-server OAuth
+    // endpoints require an active association: this connector needs
+    // re-enabling, not re-authorization.
     const onConnectSelected = vi.fn()
-    const dormant: Record<string, unknown> = { ...unauthorizedCustomMcp() }
-    delete dormant.auth_type
-    renderSelectModeWith([dormant], onConnectSelected)
+    renderSelectModeWith([deactivatedCustomMcp()], onConnectSelected)
     await screen.findByText("Records MCP")
 
+    // Connected, so the footer shows Configure; the card click must still
+    // not toggle a selection.
     fireEvent.click(screen.getByText("Records MCP"))
     expect(screen.getByTestId("settings-open-app").textContent).toBe("Records MCP")
     expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
@@ -1864,9 +1974,97 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
   })
 
+  it("deselects an entry that became unattachable while already selected", async () => {
+    // can_attach can go false under a selection that already exists: a
+    // connector disabled on the Tools page after being attached, or one
+    // attached before the gate existed. The card still renders selected
+    // (isSelected reads the selection, not the gate), so refusing the click
+    // would leave it visibly selected and removable only from the builder's
+    // own list — the un-removable state #1280 was filed for. Attaching stays
+    // gated; removing does not.
+    const onConnectSelected = vi.fn()
+    mockAppsList([deactivatedCustomMcp()])
+    render(
+      <ConnectMcpDialog
+        open
+        onOpenChange={vi.fn()}
+        selectedMcpServers={["Records MCP"]}
+        onConnectSelected={onConnectSelected}
+      />,
+    )
+    await screen.findByText("Records MCP")
+    expect(screen.getByTestId("connector-card-records")).toHaveAttribute("data-selected", "true")
+
+    fireEvent.click(screen.getByText("Records MCP"))
+    expect(screen.getByTestId("connector-card-records")).toHaveAttribute("data-selected", "false")
+    // Removing must not have opened the modal instead.
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("")
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+
+    // And it must not be re-attachable: the gate still refuses the second click.
+    fireEvent.click(
+      within(screen.getByTestId("connector-card-records")).getByText("Records MCP"),
+    )
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
+  it("routes a buttonless deactivated-before-consent entry to the modal", async () => {
+    // All four signals false and no auth_type: no checkmark, no Configure, no
+    // Authorize. The card click must still reach the detail modal — that route
+    // offers no recovery for this population (Connect has no auth_type to
+    // dispatch on), but it is the only thing the card has left, and the
+    // isAttachable comment records why.
+    const onConnectSelected = vi.fn()
+    renderSelectModeWith([dormantBeforeConsent()], onConnectSelected)
+    await screen.findByText("Records MCP")
+
+    expect(
+      within(screen.getByTestId("connector-card-records")).queryByTestId("connected-check"),
+    ).toBeNull()
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.configure" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
+
+    fireEvent.click(screen.getByText("Records MCP"))
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("Records MCP")
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
+  it("deselects a buttonless entry on the first click, then opens the modal on the second", async () => {
+    // The buttonless shape carries no affordance of its own, so the removal
+    // has to read from the card itself: the ring drops and the footer count
+    // decrements. The second click, with nothing left to remove, falls through
+    // to the modal like any other unattachable card.
+    const onConnectSelected = vi.fn()
+    mockAppsList([dormantBeforeConsent()])
+    render(
+      <ConnectMcpDialog
+        open
+        onOpenChange={vi.fn()}
+        selectedMcpServers={["Records MCP"]}
+        onConnectSelected={onConnectSelected}
+      />,
+    )
+    await screen.findByText("Records MCP")
+    expect(screen.getByTestId("connector-card-records")).toHaveAttribute("data-selected", "true")
+
+    fireEvent.click(screen.getByText("Records MCP"))
+    expect(screen.getByTestId("connector-card-records")).toHaveAttribute("data-selected", "false")
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("")
+
+    fireEvent.click(screen.getByText("Records MCP"))
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("Records MCP")
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
   it("opens the detail modal on card click outside select mode", async () => {
     // The Tools page has no selection to toggle, so the card click keeps its
-    // original destination for connected and unconnected entries alike.
+    // original destination for connected and unconnected entries alike — and
+    // the Authorize trigger, which exists to explain a diverted click, stays
+    // scoped to select mode even for an authorizable entry.
     mockAppsList([unauthorizedCustomMcp()])
     render(<ConnectMcpDialog open onOpenChange={vi.fn()} selectedMcpServers={selectedMcpServers} />)
     await screen.findByText("Records MCP")

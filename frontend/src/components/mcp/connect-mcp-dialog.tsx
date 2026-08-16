@@ -206,63 +206,35 @@ export function ConnectMcpDialog({
 
   // Whether select mode may toggle this entry into the agent's selection.
   //
-  // #1332: is_connected must not gate this for a custom mcp_oauth connector.
-  // is_connected is false for one there precisely when *this editor* holds no
-  // completed MCPOAuthGrant — but an embedding application can supply those
-  // access tokens out of band via set_oauth_token_resolver_hook (per end user,
-  // provisioned server-to-server), and then there is no interactive consent, no
-  // identity the editor could sign in as, and therefore never a grant row. The
-  // connector was permanently unattachable from the picker even though the
-  // agent create/update endpoints accept its `mcp:<name>` selector with no
-  // connected-state check and the runtime resolves credentials without a grant.
+  // Read straight off the listing, never re-derived (#1347). The decision
+  // depends on facts only the backend holds — whether the runtime will see the
+  // connector (an active association, or a team link the runtime overlays) and
+  // whether its credentials will plausibly resolve (an active MCPOAuthGrant,
+  // or a deployment-installed OAuth token resolver hook that supplies tokens
+  // out of band). This predicate previously reconstructed all of that from
+  // is_connected + is_custom + auth_type, which made three unstated backend
+  // emission rules load-bearing here and still got two populations wrong: a
+  // never-authorized custom mcp_oauth server attached and then failed at run
+  // time, and a team-owned one was refused for want of an auth_type hint.
   //
-  // A custom mcp_oauth server whose consent was simply never started, or was
-  // abandoned partway, is indistinguishable in this listing from a
-  // hook-resolved one — create_mcp_server writes the association row at
-  // creation time, long before any consent, so is_connected is false either
-  // way. This predicate makes that server attachable too: the card shows no
-  // checkmark and offers Authorize as a one-click recovery, and the agent
-  // create/update endpoints never validated connected state to begin with.
-  //
-  // Both conjuncts are load-bearing, and neither can be widened:
-  //
-  // - is_custom, because a *catalog* mcp_oauth app (e.g. Granola) carries the
-  //   same auth_type while is_connected: false there means the user has no
-  //   association row for it at all. Connecting really is a prerequisite, so
-  //   attaching it would select a connector that does not exist for them.
-  // - auth_type, because the backend emits it on a local entry only when a
-  //   personal association exists, is active, and the server is the
-  //   mcp_oauth shape (see list_mcp_apps). One consequence, once #1338's team
-  //   visibility overlay is in the tree (it is on main, but landed after this
-  //   branch was cut, so the population is not reproducible from this
-  //   branch's own backend): a team-owned connector the overlay surfaces has
-  //   no personal association, so it gets no auth_type either, and this
-  //   predicate routes it to the detail modal instead of making it
-  //   attachable. #1347 tracks expressing that case as attachable-but-not-
-  //   authorizable rather than deciding it by an absent hint.
-  //
-  //   An association deactivated before any grant completed is likewise
-  //   listed with is_connected: false and no auth_type, so it keeps its
-  //   existing card-click route to the detail modal — and that route offers
-  //   no recovery today: the modal's Connect button has no auth_type to
-  //   dispatch on, so it falls through to the mis-authored-entry toast, and
-  //   nothing in the frontend calls the toggle endpoint that would
-  //   reactivate the association. (list_mcp_apps withholds auth_type here
-  //   because, in its own words, "a deactivated server needs re-enabling,
-  //   not re-authorization" — that is the backend's rationale for omitting
-  //   the field, not a recovery this modal actually offers.) Regardless, the
-  //   runtime's server query drops inactive associations outright, so
-  //   attaching one would have loaded zero tools.
-  //
-  //   Deactivation *after* consent is a different, pre-existing story:
-  //   toggle_mcp_server only flips is_active and never revokes the grant, so
-  //   such an entry lists as is_connected: true and is attachable through the
-  //   first conjunct regardless of this one — showing the checkmark plus
-  //   Configure, never Authorize. The runtime still drops it, but the old gate
-  //   was is_connected alone, so that card behaves here exactly as it did
-  //   before this predicate existed.
-  const isAttachable = (app: AppIntegration) =>
-    isAppConnected(app) || (Boolean(app.is_custom) && app.auth_type === "mcp_oauth")
+  // Entries with can_attach false keep their card-click route to the detail
+  // modal, where Connect starts the flow repaired in #1323 — for the entries
+  // that carry an auth_type to dispatch on. One population does not: an
+  // association deactivated *before* any consent completed is listed with
+  // is_connected: false and no auth_type, so the modal's Connect falls through
+  // handleConnectApp's dispatch to the mis-authored-entry toast, and nothing
+  // in the frontend calls the toggle endpoint that would re-enable it. That
+  // dead end predates this gate (the backend withholds auth_type there because
+  // "a deactivated server needs re-enabling, not re-authorization") and is
+  // tracked separately; keep it recorded here so it stays discoverable.
+  const isAttachable = (app: AppIntegration) => Boolean(app.can_attach)
+
+  // Whether the card may advertise interactive authorization. Separate from
+  // isAttachable because the two genuinely diverge: a hook-resolved connector
+  // (#1332) and a team-owned one (#1338) are both attachable while neither has
+  // a consent flow this editor could complete — the first has none at all, the
+  // second would 404 on /{server_id}/oauth/connect.
+  const canAuthorize = (app: AppIntegration) => Boolean(app.can_authorize)
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(searchQuery), 300)
@@ -1012,8 +984,27 @@ export function ConnectMcpDialog({
     mcpOauthPollTimersRef.current.add(checkPopup)
   }
 
+  // The one id-OR-name selection check, previously written out at three
+  // sites. List-taking rather than closing over localSelectedServers, because
+  // the toggle below runs inside a functional updater and must read `prev`,
+  // not the render-time value. Deliberately does not absorb onDisconnect's
+  // case-insensitive variant, which is a different comparison.
+  const selectionMatches = (list: string[], app: AppIntegration) =>
+    list.some(name => name === app.id || name === app.name)
+
+  const isLocallySelected = (app: AppIntegration) =>
+    selectionMatches(localSelectedServers, app)
+
   const handleCardClick = (app: AppIntegration) => {
-    if (isSelectMode && isAttachable(app)) {
+    // Deselection is not gated on can_attach (#1347). An entry can become
+    // unattachable while it is already in the selection -- a connector
+    // disabled on the Tools page after being attached, or one attached before
+    // this gate existed -- and the card still renders selected, because
+    // isSelected is computed from the selection alone. Refusing the click
+    // there would leave a visibly-selected card that clicking only ever opens
+    // a modal for, the same un-removable state #1280 was filed for. Attaching
+    // stays gated; only removing is always allowed.
+    if (isSelectMode && (isAttachable(app) || isLocallySelected(app))) {
       // Match isSelected's own check (id OR name) below, not just name: a
       // consumer (e.g. agent-builder.tsx re-seeding after save) can store
       // this connector's id instead of its display name once resolved to
@@ -1024,7 +1015,7 @@ export function ConnectMcpDialog({
       // still selected, and clicking again just oscillated between the two
       // states without ever reaching "deselected").
       setLocalSelectedServers(prev =>
-        prev.some(name => name === app.id || name === app.name)
+        selectionMatches(prev, app)
           ? prev.filter(name => name !== app.id && name !== app.name)
           : [...prev, app.name]
       );
@@ -1328,7 +1319,7 @@ export function ConnectMcpDialog({
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                     {apps.map(app => {
                       const isGloballyConnected = isAppConnected(app)
-                      const isSelected = localSelectedServers.includes(app.id) || localSelectedServers.includes(app.name)
+                      const isSelected = isLocallySelected(app)
                       const isLoading = loadingApps.has(app.id)
                       return (
                         <Card
@@ -1403,22 +1394,26 @@ export function ConnectMcpDialog({
                                   >
                                     <Settings className="h-3 w-3 mr-1" /> {t('tools.mcp.dialog.configure')}
                                   </Button>
-                                ) : isSelectMode && isAttachable(app) ? (
-                                  // #1332: in select mode the card click now
-                                  // toggles selection for these entries, so it
-                                  // no longer opens the detail modal — which is
-                                  // where the per-server OAuth flow repaired in
-                                  // #1323 is started from. Keep that route
-                                  // reachable with its own trigger instead of
-                                  // dropping it, for editors who do authorize
-                                  // personally.
+                                ) : isSelectMode && canAuthorize(app) ? (
+                                  // One-click entry to the per-server OAuth
+                                  // flow repaired in #1323, kept from #1332
+                                  // where the card click stopped reaching the
+                                  // detail modal it is started from.
                                   //
-                                  // Keyed on isAttachable, not its own
-                                  // predicate, so this stays exactly the set of
-                                  // cards whose click was diverted to selection:
-                                  // every entry that loses the modal route gets
-                                  // this trigger, and no entry that kept the
-                                  // route gets a redundant second one.
+                                  // Driven by can_authorize alone (#1347), not
+                                  // by the attach gate: those two now select
+                                  // disjoint populations. An entry that is
+                                  // attachable-but-unconnected got there
+                                  // through hook-supplied credentials or a team
+                                  // link, and has no consent this editor could
+                                  // complete — the button asserted "needs
+                                  // authorization" and opened a popup that
+                                  // could never finish. What is left is the
+                                  // connector whose consent was never started:
+                                  // not attachable until it is, so its card
+                                  // click still opens the modal, and this
+                                  // labels that route rather than leaving the
+                                  // one card in a grid of toggles unexplained.
                                   <Button
                                     variant="ghost"
                                     size="sm"

@@ -32,6 +32,20 @@ export interface AppIntegration {
   user_env_configured?: boolean
   // Key-based apps: the user's current env-source pick, if any.
   env_source?: "own" | "shared" | "platform" | null
+  // Whether this entry may be selected into an agent, decided by the backend
+  // (list_mcp_apps._local_mcp_can_attach) rather than re-derived here from
+  // is_connected/is_custom/auth_type. It answers "the runtime will see this
+  // connector and its credentials will plausibly resolve", which depends on
+  // backend-only facts — grant state, team links, and whether the deployment
+  // installed an OAuth token resolver hook (#1347).
+  can_attach?: boolean
+  // Whether starting the per-server MCP OAuth flow is meaningful for this
+  // entry. False for catalog entries (they connect through
+  // /apps/{id}/oauth/connect, dispatched on auth_type), for a connector with
+  // no active personal association (the per-server route would 404), and for
+  // a deployment whose tokens arrive through the resolver hook, where no
+  // interactive consent exists at all.
+  can_authorize?: boolean
   // Team-sharing status (from POST /api/connectors/status), merged in after list load.
   shared?: boolean
   is_owner?: boolean
