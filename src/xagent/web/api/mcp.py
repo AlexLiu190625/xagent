@@ -78,6 +78,16 @@ logger = logging.getLogger(__name__)
 MCP_OAUTH_STATE_COOKIE = "xagent_mcp_oauth_state"
 MCP_OAUTH_STATE_TTL = timedelta(minutes=10)
 MCP_OAUTH_STATE_COOKIE_MAX_AGE_SECONDS = int(MCP_OAUTH_STATE_TTL.total_seconds())
+# How long an expired mcp_oauth_flow_states row is kept before the sweep in
+# connect_mcp_oauth deletes it. A row is already unusable the moment it expires
+# — _claim_mcp_oauth_flow_state requires expires_at > now — so this grace
+# period exists only to keep the sweep well clear of rows a callback may still
+# be racing to claim, and to leave a recent trail for debugging a failed
+# authorization. Matches the Slack OAuth flow-state ledger's retention.
+MCP_OAUTH_FLOW_STATE_RETENTION = timedelta(days=1)
+# Most stale rows the sweep in connect_mcp_oauth removes per request, so a
+# first-deploy backlog cannot turn one connect into a long transaction.
+MCP_OAUTH_FLOW_STATE_SWEEP_BATCH = 1000
 MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHODS = frozenset(
     {"none", "client_secret_post", "client_secret_basic"}
 )
@@ -4126,6 +4136,38 @@ async def connect_mcp_oauth(
         redirect_uri=redirect_uri,
         registration_lookup_hash=registration_lookup_hash,
     )
+
+    # Sweep this table's dead rows before adding another, mirroring the Slack
+    # OAuth flow-state ledger in channel.py. Every abandoned, denied or
+    # double-submitted authorization leaves a row that is permanently unusable
+    # once it expires (the claim query requires consumed_at IS NULL and
+    # expires_at > now), but nothing deleted it: the only other deletes are the
+    # per-user purge on disconnect and the FK cascade on server deletion, so
+    # the table grew without bound. Deliberately global rather than scoped to
+    # this user/server — a user who never reconnects would otherwise keep their
+    # rows forever, which is the leak this is meant to close. Filtering on
+    # expires_at alone (an indexed column) also covers consumed rows, since
+    # every row expires within MCP_OAUTH_STATE_TTL of being created.
+    #
+    # Bounded per request. The index narrows the scan but does not cap the work,
+    # and this table is precisely the one that has never been swept — the first
+    # connect after this ships meets whatever backlog has accumulated, inside a
+    # user-facing transaction. Draining a fixed batch per connect keeps that
+    # transaction short; the remainder is already dead, so later connects
+    # clearing it costs nothing. Deleting by a bounded id subquery rather than
+    # an IN list of fetched ids keeps it to one statement and clear of any
+    # bound-parameter limit.
+    stale_flow_state_ids = (
+        db.query(MCPOAuthFlowState.id)
+        .filter(
+            MCPOAuthFlowState.expires_at < _utc_now() - MCP_OAUTH_FLOW_STATE_RETENTION
+        )
+        .limit(MCP_OAUTH_FLOW_STATE_SWEEP_BATCH)
+        .scalar_subquery()
+    )
+    db.query(MCPOAuthFlowState).filter(
+        MCPOAuthFlowState.id.in_(stale_flow_state_ids)
+    ).delete(synchronize_session=False)
 
     state_value = secrets.token_urlsafe(32)
     code_verifier = secrets.token_urlsafe(64)

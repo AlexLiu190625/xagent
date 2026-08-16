@@ -131,6 +131,7 @@ def _add_mcp_oauth_server(
     db,
     user: User,
     *,
+    name: str = "records",
     scope: str = "records.read",
     transport: str = "streamable_http",
     client_id: str = "client-123",
@@ -140,7 +141,7 @@ def _add_mcp_oauth_server(
 ) -> MCPServer:
     server = MCPServer.from_config(
         {
-            "name": "records",
+            "name": name,
             "managed": "external",
             "transport": transport,
             "url": "https://mcp.example.com/mcp",
@@ -653,6 +654,181 @@ async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch)
     assert client.client_secret != "client-secret"
     assert decrypt_value(client.client_secret) == "client-secret"
     assert flow_state.mcp_oauth_client_id == client.id
+
+
+@pytest.mark.asyncio
+async def test_connect_sweeps_flow_states_expired_past_the_retention_window(
+    db_session, monkeypatch
+):
+    db, user, other_user = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(db, server)
+    # A second server, so the fixtures below can pin the sweep as global across
+    # servers and not just across users. Its own client row keeps the
+    # mcp_oauth_client_id FK pointing at the matching server.
+    other_server = _add_mcp_oauth_server(db, other_user, name="records-2")
+    other_client = _add_oauth_client(db, other_server)
+    db.commit()
+
+    now = mcp_api._utc_now()
+    # Deliberately literal rather than derived from
+    # MCP_OAUTH_FLOW_STATE_RETENTION: the one-day policy is the contract under
+    # test, and a fixture computed from the production constant would follow it
+    # anywhere it moved and stay green while the contract silently changed.
+    one_day = timedelta(days=1)
+
+    def _flow_state(
+        state: str,
+        owner: User,
+        expires_at,
+        *,
+        target: MCPServer = server,
+        oauth_client: MCPOAuthClient = client,
+        consumed_at=None,
+    ) -> MCPOAuthFlowState:
+        return MCPOAuthFlowState(
+            state=state,
+            mcp_server_id=target.id,
+            user_id=owner.id,
+            mcp_oauth_client_id=oauth_client.id,
+            resource_owner_key=f"xagent:user:{owner.id}",
+            issuer="https://auth.example.com",
+            resource="https://mcp.example.com/mcp",
+            scope="records.read",
+            code_verifier=encrypt_value("verifier-123"),
+            expires_at=expires_at,
+            consumed_at=consumed_at,
+        )
+
+    db.add_all(
+        [
+            # Abandoned past the retention window — the row the sweep exists
+            # for. Owned by the *other* user, so this pins the sweep as global
+            # across users: scoping it to the connecting user would leave the
+            # rows of anyone who never reconnects in the table forever, which
+            # is the leak being closed.
+            _flow_state(
+                "stale-other-user", other_user, now - one_day - timedelta(hours=1)
+            ),
+            # Same, on a server this connect is not touching — pins the sweep
+            # as global across servers too.
+            _flow_state(
+                "stale-other-server",
+                other_user,
+                now - one_day - timedelta(hours=1),
+                target=other_server,
+                oauth_client=other_client,
+            ),
+            # A completed authorization's row. Nothing filters on consumed_at,
+            # and it must not need to: a consumed row expires on the same
+            # schedule as any other, so the expires_at predicate has to reach
+            # it as well.
+            _flow_state(
+                "stale-consumed",
+                user,
+                now - one_day - timedelta(hours=1),
+                consumed_at=now - one_day - timedelta(hours=1),
+            ),
+            # The fresh side of the same boundary: expired 23 hours ago, so
+            # already unusable (the claim query requires expires_at > now) but
+            # still inside the one-day window, and therefore kept. The grace
+            # period is what keeps the sweep clear of any callback still racing
+            # to claim its row.
+            _flow_state(
+                "expired-inside-window", user, now - one_day + timedelta(hours=1)
+            ),
+            # Another authorization still in progress.
+            _flow_state("in-flight", other_user, now + mcp_api.MCP_OAUTH_STATE_TTL),
+        ]
+    )
+    db.commit()
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/mcp"),
+        user,
+        db,
+    )
+
+    assert response.status_code == 303
+    surviving = {row.state for row in db.query(MCPOAuthFlowState).all()}
+    assert not (
+        {"stale-other-user", "stale-other-server", "stale-consumed"} & surviving
+    )
+    assert {"expired-inside-window", "in-flight"} <= surviving
+    # The sweep runs in the same transaction as the insert, so the new row must
+    # still be there once it commits.
+    assert _redirect_query(response)["state"][0] in surviving
+
+
+@pytest.mark.asyncio
+async def test_connect_sweep_is_bounded_and_drains_across_requests(
+    db_session, monkeypatch
+):
+    # The sweep runs inside a user-facing request, and this table is the one
+    # that has never been swept — so the first connect after this ships meets
+    # whatever backlog accumulated. The batch cap is what keeps that from
+    # becoming one long transaction; the leftovers are already dead, so later
+    # connects draining them costs nothing.
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(db, server)
+    db.commit()
+
+    monkeypatch.setattr(mcp_api, "MCP_OAUTH_FLOW_STATE_SWEEP_BATCH", 2)
+    stale_at = mcp_api._utc_now() - timedelta(days=1) - timedelta(hours=1)
+    db.add_all(
+        [
+            MCPOAuthFlowState(
+                state=f"stale-{index}",
+                mcp_server_id=server.id,
+                user_id=user.id,
+                mcp_oauth_client_id=client.id,
+                resource_owner_key=f"xagent:user:{user.id}",
+                issuer="https://auth.example.com",
+                resource="https://mcp.example.com/mcp",
+                scope="records.read",
+                code_verifier=encrypt_value("verifier-123"),
+                expires_at=stale_at,
+            )
+            for index in range(5)
+        ]
+    )
+    db.commit()
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+
+    def _remaining_stale() -> int:
+        return (
+            db.query(MCPOAuthFlowState)
+            .filter(MCPOAuthFlowState.state.like("stale-%"))
+            .count()
+        )
+
+    async def _connect() -> None:
+        await connect_mcp_oauth(
+            server.id,
+            MCPOAuthConnectRequest(redirect_after="/mcp"),
+            user,
+            db,
+        )
+
+    await _connect()
+    assert _remaining_stale() == 3
+
+    await _connect()
+    assert _remaining_stale() == 1
+
+    await _connect()
+    assert _remaining_stale() == 0
 
 
 @pytest.mark.asyncio
