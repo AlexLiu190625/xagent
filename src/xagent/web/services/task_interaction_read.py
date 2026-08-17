@@ -103,13 +103,10 @@ def get_pending_interaction_question(
     marker = task.interaction_protocol_version
     if marker is None:
         # No native row can belong to this task under a NULL marker, so
-        # the interaction table is not queried. NULL also means no
-        # structured row was ever published for this task's current
-        # wait, which is why a transcript row that a later structured
-        # publication superseded is still the honest answer here.
-        return get_latest_waiting_question(db, int(task.id), allow_superseded=True)
+        # the interaction table is not queried.
+        return get_latest_waiting_question(db, int(task.id))
 
-    view = materialize_compatibility_view(db, int(task.id), allow_superseded=True)
+    view = materialize_compatibility_view(db, int(task.id))
     if view.tier == "unanswerable":
         # The question text, when the tier could still read one, and no
         # controls: this question cannot be answered right now, so

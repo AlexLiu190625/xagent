@@ -196,12 +196,15 @@ def test_a1_marker_null_reads_the_live_legacy_question(_db: Session) -> None:
     assert interactions == [{"type": "text_input", "label": "Live"}]
 
 
-def test_a2_marker_null_opens_the_superseded_gate(_db: Session) -> None:
-    """T0's NULL-marker cell is the one legacy fallback that opens the
-    supersede gate: no structured row was ever published for this task's
-    current wait, so a transcript question a later publication superseded
-    is still the honest answer. Mutation: change the gate condition to
-    ``allow_superseded=False`` and this test turns red."""
+def test_a2_marker_null_never_reads_a_superseded_only_row(_db: Session) -> None:
+    """``get_latest_waiting_question`` filters on
+    ``message_type == QUESTION_MESSAGE_TYPE`` only (see
+    ``_assistant_question_filters``); a row a later structured publication
+    retyped to ``question_superseded`` is a different message type and is
+    never matched, for the NULL-marker cell same as every other caller.
+    Mutation: have this cell fall back to reading superseded rows when the
+    first pass finds nothing and this test turns red -- it would return
+    the superseded content instead of ``(None, None)``."""
 
     task = _make_task(_db, marker=None)
     persist_assistant_message(
@@ -215,19 +218,21 @@ def test_a2_marker_null_opens_the_superseded_gate(_db: Session) -> None:
 
     question, interactions = read_surface.get_pending_interaction_question(_db, task)
 
-    assert question is not None
-    assert question.startswith("An old question")
-    assert interactions == [{"type": "text_input", "label": "Old"}]
+    assert (question, interactions) == (None, None)
 
 
 def test_a3_marker_null_prefers_the_live_row_over_a_higher_id_superseded_row(
     _db: Session,
 ) -> None:
-    """Priority must not invert even with the gate open: a live question
-    always wins over a superseded row, regardless of id order. Mutation:
-    collapse the reader's two passes into one ``message_type.in_(...)``
-    predicate and this test turns red (see get_latest_waiting_question's
-    own docstring for why)."""
+    """A live question always wins over a higher-id superseded row --
+    trivially true once superseded rows are never matched at all (see
+    A2), but pinned here as its own cell so a future change that starts
+    matching both message types in one predicate is caught at the level
+    where it would actually invert priority. Mutation: match both
+    ``QUESTION_MESSAGE_TYPE`` and ``SUPERSEDED_MESSAGE_TYPE`` in one
+    ``message_type.in_(...)`` predicate ordered by id and this test turns
+    red only if the superseded row is given the higher id, which it is
+    here."""
 
     task = _make_task(_db, marker=None)
     persist_assistant_message(
@@ -262,35 +267,35 @@ def test_a4_unrecognized_marker_still_routes_through_the_rich_view(
     the interaction table. Any other value, including one this reader does
     not otherwise recognize, is handed to the rich view, which is the only
     place that knows whether an active native row exists. Here there is no
-    active row, so the rich view's own T1 fallback answers from the legacy
-    transcript with the supersede gate open (the same as the NULL cell),
-    which is how this differs from the old fast-path routing: that path
-    used to answer directly with the gate closed and never see the row at
-    all. The marker is set on the in-memory ORM object without a commit:
-    ck_tasks_interaction_protocol_version pins the column to NULL-or-1 in
-    the database, so persisting 2 would fail the CHECK; this adapter only
-    ever reads the attribute, never writes it, so exercising the branch
-    this way is faithful to what the adapter actually does.
-    Mutation: change the gate condition back to ``marker != 1`` (the
-    pre-fix routing) and this test turns red -- the superseded row would
-    no longer be returned."""
+    active row, so the rich view's own T1 fallback answers from the same
+    single-pass legacy reader the NULL cell uses (A1), correctly, even
+    though this marker value cannot occur on a persisted row (see below).
+    The real behavioral difference from the old fast-path routing --
+    whether an active native row's answer can be bypassed -- is not
+    observable here since there is no active row to bypass; A4b below is
+    the cell that pins that difference. The marker is set on the
+    in-memory ORM object without a commit: ck_tasks_interaction_protocol_version
+    pins the column to NULL-or-1 in the database, so persisting 2 would
+    fail the CHECK; this adapter only ever reads the attribute, never
+    writes it, so exercising the branch this way is faithful to what the
+    adapter actually does."""
 
     task = _make_task(_db, marker=None)
     persist_assistant_message(
         _db,
         int(task.id),
         int(task.user_id),
-        "An old question",
-        message_type="question_superseded",
-        interactions=[{"type": "text_input", "label": "Old"}],
+        "A live question",
+        message_type="question",
+        interactions=[{"type": "text_input", "label": "Live"}],
     )
     task.interaction_protocol_version = 2
 
     question, interactions = read_surface.get_pending_interaction_question(_db, task)
 
     assert question is not None
-    assert question.startswith("An old question")
-    assert interactions == [{"type": "text_input", "label": "Old"}]
+    assert question.startswith("A live question")
+    assert interactions == [{"type": "text_input", "label": "Live"}]
 
 
 def test_a4b_unrecognized_marker_with_an_active_native_row_never_leaks_the_legacy_question(
@@ -348,7 +353,7 @@ def test_a5_marker_fast_path_never_calls_the_rich_view(
     and confirming it still passes. Mutation: delete the marker check (so
     every task always calls the rich view) and this test turns red."""
 
-    def _explode(db: Session, task_id: int, *, allow_superseded: bool = False):
+    def _explode(db: Session, task_id: int):
         raise AssertionError("materialize_compatibility_view must not be called")
 
     monkeypatch.setattr(read_surface, "materialize_compatibility_view", _explode)
@@ -417,16 +422,16 @@ def test_a7_marker_matches_table_absent_reads_the_legacy_transcript(
     assert interactions == [{"type": "text_input", "label": "Live"}]
 
 
-def test_a8_marker_matches_no_active_row_opens_the_supersede_gate_too(
+def test_a8_marker_matches_no_active_row_never_reads_a_superseded_only_row(
     _db: Session,
 ) -> None:
-    """T1's gate is opened unconditionally by the adapter (marker == 1
-    always calls the rich view with allow_superseded=True), not only on
-    the NULL-marker T0 cell -- a structured row was expected for this
-    wait (the marker says so) but none is active, so a transcript
-    question a publication superseded is still the honest fallback.
-    Mutation: have the adapter call materialize_compatibility_view
-    without allow_superseded=True and this test turns red."""
+    """T1's fallback (marker == 1, no active row) goes through the same
+    single-pass ``get_latest_waiting_question`` as the NULL-marker T0 cell
+    (see A2) -- a structured row was expected for this wait (the marker
+    says so) but none is active, and the transcript fallback still never
+    matches a row already retyped to ``question_superseded``. Mutation:
+    have this fallback read superseded rows and this test turns red -- it
+    would return the superseded content instead of ``(None, None)``."""
 
     task = _make_task(_db, marker=1)
     persist_assistant_message(
@@ -440,9 +445,7 @@ def test_a8_marker_matches_no_active_row_opens_the_supersede_gate_too(
 
     question, interactions = read_surface.get_pending_interaction_question(_db, task)
 
-    assert question is not None
-    assert question.startswith("An old question")
-    assert interactions == [{"type": "text_input", "label": "Old"}]
+    assert (question, interactions) == (None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -583,9 +586,7 @@ def test_a13b_unanswerable_tier_never_leaks_interactions_even_if_the_view_carrie
     Mutation: change the branch to ``return view.question,
     view.interactions`` and this test turns red; A10-A13 stay green."""
 
-    def _fake_view(
-        db: Session, task_id: int, *, allow_superseded: bool = False
-    ) -> CompatibilityQuestionView:
+    def _fake_view(db: Session, task_id: int) -> CompatibilityQuestionView:
         return CompatibilityQuestionView(
             tier="unanswerable",
             question="q",

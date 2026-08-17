@@ -1313,19 +1313,15 @@ class CompatibilityQuestionView:
     reason: str | None = None
 
 
-def _legacy_view(
-    db: "Session", task_id: int, *, allow_superseded: bool = False
-) -> CompatibilityQuestionView:
-    question, interactions = get_latest_waiting_question(
-        db, task_id, allow_superseded=allow_superseded
-    )
+def _legacy_view(db: "Session", task_id: int) -> CompatibilityQuestionView:
+    question, interactions = get_latest_waiting_question(db, task_id)
     return CompatibilityQuestionView(
         tier="legacy", question=question, interactions=interactions
     )
 
 
 def materialize_compatibility_view(
-    db: "Session", task_id: int, *, allow_superseded: bool = False
+    db: "Session", task_id: int
 ) -> CompatibilityQuestionView:
     """The single rich implementation of "what is this waiting task's
     question", three-tiered:
@@ -1385,25 +1381,14 @@ def materialize_compatibility_view(
     inside a worker-owned short session, before calling this view. #1079's
     own endpoint (not written here) is meant to consume this rich result
     directly, keeping ``reason`` for its own outcome classification.
-
-    ``allow_superseded`` is threaded straight through to the legacy tier's
-    reader and changes nothing else: when this view has established that
-    no active native row holds this task's answer slot, a transcript
-    question that a later structured publication superseded is still the
-    honest answer to "what is this task waiting on". Off by default, so
-    every caller that does not ask for it reads exactly what it read
-    before. It is a behavior switch, not an identity parameter -- the
-    principal/policy argument this function will eventually need belongs
-    to the endpoint change that first has a principal to pass, and is
-    deliberately not pre-laid here.
     """
 
     if not interaction_requests_table_exists(db):
-        return _legacy_view(db, task_id, allow_superseded=allow_superseded)
+        return _legacy_view(db, task_id)
 
     row = _active_native_row(db, task_id)
     if row is None:
-        return _legacy_view(db, task_id, allow_superseded=allow_superseded)
+        return _legacy_view(db, task_id)
 
     if row.protocol_version != INTERACTION_PROTOCOL_VERSION:
         # An active row holds this task's answer slot, so this cannot fold
