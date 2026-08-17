@@ -1258,11 +1258,16 @@ def _resolve_read_direction_anchor(
         # ``InvalidRequestError``, ``NoResultFound``,
         # ``ResourceClosedError`` and ``PendingRollbackError`` are all
         # deliberately absent from this list. ``PendingRollbackError`` in
-        # particular is not reachable here regardless: this function is
-        # only ever entered after ``interaction_requests_table_exists``
-        # has already called ``db.connection()`` on the same session, and
-        # a session broken badly enough to raise ``PendingRollbackError``
-        # raises it there first. Its source is also mixed -- sometimes a
+        # particular is not reachable here on either entry path, for a
+        # different reason on each. materialize_compatibility_view calls
+        # ``interaction_requests_table_exists`` first, which issues
+        # ``db.connection()`` on the same session, so a session broken
+        # badly enough to raise ``PendingRollbackError`` raises it there.
+        # respond() does not go through that check -- it reaches this
+        # resolver directly -- but it owns its session and has already
+        # run several statements on it by then, so the same failure
+        # surfaces before this fetch as well. Its source is also mixed
+        # -- sometimes a
         # connection that failed mid-transaction, sometimes a prior flush
         # failure that left the session itself unrecoverable -- so even if
         # it were reachable, it would not belong on a transient-only list.

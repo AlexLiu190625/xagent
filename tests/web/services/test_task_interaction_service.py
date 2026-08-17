@@ -1360,9 +1360,12 @@ def test_anchor_fetch_non_transient_sqlalchemy_error_propagates_uncaught(
     than in the whitelist above because its source is mixed -- sometimes
     a connection failure, sometimes a prior flush failure that left the
     session itself unrecoverable -- and because it is unreachable at this
-    call site regardless: a session broken enough to raise it fails
-    earlier, in ``interaction_requests_table_exists``'s own
-    ``db.connection()`` call, before this fetch ever runs. Mutation:
+    call site on either entry path: materialize_compatibility_view runs
+    ``interaction_requests_table_exists``'s own ``db.connection()`` call
+    first, and respond(), which reaches the resolver directly without
+    that check, has already run several statements on the session it
+    owns, so either way a session broken enough to raise it raises
+    earlier than this fetch. Mutation:
     widen the except clause back to ``except sa.exc.SQLAlchemyError`` and
     every case in this parametrization turns red, because all six would
     then be swallowed and reported as tier="unanswerable" instead of
@@ -1418,8 +1421,11 @@ def test_the_session_survives_a_failed_anchor_fetch_with_no_rollback(
 ) -> None:
     """The "no db.rollback()" definitive regression test: the anchor
     fetch's except clause deliberately does
-    not roll back -- the session belongs to the caller, and this module
-    makes no commits of its own (see the except clause's own comment).
+    not roll back: the session it reads through belongs to the caller,
+    so disposing of a failed transaction is the session owner's call,
+    not this read helper's. (The same module's respond() owns a session
+    of its own and does commit and roll back on it; that ownership
+    boundary is exactly the point. See the except clause's comment.)
 
     Proves this end to end in one real session: a write the caller had
     already staged, uncommitted, before the failing read survives it and
