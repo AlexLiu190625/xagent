@@ -313,6 +313,82 @@ def test_active_row_predicate_three_way_tiering(db_session) -> None:
 
 
 # ---------------------------------------------------------------------------
+# B7 (B-8 integration cell, PostgreSQL half): the anchor fetch's except
+# clause narrows to sa.exc.SQLAlchemyError and deliberately does not roll
+# back. The SQLite half of this same cell lives in
+# test_task_interaction_service.py; this is the real-backend counterpart
+# the design calls for explicitly, since PostgreSQL is where a poisoned
+# transaction after an unhandled DBAPI error is actually observable.
+# ---------------------------------------------------------------------------
+
+
+def test_the_session_survives_a_failed_anchor_fetch_with_no_rollback_postgresql(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = db_session
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    task.run_id = "run-a"
+    db.commit()
+
+    trace_id = _make_trace_event(db, task_id=task_id, run_partition="run-a")
+    _make_active_row(
+        db,
+        task_id=task_id,
+        run_id="run-a",
+        resume_trace_event_id=trace_id,
+        resume_run_partition="run-a",
+    )
+
+    # The caller's own staged, uncommitted write -- simulates a caller
+    # that has already modified something in this same session before
+    # asking the read surface for the pending question.
+    task.title = "staged-before-the-failing-read"
+
+    from sqlalchemy.orm import Session as OrmSession
+
+    original_get = OrmSession.get
+    raise_once = {"armed": True}
+
+    def _raising_get(self, model, pk, *args, **kwargs):
+        if model is TraceEvent and raise_once["armed"]:
+            raise_once["armed"] = False
+            raise sa.exc.OperationalError(
+                "SELECT 1", {}, Exception("simulated session failure")
+            )
+        return original_get(self, model, pk, *args, **kwargs)
+
+    monkeypatch.setattr(OrmSession, "get", _raising_get)
+    view = svc.materialize_compatibility_view(db, task_id)
+
+    assert view.tier == "unanswerable"
+    assert view.reason == "checkpoint_unavailable"
+
+    # (a) the caller's own pending write is still staged and committable --
+    # a db.rollback() in the except clause would have discarded it, and on
+    # PostgreSQL a real DBAPI-level error left uncaught in an open
+    # transaction poisons every later statement until a rollback happens,
+    # so this also proves the OperationalError raised above never reached
+    # the actual DBAPI connection.
+    db.commit()
+    reloaded = db.query(Task).filter(Task.id == task_id).first()
+    assert reloaded.title == "staged-before-the-failing-read"
+
+    # (b) the same session can still run a plain query...
+    still_readable = (
+        db.query(TaskInteractionRequest)
+        .filter(TaskInteractionRequest.task_id == task_id)
+        .first()
+    )
+    assert still_readable is not None
+
+    # ...and complete a whole second response construction.
+    second_view = svc.materialize_compatibility_view(db, task_id)
+    assert second_view.tier == "native"
+
+
+# ---------------------------------------------------------------------------
 # The TaskStatusPredicate structural assertion (zero TaskStatus bind
 # parameters in the active-row query) needs no database at all -- it lives
 # in the sibling SQLite-backed file (test_task_interaction_service.py) so

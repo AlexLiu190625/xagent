@@ -1197,7 +1197,14 @@ def test_t3_checkpoint_unavailable_when_the_anchor_fetch_raises(
     """T3's second reason: the anchor row fetch itself raises (a session
     or query-layer failure), distinct from anchor_dangling -- that reason
     covers the pointer naming a missing or invalid row, not the read
-    infrastructure failing before it can even answer that question."""
+    infrastructure failing before it can even answer that question.
+
+    Raises a SQLAlchemy error specifically, not a bare RuntimeError: the
+    fetch's except clause is scoped to sa.exc.SQLAlchemyError (see
+    test_anchor_fetch_non_sqlalchemy_error_propagates_uncaught below for
+    the negative case that scoping exists to draw), so this cell has to
+    raise something that class actually catches to keep testing "a
+    session or query-layer failure", not "any Python exception"."""
 
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
     _make_active_interaction_row(
@@ -1208,13 +1215,109 @@ def test_t3_checkpoint_unavailable_when_the_anchor_fetch_raises(
 
     def _raising_get(model: Any, pk: Any, *args: Any, **kwargs: Any) -> Any:
         if model is TraceEvent:
-            raise RuntimeError("simulated session failure")
+            raise sa.exc.OperationalError(
+                "SELECT 1", {}, Exception("simulated session failure")
+            )
         return real_get(model, pk, *args, **kwargs)
 
     monkeypatch.setattr(_db, "get", _raising_get)
     view = svc.materialize_compatibility_view(_db, _seeded_task)
     assert view.tier == "unanswerable"
     assert view.reason == "checkpoint_unavailable"
+
+
+def test_anchor_fetch_non_sqlalchemy_error_propagates_uncaught(
+    _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B6 (B-8): the anchor fetch's except clause is scoped to
+    sa.exc.SQLAlchemyError, not bare Exception -- a programming error
+    (a TypeError, here) must propagate to the caller rather than being
+    misclassified as a checkpoint that has become unavailable. Mutation:
+    widen the except clause back to ``except Exception`` and this test
+    turns red, because the TypeError would then be swallowed and reported
+    as tier="unanswerable" instead of raising."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+
+    def _raising_get(model: Any, pk: Any, *args: Any, **kwargs: Any) -> Any:
+        if model is TraceEvent:
+            raise TypeError("not a SQLAlchemy error")
+        raise AssertionError(f"unexpected db.get({model!r}, {pk!r})")
+
+    monkeypatch.setattr(_db, "get", _raising_get)
+    with pytest.raises(TypeError, match="not a SQLAlchemy error"):
+        svc.materialize_compatibility_view(_db, _seeded_task)
+
+
+def test_the_session_survives_a_failed_anchor_fetch_with_no_rollback(
+    _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B7 (B-8 integration cell, the "no db.rollback()" definitive
+    regression test): the anchor fetch's except clause deliberately does
+    not roll back -- the session belongs to the caller, and this module
+    makes no commits of its own (see the except clause's own comment).
+
+    Proves this end to end in one real session: a write the caller had
+    already staged, uncommitted, before the failing read survives it and
+    can still be committed; the same session can still run a plain query
+    afterward; and the same session can still complete a whole second
+    materialize_compatibility_view() call -- a full response construction
+    -- once the transient failure clears.
+
+    Mutation: add ``db.rollback()`` to the except clause and the first
+    assertion below -- the caller's staged write surviving -- turns red,
+    because the rollback discards it along with anything else the caller
+    had pending."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+
+    # The caller's own staged, uncommitted write -- simulates a caller
+    # that has already modified something in this same session before
+    # asking the read surface for the pending question.
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    task.title = "staged-before-the-failing-read"
+
+    real_get = _db.get
+    raise_once = {"armed": True}
+
+    def _raising_get(model: Any, pk: Any, *args: Any, **kwargs: Any) -> Any:
+        if model is TraceEvent and raise_once["armed"]:
+            raise_once["armed"] = False
+            raise sa.exc.OperationalError(
+                "SELECT 1", {}, Exception("simulated session failure")
+            )
+        return real_get(model, pk, *args, **kwargs)
+
+    monkeypatch.setattr(_db, "get", _raising_get)
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "unanswerable"
+    assert view.reason == "checkpoint_unavailable"
+
+    # (a) the caller's own pending write is still staged and committable --
+    # a db.rollback() in the except clause would have discarded it.
+    _db.commit()
+    reloaded = _db.query(Task).filter(Task.id == _seeded_task).first()
+    assert reloaded.title == "staged-before-the-failing-read"
+
+    # (b) the same session can still run a plain query...
+    still_readable = (
+        _db.query(TaskInteractionRequest)
+        .filter(TaskInteractionRequest.task_id == _seeded_task)
+        .first()
+    )
+    assert still_readable is not None
+
+    # ...and complete a whole second response construction: the transient
+    # failure was armed for exactly one call, so the real db.get resumes
+    # and the anchor now resolves normally.
+    second_view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert second_view.tier == "native"
 
 
 def test_stale_run_active_row_is_invisible(_db: Session, _session_factory) -> None:
@@ -2091,6 +2194,12 @@ def test_respond_reports_unavailable_when_the_interaction_row_does_not_exist(
 def test_respond_reports_unavailable_when_the_anchor_row_fetch_raises(
     _respond_db, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """_resolve_read_direction_anchor's fetch is caught on
+    sa.exc.SQLAlchemyError specifically (narrowed from a bare
+    ``except Exception``), so this cell raises that class to keep testing
+    "a session or query-layer failure", not "any Python exception" -- see
+    that resolver's own except clause for why the narrowing exists."""
+
     user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
     with _asserts_no_side_effects(
@@ -2104,7 +2213,9 @@ def test_respond_reports_unavailable_when_the_anchor_row_fetch_raises(
             self: Any, model: Any, pk: Any, *args: Any, **kwargs: Any
         ) -> Any:
             if model is TraceEvent:
-                raise RuntimeError("simulated session failure")
+                raise sa.exc.OperationalError(
+                    "SELECT 1", {}, Exception("simulated session failure")
+                )
             return original_get(self, model, pk, *args, **kwargs)
 
         monkeypatch.setattr(OrmSession, "get", _raising_get)

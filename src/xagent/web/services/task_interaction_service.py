@@ -1242,7 +1242,15 @@ def _resolve_read_direction_anchor(
 
     try:
         trace_row = db.get(TraceEvent, row.resume_trace_event_id)
-    except Exception:
+    except sa.exc.SQLAlchemyError:
+        # Narrow on purpose. A programming error here (a wrong type, a
+        # missing attribute) is not a checkpoint that has become
+        # unavailable, and collapsing the two would classify a bug as a
+        # data condition. No ``db.rollback()``: this module makes no
+        # commits and the session belongs to the caller -- rolling back
+        # here would turn "the caller's next statement fails" into "the
+        # caller's earlier writes are silently gone while its own commit
+        # still reports success".
         register_degradation(
             CHECKPOINT_LOAD_UNAVAILABLE,
             f"task {row.task_id}: interaction {row.id} anchor row fetch failed",
