@@ -53,6 +53,11 @@ on:
   # stalls. Harmless before a queue exists -- merge_group simply never fires.
   merge_group:
 
+env:
+  # Same version docker/Dockerfile.backend and docker/Dockerfile.sandbox pin.
+  # Declared once here so the two install steps below cannot drift apart.
+  UV_VERSION: "0.11.10"
+
 jobs:
   detect-migration-changes:
     name: Detect migration changes
@@ -179,8 +184,23 @@ jobs:
           # nothing to do with it. Putting the environment on PATH keeps the
           # test steps below unchanged and leaves no call site able to fall
           # back to the system interpreter.
-          python -m pip install --upgrade uv
-          uv sync --all-extras --group dev
+          #
+          # --locked is what turns that into a guarantee. A bare "uv sync"
+          # rewrites uv.lock as soon as project metadata has drifted from it,
+          # which puts the independent resolution straight back; --locked
+          # fails the job instead and names the stale lock.
+          #
+          # Pinning uv is the other half of that guarantee: a floating uv can
+          # ship a lock-format change that makes --locked fail on uv's release
+          # schedule rather than on anything in this repository.
+          #
+          # Only the test group is installed. The dev group adds pre-commit,
+          # ruff, flake8, mypy and the type stubs, and no step in either
+          # migration job runs any of them. alembic comes from the project
+          # dependencies and pytest from the test group, so both jobs still
+          # have everything they invoke.
+          python -m pip install "uv==${UV_VERSION}"
+          uv sync --locked --all-extras --no-default-groups --group test
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Test migration upgrade
@@ -249,8 +269,23 @@ jobs:
           # nothing to do with it. Putting the environment on PATH keeps the
           # test steps below unchanged and leaves no call site able to fall
           # back to the system interpreter.
-          python -m pip install --upgrade uv
-          uv sync --all-extras --group dev
+          #
+          # --locked is what turns that into a guarantee. A bare "uv sync"
+          # rewrites uv.lock as soon as project metadata has drifted from it,
+          # which puts the independent resolution straight back; --locked
+          # fails the job instead and names the stale lock.
+          #
+          # Pinning uv is the other half of that guarantee: a floating uv can
+          # ship a lock-format change that makes --locked fail on uv's release
+          # schedule rather than on anything in this repository.
+          #
+          # Only the test group is installed. The dev group adds pre-commit,
+          # ruff, flake8, mypy and the type stubs, and no step in either
+          # migration job runs any of them. alembic comes from the project
+          # dependencies and pytest from the test group, so both jobs still
+          # have everything they invoke.
+          python -m pip install "uv==${UV_VERSION}"
+          uv sync --locked --all-extras --no-default-groups --group test
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Test migration upgrade
