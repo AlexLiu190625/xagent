@@ -1242,15 +1242,40 @@ def _resolve_read_direction_anchor(
 
     try:
         trace_row = db.get(TraceEvent, row.resume_trace_event_id)
-    except sa.exc.SQLAlchemyError:
-        # Narrow on purpose. A programming error here (a wrong type, a
-        # missing attribute) is not a checkpoint that has become
-        # unavailable, and collapsing the two would classify a bug as a
-        # data condition. No ``db.rollback()``: this module makes no
-        # commits and the session belongs to the caller -- rolling back
-        # here would turn "the caller's next statement fails" into "the
-        # caller's earlier writes are silently gone while its own commit
-        # still reports success".
+    except (
+        sa.exc.OperationalError,  # connection loss / lock wait / timeout
+        sa.exc.InterfaceError,  # DBAPI-level connection failure
+        sa.exc.DisconnectionError,  # pool detected a dropped connection
+        sa.exc.PendingRollbackError,  # session state after a mid-transaction failure
+        sa.exc.TimeoutError,  # pool checkout timed out
+    ):
+        # Narrow on purpose, and narrower than ``sa.exc.SQLAlchemyError``:
+        # fallback is open only to transient, recoverable infrastructure
+        # failures. Anything that instead indicates a programming defect
+        # or a session that is itself unrecoverably broken must propagate
+        # -- swallowing it here would disguise a bug as an operational
+        # condition. That is why ``ProgrammingError``, ``DataError``,
+        # ``InternalError``, ``ArgumentError``, ``CompileError``,
+        # ``InvalidRequestError``, ``NoResultFound`` and
+        # ``ResourceClosedError`` are all deliberately absent from this
+        # list. ``PendingRollbackError`` is classified as transient
+        # because its most common source is a connection that failed
+        # mid-transaction -- a database restart, a network blip -- not a
+        # programming error.
+        #
+        # No ``db.rollback()`` here, for two independent reasons. First,
+        # the session belongs to the caller: a caller of
+        # ``materialize_compatibility_view`` may already have staged its
+        # own uncommitted writes in this same session before asking for
+        # the pending question, and a rollback here would discard them
+        # along with anything else pending. Second, when this function is
+        # reached from ``respond()``, that caller is already holding the
+        # ``tasks`` row's ``FOR UPDATE`` lock acquired earlier in the same
+        # transaction; rolling back here would release that lock along
+        # with it and break the concurrency invariant the lock exists to
+        # hold. This function only reads and never commits, so it leaves
+        # the session's transaction state exactly as it found it and lets
+        # the caller decide whether to roll back.
         register_degradation(
             CHECKPOINT_LOAD_UNAVAILABLE,
             f"task {row.task_id}: interaction {row.id} anchor row fetch failed",

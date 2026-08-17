@@ -124,7 +124,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 import sqlalchemy as sa
@@ -1200,11 +1200,13 @@ def test_t3_checkpoint_unavailable_when_the_anchor_fetch_raises(
     infrastructure failing before it can even answer that question.
 
     Raises a SQLAlchemy error specifically, not a bare RuntimeError: the
-    fetch's except clause is scoped to sa.exc.SQLAlchemyError (see
-    test_anchor_fetch_non_sqlalchemy_error_propagates_uncaught below for
-    the negative case that scoping exists to draw), so this cell has to
-    raise something that class actually catches to keep testing "a
-    session or query-layer failure", not "any Python exception"."""
+    fetch's except clause is scoped to a whitelist of transient
+    infrastructure failures, not ``sa.exc.SQLAlchemyError`` as a whole
+    (see the parametrized whitelist/blacklist tests below for the full
+    boundary, and test_anchor_fetch_non_sqlalchemy_error_propagates_uncaught
+    for the negative case that scoping exists to draw), so this cell has
+    to raise something the except tuple actually catches to keep testing
+    "a session or query-layer failure", not "any Python exception"."""
 
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
     _make_active_interaction_row(
@@ -1226,16 +1228,146 @@ def test_t3_checkpoint_unavailable_when_the_anchor_fetch_raises(
     assert view.reason == "checkpoint_unavailable"
 
 
+_TRANSIENT_ANCHOR_FETCH_ERRORS: list[Any] = [
+    pytest.param(
+        lambda: sa.exc.OperationalError(
+            "SELECT 1", {}, Exception("simulated connection loss")
+        ),
+        id="OperationalError",
+    ),
+    pytest.param(
+        lambda: sa.exc.InterfaceError(
+            "SELECT 1", {}, Exception("simulated DBAPI interface failure")
+        ),
+        id="InterfaceError",
+    ),
+    pytest.param(
+        lambda: sa.exc.DisconnectionError("simulated pool-detected disconnect"),
+        id="DisconnectionError",
+    ),
+    pytest.param(
+        lambda: sa.exc.PendingRollbackError(
+            "simulated mid-transaction session failure"
+        ),
+        id="PendingRollbackError",
+    ),
+    pytest.param(
+        lambda: sa.exc.TimeoutError("simulated pool checkout timeout"),
+        id="TimeoutError",
+    ),
+]
+
+
+@pytest.mark.parametrize("exc_factory", _TRANSIENT_ANCHOR_FETCH_ERRORS)
+def test_t3_checkpoint_unavailable_for_each_transient_infrastructure_error(
+    _db: Session,
+    _seeded_task: int,
+    monkeypatch: pytest.MonkeyPatch,
+    exc_factory: Callable[[], Exception],
+) -> None:
+    """The fallback whitelist, one cell per class: each of these five is a
+    transient, recoverable infrastructure failure (see the except
+    clause's own comment on ``_resolve_read_direction_anchor`` for the
+    classification), and each on its own degrades the read to
+    tier="unanswerable"/reason="checkpoint_unavailable" -- not only in
+    combination with the others. Mutation: delete
+    ``sa.exc.PendingRollbackError`` from the except tuple and the
+    ``PendingRollbackError`` case in this parametrization turns red,
+    because that exception then propagates uncaught instead of
+    degrading."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+
+    exc = exc_factory()
+    real_get = _db.get
+
+    def _raising_get(model: Any, pk: Any, *args: Any, **kwargs: Any) -> Any:
+        if model is TraceEvent:
+            raise exc
+        return real_get(model, pk, *args, **kwargs)
+
+    monkeypatch.setattr(_db, "get", _raising_get)
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "unanswerable"
+    assert view.reason == "checkpoint_unavailable"
+
+
+_NON_TRANSIENT_ANCHOR_FETCH_ERRORS: list[Any] = [
+    pytest.param(
+        lambda: sa.exc.ProgrammingError(
+            "stmt", {}, Exception("simulated malformed statement")
+        ),
+        id="ProgrammingError",
+    ),
+    pytest.param(
+        lambda: sa.exc.ArgumentError("simulated bad argument"),
+        id="ArgumentError",
+    ),
+    pytest.param(
+        lambda: sa.exc.CompileError("simulated compile failure"),
+        id="CompileError",
+    ),
+    pytest.param(
+        lambda: sa.exc.InvalidRequestError("simulated invalid request"),
+        id="InvalidRequestError",
+    ),
+    pytest.param(
+        lambda: sa.exc.NoResultFound("simulated no-result-found"),
+        id="NoResultFound",
+    ),
+]
+
+
+@pytest.mark.parametrize("exc_factory", _NON_TRANSIENT_ANCHOR_FETCH_ERRORS)
+def test_anchor_fetch_non_transient_sqlalchemy_error_propagates_uncaught(
+    _db: Session,
+    _seeded_task: int,
+    monkeypatch: pytest.MonkeyPatch,
+    exc_factory: Callable[[], Exception],
+) -> None:
+    """The fallback blacklist, mirroring the whitelist test above one
+    class at a time: each of these five is a ``sa.exc.SQLAlchemyError``
+    subclass -- the old, wide ``except sa.exc.SQLAlchemyError`` used to
+    swallow every one of them -- but none names a transient
+    infrastructure failure, so each must propagate to the caller instead
+    of being misclassified as "checkpoint unavailable". Mutation: widen
+    the except clause back to ``except sa.exc.SQLAlchemyError`` and every
+    case in this parametrization turns red, because all five would then
+    be swallowed and reported as tier="unanswerable" instead of
+    raising."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+
+    exc = exc_factory()
+
+    def _raising_get(model: Any, pk: Any, *args: Any, **kwargs: Any) -> Any:
+        if model is TraceEvent:
+            raise exc
+        raise AssertionError(f"unexpected db.get({model!r}, {pk!r})")
+
+    monkeypatch.setattr(_db, "get", _raising_get)
+    with pytest.raises(type(exc)):
+        svc.materialize_compatibility_view(_db, _seeded_task)
+
+
 def test_anchor_fetch_non_sqlalchemy_error_propagates_uncaught(
     _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The anchor fetch's except clause is scoped to
-    sa.exc.SQLAlchemyError, not bare Exception -- a programming error
-    (a TypeError, here) must propagate to the caller rather than being
-    misclassified as a checkpoint that has become unavailable. Mutation:
-    widen the except clause back to ``except Exception`` and this test
-    turns red, because the TypeError would then be swallowed and reported
-    as tier="unanswerable" instead of raising."""
+    """The anchor fetch's except clause only catches
+    ``sa.exc.SQLAlchemyError`` subclasses at all (and only a whitelisted
+    subset of those -- see the parametrized tests above) -- a programming
+    error that is not even a SQLAlchemy error (a TypeError, here) must
+    propagate to the caller rather than being misclassified as a
+    checkpoint that has become unavailable. Mutation: widen the except
+    clause back to ``except Exception`` and this test turns red, because
+    the TypeError would then be swallowed and reported as
+    tier="unanswerable" instead of raising."""
 
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
     _make_active_interaction_row(
