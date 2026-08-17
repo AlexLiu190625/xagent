@@ -283,6 +283,18 @@ def _protocol_marker_comparisons(tree: ast.Module) -> list[tuple[int, str]]:
     comparing the attribute inline, an entirely ordinary style a guard
     that only recognized the inline shape would be blind to.
 
+    Every operand of the comparison is checked, not only ``node.left``:
+    the marker can just as easily appear reversed (``1 !=
+    task.interaction_protocol_version``, or the aliased ``1 != marker``)
+    or as a middle term of a chained comparison (``lo < marker < 2``), and
+    a scan that only recognized ``node.left`` would be blind to all three
+    -- exactly the shapes a hand-reversed or chained rewrite of an
+    existing check tends to produce. For a comparison with one or more
+    operands recognized as the marker, every *other* operand in that same
+    comparison is reported as something the marker was compared against;
+    a chained comparison can therefore report more than one shape for a
+    single line.
+
     This is a whole-module scan, not a scope-aware one: an assignment
     anywhere in the module can alias a name compared anywhere else in the
     module. Disclosed blind spots, not fixed here because this module has
@@ -295,11 +307,15 @@ def _protocol_marker_comparisons(tree: ast.Module) -> list[tuple[int, str]]:
     reusing the same local variable name for an unrelated value would
     need this widened first.
 
-    A ``marker is None`` comparison against an aliased name is excluded
-    outright, not merely allowed to differ from the named constant: it
-    asks an unrelated question (has a marker ever been published at all,
-    not which version it names), and ``None`` has no version number to
-    drift out of sync with a constant.
+    A plain two-operand ``marker is None`` (or ``None is marker``)
+    comparison is excluded outright, not merely allowed to differ from
+    the named constant: it asks an unrelated question (has a marker ever
+    been published at all, not which version it names), and ``None`` has
+    no version number to drift out of sync with a constant. That
+    exclusion is deliberately narrow -- only a simple two-operand
+    comparison where the marker's only counterpart is a literal ``None``
+    -- so a chained comparison that happens to include ``None`` among
+    several operands is still reported in full.
     """
 
     aliases: set[str] = set()
@@ -313,49 +329,54 @@ def _protocol_marker_comparisons(tree: ast.Module) -> list[tuple[int, str]]:
         ):
             aliases.add(node.targets[0].id)
 
+    def _is_marker(operand: ast.expr) -> bool:
+        if isinstance(operand, ast.Attribute):
+            return operand.attr == "interaction_protocol_version"
+        return isinstance(operand, ast.Name) and operand.id in aliases
+
     found: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Compare):
             continue
-        left = node.left
-        is_direct_attribute = (
-            isinstance(left, ast.Attribute)
-            and left.attr == "interaction_protocol_version"
-        )
-        is_marker_alias = isinstance(left, ast.Name) and left.id in aliases
-        if not (is_direct_attribute or is_marker_alias):
+        operands = [node.left, *node.comparators]
+        marker_indices = [
+            i for i, operand in enumerate(operands) if _is_marker(operand)
+        ]
+        if not marker_indices:
             continue
-        if len(node.comparators) == 1 and (
-            isinstance(node.comparators[0], ast.Constant)
-            and node.comparators[0].value is None
+        other_operands = [
+            operand for i, operand in enumerate(operands) if i not in marker_indices
+        ]
+        if (
+            len(operands) == 2
+            and len(other_operands) == 1
+            and isinstance(other_operands[0], ast.Constant)
+            and other_operands[0].value is None
         ):
-            # An aliased marker is legitimately compared against None a
-            # second time in the read surface (``marker is None``, to
-            # decide whether to open the supersede gate) -- that is a
-            # presence check, not a "which version" check, and has no
-            # literal to pin to a constant: None can never drift the way
-            # a hardcoded version number could.
+            # The marker's one counterpart in a plain two-operand
+            # comparison is a literal None -- a presence check, not a
+            # "which version" check (see docstring).
             continue
-        for comparator in node.comparators:
-            if isinstance(comparator, ast.Name):
-                found.append((node.lineno, comparator.id))
-            elif isinstance(comparator, ast.Constant):
-                found.append((node.lineno, repr(comparator.value)))
+        for operand in other_operands:
+            if isinstance(operand, ast.Name):
+                found.append((node.lineno, operand.id))
+            elif isinstance(operand, ast.Constant):
+                found.append((node.lineno, repr(operand.value)))
             else:
-                found.append((node.lineno, type(comparator).__name__))
+                found.append((node.lineno, type(operand).__name__))
     return found
 
 
 def test_tw1d_read_surface_never_compares_the_marker_through_a_bare_literal():
-    """The read surface's own step 0 now only asks whether a native row
-    was ever staged at all (``marker is None``, excluded from ``found``
-    -- see ``_protocol_marker_comparisons``'s own docstring) and no
-    longer decides *which* version it names; that recognition now lives
-    with ``materialize_compatibility_view``'s own check on the
-    interaction row's ``protocol_version`` field, a different attribute
-    this scanner does not match. So this module is not expected to
-    contain any ``interaction_protocol_version``-vs-version comparison
-    today -- but if one is ever added back here, it must name
+    """The read surface's own step 0 only asks whether a native row was
+    ever staged at all (``marker is None``, excluded from ``found`` below
+    -- see ``_protocol_marker_comparisons``'s own docstring) and no longer
+    decides *which* version it names; that recognition now lives with
+    ``materialize_compatibility_view``'s own check on the interaction
+    row's ``protocol_version`` field, a different attribute this scanner
+    does not match. So this module is not expected to contain any
+    ``interaction_protocol_version``-vs-version comparison today -- but
+    if one is ever added back here, it must name
     ``INTERACTION_PROTOCOL_VERSION``, never a bare literal that would
     silently drift out of sync with a second protocol version. Mutation:
     add ``if marker != 1: ...`` back to the read surface and this test
@@ -383,6 +404,54 @@ def test_tw1d_guard_flags_a_planted_literal_comparison(tmp_path):
         "        return None\n"
     )
     assert _protocol_marker_comparisons(_parse(planted)) == [(2, "1")]
+
+
+def test_tw1d_guard_flags_a_planted_reversed_literal_comparison(tmp_path):
+    """The marker can appear on the right-hand side of the comparison
+    (``1 != task.interaction_protocol_version``) just as easily as on the
+    left -- a rewrite that flips operand order for style reasons is
+    ordinary, not adversarial. A guard that only inspected ``node.left``
+    would miss this entirely."""
+
+    planted = tmp_path / "planted.py"
+    planted.write_text(
+        "def read(task):\n"
+        "    if 1 != task.interaction_protocol_version:\n"
+        "        return None\n"
+    )
+    assert _protocol_marker_comparisons(_parse(planted)) == [(2, "1")]
+
+
+def test_tw1d_guard_flags_a_planted_aliased_reversed_literal_comparison(tmp_path):
+    """The same right-hand-side blind spot, compounded with the local
+    alias the read surface itself uses: ``marker`` assigned from
+    ``interaction_protocol_version`` and then compared with the literal
+    on the left (``1 != marker``)."""
+
+    planted = tmp_path / "planted.py"
+    planted.write_text(
+        "def read(task):\n"
+        "    marker = task.interaction_protocol_version\n"
+        "    if 1 != marker:\n"
+        "        return None\n"
+    )
+    assert _protocol_marker_comparisons(_parse(planted)) == [(3, "1")]
+
+
+def test_tw1d_guard_flags_a_planted_chained_literal_comparison(tmp_path):
+    """The marker can also appear as the middle term of a chained
+    comparison (``lo < marker < hi``), where it is neither ``node.left``
+    nor the sole entry in ``node.comparators`` -- both of the other
+    operands in the chain must be reported, not just one."""
+
+    planted = tmp_path / "planted.py"
+    planted.write_text(
+        "def read(task):\n"
+        "    marker = task.interaction_protocol_version\n"
+        "    if 0 < marker < 2:\n"
+        "        return None\n"
+    )
+    assert _protocol_marker_comparisons(_parse(planted)) == [(3, "0"), (3, "2")]
 
 
 # ---------------------------------------------------------------------------
