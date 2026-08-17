@@ -27,6 +27,7 @@ import xagent.web.api.websocket as websocket_module
 import xagent.web.models.task_interaction as task_interaction_module
 import xagent.web.services.chat_history_service as chat_history_service_module
 import xagent.web.services.task_interaction_read as task_interaction_read_module
+import xagent.web.services.task_interaction_service as task_interaction_service_module
 
 pytestmark = pytest.mark.skipif(
     sys.version_info < (3, 11),
@@ -264,48 +265,78 @@ def test_tw1b_closure_seeds_reference_no_banned_names():
 
 
 # ---------------------------------------------------------------------------
-# The protocol marker literal guard: the read surface's comparison against
-# interaction_protocol_version must name INTERACTION_PROTOCOL_VERSION, not
-# the literal it happens to equal today.
+# The protocol marker literal guard: any comparison against a protocol
+# version marker attribute must name INTERACTION_PROTOCOL_VERSION, not the
+# literal it happens to equal today. Two call sites share this scanner: the
+# read surface's ``interaction_protocol_version`` marker (default attribute
+# name below) and the service module's ``protocol_version`` marker on the
+# envelope/row objects that actually decide version compatibility -- see
+# _SERVICE_MARKER_ATTR_NAMES and its own test below.
 # ---------------------------------------------------------------------------
 
+_DEFAULT_MARKER_ATTR_NAMES = frozenset({"interaction_protocol_version"})
 
-def _protocol_marker_comparisons(tree: ast.Module) -> list[tuple[int, str]]:
-    """Every comparison against ``interaction_protocol_version`` in a
-    parsed module, as (line, comparator source shape).
+# The service module's version-comparison sites read ``protocol_version``
+# off ``envelope`` or a fetched ``row``/``ir`` object, never the read
+# surface's ``interaction_protocol_version`` name -- a different attribute
+# name on different carrier objects, not a second occurrence of the same
+# one. Kept as its own named set (rather than unioning into the default)
+# so a bare ``_protocol_marker_comparisons(tree)`` call keeps scanning for
+# exactly the one name it always has.
+_SERVICE_MARKER_ATTR_NAMES = frozenset({"protocol_version"})
+
+
+def _protocol_marker_comparisons(
+    tree: ast.Module, attr_names: frozenset[str] = _DEFAULT_MARKER_ATTR_NAMES
+) -> list[tuple[int, str]]:
+    """Every comparison against one of ``attr_names`` in a parsed module,
+    as (line, comparator source shape).
+
+    ``attr_names`` is a set, not a single string, because the two
+    production call sites this scanner covers name their marker attribute
+    differently: the read surface's ``interaction_protocol_version``
+    (this function's default) and the service module's ``protocol_version``
+    (see ``_SERVICE_MARKER_ATTR_NAMES``). Each caller passes the one name
+    relevant to the file it is scanning; the set is never widened to cover
+    both at once, so a match in one file cannot be satisfied by the other
+    file's attribute spelling.
 
     Counts two shapes, not just the direct one: comparing the attribute
-    itself (``<obj>.interaction_protocol_version != ...``), or comparing
-    a local variable that was assigned, in one direct step, from that
-    exact attribute (``marker = <obj>.interaction_protocol_version``
-    followed later by ``marker != ...``) -- the read surface's own step 0
-    reads the marker into a local once and compares that, rather than
-    comparing the attribute inline, an entirely ordinary style a guard
-    that only recognized the inline shape would be blind to.
+    itself (``<obj>.<attr_name> != ...``), or comparing a local variable
+    that was assigned, in one direct step, from that exact attribute
+    (``marker = <obj>.<attr_name>`` followed later by ``marker != ...``)
+    -- both production call sites read the marker into a local once and
+    compare that, rather than comparing the attribute inline, an entirely
+    ordinary style a guard that only recognized the inline shape would be
+    blind to.
 
     Every operand of the comparison is checked, not only ``node.left``:
     the marker can just as easily appear reversed (``1 !=
-    task.interaction_protocol_version``, or the aliased ``1 != marker``)
-    or as a middle term of a chained comparison (``lo < marker < 2``), and
-    a scan that only recognized ``node.left`` would be blind to all three
-    -- exactly the shapes a hand-reversed or chained rewrite of an
-    existing check tends to produce. For a comparison with one or more
-    operands recognized as the marker, every *other* operand in that same
+    row.protocol_version``, or the aliased ``1 != marker``) or as a
+    middle term of a chained comparison (``lo < marker < 2``), and a scan
+    that only recognized ``node.left`` would be blind to all three --
+    exactly the shapes a hand-reversed or chained rewrite of an existing
+    check tends to produce. For a comparison with one or more operands
+    recognized as the marker, every *other* operand in that same
     comparison is reported as something the marker was compared against;
     a chained comparison can therefore report more than one shape for a
-    single line.
+    single line. Two attributes sharing the same match set within one
+    call (e.g. ``ir.protocol_version != envelope.protocol_version``, both
+    named in ``attr_names``) leaves no *other* operand at all, so that
+    shape reports nothing -- it is a cross-object equality check, not a
+    version-vs-literal one, and out of scope for this guard.
 
     This is a whole-module scan, not a scope-aware one: an assignment
     anywhere in the module can alias a name compared anywhere else in the
-    module. Disclosed blind spots, not fixed here because this module has
-    exactly one caller to cover: a name reused for something unrelated in
-    a different function is not distinguished from a real alias, and
-    conditional rebinding is not modeled at all -- a name reassigned to
-    something else in a later branch of the same function is still
-    treated as an alias for the rest of that function. Both are provably
-    fine for the one production caller this guards; a second caller
-    reusing the same local variable name for an unrelated value would
-    need this widened first.
+    module. Disclosed blind spots, not fixed here because each of the two
+    production files this scanner covers has few enough call sites to
+    audit by hand: a name reused for something unrelated in a different
+    function is not distinguished from a real alias, and conditional
+    rebinding is not modeled at all -- a name reassigned to something else
+    in a later branch of the same function is still treated as an alias
+    for the rest of that function. Both are provably fine for today's
+    production callers; a caller reusing the same local variable name for
+    an unrelated value would need this widened first.
 
     A plain two-operand ``marker is None`` (or ``None is marker``)
     comparison is excluded outright, not merely allowed to differ from
@@ -325,13 +356,13 @@ def _protocol_marker_comparisons(tree: ast.Module) -> list[tuple[int, str]]:
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
             and isinstance(node.value, ast.Attribute)
-            and node.value.attr == "interaction_protocol_version"
+            and node.value.attr in attr_names
         ):
             aliases.add(node.targets[0].id)
 
     def _is_marker(operand: ast.expr) -> bool:
         if isinstance(operand, ast.Attribute):
-            return operand.attr == "interaction_protocol_version"
+            return operand.attr in attr_names
         return isinstance(operand, ast.Name) and operand.id in aliases
 
     found: list[tuple[int, str]] = []
@@ -452,6 +483,83 @@ def test_tw1d_guard_flags_a_planted_chained_literal_comparison(tmp_path):
         "        return None\n"
     )
     assert _protocol_marker_comparisons(_parse(planted)) == [(3, "0"), (3, "2")]
+
+
+def test_tw1e_service_module_never_compares_the_marker_through_a_bare_literal():
+    """The three places task_interaction_service.py actually decides
+    whether a version is recognized -- create()'s envelope check, the
+    compatibility view's row check, and respond()'s envelope check --
+    each compare a ``protocol_version`` attribute (on ``envelope`` or a
+    fetched row) against a version. All three must name
+    ``INTERACTION_PROTOCOL_VERSION``, never a bare literal that would
+    silently drift out of sync with a second protocol version. This is
+    the read surface's sibling check (test_tw1d above), aimed at the
+    module that actually does the comparing today: task_interaction_read
+    only asks whether a marker exists at all (``marker is None``, not a
+    version comparison), while this module runs the real check.
+    Mutation: replace any of the three ``INTERACTION_PROTOCOL_VERSION``
+    call sites with a bare ``1`` and this test turns red (see the
+    test_tw1e_guard_flags_a_planted_* tests below for the same check
+    against synthetic source, and the module docstring's live mutation
+    log for the two real call sites exercised end to end)."""
+
+    tree = _parse(_module_source_path(task_interaction_service_module))
+    comparisons = _protocol_marker_comparisons(
+        tree, attr_names=_SERVICE_MARKER_ATTR_NAMES
+    )
+    offenders = [
+        (line, shape)
+        for line, shape in comparisons
+        if shape != "INTERACTION_PROTOCOL_VERSION"
+    ]
+    assert offenders == [], f"marker compared against a non-constant: {offenders}"
+
+
+def test_tw1e_guard_flags_a_planted_literal_comparison_on_a_row_attribute(tmp_path):
+    """The service module's shape: a fetched row's ``protocol_version``
+    compared inline against a bare literal (mirrors the real check at
+    task_interaction_service.py's compatibility-view call site)."""
+
+    planted = tmp_path / "planted.py"
+    planted.write_text(
+        "def read(row):\n    if row.protocol_version != 1:\n        return None\n"
+    )
+    assert _protocol_marker_comparisons(
+        _parse(planted), attr_names=_SERVICE_MARKER_ATTR_NAMES
+    ) == [(2, "1")]
+
+
+def test_tw1e_guard_flags_a_planted_reversed_literal_comparison(tmp_path):
+    """Same reversed-operand blind spot as test_tw1d above, checked
+    against the service module's ``protocol_version`` attribute name
+    instead of the read surface's ``interaction_protocol_version``."""
+
+    planted = tmp_path / "planted.py"
+    planted.write_text(
+        "def read(row):\n    if 1 != row.protocol_version:\n        return None\n"
+    )
+    assert _protocol_marker_comparisons(
+        _parse(planted), attr_names=_SERVICE_MARKER_ATTR_NAMES
+    ) == [(2, "1")]
+
+
+def test_tw1e_guard_flags_a_planted_aliased_literal_comparison(tmp_path):
+    """The service module's own step 0 in each of its three checks reads
+    ``envelope.protocol_version`` (or ``row.protocol_version``) into a
+    local once and compares that -- the same aliasing shape as the read
+    surface's ``marker`` local, exercised here against
+    ``protocol_version`` instead of ``interaction_protocol_version``."""
+
+    planted = tmp_path / "planted.py"
+    planted.write_text(
+        "def read(envelope):\n"
+        "    version = envelope.protocol_version\n"
+        "    if version != 1:\n"
+        "        return None\n"
+    )
+    assert _protocol_marker_comparisons(
+        _parse(planted), attr_names=_SERVICE_MARKER_ATTR_NAMES
+    ) == [(3, "1")]
 
 
 # ---------------------------------------------------------------------------
