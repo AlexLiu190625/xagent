@@ -167,14 +167,21 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[all]"
-          pip install pytest pytest-mock
+          # Install from uv.lock, the same resolution every other job uses.
+          # A plain "pip install -e .[all]" re-resolves the whole graph from
+          # PyPI on every run, so an upper bound added anywhere in pyproject
+          # -- or any upstream release -- can make the resolver backtrack
+          # until it gives up, turning this workflow red on changes that have
+          # nothing to do with it. Putting the environment on PATH keeps the
+          # test steps below unchanged and leaves no call site able to fall
+          # back to the system interpreter.
+          python -m pip install --upgrade uv
+          uv sync --all-extras --group dev
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Test migration upgrade
         if: needs.detect-migration-changes.outputs.should-test == 'true'
@@ -230,14 +237,21 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[all]"
-          pip install pytest pytest-mock
+          # Install from uv.lock, the same resolution every other job uses.
+          # A plain "pip install -e .[all]" re-resolves the whole graph from
+          # PyPI on every run, so an upper bound added anywhere in pyproject
+          # -- or any upstream release -- can make the resolver backtrack
+          # until it gives up, turning this workflow red on changes that have
+          # nothing to do with it. Putting the environment on PATH keeps the
+          # test steps below unchanged and leaves no call site able to fall
+          # back to the system interpreter.
+          python -m pip install --upgrade uv
+          uv sync --all-extras --group dev
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Test migration upgrade
         if: needs.detect-migration-changes.outputs.should-test == 'true'
@@ -274,7 +288,6 @@ jobs:
       - name: Test Gmail provisioning Postgres-only behavior
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          pip install pytest-asyncio
           pytest tests/web/services/test_gmail_provisioning.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
@@ -317,7 +330,6 @@ jobs:
       - name: Test monitoring JSON extraction (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          pip install pytest-asyncio
           pytest tests/web/api/test_monitor_postgresql.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
