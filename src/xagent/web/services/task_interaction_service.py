@@ -1246,7 +1246,6 @@ def _resolve_read_direction_anchor(
         sa.exc.OperationalError,  # connection loss / lock wait / timeout
         sa.exc.InterfaceError,  # DBAPI-level connection failure
         sa.exc.DisconnectionError,  # pool detected a dropped connection
-        sa.exc.PendingRollbackError,  # session state after a mid-transaction failure
         sa.exc.TimeoutError,  # pool checkout timed out
     ):
         # Narrow on purpose, and narrower than ``sa.exc.SQLAlchemyError``:
@@ -1256,26 +1255,28 @@ def _resolve_read_direction_anchor(
         # -- swallowing it here would disguise a bug as an operational
         # condition. That is why ``ProgrammingError``, ``DataError``,
         # ``InternalError``, ``ArgumentError``, ``CompileError``,
-        # ``InvalidRequestError``, ``NoResultFound`` and
-        # ``ResourceClosedError`` are all deliberately absent from this
-        # list. ``PendingRollbackError`` is classified as transient
-        # because its most common source is a connection that failed
-        # mid-transaction -- a database restart, a network blip -- not a
-        # programming error.
+        # ``InvalidRequestError``, ``NoResultFound``,
+        # ``ResourceClosedError`` and ``PendingRollbackError`` are all
+        # deliberately absent from this list. ``PendingRollbackError`` in
+        # particular is not reachable here regardless: this function is
+        # only ever entered after ``interaction_requests_table_exists``
+        # has already called ``db.connection()`` on the same session, and
+        # a session broken badly enough to raise ``PendingRollbackError``
+        # raises it there first. Its source is also mixed -- sometimes a
+        # connection that failed mid-transaction, sometimes a prior flush
+        # failure that left the session itself unrecoverable -- so even if
+        # it were reachable, it would not belong on a transient-only list.
         #
-        # No ``db.rollback()`` here, for two independent reasons. First,
-        # the session belongs to the caller: a caller of
-        # ``materialize_compatibility_view`` may already have staged its
-        # own uncommitted writes in this same session before asking for
-        # the pending question, and a rollback here would discard them
-        # along with anything else pending. Second, when this function is
-        # reached from ``respond()``, that caller is already holding the
-        # ``tasks`` row's ``FOR UPDATE`` lock acquired earlier in the same
-        # transaction; rolling back here would release that lock along
-        # with it and break the concurrency invariant the lock exists to
-        # hold. This function only reads and never commits, so it leaves
-        # the session's transaction state exactly as it found it and lets
-        # the caller decide whether to roll back.
+        # No db.rollback() here: respond() holds the tasks row's FOR
+        # UPDATE lock from its earlier step and owns its own session end
+        # to end, so a rollback here would release that lock mid-flow.
+        # Note the backend asymmetry after a genuine DBAPI failure at this
+        # fetch: SQLite keeps the caller's staged, uncommitted writes;
+        # PostgreSQL has already invalidated the server-side transaction,
+        # so a later commit() returns successfully while discarding them.
+        # A rollback here would not recover those writes -- deciding what
+        # to do about the failed transaction belongs to the session
+        # owner, not this read helper.
         register_degradation(
             CHECKPOINT_LOAD_UNAVAILABLE,
             f"task {row.task_id}: interaction {row.id} anchor row fetch failed",
