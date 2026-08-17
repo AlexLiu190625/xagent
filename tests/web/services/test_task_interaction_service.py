@@ -980,7 +980,7 @@ def test_t1_falls_back_to_legacy_when_request_payload_does_not_parse(
 def test_unreadable_payload_warning_never_logs_the_rejected_question_text(
     _db: Session, _seeded_task: int, caplog
 ) -> None:
-    """B3 (S-1, the privacy line): the validation-failure log line must
+    """The privacy line: the validation-failure log line must
     never carry the payload's own content. pydantic's str(ValidationError)
     embeds ``input_value=``, and for this payload the input is the
     question text an end user wrote -- logging it verbatim would leak
@@ -1229,7 +1229,7 @@ def test_t3_checkpoint_unavailable_when_the_anchor_fetch_raises(
 def test_anchor_fetch_non_sqlalchemy_error_propagates_uncaught(
     _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """B6 (B-8): the anchor fetch's except clause is scoped to
+    """The anchor fetch's except clause is scoped to
     sa.exc.SQLAlchemyError, not bare Exception -- a programming error
     (a TypeError, here) must propagate to the caller rather than being
     misclassified as a checkpoint that has become unavailable. Mutation:
@@ -1255,8 +1255,8 @@ def test_anchor_fetch_non_sqlalchemy_error_propagates_uncaught(
 def test_the_session_survives_a_failed_anchor_fetch_with_no_rollback(
     _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """B7 (B-8 integration cell, the "no db.rollback()" definitive
-    regression test): the anchor fetch's except clause deliberately does
+    """The "no db.rollback()" definitive regression test: the anchor
+    fetch's except clause deliberately does
     not roll back -- the session belongs to the caller, and this module
     makes no commits of its own (see the except clause's own comment).
 

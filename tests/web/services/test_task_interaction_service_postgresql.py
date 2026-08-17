@@ -313,9 +313,9 @@ def test_active_row_predicate_three_way_tiering(db_session) -> None:
 
 
 # ---------------------------------------------------------------------------
-# B7 (B-8 integration cell, PostgreSQL half): the anchor fetch's except
-# clause narrows to sa.exc.SQLAlchemyError and deliberately does not roll
-# back. The SQLite half of this same cell lives in
+# The PostgreSQL half of the "no db.rollback()" regression test: the
+# anchor fetch's except clause narrows to sa.exc.SQLAlchemyError and
+# deliberately does not roll back. The SQLite half of this same cell lives in
 # test_task_interaction_service.py; this is the real-backend counterpart
 # the design calls for explicitly, since PostgreSQL is where a poisoned
 # transaction after an unhandled DBAPI error is actually observable.
