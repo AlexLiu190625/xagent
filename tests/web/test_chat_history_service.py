@@ -227,6 +227,138 @@ def test_get_latest_waiting_question_returns_latest_question_only():
         db_session.close()
 
 
+def test_get_latest_waiting_question_default_does_not_open_the_superseded_pass():
+    """C1: with only a superseded row on the task and no open question,
+    the default (closed) call must return (None, None), not the
+    superseded row's content. Mutation: flip the default to True and this
+    test turns red."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        persist_assistant_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "An old question",
+            message_type="question_superseded",
+            interactions=[{"type": "text_input", "label": "Old"}],
+        )
+
+        question, interactions = get_latest_waiting_question(db_session, int(task.id))
+
+        assert (question, interactions) == (None, None)
+    finally:
+        db_session.close()
+
+
+def test_get_latest_waiting_question_open_reads_a_superseded_row():
+    """C2: with the second pass opened and only a superseded row present,
+    the reader returns that row's content instead of (None, None)."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        persist_assistant_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "An old question",
+            message_type="question_superseded",
+            interactions=[{"type": "text_input", "label": "Old"}],
+        )
+
+        question, interactions = get_latest_waiting_question(
+            db_session, int(task.id), allow_superseded=True
+        )
+
+        assert question is not None
+        assert question.startswith("An old question")
+        assert interactions == [{"type": "text_input", "label": "Old"}]
+    finally:
+        db_session.close()
+
+
+def test_get_latest_waiting_question_open_prefers_a_live_question_over_a_superseded_row():
+    """C3: a live question row must win over a superseded row with a
+    higher id, even with the second pass opened -- the two-pass split is
+    what makes this ordering structural rather than incidental. Mutation:
+    collapse the two passes into one
+    ``message_type.in_((QUESTION_MESSAGE_TYPE, SUPERSEDED_MESSAGE_TYPE))``
+    predicate and this test turns red, because a single ORDER BY id DESC
+    over both types would let the higher-id superseded row win instead."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        persist_assistant_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "A live question",
+            message_type="question",
+            interactions=[{"type": "text_input", "label": "Live"}],
+        )
+        persist_assistant_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "A newer superseded row",
+            message_type="question_superseded",
+            interactions=[{"type": "text_input", "label": "Superseded"}],
+        )
+
+        question, interactions = get_latest_waiting_question(
+            db_session, int(task.id), allow_superseded=True
+        )
+
+        assert question is not None
+        assert question.startswith("A live question")
+        assert interactions == [{"type": "text_input", "label": "Live"}]
+    finally:
+        db_session.close()
+
+
+def test_get_latest_waiting_question_open_emits_one_select_when_the_first_pass_hits():
+    """C4: when the first pass already finds a live question, the second
+    pass must not run at all -- opening the gate does not mean always
+    paying for two queries. Mutation: make the second pass run
+    unconditionally and this test turns red."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        task_id = int(task.id)
+        persist_assistant_message(
+            db_session,
+            task_id,
+            int(task.user_id),
+            "A live question",
+            message_type="question",
+        )
+
+        from sqlalchemy import Select, event
+
+        seen: list[object] = []
+
+        def _record(conn, clauseelement, multiparams, params, execution_options):
+            seen.append(clauseelement)
+
+        # task_id was captured above, before the listener attaches: the
+        # prior persist_assistant_message() commit expires every object
+        # still attached to this session (SQLAlchemy's default
+        # expire_on_commit), so reading task.id inside the listener window
+        # would itself trigger a spurious reload SELECT that has nothing
+        # to do with get_latest_waiting_question's own query count.
+        bind = db_session.get_bind()
+        event.listen(bind, "before_execute", _record)
+        try:
+            get_latest_waiting_question(db_session, task_id, allow_superseded=True)
+        finally:
+            event.remove(bind, "before_execute", _record)
+
+        selects = [s for s in seen if isinstance(s, Select)]
+        assert len(selects) == 1, [type(s).__name__ for s in seen]
+    finally:
+        db_session.close()
+
+
 def test_build_assistant_transcript_content_skips_empty_unknown_interactions_header():
     content = build_assistant_transcript_content("Test", [{"type": "unknown_type"}])
 

@@ -737,9 +737,34 @@ def load_task_transcript(
 
 
 def get_latest_waiting_question(
-    db: Session, task_id: int
+    db: Session, task_id: int, *, allow_superseded: bool = False
 ) -> tuple[Optional[str], Optional[list[dict[str, Any]]]]:
-    """Return the latest persisted ask-user question for a waiting task."""
+    """Return the latest persisted ask-user question for a waiting task.
+
+    Two passes, in this order, never one query over both message types.
+    The first pass is the only one that runs by default and is the same
+    query it has always been: the highest-id row still typed as a
+    question. The second runs only when the first found nothing **and**
+    the caller opened it, and looks at rows a structured publication
+    later retyped as superseded.
+
+    They are two passes rather than one ``IN`` predicate on purpose. A
+    single predicate would order both types together, so a superseded row
+    with a higher id would win over a question row that is still live --
+    the exact inversion this split makes structurally impossible instead
+    of documenting in a comment.
+
+    Only the read surface opens the second pass, and only where it has
+    established that nothing holds this task's structured answer slot.
+    Every other caller keeps the behavior it had.
+
+    The second pass deliberately does not go through
+    ``_assistant_question_filters``. That helper's contract is that the
+    reader and ``supersede_legacy_question_rows`` compile to the same
+    WHERE clause; the second pass filters on the value supersede
+    *writes*, so folding it in would assert that the writer's input set
+    equals its own output set.
+    """
 
     latest_question = (
         db.query(TaskChatMessage)
@@ -747,6 +772,17 @@ def get_latest_waiting_question(
         .order_by(TaskChatMessage.id.desc())
         .first()
     )
+    if latest_question is None and allow_superseded:
+        latest_question = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "assistant",
+                TaskChatMessage.message_type == SUPERSEDED_MESSAGE_TYPE,
+            )
+            .order_by(TaskChatMessage.id.desc())
+            .first()
+        )
     if not latest_question:
         return None, None
 
