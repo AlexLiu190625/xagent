@@ -313,18 +313,33 @@ def test_active_row_predicate_three_way_tiering(db_session) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The PostgreSQL half of the "no db.rollback()" regression test: the
-# anchor fetch's except clause narrows to sa.exc.SQLAlchemyError and
-# deliberately does not roll back. The SQLite half of this same cell lives in
-# test_task_interaction_service.py; this is the real-backend counterpart
-# the design calls for explicitly, since PostgreSQL is where a poisoned
-# transaction after an unhandled DBAPI error is actually observable.
+# The PostgreSQL half of the "no db.rollback()" regression test: the anchor
+# fetch's except clause is a whitelist of transient infrastructure failures
+# (OperationalError, InterfaceError, DisconnectionError, TimeoutError), and
+# deliberately does not roll back on any of them. The SQLite half of this
+# same cell lives in test_task_interaction_service.py; this is the
+# real-backend counterpart the design calls for explicitly, since PostgreSQL
+# is where server-side transaction state after a DBAPI failure differs from
+# SQLite's. This test drives the except clause with a synthetic,
+# monkeypatched exception -- it verifies the resolver's own behavior (no
+# rollback, no swallowed session state), not what a genuine DBAPI failure
+# does to the underlying PostgreSQL transaction; see the test's own
+# docstring.
 # ---------------------------------------------------------------------------
 
 
 def test_the_session_survives_a_failed_anchor_fetch_with_no_rollback_postgresql(
     db_session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Verifies the resolver's own behavior at the anchor fetch: it does
+    not call db.rollback() and does not swallow the caller's session state
+    when the fetch raises. Driven with a synthetic, monkeypatched exception
+    raised in Python before any statement reaches the DBAPI connection, so
+    this is not a claim about what a genuine DBAPI-level failure does to
+    the underlying PostgreSQL transaction -- that survival differs by
+    backend (SQLite keeps the caller's staged writes; PostgreSQL discards
+    them at the next commit once the server-side transaction is
+    invalidated) and is documented at the call site, not proven here."""
     db = db_session
     user_id = make_user(db)
     task_id = make_task(db, user_id=user_id)

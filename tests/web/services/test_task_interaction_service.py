@@ -1270,12 +1270,6 @@ _TRANSIENT_ANCHOR_FETCH_ERRORS: list[Any] = [
         id="DisconnectionError",
     ),
     pytest.param(
-        lambda: sa.exc.PendingRollbackError(
-            "simulated mid-transaction session failure"
-        ),
-        id="PendingRollbackError",
-    ),
-    pytest.param(
         lambda: sa.exc.TimeoutError("simulated pool checkout timeout"),
         id="TimeoutError",
     ),
@@ -1289,16 +1283,14 @@ def test_t3_checkpoint_unavailable_for_each_transient_infrastructure_error(
     monkeypatch: pytest.MonkeyPatch,
     exc_factory: Callable[[], Exception],
 ) -> None:
-    """The fallback whitelist, one cell per class: each of these five is a
+    """The fallback whitelist, one cell per class: each of these four is a
     transient, recoverable infrastructure failure (see the except
     clause's own comment on ``_resolve_read_direction_anchor`` for the
     classification), and each on its own degrades the read to
     tier="unanswerable"/reason="checkpoint_unavailable" -- not only in
-    combination with the others. Mutation: delete
-    ``sa.exc.PendingRollbackError`` from the except tuple and the
-    ``PendingRollbackError`` case in this parametrization turns red,
-    because that exception then propagates uncaught instead of
-    degrading."""
+    combination with the others. Mutation: delete any one of these four
+    from the except tuple and that case's cell turns red, because that
+    exception then propagates uncaught instead of degrading."""
 
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
     _make_active_interaction_row(
@@ -1342,6 +1334,12 @@ _NON_TRANSIENT_ANCHOR_FETCH_ERRORS: list[Any] = [
         lambda: sa.exc.NoResultFound("simulated no-result-found"),
         id="NoResultFound",
     ),
+    pytest.param(
+        lambda: sa.exc.PendingRollbackError(
+            "simulated mid-transaction session failure"
+        ),
+        id="PendingRollbackError",
+    ),
 ]
 
 
@@ -1353,14 +1351,21 @@ def test_anchor_fetch_non_transient_sqlalchemy_error_propagates_uncaught(
     exc_factory: Callable[[], Exception],
 ) -> None:
     """The fallback blacklist, mirroring the whitelist test above one
-    class at a time: each of these five is a ``sa.exc.SQLAlchemyError``
+    class at a time: each of these six is a ``sa.exc.SQLAlchemyError``
     subclass -- the old, wide ``except sa.exc.SQLAlchemyError`` used to
     swallow every one of them -- but none names a transient
-    infrastructure failure, so each must propagate to the caller instead
-    of being misclassified as "checkpoint unavailable". Mutation: widen
-    the except clause back to ``except sa.exc.SQLAlchemyError`` and every
-    case in this parametrization turns red, because all five would then
-    be swallowed and reported as tier="unanswerable" instead of
+    infrastructure failure the except tuple is meant to catch, so each
+    must propagate to the caller instead of being misclassified as
+    "checkpoint unavailable". ``PendingRollbackError`` sits here rather
+    than in the whitelist above because its source is mixed -- sometimes
+    a connection failure, sometimes a prior flush failure that left the
+    session itself unrecoverable -- and because it is unreachable at this
+    call site regardless: a session broken enough to raise it fails
+    earlier, in ``interaction_requests_table_exists``'s own
+    ``db.connection()`` call, before this fetch ever runs. Mutation:
+    widen the except clause back to ``except sa.exc.SQLAlchemyError`` and
+    every case in this parametrization turns red, because all six would
+    then be swallowed and reported as tier="unanswerable" instead of
     raising."""
 
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
@@ -2350,11 +2355,13 @@ def test_respond_reports_unavailable_when_the_interaction_row_does_not_exist(
 def test_respond_reports_unavailable_when_the_anchor_row_fetch_raises(
     _respond_db, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """_resolve_read_direction_anchor's fetch is caught on
-    sa.exc.SQLAlchemyError specifically (narrowed from a bare
-    ``except Exception``), so this cell raises that class to keep testing
-    "a session or query-layer failure", not "any Python exception" -- see
-    that resolver's own except clause for why the narrowing exists."""
+    """_resolve_read_direction_anchor's fetch is caught on a whitelist of
+    transient infrastructure failures (``OperationalError``,
+    ``InterfaceError``, ``DisconnectionError``, ``TimeoutError``), not on
+    ``sa.exc.SQLAlchemyError`` as a whole, so this cell raises a
+    whitelisted class to keep testing "a session or query-layer failure",
+    not "any Python exception" -- see that resolver's own except clause
+    for why the whitelist exists and is scoped that narrowly."""
 
     user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
