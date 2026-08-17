@@ -67,6 +67,7 @@ from xagent.web.models.task_interaction import (
     TaskInteractionRequest,
 )
 from xagent.web.models.user import User
+from xagent.web.services import ops_signals
 from xagent.web.services import task_interaction_read as read_surface
 from xagent.web.services.chat_history_service import persist_assistant_message
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
@@ -96,6 +97,31 @@ _NATIVE_INTERACTIONS = [
 
 _NATIVE_QUESTION = "Which environment?"
 _DEFAULT_WAITING_MESSAGE = "Task waiting for user response"
+
+
+@pytest.fixture(autouse=True)
+def _restore_ops_signals() -> Iterator[None]:
+    """Several tiers below (T2, T3, T3') exercise real degradation paths
+    -- ``checkpoint_pk_anchor_dangling``, ``checkpoint_load_unavailable``,
+    etc. -- that ``ops_signals.py`` deliberately never clears (see that
+    module's docstrings: an unclearable signal is how it reports "this is
+    a property of persisted data, not something this process can observe
+    getting fixed"). Left alone, those signals stay latched in the
+    process-level registry for every test that runs afterward in the same
+    process, e.g. ``tests/web/test_health_degradations.py``, whose
+    baseline-``/health`` assertion expects the registry empty. Snapshot
+    before each test here and restore after, so this file's own
+    degradation traffic never leaks past it.
+    """
+    baseline = ops_signals.active_degradations()
+    yield
+    current = ops_signals.active_degradations()
+    for name in current:
+        if name not in baseline:
+            ops_signals.clear_degradation(name)
+    for name, detail in baseline.items():
+        if current.get(name) != detail:
+            ops_signals.register_degradation(name, detail)
 
 
 # ---------------------------------------------------------------------------
