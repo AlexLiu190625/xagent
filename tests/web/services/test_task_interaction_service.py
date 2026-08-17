@@ -987,7 +987,18 @@ def test_unreadable_payload_warning_never_logs_the_rejected_question_text(
     that text into the ops log. Mutation: swap
     ``_validation_error_summary(exc)`` back for ``str(exc)[:500]`` in the
     warning's ``extra`` and this test turns red, because the canary string
-    below would then appear in a log record's ``extra``."""
+    below would then appear in a log record's ``extra``.
+
+    Also asserts the warning was actually emitted, not just absent of the
+    canary: a caplog scan over zero records passes vacuously if the log
+    line is deleted or downgraded below WARNING, which would silently
+    defeat every assertion above. Filtering to this module's logger at
+    WARNING and requiring exactly one match, then pinning that record's
+    ``validation_errors`` to the real summary this payload produces,
+    closes that hole. Mutation: delete the ``logger.warning(...)`` call,
+    or downgrade it to ``logger.debug(...)``, and the record-count
+    assertion turns red because zero matching records survive the
+    filter."""
 
     canary = "SENSITIVE-CANARY-9f2a"
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
@@ -1004,6 +1015,19 @@ def test_unreadable_payload_warning_never_logs_the_rejected_question_text(
         logging.WARNING, logger="xagent.web.services.task_interaction_service"
     ):
         svc.materialize_compatibility_view(_db, _seeded_task)
+
+    warning_records = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.web.services.task_interaction_service"
+        and record.levelno == logging.WARNING
+    ]
+    assert len(warning_records) == 1
+    (warning_record,) = warning_records
+    assert warning_record.validation_errors == [
+        "message:string_type",
+        "interactions:missing",
+    ]
 
     for record in caplog.records:
         assert canary not in record.getMessage()
