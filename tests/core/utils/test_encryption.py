@@ -188,3 +188,21 @@ def test_decrypt_env_dict_strict_raises_on_foreign_token(use_key):
     assert decrypt_env_dict(env)["B"] == foreign
     with pytest.raises(EncryptionDecodeError):
         decrypt_env_dict_strict(env)
+
+
+def test_decrypt_value_strict_reports_missing_key_not_plaintext(monkeypatch):
+    """A key configuration fault must surface, not read as "not a token".
+
+    With no usable key at all, the lenient helper quietly returns the input;
+    the strict helper must instead let get_cipher()'s ValueError out, because
+    "this deployment has no key" and "this value is plaintext" call for
+    entirely different responses.
+    """
+    monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    get_cipher.cache_clear()
+    try:
+        with pytest.raises(ValueError, match="ENCRYPTION_KEY"):
+            decrypt_value_strict("sk-abc123")
+    finally:
+        get_cipher.cache_clear()

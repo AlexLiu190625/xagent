@@ -134,9 +134,13 @@ def decrypt_value_strict(encrypted_value: str) -> str:
     """
     if not encrypted_value:
         return encrypted_value
+    # Outside the try on purpose: a missing or malformed ENCRYPTION_KEY is a
+    # configuration fault, not a property of the value, and must not be
+    # reported as "this value is not a token".
+    cipher = get_cipher()
     try:
-        return get_cipher().decrypt(encrypted_value.encode()).decode()
-    except Exception as exc:
+        return cipher.decrypt(encrypted_value.encode()).decode()
+    except InvalidToken as exc:
         if _looks_like_fernet_token(encrypted_value):
             raise EncryptionDecodeError(
                 "Value is a Fernet token but could not be decrypted with the "
