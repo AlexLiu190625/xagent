@@ -190,19 +190,74 @@ def test_decrypt_env_dict_strict_raises_on_foreign_token(use_key):
         decrypt_env_dict_strict(env)
 
 
-def test_decrypt_value_strict_reports_missing_key_not_plaintext(monkeypatch):
-    """A key configuration fault must surface, not read as "not a token".
+def test_decrypt_value_strict_reports_missing_key_for_a_token(monkeypatch):
+    """A key configuration fault must surface for a token-shaped value.
 
     With no usable key at all, the lenient helper quietly returns the input;
     the strict helper must instead let get_cipher()'s ValueError out, because
-    "this deployment has no key" and "this value is plaintext" call for
+    "this deployment has no key" and "this token cannot be opened" call for
     entirely different responses.
     """
+    token = Fernet(STRICT_KEY_A.encode()).encrypt(b"secret").decode()
     monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
     monkeypatch.setenv("ENVIRONMENT", "production")
     get_cipher.cache_clear()
     try:
         with pytest.raises(ValueError, match="ENCRYPTION_KEY"):
-            decrypt_value_strict("sk-abc123")
+            decrypt_value_strict(token)
     finally:
         get_cipher.cache_clear()
+
+
+def test_decrypt_value_strict_passes_plaintext_through_without_a_key(monkeypatch):
+    """Plaintext never needs a key, so a missing key must not turn it into an error."""
+    monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    get_cipher.cache_clear()
+    try:
+        assert decrypt_value_strict("sk-abc123") == "sk-abc123"
+    finally:
+        get_cipher.cache_clear()
+
+
+def test_decrypt_value_strict_passes_unencodable_plaintext_through(use_key):
+    """A lone surrogate cannot be UTF-8 encoded; it is plaintext, not a token."""
+    use_key(STRICT_KEY_A)
+    value = "sk-\ud800-key"
+    assert decrypt_value_strict(value) == value
+
+
+def test_decrypt_value_strict_binary_plaintext_raises_without_the_bytes(use_key):
+    """A token whose plaintext is not UTF-8 raises the typed error and keeps
+    the decrypted bytes out of the exception entirely -- not in the message,
+    not in args, and not reachable through __cause__ or __context__."""
+    use_key(STRICT_KEY_A)
+    secret = b"\xff\xfe\x00secret-bytes"
+    token = get_cipher().encrypt(secret).decode()
+    with pytest.raises(EncryptionDecodeError) as excinfo:
+        decrypt_value_strict(token)
+    exc = excinfo.value
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    assert b"secret-bytes" not in repr(exc.args).encode()
+    assert "secret-bytes" not in str(exc)
+
+
+@pytest.mark.parametrize("cut", [4, 8, 12, 16, 20])
+def test_decrypt_value_strict_truncated_token_still_raises(use_key, cut):
+    """A token that lost a few base64 characters in transit is still reported.
+
+    Its decoded length is no longer a whole number of AES blocks, so no key
+    could open it -- but it is ciphertext, and handing it back as if it were
+    plaintext is exactly the outcome the strict helper exists to prevent.
+    The shape floor is a minimum, not an alignment rule, on purpose: a
+    two-block token (89 raw bytes) cut by 4..20 base64 characters decodes to
+    87/84/81/78/75 bytes, all still above the floor and all still reported.
+    (A one-block token is already at the floor, so a truncated one falls
+    below it under any rule; this test uses the two-block case.)
+    """
+    use_key(STRICT_KEY_A)
+    token = get_cipher().encrypt(b"a-secret-of-20-bytes").decode()
+    truncated = token[:-cut]
+    with pytest.raises(EncryptionDecodeError):
+        decrypt_value_strict(truncated)

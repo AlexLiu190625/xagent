@@ -134,20 +134,38 @@ def decrypt_value_strict(encrypted_value: str) -> str:
     """
     if not encrypted_value:
         return encrypted_value
-    # Outside the try on purpose: a missing or malformed ENCRYPTION_KEY is a
-    # configuration fault, not a property of the value, and must not be
-    # reported as "this value is not a token".
-    cipher = get_cipher()
-    try:
-        return cipher.decrypt(encrypted_value.encode()).decode()
-    except InvalidToken as exc:
-        if _looks_like_fernet_token(encrypted_value):
-            raise EncryptionDecodeError(
-                "Value is a Fernet token but could not be decrypted with the "
-                "configured encryption key"
-            ) from exc
+    # Shape first, key second. A value that is not token-shaped is passed
+    # through without ever asking for a key, so a missing or malformed
+    # ENCRYPTION_KEY cannot turn plaintext into an error; and because the
+    # shape check never encodes the value itself, a string that cannot be
+    # UTF-8 encoded is simply "not a token" here rather than a raw
+    # UnicodeEncodeError. Only a token-shaped value needs the cipher, and for
+    # it a key configuration fault is exactly what should surface.
+    if not _looks_like_fernet_token(encrypted_value):
         logger.debug("Value is not a Fernet token; returning it unchanged")
         return encrypted_value
+    cipher = get_cipher()
+    try:
+        plaintext = cipher.decrypt(encrypted_value.encode())
+    except InvalidToken as exc:
+        raise EncryptionDecodeError(
+            "Value is a Fernet token but could not be decrypted with the "
+            "configured encryption key"
+        ) from exc
+    # Decode outside any except block so the error carries no reference to
+    # the decrypted bytes: UnicodeDecodeError keeps them in .object/.args, and
+    # `raise ... from None` would still leave it reachable via __context__.
+    text: str | None
+    try:
+        text = plaintext.decode()
+    except UnicodeDecodeError:
+        text = None
+    if text is None:
+        raise EncryptionDecodeError(
+            "Value is a Fernet token that decrypted, but its content is not "
+            "valid UTF-8 text"
+        )
+    return text
 
 
 def decrypt_env_dict_strict(env: dict | None) -> dict | None:
