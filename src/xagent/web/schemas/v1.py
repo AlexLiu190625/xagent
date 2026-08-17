@@ -609,18 +609,18 @@ class TaskInfoResponse(BaseModel):
     pending_interaction: Optional[PendingInteraction] = Field(
         None,
         description=(
-            "Convenience projection of the agent's most recent question. "
-            "Always present in the response body, but null unless "
-            "status='waiting_for_user' AND the task has at least one "
-            "persisted question message. A task can reach waiting_for_user "
-            "with no question ever recorded (e.g. an empty message body), "
-            "in which case this field is null too -- but if an earlier "
-            "turn already persisted a question, this field surfaces that "
-            "earlier question rather than null, since the read returns "
-            "the latest persisted question row regardless of which turn "
-            "wrote it. This is a convenience read, not the historical "
-            "interaction record; see #1079 for the full typed interaction "
-            "surface."
+            "Convenience projection of the current pending question on a "
+            "waiting task. Always present in the response body, but null "
+            "unless status='waiting_for_user'. Null even while waiting "
+            "when: no question has ever been recorded for the task; the "
+            "task's persisted interaction row exists but cannot be read "
+            "back (its resume anchor is missing or dangling); or the row's "
+            "protocol version is not one this reader recognizes. In all of "
+            "those cases the task itself stays in waiting_for_user -- a "
+            "null field here reflects an unreadable or absent question, "
+            "not a resolved one. This is a convenience read, not the "
+            "historical interaction record; see #1079 for the full typed "
+            "interaction surface."
         ),
     )
 

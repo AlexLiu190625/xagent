@@ -74,7 +74,6 @@ answer, written here because this adapter's projection depends on them:
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any
 
 from ..models.task_interaction import INTERACTION_PROTOCOL_VERSION
@@ -85,8 +84,6 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
     from ..models.task import Task
-
-logger = logging.getLogger(__name__)
 
 __all__ = ["get_pending_interaction_question"]
 

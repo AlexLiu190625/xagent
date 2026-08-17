@@ -1300,8 +1300,8 @@ class CompatibilityQuestionView:
     """The rich three-tier result ``materialize_compatibility_view``
     produces. Not the legacy ``(question, interactions)`` tuple
     ``chat_history_service.get_latest_waiting_question`` returns -- that
-    lossy projection, and the five call sites that consume it, belong to
-    a later adapter change (see the module docstring), which
+    lossy projection, and the five call sites that consume it, are handled
+    by ``task_interaction_read.get_pending_interaction_question``, which
     imports this type and projects it down. ``reason`` carries the reason
     code #1079's endpoint needs and the legacy tuple has no slot for; it is
     only set on the ``"unanswerable"`` tier.
@@ -1376,15 +1376,15 @@ def materialize_compatibility_view(
     Remove or silence that signal and this tier's projection has to be
     decided again.
 
-    Consumers, and how much of this result they get: a later
-    adapter (not written here) projects this down to the legacy
-    ``(question, interactions)`` tuple for the five existing call sites,
-    dropping ``reason`` -- lossy by design, not an oversight. Four of the
-    five already hold a loaded ``Task`` row when they need the answer; the
-    fifth resolves and authorizes one first, inside a worker-owned short
-    session, before calling this view. #1079's own endpoint (not written
-    here) is meant to consume this rich result directly, keeping
-    ``reason`` for its own outcome classification.
+    Consumers, and how much of this result they get:
+    ``task_interaction_read.get_pending_interaction_question`` projects
+    this down to the legacy ``(question, interactions)`` tuple for the
+    five existing call sites, dropping ``reason`` -- lossy by design, not
+    an oversight. Four of the five already hold a loaded ``Task`` row when
+    they need the answer; the fifth resolves and authorizes one first,
+    inside a worker-owned short session, before calling this view. #1079's
+    own endpoint (not written here) is meant to consume this rich result
+    directly, keeping ``reason`` for its own outcome classification.
 
     ``allow_superseded`` is threaded straight through to the legacy tier's
     reader and changes nothing else: when this view has established that
