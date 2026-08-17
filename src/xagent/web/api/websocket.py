@@ -7171,8 +7171,13 @@ def _load_historical_stream_snapshot_sync(
                 question_message = None
                 question_interactions = None
                 if task.status == TaskStatus.WAITING_FOR_USER:
+                    # Same task, same db session, no await between this branch
+                    # and the task_info block above: reuse its already-fetched
+                    # result instead of querying get_pending_interaction_question
+                    # a second time for a value that cannot have changed.
                     question_message, question_interactions = (
-                        get_pending_interaction_question(db, task)
+                        waiting_question,
+                        waiting_interactions,
                     )
 
                 message = question_message or default_message
