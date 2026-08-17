@@ -215,17 +215,29 @@ class Task(Base):  # type: ignore
     # Why a column on tasks rather than an EXISTS over
     # task_interaction_requests: the read surface's first check is
     # "interaction_protocol_version != 1 -> legacy path, ask the interaction
-    # table nothing". All four waiting-question consumers already hold a
+    # table nothing". All five waiting-question consumers already hold a
     # loaded Task row when they need the answer, so that check is a free
     # attribute access -- while an EXISTS derivation would cost one
     # cross-table query per waiting-status read, on paths that include the
-    # websocket's synchronous snapshot. While every waiting task predates
-    # the native protocol (and during any rollback), the marker is NULL for
-    # all of them and the interaction table receives zero queries from the
-    # read path. The marker only ever decides priority, never whether the
-    # legacy fallback exists: readers fall back unconditionally when no
-    # active row matches, so a stale marker degrades to the legacy question
-    # rather than corrupting anything.
+    # websocket's synchronous snapshot. The fifth consumer runs in a
+    # worker-owned short session of its own rather than a request-scoped
+    # one, but it resolves and loads the same Task row before asking, so
+    # the same free-attribute-access argument applies to it unchanged.
+    # While every waiting task predates the native protocol (and during
+    # any rollback), the marker is NULL for all of them and the
+    # interaction table receives zero queries from the read path.
+    #
+    # Falling back to the legacy transcript is gated on the interaction
+    # slot being unclaimed, not on the structured side having failed to
+    # produce a question. Exactly two situations count as unclaimed: the
+    # interaction table does not exist yet, or this task has no active
+    # native row **on its current run**. As long as one active native row
+    # on this task's current run holds the slot, the read surface never
+    # falls back -- whether or not that row can be read. A row left
+    # behind by an earlier run does not hold the slot: the read
+    # surface's active-row predicate compares the row's run against the
+    # task's, so a stale one is invisible and the legacy fallback is
+    # correct there.
     interaction_protocol_version = Column(Integer, nullable=True)
 
     # Model configuration
