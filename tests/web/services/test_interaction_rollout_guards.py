@@ -280,10 +280,8 @@ def _protocol_marker_comparisons(tree: ast.Module) -> list[tuple[int, str]]:
     exact attribute (``marker = <obj>.interaction_protocol_version``
     followed later by ``marker != ...``) -- the read surface's own step 0
     reads the marker into a local once and compares that, rather than
-    comparing the attribute inline, precisely because the same local is
-    reused a second time (``allow_superseded=marker is None``) a few
-    lines down; a guard that only recognized the inline shape would be
-    blind to that, entirely ordinary, style.
+    comparing the attribute inline, an entirely ordinary style a guard
+    that only recognized the inline shape would be blind to.
 
     This is a whole-module scan, not a scope-aware one: an assignment
     anywhere in the module can alias a name compared anywhere else in the
@@ -298,9 +296,8 @@ def _protocol_marker_comparisons(tree: ast.Module) -> list[tuple[int, str]]:
     need this widened first.
 
     A ``marker is None`` comparison against an aliased name is excluded
-    outright, not merely allowed to differ from the named constant: the
-    read surface compares the same local against ``None`` a second time,
-    for an unrelated question (has a marker ever been published at all,
+    outright, not merely allowed to differ from the named constant: it
+    asks an unrelated question (has a marker ever been published at all,
     not which version it names), and ``None`` has no version number to
     drift out of sync with a constant.
     """
@@ -349,17 +346,24 @@ def _protocol_marker_comparisons(tree: ast.Module) -> list[tuple[int, str]]:
     return found
 
 
-def test_tw1d_read_surface_compares_the_marker_through_the_named_constant():
-    """The read surface's protocol check must name
-    ``INTERACTION_PROTOCOL_VERSION``, never the literal it happens to
-    equal today. A second protocol version is exactly the change that
-    would leave a stray literal behind, silently pinning the read surface
-    to version 1 while the rest of the system moved on.
-    """
+def test_tw1d_read_surface_never_compares_the_marker_through_a_bare_literal():
+    """The read surface's own step 0 now only asks whether a native row
+    was ever staged at all (``marker is None``, excluded from ``found``
+    -- see ``_protocol_marker_comparisons``'s own docstring) and no
+    longer decides *which* version it names; that recognition now lives
+    with ``materialize_compatibility_view``'s own check on the
+    interaction row's ``protocol_version`` field, a different attribute
+    this scanner does not match. So this module is not expected to
+    contain any ``interaction_protocol_version``-vs-version comparison
+    today -- but if one is ever added back here, it must name
+    ``INTERACTION_PROTOCOL_VERSION``, never a bare literal that would
+    silently drift out of sync with a second protocol version. Mutation:
+    add ``if marker != 1: ...`` back to the read surface and this test
+    turns red (see test_tw1d_guard_flags_a_planted_literal_comparison for
+    the same check against synthetic source)."""
 
     tree = _parse(_module_source_path(task_interaction_read_module))
     comparisons = _protocol_marker_comparisons(tree)
-    assert comparisons, "the read surface no longer compares the protocol marker"
     offenders = [
         (line, shape)
         for line, shape in comparisons

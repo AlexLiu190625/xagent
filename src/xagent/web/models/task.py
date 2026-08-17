@@ -214,9 +214,11 @@ class Task(Base):  # type: ignore
     #
     # Why a column on tasks rather than an EXISTS over
     # task_interaction_requests: the read surface's first check is
-    # "interaction_protocol_version != 1 -> legacy path, ask the interaction
-    # table nothing". All five waiting-question consumers already hold a
-    # loaded Task row when they need the answer, so that check is a free
+    # "interaction_protocol_version is NULL -> legacy path, ask the
+    # interaction table nothing; any other value -> ask the rich view,
+    # which is the only place that knows whether an active native row
+    # exists". All five waiting-question consumers already hold a loaded
+    # Task row when they need the answer, so the NULL check is a free
     # attribute access -- while an EXISTS derivation would cost one
     # cross-table query per waiting-status read, on paths that include the
     # websocket's synchronous snapshot. The fifth consumer runs in a

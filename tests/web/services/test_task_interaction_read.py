@@ -254,16 +254,26 @@ def test_a3_marker_null_prefers_the_live_row_over_a_higher_id_superseded_row(
     assert interactions == [{"type": "text_input", "label": "Live"}]
 
 
-def test_a4_unrecognized_marker_stays_closed(_db: Session) -> None:
-    """A marker that is neither 1 nor NULL means the structured side's
-    state is unknown, so the second pass stays shut -- unlike the NULL
-    cell above. The marker is set on the in-memory ORM object without a
-    commit: ck_tasks_interaction_protocol_version pins the column to
-    NULL-or-1 in the database, so persisting 2 would fail the CHECK; this
-    adapter only ever reads the attribute, never writes it, so exercising
-    the branch this way is faithful to what the adapter actually does.
-    Mutation: change the gate condition to ``marker != 1`` and this test
-    turns red (a superseded-only row would then be returned)."""
+def test_a4_unrecognized_marker_still_routes_through_the_rich_view(
+    _db: Session,
+) -> None:
+    """A marker that is neither 1 nor NULL is not the fast-path's business
+    to interpret -- only NULL means no native row was ever staged and skips
+    the interaction table. Any other value, including one this reader does
+    not otherwise recognize, is handed to the rich view, which is the only
+    place that knows whether an active native row exists. Here there is no
+    active row, so the rich view's own T1 fallback answers from the legacy
+    transcript with the supersede gate open (the same as the NULL cell),
+    which is how this differs from the old fast-path routing: that path
+    used to answer directly with the gate closed and never see the row at
+    all. The marker is set on the in-memory ORM object without a commit:
+    ck_tasks_interaction_protocol_version pins the column to NULL-or-1 in
+    the database, so persisting 2 would fail the CHECK; this adapter only
+    ever reads the attribute, never writes it, so exercising the branch
+    this way is faithful to what the adapter actually does.
+    Mutation: change the gate condition back to ``marker != 1`` (the
+    pre-fix routing) and this test turns red -- the superseded row would
+    no longer be returned."""
 
     task = _make_task(_db, marker=None)
     persist_assistant_message(
@@ -278,7 +288,55 @@ def test_a4_unrecognized_marker_stays_closed(_db: Session) -> None:
 
     question, interactions = read_surface.get_pending_interaction_question(_db, task)
 
-    assert (question, interactions) == (None, None)
+    assert question is not None
+    assert question.startswith("An old question")
+    assert interactions == [{"type": "text_input", "label": "Old"}]
+
+
+def test_a4b_unrecognized_marker_with_an_active_native_row_never_leaks_the_legacy_question(
+    _db: Session,
+) -> None:
+    """The invariant this fixes: once an active native row holds this
+    task's current-run answer slot, the read surface must never surface a
+    legacy transcript question instead, no matter what value happens to
+    sit in ``tasks.interaction_protocol_version``. A marker of 2 used to
+    take the fast path (``marker != 1``) and answer straight from the
+    transcript without ever looking at the interaction table, exposing a
+    stale legacy question while a native row was live. Mutation: change
+    the gate condition back to ``marker != 1`` and this test turns red --
+    the legacy question would be returned instead of the native one."""
+
+    task = _make_task(_db, marker=None)
+    persist_assistant_message(
+        _db,
+        int(task.id),
+        int(task.user_id),
+        "A live legacy question",
+        message_type="question",
+        interactions=[{"type": "text_input", "label": "Legacy"}],
+    )
+    trace_event_id = _make_trace_event(_db, task_id=int(task.id))
+    _make_active_row(_db, task_id=int(task.id), resume_trace_event_id=trace_event_id)
+    task.interaction_protocol_version = 2
+
+    question, interactions = read_surface.get_pending_interaction_question(_db, task)
+
+    assert question == "Which environment?"
+    assert interactions == [
+        {
+            "type": "text_input",
+            "field": "env",
+            "label": "Environment",
+            "options": None,
+            "placeholder": None,
+            "multiline": False,
+            "min": None,
+            "max": None,
+            "default_value": None,
+            "accept": None,
+            "multiple": False,
+        }
+    ]
 
 
 def test_a5_marker_fast_path_never_calls_the_rich_view(

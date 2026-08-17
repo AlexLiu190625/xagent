@@ -6,11 +6,14 @@ Two steps, in this order, and nothing else:
 
 1. The protocol marker fast path. ``tasks.interaction_protocol_version``
    decides whether this task can have a native interaction row at all.
-   When it is not the version this reader speaks, the interaction table
-   is not queried at all -- the legacy transcript reader answers
-   directly. Every consumer already holds a loaded ``Task`` row when it
-   needs the answer, so this check costs one attribute access on a row
-   that is already in memory, not a query.
+   Only a NULL marker means no native row was ever staged for this
+   task's current wait, so only then does the interaction table go
+   unqueried -- the legacy transcript reader answers directly. Every
+   other marker value is handed to step 2, which is the only place that
+   knows whether an active native row exists and, if so, what tier it
+   reads as. Every consumer already holds a loaded ``Task`` row when it
+   needs the answer, so the NULL check costs one attribute access on a
+   row that is already in memory, not a query.
 2. Otherwise ``materialize_compatibility_view`` -- the single rich
    implementation of "what is this waiting task's question" -- decides
    the tier, and this function projects its result down to the tuple.
@@ -76,7 +79,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from ..models.task_interaction import INTERACTION_PROTOCOL_VERSION
 from .chat_history_service import get_latest_waiting_question
 from .task_interaction_service import materialize_compatibility_view
 
@@ -99,18 +101,13 @@ def get_pending_interaction_question(
     """
 
     marker = task.interaction_protocol_version
-    if marker != INTERACTION_PROTOCOL_VERSION:
-        # No native row can belong to this task under a marker this
-        # reader does not speak, so the interaction table is not queried.
-        # A NULL marker means no structured row was ever published for
-        # this task's current wait, which is the one case where a
-        # transcript row that a later structured publication superseded
-        # is still the honest answer -- hence the second pass. Any other
-        # unrecognized value leaves the structured side's state unknown,
-        # so the second pass stays shut.
-        return get_latest_waiting_question(
-            db, int(task.id), allow_superseded=marker is None
-        )
+    if marker is None:
+        # No native row can belong to this task under a NULL marker, so
+        # the interaction table is not queried. NULL also means no
+        # structured row was ever published for this task's current
+        # wait, which is why a transcript row that a later structured
+        # publication superseded is still the honest answer here.
+        return get_latest_waiting_question(db, int(task.id), allow_superseded=True)
 
     view = materialize_compatibility_view(db, int(task.id), allow_superseded=True)
     if view.tier == "unanswerable":
