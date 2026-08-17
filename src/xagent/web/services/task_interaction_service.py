@@ -1309,6 +1309,23 @@ def _legacy_view(db: "Session", task_id: int) -> CompatibilityQuestionView:
     )
 
 
+def _validation_error_summary(exc: _PydanticValidationError) -> list[str]:
+    """Which fields failed validation and how -- never what was in them.
+
+    ``str(ValidationError)`` embeds ``input_value=``, and for this payload
+    the input is the question text written for an end user. This summary
+    is built from ``errors()`` with the input and the docs URL excluded,
+    keeping the field path and the error type and nothing else. Capped so
+    a payload with many fields cannot turn one log record into a dump.
+    """
+
+    summary: list[str] = []
+    for error in exc.errors(include_url=False, include_input=False)[:10]:
+        location = ".".join(str(part) for part in error.get("loc", ()))
+        summary.append(f"{location or '<root>'}:{error.get('type', 'unknown')}")
+    return summary
+
+
 def materialize_compatibility_view(
     db: "Session", task_id: int
 ) -> CompatibilityQuestionView:
@@ -1381,7 +1398,10 @@ def materialize_compatibility_view(
         logger.warning(
             "active native interaction row failed v1 payload validation; "
             "falling back to the legacy transcript",
-            extra={"task_id": task_id, "validation_error": str(exc)[:500]},
+            extra={
+                "task_id": task_id,
+                "validation_errors": _validation_error_summary(exc),
+            },
         )
         return _legacy_view(db, task_id)
 

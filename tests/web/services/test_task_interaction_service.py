@@ -977,6 +977,45 @@ def test_t1_falls_back_to_legacy_when_request_payload_does_not_parse(
     assert view.tier == "legacy"
 
 
+def test_unreadable_payload_warning_never_logs_the_rejected_question_text(
+    _db: Session, _seeded_task: int, caplog
+) -> None:
+    """B3 (S-1, the privacy line): the validation-failure log line must
+    never carry the payload's own content. pydantic's str(ValidationError)
+    embeds ``input_value=``, and for this payload the input is the
+    question text an end user wrote -- logging it verbatim would leak
+    that text into the ops log. Mutation: swap
+    ``_validation_error_summary(exc)`` back for ``str(exc)[:500]`` in the
+    warning's ``extra`` and this test turns red, because the canary string
+    below would then appear in a log record's ``extra``."""
+
+    canary = "SENSITIVE-CANARY-9f2a"
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db,
+        task_id=_seeded_task,
+        resume_trace_event_id=trace_event_id,
+        # "message" must be a string per the v1 shape; an int forces a
+        # validation failure while carrying the canary text in the payload
+        # a real end-user question would occupy.
+        request_payload={"message": 12345, "marker_text": canary},
+    )
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.web.services.task_interaction_service"
+    ):
+        svc.materialize_compatibility_view(_db, _seeded_task)
+
+    for record in caplog.records:
+        assert canary not in record.getMessage()
+        assert canary not in repr(record.args)
+        extra_values = {
+            key: value
+            for key, value in vars(record).items()
+            if key not in logging.LogRecord("", 0, "", 0, "", (), None).__dict__
+        }
+        assert canary not in repr(extra_values)
+
+
 def test_t2_native_projection_when_the_anchor_resolves(
     _db: Session, _seeded_task: int
 ) -> None:
