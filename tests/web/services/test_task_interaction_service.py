@@ -138,6 +138,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import task_interaction_service as svc
+from xagent.web.services.chat_history_service import persist_assistant_message
 from xagent.web.services.ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
     CHECKPOINT_PK_ANCHOR_DANGLING,
@@ -916,6 +917,40 @@ def test_t1_falls_back_to_legacy_when_there_is_no_active_row(
     assert view.tier == "legacy"
     assert view.question is None
     assert view.interactions is None
+
+
+def test_allow_superseded_threads_through_to_the_legacy_reader(
+    _db: Session, _seeded_task: int
+) -> None:
+    """B5: materialize_compatibility_view's allow_superseded keyword must
+    reach get_latest_waiting_question's own gate, not stop at
+    _legacy_view. Default call sees nothing (the superseded row is
+    invisible to the closed default); the opened call reads it. Mutation:
+    hard-code the argument _legacy_view passes through as False and this
+    test's second half turns red -- the opened call would then see
+    (None, None) too."""
+
+    persist_assistant_message(
+        _db,
+        _seeded_task,
+        make_user(_db),
+        "An old question",
+        message_type="question_superseded",
+        interactions=[{"type": "text_input", "label": "Old"}],
+    )
+
+    closed = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert closed.tier == "legacy"
+    assert closed.question is None
+    assert closed.interactions is None
+
+    opened = svc.materialize_compatibility_view(
+        _db, _seeded_task, allow_superseded=True
+    )
+    assert opened.tier == "legacy"
+    assert opened.question is not None
+    assert opened.question.startswith("An old question")
+    assert opened.interactions == [{"type": "text_input", "label": "Old"}]
 
 
 def test_t1_falls_back_to_legacy_when_task_run_id_is_null(_db: Session) -> None:
