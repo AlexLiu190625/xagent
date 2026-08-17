@@ -18,9 +18,9 @@ Two steps, in this order, and nothing else:
 This function performs **no authorization**. It takes a ``Task`` object,
 not an id, precisely so that a caller has to have resolved and
 authorized that row through its own layer first. All five callers do
-(three request-scoped handlers, one connection-scoped snapshot builder,
-and one worker-owned short session that resolves through
-``_resolve_task_or_404``). A new caller that has not is a bug in that
+(two request-scoped handlers, one connection-scoped snapshot builder
+that calls it twice, and one worker-owned short session that resolves
+through ``_resolve_task_or_404``). A new caller that has not is a bug in that
 caller, not something this function can detect.
 
 What the tuple cannot carry, and why that is accepted:

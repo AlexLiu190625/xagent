@@ -14,9 +14,9 @@ already do), then every call site's own wire shape -- an HTTP JSON body
 for four of them, a detached in-process snapshot for the other two -- is
 asserted against that tier's known projection.
 
-Call sites and how each is driven, per the delivery's own instruction not
-to invent test infrastructure the five production entry points do not
-already have:
+Call sites and how each is driven. Each is exercised through the same
+entry point production uses -- no test-only seam is invented for any of
+the five, so what these cells pin is the wire shape a client would see:
 
   1. ``GET /api/chat/task/{id}``            -- chat.py, HTTP
   2. ``GET /api/chat/task/{id}/status``      -- chat.py, HTTP
@@ -672,7 +672,7 @@ def test_v1_pending_interaction_is_null_when_both_slots_are_empty(
 
 
 # ---------------------------------------------------------------------------
-# Mixed-version matrix (O-W4-10): a question the legacy writer wrote is
+# Mixed-version matrix, old writer / new reader: a question the legacy writer wrote is
 # still readable through the new read surface, whether or not the reading
 # task ever picked up a protocol marker. Asserted at the read surface's
 # own entry point, not through any one call site -- the point is the
@@ -708,7 +708,7 @@ def test_old_writer_new_reader_legacy_question_is_still_readable_without_a_marke
 def test_old_writer_new_reader_legacy_question_is_still_readable_with_no_active_row(
     _environment: _Environment,
 ) -> None:
-    """The matrix cell the PR body names directly: the reading task has
+    """Old writer, new reader, marker present: the reading task has
     picked up the marker (interaction_protocol_version == 1) but the
     interaction table holds no active row for it -- the rich view's own
     "no active row" tier -- so the legacy writer's question is still the
