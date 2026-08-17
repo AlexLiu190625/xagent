@@ -22,9 +22,11 @@ import pytest
 
 import xagent.web.api.a2a as a2a_module
 import xagent.web.api.chat as chat_module
+import xagent.web.api.v1.tasks as v1_tasks_module
 import xagent.web.api.websocket as websocket_module
 import xagent.web.models.task_interaction as task_interaction_module
 import xagent.web.services.chat_history_service as chat_history_service_module
+import xagent.web.services.task_interaction_read as task_interaction_read_module
 
 pytestmark = pytest.mark.skipif(
     sys.version_info < (3, 11),
@@ -39,6 +41,16 @@ _IMPORT_GUARD_MODULES = {
     "chat.py": chat_module,
     "chat_history_service.py": chat_history_service_module,
     "a2a.py": a2a_module,
+    # The tuple adapter and the fifth consumption point. Both are read
+    # side: the adapter answers "what is this task asking" and the v1
+    # snapshot builder consumes it, and neither may reach for the
+    # publication gate. Note what this half does and does not prove: it
+    # rejects an import statement in these files themselves, not a
+    # transitive one -- the adapter imports the interaction service,
+    # which does import the rollout module for an unrelated counter. The
+    # function half below is what covers the reference itself.
+    "task_interaction_read.py": task_interaction_read_module,
+    "v1/tasks.py": v1_tasks_module,
 }
 
 # websocket.py is explicitly, by name, exempted from the module-half check:
@@ -117,23 +129,31 @@ _BANNED_NAMES = frozenset(
     }
 )
 
-# The 5 closure seeds are not 3: get_task and get_task_status's own bodies
+# The 7 closure seeds are not 3: get_task and get_task_status's own bodies
 # (the code outside their nested _get_task_sync / _get_task_status_sync
 # definitions) are themselves part of the read path -- they are the
 # *callers* of the nested sync functions, not reachable *from* them, so a
 # scan that only checked the 3 innermost functions would miss a banned name
-# referenced directly in the outer function body.
+# referenced directly in the outer function body. Two more seeds were added
+# alongside the tuple adapter: the adapter's own entry point is the one
+# function every waiting-status read now funnels through, and the fifth
+# consumption point (v1's task info snapshot builder) had no closure-half
+# coverage at all before this.
 _CLOSURE_SEEDS = [
     ("chat.py", "get_task"),
     ("chat.py", "get_task._get_task_sync"),
     ("chat.py", "get_task_status"),
     ("chat.py", "get_task_status._get_task_status_sync"),
     ("websocket.py", "_load_historical_stream_snapshot_sync"),
+    ("task_interaction_read.py", "get_pending_interaction_question"),
+    ("v1/tasks.py", "_load_task_info_snapshot"),
 ]
 
 _SOURCE_BY_LABEL = {
     "chat.py": chat_module,
     "websocket.py": websocket_module,
+    "task_interaction_read.py": task_interaction_read_module,
+    "v1/tasks.py": v1_tasks_module,
 }
 
 
@@ -241,6 +261,124 @@ def test_tw1b_closure_seeds_reference_no_banned_names():
     # walks through control-flow wrappers for exactly this reason.
     hits = _scan_closure_for_banned_names()
     assert hits == {}, f"read-side consumer(s) reference the rollout module: {hits}"
+
+
+# ---------------------------------------------------------------------------
+# The protocol marker literal guard: the read surface's comparison against
+# interaction_protocol_version must name INTERACTION_PROTOCOL_VERSION, not
+# the literal it happens to equal today.
+# ---------------------------------------------------------------------------
+
+
+def _protocol_marker_comparisons(tree: ast.Module) -> list[tuple[int, str]]:
+    """Every comparison against ``interaction_protocol_version`` in a
+    parsed module, as (line, comparator source shape).
+
+    Counts two shapes, not just the direct one: comparing the attribute
+    itself (``<obj>.interaction_protocol_version != ...``), or comparing
+    a local variable that was assigned, in one direct step, from that
+    exact attribute (``marker = <obj>.interaction_protocol_version``
+    followed later by ``marker != ...``) -- the read surface's own step 0
+    reads the marker into a local once and compares that, rather than
+    comparing the attribute inline, precisely because the same local is
+    reused a second time (``allow_superseded=marker is None``) a few
+    lines down; a guard that only recognized the inline shape would be
+    blind to that, entirely ordinary, style.
+
+    This is a whole-module scan, not a scope-aware one: an assignment
+    anywhere in the module can alias a name compared anywhere else in the
+    module. Disclosed blind spots, not fixed here because this module has
+    exactly one caller to cover: a name reused for something unrelated in
+    a different function is not distinguished from a real alias, and
+    conditional rebinding is not modeled at all -- a name reassigned to
+    something else in a later branch of the same function is still
+    treated as an alias for the rest of that function. Both are provably
+    fine for the one production caller this guards; a second caller
+    reusing the same local variable name for an unrelated value would
+    need this widened first.
+
+    A ``marker is None`` comparison against an aliased name is excluded
+    outright, not merely allowed to differ from the named constant: the
+    read surface compares the same local against ``None`` a second time,
+    for an unrelated question (has a marker ever been published at all,
+    not which version it names), and ``None`` has no version number to
+    drift out of sync with a constant.
+    """
+
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "interaction_protocol_version"
+        ):
+            aliases.add(node.targets[0].id)
+
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        left = node.left
+        is_direct_attribute = (
+            isinstance(left, ast.Attribute)
+            and left.attr == "interaction_protocol_version"
+        )
+        is_marker_alias = isinstance(left, ast.Name) and left.id in aliases
+        if not (is_direct_attribute or is_marker_alias):
+            continue
+        if len(node.comparators) == 1 and (
+            isinstance(node.comparators[0], ast.Constant)
+            and node.comparators[0].value is None
+        ):
+            # An aliased marker is legitimately compared against None a
+            # second time in the read surface (``marker is None``, to
+            # decide whether to open the supersede gate) -- that is a
+            # presence check, not a "which version" check, and has no
+            # literal to pin to a constant: None can never drift the way
+            # a hardcoded version number could.
+            continue
+        for comparator in node.comparators:
+            if isinstance(comparator, ast.Name):
+                found.append((node.lineno, comparator.id))
+            elif isinstance(comparator, ast.Constant):
+                found.append((node.lineno, repr(comparator.value)))
+            else:
+                found.append((node.lineno, type(comparator).__name__))
+    return found
+
+
+def test_tw1d_read_surface_compares_the_marker_through_the_named_constant():
+    """The read surface's protocol check must name
+    ``INTERACTION_PROTOCOL_VERSION``, never the literal it happens to
+    equal today. A second protocol version is exactly the change that
+    would leave a stray literal behind, silently pinning the read surface
+    to version 1 while the rest of the system moved on.
+    """
+
+    tree = _parse(_module_source_path(task_interaction_read_module))
+    comparisons = _protocol_marker_comparisons(tree)
+    assert comparisons, "the read surface no longer compares the protocol marker"
+    offenders = [
+        (line, shape)
+        for line, shape in comparisons
+        if shape != "INTERACTION_PROTOCOL_VERSION"
+    ]
+    assert offenders == [], f"marker compared against a non-constant: {offenders}"
+
+
+def test_tw1d_guard_flags_a_planted_literal_comparison(tmp_path):
+    """The guard's own destructive check: a literal comparison must be
+    reported, not silently accepted."""
+
+    planted = tmp_path / "planted.py"
+    planted.write_text(
+        "def read(task):\n"
+        "    if task.interaction_protocol_version != 1:\n"
+        "        return None\n"
+    )
+    assert _protocol_marker_comparisons(_parse(planted)) == [(2, "1")]
 
 
 # ---------------------------------------------------------------------------
