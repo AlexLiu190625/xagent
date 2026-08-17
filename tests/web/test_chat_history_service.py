@@ -228,7 +228,7 @@ def test_get_latest_waiting_question_returns_latest_question_only():
 
 
 def test_get_latest_waiting_question_default_does_not_open_the_superseded_pass():
-    """C1: with only a superseded row on the task and no open question,
+    """With only a superseded row on the task and no open question,
     the default (closed) call must return (None, None), not the
     superseded row's content. Mutation: flip the default to True and this
     test turns red."""
@@ -252,7 +252,7 @@ def test_get_latest_waiting_question_default_does_not_open_the_superseded_pass()
 
 
 def test_get_latest_waiting_question_open_reads_a_superseded_row():
-    """C2: with the second pass opened and only a superseded row present,
+    """With the second pass opened and only a superseded row present,
     the reader returns that row's content instead of (None, None)."""
     db_session = _create_db_session()
     try:
@@ -278,7 +278,7 @@ def test_get_latest_waiting_question_open_reads_a_superseded_row():
 
 
 def test_get_latest_waiting_question_open_prefers_a_live_question_over_a_superseded_row():
-    """C3: a live question row must win over a superseded row with a
+    """A live question row must win over a superseded row with a
     higher id, even with the second pass opened -- the two-pass split is
     what makes this ordering structural rather than incidental. Mutation:
     collapse the two passes into one
@@ -317,7 +317,7 @@ def test_get_latest_waiting_question_open_prefers_a_live_question_over_a_superse
 
 
 def test_get_latest_waiting_question_open_emits_one_select_when_the_first_pass_hits():
-    """C4: when the first pass already finds a live question, the second
+    """When the first pass already finds a live question, the second
     pass must not run at all -- opening the gate does not mean always
     paying for two queries. Mutation: make the second pass run
     unconditionally and this test turns red."""

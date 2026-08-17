@@ -44,9 +44,10 @@ def _assistant_question_filters(task_id: int) -> tuple[ColumnElement[bool], ...]
     conditions cannot drift apart by hand-editing one copy and not the
     other.
 
-    Scoped to this one predicate. A second, ``allow_superseded`` pass
-    over already-superseded rows may be added to the reader later; that
-    pass is not this helper's concern.
+    Scoped to this one predicate. The reader's second, ``allow_superseded``
+    pass over already-superseded rows (off by default) is implemented in
+    ``get_latest_waiting_question`` itself, not here; that pass is not
+    this helper's concern.
     """
     return (
         TaskChatMessage.task_id == task_id,

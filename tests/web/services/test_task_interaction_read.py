@@ -32,6 +32,7 @@ from xagent.web.services.ops_signals import (
     INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
     clear_degradation,
 )
+from xagent.web.services.task_interaction_service import CompatibilityQuestionView
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
 _DEGRADATION_SIGNALS_UNDER_TEST = (
@@ -503,6 +504,46 @@ def test_a13_unparseable_payload_drops_both_slots(_db: Session) -> None:
     assert (question, interactions) == (None, None)
 
 
+def test_a13b_unanswerable_tier_never_leaks_interactions_even_if_the_view_carried_some(
+    _db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pins the adapter's own ``if view.tier == "unanswerable": return
+    view.question, None`` branch, not just the outcome it currently
+    coincides with. Today all four ``materialize_compatibility_view`` code
+    paths that produce the "unanswerable" tier (A10-A13) already
+    hard-code ``interactions=None`` on the view itself, so a test that
+    only drives the real view -- like A10-A13 -- cannot tell this
+    branch apart from a naive ``return view.question, view.interactions``:
+    both would return None either way. This test stubs the view directly
+    to hand back an "unanswerable" tier that *does* carry interaction
+    controls, so it fails unless the adapter itself refuses to forward
+    them: this is the one place that guarantees a future
+    materialize_compatibility_view change which starts populating
+    interactions on this tier still cannot leak controls for a question
+    the adapter has decided cannot be answered right now.
+
+    Mutation: change the branch to ``return view.question,
+    view.interactions`` and this test turns red; A10-A13 stay green."""
+
+    def _fake_view(
+        db: Session, task_id: int, *, allow_superseded: bool = False
+    ) -> CompatibilityQuestionView:
+        return CompatibilityQuestionView(
+            tier="unanswerable",
+            question="q",
+            interactions=[{"type": "text_input", "field": "x", "label": "X"}],
+            reason="anchor_dangling",
+        )
+
+    monkeypatch.setattr(read_surface, "materialize_compatibility_view", _fake_view)
+
+    task = _make_task(_db, marker=1)
+
+    question, interactions = read_surface.get_pending_interaction_question(_db, task)
+
+    assert (question, interactions) == ("q", None)
+
+
 # ---------------------------------------------------------------------------
 # Shape invariants that hold across tiers.
 # ---------------------------------------------------------------------------
@@ -511,7 +552,7 @@ def test_a13_unparseable_payload_drops_both_slots(_db: Session) -> None:
 def test_a14_adapter_does_not_filter_non_dict_interaction_elements(
     _db: Session,
 ) -> None:
-    """C-4: the non-dict element filter belongs to the v1 layer, not this
+    """The non-dict element filter belongs to the v1 layer, not this
     adapter or the shared reader -- see _filter_interaction_descriptors'
     own docstring for why it does not sink down. Mutation: have this
     adapter filter non-dict elements out of what it returns and this test
@@ -535,7 +576,7 @@ def test_a14_adapter_does_not_filter_non_dict_interaction_elements(
 def test_a15_interaction_element_key_sets_differ_between_legacy_and_native_tiers(
     _db: Session,
 ) -> None:
-    """B-12, the known gap this delivery does not converge (see the
+    """The known gap this delivery does not converge (see the
     adapter's own module docstring): pins the two key sets so a future
     change that accidentally aligns or further diverges them is visible
     here first."""

@@ -922,7 +922,7 @@ def test_t1_falls_back_to_legacy_when_there_is_no_active_row(
 def test_allow_superseded_threads_through_to_the_legacy_reader(
     _db: Session, _seeded_task: int
 ) -> None:
-    """B5: materialize_compatibility_view's allow_superseded keyword must
+    """materialize_compatibility_view's allow_superseded keyword must
     reach get_latest_waiting_question's own gate, not stop at
     _legacy_view. Default call sees nothing (the superseded row is
     invisible to the closed default); the opened call reads it. Mutation:
@@ -1044,7 +1044,7 @@ def test_unreadable_payload_is_unanswerable_not_legacy(
 def test_unrecognized_protocol_version_raises_the_ops_signal_and_a_warning(
     _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch, caplog
 ) -> None:
-    """B1: the unrecognized-protocol-version branch must not be silent --
+    """The unrecognized-protocol-version branch must not be silent --
     it registers a named degradation and logs a WARNING. Mutation: delete
     the register_degradation() call in that branch and this test turns
     red (INTERACTION_READ_PROTOCOL_UNRECOGNIZED never appears)."""
@@ -1073,9 +1073,9 @@ def test_unrecognized_protocol_version_raises_the_ops_signal_and_a_warning(
 def test_unreadable_payload_raises_the_ops_signal_and_a_warning(
     _db: Session, _seeded_task: int, caplog
 ) -> None:
-    """B2: same requirement as B1, for the payload-unreadable branch.
-    Mutation: delete that branch's register_degradation() call and this
-    test turns red."""
+    """Same requirement as the unrecognized-protocol-version test above,
+    for the payload-unreadable branch. Mutation: delete that branch's
+    register_degradation() call and this test turns red."""
 
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
     _make_active_interaction_row(
@@ -1098,7 +1098,7 @@ def test_unreadable_payload_raises_the_ops_signal_and_a_warning(
 def test_both_slots_empty_shape_on_unrecognized_protocol_version(
     _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """B4 (one of two cells): the exact tuple shape both empty-slot
+    """One of two cells for the exact tuple shape both empty-slot
     branches must produce."""
 
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
@@ -1122,7 +1122,7 @@ def test_both_slots_empty_shape_on_unrecognized_protocol_version(
 def test_both_slots_empty_shape_on_unreadable_payload(
     _db: Session, _seeded_task: int
 ) -> None:
-    """B4 (the other cell): same shape assertion for the payload-unreadable
+    """The other cell: same shape assertion for the payload-unreadable
     branch."""
 
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
@@ -1303,7 +1303,7 @@ def test_t3_prime_anchor_dangling_for_each_remaining_validity_condition(
 def test_t3_row_validity_failure_raises_checkpoint_pk_anchor_dangling(
     _db: Session, _seeded_task: int
 ) -> None:
-    """B8 (B-16 (1)): the row-invalid branch of
+    """The row-invalid branch of
     _resolve_read_direction_anchor's six-condition guard must register
     CHECKPOINT_PK_ANCHOR_DANGLING, same as the missing-row branch above.
     Mutation: delete that register_degradation() call and this test turns
@@ -1324,7 +1324,7 @@ def test_t3_row_validity_failure_raises_checkpoint_pk_anchor_dangling(
 def test_t2_empty_trace_side_execution_id_is_treated_as_a_match(
     _db: Session, _seeded_task: int
 ) -> None:
-    """B9 (B-16 (2)): a checkpoint row whose own execution_id is empty
+    """A checkpoint row whose own execution_id is empty
     short-circuits the execution-identity comparison to "matches"
     regardless of the interaction row's resume_execution_id, so the
     anchor still resolves and the view still reaches T2. Mutation: delete

@@ -34,7 +34,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 # ---------------------------------------------------------------------------
-# Import guard: the module half (three modules, zero import expected)
+# Import guard: the module half (five modules, zero import expected)
 # ---------------------------------------------------------------------------
 
 _IMPORT_GUARD_MODULES = {
@@ -105,7 +105,7 @@ def test_tw1c_websocket_module_half_exemption_is_named_and_exactly_one_module():
 
 # ---------------------------------------------------------------------------
 # Reference guard: the function half (websocket.py's replacement for
-# module-level zero-import: 5 closure seeds, own-scope-only banned-name scan)
+# module-level zero-import: 7 closure seeds, own-scope-only banned-name scan)
 # ---------------------------------------------------------------------------
 
 _BANNED_NAMES = frozenset(
@@ -237,7 +237,7 @@ def _own_scope_identifiers(func_node) -> set[str]:
 
 
 def _scan_closure_for_banned_names() -> dict[str, set[str]]:
-    """For each of the 5 closure seeds, the banned names (if any) found in
+    """For each of the 7 closure seeds, the banned names (if any) found in
     its own scope. Real production files, always re-parsed from disk."""
     hits: dict[str, set[str]] = {}
     trees = {
@@ -257,7 +257,7 @@ def test_tw1b_closure_seeds_reference_no_banned_names():
     # block in get_task / get_task_status, not as direct ast.Module.body
     # children -- a scanner that only checked Module.body would silently
     # never find either one, turning this into an always-green false guard.
-    # _find_qualified_function (used above to resolve the 5 closure seeds)
+    # _find_qualified_function (used above to resolve the 7 closure seeds)
     # walks through control-flow wrappers for exactly this reason.
     hits = _scan_closure_for_banned_names()
     assert hits == {}, f"read-side consumer(s) reference the rollout module: {hits}"
