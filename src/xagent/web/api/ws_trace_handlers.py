@@ -229,9 +229,9 @@ def serialize_trace_data(data: Dict[str, Any]) -> Dict[str, Any]:
     Module-level so the v1 SSE content-projection layer
     (``v1/_events_stream.py``) can reuse the exact same pass on live
     broadcast frames that the WebSocket handler applies before
-    persisting/broadcasting -- this function never reads ``self``, so
-    lifting it out of ``WebSocketTraceHandler`` changes nothing about
-    its behavior for the existing caller below.
+    broadcasting -- this function never reads ``self``, so lifting it
+    out of ``WebSocketTraceHandler`` changes nothing about its
+    behavior for the existing caller below.
     """
     import json
     from datetime import datetime
