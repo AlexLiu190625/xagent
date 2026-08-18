@@ -1253,7 +1253,46 @@ def _resolve_read_direction_anchor(
 
     try:
         trace_row = db.get(TraceEvent, row.resume_trace_event_id)
-    except Exception:
+    except (
+        sa.exc.OperationalError,  # connection loss / lock wait / timeout
+        sa.exc.InterfaceError,  # DBAPI-level connection failure
+        sa.exc.DisconnectionError,  # pool detected a dropped connection
+        sa.exc.TimeoutError,  # pool checkout timed out
+    ):
+        # Narrow on purpose, and narrower than ``sa.exc.SQLAlchemyError``:
+        # fallback is open only to transient, recoverable infrastructure
+        # failures. Anything that instead indicates a programming defect
+        # or a session that is itself unrecoverably broken must propagate
+        # -- swallowing it here would disguise a bug as an operational
+        # condition. That is why ``ProgrammingError``, ``DataError``,
+        # ``InternalError``, ``ArgumentError``, ``CompileError``,
+        # ``InvalidRequestError``, ``NoResultFound``,
+        # ``ResourceClosedError`` and ``PendingRollbackError`` are all
+        # deliberately absent from this list. ``PendingRollbackError`` in
+        # particular is not reachable here on either entry path, for a
+        # different reason on each. materialize_compatibility_view calls
+        # ``interaction_requests_table_exists`` first, which issues
+        # ``db.connection()`` on the same session, so a session broken
+        # badly enough to raise ``PendingRollbackError`` raises it there.
+        # respond() does not go through that check -- it reaches this
+        # resolver directly -- but it owns its session and has already
+        # run several statements on it by then, so the same failure
+        # surfaces before this fetch as well. Its source is also mixed
+        # -- sometimes a
+        # connection that failed mid-transaction, sometimes a prior flush
+        # failure that left the session itself unrecoverable -- so even if
+        # it were reachable, it would not belong on a transient-only list.
+        #
+        # No db.rollback() here: respond() holds the tasks row's FOR
+        # UPDATE lock from its earlier step and owns its own session end
+        # to end, so a rollback here would release that lock mid-flow.
+        # Note the backend asymmetry after a genuine DBAPI failure at this
+        # fetch: SQLite keeps the caller's staged, uncommitted writes;
+        # PostgreSQL has already invalidated the server-side transaction,
+        # so a later commit() returns successfully while discarding them.
+        # A rollback here would not recover those writes -- deciding what
+        # to do about the failed transaction belongs to the session
+        # owner, not this read helper.
         register_degradation(
             CHECKPOINT_LOAD_UNAVAILABLE,
             f"task {row.task_id}: interaction {row.id} anchor row fetch failed",
@@ -1318,6 +1357,23 @@ def _legacy_view(db: "Session", task_id: int) -> CompatibilityQuestionView:
     return CompatibilityQuestionView(
         tier="legacy", question=question, interactions=interactions
     )
+
+
+def _validation_error_summary(exc: _PydanticValidationError) -> list[str]:
+    """Which fields failed validation and how -- never what was in them.
+
+    ``str(ValidationError)`` embeds ``input_value=``, and for this payload
+    the input is the question text written for an end user. This summary
+    is built from ``errors()`` with the input and the docs URL excluded,
+    keeping the field path and the error type and nothing else. Capped so
+    a payload with many fields cannot turn one log record into a dump.
+    """
+
+    summary: list[str] = []
+    for error in exc.errors(include_url=False, include_input=False)[:10]:
+        location = ".".join(str(part) for part in error.get("loc", ()))
+        summary.append(f"{location or '<root>'}:{error.get('type', 'unknown')}")
+    return summary
 
 
 def materialize_compatibility_view(
@@ -1451,7 +1507,7 @@ def materialize_compatibility_view(
                 "task_id": task_id,
                 "interaction_id": row.id,
                 "reason": "payload_unreadable",
-                "validation_error": str(exc)[:500],
+                "validation_errors": _validation_error_summary(exc),
             },
         )
         return CompatibilityQuestionView(

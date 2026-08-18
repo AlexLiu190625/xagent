@@ -75,8 +75,6 @@ from xagent.web.services.interaction_rollout import counters_snapshot
 from xagent.web.services.ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
     CHECKPOINT_PK_ANCHOR_DANGLING,
-    INTERACTION_READ_PAYLOAD_UNREADABLE,
-    INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
     clear_degradation,
 )
 from xagent.web.services.task_command_transport import (
@@ -87,24 +85,16 @@ from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
 pytestmark = pytest.mark.postgresql
 
-_DEGRADATION_SIGNALS_UNDER_TEST = (
-    CHECKPOINT_PK_ANCHOR_DANGLING,
-    CHECKPOINT_LOAD_UNAVAILABLE,
-    INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
-    INTERACTION_READ_PAYLOAD_UNREADABLE,
-)
-
 
 @pytest.fixture(autouse=True)
 def _clean_degradation_registry():
-    """The anchor resolver and materialize_compatibility_view register
-    process-global degradation signals on their failure paths; clear this
-    module's four signals around every test so they cannot leak into
-    tests that read the shared registry."""
-    for signal in _DEGRADATION_SIGNALS_UNDER_TEST:
+    """The anchor resolver registers process-global degradation signals on
+    its failure paths; clear this module's two signals around every test so
+    they cannot leak into tests that read the shared registry."""
+    for signal in (CHECKPOINT_PK_ANCHOR_DANGLING, CHECKPOINT_LOAD_UNAVAILABLE):
         clear_degradation(signal)
     yield
-    for signal in _DEGRADATION_SIGNALS_UNDER_TEST:
+    for signal in (CHECKPOINT_PK_ANCHOR_DANGLING, CHECKPOINT_LOAD_UNAVAILABLE):
         clear_degradation(signal)
 
 
@@ -322,6 +312,97 @@ def test_active_row_predicate_three_way_tiering(db_session) -> None:
 
     view3 = svc.materialize_compatibility_view(db, task3)
     assert view3.tier == "legacy"
+
+
+# ---------------------------------------------------------------------------
+# The PostgreSQL half of the "no db.rollback()" regression test: the anchor
+# fetch's except clause is a whitelist of transient infrastructure failures
+# (OperationalError, InterfaceError, DisconnectionError, TimeoutError), and
+# deliberately does not roll back on any of them. The SQLite half of this
+# same cell lives in test_task_interaction_service.py; this is the
+# real-backend counterpart the design calls for explicitly, since PostgreSQL
+# is where server-side transaction state after a DBAPI failure differs from
+# SQLite's. This test drives the except clause with a synthetic,
+# monkeypatched exception -- it verifies the resolver's own behavior (no
+# rollback, no swallowed session state), not what a genuine DBAPI failure
+# does to the underlying PostgreSQL transaction; see the test's own
+# docstring.
+# ---------------------------------------------------------------------------
+
+
+def test_the_session_survives_a_failed_anchor_fetch_with_no_rollback_postgresql(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies the resolver's own behavior at the anchor fetch: it does
+    not call db.rollback() and does not swallow the caller's session state
+    when the fetch raises. Driven with a synthetic, monkeypatched exception
+    raised in Python before any statement reaches the DBAPI connection, so
+    this is not a claim about what a genuine DBAPI-level failure does to
+    the underlying PostgreSQL transaction -- that survival differs by
+    backend (SQLite keeps the caller's staged writes; PostgreSQL discards
+    them at the next commit once the server-side transaction is
+    invalidated) and is documented at the call site, not proven here."""
+    db = db_session
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    task.run_id = "run-a"
+    db.commit()
+
+    trace_id = _make_trace_event(db, task_id=task_id, run_partition="run-a")
+    _make_active_row(
+        db,
+        task_id=task_id,
+        run_id="run-a",
+        resume_trace_event_id=trace_id,
+        resume_run_partition="run-a",
+    )
+
+    # The caller's own staged, uncommitted write -- simulates a caller
+    # that has already modified something in this same session before
+    # asking the read surface for the pending question.
+    task.title = "staged-before-the-failing-read"
+
+    from sqlalchemy.orm import Session as OrmSession
+
+    original_get = OrmSession.get
+    raise_once = {"armed": True}
+
+    def _raising_get(self, model, pk, *args, **kwargs):
+        if model is TraceEvent and raise_once["armed"]:
+            raise_once["armed"] = False
+            raise sa.exc.OperationalError(
+                "SELECT 1", {}, Exception("simulated session failure")
+            )
+        return original_get(self, model, pk, *args, **kwargs)
+
+    monkeypatch.setattr(OrmSession, "get", _raising_get)
+    view = svc.materialize_compatibility_view(db, task_id)
+
+    assert view.tier == "unanswerable"
+    assert view.reason == "checkpoint_unavailable"
+
+    # (a) the caller's own pending write is still staged and committable --
+    # a db.rollback() in the except clause would have discarded it, and on
+    # PostgreSQL a real DBAPI-level error left uncaught in an open
+    # transaction poisons every later statement until a rollback happens,
+    # so this also proves the OperationalError raised above never reached
+    # the actual DBAPI connection.
+    db.commit()
+    reloaded = db.query(Task).filter(Task.id == task_id).first()
+    assert reloaded.title == "staged-before-the-failing-read"
+
+    # (b) the same session can still run a plain query...
+    still_readable = (
+        db.query(TaskInteractionRequest)
+        .filter(TaskInteractionRequest.task_id == task_id)
+        .first()
+    )
+    assert still_readable is not None
+
+    # ...and complete a whole second response construction.
+    second_view = svc.materialize_compatibility_view(db, task_id)
+    assert second_view.tier == "native"
 
 
 # ---------------------------------------------------------------------------
