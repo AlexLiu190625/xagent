@@ -2,11 +2,16 @@
 old transcript reader (``get_latest_waiting_question``) to the read
 surface's tuple adapter (``get_pending_interaction_question``).
 
-The switch itself is two textual changes at each of the five call sites
-(function name, argument), already covered structurally by the static
-guards in ``test_interaction_rollout_guards.py``. What this file proves
-is behavioral: that the switch did not change what any of the five call
-sites puts on the wire. Each of the compatibility view's seven tiers is
+The switch itself is two textual changes (function name, argument) at
+each of the four call sites that invoke
+``get_pending_interaction_question`` -- the websocket status-reassertion
+event below is not one of those four; it reuses the ``task_info``
+event's already-fetched tuple instead of calling the adapter a second
+time for a value that cannot have changed. Already covered structurally
+by the static guards in ``test_interaction_rollout_guards.py``. What
+this file proves is behavioral: that the switch did not change what any
+of the five call sites puts on the wire. Each of the compatibility
+view's seven tiers is
 constructed once (real writes for every tier except the two the database
 schema or a code path makes otherwise unreachable, exactly as
 ``test_task_interaction_service.py`` and ``test_task_interaction_read.py``

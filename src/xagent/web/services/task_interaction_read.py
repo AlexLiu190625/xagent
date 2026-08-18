@@ -20,11 +20,18 @@ Two steps, in this order, and nothing else:
 
 This function performs **no authorization**. It takes a ``Task`` object,
 not an id, precisely so that a caller has to have resolved and
-authorized that row through its own layer first. All five callers do
-(two request-scoped handlers, one connection-scoped snapshot builder
-that calls it twice, and one worker-owned short session that resolves
-through ``_resolve_task_or_404``). A new caller that has not is a bug in that
-caller, not something this function can detect.
+authorized that row through its own layer first. All four callers do
+(two request-scoped handlers, one connection-scoped snapshot builder,
+and one worker-owned short session that resolves through
+``_resolve_task_or_404``). The snapshot builder calls this function once
+and reuses the returned tuple for both of its outbound projections (the
+``task_info`` event and the waiting-status reassertion event further
+down the same replay) rather than calling it a second time for a value
+that cannot have changed within one session -- which is why the module
+docstring above counts five consumers of the tuple against only four
+calls that produce it. A new caller that has not resolved and authorized
+its ``Task`` row is a bug in that caller, not something this function
+can detect.
 
 What the tuple cannot carry, and why that is accepted:
 

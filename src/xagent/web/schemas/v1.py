@@ -622,9 +622,17 @@ class TaskInfoResponse(BaseModel):
             "though the structured controls are not. In all cases the "
             "task itself stays in waiting_for_user -- a null field here "
             "reflects an unreadable or absent question, not a resolved "
-            "one. This is a convenience read, not the historical "
-            "interaction record; see #1079 for the full typed interaction "
-            "surface."
+            "one. Whichever of those tiers this task falls into, when the "
+            "answer comes from the legacy transcript rather than a native "
+            "interaction row, the read is by row id, not by wait: it "
+            "returns this task's most recently persisted question row "
+            "with no check on which turn wrote it or whether it was "
+            "already answered. So a task that re-entered "
+            "waiting_for_user without persisting a new question of its "
+            "own surfaces the last question an earlier turn asked and "
+            "already got answered, instead of null. This is a "
+            "convenience read, not the historical interaction record; "
+            "see #1079 for the full typed interaction surface."
         ),
     )
 
