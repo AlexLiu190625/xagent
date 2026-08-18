@@ -223,6 +223,22 @@ def is_agent_checkpoint_data(data: Any) -> bool:
     )
 
 
+# Maps every control character (codepoint 0-31) to deletion, except tab
+# (9), newline (10), and carriage return (13), which are kept -- same
+# survivor set the old per-character loop in ``clean_string`` kept via
+# ``ord(char) >= 32 or char in "\n\r\t"``. DEL (127) and the C1 control
+# range (128-159) are untouched by this table (and were untouched by the
+# old loop too, since both are >= 32) -- this table only ever removes,
+# never rewrites, so leaving them out is the same as mapping them to
+# themselves. Built once at import time, not per call: ``clean_string``
+# runs on every string value in every trace event this module
+# serializes, so a module-level table is shared across every call
+# instead of rebuilt on each one.
+_CONTROL_CHAR_TRANSLATION_TABLE = str.maketrans(
+    {codepoint: None for codepoint in range(32) if codepoint not in (9, 10, 13)}
+)
+
+
 def serialize_trace_data(data: Dict[str, Any]) -> Dict[str, Any]:
     """Recursively serialize trace event data to ensure JSON compatibility.
 
@@ -237,18 +253,18 @@ def serialize_trace_data(data: Dict[str, Any]) -> Dict[str, Any]:
     from datetime import datetime
 
     def clean_string(value: str) -> str:
-        """Clean string data to remove problematic characters for JSON."""
+        """Clean string data to remove problematic characters for JSON.
+
+        ``str.translate`` with the module-level
+        ``_CONTROL_CHAR_TRANSLATION_TABLE`` runs in C, unlike the
+        per-character generator + ``"".join`` this used to do -- same
+        survivor set (NUL and the rest of codepoints 0-31 are dropped,
+        tab/newline/CR are kept), just faster on the large strings a
+        tool result or delegation payload can carry.
+        """
         if not isinstance(value, str):
             return value
-
-        # Remove NULL characters and other problematic control characters
-        cleaned = value.replace("\x00", "")  # Remove NULL character
-        cleaned = cleaned.replace("\u0000", "")  # Remove Unicode NULL
-        # Remove other control characters that might cause issues
-        cleaned = "".join(
-            char for char in cleaned if ord(char) >= 32 or char in "\n\r\t"
-        )
-        return cleaned
+        return value.translate(_CONTROL_CHAR_TRANSLATION_TABLE)
 
     def serialize_value(value: Any) -> Any:
         # Handle Pydantic models (BaseModel)
