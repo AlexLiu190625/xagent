@@ -217,11 +217,12 @@ class Task(Base):  # type: ignore
     # "interaction_protocol_version is NULL -> legacy path, ask the
     # interaction table nothing; any other value -> ask the rich view,
     # which is the only place that knows whether an active native row
-    # exists". All five waiting-question consumers already hold a loaded
-    # Task row when they need the answer, so the NULL check is a free
+    # exists". All four call sites that ask already hold a loaded Task
+    # row when they need the answer, so the NULL check is a free
     # attribute access -- while an EXISTS derivation would cost one
     # cross-table query per waiting-status read, on paths that include the
-    # websocket's synchronous snapshot. The fifth consumer runs in a
+    # websocket's synchronous snapshot, which asks once and reuses the
+    # answer for both events it emits. The fourth call site runs in a
     # worker-owned short session of its own rather than a request-scoped
     # one, but it resolves and loads the same Task row before asking, so
     # the same free-attribute-access argument applies to it unchanged.
