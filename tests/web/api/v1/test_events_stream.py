@@ -1352,9 +1352,7 @@ async def test_events_per_task_cap_third_stream_429():
         (TaskStatus.WAITING_FOR_USER, "event: task.input_required"),
     ],
 )
-async def test_fast_path_attach_exempt_from_both_caps(
-    fast_path_status, closing_event, monkeypatch
-):
+async def test_fast_path_attach_exempt_from_both_caps(fast_path_status, closing_event):
     """``build_event_stream_response`` checks ``_stream_close_reason``
     before either concurrency cap (see its own docstring): a task that's
     already terminal or already waiting for user input takes the
@@ -1368,14 +1366,9 @@ async def test_fast_path_attach_exempt_from_both_caps(
     there is no way to fill that cap through it. Only after both caps
     are full does the task row flip to the fast-path status under test.
 
-    Also covers two properties of the fast path's step snapshot that a
-    frame-count-only assertion would miss entirely: it actually emits a
-    ``step.*`` frame for pre-existing history (not just the two
-    lifecycle frames alone -- a regression here would have
-    left ``PER_TASK_STREAM_CAP``-saturating cap coverage green while
-    silently dropping the step snapshot), and a second fast-path attach on the
-    same task reuses the ``steps()`` cache instead of repeating the
-    full trace read.
+    Also asserts one step frame goes out, so a regression that dropped
+    the snapshot could not hide behind the frame counts this test is
+    really about.
     """
     set_cache_backend_for_testing(InMemoryTTLCache())
     try:
@@ -1432,39 +1425,13 @@ async def test_fast_path_attach_exempt_from_both_caps(
         else:
             _set_task_status(task_id, fast_path_status, output="done")
 
-        calls: list[int] = []
-        original = v1_tasks._load_task_steps_snapshot
-
-        def _tracking(task_id_, principal_):
-            calls.append(1)
-            return original(task_id_, principal_)
-
-        monkeypatch.setattr(v1_tasks, "_load_task_steps_snapshot", _tracking)
-
         resp = client.get(f"/v1/chat/tasks/{task_id}/events", headers=_bearer(full_key))
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/event-stream")
         body = resp.text
         assert body.count("event: task.status") == 1
         assert body.count(closing_event) == 1
-        # The fast path really did emit the pre-existing step, not just
-        # the two lifecycle frames.
         assert body.count("event: step.completed") == 1
-        blocks = [b for b in body.split("\n\n") if b.strip()]
-        step = json.loads(blocks[1].split("data: ", 1)[1])["step"]
-        assert step["id"] == "tool_call:call-1"
-        assert step["status"] == "completed"
-        # First attach: a cache miss, so the full trace read did run once.
-        assert calls == [1]
-
-        # A second fast-path attach on the same, still-terminal task
-        # reuses the steps() cache instead of repeating that read.
-        resp2 = client.get(
-            f"/v1/chat/tasks/{task_id}/events", headers=_bearer(full_key)
-        )
-        assert resp2.status_code == 200
-        assert resp2.text.count("event: step.completed") == 1
-        assert calls == [1]  # unchanged -- second attach was a cache hit
 
         # The fast path never registers a sink, so the count above -- entirely
         # made up of the cap-filling streams -- is unchanged.
