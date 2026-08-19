@@ -1196,6 +1196,11 @@ def test_projector_equivalent_to_batch(events):
     direct-call tests above, which now exercise the projector itself.
     What this test guards instead is that the batch driver never grows
     a second, independent folding implementation.
+
+    It is also the pin on the retention default: this path goes through
+    ``from_history(events).materialized_steps()`` with no override, so a
+    projector that stopped retaining finished steps by default would
+    raise rather than return the task's whole timeline here.
     """
     expected = map_trace_events_to_public_steps(events)
     projected = PublicStepProjector.from_history(events).materialized_steps()
@@ -1257,21 +1262,6 @@ def test_projector_without_retention_returns_the_same_steps_and_keeps_none(event
     assert non_retaining._finished is None
     with pytest.raises(RuntimeError):
         non_retaining.materialized_steps()
-
-
-def test_batch_projector_still_retains_finished_steps():
-    """Re-pins the default explicitly: ``map_trace_events_to_public_steps``
-    -- and therefore ``GET /v1/chat/tasks/{task_id}/steps`` -- goes
-    through ``from_history(events).materialized_steps()`` with no
-    ``retain_finished`` override, so it must still return the task's
-    whole projected timeline, not an empty one.
-    """
-    events = _PROJECTOR_EQUIVALENCE_CASES["tool_call_success"]
-    expected = map_trace_events_to_public_steps(events)
-    assert expected
-    projected = PublicStepProjector.from_history(events).materialized_steps()
-    projected.sort(key=lambda s: s["started_at"])
-    assert projected == expected
 
 
 def test_feed_return_value_reflects_step_state_at_call_time():

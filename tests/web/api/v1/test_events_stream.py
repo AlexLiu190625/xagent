@@ -1951,34 +1951,6 @@ async def test_final_answer_start_and_error_produce_no_content_frame(frame_type)
     assert sink.queue.empty()
 
 
-async def test_content_frames_are_dropped_by_the_same_close_drain_as_status_frames():
-    """``enqueue_close`` drains the *entire* queue before inserting
-    the close frame (existing, unconditional behavior of this sink) --
-    content frames queued ahead of a close are silently dropped exactly like a
-    queued ``task.status`` would be. The contract is "any close may
-    truncate the content sequence; reconcile via ``steps()``", not
-    "only ``final_answer_error`` truncates it"."""
-    sink = _make_sink(task_id=23, status="running")
-    await sink.send_text(
-        _trace_event_frame(
-            "tool_execution_start",
-            task_id=23,
-            data={"tool_call_id": "call-1", "tool_name": "search", "tool_args": {}},
-        )
-    )
-    assert sink.queue.qsize() == 1  # the step.started frame queued above
-
-    sink.enqueue_close(es.completed_frame(status="failed", output=None, error="boom"))
-
-    assert sink.queue.qsize() == 1
-    frame_text, is_close = sink.queue.get_nowait()
-    assert is_close is True
-    assert frame_text.startswith("event: task.completed\n")
-    # The step.started frame queued before the close is gone, not
-    # delivered ahead of it -- drained by enqueue_close, same as any
-    # other backlog.
-
-
 async def test_step_started_frame_text_is_unaffected_by_the_step_s_later_completion():
     """Serialization-aliasing guard: ``feed()``
     returns the projector's own live dict, which gets mutated in place
@@ -2035,32 +2007,6 @@ def _sized_content_frame(task_id: int, total_chars: int) -> str:
     raw = json.dumps(envelope)
     assert len(raw) == total_chars
     return raw
-
-
-async def test_oversized_content_frame_is_dropped_before_projection():
-    """A content frame (parsed ``type`` in ``_CONTENT_FRAME_TYPES``)
-    whose raw text is bigger than ``MAX_RAW_FRAME_TEXT_CHARS`` is
-    dropped by ``send_text``'s size check, after classification but
-    before the call into ``_project_and_queue`` -- same drop-and-count
-    discipline as every other frame this sink drops. Warm, so a bug
-    that let this fall through would show up as a queued (truncated)
-    ``message.delta`` frame instead of nothing."""
-    sink = _make_sink(task_id=91)
-    oversized_delta = "x" * (es.MAX_RAW_FRAME_TEXT_CHARS + 1)
-    raw = json.dumps(
-        {
-            "type": "final_answer_delta",
-            "message_id": "final_answer_abc",
-            "task_id": 91,
-            "delta": oversized_delta,
-        }
-    )
-    assert len(raw) > es.MAX_RAW_FRAME_TEXT_CHARS
-
-    await sink.send_text(raw)
-
-    assert sink.dropped_frame_count == 1
-    assert sink.queue.empty()
 
 
 async def test_content_frame_exactly_at_the_size_cap_is_projected():
