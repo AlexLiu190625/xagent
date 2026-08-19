@@ -235,22 +235,13 @@ _ERROR_MESSAGES = {
 }
 
 
-def error_frame(code: str, *, message: str | None = None) -> str:
+def error_frame(code: str) -> str:
     """Build a ``stream.error`` frame. ``code`` is always the machine-
-    readable value from ``_ERROR_MESSAGES`` (clients branch on it) --
-    ``message`` overrides only the human-readable text for a call site
-    whose actual cause ``_ERROR_MESSAGES[code]``'s generic wording
-    doesn't describe (e.g. a DB read failing under the ``resync_required``
-    code, which the default wording describes as a queue overflow).
-    Defaults to ``_ERROR_MESSAGES[code]`` when omitted. The lookup runs
-    either way, so an unrecognized ``code`` raises ``KeyError`` whether
-    or not a ``message`` was passed -- the check is on the code, not on
-    which optional argument the caller supplied.
-    """
-    default_message = _ERROR_MESSAGES[code]
-    return _sse_frame(
-        "stream.error", {"code": code, "message": message or default_message}
-    )
+    readable value from ``_ERROR_MESSAGES`` (clients branch on it), and
+    the lookup runs unconditionally, so an unrecognized ``code`` raises
+    ``KeyError`` rather than reaching the wire as a frame with no
+    message."""
+    return _sse_frame("stream.error", {"code": code, "message": _ERROR_MESSAGES[code]})
 
 
 # -- Content projection: step.* / message.* --------------------------------

@@ -263,20 +263,19 @@ def _long_intervals(**overrides: float) -> dict[str, float]:
 # ===== error_frame code validation =====
 
 
-def test_error_frame_rejects_an_unknown_code_with_or_without_a_message():
+def test_error_frame_rejects_an_unknown_code_without_reaching_the_wire():
     """``_ERROR_MESSAGES[code]`` is looked up unconditionally, so an
-    unrecognized code raises ``KeyError`` whether or not a ``message``
-    override was also passed -- the check is on the code, not on which
-    optional argument the caller supplied."""
+    unrecognized code raises ``KeyError`` instead of producing a
+    ``stream.error`` frame whose ``message`` a client cannot render."""
     with pytest.raises(KeyError):
         es.error_frame("nope")
-    with pytest.raises(KeyError):
-        es.error_frame("nope", message="anything")
 
-    # A known code still honors the message override.
-    frame = es.error_frame("task_deleted", message="custom text")
+    frame = es.error_frame("task_deleted")
     data = json.loads(frame.split("data: ", 1)[1])
-    assert data == {"code": "task_deleted", "message": "custom text"}
+    assert data == {
+        "code": "task_deleted",
+        "message": es._ERROR_MESSAGES["task_deleted"],
+    }
 
 
 # ===== sink.send_text never raises =====
