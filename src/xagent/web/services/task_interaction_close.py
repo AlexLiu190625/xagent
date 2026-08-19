@@ -67,6 +67,17 @@ as the message-injection replay that
 ``AgentRunner.inject_user_message`` short-circuits on a repeated turn
 id.
 
+The close statement binds to one primary key, read before the injection
+by ``active_interaction_id_sync`` and carried to the close by whichever
+path is doing the injecting. It is not enough to match on
+``(task_id, run_id, active)``: injecting the message is exactly what
+resumes the agent, and a resumed agent can stage a fresh question before
+the close runs, which an unbound statement would retire as though the
+injected message had answered it. Reading the id at close time instead of
+before the injection leaves that window exactly as wide as it is with no
+key at all -- the value has to be the one observed before the message
+went in.
+
 Every rowcount the close statement below produces is classified the same
 way, at the one place the classification happens
 (``_classify_close_rowcount``): exactly one row closed is the expected
@@ -130,13 +141,83 @@ def _classify_close_rowcount(rowcount: int, *, task_id: int, run_id: str) -> Non
         )
 
 
+def active_interaction_id_sync(task_id: int) -> int | None:
+    """The id of this task's active native interaction row, or ``None``.
+
+    Read this *before* injecting the user message, and pass what it
+    returns to ``close_legacy_resume_interaction`` -- see this module's
+    docstring for why that ordering is the whole point.
+
+    Opens and closes its own short session. All four legacy-resume paths
+    call it from a point where they hold no session of their own: the two
+    fence-transaction paths (``a2a.py``, ``v1/task_reply.py``) open their
+    fence only after the injection has already committed, and the two
+    WebSocket paths hold none at all.
+
+    Keys off ``_active_native_row_criteria``
+    (``task_interaction_service.py``), the same four-field predicate every
+    other reader of "this task's one live row" uses, rather than a
+    predicate of its own -- the close this feeds and the readers that show
+    the question must not disagree about which row is live.
+
+    Returns ``None`` when the read cannot be made at all -- no table yet,
+    no session, a failing query. ``None`` closes nothing: the close
+    statement matches zero rows and the active row survives, which
+    degrades to a reader falling back to the legacy transcript question,
+    the same benign outcome the module docstring describes for a stale
+    marker. The alternative -- closing on the old unbound predicate when
+    the read fails -- is the retire-the-wrong-row bug this function exists
+    to prevent, so an unreadable id must never widen what the close
+    matches.
+    """
+    from .task_interaction_service import _active_native_row_criteria
+
+    try:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            if not interaction_requests_table_exists(db):
+                return None
+            row = (
+                db.query(TaskInteractionRequest.id)
+                .join(Task, Task.id == TaskInteractionRequest.task_id)
+                .filter(
+                    TaskInteractionRequest.task_id == task_id,
+                    *_active_native_row_criteria(),
+                )
+                .first()
+            )
+            return int(row[0]) if row is not None else None
+    except Exception:
+        logger.warning(
+            "could not read the active interaction row before injection for "
+            "task_id=%s; the close will match no row",
+            task_id,
+            exc_info=True,
+        )
+        return None
+
+
 def close_legacy_resume_interaction(
     db: Session,
     *,
     task_id: int,
     run_id: str,
+    interaction_id: int | None,
 ) -> int:
     """Retire the run's active interaction row and clear the task's marker.
+
+    ``interaction_id`` is the row observed *before* the user message was
+    injected, from ``active_interaction_id_sync``; the close binds to it,
+    so it retires that exact question and nothing else. This module's
+    docstring carries the argument for why the value has to come from
+    before the injection.
+
+    ``interaction_id=None`` means there was no active row to answer at
+    injection time. SQLAlchemy renders it as ``id IS NULL``, which is
+    never true of a primary key, so the close matches zero rows -- and the
+    marker clear below still runs, which is the whole behavior that case
+    needs. Do not "simplify" this into skipping the statement or dropping
+    the predicate: both change which rows the close can touch.
 
     Caller obligations, because neither happens here: the caller has
     already confirmed ``interaction_requests_table_exists(db)`` -- this
@@ -153,24 +234,12 @@ def close_legacy_resume_interaction(
     Returns the close statement's rowcount, classified and logged by
     ``_classify_close_rowcount`` -- see the module docstring for why a
     rowcount greater than 1 is logged, not raised.
-
-    A constraint on the batch that adds a production writer for
-    ``task_interaction_requests``: the close statement matches on
-    ``(task_id, run_id, active)`` alone -- nothing binds it to the
-    specific question the injected user message answered. That is sound
-    only while this run cannot stage a new row between the message write
-    and this close. Injecting the message is exactly what resumes the
-    agent, so once a production writer exists, the resumed agent may
-    stage a fresh question in that window and this statement would
-    retire it as if it had been answered. The writer batch must either
-    key this close on the row observed before injection (read the
-    primary key first) or add a staleness fence; it must not ship the
-    statement as-is.
     """
     now = datetime.now(timezone.utc)
     close_result = db.execute(
         sa.update(TaskInteractionRequest)
         .where(
+            TaskInteractionRequest.id == interaction_id,
             TaskInteractionRequest.task_id == task_id,
             TaskInteractionRequest.run_id == run_id,
             TaskInteractionRequest.status == "active",
@@ -200,13 +269,19 @@ def close_legacy_resume_interaction(
     return rowcount
 
 
-def close_legacy_resume_interaction_sync(task_id: int, run_id: str) -> int:
+def close_legacy_resume_interaction_sync(
+    task_id: int, run_id: str, interaction_id: int | None
+) -> int:
     """Close + clear from a synchronous or ``asyncio.to_thread`` caller.
 
     Shared by both WebSocket legacy-resume injection sites (the online
     handler and the deferred ``execute_resume_background`` path): each
     calls this via ``run_db_io_cancellation_safe`` with no transaction of
     its own open first, and this function commits before returning.
+
+    ``interaction_id`` is passed straight through -- see
+    ``close_legacy_resume_interaction`` for where it has to come from and
+    what ``None`` means.
 
     Skips entirely, without opening the lock read below, when
     ``task_interaction_requests`` does not exist on this deployment -- a
@@ -234,7 +309,9 @@ def close_legacy_resume_interaction_sync(task_id: int, run_id: str) -> int:
         db.execute(
             sa.select(Task.id).where(Task.id == task_id).with_for_update(key_share=True)
         ).first()
-        rowcount = close_legacy_resume_interaction(db, task_id=task_id, run_id=run_id)
+        rowcount = close_legacy_resume_interaction(
+            db, task_id=task_id, run_id=run_id, interaction_id=interaction_id
+        )
         db.commit()
         return rowcount
 

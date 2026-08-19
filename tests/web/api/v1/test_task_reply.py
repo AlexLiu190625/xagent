@@ -541,6 +541,53 @@ def test_reply_closes_the_legacy_resume_interaction_row_on_successful_injection(
         db.close()
 
 
+def test_reply_reads_the_interaction_row_before_injecting(mock_start_task):
+    """The close is keyed on the row observed *before* the injection,
+    and only the ordering makes that true -- see task_interaction_close's
+    module docstring. Moving the read after the injection leaves the whole
+    change doing nothing while the row-level assertions in the test above
+    stay green."""
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-close-order")
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="run-close-order", idempotency_key="reply-close-order-q1"
+    )
+
+    order: list[str] = []
+
+    def record_read(_task_id: int) -> int:
+        order.append("read")
+        return row_id
+
+    async def record_injection(*_args: object, **_kwargs: object) -> bool:
+        order.append("inject")
+        return True
+
+    agent_patch, _agent_service = _patch_agent_service(
+        AsyncMock(side_effect=record_injection)
+    )
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.api.v1.task_reply._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.api.v1.task_reply.active_interaction_id_sync",
+            side_effect=record_read,
+        ),
+    ):
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+
+    assert resp.status_code == 202, resp.text
+    assert order == ["read", "inject"]
+
+
 def test_update_reply_input_rolls_back_the_interaction_close_with_the_fence() -> None:
     """Mirrors test_a2a_api.py's
     test_update_a2a_resume_input_rolls_back_the_interaction_close_with_the_fence
@@ -585,7 +632,9 @@ def test_update_reply_input_rolls_back_the_interaction_close_with_the_fence() ->
     stale_lease = TaskLease(
         task_id=task_id, runner_id="a-different-runner", run_id="run-reply-atomicity"
     )
-    updated = task_reply_module._update_reply_input_sync(stale_lease, "attempted text")
+    updated = task_reply_module._update_reply_input_sync(
+        stale_lease, "attempted text", row_id
+    )
 
     assert updated is False
     db = _direct_db_session()

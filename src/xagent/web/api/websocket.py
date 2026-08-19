@@ -150,6 +150,7 @@ from ..services.task_execution_controller import (
     task_execution_controller,
 )
 from ..services.task_interaction_close import (
+    active_interaction_id_sync,
     clear_interaction_marker_if_unpaired,
     close_legacy_resume_interaction_sync,
 )
@@ -3280,11 +3281,17 @@ async def execute_resume_background(
             # apply inside a nested closure.
             assert lease.run_id is not None
             close_run_id = lease.run_id
+            # Observed by the online handler before it injected -- carried
+            # here through pending_user_message rather than read now, since
+            # this path injects later still. Bound to a plain local before
+            # the lambda below, like close_run_id above.
+            close_interaction_id = pending_user_message.get("interaction_id")
             try:
                 await run_db_io_cancellation_safe(
                     lambda: close_legacy_resume_interaction_sync(
                         task_id,
                         close_run_id,
+                        close_interaction_id,
                     )
                 )
             except Exception:
@@ -5944,6 +5951,18 @@ async def _handle_chat_message_unserialized(
                         return
                     delivery_claimed = True
 
+                    # Read before the injection below and before the posted
+                    # fork, so both branches carry the same observation --
+                    # see task_interaction_close's module docstring for why
+                    # it has to precede the injection. The two branches are
+                    # mutually exclusive: posted true closes below with this
+                    # local, posted false hands the same value to
+                    # execute_resume_background through pending_user_message,
+                    # so one observation only ever serves one close.
+                    active_interaction_id = await run_db_io_cancellation_safe(
+                        lambda: active_interaction_id_sync(task_id)
+                    )
+
                     posted = False
                     if live_task_lease is not None:
                         with bind_task_lease_context(live_task_lease):
@@ -6016,6 +6035,12 @@ async def _handle_chat_message_unserialized(
                                     "display_message": display_user_message,
                                     "files": display_file_refs,
                                     "turn_id": turn_id,
+                                    # The pre-injection observation, carried
+                                    # rather than re-read: the deferred path
+                                    # injects later still, so a read there
+                                    # would be even further past the point
+                                    # where the answered row is identifiable.
+                                    "interaction_id": active_interaction_id,
                                 }
                             ),
                             delivery_turn_id=turn_id,
@@ -6076,11 +6101,13 @@ async def _handle_chat_message_unserialized(
                         assert live_task_lease is not None
                         assert live_task_lease.run_id is not None
                         close_run_id = live_task_lease.run_id
+                        close_interaction_id = active_interaction_id
                         try:
                             await run_db_io_cancellation_safe(
                                 lambda: close_legacy_resume_interaction_sync(
                                     task_id,
                                     close_run_id,
+                                    close_interaction_id,
                                 )
                             )
                         except Exception:
