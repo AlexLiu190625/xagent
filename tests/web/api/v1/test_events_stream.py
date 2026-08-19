@@ -556,13 +556,13 @@ async def test_watchdog_waiting_for_user_closes_with_null_prompt_when_no_questio
     )
     assert closed is True
     assert sink.closing is True
-    assert sink.queue.get_nowait() == (es.input_required_frame(task_id, None), True)
-    assert (
-        json.loads(es.input_required_frame(task_id, None).split("data: ", 1)[1])[
-            "prompt"
-        ]
-        is None
-    )
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is True
+    assert frame_text.startswith("event: task.input_required\n")
+    assert json.loads(frame_text.split("data: ", 1)[1]) == {
+        "task_id": task_id,
+        "prompt": None,
+    }
 
 
 async def test_watchdog_waiting_for_user_closes_with_the_pending_question_as_prompt():
@@ -1675,55 +1675,50 @@ async def test_trace_event_tool_call_start_then_end_projects_paired_step_frames(
     assert completed["data"]["result"] == "sunny"
 
 
-async def test_trace_event_ai_message_projects_a_completed_message_step():
-    """A one-shot ``ai_message`` (no ``stream_message_id``, i.e. a run
-    with no live token stream) still projects a step -- it's a public
-    ``message`` step, always already ``completed`` (see
-    ``_build_message_step``)."""
-    sink = _make_sink(task_id=7)
-    await sink.send_text(
-        _trace_event_frame(
-            "ai_message",
-            task_id=7,
-            event_id="persisted-event-id",
-            data={"content": "the answer"},
-        )
-    )
-    frame_text, is_close = sink.queue.get_nowait()
-    assert is_close is False
-    assert frame_text.startswith("event: step.completed\n")
-    step = json.loads(frame_text.split("data: ", 1)[1])["step"]
-    assert step["id"] == "message:persisted-event-id"
-    assert step["data"] == {"role": "assistant", "content": "the answer"}
+@pytest.mark.parametrize(
+    ("event_id", "extra_data"),
+    [
+        pytest.param("persisted-event-id", {}, id="no-stream-message-id"),
+        pytest.param(
+            "live-final-answer",
+            {"stream_message_id": "final_answer_abc"},
+            id="with-stream-message-id",
+        ),
+    ],
+)
+async def test_trace_event_ai_message_projects_a_completed_message_step(
+    event_id, extra_data
+):
+    """An ``ai_message`` folds into a public ``message`` step, always
+    already ``completed`` (see ``_build_message_step``), whether or not it
+    carries ``stream_message_id``.
 
-
-async def test_trace_event_ai_message_with_stream_message_id_also_projects_a_step():
-    """New contract: an ``ai_message`` carrying ``stream_message_id`` --
-    the persisted mirror of a final answer already delivered live via
-    ``message.delta``/``message.completed`` -- still folds into a
-    ``message`` step here, the same as any other ``ai_message``. This
-    duplicates that content as a second delivery (a ``step.completed``
-    alongside the earlier delta/completed frames), not a loss: dropping
-    it here (the old behavior) had no persisted counterpart, so
-    ``steps()`` already shows this exact row as a ``message`` step
-    regardless -- filtering only the live path made an already-attached
-    stream disagree with ``steps()`` about whether the step exists. See
+    The second cell is the new contract. An ``ai_message`` carrying
+    ``stream_message_id`` is the persisted mirror of a final answer this
+    stream already delivered live as ``message.delta`` /
+    ``message.completed``, so folding it too duplicates that content as a
+    second delivery rather than losing it. Dropping it here -- the old
+    behavior -- had no persisted counterpart: ``steps()`` shows this exact
+    row as a ``message`` step regardless, so filtering only the live path
+    made an already-attached stream disagree with ``steps()`` about whether
+    the step exists. See
     ``test_live_projection_matches_steps_for_a_streamed_final_answer``
-    below for the two-path parity this restores."""
+    below for the two-path parity this restores.
+    """
     sink = _make_sink(task_id=7)
     await sink.send_text(
         _trace_event_frame(
             "ai_message",
             task_id=7,
-            event_id="live-final-answer",
-            data={"content": "the answer", "stream_message_id": "final_answer_abc"},
+            event_id=event_id,
+            data={"content": "the answer", **extra_data},
         )
     )
     frame_text, is_close = sink.queue.get_nowait()
     assert is_close is False
     assert frame_text.startswith("event: step.completed\n")
     step = json.loads(frame_text.split("data: ", 1)[1])["step"]
-    assert step["id"] == "message:live-final-answer"
+    assert step["id"] == f"message:{event_id}"
     assert step["data"] == {"role": "assistant", "content": "the answer"}
     assert sink.queue.empty()
 
@@ -1887,48 +1882,6 @@ async def test_trace_event_tool_call_redacts_credential_shaped_fields_on_the_wir
     assert (
         completed_data["result"]["headers"]["Authorization"] == REDACTED_RUNTIME_SECRET
     )
-
-
-async def test_final_answer_delta_projects_message_delta_frame():
-    sink = _make_sink(task_id=21)
-    await sink.send_text(
-        json.dumps(
-            {
-                "type": "final_answer_delta",
-                "message_id": "final_answer_abc",
-                "task_id": 21,
-                "delta": "Hey",
-            }
-        )
-    )
-    frame_text, is_close = sink.queue.get_nowait()
-    assert is_close is False
-    assert frame_text == es.message_delta_frame("final_answer_abc", "Hey")
-    assert json.loads(frame_text.split("data: ", 1)[1]) == {
-        "message_id": "final_answer_abc",
-        "text": "Hey",
-    }
-
-
-async def test_final_answer_end_projects_message_completed_frame():
-    sink = _make_sink(task_id=21)
-    await sink.send_text(
-        json.dumps(
-            {
-                "type": "final_answer_end",
-                "message_id": "final_answer_abc",
-                "task_id": 21,
-                "content": "Hello there",
-            }
-        )
-    )
-    frame_text, is_close = sink.queue.get_nowait()
-    assert is_close is False
-    assert frame_text == es.message_completed_frame("final_answer_abc", "Hello there")
-    assert json.loads(frame_text.split("data: ", 1)[1]) == {
-        "message_id": "final_answer_abc",
-        "content": "Hello there",
-    }
 
 
 @pytest.mark.parametrize("frame_type", ["final_answer_start", "final_answer_error"])
@@ -2206,65 +2159,91 @@ async def test_poisoned_live_frame_increments_dropped_frame_count_only_once(
 # ===== single-frame content byte cap =====
 
 
-async def test_message_delta_over_the_byte_cap_is_truncated_and_flagged():
+@pytest.mark.parametrize(
+    ("frame_type", "content_key", "wire_event", "wire_key", "oversized"),
+    [
+        pytest.param(
+            "final_answer_delta",
+            "delta",
+            "message.delta",
+            "text",
+            False,
+            id="delta-under-the-cap",
+        ),
+        pytest.param(
+            "final_answer_delta",
+            "delta",
+            "message.delta",
+            "text",
+            True,
+            id="delta-over-the-cap",
+        ),
+        pytest.param(
+            "final_answer_end",
+            "content",
+            "message.completed",
+            "content",
+            False,
+            id="completed-under-the-cap",
+        ),
+        pytest.param(
+            "final_answer_end",
+            "content",
+            "message.completed",
+            "content",
+            True,
+            id="completed-over-the-cap",
+        ),
+    ],
+)
+async def test_final_answer_frames_project_message_frames_under_the_byte_cap(
+    frame_type, content_key, wire_event, wire_key, oversized
+):
+    """Each ``final_answer_*`` broadcast frame maps to its own
+    ``message.*`` SSE event, and each carries the same per-frame byte cap
+    on its own content field.
+
+    Four cells, each catching a different error:
+      - ``delta-under-the-cap`` / ``completed-under-the-cap``: the frame
+        family mapping itself (``final_answer_delta`` -> ``message.delta``
+        carrying ``text``, ``final_answer_end`` -> ``message.completed``
+        carrying ``content``), plus the absence of a ``truncated`` key on
+        content that fits. A wrong mapping, a renamed field, or a
+        ``truncated`` marker on unremarkable content fails here.
+      - ``delta-over-the-cap`` / ``completed-over-the-cap``: the cap is
+        applied on *both* paths, not just the streamed-delta one. A
+        ``_capped_text`` call missing from the final-answer *end* path
+        would leave the completed cell's content whole and unmarked while
+        the delta cells still passed.
+    """
     sink = _make_sink(task_id=51)
-    oversized = "x" * (es.MAX_FRAME_CONTENT_BYTES + 1000)
+    payload = (
+        "x" * (es.MAX_FRAME_CONTENT_BYTES + 1000)
+        if oversized
+        else "just a normal chunk"
+    )
     await sink.send_text(
         json.dumps(
             {
-                "type": "final_answer_delta",
+                "type": frame_type,
                 "message_id": "final_answer_abc",
                 "task_id": 51,
-                "delta": oversized,
+                content_key: payload,
             }
         )
     )
-    frame_text, _ = sink.queue.get_nowait()
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is False
+    assert frame_text.startswith(f"event: {wire_event}\n")
     data = json.loads(frame_text.split("data: ", 1)[1])
-    assert data["truncated"] is True
-    assert len(data["text"].encode("utf-8")) <= es.MAX_FRAME_CONTENT_BYTES
-    assert data["text"] != oversized
-
-
-async def test_message_delta_under_the_byte_cap_is_unmarked():
-    sink = _make_sink(task_id=53)
-    await sink.send_text(
-        json.dumps(
-            {
-                "type": "final_answer_delta",
-                "message_id": "final_answer_abc",
-                "task_id": 53,
-                "delta": "just a normal chunk",
-            }
-        )
-    )
-    frame_text, _ = sink.queue.get_nowait()
-    data = json.loads(frame_text.split("data: ", 1)[1])
-    assert "truncated" not in data
-    assert data["text"] == "just a normal chunk"
-
-
-async def test_message_completed_over_the_byte_cap_is_truncated_and_flagged():
-    """Same cap, same flagging, on ``message.completed`` -- pins that
-    the final-answer *end* path (not just the streamed delta path
-    above) also goes through ``_capped_text``."""
-    sink = _make_sink(task_id=52)
-    oversized = "x" * (es.MAX_FRAME_CONTENT_BYTES + 1000)
-    await sink.send_text(
-        json.dumps(
-            {
-                "type": "final_answer_end",
-                "message_id": "final_answer_abc",
-                "task_id": 52,
-                "content": oversized,
-            }
-        )
-    )
-    frame_text, _ = sink.queue.get_nowait()
-    data = json.loads(frame_text.split("data: ", 1)[1])
-    assert data["truncated"] is True
-    assert len(data["content"].encode("utf-8")) <= es.MAX_FRAME_CONTENT_BYTES
-    assert data["content"] != oversized
+    assert data["message_id"] == "final_answer_abc"
+    if oversized:
+        assert data["truncated"] is True
+        assert es._byte_length(data[wire_key]) <= es.MAX_FRAME_CONTENT_BYTES
+        assert data[wire_key] != payload
+    else:
+        assert "truncated" not in data
+        assert data == {"message_id": "final_answer_abc", wire_key: payload}
 
 
 def test_capped_text_handles_a_multibyte_character_straddling_the_byte_boundary():
@@ -2371,20 +2350,38 @@ async def test_capped_step_data_preserves_identifying_keys_per_step_type():
     )
 
 
-async def test_capped_step_data_truncates_an_oversized_identifying_value():
+@pytest.mark.parametrize(
+    "huge_name",
+    ["n" * 70_000, "名" * 12_000],
+    ids=["ascii-name", "cjk-name"],
+)
+def test_capped_step_data_truncates_an_oversized_identifying_value(huge_name):
     """An identifying value can itself be large enough to blow the cap
     once folded into the truncation marker (the first pass in
-    ``_capped_step_data``'s docstring) -- e.g. an unusually long tool
-    name. The second pass must truncate that value (not drop it) and
-    the result must still fit under ``MAX_FRAME_CONTENT_BYTES``:
-    truncating the value to the *full* cap and only then wrapping it in
-    the marker dict would overflow on the marker's own JSON overhead
-    alone, which is exactly the bug this guards against."""
-    huge_name = "n" * 70_000
+    ``_capped_step_data``'s docstring). The second pass must truncate it
+    rather than drop it, and the result must still fit under
+    ``MAX_FRAME_CONTENT_BYTES``.
+
+    Two cells, two different bugs:
+      - ``ascii-name``: truncating the value to the *full* cap and only
+        then wrapping it in the marker dict overflows on the marker's own
+        JSON overhead alone. This cell is what a per-key budget that
+        forgets that overhead fails on.
+      - ``cjk-name``: ``per_key_budget`` is computed in escaped-JSON
+        bytes, the domain ``_byte_length``'s cap checks use. Before
+        ``_capped_text`` measured in that same domain, handing it that
+        budget for a CJK name let it keep far more *characters* than the
+        escaped budget allowed (UTF-8 costs 3 bytes per "名", the escaped
+        ``\\uXXXX`` wire form costs 6), so the reassembled dict was still
+        over the cap on its own re-check and the identifying ``name``
+        field a client needs to know which tool ran was dropped entirely
+        -- not because it was genuinely too large to fit, but because the
+        two functions measured in different domains.
+    """
     result = es._capped_step_data({"name": huge_name, "junk": "x" * 1000})
     assert es._byte_length(result) <= es.MAX_FRAME_CONTENT_BYTES
     assert result["truncated"] is True
-    assert "name" in result
+    assert "name" in result  # the truncation pass preserved it -- not dropped
     assert len(result["name"]) < len(huge_name)
     assert result["original_bytes"] > es.MAX_FRAME_CONTENT_BYTES
 
@@ -2432,28 +2429,45 @@ def test_capped_step_data_drops_only_the_value_it_cannot_shrink():
     assert es._byte_length(result) <= es.MAX_FRAME_CONTENT_BYTES
 
 
-def test_capped_step_data_prefers_dropping_a_non_string_over_a_truncatable_one():
+@pytest.mark.parametrize(
+    ("data", "dropped_key", "kept_key", "kept_original"),
+    [
+        pytest.param(
+            {"sub_agent_name": {"k": "x" * 70_000}, "role": "assistant" * 9_000},
+            "sub_agent_name",
+            "role",
+            "assistant" * 9_000,
+            id="oversized-dict-beats-oversized-string",
+        ),
+        pytest.param(
+            {"name": {"k": "x" * 66_000}, "phase": "p" * 70_000},
+            "name",
+            "phase",
+            "p" * 70_000,
+            id="smaller-dict-still-dropped-first",
+        ),
+    ],
+)
+def test_capped_step_data_prefers_dropping_a_non_string_over_a_truncatable_one(
+    data, dropped_key, kept_key, kept_original
+):
     """When both a truncatable string and an un-shrinkable non-string
     survive a failed pass, the non-string is dropped first -- preferring
     to drop the salvageable string would degrade a step that could have
     kept real content down to the bare marker for no reason. Per the
     docstring, a pass over strings only always fits within the cap, so
     reaching the drop step guarantees at least one non-string survivor
-    remains; falling back to the largest overall is unreachable here."""
-    result = es._capped_step_data(
-        {"sub_agent_name": {"k": "x" * 70_000}, "role": "assistant" * 9_000}
-    )
-    assert result["truncated"] is True
-    assert "sub_agent_name" not in result
-    assert "role" in result
-    assert 0 < len(result["role"]) < len("assistant" * 9_000)
-    assert es._byte_length(result) <= es.MAX_FRAME_CONTENT_BYTES
+    remains; falling back to the largest overall is unreachable here.
 
-    result = es._capped_step_data({"name": {"k": "x" * 66_000}, "phase": "p" * 70_000})
+    The second cell is the one that pins "non-string first" rather than
+    "largest first": there the dict is the *smaller* of the two values, so
+    a size-only rule would drop the string instead.
+    """
+    result = es._capped_step_data(data)
     assert result["truncated"] is True
-    assert "name" not in result
-    assert "phase" in result
-    assert 0 < len(result["phase"]) < 70_000
+    assert dropped_key not in result
+    assert kept_key in result
+    assert 0 < len(result[kept_key]) < len(kept_original)
     assert es._byte_length(result) <= es.MAX_FRAME_CONTENT_BYTES
 
 
@@ -2501,28 +2515,6 @@ async def test_message_delta_with_cjk_content_is_capped_on_the_wire_not_decoded_
     assert data["truncated"] is True
     assert es._byte_length(data["text"]) <= es.MAX_FRAME_CONTENT_BYTES
     assert data["text"] != oversized
-
-
-async def test_capped_step_data_preserves_cjk_identifying_value_via_the_wire_byte_domain():
-    """The truncation pass's per-key budget (``per_key_budget`` in
-    ``_capped_step_data``) is computed in escaped-JSON bytes -- the same
-    domain ``_byte_length``'s cap checks use. Before ``_capped_text``
-    measured in that same domain, handing it that budget for a CJK name
-    let it keep far more *characters* than the escaped budget actually
-    allowed (UTF-8 costs 3 bytes per "名", the escaped wire form costs
-    6), so the reassembled dict was still over the cap on its own
-    re-check and the identifying ``name`` field a client needs to know
-    which tool ran got dropped entirely -- not because the name was
-    genuinely too large to fit, but because the two functions were
-    measuring in different domains. This pins that a CJK name now
-    survives, truncated, instead."""
-    huge_name_cjk = "名" * 12_000
-    result = es._capped_step_data({"name": huge_name_cjk, "junk": "x" * 1000})
-    assert es._byte_length(result) <= es.MAX_FRAME_CONTENT_BYTES
-    assert result["truncated"] is True
-    assert "name" in result  # the truncation pass preserved it -- not dropped
-    assert len(result["name"]) < len(huge_name_cjk)
-    assert result["original_bytes"] > es.MAX_FRAME_CONTENT_BYTES
 
 
 async def test_nonfinite_step_data_values_are_normalized_to_null_on_the_wire():
