@@ -176,6 +176,18 @@ describe("OfficialMcpSettingsDialog connected-state actions", () => {
     screen.getByRole("button", { name: "tools.mcp.dialog.manageKey" })
   })
 
+  it("withholds Configure when no canConfigure is provided and the connection gate is closed", () => {
+    // Mirrors the fallback case above with isGloballyConnected flipped to
+    // false: the omitted-prop shape must read the connection gate rather
+    // than defaulting Configure on regardless of it.
+    renderDialog({
+      app: app({ auth_type: "mcp_oauth" }),
+      isGloballyConnected: false,
+    })
+
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.configure" })).toBeNull()
+  })
+
   it("withholds Configure for a non-owned team tool even when configurable", () => {
     renderDialog({
       app: app({
