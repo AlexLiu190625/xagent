@@ -169,10 +169,10 @@ export function OfficialMcpSettingsDialog({
 
   if (!app) return null;
 
-  // configurable answers "would the edit route resolve for this viewer" —
-  // independent of connection state (D6/D8): a connector whose tokens arrive
-  // through a deployment-installed resolver hook is never "connected" for its
-  // own creator, yet its owner holds the association the edit routes require.
+  // configurable answers "would the edit route resolve for this viewer",
+  // independent of connection state: a connector whose tokens arrive through a
+  // deployment-installed resolver hook is never "connected" for its own
+  // creator, yet its owner holds the association the edit routes require.
   // The `??` fallback exists only for the caller that omits the prop entirely
   // (the Tools page's hand-built entry) and reproduces the pre-field gate.
   const configurable = Boolean(canConfigure ?? isGloballyConnected)
@@ -249,12 +249,10 @@ export function OfficialMcpSettingsDialog({
             )}
 
             {/* Configure / manage-my-key: gated on configurable, not on
-                isGloballyConnected. This is the one button whose availability
-                answers a different question than the other three below — "does
-                the edit route resolve for this viewer" rather than "is this
-                entry connected" — which is why it was pulled out of the IIFE
-                that used to wrap all four as a single isGloballyConnected
-                block. */}
+                isGloballyConnected. It is the one button here whose
+                availability answers a different question than the two below —
+                "does the edit route resolve for this viewer" rather than "is
+                this entry connected". */}
             {configurable && !isNonOwnedTeamTool && !isKeyless && (
               <Button
                 className="w-full max-w-[200px] rounded-full h-11 font-medium bg-slate-900 text-white hover:bg-slate-800"

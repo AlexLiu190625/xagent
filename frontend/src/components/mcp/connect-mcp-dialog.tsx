@@ -1534,13 +1534,10 @@ export function ConnectMcpDialog({
                                       // granted server is legitimate (can_authorize
                                       // can be true here too), but the picker
                                       // suppresses the trigger on connected state
-                                      // itself. A ternary used to give this for
-                                      // free by testing isGloballyConnected first;
-                                      // now that Configure and Authorize are
-                                      // independent blocks (they can both apply --
-                                      // a connector can need both a URL fix and
-                                      // consent), the suppression has to be
-                                      // written out.
+                                      // itself. It has to be spelled out because
+                                      // this block and Configure below are
+                                      // independent: both can apply at once -- a
+                                      // connector can need a URL fix and consent.
                                       <Button
                                         variant="ghost"
                                         size="sm"
@@ -1558,9 +1555,7 @@ export function ConnectMcpDialog({
                                       // whether the edit route resolves for this
                                       // viewer (list_mcp_apps.can_configure) has
                                       // nothing to do with whether consent is
-                                      // outstanding. Every entry this file lists
-                                      // carries a boolean can_configure, pinned by
-                                      // test_every_listed_entry_carries_all_three_decisions.
+                                      // outstanding.
                                       <Button
                                         variant="ghost"
                                         size="sm"

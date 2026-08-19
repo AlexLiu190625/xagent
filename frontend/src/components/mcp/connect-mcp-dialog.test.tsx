@@ -2133,11 +2133,10 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
   })
 
   it("shows Configure and the connected checkmark, not Authorize, for a connected custom mcp_oauth entry (#1332)", async () => {
-    // The isGloballyConnected branch of the footer ternary is checked first
-    // and must keep winning: a connected entry shows Configure plus the
-    // checkmark, never Authorize -- including now that can_authorize is true
-    // for it (re-consent is legitimate; the picker suppresses the trigger on
-    // connected state itself, which is why the backend does not).
+    // A connected entry shows Configure plus the checkmark, never Authorize --
+    // including when can_authorize is true for it (re-consent is legitimate;
+    // the Authorize block's own !isGloballyConnected term suppresses the
+    // trigger on connected state, which is why the backend does not).
     const onConnectSelected = vi.fn()
     renderSelectModeWith(
       [{ ...unauthorizedCustomMcp(), is_connected: true, can_attach: true }],
@@ -2397,6 +2396,10 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
       ...hookResolvedCustomMcp(),
       name: "Team Records",
       id: "team-records",
+      // The base factory is the owner's shape, which is configurable; a member
+      // reaching this connector through the team overlay holds no association
+      // of their own, so the listing reports false here.
+      can_configure: false,
     }
     delete teamOwned.auth_type
     renderSelectModeWith([teamOwned], onConnectSelected)
