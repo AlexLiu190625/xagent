@@ -676,6 +676,106 @@ def test_supersede_end_to_end_with_the_reader():
         db.close()
 
 
+def test_the_reader_only_reaches_superseded_rows_when_the_caller_opens_it():
+    """``allow_superseded`` is off unless a caller passes it. The default
+    call -- the one every caller but the read surface adapter makes --
+    sees a superseded row exactly as it always did: not at all. Mutation:
+    default the parameter to True and the first assertion turns red."""
+
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A question",
+            message_type="question",
+            interactions=[{"type": "text_input", "label": "Env"}],
+        )
+        supersede_legacy_question_rows(db, task_id=int(task.id))
+
+        assert get_latest_waiting_question(db, int(task.id)) == (None, None)
+
+        question, interactions = get_latest_waiting_question(
+            db, int(task.id), allow_superseded=True
+        )
+        assert question is not None
+        assert question.startswith("A question")
+        assert interactions == [{"type": "text_input", "label": "Env"}]
+    finally:
+        db.close()
+
+
+def test_an_opened_reader_still_prefers_a_live_question_row():
+    """Two sequential passes, not one ``message_type.in_(...)`` predicate:
+    the live question row wins even when a superseded row carries a higher
+    id, because the second pass only runs when the first came back empty.
+    Mutation: match both message types in one predicate ordered by id and
+    this turns red -- the superseded row here has the higher id."""
+
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A live question",
+            message_type="question",
+        )
+        persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "An older question already superseded",
+            message_type=SUPERSEDED_MESSAGE_TYPE,
+        )
+
+        question, _ = get_latest_waiting_question(
+            db, int(task.id), allow_superseded=True
+        )
+
+        assert question is not None
+        assert question.startswith("A live question")
+    finally:
+        db.close()
+
+
+def test_an_opened_reader_returns_the_newest_round_after_a_whole_task_relabel():
+    """``supersede_legacy_question_rows`` matches on task, role and message
+    type with no run partition, so one call relabels every round's question
+    row on the task at once (see its own docstring). The opened second pass
+    orders by id descending, so what it hands back on a task that has asked
+    three times is the third round's question, not the first.
+
+    Mutation: order the second pass ascending and this turns red."""
+
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        for round_number in (1, 2, 3):
+            persist_assistant_message(
+                db,
+                int(task.id),
+                int(task.user_id),
+                f"Round {round_number} question",
+                message_type="question",
+            )
+
+        relabelled = supersede_legacy_question_rows(db, task_id=int(task.id))
+        assert relabelled == 3
+
+        question, _ = get_latest_waiting_question(
+            db, int(task.id), allow_superseded=True
+        )
+
+        assert question is not None
+        assert question.startswith("Round 3 question")
+    finally:
+        db.close()
+
+
 @contextmanager
 def _captured_statements(bind):
     """Every SQL construct SQLAlchemy sends through ``bind`` while the

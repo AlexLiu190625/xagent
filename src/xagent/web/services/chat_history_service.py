@@ -733,9 +733,32 @@ def load_task_transcript(
 
 
 def get_latest_waiting_question(
-    db: Session, task_id: int
+    db: Session, task_id: int, *, allow_superseded: bool = False
 ) -> tuple[Optional[str], Optional[list[dict[str, Any]]]]:
-    """Return the latest persisted ask-user question for a waiting task."""
+    """Return the latest persisted ask-user question for a waiting task.
+
+    Two sequential passes rather than one ``message_type.in_(...)``
+    predicate. A single predicate ordered by id lets a
+    ``SUPERSEDED_MESSAGE_TYPE`` row with a higher id outrank a
+    ``QUESTION_MESSAGE_TYPE`` row that is still live, inverting the
+    priority this reader owes its callers. The first pass is
+    unconditional and always runs first.
+
+    ``allow_superseded`` opens a second pass over
+    ``SUPERSEDED_MESSAGE_TYPE`` rows, and only when the first pass came
+    back empty. It is off by default, and the read surface adapter
+    (``task_interaction_read.get_pending_interaction_question``) is the
+    only caller that turns it on; every other caller reads exactly what it
+    reads with the parameter absent.
+
+    What the second pass hands back is the newest question row on this
+    task that ``supersede_legacy_question_rows`` has relabelled. That
+    writer's WHERE is ``_assistant_question_filters`` -- task, assistant
+    role, message type -- with no run partition, so one call relabels
+    every round's question row on the task at once; taking the highest id
+    back is therefore this task's most recent question even on a task that
+    has asked several times.
+    """
 
     latest_question = (
         db.query(TaskChatMessage)
@@ -743,6 +766,17 @@ def get_latest_waiting_question(
         .order_by(TaskChatMessage.id.desc())
         .first()
     )
+    if not latest_question and allow_superseded:
+        latest_question = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "assistant",
+                TaskChatMessage.message_type == SUPERSEDED_MESSAGE_TYPE,
+            )
+            .order_by(TaskChatMessage.id.desc())
+            .first()
+        )
     if not latest_question:
         return None, None
 
