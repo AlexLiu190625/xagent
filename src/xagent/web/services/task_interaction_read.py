@@ -18,6 +18,17 @@ Two steps, in this order, and nothing else:
    implementation of "what is this waiting task's question" -- decides
    the tier, and this function projects its result down to the tuple.
 
+The marker also decides one thing beyond routing: whether the transcript
+reader may reach a question row a structured publication has already
+relabelled to ``question_superseded``. This function is the only caller
+anywhere that opens ``get_latest_waiting_question``'s ``allow_superseded``
+gate, and it opens it on exactly the outcomes where nothing holds this
+task's answer slot -- a NULL marker in step 1, and the two fallback
+branches of the rich view in step 2. A marker value this reader does not
+recognize leaves the slot's state unknown, and unknown keeps the gate
+shut. Step 1 still costs one attribute access and no query: the gate value
+comes from the marker, which is already in memory.
+
 This function performs **no authorization**. It takes a ``Task`` object,
 not an id, precisely so that a caller has to have resolved and
 authorized that row through its own layer first. All four callers do
@@ -86,6 +97,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from ..models.task_interaction import INTERACTION_PROTOCOL_VERSION
 from .chat_history_service import get_latest_waiting_question
 from .task_interaction_service import materialize_compatibility_view
 
@@ -107,13 +119,28 @@ def get_pending_interaction_question(
     that authorized it (see the module docstring).
     """
 
-    marker = task.interaction_protocol_version
+    # Annotated because the declarative column gives this attribute no
+    # instance-level type. Read off a loaded row it is the stored value,
+    # and comparing it below yields a plain bool rather than the SQL
+    # expression the same comparison would build on the class.
+    marker: Any = task.interaction_protocol_version
     if marker is None:
         # No native row can belong to this task under a NULL marker, so
-        # the interaction table is not queried.
-        return get_latest_waiting_question(db, int(task.id))
+        # the interaction table is not queried -- and nothing holds this
+        # task's answer slot, so a question row a structured publication
+        # already relabelled is still the honest answer.
+        return get_latest_waiting_question(db, int(task.id), allow_superseded=True)
 
-    view = materialize_compatibility_view(db, int(task.id))
+    # Only the one recognized marker lets the view's own two fallback
+    # branches decide that nothing holds the answer slot. Every other value
+    # -- including one that is not an integer at all -- compares unequal
+    # and leaves the gate shut, which is the right direction: an
+    # unrecognized marker means the slot's state is unknown.
+    view = materialize_compatibility_view(
+        db,
+        int(task.id),
+        allow_superseded=marker == INTERACTION_PROTOCOL_VERSION,
+    )
     if view.tier == "unanswerable":
         # The question text, when the tier could still read one, and no
         # controls: this question cannot be answered right now, so

@@ -9,19 +9,22 @@ filters or reshapes what it receives (A14).
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import Select, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
+import xagent.web.services.chat_history_service as chat_history_service
+import xagent.web.services.task_interaction_service as interaction_service_module
 from tests.web.services.task_interaction_schema_shared import make_task, make_user
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.models.database import Base
-from xagent.web.models.task import Task, TraceEvent
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import task_interaction_read as read_surface
 from xagent.web.services.chat_history_service import persist_assistant_message
@@ -196,15 +199,15 @@ def test_a1_marker_null_reads_the_live_legacy_question(_db: Session) -> None:
     assert interactions == [{"type": "text_input", "label": "Live"}]
 
 
-def test_a2_marker_null_never_reads_a_superseded_only_row(_db: Session) -> None:
-    """``get_latest_waiting_question`` filters on
-    ``message_type == QUESTION_MESSAGE_TYPE`` only (see
-    ``_assistant_question_filters``); a row a later structured publication
-    retyped to ``question_superseded`` is a different message type and is
-    never matched, for the NULL-marker cell same as every other caller.
-    Mutation: have this cell fall back to reading superseded rows when the
-    first pass finds nothing and this test turns red -- it would return
-    the superseded content instead of ``(None, None)``."""
+def test_a2_marker_null_recovers_a_superseded_only_row(_db: Session) -> None:
+    """A NULL marker means no native row holds this task's answer slot, so
+    a question row a structured publication already relabelled to
+    ``question_superseded`` is the only record of what this task is asking
+    -- and the honest answer, not an empty pair. Step 0 is the one caller
+    that opens ``allow_superseded``, which is what makes the second pass
+    run here after the first finds no live row. Mutation: pass
+    ``allow_superseded=False`` from step 0 and this turns red -- the pair
+    comes back empty and the question is unreachable."""
 
     task = _make_task(_db, marker=None)
     persist_assistant_message(
@@ -218,7 +221,9 @@ def test_a2_marker_null_never_reads_a_superseded_only_row(_db: Session) -> None:
 
     question, interactions = read_surface.get_pending_interaction_question(_db, task)
 
-    assert (question, interactions) == (None, None)
+    assert question is not None
+    assert question.startswith("An old question")
+    assert interactions == [{"type": "text_input", "label": "Old"}]
 
 
 def test_a3_marker_null_prefers_the_live_row_over_a_higher_id_superseded_row(
@@ -353,7 +358,7 @@ def test_a5_marker_fast_path_never_calls_the_rich_view(
     and confirming it still passes. Mutation: delete the marker check (so
     every task always calls the rich view) and this test turns red."""
 
-    def _explode(db: Session, task_id: int):
+    def _explode(db: Session, task_id: int, *, allow_superseded: bool = False):
         raise AssertionError("materialize_compatibility_view must not be called")
 
     monkeypatch.setattr(read_surface, "materialize_compatibility_view", _explode)
@@ -422,16 +427,17 @@ def test_a7_marker_matches_table_absent_reads_the_legacy_transcript(
     assert interactions == [{"type": "text_input", "label": "Live"}]
 
 
-def test_a8_marker_matches_no_active_row_never_reads_a_superseded_only_row(
+def test_a8_marker_matches_no_active_row_recovers_a_superseded_only_row(
     _db: Session,
 ) -> None:
-    """T1's fallback (marker == 1, no active row) goes through the same
-    single-pass ``get_latest_waiting_question`` as the NULL-marker T0 cell
-    (see A2) -- a structured row was expected for this wait (the marker
-    says so) but none is active, and the transcript fallback still never
-    matches a row already retyped to ``question_superseded``. Mutation:
-    have this fallback read superseded rows and this test turns red -- it
-    would return the superseded content instead of ``(None, None)``."""
+    """T1's "no active row" fallback reaches relabelled rows for the same
+    reason the NULL-marker cell does (see A2): no native row holds this
+    task's answer slot, so the relabelled transcript row is the only record
+    of the question and answering it lands nowhere a native row has
+    claimed. The gate value travels marker -> adapter ->
+    ``materialize_compatibility_view`` -> ``_legacy_view``. Mutation: stop
+    threading ``allow_superseded`` into either legacy branch of the
+    compatibility view and this turns red."""
 
     task = _make_task(_db, marker=1)
     persist_assistant_message(
@@ -445,7 +451,107 @@ def test_a8_marker_matches_no_active_row_never_reads_a_superseded_only_row(
 
     question, interactions = read_surface.get_pending_interaction_question(_db, task)
 
-    assert (question, interactions) == (None, None)
+    assert question is not None
+    assert question.startswith("An old question")
+    assert interactions == [{"type": "text_input", "label": "Old"}]
+
+
+# ---------------------------------------------------------------------------
+# Superseded recovery: what the read surface answers once a structured
+# publication has relabelled the transcript row it replaced.
+# ---------------------------------------------------------------------------
+
+
+def _make_terminated_row(db: Session, *, task_id: int) -> None:
+    """One interaction row in a terminal state: it holds no answer slot, so
+    the active-row predicate does not match it and the compatibility view
+    falls back to the transcript."""
+
+    now = _now()
+    row = TaskInteractionRequest(
+        task_id=task_id,
+        run_id="run-a",
+        kind="clarification",
+        protocol_version=1,
+        status="terminated",
+        active_slot=None,
+        origin="internal",
+        request_payload={"message": "Which environment?", "interactions": []},
+        request_idempotency_key=f"read-terminal-key-{task_id}",
+        resume_trace_event_id=None,
+        resume_event_id="resume-event-1",
+        resume_execution_id="exec-1",
+        resume_locator_format="trace_event_pk_v1",
+        resume_checkpoint_type="agent_execution_checkpoint",
+        resume_run_partition="run-a",
+        terminal_reason="deadline_elapsed",
+        terminated_at=now,
+        created_at=now,
+        expires_at=now + timedelta(minutes=15),
+    )
+    db.add(row)
+    db.commit()
+
+
+def test_read_surface_recovers_a_superseded_question(_db: Session) -> None:
+    """The steady state a structured publication leaves behind on a task
+    whose marker was never advanced: the task is waiting, its interaction
+    row has reached a terminal state, and the transcript row that carried
+    the question has been relabelled. Nothing holds the answer slot, so the
+    relabelled row is what this task is asking and the read surface hands
+    it back."""
+
+    task = _make_task(_db, marker=None)
+    task.status = TaskStatus.WAITING_FOR_USER
+    _db.commit()
+    _make_terminated_row(_db, task_id=int(task.id))
+    persist_assistant_message(
+        _db,
+        int(task.id),
+        int(task.user_id),
+        "Which environment?",
+        message_type="question_superseded",
+        interactions=[{"type": "text_input", "label": "Environment"}],
+    )
+
+    question, interactions = read_surface.get_pending_interaction_question(_db, task)
+
+    assert question is not None
+    assert question.startswith("Which environment?")
+    assert interactions == [{"type": "text_input", "label": "Environment"}]
+
+
+def test_recovery_still_applies_when_an_active_row_exists_under_a_null_marker(
+    _db: Session,
+) -> None:
+    """A known boundary, pinned as current behavior rather than as the
+    behavior anyone wants: step 0 reads the marker off the task row and
+    queries nothing else, so a NULL marker sitting on a task that does have
+    an active interaction row still opens the gate and answers from the
+    relabelled transcript row.
+
+    The pair "active row staged" and "marker advanced to 1" is written by
+    the staging side, which is what keeps this combination from occurring;
+    the read surface does not second-guess it, and the superseded fallback
+    does not take that duty on either."""
+
+    task = _make_task(_db, marker=None)
+    trace_event_id = _make_trace_event(_db, task_id=int(task.id))
+    _make_active_row(_db, task_id=int(task.id), resume_trace_event_id=trace_event_id)
+    persist_assistant_message(
+        _db,
+        int(task.id),
+        int(task.user_id),
+        "An old question",
+        message_type="question_superseded",
+        interactions=[{"type": "text_input", "label": "Old"}],
+    )
+
+    question, interactions = read_surface.get_pending_interaction_question(_db, task)
+
+    assert question is not None
+    assert question.startswith("An old question")
+    assert interactions == [{"type": "text_input", "label": "Old"}]
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +692,9 @@ def test_a13b_unanswerable_tier_never_leaks_interactions_even_if_the_view_carrie
     Mutation: change the branch to ``return view.question,
     view.interactions`` and this test turns red; A10-A13 stay green."""
 
-    def _fake_view(db: Session, task_id: int) -> CompatibilityQuestionView:
+    def _fake_view(
+        db: Session, task_id: int, *, allow_superseded: bool = False
+    ) -> CompatibilityQuestionView:
         return CompatibilityQuestionView(
             tier="unanswerable",
             question="q",
@@ -677,3 +785,205 @@ def test_a15_interaction_element_key_sets_differ_between_legacy_and_native_tiers
         "accept",
         "multiple",
     }
+
+
+# ---------------------------------------------------------------------------
+# The gate value itself: which of the read surface's outcomes lets the
+# transcript reader reach relabelled rows, and which does not. Every cell
+# below records the ``allow_superseded`` value that actually arrived at
+# ``get_latest_waiting_question``, from whichever of its two call sites ran.
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _recorded_gate_values(monkeypatch: pytest.MonkeyPatch):
+    """Every ``allow_superseded`` value ``get_latest_waiting_question``
+    receives while the block runs, in call order, patched at both of its
+    call sites: step 0 in the adapter and ``_legacy_view`` in the
+    compatibility view. An empty list means the transcript reader was never
+    reached at all."""
+
+    seen: list[bool] = []
+    real = chat_history_service.get_latest_waiting_question
+
+    def _record(db, task_id, *, allow_superseded: bool = False):
+        seen.append(allow_superseded)
+        return real(db, task_id, allow_superseded=allow_superseded)
+
+    monkeypatch.setattr(read_surface, "get_latest_waiting_question", _record)
+    monkeypatch.setattr(
+        interaction_service_module, "get_latest_waiting_question", _record
+    )
+    yield seen
+
+
+def _gate_marker_null(db: Session) -> Task:
+    task = _make_task(db, marker=None)
+    _persist_live_question(db, task)
+    return task
+
+
+def _gate_unrecognized_marker(db: Session) -> Task:
+    task = _make_task(db, marker=None)
+    _persist_live_question(db, task)
+    # ck_tasks_interaction_protocol_version pins the column to NULL-or-1, so
+    # this value is set on the in-memory row only -- the same construction
+    # A4 uses, and faithful because the adapter only ever reads it.
+    task.interaction_protocol_version = 2
+    return task
+
+
+def _gate_table_absent(db: Session) -> Task:
+    task = _make_task(db, marker=1)
+    _persist_live_question(db, task)
+    TaskInteractionRequest.__table__.drop(bind=db.get_bind())
+    return task
+
+
+def _gate_no_active_row(db: Session) -> Task:
+    task = _make_task(db, marker=1)
+    _persist_live_question(db, task)
+    return task
+
+
+def _gate_unanswerable_payload(db: Session) -> Task:
+    task = _make_task(db, marker=1)
+    trace_event_id = _make_trace_event(db, task_id=int(task.id))
+    _make_active_row(
+        db,
+        task_id=int(task.id),
+        resume_trace_event_id=trace_event_id,
+        request_payload={"not": "a valid v1 payload"},
+    )
+    return task
+
+
+def _gate_unanswerable_anchor(db: Session) -> Task:
+    task = _make_task(db, marker=1)
+    trace_event_id = _make_trace_event(
+        db, task_id=int(task.id), run_partition="a-different-run"
+    )
+    _make_active_row(db, task_id=int(task.id), resume_trace_event_id=trace_event_id)
+    return task
+
+
+def _persist_live_question(db: Session, task: Task) -> None:
+    persist_assistant_message(
+        db,
+        int(task.id),
+        int(task.user_id),
+        "A live question",
+        message_type="question",
+        interactions=[{"type": "text_input", "label": "Live"}],
+    )
+
+
+_GATE_CASES: dict[str, tuple[Any, list[bool]]] = {
+    # No native row can belong to this task, so the relabelled transcript
+    # row is reachable.
+    "marker_null": (_gate_marker_null, [True]),
+    # A marker value this reader does not recognize means the slot's state
+    # is unknown, and unknown closes the gate.
+    "unrecognized_marker": (_gate_unrecognized_marker, [False]),
+    # Both compatibility-view fallbacks mean nothing holds the slot.
+    "table_absent": (_gate_table_absent, [True]),
+    "no_active_row": (_gate_no_active_row, [True]),
+    # The unanswerable tiers never reach the transcript reader at all.
+    "unanswerable_payload": (_gate_unanswerable_payload, []),
+    "unanswerable_anchor": (_gate_unanswerable_anchor, []),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_GATE_CASES))
+def test_gate_value_per_read_surface_outcome(
+    _db: Session, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    build, expected = _GATE_CASES[case]
+    task = build(_db)
+
+    with _recorded_gate_values(monkeypatch) as seen:
+        read_surface.get_pending_interaction_question(_db, task)
+
+    assert seen == expected
+
+
+def test_gate_is_closed_for_an_unrecognized_protocol_version_row(
+    _db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The third unanswerable tier, which needs its own construction: an
+    active row's protocol_version cannot be written to anything but 1
+    (ck_task_interaction_requests_active_protocol), so it is mutated in
+    memory behind the accessor that reads it, the same way A12 does."""
+
+    task = _make_task(_db, marker=1)
+    trace_event_id = _make_trace_event(_db, task_id=int(task.id))
+    row = _make_active_row(
+        _db, task_id=int(task.id), resume_trace_event_id=trace_event_id
+    )
+    row.protocol_version = 2
+    monkeypatch.setattr(
+        interaction_service_module, "_active_native_row", lambda db, task_id: row
+    )
+
+    with _recorded_gate_values(monkeypatch) as seen:
+        read_surface.get_pending_interaction_question(_db, task)
+
+    assert seen == []
+
+
+# ---------------------------------------------------------------------------
+# Statement count: step 0 still costs nothing beyond what the transcript
+# reader itself costs.
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _counted_selects(bind):
+    seen: list[object] = []
+
+    def _record(conn, clauseelement, multiparams, params, execution_options):
+        if isinstance(clauseelement, Select):
+            seen.append(clauseelement)
+
+    event.listen(bind, "before_execute", _record)
+    try:
+        yield seen
+    finally:
+        event.remove(bind, "before_execute", _record)
+
+
+@pytest.mark.parametrize("message_type", ["question", "question_superseded"])
+def test_m3_marker_null_issues_no_statement_the_reader_would_not(
+    _db: Session, message_type: str
+) -> None:
+    """Under a NULL marker the adapter must emit exactly the statements
+    ``get_latest_waiting_question`` emits on its own -- one when the first
+    pass hits, two when the gate is open and the first pass comes back
+    empty -- and nothing else. Mutation: add any query to step 0, for
+    instance a lookup into the interaction table, and this turns red."""
+
+    task = _make_task(_db, marker=None)
+    persist_assistant_message(
+        _db,
+        int(task.id),
+        int(task.user_id),
+        "A question",
+        message_type=message_type,
+    )
+    # Load the task's own columns before counting: persist_assistant_message
+    # commits, which expires them, and the refresh SELECT that first touch
+    # would otherwise emit belongs to the fixture, not to either function
+    # under measurement.
+    _db.refresh(task)
+    task_id = int(task.id)
+    bind = _db.get_bind()
+
+    with _counted_selects(bind) as through_adapter:
+        read_surface.get_pending_interaction_question(_db, task)
+    with _counted_selects(bind) as direct:
+        chat_history_service.get_latest_waiting_question(
+            _db, task_id, allow_superseded=True
+        )
+
+    assert len(through_adapter) == len(direct)
+    assert len(direct) == (1 if message_type == "question" else 2)

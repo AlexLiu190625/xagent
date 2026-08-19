@@ -1352,8 +1352,12 @@ class CompatibilityQuestionView:
     reason: str | None = None
 
 
-def _legacy_view(db: "Session", task_id: int) -> CompatibilityQuestionView:
-    question, interactions = get_latest_waiting_question(db, task_id)
+def _legacy_view(
+    db: "Session", task_id: int, *, allow_superseded: bool = False
+) -> CompatibilityQuestionView:
+    question, interactions = get_latest_waiting_question(
+        db, task_id, allow_superseded=allow_superseded
+    )
     return CompatibilityQuestionView(
         tier="legacy", question=question, interactions=interactions
     )
@@ -1377,7 +1381,7 @@ def _validation_error_summary(exc: _PydanticValidationError) -> list[str]:
 
 
 def materialize_compatibility_view(
-    db: "Session", task_id: int
+    db: "Session", task_id: int, *, allow_superseded: bool = False
 ) -> CompatibilityQuestionView:
     """The single rich implementation of "what is this waiting task's
     question", three-tiered:
@@ -1385,7 +1389,9 @@ def materialize_compatibility_view(
     T1 (tier ``"legacy"``) -- the ``task_interaction_requests`` table does
     not exist yet, or there is no active native row for this task: falls
     back, internally, to ``get_latest_waiting_question`` and returns
-    exactly what that function would have, unconditionally. This tier's
+    exactly what that function hands back, with no filtering of its own
+    and no reason code (the caller's ``allow_superseded`` is passed
+    through to it -- see below). This tier's
     table-existence gate is not defensive decoration for a table that
     might never exist -- ``interaction_rollout.py``'s own ``/ready`` gate
     treats "the service deploys before its own migration has run" as a
@@ -1437,14 +1443,22 @@ def materialize_compatibility_view(
     first, inside a worker-owned short session, before calling this view.
     #1079's own endpoint (not written here) is meant to consume this rich
     result directly, keeping ``reason`` for its own outcome classification.
+
+    ``allow_superseded`` is passed straight to
+    ``get_latest_waiting_question`` on both T1 branches and nowhere else.
+    It lets the transcript reader reach a question row a structured
+    publication has already relabelled, which is only honest on those two
+    branches: both mean no native row holds this task's answer slot. The
+    three T3 branches never call ``_legacy_view`` at all, so the parameter
+    has no place to appear in them -- not an omission.
     """
 
     if not interaction_requests_table_exists(db):
-        return _legacy_view(db, task_id)
+        return _legacy_view(db, task_id, allow_superseded=allow_superseded)
 
     row = _active_native_row(db, task_id)
     if row is None:
-        return _legacy_view(db, task_id)
+        return _legacy_view(db, task_id, allow_superseded=allow_superseded)
 
     if row.protocol_version != INTERACTION_PROTOCOL_VERSION:
         # An active row holds this task's answer slot, so this cannot fold
