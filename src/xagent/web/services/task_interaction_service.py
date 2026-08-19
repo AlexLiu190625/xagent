@@ -106,7 +106,11 @@ from ..models.task_interaction import (
     TaskInteractionRequest,
 )
 from .chat_history_service import get_latest_waiting_question
-from .interaction_rollout import COUNTER_LIFECYCLE_RESPONSE_CONFLICT, increment_counter
+from .interaction_rollout import (
+    COUNTER_COMPAT_READ_FALLBACK,
+    COUNTER_LIFECYCLE_RESPONSE_CONFLICT,
+    increment_counter,
+)
 from .ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
     CHECKPOINT_PK_ANCHOR_DANGLING,
@@ -1467,11 +1471,17 @@ def materialize_compatibility_view(
     structured record of the answer. The table-absent branch does not
     recheck: with no table there is nothing an active row could have been
     written into.
+
+    ``compat.read_fallback`` counts one per legacy tier returned from here,
+    and only from here: it is what makes the answer-from-the-transcript
+    rate readable next to how often a native row was published. A run the
+    recheck rescues is not a fallback and is not counted.
     """
 
     if not interaction_requests_table_exists(db):
         # No recheck on this branch: with no table there is nowhere for an
         # active row to have been written.
+        increment_counter(COUNTER_COMPAT_READ_FALLBACK)
         return _legacy_view(db, task_id, allow_superseded=allow_superseded)
 
     row = _active_native_row(db, task_id)
@@ -1479,6 +1489,7 @@ def materialize_compatibility_view(
         fallback = _legacy_view(db, task_id, allow_superseded=allow_superseded)
         row = _active_native_row(db, task_id)
         if row is None:
+            increment_counter(COUNTER_COMPAT_READ_FALLBACK)
             return fallback
         # An active row appeared between the two looks, so this task's tier
         # is decided from it below instead of from the transcript. Once:

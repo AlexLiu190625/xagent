@@ -28,6 +28,10 @@ from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import task_interaction_read as read_surface
 from xagent.web.services.chat_history_service import persist_assistant_message
+from xagent.web.services.interaction_rollout import (
+    COUNTER_COMPAT_READ_FALLBACK,
+    counters_snapshot,
+)
 from xagent.web.services.ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
     CHECKPOINT_PK_ANCHOR_DANGLING,
@@ -987,3 +991,75 @@ def test_m3_marker_null_issues_no_statement_the_reader_would_not(
 
     assert len(through_adapter) == len(direct)
     assert len(direct) == (1 if message_type == "question" else 2)
+
+
+# ---------------------------------------------------------------------------
+# compat.read_fallback: where the counter is incremented, and where it must
+# not be.
+# ---------------------------------------------------------------------------
+
+
+def _read_fallback_count() -> int:
+    return counters_snapshot().get(COUNTER_COMPAT_READ_FALLBACK, 0)
+
+
+@pytest.mark.parametrize("case", ["table_absent", "no_active_row"])
+def test_each_compatibility_view_legacy_branch_counts_one_read_fallback(
+    _db: Session, case: str
+) -> None:
+    task = _make_task(_db, marker=1)
+    _persist_live_question(_db, task)
+    if case == "table_absent":
+        TaskInteractionRequest.__table__.drop(bind=_db.get_bind())
+
+    before = _read_fallback_count()
+    read_surface.get_pending_interaction_question(_db, task)
+
+    assert _read_fallback_count() == before + 1
+
+
+def test_the_marker_fast_path_counts_no_read_fallback(_db: Session) -> None:
+    """The counter measures how often the compatibility view had to answer
+    from the transcript, which is only meaningful next to how often it was
+    asked. Counting step 0 as well would make it every read of a task whose
+    marker is NULL -- today that is every task -- and the ratio would carry
+    no information. Mutation: increment in step 0 and this turns red."""
+
+    task = _make_task(_db, marker=None)
+    _persist_live_question(_db, task)
+
+    before = _read_fallback_count()
+    read_surface.get_pending_interaction_question(_db, task)
+
+    assert _read_fallback_count() == before
+
+
+def test_a_recheck_that_finds_an_active_row_counts_no_read_fallback(
+    _db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recheck exists to stop a legacy answer being returned, so the
+    run it saves is not a fallback and must not be counted. The active row
+    is made to appear on the second look only, which is the shape a
+    concurrent publication produces."""
+
+    task = _make_task(_db, marker=1)
+    trace_event_id = _make_trace_event(_db, task_id=int(task.id))
+    row = _make_active_row(
+        _db, task_id=int(task.id), resume_trace_event_id=trace_event_id
+    )
+    looks = 0
+
+    def _appears_on_the_second_look(db, task_id: int):
+        nonlocal looks
+        looks += 1
+        return None if looks == 1 else row
+
+    monkeypatch.setattr(
+        interaction_service_module, "_active_native_row", _appears_on_the_second_look
+    )
+
+    before = _read_fallback_count()
+    question, _ = read_surface.get_pending_interaction_question(_db, task)
+
+    assert question == "Which environment?"
+    assert _read_fallback_count() == before

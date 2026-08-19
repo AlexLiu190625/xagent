@@ -6,8 +6,17 @@ different task, and a nonexistent task_id), idempotency, the
 degrade/propagate split on the catch clause, signal pairing,
 transcript-field invariance, a caller-originated flush failure
 propagating past the catch instead of being absorbed by it, and the
-reader's and writer's compiled WHERE clauses matching at runtime. One
-property is not provable here -- that
+reader's and writer's compiled WHERE clauses matching at runtime.
+
+One fact this file holds both halves of, and the reason the pairing
+lives here: the relabel scans the whole task and carries no run
+partition. Its WHERE is task, assistant role, message type, so a single
+call relabels every round's question row on the task at once. That is
+what makes the reader's superseded-row pass correct on a task that has
+asked more than once -- ordering by id descending over rows the relabel
+just swept up lands on the newest round, not on some earlier one.
+
+One property is not provable here -- that
 the savepoint is actually necessary, i.e. that a failed statement
 without it would poison the caller's transaction. SQLite does not abort
 an open transaction after a failed statement the way PostgreSQL does, so
@@ -822,6 +831,16 @@ def _reader_and_writer_where_clauses(db, task_id: int) -> tuple[str, str]:
     such as ``message_type.in_(["question"])``, count as a difference.
     Two predicates that mean the same thing but do not render the same
     thing are exactly the state this abstraction exists to prevent.
+
+    The reader is called with ``allow_superseded`` left at its default, so
+    what this captures is its first pass and only its first pass. The
+    second pass belongs on the other side of this pairing: its predicate
+    matches ``SUPERSEDED_MESSAGE_TYPE``, which is what the writer
+    *produces*. Folding it into the captured set would demand that the
+    writer's input set equal its own output set, an assertion that can
+    never hold. ``assert len(selects) == 1`` below therefore holds because
+    the caller here left the second pass shut, not because the reader can
+    only ever emit one statement.
     """
     bind = db.get_bind()
     with _captured_statements(bind) as read_seen:
@@ -848,6 +867,11 @@ def test_the_shared_where_clause_still_has_all_three_legs():
     drift -- one side diverging from the other, and a condition
     disappearing from the shared helper, which moves both sides together
     and would keep a bare equality check green.
+
+    Scope: this pins the reader's first pass against the writer, nothing
+    else. A live question row is persisted below, so the first pass hits
+    and the reader's superseded-row pass -- which only runs when a caller
+    opens it and the first pass comes back empty -- never runs here.
     """
     db = _create_db_session()
     try:
