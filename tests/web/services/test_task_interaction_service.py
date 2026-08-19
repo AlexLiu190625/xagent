@@ -807,6 +807,32 @@ def test_ca2_a_non_admin_user_cannot_tell_a_foreign_task_from_an_absent_one(
     assert on_a_foreign_task == svc.CreateUnauthorized(reason="not_task_principal")
 
 
+@pytest.mark.parametrize("is_admin", [False, True], ids=["plain_user", "admin"])
+@pytest.mark.parametrize("task_exists", [True, False], ids=["real_task", "absent_task"])
+def test_ca3_create_rejects_a_user_principal_carrying_no_user_id(
+    _db: Session, _seeded_task: int, is_admin: bool, task_exists: bool
+) -> None:
+    """is_admin authorizes without ownership, but not without an identity.
+    Rejected before the lookup on both branches: the owner predicate would
+    otherwise render as Task.user_id IS NULL and match every ownerless
+    task, and an admin passing on the flag alone would reach the write
+    point with nothing to record as who acted."""
+
+    principal = svc.InteractionPrincipal(
+        kind="user",
+        user_id=None,
+        is_admin=is_admin,
+        auth_mode=None,
+    )
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task if task_exists else _ABSENT_TASK_ID,
+        principal=principal,
+        envelope=_valid_envelope(),
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+
+
 def test_cw1_fully_valid_call_returns_not_wired(
     _db: Session, _seeded_task: int
 ) -> None:
@@ -828,13 +854,14 @@ def test_create_never_touches_staging_or_stages_a_row(
     by asserting the table it would write to stays empty across a
     successful (CreateNotWired) call."""
 
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
     envelope = _valid_envelope()
     outcome = svc.create(
         _db,
         task_id=_seeded_task,
         principal=svc.InteractionPrincipal(
             kind="user",
-            user_id=None,
+            user_id=task.user_id + 1000,
             is_admin=True,
             auth_mode=None,
         ),
@@ -2110,6 +2137,42 @@ def test_module_issues_zero_sa_text_calls() -> None:
     assert text_calls == []
 
 
+def test_no_production_module_outside_this_one_renders_a_responder_identity() -> None:
+    """``responder_identity`` values exist only where ``identity_string()``
+    is called, and every such call is in this module -- inside
+    ``respond()``, which the create/respond gate holds at zero production
+    callers.
+
+    That chain is what makes the fail-closed tightening in
+    ``identity_string()`` a no-op for today's behavior rather than a
+    change to it: no production path reaches the function at all, so no
+    caller can be relying on the ``"user:None"`` string it used to
+    produce. Written as a scan rather than as a behavior case because the
+    claim is about the absence of call sites, which no constructed call
+    can demonstrate.
+
+    Shares the blind spots of every AST scan over this package
+    (``interaction_static_scan_shared``): dynamic access, alias chains,
+    the ``scripts/`` tree, and use in value position are all invisible.
+    """
+
+    import ast
+
+    from tests.web.services.interaction_static_scan_shared import _scan_root
+
+    callers = []
+    for path in _scan_root("task_interaction_service"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "identity_string"
+            ):
+                callers.append(f"{path.name}:{node.lineno}")
+    assert callers == []
+
+
 # ---------------------------------------------------------------------------
 # respond(): the answer-side entry point. respond() owns and retires its own
 # session (see its docstring), so every test below patches
@@ -2552,6 +2615,35 @@ def test_respond_rejects_a_user_principal_that_does_not_own_the_task(
             interaction_id=interaction_id,
             task_id=task_id,
             principal=intruder,
+            envelope=_respond_envelope(),
+        )
+
+        assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
+
+
+@pytest.mark.parametrize("is_admin", [False, True], ids=["plain_user", "admin"])
+def test_respond_rejects_a_user_principal_carrying_no_user_id(
+    _respond_db, is_admin: bool
+) -> None:
+    """is_admin authorizes without ownership, but not without an identity:
+    a principal that passed on the flag alone would reach the write point
+    with nothing to record as who answered."""
+
+    _owner_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    principal = svc.InteractionPrincipal(
+        kind="user",
+        user_id=None,
+        is_admin=is_admin,
+        auth_mode=None,
+    )
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=principal,
             envelope=_respond_envelope(),
         )
 

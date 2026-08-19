@@ -196,8 +196,39 @@ class InteractionPrincipal:
     guest_id: str | None = None
 
     def identity_string(self) -> str:
+        """The ``responder_identity`` value for this principal.
+
+        Raises ``ValueError`` for a principal this namespacing cannot
+        describe, rather than rendering the gap into the string. There are
+        two such gaps, and both used to produce something that looks like
+        an identity and is not one: a missing id interpolated into the
+        literal ``"user:None"`` / ``"guest:None"``, and an unrecognized
+        ``kind`` falling through to the user branch and being recorded as a
+        user. Nothing downstream stops either --
+        ``ck_task_interaction_requests_responder_identity_nonempty``
+        (``models/task_interaction.py``) only requires a non-empty string,
+        and both of those are non-empty -- and this column is the one field
+        this table's audit trail can rely on staying populated, so a value
+        it cannot trust is worse here than a failure.
+
+        ``ValueError``, not a typed rejection, because this is a pure
+        function of the principal: reaching it with one this incomplete
+        means the caller built the principal wrong, which is a programming
+        error rather than a request that can be answered. It is what
+        ``task_is_owned_by_public_principal`` already raises for a
+        malformed guest principal. Both write-side facades reject such a
+        principal at their authorization step, so no caller should be in a
+        position to see this raise.
+        """
+
         if self.kind == "guest":
+            if self.guest_id is None:
+                raise ValueError("guest principal carries no guest_id")
             return f"guest:{self.guest_id}"
+        if self.kind != "user":
+            raise ValueError(f"principal kind {self.kind!r} has no identity namespace")
+        if self.user_id is None:
+            raise ValueError("user principal carries no user_id")
         return f"user:{self.user_id}"
 
 
@@ -1033,12 +1064,14 @@ def create(
       column, so it is a predicate on the lookup itself
       (``Task.user_id == principal.user_id``) rather than a Python
       comparison run after the row is already in hand. Such a principal
-      never loads a row it does not own. One carrying no ``user_id`` at
-      all is unauthorized before the lookup is even built, because the
-      predicate would otherwise render as ``Task.user_id IS NULL`` and
-      match every ownerless task.
+      never loads a row it does not own.
     - An admin ``"user"`` principal is authorized without owning the task,
       so there is no owner predicate to add; the lookup stays id-only.
+    - Either way, a ``"user"`` principal carrying no ``user_id`` is
+      unauthorized before the lookup is even built. An admin passing on
+      the flag alone would reach the write point with no identity to
+      record, and a non-admin's owner predicate built from that absent id
+      would reject only by way of ``Task.user_id`` being NOT NULL.
     - A ``"guest"`` principal's ownership is
       ``task_is_owned_by_public_principal``, which reads the task's
       ``agent_config`` JSON and cannot be compiled into this lookup's WHERE
@@ -1157,13 +1190,17 @@ def create(
         ):
             return CreateValidationRejected(reason="invalid_values")
 
-    owner_scoped = principal.kind == "user" and not principal.is_admin
-    if owner_scoped and principal.user_id is None:
-        # An owner predicate built on a None user id renders as
-        # ``Task.user_id IS NULL``, which matches every ownerless task
-        # instead of matching nothing. Reject before the lookup so the
-        # predicate is never built from an absent identity.
+    if principal.kind == "user" and principal.user_id is None:
+        # Rejected before the lookup, on both branches. An admin passing
+        # on the flag alone would reach the write point with no identity to
+        # record as who acted. A non-admin's owner predicate would be built
+        # from that same absent id and render as ``Task.user_id IS NULL``,
+        # which rejects only because ``Task.user_id`` is NOT NULL today --
+        # an explicit rejection here says what is meant instead of
+        # borrowing a schema detail to mean it.
         return CreateUnauthorized(reason="not_task_principal")
+
+    owner_scoped = principal.kind == "user" and not principal.is_admin
 
     task_lookup = db.query(Task).filter(Task.id == task_id)
     if owner_scoped:
@@ -2294,12 +2331,15 @@ def respond(
     it is chatting through, matching the existing `public_chat_access.py`
     precedent of dispatching guest-originated work under the owner's
     identity, and step 3's non-admin branch requires `task.user_id ==
-    principal.user_id` to even reach here. The admin branch carries no such
-    requirement -- `principal.is_admin` authorizes on its own -- so an
-    admin's `actor_user_id` is the admin's own `principal.user_id` (which
-    can be absent, or belong to someone other than the task's owner), not
-    the task owner's. Do not "fix" this into agreement; they are answers to
-    different questions.
+    principal.user_id` to even reach here. The admin branch carries no
+    ownership requirement -- `principal.is_admin` authorizes without one --
+    so an admin's `actor_user_id` is the admin's own `principal.user_id`,
+    belonging to someone other than the task's owner. It is never absent:
+    step 3 requires a `"user"` principal to carry a `user_id` on both
+    branches, so an identity-less caller cannot pass on the admin flag
+    alone and arrive here with nothing to record. Do not "fix" the
+    disagreement between the two columns into agreement; they are answers
+    to different questions.
 
     Of the two audit-relevant columns this function fills on the interaction
     row, `responder_identity` is the one a reader can trust to stay
@@ -2566,8 +2606,12 @@ def respond(
             return RespondUnavailable(reason="task_missing")
 
         if principal.kind == "user":
-            authorized = principal.is_admin or (
-                principal.user_id is not None and task.user_id == principal.user_id
+            # user_id is required of both branches, not only of the owner
+            # comparison: an admin authorized on the flag alone would
+            # otherwise reach step 8 with no identity to write into
+            # responder_identity or actor_user_id.
+            authorized = principal.user_id is not None and (
+                principal.is_admin or task.user_id == principal.user_id
             )
         elif principal.kind == "guest":
             try:
