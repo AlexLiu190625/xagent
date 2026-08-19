@@ -150,6 +150,7 @@ from xagent.web.services.ops_signals import (
     active_degradations,
     clear_degradation,
 )
+from xagent.web.services.task_clarification_draft import CLARIFICATION_REQUEST_TTL
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
 _DEGRADATION_SIGNALS_UNDER_TEST = (
@@ -650,6 +651,7 @@ def test_cv3_ttl_out_of_policy_range_is_rejected_not_clamped(
 @pytest.mark.parametrize(
     "ttl_seconds",
     [
+        pytest.param(59, id="one_below_min_rejected"),
         pytest.param(604801, id="one_above_max_rejected"),
         # True is also rejected via the range check below on its own (it
         # compares equal to 1, under the 60-second minimum), independent of
@@ -692,6 +694,22 @@ def test_cv3_ttl_at_policy_boundary_reaches_create_not_wired(
         envelope=envelope,
     )
     assert outcome == svc.CreateNotWired(reason="seam_not_wired")
+
+
+def test_the_published_ttl_falls_inside_the_override_interval() -> None:
+    """The two constants describe different quantities -- one the value
+    the publication path writes into expires_at, the other the range a
+    caller's own override has to fall inside -- and are deliberately not
+    unified. The one relationship that does have to hold between them is
+    pinned here, so that moving either number alone cannot leave the
+    published TTL outside the range this facade would accept for it."""
+
+    published_ttl_seconds = CLARIFICATION_REQUEST_TTL.total_seconds()
+    assert (
+        svc._MIN_INTERACTION_TTL_SECONDS
+        <= published_ttl_seconds
+        <= svc._MAX_INTERACTION_TTL_SECONDS
+    )
 
 
 def test_ca1_principal_not_owning_the_task_is_unauthorized(

@@ -983,15 +983,30 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
             raise ValueError(f"{where} has min greater than max")
 
 
-# TTL policy interval for a create() envelope's optional ttl_seconds
-# override. Enforcing the bound here in the facade is deliberate: clamping
-# silently would be fail-open, and is explicitly rejected in favor of an
-# outright validation failure. The concrete numbers are not pinned by
-# anything: no existing config or constant anywhere in this codebase
-# defines an interaction TTL policy today. The two bounds below are this
-# delivery's own placeholder, not a fact recovered from source, logs, or
-# the database -- flagged here as a value that needs an explicit policy
-# decision, not a discovered one.
+# The interval a create() envelope's optional ttl_seconds override must
+# fall inside. Enforcing the bound here in the facade is deliberate:
+# clamping silently would be fail-open, so an out-of-range override is an
+# outright validation failure instead.
+#
+# These two bound what a caller may ask for. Neither is the TTL anything
+# is published with: that is CLARIFICATION_REQUEST_TTL (24 hours,
+# task_clarification_draft.py), the value the publication path adds to
+# "now" to get a row's expires_at. The two are different quantities -- an
+# interval and a value -- and are deliberately not unified; the value sits
+# inside the interval, which is the only relationship between them that
+# has to hold.
+#
+# No config or constant anywhere in this codebase defines an interaction
+# TTL policy, so the numbers are decided here rather than derived: the
+# widest interval whose ends both still mean something. The floor is a
+# minute because a question the user cannot plausibly answer within the
+# window is worse than no question, and because
+# ck_task_interaction_requests_expiry_after_creation
+# (models/task_interaction.py) requires expires_at > created_at -- any
+# positive floor satisfies that constraint and a minute is the smallest
+# one a person answering a question can use. The ceiling is a week
+# because a row that effectively never expires is a row a reclaim job can
+# never retire.
 _MIN_INTERACTION_TTL_SECONDS = 60
 _MAX_INTERACTION_TTL_SECONDS = 7 * 24 * 3600
 
@@ -2340,6 +2355,30 @@ def respond(
     alone and arrive here with nothing to record. Do not "fix" the
     disagreement between the two columns into agreement; they are answers
     to different questions.
+
+    Step 3 letting an admin through without owning the task is the
+    intended behavior, not a missed check, and the reason is that step 3
+    is not the step that authorizes the write. Two guards run, in this
+    order and for different purposes:
+
+    - Step 3, before the idempotency preread, keeps an unauthorized caller
+      from reaching a read at all: without it, anyone who could guess an
+      idempotency key could pull back someone else's receipt. It rejects
+      early and broadly, and being an admin is enough to clear it.
+    - Step 6's answer fence carries `_answer_fence_task_predicate`, whose
+      ownership term requires `principal.user_id` to be the task's owner.
+      An admin does not satisfy it. The fence matches zero rows, the
+      reread classifies the miss, and the call returns
+      `RespondUnauthorized(reason="not_task_principal")`.
+
+    So an admin passes the authorization step and is still refused at the
+    write point -- refused precisely, after the reread has established why,
+    rather than refused early on a guess. Any reader tempted to "align" the
+    two by rejecting admins at step 3 should note that this would change
+    what the service does for admins, not just where it says no, and that
+    the two guards are answering different questions on purpose: one is
+    "may this caller read anything here", the other is "may this caller
+    write this row".
 
     Of the two audit-relevant columns this function fills on the interaction
     row, `responder_identity` is the one a reader can trust to stay
