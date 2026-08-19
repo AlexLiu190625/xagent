@@ -1451,14 +1451,39 @@ def materialize_compatibility_view(
     branches: both mean no native row holds this task's answer slot. The
     three T3 branches never call ``_legacy_view`` at all, so the parameter
     has no place to appear in them -- not an omission.
+
+    Deciding "no active row" and reading the transcript are two separate
+    statements, and on PostgreSQL's default READ COMMITTED each statement
+    takes a fresh snapshot, so another session can commit an active row
+    between them. The no-active-row branch therefore looks once more, after
+    the transcript read and before returning, and answers from the row if
+    one has appeared. **This narrows the window, it does not close it**:
+    another session can still commit an active row between that recheck and
+    this function's return, and the caller gets the legacy tier anyway. The
+    consequence of landing in that remaining window is bounded and worth
+    naming: the user answers through the legacy channel, the native row
+    retires as ``answered_via_legacy_resume``, and the answer is neither
+    lost nor the task left stuck -- what that one turn does not get is a
+    structured record of the answer. The table-absent branch does not
+    recheck: with no table there is nothing an active row could have been
+    written into.
     """
 
     if not interaction_requests_table_exists(db):
+        # No recheck on this branch: with no table there is nowhere for an
+        # active row to have been written.
         return _legacy_view(db, task_id, allow_superseded=allow_superseded)
 
     row = _active_native_row(db, task_id)
     if row is None:
-        return _legacy_view(db, task_id, allow_superseded=allow_superseded)
+        fallback = _legacy_view(db, task_id, allow_superseded=allow_superseded)
+        row = _active_native_row(db, task_id)
+        if row is None:
+            return fallback
+        # An active row appeared between the two looks, so this task's tier
+        # is decided from it below instead of from the transcript. Once:
+        # there is no second recheck, and a row found here is answered
+        # from rather than looked at again.
 
     if row.protocol_version != INTERACTION_PROTOCOL_VERSION:
         # An active row holds this task's answer slot, so this cannot fold
