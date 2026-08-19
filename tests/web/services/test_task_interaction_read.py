@@ -135,6 +135,24 @@ def _make_trace_event(
     return int(event.id)
 
 
+def _anchor_event_id(db: Session, resume_trace_event_id: int | None) -> str:
+    """The ``event_id`` carried by the trace row an anchor points at.
+
+    The write direction stores exactly this string in the interaction row's
+    ``resume_event_id``, and the read-direction resolver compares the two,
+    so an anchor resolves only when the fixture takes the value from the
+    row it names. A cell that wants an unresolvable anchor breaks one of
+    the other conditions on purpose rather than leaving this one mismatched
+    by accident."""
+
+    trace_row = (
+        None
+        if resume_trace_event_id is None
+        else db.get(TraceEvent, resume_trace_event_id)
+    )
+    return "no-anchor-row" if trace_row is None else str(trace_row.event_id)
+
+
 def _make_active_row(
     db: Session,
     *,
@@ -165,7 +183,7 @@ def _make_active_row(
         },
         request_idempotency_key=f"read-key-{task_id}",
         resume_trace_event_id=resume_trace_event_id,
-        resume_event_id="resume-event-1",
+        resume_event_id=_anchor_event_id(db, resume_trace_event_id),
         resume_execution_id=resume_execution_id,
         resume_locator_format="trace_event_pk_v1",
         resume_checkpoint_type="agent_execution_checkpoint",
@@ -599,7 +617,7 @@ def test_a10_anchor_dangling_keeps_the_question_text_drops_controls(
     task = _make_task(_db, marker=1)
     # A trace event on a different run partition than the interaction
     # row's own resume_run_partition breaks the anchor's row-validity
-    # judgment -- one of _resolve_read_direction_anchor's six conditions
+    # judgment -- one of _resolve_read_direction_anchor's seven conditions
     # -- producing "anchor_dangling" through a real write, no monkeypatch.
     trace_event_id = _make_trace_event(
         _db, task_id=int(task.id), run_partition="a-different-run"

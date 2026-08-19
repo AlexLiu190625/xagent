@@ -1159,9 +1159,10 @@ def _resolve_read_direction_anchor(
     """Resolve an active interaction row's resume anchor for the read
     direction: does ``row.resume_trace_event_id`` still point at a
     structurally valid checkpoint row -- the right task, event type,
-    checkpoint type, run partition, and (when present) execution identity?
-    Returns ``None`` on success, or an ``_AnchorUnresolved`` naming which of
-    the two outcomes applies otherwise.
+    checkpoint type, run partition, (when present) execution identity, and
+    the event id the anchor itself names? Returns ``None`` on success, or
+    an ``_AnchorUnresolved`` naming which of the two outcomes applies
+    otherwise.
 
     This validates the row's *identity*, not its *payload*: unlike
     ``trace_handlers``, which also calls ``decode_trace_event_data`` and
@@ -1189,6 +1190,15 @@ def _resolve_read_direction_anchor(
       predicate the two resolvers could both import is a real
       simplification, left as a follow-up, not done here -- see the
       module docstring's delivered-here accounting.)
+    - One condition in that judgment is this resolver's alone and is not
+      expected to appear in trace_handlers': ``trace_row.event_id`` must
+      equal ``row.resume_event_id``. It is the identity the write-direction
+      resolver stored on the interaction row for exactly this comparison,
+      and it is checkable only from here -- trace_handlers reaches a
+      checkpoint by primary key with no interaction row in hand, so it has
+      no second identity to compare against. The "must agree with
+      trace_handlers' own" rule above does not reach it, and matching the
+      two sides is not a reason to remove it.
     - ``CHECKPOINT_LOAD_UNAVAILABLE`` is registered exactly the way
       trace_handlers registers it: a read failure is a read failure on
       either side.
@@ -1320,6 +1330,7 @@ def _resolve_read_direction_anchor(
     execution_matches = (
         not row_execution_id or row_execution_id == row.resume_execution_id
     )
+    event_id_matches = str(trace_row.event_id) == row.resume_event_id
     if (
         trace_row.task_id != row.task_id
         or trace_row.event_type != str(CHECKPOINT_EVENT_TYPE)
@@ -1327,6 +1338,7 @@ def _resolve_read_direction_anchor(
         or row_data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES
         or not partition_matches
         or not execution_matches
+        or not event_id_matches
     ):
         register_degradation(
             CHECKPOINT_PK_ANCHOR_DANGLING,
