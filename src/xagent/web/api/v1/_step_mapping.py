@@ -249,26 +249,16 @@ class PublicStepProjector:
         self._open_dag_execution_key: Optional[str] = None
 
     @classmethod
-    def from_history(
-        cls, events: List[Any], *, retain_finished: bool = True
-    ) -> "PublicStepProjector":
+    def from_history(cls, events: List[Any]) -> "PublicStepProjector":
         """Build a projector pre-warmed by replaying a full event history.
 
         Feeds every event into a fresh instance, in order. The resulting
-        pairing state (open plan key/counter, any still-``pending``
+        state (the accumulated timeline plus any still-unpaired
         starts) is identical to what a live consumer would have
         accumulated by that point -- there is no separate "batch" code
         path for the folding logic itself, only this replay.
-
-        Defaults to retaining: the batch driver
-        (``map_trace_events_to_public_steps``) reads its result only
-        through :meth:`materialized_steps`, which needs the retained
-        history. A caller that keeps the projector alive after this
-        initial read and only acts on subsequent ``feed`` results can
-        pass ``retain_finished=False`` -- but only if it never calls
-        :meth:`materialized_steps` afterwards.
         """
-        projector = cls(retain_finished=retain_finished)
+        projector = cls()
         for event in events:
             projector.feed(event)
         return projector
