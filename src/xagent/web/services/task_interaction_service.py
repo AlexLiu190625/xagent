@@ -853,6 +853,105 @@ def build_v1_request_payload(parsed: AskUserQuestionArgs) -> dict[str, Any]:
     return payload
 
 
+# The seven interaction types the render surface implements, kept as a set
+# here rather than as a ``Literal`` on ``InteractionArg.type``: that model
+# is also the ``ask_user_question`` tool's argument schema, so narrowing it
+# would narrow what the model itself is allowed to emit, which is a
+# different decision from what this service is willing to persist. The
+# seven are the same ones the frontend's own normalizer accepts
+# (``frontend/src/contexts/app-context-chat.tsx``); an item typed anything
+# else is dropped there and renders as nothing at all.
+_V1_INTERACTION_TYPES = frozenset(
+    {
+        "select_one",
+        "select_multiple",
+        "text_input",
+        "file_upload",
+        "confirm",
+        "number_input",
+        "action_cards",
+    }
+)
+
+# The three types whose whole purpose is picking from a supplied list, and
+# the four that render their own control and have nothing to pick from.
+# The split is the render surface's, not this module's: ``select_one``,
+# ``select_multiple``, and ``action_cards`` iterate ``interaction.options``
+# (``frontend/src/components/chat/clarification-form.tsx``), while
+# ``confirm`` renders a switch, ``text_input`` a field, ``number_input`` a
+# spinner, and ``file_upload`` a picker -- none of which read ``options``.
+_V1_TYPES_REQUIRING_OPTIONS = frozenset(
+    {"select_one", "select_multiple", "action_cards"}
+)
+_V1_TYPES_REJECTING_OPTIONS = _V1_INTERACTION_TYPES - _V1_TYPES_REQUIRING_OPTIONS
+
+
+def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
+    """Reject a shape-valid v1 payload that must not be persisted.
+
+    Raises ``ValueError`` describing the first violation found; returns
+    ``None`` when the payload may be written.
+
+    Deliberately separate from ``parse_v1_request_payload`` rather than
+    folded into it, because the two directions have different failure
+    policies for the same payload and folding them would collapse both
+    into one. The read direction meets these payloads as rows that are
+    already persisted: a payload it cannot make sense of has to degrade to
+    something the waiting user can still act on, so widening what it
+    rejects turns readable-but-odd rows into unanswerable ones. The write
+    direction meets them before anything is stored, where the only useful
+    answer is to refuse -- a question naming an interaction type no
+    renderer implements, or a select with nothing to select, reaches the
+    user as a form they cannot complete and a run that can never be
+    resumed. ``parse_v1_request_payload`` therefore keeps accepting
+    exactly what it accepts today, and this runs on top of it on the write
+    side only.
+
+    ``build_clarification_payload`` (``task_clarification_draft.py``) is a
+    second producer of this same shape and its output has to keep passing
+    here, pinned by a test that feeds this function that builder's real
+    output. Two of that builder's shapes are the reason for the boundaries
+    drawn below. An empty ``interactions`` list is accepted: a
+    ``send_message``-sourced draft never carries interactions, and an
+    over-size form is deliberately dropped to ``[]`` rather than truncated
+    to half a form -- both are questions with prose and no form, which the
+    read surface renders. A blank ``message`` is rejected, and that costs
+    the builder nothing: ``resolve_publishable_clarification`` already
+    classifies a payload whose message is blank after filtering as
+    ``NotApplicable("empty_question")`` and never offers it for writing.
+
+    Answers are out of scope here and in every other function in this
+    module. Until the answer-side field schema lands (issue #1368),
+    everything downstream of an interaction row must treat
+    ``response_payload`` as unvalidated input: nothing checks a submitted
+    answer against the ``InteractionArg.type`` / ``InteractionArg.field``
+    definitions this function checks on the question side, so a
+    malformed-but-dict-shaped answer is stored as submitted.
+    """
+
+    if not parsed.message.strip():
+        raise ValueError("request_payload.message is blank")
+
+    seen_fields: set[str] = set()
+    for index, interaction in enumerate(parsed.interactions):
+        where = f"request_payload.interactions[{index}]"
+        if interaction.type not in _V1_INTERACTION_TYPES:
+            raise ValueError(f"{where}.type {interaction.type!r} is not a v1 type")
+        if interaction.field in seen_fields:
+            raise ValueError(f"{where}.field {interaction.field!r} is duplicated")
+        seen_fields.add(interaction.field)
+        if interaction.type in _V1_TYPES_REQUIRING_OPTIONS and not interaction.options:
+            raise ValueError(f"{where} is a {interaction.type} carrying no options")
+        if interaction.type in _V1_TYPES_REJECTING_OPTIONS and interaction.options:
+            raise ValueError(f"{where} is a {interaction.type} carrying options")
+        if (
+            interaction.min is not None
+            and interaction.max is not None
+            and interaction.min > interaction.max
+        ):
+            raise ValueError(f"{where} has min greater than max")
+
+
 # TTL policy interval for a create() envelope's optional ttl_seconds
 # override. Enforcing the bound here in the facade is deliberate: clamping
 # silently would be fail-open, and is explicitly rejected in favor of an
@@ -918,7 +1017,10 @@ def create(
     then JSON-serializability with ``allow_nan=False``, via
     ``build_v1_request_payload`` -- a shape-valid payload carrying a
     NaN/Infinity ``default_value`` fails the second check and is rejected
-    the same way a shape failure is), and an optional ``ttl_seconds``
+    the same way a shape failure is -- and then the write side's own
+    admissibility rules, via ``validate_v1_write_payload``, which is where
+    an unrenderable interaction type or a select with no options is
+    refused), and an optional ``ttl_seconds``
     against this facade's policy interval -- out of range is a rejection,
     never a silent clamp. Authorization runs only after every one of those
     passes, against a task this call itself loads.
@@ -1032,6 +1134,16 @@ def create(
         # e.g. a NaN/Infinity default_value: shape-valid per
         # AskUserQuestionArgs, but not JSON-serializable with
         # allow_nan=False -- see build_v1_request_payload's own docstring.
+        return CreateValidationRejected(reason="invalid_values")
+    try:
+        validate_v1_write_payload(parsed_values)
+    except ValueError:
+        # Shape-valid and serializable, but not a question this service is
+        # willing to persist -- an unrenderable interaction type, a select
+        # with nothing to select, a duplicated field name, an inverted
+        # numeric range. Same reason as every other payload rejection: the
+        # caller learns its values were not accepted, not which of the
+        # checks in front of them said so.
         return CreateValidationRejected(reason="invalid_values")
     if envelope.ttl_seconds is not None:
         if isinstance(envelope.ttl_seconds, bool) or not isinstance(

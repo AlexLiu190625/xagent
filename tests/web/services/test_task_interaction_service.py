@@ -496,6 +496,146 @@ def test_cv3_values_not_shaped_like_v1_payload_is_rejected(
     assert outcome == svc.CreateValidationRejected(reason="invalid_values")
 
 
+def _interaction(**overrides: Any) -> dict[str, Any]:
+    item: dict[str, Any] = {"type": "text_input", "field": "env", "label": "Env"}
+    item.update(overrides)
+    return item
+
+
+def _values(interactions: list[dict[str, Any]], message: str = "Which one?") -> Any:
+    return {"message": message, "interactions": interactions}
+
+
+# The write side's admissibility rules, one row per rule. Every row here is
+# shape-valid per AskUserQuestionArgs and JSON-serializable, so the only
+# thing that can reject it is validate_v1_write_payload.
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param(_values([], message="   "), id="blank_message"),
+        pytest.param(_values([], message=""), id="empty_message"),
+        pytest.param(
+            _values([_interaction(type="carrier_pigeon")]), id="unrenderable_type"
+        ),
+        pytest.param(
+            _values([_interaction(field="env"), _interaction(field="env")]),
+            id="duplicated_field",
+        ),
+        pytest.param(
+            _values([_interaction(type="select_one", options=None)]),
+            id="select_one_without_options",
+        ),
+        pytest.param(
+            _values([_interaction(type="select_one", options=[])]),
+            id="select_one_with_an_empty_option_list",
+        ),
+        pytest.param(
+            _values([_interaction(type="select_multiple", options=None)]),
+            id="select_multiple_without_options",
+        ),
+        pytest.param(
+            _values([_interaction(type="action_cards", options=None)]),
+            id="action_cards_without_options",
+        ),
+        pytest.param(
+            _values(
+                [_interaction(options=[{"label": "Yes", "value": "yes"}])],
+            ),
+            id="text_input_with_options",
+        ),
+        pytest.param(
+            _values(
+                [
+                    _interaction(
+                        type="confirm", options=[{"label": "Yes", "value": "yes"}]
+                    )
+                ],
+            ),
+            id="confirm_with_options",
+        ),
+        pytest.param(
+            _values([_interaction(type="number_input", min=10, max=3)]),
+            id="min_greater_than_max",
+        ),
+    ],
+)
+def test_cv4_write_side_payload_rules_reject_the_envelope(
+    _db: Session, _seeded_task: int, values: Any
+) -> None:
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task,
+        principal=_owning_principal(task.user_id),
+        envelope=_valid_envelope(values=values),
+    )
+    assert outcome == svc.CreateValidationRejected(reason="invalid_values")
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param(
+            _values(
+                [
+                    _interaction(
+                        type="select_one", options=[{"label": "A", "value": "a"}]
+                    ),
+                    _interaction(
+                        type="select_multiple",
+                        field="tags",
+                        options=[{"label": "B", "value": "b"}],
+                    ),
+                    _interaction(type="text_input", field="notes"),
+                    _interaction(type="file_upload", field="doc"),
+                    _interaction(type="confirm", field="agree"),
+                    _interaction(type="number_input", field="count", min=1, max=9),
+                    _interaction(
+                        type="action_cards",
+                        field="action",
+                        options=[{"label": "C", "value": "c"}],
+                    ),
+                ]
+            ),
+            id="one_item_of_every_v1_type",
+        ),
+        pytest.param(_values([]), id="prose_only_question_with_no_form"),
+        pytest.param(
+            _values([_interaction(type="number_input", field="n", min=3, max=3)]),
+            id="min_equal_to_max",
+        ),
+    ],
+)
+def test_cv4_write_side_payload_rules_accept_a_legal_payload(
+    _db: Session, _seeded_task: int, values: Any
+) -> None:
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task,
+        principal=_owning_principal(task.user_id),
+        envelope=_valid_envelope(values=values),
+    )
+    assert outcome == svc.CreateNotWired(reason="seam_not_wired")
+
+
+def test_cv4_the_read_direction_parser_still_accepts_what_the_write_side_rejects(
+    _db: Session, _seeded_task: int
+) -> None:
+    """The two directions have different failure policies for the same
+    payload. parse_v1_request_payload is what the read surface calls on an
+    already-persisted row, and it must keep accepting every payload it
+    accepts today -- widening it would turn readable-but-odd rows into
+    unanswerable ones. Only the write side refuses."""
+
+    values = _values([_interaction(type="select_one", options=None)])
+    parsed = svc.parse_v1_request_payload(values)
+    assert parsed.message == "Which one?"
+    assert parsed.interactions[0].type == "select_one"
+    with pytest.raises(ValueError):
+        svc.validate_v1_write_payload(parsed)
+
+
 def test_cv3_ttl_out_of_policy_range_is_rejected_not_clamped(
     _db: Session, _seeded_task: int
 ) -> None:
