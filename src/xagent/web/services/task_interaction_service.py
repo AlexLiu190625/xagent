@@ -921,21 +921,47 @@ def create(
     the same way a shape failure is), and an optional ``ttl_seconds``
     against this facade's policy interval -- out of range is a rejection,
     never a silent clamp. Authorization runs only after every one of those
-    passes,
-    and only against a task this call itself loads by id: a ``"user"``
-    principal must own the task or be an admin; a ``"guest"`` principal is
-    checked with the same shared ownership predicate ``respond()`` will
-    reuse (``task_is_owned_by_public_principal``), not a re-derived
-    conjunction; a principal whose ``kind`` is neither ``"user"`` nor
-    ``"guest"`` is always unauthorized -- there is no third branch that
-    defaults to allow. A malformed principal that populates zero or more
-    than one of the guest entity-binding fields makes the ownership
-    predicate raise ``ValueError``; this function catches only that one
-    exception type from that one call and treats it as unauthorized, the
-    same fail-closed-on-a-malformed-caller behavior the predicate itself
-    documents. A task that does not exist at all is ``Unavailable``, not
-    ``Unauthorized`` -- that branch is reached before the ownership check
-    even runs, because there is no row to check ownership against.
+    passes, against a task this call itself loads.
+
+    The load is owner-scoped for the branch that can express ownership in
+    SQL and id-only for the two that cannot, and the difference is
+    deliberate:
+
+    - A non-admin ``"user"`` principal's ownership is one equality on a
+      column, so it is a predicate on the lookup itself
+      (``Task.user_id == principal.user_id``) rather than a Python
+      comparison run after the row is already in hand. Such a principal
+      never loads a row it does not own. One carrying no ``user_id`` at
+      all is unauthorized before the lookup is even built, because the
+      predicate would otherwise render as ``Task.user_id IS NULL`` and
+      match every ownerless task.
+    - An admin ``"user"`` principal is authorized without owning the task,
+      so there is no owner predicate to add; the lookup stays id-only.
+    - A ``"guest"`` principal's ownership is
+      ``task_is_owned_by_public_principal``, which reads the task's
+      ``agent_config`` JSON and cannot be compiled into this lookup's WHERE
+      clause. That branch keeps the id-only load and the shared Python
+      predicate ``respond()`` reuses, not a re-derived conjunction.
+
+    A principal whose ``kind`` is neither ``"user"`` nor ``"guest"`` is
+    always unauthorized -- there is no third branch that defaults to allow.
+    A malformed principal that populates zero or more than one of the guest
+    entity-binding fields makes the ownership predicate raise
+    ``ValueError``; this function catches only that one exception type from
+    that one call and treats it as unauthorized, the same
+    fail-closed-on-a-malformed-caller behavior the predicate itself
+    documents.
+
+    Consequence of the owner-scoped lookup, and the reason it is stated
+    here rather than left for a reader to derive from the SQL: for a
+    non-admin ``"user"`` principal, "this task does not exist" and "this
+    task is not yours" are the same empty result set, and both return
+    ``CreateUnauthorized(reason="not_task_principal")``. That principal
+    cannot use this function to learn whether a ``task_id`` exists.
+    ``CreateUnavailable(reason="task_missing")`` remains reachable only
+    from the two id-only branches -- an admin and a guest, neither of whom
+    is told anything by it that their own branch does not already tell
+    them.
 
     ``origin`` is deliberately not part of this envelope or this
     validation step in this delivery: the reason vocabulary deliberately
@@ -962,21 +988,23 @@ def create(
     ``stage_interaction_request``.
 
     ``CreateUnavailable(reason="task_missing")`` and
-    ``CreateUnauthorized(reason="not_task_principal")`` are deliberately
-    distinguishable outcomes inside this function, but a caller that
-    exposes that distinction externally hands an unauthenticated or
-    unauthorized requester a task-existence oracle: "unavailable" versus
-    "unauthorized" reveals whether ``task_id`` exists at all. Any future
-    endpoint that calls this function directly and maps its outcome onto
-    an HTTP response shape must collapse both to the same client-facing
-    shape. The three existing public-chat entry points already do the
-    equivalent one layer up, at the HTTP boundary: a task that does not
-    exist and a task whose ``guest_id`` belongs to another visitor both
-    produce the identical not-found-shaped 403. The same obligation
-    applies to the respond-side twin pair
+    ``CreateUnauthorized(reason="not_task_principal")`` remain
+    distinguishable outcomes on the two id-only branches above, and a
+    caller that exposes that distinction externally hands an
+    unauthenticated or unauthorized requester a task-existence oracle:
+    "unavailable" versus "unauthorized" reveals whether ``task_id`` exists
+    at all. Any future endpoint that calls this function directly and maps
+    its outcome onto an HTTP response shape must collapse both to the same
+    client-facing shape. The three existing public-chat entry points
+    already do the equivalent one layer up, at the HTTP boundary: a task
+    that does not exist and a task whose ``guest_id`` belongs to another
+    visitor both produce the identical not-found-shaped 403. The same
+    obligation applies to the respond-side twin pair
     (``RespondUnavailable(reason="task_missing")`` versus
-    ``RespondUnauthorized(reason="not_task_principal")``) once
-    ``respond()`` has a caller. This applies to every outcome consumer
+    ``RespondUnauthorized(reason="not_task_principal")``): ``respond()``
+    loads its task by id under a lock for every principal kind, so both of
+    its variants stay distinguishable for every caller, and that side
+    carries the obligation in full. This applies to every outcome consumer
     built on this module, not only to ``create()``'s own two variants.
     """
 
@@ -1017,14 +1045,33 @@ def create(
         ):
             return CreateValidationRejected(reason="invalid_values")
 
-    task = db.query(Task).filter(Task.id == task_id).first()
+    owner_scoped = principal.kind == "user" and not principal.is_admin
+    if owner_scoped and principal.user_id is None:
+        # An owner predicate built on a None user id renders as
+        # ``Task.user_id IS NULL``, which matches every ownerless task
+        # instead of matching nothing. Reject before the lookup so the
+        # predicate is never built from an absent identity.
+        return CreateUnauthorized(reason="not_task_principal")
+
+    task_lookup = db.query(Task).filter(Task.id == task_id)
+    if owner_scoped:
+        task_lookup = task_lookup.filter(Task.user_id == principal.user_id)
+    task = task_lookup.first()
     if task is None:
+        # An owner-scoped lookup cannot tell "no such task" from "not your
+        # task" -- both are the empty result set, and reporting either one
+        # specifically would make this function an existence oracle for a
+        # principal that is not entitled to one. The id-only branches
+        # (admin, guest) keep reporting task_missing.
+        if owner_scoped:
+            return CreateUnauthorized(reason="not_task_principal")
         return CreateUnavailable(reason="task_missing")
 
     if principal.kind == "user":
-        authorized = principal.is_admin or (
-            principal.user_id is not None and task.user_id == principal.user_id
-        )
+        # A non-admin reached this line only by matching the owner
+        # predicate in SQL; an admin reached it without one and is
+        # authorized on the flag alone.
+        authorized = True
     elif principal.kind == "guest":
         try:
             authorized = task_is_owned_by_public_principal(task, principal)

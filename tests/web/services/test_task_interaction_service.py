@@ -567,12 +567,104 @@ def test_ca1_principal_not_owning_the_task_is_unauthorized(
     assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
 
 
-def test_cu1_missing_task_is_unavailable(_db: Session) -> None:
-    envelope = _valid_envelope()
-    outcome = svc.create(
-        _db, task_id=999999999, principal=_owning_principal(1), envelope=envelope
+def _admin_principal(user_id: int) -> svc.InteractionPrincipal:
+    return svc.InteractionPrincipal(
+        kind="user",
+        user_id=user_id,
+        is_admin=True,
+        auth_mode=None,
     )
-    assert outcome == svc.CreateUnavailable(reason="task_missing")
+
+
+# The id create() is asked about when a scenario wants no matching row.
+_ABSENT_TASK_ID = 999999999
+
+
+# create()'s task lookup, one row per (principal branch x ownership x
+# whether the task exists). The three branches load differently on
+# purpose: a non-admin "user" carries an owner predicate into the lookup,
+# an admin and a guest load by id alone. That difference is what decides
+# which of the two "no row" outcomes each branch can return, so the table
+# below is the single place all of it is asserted.
+@pytest.mark.parametrize(
+    ("make_principal", "task_exists", "expected"),
+    [
+        pytest.param(
+            lambda owner_id: _owning_principal(owner_id),
+            True,
+            svc.CreateNotWired(reason="seam_not_wired"),
+            id="owner_user_on_its_own_task",
+        ),
+        pytest.param(
+            lambda owner_id: _owning_principal(owner_id + 1000),
+            True,
+            svc.CreateUnauthorized(reason="not_task_principal"),
+            id="foreign_user_on_an_existing_task",
+        ),
+        pytest.param(
+            lambda owner_id: _owning_principal(owner_id),
+            False,
+            svc.CreateUnauthorized(reason="not_task_principal"),
+            id="user_on_an_absent_task",
+        ),
+        pytest.param(
+            lambda owner_id: _admin_principal(owner_id + 1000),
+            True,
+            svc.CreateNotWired(reason="seam_not_wired"),
+            id="admin_on_someone_elses_task",
+        ),
+        pytest.param(
+            lambda owner_id: _admin_principal(owner_id + 1000),
+            False,
+            svc.CreateUnavailable(reason="task_missing"),
+            id="admin_on_an_absent_task",
+        ),
+        pytest.param(
+            lambda owner_id: _widget_workforce_guest_principal(
+                user_id=owner_id, workforce_id=9
+            ),
+            False,
+            svc.CreateUnavailable(reason="task_missing"),
+            id="guest_on_an_absent_task",
+        ),
+    ],
+)
+def test_ca2_task_lookup_is_owner_scoped_for_non_admin_user_principals(
+    _db: Session,
+    _seeded_task: int,
+    make_principal: Any,
+    task_exists: bool,
+    expected: Any,
+) -> None:
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    task_id = _seeded_task if task_exists else _ABSENT_TASK_ID
+    outcome = svc.create(
+        _db,
+        task_id=task_id,
+        principal=make_principal(task.user_id),
+        envelope=_valid_envelope(),
+    )
+    assert outcome == expected
+
+
+def test_ca2_a_non_admin_user_cannot_tell_a_foreign_task_from_an_absent_one(
+    _db: Session, _seeded_task: int
+) -> None:
+    """The owner predicate lives in the lookup's WHERE clause, so a
+    non-admin "user" principal gets one empty result set for both "this
+    task belongs to someone else" and "there is no such task". Both must
+    produce the identical outcome object, or the pair is an existence
+    oracle for a principal not entitled to one."""
+
+    principal = _owning_principal(999999)
+    on_a_foreign_task = svc.create(
+        _db, task_id=_seeded_task, principal=principal, envelope=_valid_envelope()
+    )
+    on_an_absent_task = svc.create(
+        _db, task_id=_ABSENT_TASK_ID, principal=principal, envelope=_valid_envelope()
+    )
+    assert on_a_foreign_task == on_an_absent_task
+    assert on_a_foreign_task == svc.CreateUnauthorized(reason="not_task_principal")
 
 
 def test_cw1_fully_valid_call_returns_not_wired(
