@@ -1226,6 +1226,54 @@ def test_projector_incremental_feed_matches_materialized_steps(events):
     assert reconstructed == materialized
 
 
+@pytest.mark.parametrize(
+    "events",
+    _PROJECTOR_EQUIVALENCE_CASES.values(),
+    ids=list(_PROJECTOR_EQUIVALENCE_CASES.keys()),
+)
+def test_projector_without_retention_returns_the_same_steps_and_keeps_none(events):
+    """``retain_finished=False`` changes only what the projector keeps
+    after ``feed()`` returns, never what ``feed()`` itself returns.
+
+    Feeds the same event sequence into a retaining and a non-retaining
+    projector in lockstep, deep-copying each ``feed()`` result
+    immediately (the same reason ``test_feed_return_value_reflects_step_
+    state_at_call_time`` does -- a returned dict is mutated in place
+    when its end event later arrives, and a non-retaining projector
+    still hands back that same live object, it just doesn't also keep
+    it in ``_finished``). The two sequences must be equal event-for-
+    event. Afterwards, the non-retaining projector's ``_finished`` is
+    ``None`` and ``materialized_steps()`` raises rather than returning a
+    silently partial timeline.
+    """
+    retaining = PublicStepProjector()
+    non_retaining = PublicStepProjector(retain_finished=False)
+    retaining_results = []
+    non_retaining_results = []
+    for event in events:
+        retaining_results.append(copy.deepcopy(retaining.feed(event)))
+        non_retaining_results.append(copy.deepcopy(non_retaining.feed(event)))
+    assert retaining_results == non_retaining_results
+    assert non_retaining._finished is None
+    with pytest.raises(RuntimeError):
+        non_retaining.materialized_steps()
+
+
+def test_batch_projector_still_retains_finished_steps():
+    """Re-pins the default explicitly: ``map_trace_events_to_public_steps``
+    -- and therefore ``GET /v1/chat/tasks/{task_id}/steps`` -- goes
+    through ``from_history(events).materialized_steps()`` with no
+    ``retain_finished`` override, so it must still return the task's
+    whole projected timeline, not an empty one.
+    """
+    events = _PROJECTOR_EQUIVALENCE_CASES["tool_call_success"]
+    expected = map_trace_events_to_public_steps(events)
+    assert expected
+    projected = PublicStepProjector.from_history(events).materialized_steps()
+    projected.sort(key=lambda s: s["started_at"])
+    assert projected == expected
+
+
 def test_feed_return_value_reflects_step_state_at_call_time():
     """``feed()``'s return is the same dict object later mutated in place
     when the matching end event finalizes the step -- so a caller that

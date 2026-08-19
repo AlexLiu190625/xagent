@@ -1,9 +1,10 @@
 """Tests for the v1 SSE transport layer (``GET /v1/chat/tasks/{id}/events``).
 
-Covers the transport layer only: registration, the sink's frame filter
-and exception discipline, the watchdog, the 1-hour cap, and concurrency
-caps. Step/message content projection isn't part of this layer, so it
-isn't tested here. Tests either drive ``_events_stream`` directly (fast,
+Covers registration, the sink's frame filter and exception discipline,
+the watchdog, the 1-hour cap, concurrency caps, and the ``step.*`` /
+``message.*`` content projection layered on top of that transport
+(classification, filtering, and the per-frame content caps). Tests
+either drive ``_events_stream`` directly (fast,
 deterministic -- used whenever a test needs injected short intervals or
 precise control over the race between the watchdog and the deadline) or
 go through the real HTTP endpoint (used for the 401/404/429/terminal-
@@ -21,13 +22,36 @@ from fastapi import FastAPI
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
 
+from xagent.core.agent.trace import (
+    ACTION_END_TOOL,
+    ACTION_START_TOOL,
+    TraceAction,
+    TraceCategory,
+)
+from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
+from xagent.core.agent.trace import (
+    TraceEventType,
+    TraceScope,
+)
+from xagent.core.tools.adapters.vibe.connector_runtime import (
+    REDACTED_RUNTIME_SECRET,
+    redact_runtime_sensitive_payload,
+)
 from xagent.web.api.chat import chat_router
+from xagent.web.api.trace_handlers import (
+    DatabaseTraceHandler,
+    _convert_float_to_datetime,
+)
 from xagent.web.api.v1 import _events_stream as es
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.api.v1.deps import ApiKeyPrincipal, _resolve_principal_from_credentials
 from xagent.web.api.v1.errors import V1ApiError, V1ErrorCode
+from xagent.web.api.ws_trace_handlers import (
+    WebSocketTraceHandler,
+    get_event_type_mapping,
+)
 from xagent.web.models.agent_api_key import AgentApiKey
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 
 from ..conftest import (
     _admin_headers,
@@ -157,6 +181,72 @@ def _make_sink(task_id: int = 1, status: str = "running") -> es.V1EventStreamSin
     )
 
 
+def _insert_trace_event(
+    *,
+    task_id: int,
+    event_type: str,
+    event_id: str,
+    timestamp: datetime,
+    data: dict,
+    step_id: str | None = None,
+    build_id: str | None = None,
+) -> None:
+    """Insert one ``TraceEvent`` row directly via the test DB.
+
+    Mirrors ``test_tasks.py``'s helper of the same name -- bypasses the
+    production trace handler (which runs through asyncio + a thread
+    pool) so a test can set up "this step already happened before
+    attach" history without spinning up the agent runtime.
+    """
+    db = _direct_db_session()
+    try:
+        db.add(
+            TraceEvent(
+                task_id=task_id,
+                event_id=event_id,
+                event_type=event_type,
+                timestamp=timestamp,
+                step_id=step_id,
+                build_id=build_id,
+                data=data,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _insert_question_message(task_id: int, *, content: str) -> None:
+    """Write one assistant question row directly, bypassing the WS writer.
+
+    Mirrors ``test_tasks.py``'s helper of the same name and the row
+    shape ``_persist_agent_outbound_event`` (``api/websocket.py``) writes
+    for ``expect_response`` outbound events: ``role='assistant'``,
+    ``message_type='question'``. This is what makes
+    ``task_interaction_read.get_pending_interaction_question`` -- and
+    therefore ``_TaskInfoSnapshot.pending_question`` -- return
+    non-``None``.
+    """
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        db.add(
+            TaskChatMessage(
+                task_id=task_id,
+                user_id=int(task.user_id),
+                role="assistant",
+                content=content,
+                message_type="question",
+                turn_id=f"question-{task_id}",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def _long_intervals(**overrides: float) -> dict[str, float]:
     """Defaults for ``build_event_stream_response``/``_generate``'s three
     tunable intervals (watchdog / absolute deadline / heartbeat): 1000s
@@ -168,6 +258,25 @@ def _long_intervals(**overrides: float) -> dict[str, float]:
         "heartbeat_interval_seconds": 1000,
         **overrides,
     }
+
+
+# ===== error_frame code validation =====
+
+
+def test_error_frame_rejects_an_unknown_code_with_or_without_a_message():
+    """``_ERROR_MESSAGES[code]`` is looked up unconditionally, so an
+    unrecognized code raises ``KeyError`` whether or not a ``message``
+    override was also passed -- the check is on the code, not on which
+    optional argument the caller supplied."""
+    with pytest.raises(KeyError):
+        es.error_frame("nope")
+    with pytest.raises(KeyError):
+        es.error_frame("nope", message="anything")
+
+    # A known code still honors the message override.
+    frame = es.error_frame("task_deleted", message="custom text")
+    data = json.loads(frame.split("data: ", 1)[1])
+    assert data == {"code": "task_deleted", "message": "custom text"}
 
 
 # ===== sink.send_text never raises =====
@@ -267,12 +376,21 @@ def test_events_terminal_task_immediate_close():
 # ===== attach on a task already waiting for user input =====
 
 
+@pytest.mark.timeout(10)
 def test_events_waiting_for_user_attach_takes_the_fast_path():
     """The attach-time fast path for a task that's already
     ``waiting_for_user`` (and not mid-resume): emits ``task.status`` +
     ``task.input_required`` and closes immediately, instead of waiting
     out the watchdog's first cycle (up to 30s in production) to reach
-    the same conclusion."""
+    the same conclusion.
+
+    ``client.get()`` here is a blocking call with no timeout of its own;
+    the fast path not registering a sink or closing the stream is the
+    only thing keeping it from hanging. A regression that fell through
+    to the normal streaming path instead would make this test hang the
+    whole suite rather than fail it, so it's pinned with an explicit
+    timeout (``pytest-timeout``, already a dev dependency) rather than
+    relying on there being no bug."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id)
     _set_task_status(task_id, TaskStatus.WAITING_FOR_USER, control_state="idle")
@@ -418,11 +536,13 @@ async def test_watchdog_paused_does_not_close():
     assert sink.queue.get_nowait() == (es.status_frame("paused"), False)
 
 
-async def test_watchdog_waiting_for_user_closes_with_null_prompt_input_required():
+async def test_watchdog_waiting_for_user_closes_with_null_prompt_when_no_question():
     """The watchdog is the only trigger this transport layer implements
-    for input_required, and it always sends a null prompt -- populating
-    it from the agent's question text belongs to the content-projection
-    layer."""
+    for input_required. Its ``prompt`` comes from
+    ``_TaskInfoSnapshot.pending_question`` -- when the task has no
+    persisted assistant question (this test's setup), that snapshot
+    field is itself ``None``, so the frame's prompt is null too. The
+    companion test below pins the opposite case."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id)
     principal = _principal_for(full_key)
@@ -437,11 +557,57 @@ async def test_watchdog_waiting_for_user_closes_with_null_prompt_input_required(
     )
     assert closed is True
     assert sink.closing is True
-    assert sink.queue.get_nowait() == (es.input_required_frame(task_id), True)
+    assert sink.queue.get_nowait() == (es.input_required_frame(task_id, None), True)
     assert (
-        json.loads(es.input_required_frame(task_id).split("data: ", 1)[1])["prompt"]
+        json.loads(es.input_required_frame(task_id, None).split("data: ", 1)[1])[
+            "prompt"
+        ]
         is None
     )
+
+
+async def test_watchdog_waiting_for_user_closes_with_the_pending_question_as_prompt():
+    """When the task *does* have a persisted assistant question, the
+    watchdog's close frame carries it as ``prompt`` -- sourced from
+    ``_TaskInfoSnapshot.pending_question`` (``get_latest_waiting_question``),
+    the same authoritative row read the close decision itself already
+    uses. No agent_message frame sniffing is involved."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    key_prefix = _key_prefix_for_agent(agent_id)
+    _set_task_status(task_id, TaskStatus.WAITING_FOR_USER, control_state="idle")
+    _insert_question_message(task_id, content="Where are you flying to?")
+
+    sink = es.V1EventStreamSink(
+        task_id=task_id, principal_key_prefix=key_prefix, initial_status="running"
+    )
+    closed = await es.watchdog_check_once(
+        sink, task_id, principal, read_task_snapshot=v1_tasks._load_task_info_snapshot
+    )
+    assert closed is True
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is True
+    assert json.loads(frame_text.split("data: ", 1)[1]) == {
+        "task_id": task_id,
+        "prompt": "Where are you flying to?",
+    }
+
+
+def test_fast_path_attach_carries_the_pending_question_as_prompt():
+    """Same ``prompt`` sourcing as the watchdog test above, but through
+    the attach-time fast path (``_input_required_snapshot_stream``) --
+    the other of the two callers ``input_required_frame`` has."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _set_task_status(task_id, TaskStatus.WAITING_FOR_USER, control_state="idle")
+    _insert_question_message(task_id, content="Which city?")
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/events", headers=_bearer(full_key))
+    assert resp.status_code == 200
+    blocks = [b for b in resp.text.split("\n\n") if b.strip()]
+    input_required_data = json.loads(blocks[1].split("data: ", 1)[1])
+    assert input_required_data == {"task_id": task_id, "prompt": "Which city?"}
 
 
 async def test_watchdog_waiting_for_user_with_resume_requested_does_not_close():
@@ -1145,6 +1311,32 @@ async def test_sink_send_text_never_queries_db(monkeypatch):
     await sink.send_text(
         json.dumps({"type": "task_completed", "task": {"id": sink.task_id}})
     )
+    # Content frames must stay just as DB-free as the lifecycle path
+    # above -- the step/message projection path reads only the broadcast
+    # dict, never the database.
+    await sink.send_text(
+        json.dumps(
+            {
+                "type": "trace_event",
+                "event_id": "ev-1",
+                "event_type": "tool_execution_start",
+                "task_id": sink.task_id,
+                "timestamp": 0,
+                "step_id": "step-1",
+                "data": {"tool_call_id": "call-1", "tool_name": "search", "args": {}},
+            }
+        )
+    )
+    await sink.send_text(
+        json.dumps(
+            {
+                "type": "final_answer_delta",
+                "message_id": "msg-1",
+                "task_id": sink.task_id,
+                "delta": "hi",
+            }
+        )
+    )
     assert calls == []
 
 
@@ -1359,3 +1551,1673 @@ async def test_completion_hint_wakes_watchdog_before_its_next_periodic_tick():
 
     await asyncio.wait_for(_drain(), timeout=2)
     assert any("event: task.completed" in f for f in frames)
+
+
+# ===== content projection: step.* / message.* from live broadcast frames
+# (see ``project_content_frames`` and its docstring for the frame-family
+# classification this section pins) =====
+
+
+def _trace_event_frame(
+    event_type: str,
+    *,
+    task_id: int,
+    data: dict,
+    event_id: str = "ev-1",
+    step_id: str | None = None,
+    timestamp: float = 0.0,
+) -> str:
+    payload: dict = {
+        "type": "trace_event",
+        "event_id": event_id,
+        "event_type": event_type,
+        "task_id": task_id,
+        "timestamp": timestamp,
+        "data": data,
+    }
+    if step_id is not None:
+        payload["step_id"] = step_id
+    return json.dumps(payload)
+
+
+def _broadcast_frame_for(event: "CoreTraceEvent", *, task_id: int) -> str:
+    """The exact text a real broadcast of ``event`` would carry.
+
+    Routes the core trace event through the production conversion --
+    ``WebSocketTraceHandler._convert_trace_event_to_stream_event``, which
+    applies ``serialize_trace_data``, ``normalize_public_trace_event``
+    and ``create_stream_event`` -- and serializes it the way
+    ``ConnectionManager.broadcast_to_task`` does. Constructing the
+    handler touches no database (its ``__init__`` sets three attributes;
+    ``_load_task_description`` is the async path and is deliberately not
+    called, so no ``task_description`` is injected).
+    """
+    handler = WebSocketTraceHandler(task_id)
+    converted = handler._convert_trace_event_to_stream_event(event)
+    assert converted is not None, "fixture event must be projectable"
+    return json.dumps(converted)
+
+
+def _persist_core_event(event: "CoreTraceEvent", *, task_id: int) -> None:
+    """Write the row the persistence path would write for ``event``.
+
+    Reproduces what ``DatabaseTraceHandler._save_trace_event`` derives --
+    ``get_event_type_mapping`` for the event type,
+    ``_serialize_data_for_json`` for the data,
+    ``redact_runtime_sensitive_payload`` for the ``tool_execution_*``
+    family, ``event_id=str(event.id)`` and ``step_id=event.step_id`` --
+    then inserts through the test's own ``_insert_trace_event`` with
+    ``timestamp=_convert_float_to_datetime(event.timestamp)``.
+
+    Deliberately does NOT reproduce ``stage_trace_event_row``'s
+    ``stored_data`` rewrite or its ``build_id``/``parent_event_id``
+    stamping -- the real path runs ``data = staged.stored_data`` at
+    ``trace_handlers.py:709``; no fixture in this module needs either.
+    """
+    event_type_str = get_event_type_mapping(event)
+    handler = DatabaseTraceHandler(task_id=task_id)
+    data = handler._serialize_data_for_json(event.data or {})
+    if event_type_str in {
+        "tool_execution_start",
+        "tool_execution_end",
+        "tool_execution_failed",
+    }:
+        data = redact_runtime_sensitive_payload(data)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type=event_type_str,
+        event_id=str(event.id),
+        timestamp=_convert_float_to_datetime(event.timestamp),
+        data=data,
+        step_id=event.step_id,
+    )
+
+
+async def test_trace_event_tool_call_start_then_end_projects_paired_step_frames():
+    """A live start/end pair for the same ``tool_call_id`` folds through
+    the same ``PublicStepProjector`` pairing rule ``steps()`` uses:
+    ``step.started`` (running) first, then ``step.completed`` carrying
+    the tool's result, both keyed by the same public step id."""
+    sink = _make_sink(task_id=42)
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_start",
+            task_id=42,
+            step_id="step-1",
+            data={
+                "tool_call_id": "call-1",
+                "tool_name": "search",
+                "tool_args": {"query": "weather"},
+            },
+        )
+    )
+    started_text, started_close = sink.queue.get_nowait()
+    assert started_close is False
+    assert started_text.startswith("event: step.started\n")
+    started = json.loads(started_text.split("data: ", 1)[1])["step"]
+    assert started["id"] == "tool_call:call-1"
+    assert started["status"] == "running"
+    assert started["data"]["name"] == "search"
+
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_end",
+            task_id=42,
+            step_id="step-1",
+            data={"tool_call_id": "call-1", "success": True, "result": "sunny"},
+        )
+    )
+    completed_text, completed_close = sink.queue.get_nowait()
+    assert completed_close is False
+    assert completed_text.startswith("event: step.completed\n")
+    completed = json.loads(completed_text.split("data: ", 1)[1])["step"]
+    assert completed["id"] == "tool_call:call-1"
+    assert completed["status"] == "completed"
+    assert completed["data"]["result"] == "sunny"
+
+
+async def test_trace_event_ai_message_projects_a_completed_message_step():
+    """A one-shot ``ai_message`` (no ``stream_message_id``, i.e. a run
+    with no live token stream) still projects a step -- it's a public
+    ``message`` step, always already ``completed`` (see
+    ``_build_message_step``)."""
+    sink = _make_sink(task_id=7)
+    await sink.send_text(
+        _trace_event_frame(
+            "ai_message",
+            task_id=7,
+            event_id="persisted-event-id",
+            data={"content": "the answer"},
+        )
+    )
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is False
+    assert frame_text.startswith("event: step.completed\n")
+    step = json.loads(frame_text.split("data: ", 1)[1])["step"]
+    assert step["id"] == "message:persisted-event-id"
+    assert step["data"] == {"role": "assistant", "content": "the answer"}
+
+
+async def test_trace_event_ai_message_with_stream_message_id_also_projects_a_step():
+    """New contract: an ``ai_message`` carrying ``stream_message_id`` --
+    the persisted mirror of a final answer already delivered live via
+    ``message.delta``/``message.completed`` -- still folds into a
+    ``message`` step here, the same as any other ``ai_message``. This
+    duplicates that content as a second delivery (a ``step.completed``
+    alongside the earlier delta/completed frames), not a loss: dropping
+    it here (the old behavior) had no persisted counterpart, so
+    ``steps()`` already shows this exact row as a ``message`` step
+    regardless -- filtering only the live path made an already-attached
+    stream disagree with ``steps()`` about whether the step exists. See
+    ``test_live_projection_matches_steps_for_a_streamed_final_answer``
+    below for the two-path parity this restores."""
+    sink = _make_sink(task_id=7)
+    await sink.send_text(
+        _trace_event_frame(
+            "ai_message",
+            task_id=7,
+            event_id="live-final-answer",
+            data={"content": "the answer", "stream_message_id": "final_answer_abc"},
+        )
+    )
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is False
+    assert frame_text.startswith("event: step.completed\n")
+    step = json.loads(frame_text.split("data: ", 1)[1])["step"]
+    assert step["id"] == "message:live-final-answer"
+    assert step["data"] == {"role": "assistant", "content": "the answer"}
+    assert sink.queue.empty()
+
+
+async def test_trace_event_delegated_child_source_is_filtered():
+    """A trace_event whose ``data["source"]`` marks it as a
+    delegated child agent's own trace is dropped, the same
+    ``build_id IS NOT NULL``-equivalent exclusion ``steps()`` gets for
+    free from its SQL WHERE clause."""
+    sink = _make_sink(task_id=9)
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_start",
+            task_id=9,
+            data={
+                "tool_call_id": "call-1",
+                "tool_name": "search",
+                "tool_args": {},
+                "source": "xagent-agent-tool-child",
+            },
+        )
+    )
+    assert sink.queue.empty()
+
+
+async def test_trace_event_task_info_produces_no_step_frame():
+    """``task_info`` short-circuits to the
+    ``task.status``/``task.input_required`` lifecycle handling in
+    ``send_text`` (unchanged, tested elsewhere in this file) and never
+    reaches the step projector -- it isn't, and never becomes, a public
+    step.
+
+    An empty outbound queue alone doesn't pin this: ``task_info`` isn't
+    one of ``_step_mapping.py``'s recognized event types either, so
+    feeding it to the projector directly would *also* produce no step
+    frame -- the short-circuit's queue-visible effect would be
+    unchanged if it were deleted. What the short-circuit actually
+    controls is whether the projector is invoked at all, which is why
+    the projector's ``feed`` is spied on below and asserted never
+    called -- that assertion alone would fail if the short-circuit were
+    removed, even though the queue-emptiness assertion would not."""
+    sink = _make_sink(task_id=11, status="running")
+    feed_spy = MagicMock(wraps=sink._projector.feed)
+    sink._projector.feed = feed_spy
+    await sink.send_text(
+        json.dumps(
+            {
+                "type": "trace_event",
+                "event_id": "ev-1",
+                "event_type": "task_info",
+                "task_id": 11,
+                "timestamp": 0,
+                # Real broadcasts carry status/control_state both at the
+                # top level (what ``_is_versioned_task_event`` reads) and
+                # merged into ``data`` (``_with_task_control_state_snapshot``,
+                # ``websocket.py``) -- both are set here to match.
+                "status": "waiting_for_user",
+                "control_state": "idle",
+                "data": {
+                    "status": "waiting_for_user",
+                    "control_state": "idle",
+                    "message": "What city?",
+                },
+            }
+        )
+    )
+    # The lifecycle side still reacts (a status frame is queued and the
+    # completion hint fires) -- only the *step* projection is asserted
+    # absent here.
+    assert sink.completion_hint.is_set()
+    frame_text, _ = sink.queue.get_nowait()
+    assert frame_text.startswith("event: task.status\n")
+    assert sink.queue.empty()
+    feed_spy.assert_not_called()
+
+
+async def test_trace_event_audit_only_data_is_filtered():
+    """The same ``__audit_only__`` server-side-RCA marker the WebSocket
+    broadcaster already drops before fanning out (see
+    ``is_audit_only_trace_data``) is honored on the live SSE path too."""
+    sink = _make_sink(task_id=13)
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_start",
+            task_id=13,
+            data={
+                "tool_call_id": "call-1",
+                "tool_name": "search",
+                "tool_args": {},
+                "__audit_only__": True,
+            },
+        )
+    )
+    assert sink.queue.empty()
+
+
+async def test_trace_event_tool_call_redacts_credential_shaped_fields_on_the_wire():
+    """The same runtime-secret redaction ``normalize_public_trace_event``
+    already applies before a trace event reaches this stream's projector
+    (see ``test_normalize_public_trace_event_redacts_tool_runtime_secrets``
+    in ``tests/web/api/test_public_trace_events.py``, the ``steps()``-side
+    fixture this mirrors) must also hold for a *live* SSE frame, not just
+    for the function in isolation: this pins that the emitted
+    ``step.started``/``step.completed`` wire text itself never carries the
+    raw secret, only the shared redaction marker."""
+    sink = _make_sink(task_id=17)
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_start",
+            task_id=17,
+            data={
+                "tool_call_id": "call-1",
+                "tool_name": "shiftcare",
+                "tool_args": {
+                    "headers": {
+                        "Authorization": "Bearer live-stream-secret-token",
+                        "X-Account": "6185",
+                    },
+                    "connector_runtime": {
+                        "secrets": {"authorization": "Bearer nested-live-token"},
+                        "auth_selector": {"resource_owner_key": "xagent:user:owner"},
+                    },
+                },
+            },
+        )
+    )
+    started_text, started_close = sink.queue.get_nowait()
+    assert started_close is False
+    assert started_text.startswith("event: step.started\n")
+    assert "live-stream-secret-token" not in started_text
+    assert "nested-live-token" not in started_text
+    assert "xagent:user:owner" not in started_text
+    # The public step's ``data.args`` is the (already-redacted) source
+    # ``tool_args``: see ``_build_tool_start`` in ``_step_mapping.py``.
+    started_data = json.loads(started_text.split("data: ", 1)[1])["step"]["data"]
+    assert started_data["args"]["headers"]["Authorization"] == REDACTED_RUNTIME_SECRET
+    assert started_data["args"]["headers"]["X-Account"] == "6185"
+    assert (
+        started_data["args"]["connector_runtime"]["auth_selector"]["resource_owner_key"]
+        == REDACTED_RUNTIME_SECRET
+    )
+
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_end",
+            task_id=17,
+            data={
+                "tool_call_id": "call-1",
+                "success": True,
+                "result": {
+                    "headers": {"Authorization": "Bearer live-stream-secret-token"}
+                },
+            },
+        )
+    )
+    completed_text, completed_close = sink.queue.get_nowait()
+    assert completed_close is False
+    assert completed_text.startswith("event: step.completed\n")
+    assert "live-stream-secret-token" not in completed_text
+    completed_data = json.loads(completed_text.split("data: ", 1)[1])["step"]["data"]
+    assert (
+        completed_data["result"]["headers"]["Authorization"] == REDACTED_RUNTIME_SECRET
+    )
+
+
+async def test_final_answer_delta_projects_message_delta_frame():
+    sink = _make_sink(task_id=21)
+    await sink.send_text(
+        json.dumps(
+            {
+                "type": "final_answer_delta",
+                "message_id": "final_answer_abc",
+                "task_id": 21,
+                "delta": "Hey",
+            }
+        )
+    )
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is False
+    assert frame_text == es.message_delta_frame("final_answer_abc", "Hey")
+    assert json.loads(frame_text.split("data: ", 1)[1]) == {
+        "message_id": "final_answer_abc",
+        "text": "Hey",
+    }
+
+
+async def test_final_answer_end_projects_message_completed_frame():
+    sink = _make_sink(task_id=21)
+    await sink.send_text(
+        json.dumps(
+            {
+                "type": "final_answer_end",
+                "message_id": "final_answer_abc",
+                "task_id": 21,
+                "content": "Hello there",
+            }
+        )
+    )
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is False
+    assert frame_text == es.message_completed_frame("final_answer_abc", "Hello there")
+    assert json.loads(frame_text.split("data: ", 1)[1]) == {
+        "message_id": "final_answer_abc",
+        "content": "Hello there",
+    }
+
+
+@pytest.mark.parametrize("frame_type", ["final_answer_start", "final_answer_error"])
+async def test_final_answer_start_and_error_produce_no_content_frame(frame_type):
+    """Neither is on the public event list. A ``message.delta``
+    sequence may therefore end with no ``message.completed`` -- the next
+    lifecycle event is the client's abandonment signal, not a dedicated
+    close event from this pair."""
+    sink = _make_sink(task_id=21)
+    await sink.send_text(
+        json.dumps(
+            {
+                "type": frame_type,
+                "message_id": "final_answer_abc",
+                "task_id": 21,
+                "error": "boom",
+            }
+        )
+    )
+    assert sink.queue.empty()
+
+
+async def test_content_frames_are_dropped_by_the_same_close_drain_as_status_frames():
+    """``enqueue_close`` drains the *entire* queue before inserting
+    the close frame (existing, unconditional behavior of this sink) --
+    content frames queued ahead of a close are silently dropped exactly like a
+    queued ``task.status`` would be. The contract is "any close may
+    truncate the content sequence; reconcile via ``steps()``", not
+    "only ``final_answer_error`` truncates it"."""
+    sink = _make_sink(task_id=23, status="running")
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_start",
+            task_id=23,
+            data={"tool_call_id": "call-1", "tool_name": "search", "tool_args": {}},
+        )
+    )
+    assert sink.queue.qsize() == 1  # the step.started frame queued above
+
+    sink.enqueue_close(es.completed_frame(status="failed", output=None, error="boom"))
+
+    assert sink.queue.qsize() == 1
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is True
+    assert frame_text.startswith("event: task.completed\n")
+    # The step.started frame queued before the close is gone, not
+    # delivered ahead of it -- drained by enqueue_close, same as any
+    # other backlog.
+
+
+async def test_step_started_frame_text_is_unaffected_by_the_step_s_later_completion():
+    """Serialization-aliasing guard: ``feed()``
+    returns the projector's own live dict, which gets mutated in place
+    when the step's end event later arrives. The ``step.started`` frame
+    text must have been fully serialized to a JSON string at enqueue
+    time -- if it instead held a reference to the projector's dict and
+    serialized lazily, this test's already-queued frame would show
+    ``status: "completed"`` after the second ``send_text`` call below,
+    not the ``"running"`` it captured when the start event arrived."""
+    sink = _make_sink(task_id=29)
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_start",
+            task_id=29,
+            data={"tool_call_id": "call-1", "tool_name": "search", "tool_args": {}},
+        )
+    )
+    started_text, _ = sink.queue.get_nowait()
+
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_end",
+            task_id=29,
+            data={"tool_call_id": "call-1", "success": True, "result": "sunny"},
+        )
+    )
+    # Draining the second frame too is incidental to this test's point;
+    # what matters is that re-reading the *first* frame's text (captured
+    # before the mutation) still says "running".
+    sink.queue.get_nowait()
+
+    assert json.loads(started_text.split("data: ", 1)[1])["step"]["status"] == "running"
+
+
+# ===== raw-frame size pre-check: an oversized content frame is dropped
+# before it's projected =====
+
+
+def _sized_content_frame(task_id: int, total_chars: int) -> str:
+    """A ``final_answer_delta`` frame whose serialized text is exactly
+    ``total_chars`` long: build the envelope with an empty ``delta``,
+    measure it, then pad with that many ASCII characters (each costs
+    exactly one character in the serialized form)."""
+    envelope: dict = {
+        "type": "final_answer_delta",
+        "message_id": "final_answer_abc",
+        "task_id": task_id,
+        "delta": "",
+    }
+    base_len = len(json.dumps(envelope))
+    pad = total_chars - base_len
+    assert pad >= 0
+    envelope["delta"] = "a" * pad
+    raw = json.dumps(envelope)
+    assert len(raw) == total_chars
+    return raw
+
+
+async def test_oversized_content_frame_is_dropped_before_projection():
+    """A content frame (parsed ``type`` in ``_CONTENT_FRAME_TYPES``)
+    whose raw text is bigger than ``MAX_RAW_FRAME_TEXT_CHARS`` is
+    dropped by ``send_text``'s size check, after classification but
+    before the call into ``_project_and_queue`` -- same drop-and-count
+    discipline as every other frame this sink drops. Warm, so a bug
+    that let this fall through would show up as a queued (truncated)
+    ``message.delta`` frame instead of nothing."""
+    sink = _make_sink(task_id=91)
+    oversized_delta = "x" * (es.MAX_RAW_FRAME_TEXT_CHARS + 1)
+    raw = json.dumps(
+        {
+            "type": "final_answer_delta",
+            "message_id": "final_answer_abc",
+            "task_id": 91,
+            "delta": oversized_delta,
+        }
+    )
+    assert len(raw) > es.MAX_RAW_FRAME_TEXT_CHARS
+
+    await sink.send_text(raw)
+
+    assert sink.dropped_frame_count == 1
+    assert sink.queue.empty()
+
+
+async def test_content_frame_exactly_at_the_size_cap_is_projected():
+    """Boundary case, built to land exactly on the threshold: a content
+    frame whose raw text is exactly ``MAX_RAW_FRAME_TEXT_CHARS`` long is
+    still parsed and projected -- the size check only rejects frames
+    strictly larger. 256 KiB of delta text is itself over the 64 KiB
+    per-frame content cap, so the projected frame carries
+    ``truncated: true`` -- this test states that whole outcome, not
+    just that the frame arrived."""
+    sink = _make_sink(task_id=93)
+    raw = _sized_content_frame(93, es.MAX_RAW_FRAME_TEXT_CHARS)
+
+    await sink.send_text(raw)
+
+    assert sink.dropped_frame_count == 0
+    frame_text, _ = sink.queue.get_nowait()
+    assert frame_text.startswith("event: message.delta\n")
+    data = json.loads(frame_text.split("data: ", 1)[1])
+    assert data["truncated"] is True
+
+
+async def test_content_frame_one_char_over_the_size_cap_is_dropped():
+    """One character over the same boundary is dropped and counted, so
+    an off-by-one in the comparison would fail this test but not the
+    one above."""
+    sink = _make_sink(task_id=94)
+    raw = _sized_content_frame(94, es.MAX_RAW_FRAME_TEXT_CHARS + 1)
+
+    await sink.send_text(raw)
+
+    assert sink.dropped_frame_count == 1
+    assert sink.queue.empty()
+
+
+def test_capped_text_keeps_a_string_exactly_at_the_cap():
+    """``_capped_text`` measures a string's escaped-JSON wire form,
+    quotes included: ``MAX_FRAME_CONTENT_BYTES - 2`` plain ASCII
+    characters plus the two wrapping quotes lands exactly on the cap
+    (65536 bytes), so that length must survive untouched. One character
+    more must truncate, to a 65534-character result."""
+    at_cap = "a" * (es.MAX_FRAME_CONTENT_BYTES - 2)
+    assert es._byte_length(at_cap) == es.MAX_FRAME_CONTENT_BYTES
+    text, truncated = es._capped_text(at_cap)
+    assert truncated is False
+    assert text == at_cap
+
+    over_cap = "a" * (es.MAX_FRAME_CONTENT_BYTES - 1)
+    text, truncated = es._capped_text(over_cap)
+    assert truncated is True
+    assert len(text) == 65534
+
+
+async def test_oversized_task_completed_frame_is_not_dropped_by_the_raw_precheck():
+    """The size check applies only to frames whose parsed ``type`` is in
+    ``_CONTENT_FRAME_TYPES`` -- a ``task_completed`` broadcast returns on
+    ``send_text``'s acceleration branch before the content check is ever
+    reached, regardless of size. It carries its whole output twice
+    (``result`` and ``output``, see ``websocket.py``), so it can cross
+    ``MAX_RAW_FRAME_TEXT_CHARS`` on an ordinary large response, well
+    before anything is actually wrong. A size check placed ahead of the
+    parse cannot make this distinction -- it would drop a large
+    ``task_completed`` whole, leaving ``completion_hint`` unset and
+    delaying the watchdog's terminal close to its next scheduled cycle
+    (30s in production) instead of firing immediately."""
+    sink = _make_sink(task_id=97)
+    duplicated_output = "x" * ((es.MAX_RAW_FRAME_TEXT_CHARS // 2) + 100)
+    raw = json.dumps(
+        {
+            "type": "task_completed",
+            "task": {"id": 97, "title": "t", "status": "completed", "description": ""},
+            "result": duplicated_output,
+            "output": duplicated_output,
+            "success": True,
+        }
+    )
+    assert len(raw) > es.MAX_RAW_FRAME_TEXT_CHARS
+
+    await sink.send_text(raw)
+
+    assert sink.dropped_frame_count == 0
+    assert sink.completion_hint.is_set()
+
+
+async def test_oversized_task_info_frame_is_not_dropped_by_the_raw_precheck():
+    """``task_info`` is a lifecycle envelope (``_feed_trace_event``'s own
+    ``event_type == "task_info"`` short-circuit), not step/message
+    content, but its raw frame's own top-level ``"type"`` is
+    ``"trace_event"`` -- the same type actual content frames
+    (tool_call/thinking/agent_delegation/message) carry. The size check
+    exempts it by its parsed ``event_type`` explicitly
+    (``!= "task_info"``), after ``json.loads`` -- not by a prefix sniff.
+    A check placed ahead of the parse would judge every ``trace_event``
+    frame the same way regardless of its nested ``event_type``, and
+    would drop a legitimately large ``task_info`` whole (its task
+    description has no size bound of its own) -- losing
+    ``task.status`` and ``completion_hint`` the same way it would cost
+    an oversized ``task_completed`` its ``task.completed`` (see the
+    companion test above)."""
+    sink = _make_sink(task_id=101, status="running")
+    huge_description = "x" * (es.MAX_RAW_FRAME_TEXT_CHARS + 1000)
+    raw = json.dumps(
+        {
+            "type": "trace_event",
+            "event_id": "ev-101",
+            "event_type": "task_info",
+            "task_id": 101,
+            "timestamp": 0,
+            "status": "waiting_for_user",
+            "control_state": "idle",
+            "data": {
+                "status": "waiting_for_user",
+                "control_state": "idle",
+                "message": huge_description,
+            },
+        }
+    )
+    assert len(raw) > es.MAX_RAW_FRAME_TEXT_CHARS
+
+    await sink.send_text(raw)
+
+    assert sink.dropped_frame_count == 0
+    assert sink.completion_hint.is_set()
+    frame_text, _ = sink.queue.get_nowait()
+    assert frame_text.startswith("event: task.status\n")
+    assert json.loads(frame_text.split("data: ", 1)[1]) == {
+        "status": "waiting_for_user"
+    }
+
+
+async def test_unparseable_frame_is_dropped_and_counted():
+    """A frame that isn't valid JSON can't be classified at all -- there
+    is no parsed ``type`` to check -- so ``json.loads`` itself raises
+    and the outer ``except`` in ``send_text`` drops and counts it, the
+    same discipline every other drop in this method gets. Length is
+    irrelevant on this path: the failure happens at the very first
+    character, well before any size check would run, so a short input
+    is enough to exercise it."""
+    sink = _make_sink(task_id=99)
+    raw = "x" * 64
+
+    await sink.send_text(raw)
+
+    assert sink.dropped_frame_count == 1
+    assert sink.queue.empty()
+
+
+async def test_oversized_non_dict_json_frame_is_ignored_without_counting():
+    """A frame that IS valid JSON but not a dict (a bare array here) is
+    ignored by ``send_text``'s own ``isinstance(message, dict)`` guard,
+    before classification or the size check ever run -- even though it's
+    larger than ``MAX_RAW_FRAME_TEXT_CHARS``. Deliberate semantic change
+    from the pre-parse-sniffing era: only a frame classifiable as
+    content (``_CONTENT_FRAME_TYPES``) counts as a drop now: this one is
+    silently ignored, not counted."""
+    sink = _make_sink(task_id=103)
+    raw = json.dumps(["x"] * (es.MAX_RAW_FRAME_TEXT_CHARS // 2))
+    assert len(raw) > es.MAX_RAW_FRAME_TEXT_CHARS
+
+    await sink.send_text(raw)
+
+    assert sink.dropped_frame_count == 0
+    assert sink.queue.empty()
+
+
+# ===== a frame that fails to project is dropped, not fatal, and never
+# double-counted between the sink's two except layers
+# (see _project_and_queue) =====
+
+
+async def test_poisoned_live_frame_increments_dropped_frame_count_only_once(
+    monkeypatch,
+):
+    """A projection failure on the live path is
+    caught inside ``_project_and_queue`` and never re-raises -- if it
+    did, ``send_text``'s own outer ``except`` would catch it too and
+    count the same dropped frame twice."""
+    sink = _make_sink(task_id=73)
+
+    def _boom(message, projector):
+        raise RuntimeError("boom live")
+
+    monkeypatch.setattr(es, "project_content_frames", _boom)
+
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_start",
+            task_id=73,
+            data={"tool_call_id": "call-1", "tool_name": "x", "tool_args": {}},
+        )
+    )  # must not raise
+
+    assert sink.dropped_frame_count == 1
+    assert sink.queue.empty()
+
+
+# ===== single-frame content byte cap =====
+
+
+async def test_message_delta_over_the_byte_cap_is_truncated_and_flagged():
+    sink = _make_sink(task_id=51)
+    oversized = "x" * (es.MAX_FRAME_CONTENT_BYTES + 1000)
+    await sink.send_text(
+        json.dumps(
+            {
+                "type": "final_answer_delta",
+                "message_id": "final_answer_abc",
+                "task_id": 51,
+                "delta": oversized,
+            }
+        )
+    )
+    frame_text, _ = sink.queue.get_nowait()
+    data = json.loads(frame_text.split("data: ", 1)[1])
+    assert data["truncated"] is True
+    assert len(data["text"].encode("utf-8")) <= es.MAX_FRAME_CONTENT_BYTES
+    assert data["text"] != oversized
+
+
+async def test_message_delta_under_the_byte_cap_is_unmarked():
+    sink = _make_sink(task_id=53)
+    await sink.send_text(
+        json.dumps(
+            {
+                "type": "final_answer_delta",
+                "message_id": "final_answer_abc",
+                "task_id": 53,
+                "delta": "just a normal chunk",
+            }
+        )
+    )
+    frame_text, _ = sink.queue.get_nowait()
+    data = json.loads(frame_text.split("data: ", 1)[1])
+    assert "truncated" not in data
+    assert data["text"] == "just a normal chunk"
+
+
+async def test_message_completed_over_the_byte_cap_is_truncated_and_flagged():
+    """Same cap, same flagging, on ``message.completed`` -- pins that
+    the final-answer *end* path (not just the streamed delta path
+    above) also goes through ``_capped_text``."""
+    sink = _make_sink(task_id=52)
+    oversized = "x" * (es.MAX_FRAME_CONTENT_BYTES + 1000)
+    await sink.send_text(
+        json.dumps(
+            {
+                "type": "final_answer_end",
+                "message_id": "final_answer_abc",
+                "task_id": 52,
+                "content": oversized,
+            }
+        )
+    )
+    frame_text, _ = sink.queue.get_nowait()
+    data = json.loads(frame_text.split("data: ", 1)[1])
+    assert data["truncated"] is True
+    assert len(data["content"].encode("utf-8")) <= es.MAX_FRAME_CONTENT_BYTES
+    assert data["content"] != oversized
+
+
+def test_capped_text_handles_a_multibyte_character_straddling_the_byte_boundary():
+    """``_capped_text``'s character-slice pre-check bounds character
+    *count*, not the escaped-JSON byte count the function actually caps
+    against -- for an all-ASCII text (the shape every other byte-cap
+    test in this module uses) that pre-slice usually still lands close
+    enough to the cap to take the function's early-return branch. A
+    multi-byte character (every "中" is 3 UTF-8 bytes but a 6-byte
+    ``\\uXXXX`` escape on the wire) blows well past the cap even after
+    that pre-slice, which is what exercises the function's other
+    branch: a binary search over the character-sliced prefix for the
+    longest one whose escaped bytes still fit (see the function's own
+    docstring for why this replaces a raw UTF-8 byte-slice, which is
+    unsafe once the measured domain is escaped bytes instead of decoded
+    ones).
+    """
+    oversized = "中" * (es.MAX_FRAME_CONTENT_BYTES + 1000)
+    capped, truncated = es._capped_text(oversized)
+    assert truncated is True
+    assert len(capped.encode("utf-8")) <= es.MAX_FRAME_CONTENT_BYTES
+    # The cap is on the escaped wire form, so this is the assertion that
+    # discriminates. A decoded-UTF-8-byte implementation returns 21845
+    # characters for this input -- 65535 decoded bytes, satisfying the
+    # assertion above -- while its escaped form measures 131072 bytes,
+    # twice the cap.
+    assert es._byte_length(capped) <= es.MAX_FRAME_CONTENT_BYTES
+    # Escaped-byte-sliced inside the character-sliced prefix: strictly
+    # fewer whole characters survive than a pure character-count slice
+    # would keep (that would be MAX_FRAME_CONTENT_BYTES characters,
+    # escaping to 6x as many wire bytes).
+    assert len(capped) < es.MAX_FRAME_CONTENT_BYTES
+
+
+async def test_step_data_over_the_byte_cap_collapses_to_a_truncation_marker():
+    sink = _make_sink(task_id=55)
+    oversized_result = "y" * (es.MAX_FRAME_CONTENT_BYTES + 1000)
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_start",
+            task_id=55,
+            data={"tool_call_id": "call-1", "tool_name": "search", "tool_args": {}},
+        )
+    )
+    sink.queue.get_nowait()  # drain the (small) step.started frame
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_end",
+            task_id=55,
+            data={
+                "tool_call_id": "call-1",
+                "success": True,
+                "result": oversized_result,
+            },
+        )
+    )
+    frame_text, _ = sink.queue.get_nowait()
+    step = json.loads(frame_text.split("data: ", 1)[1])["step"]
+    # "name" (the tool's identifying field, carried since the start
+    # event) survives the truncation marker -- see
+    # ``_STEP_DATA_IDENTIFYING_KEYS`` -- only the oversized "result"
+    # content is dropped.
+    assert step["data"] == {
+        "truncated": True,
+        "original_bytes": step["data"]["original_bytes"],
+        "name": "search",
+    }
+    assert step["data"]["original_bytes"] > es.MAX_FRAME_CONTENT_BYTES
+    # The step's own identity/status fields are untouched by the cap --
+    # only its content-bearing ``data`` sub-object is affected.
+    assert step["id"] == "tool_call:call-1"
+    assert step["status"] == "completed"
+
+
+async def test_capped_step_data_preserves_identifying_keys_per_step_type():
+    """``_capped_step_data`` keeps each public step type's own
+    identifying field (``phase``/``name``/``sub_agent_name``/``role``)
+    through the truncation marker -- a client reading a truncated frame
+    still knows *what* the step was, not just that it was too big."""
+    oversized = "z" * (es.MAX_FRAME_CONTENT_BYTES + 1000)
+    assert es._capped_step_data({"phase": "planning", "junk": oversized}) == {
+        "truncated": True,
+        "original_bytes": es._byte_length({"phase": "planning", "junk": oversized}),
+        "phase": "planning",
+    }
+    assert es._capped_step_data(
+        {"sub_agent_name": "researcher", "input": oversized}
+    ) == {
+        "truncated": True,
+        "original_bytes": es._byte_length(
+            {"sub_agent_name": "researcher", "input": oversized}
+        ),
+        "sub_agent_name": "researcher",
+    }
+    assert es._capped_step_data({"role": "assistant", "content": oversized}) == {
+        "truncated": True,
+        "original_bytes": es._byte_length({"role": "assistant", "content": oversized}),
+        "role": "assistant",
+    }
+    # A key genuinely absent from this step's data is never synthesized.
+    small_but_over_cap = {"role": "assistant"}
+    assert "phase" not in es._capped_step_data(
+        {**small_but_over_cap, "content": oversized}
+    )
+
+
+async def test_capped_step_data_truncates_an_oversized_identifying_value():
+    """An identifying value can itself be large enough to blow the cap
+    once folded into the truncation marker (the first pass in
+    ``_capped_step_data``'s docstring) -- e.g. an unusually long tool
+    name. The second pass must truncate that value (not drop it) and
+    the result must still fit under ``MAX_FRAME_CONTENT_BYTES``:
+    truncating the value to the *full* cap and only then wrapping it in
+    the marker dict would overflow on the marker's own JSON overhead
+    alone, which is exactly the bug this guards against."""
+    huge_name = "n" * 70_000
+    result = es._capped_step_data({"name": huge_name, "junk": "x" * 1000})
+    assert es._byte_length(result) <= es.MAX_FRAME_CONTENT_BYTES
+    assert result["truncated"] is True
+    assert "name" in result
+    assert len(result["name"]) < len(huge_name)
+    assert result["original_bytes"] > es.MAX_FRAME_CONTENT_BYTES
+
+
+def test_capped_step_data_drops_only_the_value_it_cannot_shrink():
+    """A non-string identifying value (a dict- or list-valued ``name``/
+    ``role``, say) can't be truncated in place -- ``_capped_text`` only
+    accepts a string. The naive fix (drop it at the final bare-marker
+    step and stop) still fails: the un-shrinkable value counts toward
+    the first pass's own overhead, driving every *other* key's budget
+    to zero, so a survivor that should have kept real content comes
+    back as ``""``. The actual fix is a bounded retry: drop only the
+    largest surviving value that cannot be truncated in place and
+    rebuild the marker from the original data, so the keys that survive
+    get a real, non-zero budget."""
+    oversized_dict = {"nested": "x" * 70_000}
+    result = es._capped_step_data({"name": oversized_dict, "phase": "planning"})
+    assert result["truncated"] is True
+    assert "name" not in result
+    assert result["phase"] == "planning"
+    assert result["original_bytes"] > es.MAX_FRAME_CONTENT_BYTES
+    assert es._byte_length(result) <= es.MAX_FRAME_CONTENT_BYTES
+
+    result = es._capped_step_data({"role": ["a" * 70_000], "name": "search"})
+    assert result["truncated"] is True
+    assert "role" not in result
+    assert result["name"] == "search"
+    assert es._byte_length(result) <= es.MAX_FRAME_CONTENT_BYTES
+
+    # Nothing else to keep once the one identifying value is dropped:
+    # the honest limit of this fix, same as before it.
+    result = es._capped_step_data({"name": oversized_dict})
+    assert result == {
+        "truncated": True,
+        "original_bytes": result["original_bytes"],
+    }
+
+    # Regression guard: the string-only ladder is unchanged -- both
+    # values survive, each truncated, when both can be shrunk.
+    result = es._capped_step_data({"name": "n" * 70_000, "role": "r" * 70_000})
+    assert result["truncated"] is True
+    assert "name" in result and "role" in result
+    assert 0 < len(result["name"]) < 70_000
+    assert 0 < len(result["role"]) < 70_000
+    assert es._byte_length(result) <= es.MAX_FRAME_CONTENT_BYTES
+
+
+def test_capped_step_data_prefers_dropping_a_non_string_over_a_truncatable_one():
+    """When both a truncatable string and an un-shrinkable non-string
+    survive a failed pass, the non-string is dropped first -- preferring
+    to drop the salvageable string would degrade a step that could have
+    kept real content down to the bare marker for no reason. Per the
+    docstring, a pass over strings only always fits within the cap, so
+    reaching the drop step guarantees at least one non-string survivor
+    remains; falling back to the largest overall is unreachable here."""
+    result = es._capped_step_data(
+        {"sub_agent_name": {"k": "x" * 70_000}, "role": "assistant" * 9_000}
+    )
+    assert result["truncated"] is True
+    assert "sub_agent_name" not in result
+    assert "role" in result
+    assert 0 < len(result["role"]) < len("assistant" * 9_000)
+    assert es._byte_length(result) <= es.MAX_FRAME_CONTENT_BYTES
+
+    result = es._capped_step_data({"name": {"k": "x" * 66_000}, "phase": "p" * 70_000})
+    assert result["truncated"] is True
+    assert "name" not in result
+    assert "phase" in result
+    assert 0 < len(result["phase"]) < 70_000
+    assert es._byte_length(result) <= es.MAX_FRAME_CONTENT_BYTES
+
+
+def test_capped_text_bounds_emoji_content_in_the_escaped_wire_byte_domain():
+    """``_sse_frame`` serializes with ``json.dumps``'s default
+    ``ensure_ascii=True``, so a non-BMP character like an emoji escapes
+    to a 12-byte ``\\uD83D\\uDE00`` surrogate pair on the wire -- 3x its
+    own 4-byte UTF-8 width. 16384 emoji is exactly
+    ``MAX_FRAME_CONTENT_BYTES`` in UTF-8 bytes, the domain a decoded-byte
+    cap check would measure -- a check in that domain would let this
+    input sail through completely untruncated, while its escaped wire
+    form runs to roughly 3x the cap. ``_capped_text`` measures the
+    escaped form itself, so it catches this case.
+    """
+    oversized = "\U0001f600" * 16384
+    capped, truncated = es._capped_text(oversized)
+    assert truncated is True
+    assert es._byte_length(capped) <= es.MAX_FRAME_CONTENT_BYTES
+    assert capped != oversized
+
+
+async def test_message_delta_with_cjk_content_is_capped_on_the_wire_not_decoded_bytes():
+    """A CJK string long enough to fit under a decoded-UTF-8-byte cap (3
+    bytes/character) but not under its escaped wire form (6 bytes/
+    character via ``\\uXXXX``, ``ensure_ascii=True``) would reach the
+    client whole under that measurement -- 12000 "中" characters is
+    36000 UTF-8 bytes (well under ``MAX_FRAME_CONTENT_BYTES``) but
+    roughly 72000 escaped wire bytes (over it). Pins that
+    ``message.delta``'s ``text`` field is capped in the same domain the
+    frame is actually serialized in."""
+    sink = _make_sink(task_id=57)
+    oversized = "中" * 12_000
+    await sink.send_text(
+        json.dumps(
+            {
+                "type": "final_answer_delta",
+                "message_id": "final_answer_cjk",
+                "task_id": 57,
+                "delta": oversized,
+            }
+        )
+    )
+    frame_text, _ = sink.queue.get_nowait()
+    data = json.loads(frame_text.split("data: ", 1)[1])
+    assert data["truncated"] is True
+    assert es._byte_length(data["text"]) <= es.MAX_FRAME_CONTENT_BYTES
+    assert data["text"] != oversized
+
+
+async def test_capped_step_data_preserves_cjk_identifying_value_via_the_wire_byte_domain():
+    """The truncation pass's per-key budget (``per_key_budget`` in
+    ``_capped_step_data``) is computed in escaped-JSON bytes -- the same
+    domain ``_byte_length``'s cap checks use. Before ``_capped_text``
+    measured in that same domain, handing it that budget for a CJK name
+    let it keep far more *characters* than the escaped budget actually
+    allowed (UTF-8 costs 3 bytes per "名", the escaped wire form costs
+    6), so the reassembled dict was still over the cap on its own
+    re-check and the identifying ``name`` field a client needs to know
+    which tool ran got dropped entirely -- not because the name was
+    genuinely too large to fit, but because the two functions were
+    measuring in different domains. This pins that a CJK name now
+    survives, truncated, instead."""
+    huge_name_cjk = "名" * 12_000
+    result = es._capped_step_data({"name": huge_name_cjk, "junk": "x" * 1000})
+    assert es._byte_length(result) <= es.MAX_FRAME_CONTENT_BYTES
+    assert result["truncated"] is True
+    assert "name" in result  # the truncation pass preserved it -- not dropped
+    assert len(result["name"]) < len(huge_name_cjk)
+    assert result["original_bytes"] > es.MAX_FRAME_CONTENT_BYTES
+
+
+async def test_nonfinite_step_data_values_are_normalized_to_null_on_the_wire():
+    """``PublicStep.data`` is typed ``Dict[str, Any]`` (see
+    ``xagent.web.schemas.v1``), so nothing stops a tool result or
+    delegation payload from carrying a raw ``float('nan')``/``inf``/
+    ``-inf`` -- Python's ``json.dumps`` (used by ``_sse_frame``, the
+    function every frame builder in this module funnels through)
+    accepts those by default and emits the bare, non-standard tokens
+    ``NaN``/``Infinity``/``-Infinity``, which a strict ``JSON.parse``
+    client rejects outright.
+
+    A ``step.*`` frame's only producer, live projection
+    (``_step_content_frame``), funnels
+    through ``_step_wire_frame``, which receives its dict only after a
+    ``PublicStep(**step).model_dump(mode="json")`` call. Pydantic v2's
+    JSON serialization mode normalizes non-finite floats to ``null`` for
+    any field typed ``Any`` (verified directly below), independent of a
+    field's nesting depth -- so every ``step.*`` frame this module emits
+    is already immune to this failure mode with no additional guard in
+    ``_step_wire_frame`` itself. This test pins that implicit
+    invariant by exercising a real ``_step_wire_frame`` call (the
+    shared choke point) with three-deep nested non-finite values and
+    asserting the resulting wire text is strict-JSON-clean. It changes
+    no production code -- if this ever regresses (e.g. a future
+    producer bypasses ``model_dump(mode="json")`` and hands
+    ``_step_wire_frame`` a dict straight from application code), this
+    test is the tripwire.
+    """
+    nested_nonfinite_data = {
+        "name": "search",
+        "args": {
+            "level_one": {
+                "level_two": {
+                    "level_three": [float("nan"), float("inf"), float("-inf")]
+                },
+                "solo_nan": float("nan"),
+            }
+        },
+        "result": float("inf"),
+    }
+    step = es.PublicStep(
+        id="tool_call:call-nonfinite",
+        type="tool_call",
+        status="completed",
+        started_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        completed_at=datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC),
+        data=nested_nonfinite_data,
+    )
+    frame_text = es._step_wire_frame(step.model_dump(mode="json"))
+
+    assert "NaN" not in frame_text
+    assert "Infinity" not in frame_text
+
+    payload = frame_text.split("data: ", 1)[1].strip()
+
+    def _reject_nonfinite(constant_text: str) -> None:
+        pytest.fail(
+            f"strict JSON parse hit a non-finite constant token: {constant_text!r}"
+        )
+
+    parsed = json.loads(payload, parse_constant=_reject_nonfinite)
+    wire_args = parsed["step"]["data"]["args"]
+    assert wire_args["level_one"]["level_two"]["level_three"] == [None, None, None]
+    assert wire_args["level_one"]["solo_nan"] is None
+    assert parsed["step"]["data"]["result"] is None
+
+
+async def test_stream_projector_keeps_no_finished_steps_for_the_connection():
+    """The sink's projector is built with ``retain_finished=False`` (see
+    ``V1EventStreamSink.__init__``): it acts on each ``feed()`` result
+    immediately by serializing it to a frame, and never calls
+    ``materialized_steps()``, so retaining every finalized step would
+    hold each one's untruncated ``data`` for as long as the connection
+    lives. Feeds 50 tool-call pairs plus one message -- enough that the
+    fold definitely ran repeatedly, not just once -- and checks what's
+    left behind rather than trusting it was never accumulated.
+    """
+    sink = _make_sink(task_id=99)
+    for i in range(50):
+        await sink.send_text(
+            _trace_event_frame(
+                "tool_execution_start",
+                task_id=99,
+                step_id=f"step-{i}",
+                data={
+                    "tool_call_id": f"call-{i}",
+                    "tool_name": "search",
+                    "tool_args": {"query": f"q{i}"},
+                },
+            )
+        )
+        await sink.send_text(
+            _trace_event_frame(
+                "tool_execution_end",
+                task_id=99,
+                step_id=f"step-{i}",
+                data={"tool_call_id": f"call-{i}", "success": True, "result": "ok"},
+            )
+        )
+    await sink.send_text(
+        _trace_event_frame(
+            "ai_message",
+            task_id=99,
+            data={"content": "done"},
+        )
+    )
+    queued = []
+    while not sink.queue.empty():
+        queued.append(sink.queue.get_nowait())
+    assert len(queued) == 101
+    assert sink._projector._finished is None
+    assert sink._projector._pending == {}
+
+
+# ===== two-path consistency: the same trace event sequence collapses to
+# the same PublicStep whether read via steps() or via the live stream =====
+
+
+async def test_live_projection_matches_steps_endpoint_for_the_same_events():
+    """Same trace event sequence, same collapsed ``PublicStep`` --
+    ``id``/``type``/``status``/``data``/``started_at``/``completed_at``
+    -- whether read through ``steps()`` (the persisted-history path) or
+    through this stream's live projection (the same
+    ``PublicStepProjector``, fed the broadcast-shaped frame instead of
+    the ORM row). Both surfaces derive from the same two
+    ``xagent.core.agent.trace.TraceEvent`` objects through the real
+    conversion pipeline -- ``_persist_core_event`` for the ``steps()``
+    leg, ``_broadcast_frame_for`` for the live leg -- so a change on
+    either side of that pipeline shows up here rather than being masked
+    by two independently hand-built literals. Fixture data carries no
+    credential-shaped keys, so both redaction call sites are a no-op and
+    cannot mask a divergence. Message steps are excluded here -- see the
+    divergence test below for that one, explicitly accepted difference.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    start_event = CoreTraceEvent(
+        ACTION_START_TOOL,
+        step_id="step-1",
+        timestamp=base.timestamp(),
+        data={
+            "tool_call_id": "call-1",
+            "tool_name": "search",
+            "tool_args": {"q": "weather"},
+        },
+    )
+    end_event = CoreTraceEvent(
+        ACTION_END_TOOL,
+        step_id="step-1",
+        timestamp=base.timestamp(),
+        data={"tool_call_id": "call-1", "success": True, "result": "sunny"},
+    )
+    _persist_core_event(start_event, task_id=task_id)
+    _persist_core_event(end_event, task_id=task_id)
+
+    steps_resp = client.get(
+        f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+    )
+    assert steps_resp.status_code == 200
+    steps_via_polling = steps_resp.json()["steps"]
+    assert len(steps_via_polling) == 1
+
+    sink = _make_sink(task_id=task_id)
+    await sink.send_text(_broadcast_frame_for(start_event, task_id=task_id))
+    sink.queue.get_nowait()  # the step.started frame -- not under test here
+    await sink.send_text(_broadcast_frame_for(end_event, task_id=task_id))
+    frame_text, _ = sink.queue.get_nowait()
+    step_via_live = json.loads(frame_text.split("data: ", 1)[1])["step"]
+
+    polled = steps_via_polling[0]
+    assert step_via_live["id"] == polled["id"]
+    assert step_via_live["type"] == polled["type"]
+    assert step_via_live["status"] == polled["status"]
+    assert step_via_live["data"] == polled["data"]
+    assert step_via_live["started_at"] == polled["started_at"]
+    assert step_via_live["completed_at"] == polled["completed_at"]
+
+
+async def test_planning_step_ids_count_per_connection_and_collide_with_steps():
+    """Known divergence, not a bug, for a ``thinking:plan:``/``thinking:
+    planning:`` step id -- pins the endpoint docstring's carve-out.
+
+    Two planning cycles happen on the task: cycle 1 opens and closes
+    (``dag_execution`` phase ``planning`` then ``executing``), cycle 2
+    opens and is still running. ``steps()`` replays the whole persisted
+    history, so it numbers them ``:1`` and ``:2`` in order. A fresh sink
+    -- a client attaching mid-task -- only ever sees cycle 2's start
+    broadcast (cycle 1 already happened before it attached), so its own
+    projector, starting empty, numbers that as its *first* observed
+    planning cycle: ``:1``. That id is not a mismatch, it's an outright
+    collision -- it equals ``steps()``'s id for cycle 1's *different*
+    step, not merely differing from cycle 2's own id. ``data`` and
+    ``started_at`` still agree with cycle 2's row, which is what makes
+    the id divergence the only thing wrong with treating the two as the
+    same step.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    dag_execution_type = TraceEventType(
+        TraceScope.TASK, TraceAction.UPDATE, TraceCategory.DAG
+    )
+    t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    t1 = datetime(2026, 1, 1, 12, 0, 5, tzinfo=UTC)
+    t2 = datetime(2026, 1, 1, 12, 0, 10, tzinfo=UTC)
+    cycle1_start = CoreTraceEvent(
+        dag_execution_type,
+        task_id=str(task_id),
+        timestamp=t0.timestamp(),
+        data={"phase": "planning"},
+    )
+    cycle1_end = CoreTraceEvent(
+        dag_execution_type,
+        task_id=str(task_id),
+        timestamp=t1.timestamp(),
+        data={"phase": "executing"},
+    )
+    cycle2_start = CoreTraceEvent(
+        dag_execution_type,
+        task_id=str(task_id),
+        timestamp=t2.timestamp(),
+        data={"phase": "planning"},
+    )
+    _persist_core_event(cycle1_start, task_id=task_id)
+    _persist_core_event(cycle1_end, task_id=task_id)
+    _persist_core_event(cycle2_start, task_id=task_id)
+
+    steps_resp = client.get(
+        f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+    )
+    assert steps_resp.status_code == 200
+    thinking_steps = [s for s in steps_resp.json()["steps"] if s["type"] == "thinking"]
+    assert len(thinking_steps) == 2
+    step_one = next(
+        s for s in thinking_steps if s["id"] == f"thinking:planning:{task_id}:1"
+    )
+    step_two = next(
+        s for s in thinking_steps if s["id"] == f"thinking:planning:{task_id}:2"
+    )
+    assert step_one["started_at"] != step_two["started_at"]
+
+    sink = _make_sink(task_id=task_id)
+    await sink.send_text(_broadcast_frame_for(cycle2_start, task_id=task_id))
+    frame_text, _ = sink.queue.get_nowait()
+    live_step = json.loads(frame_text.split("data: ", 1)[1])["step"]
+
+    # The live id is the collision, not merely a mismatch: it equals the
+    # *other*, earlier step's steps() id rather than merely differing
+    # from the step it actually is.
+    assert live_step["id"] == f"thinking:planning:{task_id}:1"
+    assert live_step["id"] != step_two["id"]
+    assert live_step["id"] == step_one["id"]
+    # Divergence is confined to the id: content and timing still agree
+    # with the step this live frame actually is (cycle 2).
+    assert live_step["data"] == step_two["data"]
+    assert live_step["started_at"] == step_two["started_at"]
+
+
+async def test_known_divergence_message_step_id_differs_between_the_two_paths():
+    """Accepted divergence, not a bug: an ``ai_message``'s ``PublicStep``
+    id is the persisted trace ``event_id`` via ``steps()`` (the row's own
+    primary identifier) but a fresh uuid4 minted per broadcast frame via
+    the live stream (``create_stream_event`` mints a new one on every
+    send) -- the two paths can't share this id, so a client must not try
+    to correlate a message step across ``steps()`` and the live stream by
+    id. Content itself still matches -- ``data`` is the only field
+    compared below; ``started_at``/``completed_at`` aren't, since this
+    fixture doesn't mirror a timestamp into the live frame either."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="ai_message",
+        event_id="persisted-id-123",
+        timestamp=base,
+        data={"content": "the answer"},
+    )
+
+    steps_resp = client.get(
+        f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+    )
+    polled = steps_resp.json()["steps"][0]
+    assert polled["id"] == "message:persisted-id-123"
+
+    sink = _make_sink(task_id=task_id)
+    await sink.send_text(
+        _trace_event_frame(
+            "ai_message",
+            task_id=task_id,
+            event_id="live-frame-uuid-456",
+            data={"content": "the answer"},
+        )
+    )
+    frame_text, _ = sink.queue.get_nowait()
+    step_via_live = json.loads(frame_text.split("data: ", 1)[1])["step"]
+    assert step_via_live["id"] == "message:live-frame-uuid-456"
+    assert step_via_live["id"] != polled["id"]
+    assert step_via_live["data"] == polled["data"]
+
+
+async def test_live_projection_matches_steps_for_a_streamed_final_answer():
+    """``data``/``type``/``status`` parity for an ``ai_message`` that
+    also carries ``stream_message_id`` -- the persisted mirror of a
+    final answer that is ALSO delivered live via
+    ``message.delta``/``message.completed`` on this same stream. The
+    two-path parity tests above deliberately exclude message steps, so
+    this combination gets its coverage here: the live fold projects a
+    ``message`` step for it (see
+    ``test_trace_event_ai_message_with_stream_message_id_also_projects_a_step``),
+    and this pins that the step carries the *same* content ``steps()``
+    shows for the persisted row. The live stream additionally emits the
+    ``message.delta``/``message.completed`` frames for the same content
+    -- duplication the contract accepts in exchange for parity -- not
+    asserted again here since
+    ``test_final_answer_delta_projects_message_delta_frame`` and its
+    ``_completed`` counterpart already pin that half independently.
+    ``id`` is excluded below for the same reason the plain-``ai_message``
+    divergence test above excludes it (a fresh uuid4 per live frame);
+    ``started_at``/``completed_at`` are compared, with the live frame's
+    timestamp mirroring the persisted event's -- both derive from the
+    same event timestamp field regardless of path (see
+    ``_step_mapping.py``'s ``_ts``), so a client can rely on those two
+    fields matching even though ``id`` never will."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="ai_message",
+        event_id="persisted-final-answer",
+        timestamp=base,
+        data={"content": "the answer", "stream_message_id": "final_answer_xyz"},
+    )
+
+    steps_resp = client.get(
+        f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+    )
+    assert steps_resp.status_code == 200
+    steps_via_polling = steps_resp.json()["steps"]
+    assert len(steps_via_polling) == 1
+    polled = steps_via_polling[0]
+    assert polled["data"] == {"role": "assistant", "content": "the answer"}
+
+    sink = _make_sink(task_id=task_id)
+    await sink.send_text(
+        _trace_event_frame(
+            "ai_message",
+            task_id=task_id,
+            event_id="live-final-answer-uuid",
+            timestamp=base.timestamp(),
+            data={"content": "the answer", "stream_message_id": "final_answer_xyz"},
+        )
+    )
+    frame_text, _ = sink.queue.get_nowait()
+    step_via_live = json.loads(frame_text.split("data: ", 1)[1])["step"]
+    # Same accepted id divergence as the plain-ai_message case above --
+    # data/type/status/timestamps are compared below, id is not.
+    assert (
+        step_via_live["data"]
+        == polled["data"]
+        == {
+            "role": "assistant",
+            "content": "the answer",
+        }
+    )
+    assert step_via_live["type"] == polled["type"] == "message"
+    assert step_via_live["status"] == polled["status"] == "completed"
+    assert step_via_live["started_at"] == polled["started_at"]
+    assert step_via_live["completed_at"] == polled["completed_at"]
+    assert sink.queue.empty()
+
+
+async def test_delegated_child_events_excluded_from_both_paths_consistently():
+    """A delegated child agent's own trace events never reach a public
+    step on either path -- but the two paths exclude them via different
+    checks, not the same predicate: ``steps()`` excludes via its
+    ``TraceEvent.build_id IS NULL`` column filter, the live path
+    excludes via the ``data["source"]`` field filter (see
+    ``test_trace_event_delegated_child_source_is_filtered``). They agree
+    because one producer stamps both on a delegated child's events;
+    nothing enforces that they keep agreeing. Verifies the two
+    independent mechanisms agree in practice: the resulting step id sets
+    match, not just that each mechanism works in isolation -- and
+    exercises the REST-side filter for real by persisting a row with a
+    non-null ``build_id`` (rather than relying on none existing to
+    exclude), so ``polled_ids`` matching means the filter actually
+    excluded something. Only id-set membership is compared here -- no
+    per-field (let alone timestamp) comparison, since the point under
+    test is exclusion, not content."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_start",
+        event_id="hist-1",
+        timestamp=base,
+        step_id="step-1",
+        data={"tool_call_id": "call-1", "tool_name": "search", "tool_args": {}},
+    )
+    # A delegated child's own persisted row -- excluded from steps() by
+    # its non-null build_id, not by an absence of matching rows.
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_start",
+        event_id="hist-child-1",
+        timestamp=base,
+        step_id="step-2",
+        build_id="child-build-1",
+        data={
+            "tool_call_id": "call-child-1",
+            "tool_name": "child_tool",
+            "tool_args": {},
+        },
+    )
+
+    steps_resp = client.get(
+        f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+    )
+    polled_ids = {step["id"] for step in steps_resp.json()["steps"]}
+    assert polled_ids == {"tool_call:call-1"}
+
+    sink = _make_sink(task_id=task_id)
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_start",
+            task_id=task_id,
+            step_id="step-1",
+            data={"tool_call_id": "call-1", "tool_name": "search", "tool_args": {}},
+        )
+    )
+    started_frame_text, _ = sink.queue.get_nowait()
+    live_ids = {json.loads(started_frame_text.split("data: ", 1)[1])["step"]["id"]}
+
+    # The delegated child agent's own trace event -- same shape a real
+    # broadcast for it would have, filtered by data.source before it
+    # ever reaches the projector (see _feed_trace_event).
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_start",
+            task_id=task_id,
+            step_id="step-2",
+            data={
+                "tool_call_id": "call-child-1",
+                "tool_name": "child_tool",
+                "tool_args": {},
+                "source": "xagent-agent-tool-child",
+            },
+        )
+    )
+    assert sink.queue.empty()  # nothing else was projected for the child event
+
+    assert live_ids == polled_ids
+
+
+async def test_an_unclosed_dag_planning_phase_projects_a_running_thinking_step():
+    """Two-path consistency for a task whose *planning* phase never
+    resolves because no ``dag_execute_end`` ever arrives to close it.
+
+    This fixture only ever sends the ``dag_execution{phase: "planning"}``
+    start, with no matching ``phase: "executing"`` end and no
+    ``dag_execute_end`` at all -- so on *both* paths the ``thinking``
+    step is left at ``status: "running"`` forever; there is no event
+    either path treats as a close for it. That's what this test pins:
+    the two paths still agree with each other on the open-ended case.
+    ``_step_mapping.py`` does consume ``dag_execute_end``: see
+    ``test_dag_execute_end_closes_the_planning_step_as_failed``,
+    directly below, for the case where that event does arrive and
+    closes the step as ``failed``. This fixture is deliberately kept
+    separate rather than repurposed for that outcome, since the point
+    made here is specifically about the still-open, never-closed case.
+
+    Scope of what this pins: each surface's own outcome for this event
+    shape, from a literal built per surface. It is not producer-faithful
+    parity coverage -- that lives in
+    ``test_live_projection_matches_steps_endpoint_for_the_same_events``
+    and ``test_planning_step_ids_count_per_connection_and_collide_with_steps``,
+    which fork both legs from one shared ``CoreTraceEvent`` through the
+    real production pipelines, so a change on either pipeline shows up
+    there. ``type``/``status``/``data``/``started_at``/``completed_at``
+    are compared across the two legs below; ``id`` is deliberately not
+    (see the comment at the assertions).
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="dag_execution",
+        event_id="hist-1",
+        timestamp=base,
+        data={"pattern": "DAGPattern", "phase": "planning"},
+    )
+    _set_task_status(task_id, TaskStatus.FAILED, error_message="plan validation failed")
+
+    steps_resp = client.get(
+        f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+    )
+    assert steps_resp.status_code == 200
+    steps_via_polling = steps_resp.json()["steps"]
+    assert len(steps_via_polling) == 1
+    assert steps_via_polling[0]["status"] == "running"
+    assert steps_via_polling[0]["data"] == {"phase": "planning"}
+
+    sink = _make_sink(task_id=task_id)
+    await sink.send_text(
+        _trace_event_frame(
+            "dag_execution",
+            task_id=task_id,
+            event_id="hist-1",
+            timestamp=base.timestamp(),
+            data={"pattern": "DAGPattern", "phase": "planning"},
+        )
+    )
+    frame_text, _ = sink.queue.get_nowait()
+    assert frame_text.startswith("event: step.started\n")
+    step_via_live = json.loads(frame_text.split("data: ", 1)[1])["step"]
+
+    polled = steps_via_polling[0]
+    # ``id`` is not compared across the two legs on purpose: a
+    # ``thinking:planning:`` id ends in the projecting side's own count
+    # of planning cycles, which the endpoint docstring documents as not
+    # comparable across surfaces (``test_planning_step_ids_count_per_
+    # connection_and_collide_with_steps`` pins the collision). Both legs
+    # here are that count's first value, so asserting them equal would
+    # pin a fixture coincidence rather than the contract. ``started_at``
+    # and content are what the docstring tells clients to reconcile on,
+    # and they are asserted below.
+    assert step_via_live["type"] == polled["type"]
+    assert step_via_live["status"] == polled["status"] == "running"
+    assert step_via_live["data"] == polled["data"]
+    assert step_via_live["started_at"] == polled["started_at"]
+    assert step_via_live["completed_at"] == polled["completed_at"]
+    assert sink.queue.empty()  # no further frame -- nothing ever closes it
+
+
+async def test_dag_execute_end_closes_the_planning_step_as_failed():
+    """Two-path consistency for a closed planning failure: a full
+    ``dag_execute_start`` -> ``dag_execution{phase: "planning"}`` ->
+    ``dag_execute_end{status: "failed"}`` sequence, where the trailing
+    event reaches into the still-open planning step and closes it
+    as ``failed`` (see ``_step_mapping.py``'s ``dag_execute_end``
+    branch). Companion to
+    ``test_an_unclosed_dag_planning_phase_projects_a_running_thinking_step``
+    above, which pins the still-open case this one's ``dag_execute_end``
+    resolves -- that test's fixture is intentionally left alone rather
+    than being turned into this one.
+
+    ``dag_execute_start`` carries no step of its own (it only clears a
+    stale open key from a prior round -- see the module docstring's
+    ``dag_execute_start`` paragraph), so it is expected to project no
+    frame at all on the live path; that's asserted explicitly below
+    rather than just being skipped over.
+
+    Same scope note as the companion test above: this pins each
+    surface's own outcome for this event shape, from a literal built per
+    surface, and ``id`` is deliberately not compared across the two
+    legs. Producer-faithful parity coverage lives in the two
+    shared-``CoreTraceEvent`` tests.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    plan_start = datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC)
+    plan_end = datetime(2026, 1, 1, 12, 0, 2, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="dag_execute_start",
+        event_id="hist-0",
+        timestamp=base,
+        data={"pattern": "DAGPattern"},
+    )
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="dag_execution",
+        event_id="hist-1",
+        timestamp=plan_start,
+        data={"pattern": "DAGPattern", "phase": "planning"},
+    )
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="dag_execute_end",
+        event_id="hist-2",
+        timestamp=plan_end,
+        data={"status": "failed", "result": {"success": False}},
+    )
+    _set_task_status(task_id, TaskStatus.FAILED, error_message="plan validation failed")
+
+    steps_resp = client.get(
+        f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+    )
+    assert steps_resp.status_code == 200
+    steps_via_polling = steps_resp.json()["steps"]
+    assert len(steps_via_polling) == 1
+    assert steps_via_polling[0]["status"] == "failed"
+    assert steps_via_polling[0]["data"] == {"phase": "planning"}
+
+    sink = _make_sink(task_id=task_id)
+    await sink.send_text(
+        _trace_event_frame(
+            "dag_execute_start",
+            task_id=task_id,
+            timestamp=base.timestamp(),
+            data={"pattern": "DAGPattern"},
+        )
+    )
+    assert sink.queue.empty()  # dag_execute_start projects no step of its own
+
+    await sink.send_text(
+        _trace_event_frame(
+            "dag_execution",
+            task_id=task_id,
+            timestamp=plan_start.timestamp(),
+            data={"pattern": "DAGPattern", "phase": "planning"},
+        )
+    )
+    started_frame_text, _ = sink.queue.get_nowait()
+    assert started_frame_text.startswith("event: step.started\n")
+
+    await sink.send_text(
+        _trace_event_frame(
+            "dag_execute_end",
+            task_id=task_id,
+            timestamp=plan_end.timestamp(),
+            data={"status": "failed", "result": {"success": False}},
+        )
+    )
+    completed_frame_text, _ = sink.queue.get_nowait()
+    assert completed_frame_text.startswith("event: step.completed\n")
+    step_via_live = json.loads(completed_frame_text.split("data: ", 1)[1])["step"]
+
+    polled = steps_via_polling[0]
+    # ``id`` deliberately not compared across the legs -- see the
+    # companion test above for why a planning id's trailing count is a
+    # per-surface value.
+    assert step_via_live["type"] == polled["type"]
+    assert step_via_live["status"] == polled["status"] == "failed"
+    assert step_via_live["data"] == polled["data"] == {"phase": "planning"}
+    assert step_via_live["started_at"] == polled["started_at"]
+    assert step_via_live["completed_at"] == polled["completed_at"]
+    assert sink.queue.empty()  # no further frame after the close
