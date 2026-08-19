@@ -230,10 +230,9 @@ def is_agent_checkpoint_data(data: Any) -> bool:
 # range (128-159) are untouched by this table (and were untouched by the
 # old loop too, since both are >= 32) -- this table only ever removes,
 # never rewrites, so leaving them out is the same as mapping them to
-# themselves. Built once at import time, not per call: ``clean_string``
-# runs on every string value in every trace event this module
-# serializes, so a module-level table is shared across every call
-# instead of rebuilt on each one.
+# themselves. The table's contents never vary, and ``clean_string`` needs
+# it for every string value in every trace event this module serializes,
+# so it lives at module scope rather than inside the function.
 _CONTROL_CHAR_TRANSLATION_TABLE = str.maketrans(
     {codepoint: None for codepoint in range(32) if codepoint not in (9, 10, 13)}
 )
@@ -256,11 +255,13 @@ def serialize_trace_data(data: Dict[str, Any]) -> Dict[str, Any]:
         """Clean string data to remove problematic characters for JSON.
 
         ``str.translate`` with the module-level
-        ``_CONTROL_CHAR_TRANSLATION_TABLE`` runs in C, unlike the
-        per-character generator + ``"".join`` this used to do -- same
-        survivor set (NUL and the rest of codepoints 0-31 are dropped,
-        tab/newline/CR are kept), just faster on the large strings a
-        tool result or delegation payload can carry.
+        ``_CONTROL_CHAR_TRANSLATION_TABLE`` filters the whole string in
+        one C-level call. The previous form ran one Python-level
+        generator step per character and fed the survivors to
+        ``"".join`` -- the join was already a C builtin; the
+        per-character iteration was not. Same survivor set either way:
+        codepoints 0-31 are dropped except tab, newline, and carriage
+        return.
         """
         if not isinstance(value, str):
             return value
