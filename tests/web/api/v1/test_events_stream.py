@@ -2854,23 +2854,63 @@ async def test_fast_path_step_snapshot_is_bounded_by_replay_max_steps():
 # ===== fast-path generation fence (steps read outlives the snapshot) =====
 
 
-async def test_fast_path_terminal_generation_changed_withholds_steps_but_still_concludes():
-    """Between the snapshot that picked this fast path and the steps
-    read a few lines below it, the task row can move to a new run (a
-    ``POST reply`` restarting a ``WAITING_FOR_USER`` task, or a WS
-    ``APPEND`` restarting a ``COMPLETED``/``FAILED`` one). The steps
-    this path reads afterward already belong to that new run. Simulated
-    here by handing back one step from ``read_task_steps_response`` and
-    a reread whose ``run_id`` differs from the original snapshot's --
-    the shape a real restart leaves behind, without needing to drive an
-    actual restart through the DB. What the fence withholds is the
-    step, not the conclusion: ``task.completed`` describes
-    ``snapshot``'s own authoritative read, the read that selected this
-    fast path, so it goes out here exactly as it does when the reread
-    fails and when the step list is empty. ``stream.error(resync_required)``
-    follows it and names the restart. This is the same three-frame
-    shape a lifecycle-only client gets from every other exit of this
-    path."""
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        pytest.param("run_id", "run-new", id="run-id-moved"),
+        pytest.param("state_version", 2, id="state-version-moved"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot", "conclusion_marker"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "stale output from the superseded run", "error": None},
+            "stale output from the superseded run",
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            "what next?",
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_generation_change_withholds_steps_but_still_concludes(
+    stream_fn,
+    status,
+    conclusion_event,
+    extra_snapshot,
+    conclusion_marker,
+    changed_field,
+    changed_value,
+):
+    """Between the snapshot that picked a fast path and that path's own
+    steps read, the task row can move to a new run (a ``POST reply``
+    restarting a ``WAITING_FOR_USER`` task, or a WS ``APPEND`` restarting
+    a ``COMPLETED``/``FAILED`` one), and the steps read afterward already
+    belong to that new run. Simulated by handing back one step and a
+    reread whose generation differs -- the shape a real restart leaves
+    behind, without driving an actual restart through the DB.
+
+    What the fence withholds is the step, not the conclusion: the
+    conclusion describes ``snapshot``'s own authoritative read, the read
+    that selected this path, so it goes out here exactly as it does when
+    the reread fails and when the step list is empty, and
+    ``stream.error(resync_required)`` follows it naming the restart.
+
+    Four cells: both fast paths crossed with both fields the fence
+    compares. Either field moving on its own is enough, so a fence that
+    only compared ``run_id`` would pass the ``run-id-moved`` cells and
+    fail the ``state-version-moved`` ones -- which a single-field pair
+    could not distinguish.
+    """
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     step = es.PublicStep(
         id="tool_call:call-1",
@@ -2880,25 +2920,20 @@ async def test_fast_path_terminal_generation_changed_withholds_steps_but_still_c
         completed_at=base,
         data={"name": "search", "result": "ok"},
     )
+    original = {"run_id": "run-1", "state_version": 1}
 
     def _read_task_steps_response(task_id_, principal_):
         return SimpleNamespace(steps=[step])
 
     def _reread_task_snapshot(task_id_, principal_):
-        return SimpleNamespace(run_id="run-new", state_version=1)
+        return SimpleNamespace(**{**original, changed_field: changed_value})
 
     snapshot = SimpleNamespace(
-        task_id=1,
-        agent_id=1,
-        status=TaskStatus.COMPLETED,
-        output="stale output from the superseded run",
-        error=None,
-        run_id="run-old",
-        state_version=1,
+        task_id=1, agent_id=1, status=status, **original, **extra_snapshot
     )
     frames = [
         chunk
-        async for chunk in es._terminal_snapshot_stream(
+        async for chunk in getattr(es, stream_fn)(
             snapshot,
             principal=None,
             read_task_steps_response=_read_task_steps_response,
@@ -2907,67 +2942,16 @@ async def test_fast_path_terminal_generation_changed_withholds_steps_but_still_c
     ]
     body = "".join(frames)
     assert body.count("event: task.status") == 1
-    assert body.count("event: task.completed") == 1
+    assert body.count(f"event: {conclusion_event}") == 1
     assert "event: step.completed" not in body
     assert body.count("event: stream.error") == 1
     assert "resync_required" in body
     # The conclusion precedes the error, same ordering as every other
     # failure exit on this path.
-    assert body.index("event: task.completed") < body.index("event: stream.error")
+    assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
     # The conclusion still carries ``snapshot``'s own values, not a
     # placeholder standing in for the superseded run.
-    assert "stale output from the superseded run" in body
-
-
-async def test_fast_path_waiting_for_user_generation_changed_withholds_steps_but_still_concludes():
-    """Same race as the terminal case above, exercised on the other fast
-    path (``_input_required_snapshot_stream``) and triggered through
-    ``state_version`` instead of ``run_id`` -- either field moving is
-    enough to mean the reread's snapshot is not the one that picked
-    this path. Same rule as the terminal case too: the step is
-    withheld, ``task.input_required`` still goes out, and
-    ``stream.error(resync_required)`` follows it."""
-    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-    step = es.PublicStep(
-        id="tool_call:call-1",
-        type="tool_call",
-        status="completed",
-        started_at=base,
-        completed_at=base,
-        data={"name": "search", "result": "ok"},
-    )
-
-    def _read_task_steps_response(task_id_, principal_):
-        return SimpleNamespace(steps=[step])
-
-    def _reread_task_snapshot(task_id_, principal_):
-        return SimpleNamespace(run_id="run-1", state_version=2)
-
-    snapshot = SimpleNamespace(
-        task_id=1,
-        agent_id=1,
-        status=TaskStatus.WAITING_FOR_USER,
-        pending_question="what next?",
-        run_id="run-1",
-        state_version=1,
-    )
-    frames = [
-        chunk
-        async for chunk in es._input_required_snapshot_stream(
-            snapshot,
-            principal=None,
-            read_task_steps_response=_read_task_steps_response,
-            read_task_snapshot=_reread_task_snapshot,
-        )
-    ]
-    body = "".join(frames)
-    assert body.count("event: task.status") == 1
-    assert body.count("event: task.input_required") == 1
-    assert "event: step.completed" not in body
-    assert body.count("event: stream.error") == 1
-    assert "resync_required" in body
-    assert body.index("event: task.input_required") < body.index("event: stream.error")
-    assert "what next?" in body
+    assert conclusion_marker in body
 
 
 async def test_fast_path_terminal_empty_steps_skips_the_generation_reread():
@@ -3009,17 +2993,38 @@ async def test_fast_path_terminal_empty_steps_skips_the_generation_reread():
     assert "resync_required" not in body
 
 
-async def test_fast_path_terminal_generation_reread_failure_closes_with_resync_required_and_no_steps():
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_generation_reread_failure_concludes_then_closes_for_resync(
+    stream_fn, status, conclusion_event, extra_snapshot
+):
     """The generation reread can fail the same way any other DB read in
     this module can (a transient error) -- that answers neither
     "unchanged" nor "changed", so it is treated like the steps-read
-    failure just above it in this path: the conclusion still goes out
-    (it was already known-good from ``snapshot``, independent of this
-    reread), but the step this path read is withheld, since its
-    generation was never confirmed to match. The accompanying
-    ``stream.error`` must describe what actually happened -- the reread
-    itself failed -- not claim the task moved to a new run, since that
-    was never established one way or the other."""
+    failure just above it: the conclusion still goes out (it was already
+    known-good from ``snapshot``, independent of this reread), the step
+    this path read is withheld since its generation was never confirmed,
+    and the accompanying ``stream.error`` must describe what actually
+    happened -- the reread itself failed -- not claim the task moved to a
+    new run, which was never established either way.
+    """
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     step = es.PublicStep(
         id="tool_call:call-1",
@@ -3039,15 +3044,14 @@ async def test_fast_path_terminal_generation_reread_failure_closes_with_resync_r
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
-        status=TaskStatus.COMPLETED,
-        output="done",
-        error=None,
+        status=status,
         run_id="run-1",
         state_version=1,
+        **extra_snapshot,
     )
     frames = [
         chunk
-        async for chunk in es._terminal_snapshot_stream(
+        async for chunk in getattr(es, stream_fn)(
             snapshot,
             principal=None,
             read_task_steps_response=_read_task_steps_response,
@@ -3056,56 +3060,14 @@ async def test_fast_path_terminal_generation_reread_failure_closes_with_resync_r
     ]
     body = "".join(frames)
     assert body.count("event: task.status") == 1
-    assert body.count("event: task.completed") == 1
+    assert body.count(f"event: {conclusion_event}") == 1
     assert "event: step.completed" not in body
     assert body.count("event: stream.error") == 1
     assert "resync_required" in body
     assert "moved to a new run" not in body
-
-
-async def test_fast_path_waiting_for_user_generation_reread_failure_closes_with_resync_required_and_no_steps():
-    """Same reread failure as the terminal case above, exercised on
-    ``_input_required_snapshot_stream``."""
-    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-    step = es.PublicStep(
-        id="tool_call:call-1",
-        type="tool_call",
-        status="completed",
-        started_at=base,
-        completed_at=base,
-        data={"name": "search", "result": "ok"},
-    )
-
-    def _read_task_steps_response(task_id_, principal_):
-        return SimpleNamespace(steps=[step])
-
-    def _raising_reread(task_id_, principal_):
-        raise RuntimeError("transient DB error rereading task snapshot")
-
-    snapshot = SimpleNamespace(
-        task_id=1,
-        agent_id=1,
-        status=TaskStatus.WAITING_FOR_USER,
-        pending_question="what next?",
-        run_id="run-1",
-        state_version=1,
-    )
-    frames = [
-        chunk
-        async for chunk in es._input_required_snapshot_stream(
-            snapshot,
-            principal=None,
-            read_task_steps_response=_read_task_steps_response,
-            read_task_snapshot=_raising_reread,
-        )
-    ]
-    body = "".join(frames)
-    assert body.count("event: task.status") == 1
-    assert body.count("event: task.input_required") == 1
-    assert "event: step.completed" not in body
-    assert body.count("event: stream.error") == 1
-    assert "resync_required" in body
-    assert "moved to a new run" not in body
+    # The conclusion precedes the error on this exit too -- neither leg
+    # asserted that before, so a reordered yield would have passed both.
+    assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
 
 
 async def test_fast_path_terminal_generation_reread_task_deleted_closes_with_task_deleted():
@@ -3165,7 +3127,28 @@ async def test_fast_path_terminal_generation_reread_task_deleted_closes_with_tas
 # ===== fast-path step serialization failure (after the first yield) =====
 
 
-async def test_fast_path_terminal_unserializable_step_concludes_then_closes_for_resync():
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_unserializable_step_concludes_then_closes_for_resync(
+    stream_fn, status, conclusion_event, extra_snapshot
+):
     """The fast path's serialization loop runs after
     ``StreamingResponse`` has sent 200, and ``model_dump(mode="json")``
     raises ``PydanticSerializationError`` on a value it has no encoding
@@ -3173,13 +3156,18 @@ async def test_fast_path_terminal_unserializable_step_concludes_then_closes_for_
     response first, inside the steps-read guard, so this loop's guard is
     a defensive boundary; the stub reader here hands the loop a
     ``PublicStep`` that reader could not have produced, to pin what the
-    boundary does. The raise happens after
-    ``StreamingResponse`` has already sent 200 and the headers, so an
-    unguarded raise would end the response with no close frame at all --
-    indistinguishable, to the client, from the connection dropping.
-    Instead the conclusion goes out, then
-    ``stream.error(resync_required)``, and the steps before the failing
-    one are kept."""
+    boundary does. The raise happens after ``StreamingResponse`` has
+    already sent 200 and the headers, so an unguarded raise would end the
+    response with no close frame at all -- indistinguishable, to the
+    client, from the connection dropping. Instead the conclusion goes out,
+    then ``stream.error(resync_required)``, and the steps before the
+    failing one are kept.
+
+    Both legs use a ``[good, bad]`` step list so both assert the
+    partial-send behavior, not just the terminal one: a guard that
+    discarded the whole list on the first failure would still satisfy a
+    single-step leg.
+    """
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 
     class _Unserializable:
@@ -3211,15 +3199,14 @@ async def test_fast_path_terminal_unserializable_step_concludes_then_closes_for_
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
-        status=TaskStatus.COMPLETED,
-        output="done",
-        error=None,
+        status=status,
         run_id="run-1",
         state_version=1,
+        **extra_snapshot,
     )
     frames = [
         chunk
-        async for chunk in es._terminal_snapshot_stream(
+        async for chunk in getattr(es, stream_fn)(
             snapshot,
             principal=None,
             read_task_steps_response=_read_task_steps_response,
@@ -3231,61 +3218,13 @@ async def test_fast_path_terminal_unserializable_step_concludes_then_closes_for_
     assert body.count("event: step.completed") == 1  # the good step survived
     assert "tool_call:call-1" in body
     assert "tool_call:call-2" not in body
-    assert body.count("event: task.completed") == 1
+    assert body.count(f"event: {conclusion_event}") == 1
     assert body.count("event: stream.error") == 1
     assert "resync_required" in body
-    assert body.index("event: task.completed") < body.index("event: stream.error")
+    assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
     # The wording names serialization, not a read and not a restart.
     assert "Serializing the task's steps failed" in body
     assert "moved to a new run" not in body
-
-
-async def test_fast_path_waiting_for_user_unserializable_step_concludes_then_closes():
-    """Same serialization failure on the other fast path: the conclusion
-    is ``task.input_required`` and the close frame is the same."""
-    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-
-    class _Unserializable:
-        pass
-
-    bad = es.PublicStep(
-        id="tool_call:call-1",
-        type="tool_call",
-        status="completed",
-        started_at=base,
-        completed_at=base,
-        data={"name": "search", "result": _Unserializable()},
-    )
-
-    def _read_task_steps_response(task_id_, principal_):
-        return SimpleNamespace(steps=[bad])
-
-    def _reread_task_snapshot(task_id_, principal_):
-        return SimpleNamespace(run_id="run-1", state_version=1)
-
-    snapshot = SimpleNamespace(
-        task_id=1,
-        agent_id=1,
-        status=TaskStatus.WAITING_FOR_USER,
-        pending_question="what next?",
-        run_id="run-1",
-        state_version=1,
-    )
-    frames = [
-        chunk
-        async for chunk in es._input_required_snapshot_stream(
-            snapshot,
-            principal=None,
-            read_task_steps_response=_read_task_steps_response,
-            read_task_snapshot=_reread_task_snapshot,
-        )
-    ]
-    body = "".join(frames)
-    assert "event: step.completed" not in body
-    assert body.count("event: task.input_required") == 1
-    assert body.count("event: stream.error") == 1
-    assert "Serializing the task's steps failed" in body
-    assert body.index("event: task.input_required") < body.index("event: stream.error")
 
 
 # ===== single-frame content byte cap =====
