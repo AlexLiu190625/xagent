@@ -1542,6 +1542,89 @@ async def test_broadcast_frame_reaches_generator_output_as_task_status():
     await resp.body_iterator.aclose()
 
 
+# ===== the same full path, for content frames rather than lifecycle ones =====
+
+
+async def test_broadcast_content_frames_reach_generator_output_as_step_and_message():
+    """Composition smoke test for the content path end to end: real sink
+    registration -> ``ConnectionManager.broadcast_to_task`` ->
+    ``V1EventStreamSink.send_text`` -> projection -> the outbound queue ->
+    ``_generate``'s yield -> the ``StreamingResponse`` body.
+
+    Deliberately a composition test, not per-layer coverage: what each
+    intermediate layer does with each frame family is already pinned by
+    the direct ``send_text`` tests above. What only this test can catch is
+    a break in the joins between them -- registration, the manager's
+    fan-out, or body iteration -- which would leave the endpoint
+    lifecycle-only while every direct test stayed green.
+
+    Both content families go through, because they take different routes
+    inside ``send_text``: a trace event folds through the projector, a
+    final-answer frame maps straight to a ``message.*`` frame. The trace
+    frame is built by routing a real ``CoreTraceEvent`` through the
+    production conversion (``_broadcast_frame_for``) rather than
+    hand-shaping a dict.
+
+    The first frame is pulled before broadcasting for the reason the
+    lifecycle test above states: the generator's body -- and therefore
+    ``manager.register_connection`` -- does not run until it is first
+    iterated, so a broadcast issued earlier would reach no sink.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        **_long_intervals(),
+    )
+    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    assert "event: task.status" in first
+    assert es.count_task_sinks(task_id) == 1  # the sink really did register
+
+    start_event = CoreTraceEvent(
+        ACTION_START_TOOL,
+        step_id="step-1",
+        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC).timestamp(),
+        data={
+            "tool_call_id": "call-1",
+            "tool_name": "search",
+            "tool_args": {"q": "weather"},
+        },
+    )
+    await es.manager.broadcast_to_task(
+        json.loads(_broadcast_frame_for(start_event, task_id=task_id)), task_id
+    )
+    step_frame = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    assert step_frame.startswith("event: step.started\n")
+    step = json.loads(step_frame.split("data: ", 1)[1])["step"]
+    assert step["id"] == "tool_call:call-1"
+    assert step["data"]["name"] == "search"
+
+    await es.manager.broadcast_to_task(
+        {
+            "type": "final_answer_delta",
+            "message_id": "final_answer_e2e",
+            "task_id": task_id,
+            "delta": "sun",
+        },
+        task_id,
+    )
+    message_frame = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    assert message_frame.startswith("event: message.delta\n")
+    assert json.loads(message_frame.split("data: ", 1)[1]) == {
+        "message_id": "final_answer_e2e",
+        "text": "sun",
+    }
+
+    await resp.body_iterator.aclose()
+    assert es.count_task_sinks(task_id) == 0  # teardown unregistered the sink
+
+
 # ===== consecutive identical statuses only produce one frame =====
 
 
