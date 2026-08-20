@@ -559,11 +559,11 @@ async def test_queued_wire_bytes_falls_back_as_frames_are_read_out():
 
 async def test_generator_read_path_keeps_queued_wire_bytes_at_zero_between_frames():
     """Division of labor with the two tests above: those pin
-    ``next_frame``'s own body (what mutation testing calls M2 -- deleting
-    the subtraction inside it). This one pins the call *site* -- that
-    ``_generate``'s per-frame read actually goes through ``next_frame``
-    rather than a bare ``sink.queue.get()`` that would bypass the byte
-    accounting entirely (M5). Runs a real attach, then puts and reads one
+    ``next_frame``'s own body (deleting the subtraction inside it turns
+    them red). This one pins the call *site* -- that ``_generate``'s
+    per-frame read actually goes through ``next_frame`` rather than a
+    bare ``sink.queue.get()`` that would bypass the byte accounting
+    entirely. Runs a real attach, then puts and reads one
     budget-sized frame at a time -- never letting more than one frame's
     worth of backlog build up -- and checks after every read that the
     delivered frame is the one just queued (not a ``resync_required``

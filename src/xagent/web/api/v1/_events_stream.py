@@ -77,6 +77,10 @@ values it deliberately leaves unbounded, in one place:
     then the cost of engaging is one forced ``resync_required`` close,
     identical in kind and price to the element cap's own overflow; a
     consumer that is keeping up never accumulates a backlog at all.
+    Tighter would hurt: 1 MiB puts the engagement average at 4 KiB,
+    inside ordinary backlog territory, so 4 MiB is the tightest value
+    that leaves ordinary traffic alone -- against the ~16 MiB a full
+    element-capped queue of maximum frames would otherwise hold.
   - Concurrent streams: ``PER_TASK_STREAM_CAP`` (2) and
     ``PER_PRINCIPAL_STREAM_CAP`` (32), both rejected with 429 at
     attach, before any sink exists.
@@ -802,7 +806,7 @@ class V1EventStreamSink:
         self.principal_key_prefix = principal_key_prefix
         self.dropped_frame_count = 0
         # Wire bytes currently sitting in ``_queue``. Maintained at the
-        # two places that touch the queue and nowhere else: ``_put_counted``
+        # three places that touch the queue and nowhere else: ``_put_counted``
         # adds a frame's length as it goes in, ``next_frame`` subtracts it
         # as it comes out, and ``enqueue_close`` zeroes it after draining.
         # No caller outside this class adjusts it.
