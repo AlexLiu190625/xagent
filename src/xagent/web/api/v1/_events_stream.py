@@ -48,6 +48,61 @@ Sink instances duck-type the ``websocket.ConnectionManager`` connection
 contract (an object with an async ``send_text(str)`` method) so they
 register into the *same* shared ``manager`` real WebSocket connections
 use, and ride the same ``broadcast_to_task`` fan-out.
+
+Size and admission bounds -- every limit this stream applies, and the
+values it deliberately leaves unbounded, in one place:
+
+  - One step's ``data`` sub-object, and one message frame's text:
+    ``MAX_FRAME_CONTENT_BYTES`` (64 KiB), measured in the escaped-JSON
+    domain the frame is actually serialized in, not decoded UTF-8 bytes
+    (see ``_capped_text``). The two families handle an overrun
+    differently on purpose: a message's text is truncated in place and
+    the frame is marked ``truncated``, while an oversized step ``data``
+    is *replaced* by a marker keeping the step's identifying keys --
+    step ``data`` is arbitrary nested JSON, so there is no single
+    string to cut (see ``_capped_step_data``).
+  - One inbound broadcast frame, before it is projected at all:
+    ``MAX_RAW_FRAME_TEXT_CHARS`` (256 KiB), measured excluding the
+    ``task_description`` stamp every converted trace event carries (see
+    ``_measured_content_frame``). Over the cap is a silent drop --
+    counted and logged, never a close, and never applied to a
+    lifecycle frame.
+  - One sink's outbound queue: ``OUTBOUND_QUEUE_MAX_SIZE`` (256
+    frames) *and* ``MAX_QUEUED_WIRE_BYTES`` (4 MiB of queued frame
+    text). Whichever binds first drains the backlog and closes with
+    ``resync_required``; the element cap binds on a long backlog of
+    ordinary frames, the byte budget on a short backlog of large ones.
+    The byte budget only engages once the queued average exceeds 16
+    KiB -- one quarter of the per-frame content cap above -- and even
+    then the cost of engaging is one forced ``resync_required`` close,
+    identical in kind and price to the element cap's own overflow; a
+    consumer that is keeping up never accumulates a backlog at all.
+  - Concurrent streams: ``PER_TASK_STREAM_CAP`` (2) and
+    ``PER_PRINCIPAL_STREAM_CAP`` (32), both rejected with 429 at
+    attach, before any sink exists.
+  - Deliberately uncapped: ``task.completed``'s ``output`` and
+    ``task.input_required``'s ``prompt`` (full argument in the comment
+    above ``completed_frame``). Both are the payload of a conclusion
+    frame, both are sent once per stream as that frame, and neither has
+    an equivalent on ``GET .../steps`` -- their recovery channel is
+    ``GET /v1/chat/tasks/{task_id}``. Neither ever meets the queue's
+    byte budget: on the live path (the watchdog closing an already-open
+    stream) they reach the client only as a budget-exempt close frame
+    via ``enqueue_close``; on the two attach-time fast paths (terminal,
+    waiting-for-user) they are ``yield``ed straight from the generator
+    before any sink or queue exists for this connection at all.
+  - Uncapped and bounded only by the frame they arrive in: a step's
+    ``id`` and a ``message.*`` frame's ``message_id``. Neither has a
+    cap of its own -- ``PublicStep.id`` is a plain ``str`` -- and an id
+    sits outside the ``data`` sub-object the 64 KiB cap covers. A step
+    id derives from the event's own ``tool_call_id``/``step_id``, so
+    what bounds it is the 256 KiB check on the inbound frame carrying
+    it, and the queue's byte budget bounds ids in aggregate. Today's
+    only ``message_id`` producer emits a fixed 45 characters
+    (``f"final_answer_{uuid4().hex}"``,
+    ``core/agent/runtime.py``'s ``start_final_answer_stream``), but
+    this path does not itself enforce that length -- the effective
+    bound here is the same 256 KiB inbound raw-frame check.
 """
 
 from __future__ import annotations
@@ -585,6 +640,12 @@ def _feed_trace_event(
         return []
     if is_audit_only_trace_data(data):
         return []
+    # Measured cost of this pass per sink (serialize, normalize, fold,
+    # validate, serialize to wire): by direct call on a development
+    # machine, median of 7, no I/O -- 6.2 ms (min 6.0 / max 6.3) for a raw
+    # frame just under ``MAX_RAW_FRAME_TEXT_CHARS``, 1.6 ms at a 64 KiB
+    # payload. ``PER_TASK_STREAM_CAP`` is 2, so one broadcast's sequential
+    # fan-out adds at most ~12.4 ms.
     serialized_data = serialize_trace_data(data)
     normalized_type, normalized_data = normalize_public_trace_event(
         event_type, serialized_data
