@@ -1330,7 +1330,7 @@ def _resolve_read_direction_anchor(
     execution_matches = (
         not row_execution_id or row_execution_id == row.resume_execution_id
     )
-    event_id_matches = str(trace_row.event_id) == row.resume_event_id
+    event_id_matches = trace_row.event_id == row.resume_event_id
     if (
         trace_row.task_id != row.task_id
         or trace_row.event_type != str(CHECKPOINT_EVENT_TYPE)
@@ -1484,17 +1484,39 @@ def materialize_compatibility_view(
     recheck: with no table there is nothing an active row could have been
     written into.
 
+    The recheck's inverse is not narrowed by any of this and does not need
+    to be: a row it finds can retire between the find and whatever the
+    caller does next. Nothing is corrupted when that happens, because the
+    answer path never trusts this read -- ``respond()`` re-selects the row
+    inside ``_answer_fence_stmt``'s compare-and-swap and classifies the
+    zero rowcount, rather than writing into a slot that has since moved on.
+
     ``compat.read_fallback`` counts one per legacy tier returned from here,
-    and only from here: it is what makes the answer-from-the-transcript
-    rate readable next to how often a native row was published. A run the
-    recheck rescues is not a fallback and is not counted.
+    and only from here. It is a raw count and not a rate: nothing in this
+    registry records how often this function ran or how often it answered
+    from a native row, so there is no denominator to read it against, and
+    a reader who wants one has to bring their own request-volume figure.
+    Two different states increment it and they are worth keeping apart --
+    the table-absent branch counts a deployment whose interaction-table
+    migration has not landed yet, and the no-active-row branch counts a
+    read that genuinely had to fall back to the transcript. Only the second
+    says anything about the rollout; past the migration the first cannot
+    fire at all, so a non-zero count on a migrated deployment is entirely
+    the second. A run the recheck rescues is not a fallback and is not
+    counted. Like every counter in ``interaction_rollout``, this one lives
+    in process memory: it starts at zero on each start, a redeploy resets
+    it, and a reader behind a load balancer sees one process's share.
     """
 
     if not interaction_requests_table_exists(db):
         # No recheck on this branch: with no table there is nowhere for an
-        # active row to have been written.
+        # active row to have been written. The count goes up after
+        # ``_legacy_view`` returns, not before it is called, so a raise on
+        # the way through cannot leave a fallback counted that no caller
+        # ever received -- same ordering as the no-active-row branch below.
+        fallback = _legacy_view(db, task_id, allow_superseded=allow_superseded)
         increment_counter(COUNTER_COMPAT_READ_FALLBACK)
-        return _legacy_view(db, task_id, allow_superseded=allow_superseded)
+        return fallback
 
     row = _active_native_row(db, task_id)
     if row is None:
