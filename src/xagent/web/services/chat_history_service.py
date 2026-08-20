@@ -34,20 +34,30 @@ QUESTION_MESSAGE_TYPE = "question"
 SUPERSEDED_MESSAGE_TYPE = "question_superseded"
 
 
-def _assistant_question_filters(task_id: int) -> tuple[ColumnElement[bool], ...]:
-    """The three-leg WHERE predicate for a task's assistant question
-    rows: ``task_id``, ``role == "assistant"``,
-    ``message_type == QUESTION_MESSAGE_TYPE``. It matches every such
-    row, whether it is still waiting for an answer or was already
-    answered. Shared by the reader (``get_latest_waiting_question``)
-    and the writer (``supersede_legacy_question_rows``) so the two
-    conditions cannot drift apart by hand-editing one copy and not the
-    other.
+def _assistant_question_filters(
+    task_id: int, *, message_type: str = QUESTION_MESSAGE_TYPE
+) -> tuple[ColumnElement[bool], ...]:
+    """The three-leg WHERE predicate for a task's assistant question rows:
+    ``task_id``, ``role == "assistant"``, and one ``message_type``. It
+    matches every such row, whether it is still waiting for an answer or
+    was already answered. Shared by the reader
+    (``get_latest_waiting_question``) and the writer
+    (``supersede_legacy_question_rows``) so the two conditions cannot drift
+    apart by hand-editing one copy and not the other.
+
+    ``message_type`` defaults to ``QUESTION_MESSAGE_TYPE``: the value the
+    writer wants and the value the reader's first pass wants, so both keep
+    calling this with one argument and the drift-guard test keeps comparing
+    the same two rendered clauses. The reader's second pass passes
+    ``SUPERSEDED_MESSAGE_TYPE`` instead, because it looks for what the
+    writer *produces* rather than what the writer consumes. That one leg is
+    the only thing that legitimately differs between the two passes; the
+    other two legs stay shared, which is the whole point of this helper.
     """
     return (
         TaskChatMessage.task_id == task_id,
         TaskChatMessage.role == "assistant",
-        TaskChatMessage.message_type == QUESTION_MESSAGE_TYPE,
+        TaskChatMessage.message_type == message_type,
     )
 
 
@@ -770,9 +780,9 @@ def get_latest_waiting_question(
         latest_question = (
             db.query(TaskChatMessage)
             .filter(
-                TaskChatMessage.task_id == task_id,
-                TaskChatMessage.role == "assistant",
-                TaskChatMessage.message_type == SUPERSEDED_MESSAGE_TYPE,
+                *_assistant_question_filters(
+                    task_id, message_type=SUPERSEDED_MESSAGE_TYPE
+                )
             )
             .order_by(TaskChatMessage.id.desc())
             .first()
