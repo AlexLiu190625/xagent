@@ -634,6 +634,62 @@ def project_content_frames(
     return _feed_final_answer(frame_type, message)
 
 
+def _measured_content_frame(
+    text: str, message: dict[str, Any]
+) -> tuple[int, dict[str, Any]]:
+    """Return ``(chars, frame)`` -- the length the drop check below
+    compares against the cap, and the frame projection should consume.
+
+    ``ws_trace_handlers.py``'s ``_convert_trace_event_to_stream_event``
+    copies the task's ``description`` column onto
+    ``data["task_description"]`` for *every* trace event it converts,
+    with no event-type gate. That column has no length bound
+    (``Column(Text)``, filled from the task's first user message, which
+    has no ``max_length`` of its own), and it is re-stamped on each
+    frame -- so counting it would let one long description push every
+    subsequent ``step.*`` frame of that task past
+    ``MAX_RAW_FRAME_TEXT_CHARS`` and drop the task's whole content
+    stream for the life of the connection.
+
+    Excluding it costs the client nothing, because no content this
+    module puts on the wire can contain it: each of the four producers
+    builds its ``data`` from explicitly named keys (``_step_mapping``'s
+    ``_build_thinking_start`` / ``_build_tool_start`` /
+    ``_build_message_step`` and the ``extra_data_fn`` patches, then
+    ``message_delta_frame`` / ``message_completed_frame``), so the
+    description was consuming a budget it could never spend.
+
+    An under-cap frame is returned unchanged, description and all --
+    the walk that projection pays over it is already bounded by the
+    cap. An over-cap frame carrying a description is pruned *before*
+    both measuring and projecting, not just before measuring: the raw
+    frame check was this field's only per-frame CPU bound (a
+    synchronous, unbounded ``clean_string`` walk during projection), so
+    a frame that survives the check must not still be paying for the
+    field the check just excused it from. Measured by re-serializing
+    the parsed frame without that one field rather than by subtracting
+    an estimate of the field's serialized length: an estimate would
+    have to reproduce the producer's separators and escaping, while a
+    re-dump is exact in the same character domain ``len(text)`` is
+    measured in (``broadcast_to_task`` serializes with a default
+    ``json.dumps``, and so does this). It runs only for a frame that is
+    both over the cap and carrying a description -- the frame that
+    would otherwise be dropped outright -- so an ordinary frame still
+    costs one ``len()``, and the re-dump's own cost scales with the
+    frame *without* the description, not with the description.
+    ``json.dumps`` cannot fail here: ``message`` came out of
+    ``json.loads`` in the caller.
+    """
+    if len(text) <= MAX_RAW_FRAME_TEXT_CHARS:
+        return len(text), message
+    data = message.get("data")
+    if not isinstance(data, dict) or "task_description" not in data:
+        return len(text), message
+    pruned = {key: value for key, value in data.items() if key != "task_description"}
+    frame = {**message, "data": pruned}
+    return len(json.dumps(frame)), frame
+
+
 # -- Sink -----------------------------------------------------------------
 
 
@@ -802,35 +858,60 @@ class V1EventStreamSink:
         The raw-size check itself runs after ``json.loads`` and the
         lifecycle handling above, guarding only the call into
         ``_project_and_queue`` -- the last thing between a parsed frame
-        and the projector. It compares ``len(text)`` -- the raw
-        broadcast frame's own character count -- against
-        ``MAX_RAW_FRAME_TEXT_CHARS`` (256 KiB): strictly greater than is
-        a drop, exactly equal is kept. On a drop, ``dropped_frame_count``
-        is incremented, one ``logger.warning`` fires, and the method
-        returns -- no queued frame, no close, no ``stream.error``: a
-        dropped frame is invisible to the client.
-        The size check applies only to frames whose parsed ``type`` is
-        in ``_CONTENT_FRAME_TYPES`` and whose top-level ``event_type``
-        is not ``task_info``; dispatch into the projector is unchanged
-        for the whole ``_CONTENT_FRAME_TYPES`` set regardless. Lifecycle
-        frames are exempt from the size check structurally rather than
-        by a prefix sniff: ``task_completed`` returns above before this
-        check runs, ``task.status``/``task.input_required`` are
-        enqueued above it, and ``task_info`` is named explicitly so an
-        oversized one is neither counted as a drop nor logged as one --
-        it carries an operator-controlled task description with no size
-        bound of its own (see ``MAX_RAW_FRAME_TEXT_CHARS``'s own comment
-        for why ``task_completed`` can also legitimately cross this
-        threshold). The check runs after ``json.loads`` because what it
-        has to exempt is only knowable after it: a ``task_info``
-        frame's own top-level ``type`` is ``trace_event``, the same
-        value real content frames carry, so nothing short of parsing
-        distinguishes the two. The parse is not extra cost on the
-        fan-out path: ``ConnectionManager.broadcast_to_task``
-        serializes the frame with ``json.dumps`` once per connection,
-        inside its own send loop, before this method is called at all --
-        and the expensive half here, ``serialize_trace_data`` plus the
-        projection fold, is skipped for a frame this check drops.
+        and the projector. It applies only to frames whose parsed
+        ``type`` is in ``_CONTENT_FRAME_TYPES``; dispatch into the
+        projector is unchanged for that whole set regardless. What it
+        compares against ``MAX_RAW_FRAME_TEXT_CHARS`` (256 KiB) is the
+        frame's own character count minus the ``task_description``
+        field the broadcast conversion stamps onto every trace event --
+        see ``_measured_content_frame`` for why that subtraction exists
+        and why it costs nothing on the ordinary path. Strictly greater
+        than the cap is a drop, exactly equal is kept. On a drop,
+        ``dropped_frame_count`` is incremented, one ``logger.warning``
+        fires, and the method returns -- no queued frame, no close, no
+        ``stream.error``: a dropped frame is invisible to the client.
+
+        Two separate mechanisms keep lifecycle delivery out of this
+        check's way, and they are not interchangeable:
+
+          - Placement. Running after ``json.loads`` and after the
+            lifecycle handling above is what makes an oversized frame
+            unable to cost a client its lifecycle signal:
+            ``task_completed`` returns on the acceleration branch
+            before this check is reached, and ``task.status`` /
+            ``completion_hint`` have already been enqueued or set by
+            the time it runs. A gate placed ahead of the parse would
+            drop those frames whole -- and could not tell them apart
+            anyway, since a ``task_info`` frame's own top-level
+            ``type`` is ``trace_event``, the same value real content
+            frames carry (see ``MAX_RAW_FRAME_TEXT_CHARS``'s own
+            comment for why ``task_completed`` can legitimately cross
+            this threshold too).
+          - The ``event_type != "task_info"`` exemption. By the time
+            control reaches it, a ``task_info`` frame's status is
+            already enqueued above, and ``_feed_trace_event`` returns
+            ``[]`` for ``task_info`` whether the exemption is there or
+            not. So the exemption decides exactly one thing: whether
+            an oversized ``task_info`` increments
+            ``dropped_frame_count`` and logs a drop warning. It is not
+            what protects ``task.status``/``completion_hint``
+            delivery. It is there because such a frame carries the
+            task description with no size bound of its own, so
+            counting it as a dropped content frame would be counting a
+            drop that had no content to lose.
+
+        The parse is not extra cost on the fan-out path:
+        ``ConnectionManager.broadcast_to_task`` serializes the frame
+        with ``json.dumps`` once per connection, inside its own send
+        loop, before this method is called at all. What happens to the
+        expensive half here -- ``serialize_trace_data`` plus the
+        projection fold -- depends on where the frame lands: a frame
+        under the cap pays it in full; a frame over the cap only
+        because of its task description is pruned by
+        ``_measured_content_frame`` before projection runs, not just
+        before the comparison, so it pays that cost against the frame
+        without the description instead; and a frame still over the
+        cap after pruning is dropped outright and pays none of it.
         """
         try:
             self._assert_owner_loop()
@@ -865,19 +946,21 @@ class V1EventStreamSink:
                         # read wouldn't have closed anyway.
                         self.completion_hint.set()
             if str(message.get("type") or "") in _CONTENT_FRAME_TYPES:
-                if (
-                    message.get("event_type") != "task_info"
-                    and len(text) > MAX_RAW_FRAME_TEXT_CHARS
-                ):
-                    self.dropped_frame_count += 1
-                    logger.warning(
-                        "v1 SSE sink dropped an oversized broadcast frame "
-                        "(%d chars) for task %s before projecting it",
-                        len(text),
-                        self.task_id,
-                    )
-                    return
-                self._project_and_queue(message)
+                frame = message
+                if message.get("event_type") != "task_info":
+                    measured_chars, frame = _measured_content_frame(text, message)
+                    if measured_chars > MAX_RAW_FRAME_TEXT_CHARS:
+                        self.dropped_frame_count += 1
+                        logger.warning(
+                            "v1 SSE sink dropped an oversized broadcast frame "
+                            "(%d chars, %d excluding the task description) for "
+                            "task %s before projecting it",
+                            len(text),
+                            measured_chars,
+                            self.task_id,
+                        )
+                        return
+                self._project_and_queue(frame)
         except Exception:
             self.dropped_frame_count += 1
             logger.exception(

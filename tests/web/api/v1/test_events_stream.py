@@ -2090,6 +2090,77 @@ async def test_oversized_task_info_frame_is_not_dropped_by_the_raw_precheck():
     }
 
 
+async def test_a_huge_task_description_does_not_drop_a_small_content_frame():
+    """The size check measures the frame without its
+    ``task_description``, so a long description cannot drop content.
+
+    ``ws_trace_handlers.py``'s ``_convert_trace_event_to_stream_event``
+    stamps the task's ``description`` column onto *every* trace event
+    it converts, not just ``task_info``, and that column has no length
+    bound. Counting it would put every ``step.*`` frame of such a task
+    past ``MAX_RAW_FRAME_TEXT_CHARS`` for the life of the connection --
+    a task whose first user message is long enough would receive no
+    step content at all. The frame built here is over the raw cap on
+    the description alone while its actual step content is a few dozen
+    characters, and it must still project. The projected ``data`` is
+    asserted too: the description is not merely uncounted, it never
+    reaches the wire, because the step builders name their keys
+    explicitly."""
+    sink = _make_sink(task_id=102)
+    huge_description = "x" * (es.MAX_RAW_FRAME_TEXT_CHARS + 1000)
+    raw = _trace_event_frame(
+        "tool_execution_start",
+        task_id=102,
+        step_id="step-1",
+        data={
+            "tool_call_id": "call-1",
+            "tool_name": "search",
+            "tool_args": {"query": "weather"},
+            "task_description": huge_description,
+        },
+    )
+    assert len(raw) > es.MAX_RAW_FRAME_TEXT_CHARS
+
+    await sink.send_text(raw)
+
+    assert sink.dropped_frame_count == 0
+    frame_text, _ = sink.queue.get_nowait()
+    assert frame_text.startswith("event: step.started\n")
+    step = json.loads(frame_text.split("data: ", 1)[1])["step"]
+    assert step["id"] == "tool_call:call-1"
+    assert step["data"]["name"] == "search"
+    assert "task_description" not in step["data"]
+
+
+async def test_a_frame_still_over_the_cap_without_its_description_is_dropped():
+    """The control for the test above: excluding ``task_description``
+    from the measurement is not a blanket exemption for any frame that
+    carries one. This frame's own tool arguments are over the raw cap
+    by themselves, so it is still dropped and counted -- and nothing is
+    queued, which a projection of the same frame would not have left
+    (an oversized ``tool_execution_start`` still projects a
+    ``step.started`` with truncated ``data``)."""
+    sink = _make_sink(task_id=103)
+    huge_description = "x" * (es.MAX_RAW_FRAME_TEXT_CHARS + 1000)
+    huge_args = "y" * (es.MAX_RAW_FRAME_TEXT_CHARS + 1000)
+    raw = _trace_event_frame(
+        "tool_execution_start",
+        task_id=103,
+        step_id="step-2",
+        data={
+            "tool_call_id": "call-2",
+            "tool_name": "search",
+            "tool_args": {"query": huge_args},
+            "task_description": huge_description,
+        },
+    )
+
+    await sink.send_text(raw)
+
+    assert sink.dropped_frame_count == 1
+    assert sink.queue.empty()
+
+
 async def test_unparseable_frame_is_dropped_and_counted():
     """A frame that isn't valid JSON can't be classified at all -- there
     is no parsed ``type`` to check -- so ``json.loads`` itself raises
