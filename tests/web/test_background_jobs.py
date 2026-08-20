@@ -1985,6 +1985,74 @@ def test_execute_background_job_skips_failed_job(tmp_path, monkeypatch):
         verify_db.close()
 
 
+def test_execute_background_job_skips_failed_job_with_conflicting_result(
+    tmp_path, monkeypatch
+):
+    """A FAILED row's own error_message must win even when its stored result
+    carries a stale success verdict from the handler that produced it.
+
+    This happens for real: a document handler can finish ingestion, then fail
+    while publishing the collection config, and store a result dict whose
+    "status" is "success" from the ingestion step alongside the FAILED row's
+    own error_message. The short-circuit must report the row's failure, not
+    let the embedded result displace it.
+    """
+    from xagent.web.jobs import tasks as tasks_module
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    job_type = "test.skip-failed-job-conflicting-result"
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-skip-failed-conflicting.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "skip-failed-job-conflicting-result")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=job_type,
+            payload={},
+        )
+        setattr(job, "status", BackgroundJobStatus.FAILED.value)
+        setattr(job, "error_message", "Failed to publish collection config")
+        setattr(
+            job,
+            "result",
+            {"status": "success", "error": None, "message": "x"},
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = str(job.id)
+        stored_error = job.error_message
+    finally:
+        db.close()
+
+    def handler_spy(session, received):
+        pytest.fail("handler must not run for a FAILED background job")
+
+    tasks_module.register_background_job_handler(job_type, handler_spy)
+    try:
+        outcome = tasks_module.execute_background_job.apply(args=[job_id], throw=False)
+    finally:
+        tasks_module._EXTRA_HANDLERS.pop(job_type, None)
+
+    assert outcome.result["status"] == "failed"
+    assert outcome.result["error"] == stored_error
+    assert outcome.result["message"] == "x"
+
+    verify_db = SessionLocal()
+    try:
+        refreshed = (
+            verify_db.query(BackgroundJob).filter(BackgroundJob.id == job_id).first()
+        )
+        assert refreshed is not None
+        assert refreshed.status == BackgroundJobStatus.FAILED.value
+    finally:
+        verify_db.close()
+
+
 def test_execute_background_job_fails_exhausted_stale_job(tmp_path, monkeypatch):
     """A redelivered message for a silent, budget-exhausted RUNNING row terminates
     it instead of running the handler a fourth time."""

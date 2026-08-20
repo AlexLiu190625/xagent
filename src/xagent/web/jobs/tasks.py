@@ -130,9 +130,9 @@ def execute_background_job(self: Any, job_id: str) -> dict[str, Any]:
         if job.status == BackgroundJobStatus.FAILED.value:
             logger.info("Skipping failed background job %s", job_id)
             return {
+                **dict(job.result or {}),
                 "status": "failed",
                 "error": job.error_message,
-                **dict(job.result or {}),
             }
 
         if int(job.attempts or 0) >= int(job.max_attempts or 1):

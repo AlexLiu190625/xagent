@@ -277,9 +277,13 @@ def requeue_stale_background_jobs(
     crashes. The database row remains authoritative, so the scheduler can safely
     put old pending/enqueued/running jobs back on the broker.
 
-    A RUNNING row counts as stale only when both started_at and updated_at are
-    older than the cutoff: progress writes refresh updated_at, so an actively
-    progressing job is never swept just because it has been running a long time.
+    A RUNNING row with a non-NULL updated_at counts as stale only when both
+    started_at and updated_at are older than the cutoff: progress writes
+    refresh updated_at, so an actively progressing job is never swept just
+    because it has been running a long time. A RUNNING row whose updated_at is
+    still NULL (no write since creation) is swept by the NULL-updated_at
+    branch below, which carries no status condition; that behavior is
+    unchanged.
 
     A job whose attempts already reached max_attempts is marked FAILED instead
     of requeued; its last progress snapshot is kept under the result key
@@ -288,10 +292,10 @@ def requeue_stale_background_jobs(
 
     There is no execution lease on this table, so a worker that is alive but
     silent past the cutoff can still race this sweep and later overwrite the
-    terminal state it writes. This sweep is the sole recovery path that turns a
-    silent, budget-exhausted row terminal: a broker redelivery for a fresh row
-    is refused without writing anything, and once Celery acks that refusal no
-    further redelivery follows it, so only this sweep converges the row.
+    terminal state it writes. Once a redelivery is refused because the row
+    still shows recent progress, Celery acks the message and no further
+    redelivery exists for it, so this sweep is then the only path that turns
+    the row terminal.
     """
     stale_seconds = stale_after_seconds or get_background_job_stale_seconds()
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
