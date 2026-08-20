@@ -27,7 +27,10 @@ task's answer slot -- a NULL marker in step 1, and the two fallback
 branches of the rich view in step 2. A marker value this reader does not
 recognize leaves the slot's state unknown, and unknown keeps the gate
 shut. Step 1 still costs one attribute access and no query: the gate value
-comes from the marker, which is already in memory.
+comes from the marker, which is already in memory. Once a writer for those
+relabelled rows exists, this gate is a client-visible change at all four
+consumers: a waiting task that renders an empty or generic waiting state
+today starts rendering the recovered question instead.
 
 This function performs **no authorization**. It takes a ``Task`` object,
 not an id, precisely so that a caller has to have resolved and

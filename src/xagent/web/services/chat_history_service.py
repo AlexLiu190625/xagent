@@ -748,11 +748,18 @@ def get_latest_waiting_question(
     """Return the latest persisted ask-user question for a waiting task.
 
     Two sequential passes rather than one ``message_type.in_(...)``
-    predicate. A single predicate ordered by id lets a
-    ``SUPERSEDED_MESSAGE_TYPE`` row with a higher id outrank a
-    ``QUESTION_MESSAGE_TYPE`` row that is still live, inverting the
-    priority this reader owes its callers. The first pass is
-    unconditional and always runs first.
+    predicate. Today's writer cannot produce the inversion that shape
+    avoids: it relabels a task's question rows in one unpartitioned
+    statement, so any row still labelled ``QUESTION_MESSAGE_TYPE``
+    postdates every ``SUPERSEDED_MESSAGE_TYPE`` row on the task. The
+    passes are kept for the writer shapes that come next -- a relabel
+    narrowed to one run or turn, or one committed alongside a fresh
+    question insert -- where the two labels' ids interleave and a single
+    id-ordered predicate would rank a superseded row over a live one,
+    inverting the priority this reader owes its callers. Narrowing a
+    task-wide write to the row it actually means is already a stated
+    obligation next door, on ``close_legacy_resume_interaction``'s close
+    statement. The first pass is unconditional and always runs first.
 
     ``allow_superseded`` opens a second pass over
     ``SUPERSEDED_MESSAGE_TYPE`` rows, and only when the first pass came
