@@ -2132,6 +2132,46 @@ async def test_a_huge_task_description_does_not_drop_a_small_content_frame():
     assert "task_description" not in step["data"]
 
 
+async def test_projection_consumes_the_pruned_frame_not_the_original():
+    """The over-cap path hands projection the frame with
+    ``task_description`` already removed, not the original.
+
+    The wire output cannot distinguish the two -- the step builders name
+    their keys explicitly, so the description never reaches a frame
+    either way. What this pins is the processing boundary: the raw-frame
+    check was that unbounded field's only per-frame CPU bound, and
+    ``_measured_content_frame`` replaces it by pruning before projection
+    rather than after, so a surviving frame's ``serialize_trace_data``
+    walk never runs over the description. Asserted at the
+    ``_project_and_queue`` boundary because no later observation point
+    can see the difference."""
+    sink = _make_sink(task_id=104)
+    received: list[dict] = []
+    original = sink._project_and_queue
+    sink._project_and_queue = lambda frame: (
+        received.append(frame),
+        original(frame),
+    )[-1]
+    huge_description = "x" * (es.MAX_RAW_FRAME_TEXT_CHARS + 1000)
+    raw = _trace_event_frame(
+        "tool_execution_start",
+        task_id=104,
+        step_id="step-1",
+        data={
+            "tool_call_id": "call-1",
+            "tool_name": "search",
+            "tool_args": {"query": "weather"},
+            "task_description": huge_description,
+        },
+    )
+
+    await sink.send_text(raw)
+
+    assert len(received) == 1
+    assert "task_description" not in received[0]["data"]
+    assert received[0]["data"]["tool_name"] == "search"
+
+
 async def test_a_frame_still_over_the_cap_without_its_description_is_dropped():
     """The control for the test above: excluding ``task_description``
     from the measurement is not a blanket exemption for any frame that

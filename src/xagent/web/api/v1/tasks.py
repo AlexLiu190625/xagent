@@ -1313,8 +1313,10 @@ async def stream_chat_task_events(
       too large" rather than "a step was too large". A truncated
       ``message.delta``/``message.completed`` carries the shortened text
       itself plus ``truncated: true`` and no ``original_bytes``. A raw
-      broadcast frame whose own text runs past 256 KiB is dropped whole
-      instead of truncated (see Behavior below): no marker, no content.
+      broadcast frame that runs past 256 KiB -- measured without the
+      internal task-description stamp such frames carry -- is dropped
+      whole instead of truncated (see Behavior below): no marker, no
+      content.
       This cap is specific to this stream -- ``GET .../steps`` applies
       no such cap and always returns a step's full, untruncated
       ``data``, so the two surfaces can disagree on content for the

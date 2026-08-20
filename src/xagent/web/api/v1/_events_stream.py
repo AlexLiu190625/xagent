@@ -17,7 +17,8 @@ Each connection gets its own projector, and that projector is fed only
 the frames broadcast after the connection registered. A step that was
 already running at that moment therefore has no matching start in it,
 so the step's eventual end event folds in as an orphan and is dropped:
-on this stream that step stays at whatever state it was last seen in.
+that step never appears on this stream at all, since its start was
+broadcast before this connection existed.
 Clients attaching mid-task reconcile against
 ``GET /v1/chat/tasks/{task_id}/steps``, which reads the database and
 so is unaffected by when the stream was opened.
@@ -111,9 +112,10 @@ PER_PRINCIPAL_STREAM_CAP = 32
 # ``core/task_runtime.py``'s ``MAX_TASK_RUNTIME_JSON_BYTES``), not a new
 # one invented for this module.
 MAX_FRAME_CONTENT_BYTES = 64 * 1024
-# Check on a raw broadcast frame's own text length, run after
-# ``json.loads`` parses it, gating only the call into the projection
-# pass -- ``MAX_FRAME_CONTENT_BYTES`` only bounds the *projected*
+# Check on a raw broadcast frame's text length -- measured excluding
+# the internal task-description stamp broadcast frames carry (see
+# ``_measured_content_frame``) -- run after ``json.loads`` parses it,
+# gating only the call into the projection pass -- ``MAX_FRAME_CONTENT_BYTES`` only bounds the *projected*
 # content that ends up on the wire, so without this a multi-megabyte raw
 # frame still pays for a full ``serialize_trace_data`` walk + projection
 # just to have its content truncated at the very end. 4x
