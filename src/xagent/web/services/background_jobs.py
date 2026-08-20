@@ -291,9 +291,10 @@ def requeue_stale_background_jobs(
     progress snapshot under "last_progress". Returns only the rows it
     attempted to requeue, never the ones it failed.
 
-    There is no execution lease on this table, so a worker that is alive but
-    silent past the cutoff can still race this sweep and later overwrite the
-    terminal state it writes. A redelivery of a budget-exhausted row is always
+    This table has not yet adopted the lease pattern used elsewhere in the
+    repo (task_lease_service), so a worker that is alive but silent past the
+    cutoff can still race this sweep and later overwrite the terminal state
+    it writes. A redelivery of a budget-exhausted row is always
     refused without writing anything, so Celery acks the message and no further redelivery exists for
     it; the sweep is the path that later turns such a row terminal, though
     other enqueue paths can still transition a row independently before then.

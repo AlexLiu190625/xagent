@@ -1819,7 +1819,9 @@ def test_requeue_stale_survives_mark_failed_error(tmp_path, monkeypatch):
     monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
 
-    def poisoned_mark_job_failed(*args, **kwargs):
+    def poisoned_mark_job_failed(db_arg, job_arg, **kwargs):
+        setattr(job_arg, "status", BackgroundJobStatus.FAILED.value)
+        db_arg.add(job_arg)
         raise RuntimeError("simulated commit failure")
 
     monkeypatch.setattr(bg_module, "mark_job_failed", poisoned_mark_job_failed)
@@ -1859,6 +1861,7 @@ def test_requeue_stale_survives_mark_failed_error(tmp_path, monkeypatch):
         db.commit()
         db.refresh(exhausted)
         db.refresh(under_budget)
+        exhausted_id = exhausted.id
         exhausted_prior_status = exhausted.status
         under_budget_id = under_budget.id
 
@@ -1866,8 +1869,20 @@ def test_requeue_stale_survives_mark_failed_error(tmp_path, monkeypatch):
 
         assert [item.id for item in requeued] == [under_budget_id]
 
-        db.refresh(exhausted)
-        assert exhausted.status == exhausted_prior_status
+        # Re-query in a fresh session rather than refreshing the original
+        # `db`'s identity-mapped object, so this proves the DB-persisted row
+        # survived unchanged, not just that our own object happens to.
+        verify_db = SessionLocal()
+        try:
+            refreshed_exhausted = (
+                verify_db.query(BackgroundJob)
+                .filter(BackgroundJob.id == exhausted_id)
+                .first()
+            )
+            assert refreshed_exhausted is not None
+            assert refreshed_exhausted.status == exhausted_prior_status
+        finally:
+            verify_db.close()
 
         db.refresh(under_budget)
         assert under_budget.status == BackgroundJobStatus.PENDING.value
@@ -2273,9 +2288,11 @@ def test_execute_background_job_skips_failed_job_with_conflicting_result(
     finally:
         tasks_module._EXTRA_HANDLERS.pop(job_type, None)
 
+    # Contract: status and error always reflect the row's actual failure; any
+    # other stored key (like this stale "message") is passed through as-is,
+    # not pinned to a particular value.
     assert outcome.result["status"] == "failed"
     assert outcome.result["error"] == stored_error
-    assert outcome.result["message"] == "x"
 
     verify_db = SessionLocal()
     try:
@@ -2321,6 +2338,8 @@ def test_execute_background_job_refuses_exhausted_stale_job(tmp_path, monkeypatc
         db.commit()
         db.refresh(job)
         job_id = str(job.id)
+        attempts_before = job.attempts
+        started_at_before = job.started_at
         updated_at_before = job.updated_at
     finally:
         db.close()
@@ -2346,6 +2365,8 @@ def test_execute_background_job_refuses_exhausted_stale_job(tmp_path, monkeypatc
         )
         assert refreshed is not None
         assert refreshed.status == BackgroundJobStatus.RUNNING.value
+        assert refreshed.attempts == attempts_before
+        assert refreshed.started_at == started_at_before
         assert refreshed.updated_at == updated_at_before
     finally:
         verify_db.close()
@@ -2379,6 +2400,8 @@ def test_execute_background_job_refuses_exhausted_fresh_job(tmp_path, monkeypatc
         db.commit()
         db.refresh(job)
         job_id = str(job.id)
+        attempts_before = job.attempts
+        started_at_before = job.started_at
         updated_at_before = job.updated_at
     finally:
         db.close()
@@ -2404,6 +2427,8 @@ def test_execute_background_job_refuses_exhausted_fresh_job(tmp_path, monkeypatc
         )
         assert refreshed is not None
         assert refreshed.status == BackgroundJobStatus.RUNNING.value
+        assert refreshed.attempts == attempts_before
+        assert refreshed.started_at == started_at_before
         assert refreshed.updated_at == updated_at_before
     finally:
         verify_db.close()

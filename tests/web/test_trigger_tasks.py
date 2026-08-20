@@ -101,3 +101,67 @@ def test_handle_trigger_scan_skips_dispatch_when_nothing_reaped(
     reap_mock.assert_called_once_with(db)
     dispatch_mock.assert_not_called()
     assert result["reaped_preview_run_pause_dispatches"] == 0
+
+
+def test_handle_trigger_scan_survives_stale_sweep_failure(
+    tmp_path, monkeypatch
+) -> None:
+    """A stale-sweep failure must not stall the rest of the scan tick's work."""
+    SessionLocal = _init_test_db(tmp_path / "trigger-scan-sweep-failure.db")
+    db = SessionLocal()
+    user = _create_user(db)
+
+    def raise_sweep(_db):
+        raise RuntimeError("simulated sweep failure")
+
+    scan_calls: list[object] = []
+
+    def fake_scan(_db):
+        scan_calls.append(_db)
+        return []
+
+    monkeypatch.setattr(trigger_tasks, "requeue_stale_background_jobs", raise_sweep)
+    monkeypatch.setattr(trigger_tasks, "scan_due_scheduled_triggers", fake_scan)
+    monkeypatch.setattr(
+        trigger_tasks, "reap_stale_preview_workforce_runs", MagicMock(return_value=[])
+    )
+
+    job = BackgroundJob(
+        user_id=int(user.id),
+        job_type=BackgroundJobType.TRIGGER_SCAN.value,
+        payload={},
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    result = trigger_tasks.handle_trigger_scan(db, job)
+
+    assert result["requeued_stale_jobs"] == 0
+    assert scan_calls == [db]
+
+
+def test_scan_due_triggers_survives_stale_sweep_failure(tmp_path, monkeypatch) -> None:
+    """The Celery Beat entrypoint must survive a stale-sweep failure the same
+    way the BackgroundJob-driven variant does."""
+    _init_test_db(tmp_path / "scan-due-triggers-sweep-failure.db")
+
+    def raise_sweep(_db):
+        raise RuntimeError("simulated sweep failure")
+
+    scan_calls: list[object] = []
+
+    def fake_scan(_db):
+        scan_calls.append(_db)
+        return []
+
+    monkeypatch.setattr(trigger_tasks, "requeue_stale_background_jobs", raise_sweep)
+    monkeypatch.setattr(trigger_tasks, "scan_due_scheduled_triggers", fake_scan)
+    monkeypatch.setattr(
+        trigger_tasks, "reap_stale_preview_workforce_runs", MagicMock(return_value=[])
+    )
+
+    result = trigger_tasks.scan_due_triggers()
+
+    assert result["requeued_stale_jobs"] == 0
+    assert len(scan_calls) == 1

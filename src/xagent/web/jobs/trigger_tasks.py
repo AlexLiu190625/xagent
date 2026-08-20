@@ -95,7 +95,11 @@ def handle_trigger_event(db: Session, job: BackgroundJob) -> dict[str, Any]:
 def handle_trigger_scan(db: Session, job: BackgroundJob) -> dict[str, Any]:
     payload = dict(job.payload or {})
     update_job_progress(db, job, message="Scanning scheduled triggers")
-    requeued_jobs = requeue_stale_background_jobs(db)
+    try:
+        requeued_jobs = requeue_stale_background_jobs(db)
+    except Exception:
+        logger.exception("Stale background job sweep failed this tick")
+        requeued_jobs = []
     runs = scan_due_scheduled_triggers(db)
     # This is the BackgroundJob-driven variant of the same scan
     # `scan_due_triggers` below runs for Celery Beat -- the reaper must run
@@ -130,7 +134,11 @@ def scan_due_triggers() -> dict[str, Any]:
 
     db = SessionLocal()
     try:
-        requeued_jobs = requeue_stale_background_jobs(db)
+        try:
+            requeued_jobs = requeue_stale_background_jobs(db)
+        except Exception:
+            logger.exception("Stale background job sweep failed this tick")
+            requeued_jobs = []
         runs = scan_due_scheduled_triggers(db)
         # Only counts reaped runs whose Task was still RUNNING (i.e. that
         # needed an explicit PAUSE dispatch), not every reaped run.
