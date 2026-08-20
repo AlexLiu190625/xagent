@@ -991,7 +991,11 @@ def test_openrouter_reasoning_hook_enables_reasoning_payload(monkeypatch):
         "openrouter/deepseek/deepseek-v4-flash",
     ],
 )
-def test_openrouter_deepseek_defaults_to_disabled_thinking(monkeypatch, model_name):
+@pytest.mark.parametrize("is_streaming", [True, False])
+@pytest.mark.parametrize("response_format", [None, {"type": "json_object"}])
+def test_openrouter_deepseek_defaults_to_disabled_thinking(
+    monkeypatch, model_name, is_streaming, response_format
+):
     monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
     llm = OpenRouterLLM(
         model_name=model_name,
@@ -1003,9 +1007,9 @@ def test_openrouter_deepseek_defaults_to_disabled_thinking(monkeypatch, model_na
         extra_body={"trace_id": "abc"},
         thinking=None,
         tools=None,
-        response_format=None,
+        response_format=response_format,
         output_config=None,
-        is_streaming=True,
+        is_streaming=is_streaming,
     )
 
     assert extra_body == {
@@ -1059,6 +1063,35 @@ def test_openrouter_non_deepseek_defaults_leave_thinking_unset(
     )
 
     assert extra_body == {"trace_id": "abc"}
+
+
+@pytest.mark.parametrize(
+    ("is_streaming", "expected_extra_body"),
+    [
+        (True, {"reasoning": {"enabled": False}, "thinking": {"type": "disabled"}}),
+        (False, {}),
+    ],
+)
+def test_openrouter_non_deepseek_thinking_structured_output_fork(
+    monkeypatch, is_streaming, expected_extra_body
+):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    llm = OpenRouterLLM(
+        model_name="openai/gpt-5",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    extra_body = llm._prepare_provider_reasoning_extra_body(
+        extra_body={},
+        thinking=None,
+        tools=None,
+        response_format={"type": "json_object"},
+        output_config=None,
+        is_streaming=is_streaming,
+    )
+
+    assert extra_body == expected_extra_body
 
 
 @pytest.mark.asyncio
