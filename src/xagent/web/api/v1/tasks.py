@@ -1226,6 +1226,10 @@ async def stream_chat_task_events(
         agent's pending question when one is on record (the same value
         ``GET /v1/chat/tasks/{task_id}`` returns as
         ``pending_interaction.question``), or ``null`` if none is.
+        Earlier versions of this endpoint sent ``null`` here in every
+        case, so a client that assumed the field was never populated
+        must accept a string: the field's name and type (nullable
+        string) are unchanged, only the value can now be present.
         Answer it with ``POST /v1/chat/tasks/{task_id}/reply`` -- calling
         ``POST .../messages`` (append) on a task in this state 409s.
       - ``stream.error``: ``{code, message}``, a flat shape distinct
@@ -1329,22 +1333,22 @@ async def stream_chat_task_events(
       - This stream carries only what happens after the connection
         opens; it never sends the steps that already happened, on any
         path. That has two consequences a client must handle. First, a
-        step that was already running at attach time never reaches
-        ``step.completed`` on this stream: its end event has no matching
-        start on this connection, so it is dropped rather than sent, and
-        that step stays ``"running"`` here for the rest of the stream's
-        life even though the task actually resolved it. Second, an
-        attach that arrives once the task has already finished (or is
-        already waiting on user input) has no live content left to
-        carry, so it closes with the lifecycle frames alone. Either way,
-        ``GET .../steps`` reads the database and is unaffected by when
-        the stream was opened, so that is where a client reconciles what
-        this stream did not carry.
+        step that was already running at attach time does not appear on
+        this stream at all: its ``step.started`` was broadcast before
+        this connection existed, and its end event arrives here with no
+        matching start, so that end is dropped rather than sent. The
+        client sees neither half of the step -- it is absent, not left
+        at ``"running"``. Second, an attach that arrives once the task
+        has already finished (or is already waiting on user input) has
+        no live content left to carry, so it closes with the lifecycle
+        frames alone. Either way, ``GET .../steps`` reads the database
+        and is unaffected by when the stream was opened, so that is
+        where a client reconciles what this stream did not carry.
       - Frame sequence into ``task.completed``: a task that fails emits
         ``task.status`` (``"failed"``) from the failure broadcast first,
         then the watchdog's authoritative ``task.completed`` close
         frame. Delivery of every ``step.*``/``message.*`` content frame
-        on this stream is best-effort, not guaranteed, for three
+        on this stream is best-effort, not guaranteed, for four
         separate reasons: (1) closing a stream for any reason drains its
         queued backlog before inserting the close frame, so any
         already-queued frame -- a ``task.status``, a ``step.*``, a
@@ -1358,9 +1362,23 @@ async def stream_chat_task_events(
         raw broadcast frame is dropped whole rather than projected,
         so its content never reaches the per-field truncation cap
         described above and leaves no ``"truncated": true`` marker --
-        this is a full drop, not a truncation. (2) and (3) are silent:
-        neither one ever produces a ``stream.error`` frame or any other
-        signal on the wire. (1) is not silent in the same way -- the
+        this is a full drop, not a truncation. The size measured
+        excludes the task description that the broadcast conversion
+        stamps onto every trace event, so a task's description alone
+        can no longer blank out its step stream this way -- a frame is
+        only dropped here when its content, apart from that field, is
+        still over the cap. (4) a planning step can be left unresolved:
+        when a planning round ends without emitting its own terminal
+        event (a plan-generation error escaping before it), the next
+        round clears the pairing key that step was waiting on, so the
+        step's ``step.completed`` is never produced and the client
+        keeps a ``thinking`` step at ``"running"`` for the rest of the
+        stream's life (``_step_mapping.py``'s ``dag_execute_start``
+        branch). This one is not a stream-only artifact: ``GET
+        .../steps`` folds the same events and shows that step the same
+        way. (2), (3) and (4) are silent: none of them ever produces a
+        ``stream.error`` frame or any other signal on the wire. (1) is
+        not silent in the same way -- the
         close frame that follows a queue-drain is often itself a
         ``stream.error`` (``resync_required``/``unauthorized``/
         ``task_deleted``/``stream_expired``) -- but that close frame
