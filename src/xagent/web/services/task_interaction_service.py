@@ -1463,10 +1463,18 @@ def materialize_compatibility_view(
     ``allow_superseded`` is passed straight to
     ``get_latest_waiting_question`` on both T1 branches and nowhere else.
     It lets the transcript reader reach a question row a structured
-    publication has already relabelled, which is only honest on those two
-    branches: both mean no native row holds this task's answer slot. The
-    three T3 branches never call ``_legacy_view`` at all, so the parameter
-    has no place to appear in them -- not an omission.
+    publication has already relabelled. Both T1 branches mean "no active
+    native row", which is not on its own enough to make that honest: the
+    window where ``respond()`` has retired the row to ``answered`` while
+    the task stays ``WAITING_FOR_USER`` until its staged resume command is
+    consumed means it too, and a read landing there would re-offer the
+    relabelled row for a question already answered. That window is
+    unreachable here -- ``respond()`` is its only writer and has no
+    production caller, kept true by its own zero-caller gate -- and what
+    the read surface owes it belongs to the change that publishes an
+    interaction atomically with the task's status transition. The three T3
+    branches never call ``_legacy_view`` at all, so the parameter has no
+    place to appear in them -- not an omission.
 
     Deciding "no active row" and reading the transcript are two separate
     statements, and on PostgreSQL's default READ COMMITTED each statement
