@@ -488,6 +488,120 @@ async def test_slow_consumer_queue_overflow_closes_with_resync_required():
     assert sink.queue.get_nowait() == (es.error_frame("resync_required"), True)
 
 
+def _budget_sized_frame() -> tuple[str, int]:
+    """One 64 KiB frame plus how many of them fit exactly in the budget.
+
+    Sized so the byte budget is what the tests below exercise: at 64 KiB
+    a frame, the budget holds 64 of them, well under
+    ``OUTBOUND_QUEUE_MAX_SIZE`` -- asserted rather than assumed, so this
+    can never silently decay into another item-count test if either
+    constant moves.
+    """
+    frame = "x" * (64 * 1024)
+    fits = es.MAX_QUEUED_WIRE_BYTES // len(frame)
+    assert fits * len(frame) == es.MAX_QUEUED_WIRE_BYTES, (
+        "premise: the budget is a whole multiple of this frame size"
+    )
+    assert fits < es.OUTBOUND_QUEUE_MAX_SIZE, (
+        "premise: the byte budget must bind before the item-count cap"
+    )
+    return frame, fits
+
+
+async def test_backlog_exactly_at_the_byte_budget_does_not_close():
+    """The budget is an upper bound, not an exclusive one: a backlog whose
+    queued wire bytes land exactly on ``MAX_QUEUED_WIRE_BYTES`` keeps
+    streaming, and only the frame that would push it over closes. Same
+    boundary rule ``MAX_RAW_FRAME_TEXT_CHARS`` uses -- strictly over is
+    the event, exactly equal is not."""
+    sink = _make_sink()
+    frame, fits = _budget_sized_frame()
+    for _ in range(fits):
+        sink._put_or_overflow(frame)
+    assert sink.closing is False
+    assert sink.queued_wire_bytes == es.MAX_QUEUED_WIRE_BYTES
+    assert sink.queue.qsize() == fits
+
+
+async def test_byte_budget_overflow_closes_with_resync_required_and_drains():
+    """One frame past the budget closes the stream through the existing
+    overflow path: the backlog is dropped, the ``resync_required`` close
+    frame is the only thing left queued, and the byte accounting returns
+    to zero. The item-count cap is not reached here (see
+    ``_budget_sized_frame``'s premise assertions), so this closure can
+    only have come from the byte budget."""
+    sink = _make_sink()
+    frame, fits = _budget_sized_frame()
+    for _ in range(fits + 1):
+        sink._put_or_overflow(frame)
+    assert sink.closing is True
+    assert sink.queue.qsize() == 1
+    assert await sink.next_frame() == (es.error_frame("resync_required"), True)
+    assert sink.queued_wire_bytes == 0
+
+
+async def test_queued_wire_bytes_falls_back_as_frames_are_read_out():
+    """The budget bounds what is *currently* queued, not what has ever
+    been queued: a consumer that keeps up never accumulates toward it.
+    Pins that ``next_frame`` -- the sink's own accounted read method --
+    is what discounts a delivered frame's bytes."""
+    sink = _make_sink()
+    sink._put_or_overflow("a" * 100)
+    sink._put_or_overflow("b" * 50)
+    assert sink.queued_wire_bytes == 150
+    assert await sink.next_frame() == ("a" * 100, False)
+    assert sink.queued_wire_bytes == 50
+    assert await sink.next_frame() == ("b" * 50, False)
+    assert sink.queued_wire_bytes == 0
+
+
+async def test_generator_read_path_keeps_queued_wire_bytes_at_zero_between_frames():
+    """Division of labor with the two tests above: those pin
+    ``next_frame``'s own body (what mutation testing calls M2 -- deleting
+    the subtraction inside it). This one pins the call *site* -- that
+    ``_generate``'s per-frame read actually goes through ``next_frame``
+    rather than a bare ``sink.queue.get()`` that would bypass the byte
+    accounting entirely (M5). Runs a real attach, then puts and reads one
+    budget-sized frame at a time -- never letting more than one frame's
+    worth of backlog build up -- and checks after every read that the
+    delivered frame is the one just queued (not a ``resync_required``
+    close) and that ``queued_wire_bytes`` is back at zero. Precondition:
+    ``fits < OUTBOUND_QUEUE_MAX_SIZE`` (asserted in
+    ``_budget_sized_frame``), so the element cap never intervenes and
+    every read in this loop can only be explained by the byte budget's
+    own accounting.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        **_long_intervals(),
+    )
+    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    assert "event: task.status" in first
+
+    sink = next(
+        connection
+        for connection in es.manager.connections_for_task(task_id)
+        if isinstance(connection, es.V1EventStreamSink)
+    )
+    frame, fits = _budget_sized_frame()
+    for _ in range(fits + 4):
+        sink._put_or_overflow(frame)
+        delivered = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert delivered == frame
+        assert sink.queued_wire_bytes == 0
+    assert sink.closing is False
+
+    await resp.body_iterator.aclose()
+
+
 # ===== key revoked/paused closes within one watchdog cycle =====
 
 

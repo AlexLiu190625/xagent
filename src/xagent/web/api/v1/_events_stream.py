@@ -112,6 +112,27 @@ PER_PRINCIPAL_STREAM_CAP = 32
 # ``core/task_runtime.py``'s ``MAX_TASK_RUNTIME_JSON_BYTES``), not a new
 # one invented for this module.
 MAX_FRAME_CONTENT_BYTES = 64 * 1024
+# The queue's second bound, on the total wire bytes it is holding rather
+# than on its element count. The element cap alone lets a slow consumer
+# retain 256 x the largest frame this module can build: a
+# ``message.completed`` whose text is capped at
+# ``MAX_FRAME_CONTENT_BYTES`` measures 65,659 bytes, so 16.0 MiB per
+# sink, and a frame whose *id* rather than its content is what made it
+# large is bounded only by ``MAX_RAW_FRAME_TEXT_CHARS`` on the frame it
+# arrived in, so it can be several times that again. Both are
+# constructive upper bounds from the frame builders, not observed
+# backlogs.
+# Sized as 64 largest-possible content frames -- expressed against
+# ``MAX_FRAME_CONTENT_BYTES`` so it tracks that cap instead of drifting
+# from it. Strictly over the budget closes, exactly on it does not --
+# the same boundary rule ``MAX_RAW_FRAME_TEXT_CHARS`` uses. Why this
+# value and not tighter or looser is argued once, in the module
+# docstring's size-bounds section, not repeated here. Frames are pure
+# ASCII (``json.dumps`` runs with the default ``ensure_ascii=True``), so
+# ``len(frame_text)`` is the wire byte count and no encode is needed.
+# CPython's own ~41-byte-per-string header is not counted: 256 of them
+# is ~10 KiB against a 4 MiB budget.
+MAX_QUEUED_WIRE_BYTES = 64 * MAX_FRAME_CONTENT_BYTES
 # Check on a raw broadcast frame's text length -- measured excluding
 # the internal task-description stamp broadcast frames carry (see
 # ``_measured_content_frame``) -- run after ``json.loads`` parses it,
@@ -719,6 +740,12 @@ class V1EventStreamSink:
         self.task_id = task_id
         self.principal_key_prefix = principal_key_prefix
         self.dropped_frame_count = 0
+        # Wire bytes currently sitting in ``_queue``. Maintained at the
+        # two places that touch the queue and nowhere else: ``_put_counted``
+        # adds a frame's length as it goes in, ``next_frame`` subtracts it
+        # as it comes out, and ``enqueue_close`` zeroes it after draining.
+        # No caller outside this class adjusts it.
+        self._queued_bytes = 0
         self.completion_hint = asyncio.Event()
         # Each element is ``(frame_text, is_close)``. ``is_close`` travels
         # with the frame itself rather than being inferred from
@@ -762,7 +789,20 @@ class V1EventStreamSink:
 
     @property
     def queue(self) -> "asyncio.Queue[tuple[str, bool]]":
+        """The raw outbound queue, for inspecting depth and emptiness.
+
+        Take frames off it through ``next_frame`` instead of reading this
+        directly: that method is where a dequeued frame's bytes are
+        discounted from ``queued_wire_bytes``, so a bare ``get`` /
+        ``get_nowait`` here drains the queue while leaving the byte
+        accounting reading high.
+        """
         return self._queue
+
+    @property
+    def queued_wire_bytes(self) -> int:
+        """Total wire bytes of the frames currently queued."""
+        return self._queued_bytes
 
     def _assert_owner_loop(self) -> None:
         if asyncio.get_running_loop() is not self._owner_loop:
@@ -795,8 +835,46 @@ class V1EventStreamSink:
                 self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-        self._queue.put_nowait((frame_text, True))
+        # Exact rather than approximate: the loop above only exits with the
+        # queue empty (one event loop, no concurrent producer), so there
+        # are no bytes left to account for.
+        self._queued_bytes = 0
+        # Deliberately not routed through the byte budget: this is the one
+        # frame that must always fit. ``task.completed``'s ``output`` and
+        # ``task.input_required``'s ``prompt`` are uncapped by design (see
+        # the comment above ``completed_frame``); on the live path they
+        # only ever reach the client as a budget-exempt close frame via
+        # this method, and on the attach-time fast paths there is no sink
+        # and no queue at all -- refusing one here on a budget while the
+        # stream is closing anyway would drop a payload the client cannot
+        # recover from this stream, with no backlog left to protect.
+        self._put_counted(frame_text, is_close=True)
         return True
+
+    def _put_counted(self, frame_text: str, *, is_close: bool) -> None:
+        """The only place a frame enters the outbound queue.
+
+        Single write point so ``_queued_bytes`` cannot fall out of step
+        with the queue's actual contents: a frame that is queued is
+        counted in the same statement, and if ``put_nowait`` raises
+        ``QueueFull`` the count is not touched either.
+        """
+        self._queue.put_nowait((frame_text, is_close))
+        self._queued_bytes += len(frame_text)
+
+    async def next_frame(self) -> tuple[str, bool]:
+        """Take the next queued frame and discount its bytes.
+
+        The accounted counterpart of ``_put_counted``, and the way the
+        generator consumes this queue. There is no ``await`` between the
+        queue read and the subtraction, so a cancelled wait (the
+        generator's per-frame ``wait_for`` timeout) can never leave a
+        frame dequeued but still counted.
+        """
+        self._assert_owner_loop()
+        frame_text, is_close = await self._queue.get()
+        self._queued_bytes -= len(frame_text)
+        return frame_text, is_close
 
     def _put_or_overflow(self, frame_text: str) -> None:
         # Defense in depth: every current caller already checks ``closing``
@@ -804,8 +882,15 @@ class V1EventStreamSink:
         # matter how it's reached, so the guard lives here too.
         if self._closing:
             return
+        # Two bounds, one close path. Checked before the put rather than
+        # after it so ``_queued_bytes`` never exceeds the budget even
+        # transiently. Strictly over closes, exactly at the budget does
+        # not -- the same boundary rule ``MAX_RAW_FRAME_TEXT_CHARS`` uses.
+        if self._queued_bytes + len(frame_text) > MAX_QUEUED_WIRE_BYTES:
+            self.enqueue_close(error_frame("resync_required"))
+            return
         try:
-            self._queue.put_nowait((frame_text, False))
+            self._put_counted(frame_text, is_close=False)
         except asyncio.QueueFull:
             self.enqueue_close(error_frame("resync_required"))
 
@@ -853,9 +938,10 @@ class V1EventStreamSink:
         projected and queued via ``_project_and_queue``, which always
         routes successfully-projected output through ``_put_or_overflow``
         like any other queued frame -- never a direct
-        ``queue.put_nowait`` -- so it gets the same closed guard and
-        overflow-to-``resync_required`` handling status frames already
-        get.
+        ``queue.put_nowait`` -- so it gets the same closed guard and the
+        same overflow-to-``resync_required`` handling status frames
+        already get, on both of the queue's bounds: its element count
+        and its total queued wire bytes.
 
         The raw-size check itself runs after ``json.loads`` and the
         lifecycle handling above, guarding only the call into
@@ -1279,7 +1365,7 @@ async def _generate(
             )
             try:
                 frame_text, is_close = await asyncio.wait_for(
-                    sink.queue.get(), timeout=wait_budget
+                    sink.next_frame(), timeout=wait_budget
                 )
             except asyncio.TimeoutError:
                 yield ": ping\n\n"
