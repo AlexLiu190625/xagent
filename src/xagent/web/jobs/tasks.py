@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from ...config import get_background_job_stale_seconds
 from ..models.background_job import (
     BackgroundJob,
     BackgroundJobStatus,
@@ -125,6 +127,51 @@ def execute_background_job(self: Any, job_id: str) -> dict[str, Any]:
         if job.status == BackgroundJobStatus.SUCCEEDED.value:
             logger.info("Skipping already completed background job %s", job_id)
             return dict(job.result or {"status": "succeeded"})
+        if job.status == BackgroundJobStatus.FAILED.value:
+            logger.info("Skipping failed background job %s", job_id)
+            return {
+                "status": "failed",
+                "error": job.error_message,
+                **dict(job.result or {}),
+            }
+
+        if int(job.attempts or 0) >= int(job.max_attempts or 1):
+            stale_cutoff = datetime.now(timezone.utc) - timedelta(
+                seconds=get_background_job_stale_seconds()
+            )
+            is_fresh = (
+                db.query(BackgroundJob.id)
+                .filter(
+                    BackgroundJob.id == job.id,
+                    BackgroundJob.updated_at.is_not(None),
+                    BackgroundJob.updated_at > stale_cutoff,
+                )
+                .first()
+                is not None
+            )
+            if is_fresh:
+                logger.warning(
+                    "Refusing redelivered background job %s: retry budget exhausted (attempts=%s, max_attempts=%s) but the job shows recent progress",
+                    job_id,
+                    job.attempts,
+                    job.max_attempts,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": "Retry budget exhausted; refusing duplicate execution while the job shows recent progress",
+                }
+            error_message = (
+                f"Background job exceeded its retry budget "
+                f"(attempts={int(job.attempts or 0)} of {int(job.max_attempts or 1)})"
+            )
+            logger.warning("Failing background job %s: %s", job_id, error_message)
+            mark_job_failed(
+                db,
+                job,
+                error_message=error_message,
+                result={"last_progress": dict(job.progress or {})},
+            )
+            return {"status": "failed", "error": error_message}
 
         mark_job_running(db, job)
         try:

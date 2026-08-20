@@ -271,11 +271,27 @@ def requeue_stale_background_jobs(
     stale_after_seconds: int | None = None,
     limit: int = 100,
 ) -> list[BackgroundJob]:
-    """Requeue non-terminal jobs whose durable DB state is stale.
+    """Requeue stale non-terminal jobs that still have retry budget.
 
     Redis/Celery can lose in-flight delivery state during broker loss or worker
     crashes. The database row remains authoritative, so the scheduler can safely
     put old pending/enqueued/running jobs back on the broker.
+
+    A RUNNING row counts as stale only when both started_at and updated_at are
+    older than the cutoff: progress writes refresh updated_at, so an actively
+    progressing job is never swept just because it has been running a long time.
+
+    A job whose attempts already reached max_attempts is marked FAILED instead
+    of requeued; its last progress snapshot is kept under the result key
+    "last_progress". Returns only the rows it attempted to requeue, never the
+    ones it failed.
+
+    There is no execution lease on this table, so a worker that is alive but
+    silent past the cutoff can still race this sweep and later overwrite the
+    terminal state it writes. This sweep is the sole recovery path that turns a
+    silent, budget-exhausted row terminal: a broker redelivery for a fresh row
+    is refused without writing anything, and once Celery acks that refusal no
+    further redelivery follows it, so only this sweep converges the row.
     """
     stale_seconds = stale_after_seconds or get_background_job_stale_seconds()
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
@@ -294,6 +310,7 @@ def requeue_stale_background_jobs(
                     BackgroundJob.status == BackgroundJobStatus.RUNNING.value,
                     BackgroundJob.started_at.is_not(None),
                     BackgroundJob.started_at <= cutoff,
+                    BackgroundJob.updated_at <= cutoff,
                 ),
                 and_(
                     BackgroundJob.status != BackgroundJobStatus.RUNNING.value,
@@ -312,8 +329,32 @@ def requeue_stale_background_jobs(
         .all()
     )
 
-    requeued: list[BackgroundJob] = []
+    requeue_targets: list[BackgroundJob] = []
     for job in stale_jobs:
+        if int(job.attempts or 0) >= int(job.max_attempts or 1):
+            logger.warning(
+                "Failing stale background job %s type=%s status=%s: retry budget exhausted (attempts=%s, max_attempts=%s)",
+                job.id,
+                job.job_type,
+                job.status,
+                job.attempts,
+                job.max_attempts,
+            )
+            mark_job_failed(
+                db,
+                job,
+                error_message=(
+                    f"Background job exceeded its retry budget "
+                    f"(attempts={int(job.attempts or 0)} of {int(job.max_attempts or 1)}); "
+                    "not requeueing"
+                ),
+                result={"last_progress": dict(job.progress or {})},
+            )
+        else:
+            requeue_targets.append(job)
+
+    requeued: list[BackgroundJob] = []
+    for job in requeue_targets:
         logger.warning(
             "Requeueing stale background job %s type=%s status=%s",
             job.id,
@@ -331,38 +372,38 @@ def requeue_stale_background_jobs(
         )
         db.add(job)
 
-    if not stale_jobs:
+    if not requeue_targets:
         return requeued
 
     db.commit()
-    for job in stale_jobs:
+    for job in requeue_targets:
         db.refresh(job)
 
     if not get_celery_enabled():
-        return stale_jobs
+        return requeue_targets
 
     if get_celery_broker_url() is None:
         error_message = "Celery background jobs are enabled but no broker URL is set"
-        for job in stale_jobs:
+        for job in requeue_targets:
             setattr(
                 job, "error_message", f"Failed to requeue stale job: {error_message}"
             )
             db.add(job)
         db.commit()
-        for job in stale_jobs:
+        for job in requeue_targets:
             db.refresh(job)
-        return stale_jobs
+        return requeue_targets
 
     from ..jobs.tasks import execute_background_job
 
-    for job in stale_jobs:
+    for job in requeue_targets:
         setattr(job, "status", BackgroundJobStatus.ENQUEUED.value)
         db.add(job)
     db.commit()
-    for job in stale_jobs:
+    for job in requeue_targets:
         db.refresh(job)
 
-    for job in stale_jobs:
+    for job in requeue_targets:
         try:
             async_result = execute_background_job.apply_async(
                 args=[job.id],

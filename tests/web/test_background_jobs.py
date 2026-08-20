@@ -1454,6 +1454,43 @@ def test_background_web_file_new_branch_returns_rollback_callback(
         get_unscoped_file_storage.cache_clear()
 
 
+def test_requeue_stale_skips_actively_progressing_running_job(tmp_path, monkeypatch):
+    """A RUNNING job that keeps writing progress must not be swept as stale.
+
+    started_at ages past the cutoff for any long-running job; a fresh updated_at
+    is what actually distinguishes a live worker from a silent one.
+    """
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-stale-fresh-progress.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="stale-fresh-progress")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"collection": "kb"},
+        )
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(hours=3)
+        setattr(job, "status", BackgroundJobStatus.RUNNING.value)
+        setattr(job, "started_at", old)
+        setattr(job, "updated_at", now)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+
+        assert requeued == []
+        db.refresh(job)
+        assert job.status == BackgroundJobStatus.RUNNING.value
+    finally:
+        db.close()
+
+
 def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monkeypatch):
     monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
@@ -1471,6 +1508,7 @@ def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monke
         old = datetime.now(timezone.utc) - timedelta(hours=3)
         setattr(job, "status", BackgroundJobStatus.RUNNING.value)
         setattr(job, "started_at", old)
+        setattr(job, "updated_at", old)
         db.add(job)
         db.commit()
         db.refresh(job)
@@ -1483,6 +1521,121 @@ def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monke
         assert job.celery_task_id is None
         assert job.started_at is None
         assert job.progress["message"] == "Requeued stale background job"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("shape", ["running_aged", "pending_aged"])
+def test_requeue_stale_fails_job_with_exhausted_attempts(tmp_path, monkeypatch, shape):
+    """A stale row that already burned its retry budget is failed, not requeued.
+
+    Covers both shapes a pre-fix production row can be stuck in: RUNNING (worker
+    died mid-run) and PENDING (an old requeue cycle flipped it back without ever
+    checking the budget).
+    """
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    SessionLocal = _init_test_db(tmp_path / f"jobs-stale-exhausted-{shape}.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username=f"stale-exhausted-{shape}")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"collection": "kb"},
+        )
+        old = datetime.now(timezone.utc) - timedelta(hours=3)
+        progress = {"message": "Crawling page 7", "completed": 7, "total": 40}
+        setattr(job, "attempts", 3)
+        setattr(job, "progress", progress)
+        if shape == "running_aged":
+            setattr(job, "status", BackgroundJobStatus.RUNNING.value)
+            setattr(job, "started_at", old)
+        else:
+            setattr(job, "status", BackgroundJobStatus.PENDING.value)
+        setattr(job, "updated_at", old)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+
+        assert requeued == []
+        db.refresh(job)
+        assert job.status == BackgroundJobStatus.FAILED.value
+        assert job.finished_at is not None
+        assert "retry budget" in str(job.error_message)
+        assert job.result["last_progress"] == progress
+    finally:
+        db.close()
+
+
+def test_requeue_stale_with_celery_never_dispatches_exhausted_job(
+    tmp_path, monkeypatch
+):
+    """The Celery-enabled sweep path must never hand an exhausted job to apply_async."""
+    from xagent.web.jobs import tasks as tasks_module
+
+    monkeypatch.setenv(CELERY_ENABLED, "true")
+    monkeypatch.setenv(CELERY_BROKER_URL, "memory://")
+
+    apply_async_calls: list[str] = []
+
+    def fake_apply_async(*, args, queue):
+        apply_async_calls.append(args[0])
+        return MagicMock(id=f"fake-task-{args[0]}")
+
+    monkeypatch.setattr(
+        tasks_module.execute_background_job, "apply_async", fake_apply_async
+    )
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-stale-celery-budget.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="stale-celery-budget")
+        old = datetime.now(timezone.utc) - timedelta(hours=3)
+
+        exhausted = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"collection": "kb-exhausted"},
+        )
+        setattr(exhausted, "status", BackgroundJobStatus.RUNNING.value)
+        setattr(exhausted, "attempts", 3)
+        setattr(exhausted, "started_at", old)
+        setattr(exhausted, "updated_at", old)
+        db.add(exhausted)
+
+        under_budget = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"collection": "kb-under-budget"},
+        )
+        setattr(under_budget, "status", BackgroundJobStatus.RUNNING.value)
+        setattr(under_budget, "attempts", 0)
+        setattr(under_budget, "started_at", old)
+        setattr(under_budget, "updated_at", old)
+        db.add(under_budget)
+
+        db.commit()
+        db.refresh(exhausted)
+        db.refresh(under_budget)
+        under_budget_id = under_budget.id
+
+        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+
+        assert apply_async_calls == [under_budget_id]
+        assert [item.id for item in requeued] == [under_budget_id]
+
+        db.refresh(exhausted)
+        assert exhausted.status == BackgroundJobStatus.FAILED.value
+
+        db.refresh(under_budget)
+        assert under_budget.status == BackgroundJobStatus.ENQUEUED.value
     finally:
         db.close()
 
@@ -1767,6 +1920,185 @@ def test_registered_handler_retryable_error_flows_through_execute_background_job
         assert refreshed.status == BackgroundJobStatus.ENQUEUED.value
         assert refreshed.attempts == 1
         assert "transient downstream failure" in str(refreshed.error_message)
+    finally:
+        verify_db.close()
+
+
+def test_execute_background_job_skips_failed_job(tmp_path, monkeypatch):
+    """A redelivered broker message must never resurrect a terminal FAILED row."""
+    from xagent.web.jobs import tasks as tasks_module
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    job_type = "test.skip-failed-job"
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-skip-failed.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "skip-failed-job")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=job_type,
+            payload={},
+        )
+        stored_progress = {"message": "x", "completed": 1, "total": 2}
+        setattr(job, "status", BackgroundJobStatus.FAILED.value)
+        setattr(
+            job,
+            "error_message",
+            "Background job exceeded its retry budget (attempts=3 of 3)",
+        )
+        setattr(job, "result", {"last_progress": stored_progress})
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = str(job.id)
+        stored_error = job.error_message
+    finally:
+        db.close()
+
+    def handler_spy(session, received):
+        pytest.fail("handler must not run for a FAILED background job")
+
+    tasks_module.register_background_job_handler(job_type, handler_spy)
+    try:
+        outcome = tasks_module.execute_background_job.apply(args=[job_id], throw=False)
+    finally:
+        tasks_module._EXTRA_HANDLERS.pop(job_type, None)
+
+    assert outcome.result == {
+        "status": "failed",
+        "error": stored_error,
+        "last_progress": stored_progress,
+    }
+
+    verify_db = SessionLocal()
+    try:
+        refreshed = (
+            verify_db.query(BackgroundJob).filter(BackgroundJob.id == job_id).first()
+        )
+        assert refreshed is not None
+        assert refreshed.status == BackgroundJobStatus.FAILED.value
+    finally:
+        verify_db.close()
+
+
+def test_execute_background_job_fails_exhausted_stale_job(tmp_path, monkeypatch):
+    """A redelivered message for a silent, budget-exhausted RUNNING row terminates
+    it instead of running the handler a fourth time."""
+    from xagent.web.jobs import tasks as tasks_module
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    job_type = "test.exhausted-stale-job"
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-exhausted-stale.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "exhausted-stale-job")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=job_type,
+            payload={},
+        )
+        old = datetime.now(timezone.utc) - timedelta(hours=3)
+        progress = {"message": "Crawling page 9", "completed": 9, "total": 50}
+        setattr(job, "status", BackgroundJobStatus.RUNNING.value)
+        setattr(job, "attempts", 3)
+        setattr(job, "started_at", old)
+        setattr(job, "updated_at", old)
+        setattr(job, "progress", progress)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = str(job.id)
+    finally:
+        db.close()
+
+    def handler_spy(session, received):
+        pytest.fail("handler must not run for a budget-exhausted stale job")
+
+    tasks_module.register_background_job_handler(job_type, handler_spy)
+    try:
+        outcome = tasks_module.execute_background_job.apply(args=[job_id], throw=False)
+    finally:
+        tasks_module._EXTRA_HANDLERS.pop(job_type, None)
+
+    assert outcome.result["status"] == "failed"
+    assert "retry budget" in outcome.result["error"]
+
+    verify_db = SessionLocal()
+    try:
+        refreshed = (
+            verify_db.query(BackgroundJob).filter(BackgroundJob.id == job_id).first()
+        )
+        assert refreshed is not None
+        assert refreshed.status == BackgroundJobStatus.FAILED.value
+        assert refreshed.result["last_progress"] == progress
+    finally:
+        verify_db.close()
+
+
+def test_execute_background_job_refuses_exhausted_fresh_job(tmp_path, monkeypatch):
+    """A redelivered message for a still-live, budget-exhausted RUNNING row is
+    refused without writing terminal state, so the live worker can finish and
+    write its own outcome."""
+    from xagent.web.jobs import tasks as tasks_module
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    job_type = "test.exhausted-fresh-job"
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-exhausted-fresh.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "exhausted-fresh-job")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=job_type,
+            payload={},
+        )
+        setattr(job, "status", BackgroundJobStatus.RUNNING.value)
+        setattr(job, "attempts", 3)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = str(job.id)
+        updated_at_before = job.updated_at
+    finally:
+        db.close()
+
+    def handler_spy(session, received):
+        pytest.fail("handler must not run for a fresh budget-exhausted job")
+
+    tasks_module.register_background_job_handler(job_type, handler_spy)
+    try:
+        outcome = tasks_module.execute_background_job.apply(args=[job_id], throw=False)
+    finally:
+        tasks_module._EXTRA_HANDLERS.pop(job_type, None)
+
+    assert outcome.result == {
+        "status": "skipped",
+        "reason": (
+            "Retry budget exhausted; refusing duplicate execution while the job "
+            "shows recent progress"
+        ),
+    }
+
+    verify_db = SessionLocal()
+    try:
+        refreshed = (
+            verify_db.query(BackgroundJob).filter(BackgroundJob.id == job_id).first()
+        )
+        assert refreshed is not None
+        assert refreshed.status == BackgroundJobStatus.RUNNING.value
+        assert refreshed.updated_at == updated_at_before
     finally:
         verify_db.close()
 
