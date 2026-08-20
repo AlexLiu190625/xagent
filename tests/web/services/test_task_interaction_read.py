@@ -41,6 +41,8 @@ from xagent.web.services.ops_signals import (
     CHECKPOINT_PK_ANCHOR_DANGLING,
     INTERACTION_READ_PAYLOAD_UNREADABLE,
     INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
+    INTERACTION_READ_TASK_MARKER_UNRECOGNIZED,
+    active_degradations,
     clear_degradation,
 )
 from xagent.web.services.task_interaction_service import CompatibilityQuestionView
@@ -51,6 +53,7 @@ _DEGRADATION_SIGNALS_UNDER_TEST = (
     CHECKPOINT_LOAD_UNAVAILABLE,
     INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
     INTERACTION_READ_PAYLOAD_UNREADABLE,
+    INTERACTION_READ_TASK_MARKER_UNRECOGNIZED,
 )
 
 
@@ -355,6 +358,25 @@ def test_a4b_unrecognized_marker_with_an_active_native_row_never_leaks_the_legac
             "multiple": False,
         }
     ]
+
+
+def test_a4c_unrecognized_marker_registers_a_degradation_signal(
+    _db: Session,
+) -> None:
+    """A4 pins where an unrecognized marker routes; this pins that it is
+    also reported. Every corruption branch inside the compatibility view
+    raises a signal and this one did not, leaving an operator nothing to
+    look at. Keyed and process-local, so the assertion reads the registry
+    rather than logs. Mutation: drop the register call and this turns red."""
+
+    task = _make_task(_db, marker=None)
+    _persist_live_question(_db, task)
+    task.interaction_protocol_version = 2
+
+    read_surface.get_pending_interaction_question(_db, task)
+
+    detail = active_degradations()[INTERACTION_READ_TASK_MARKER_UNRECOGNIZED]
+    assert f"task {task.id}" in detail
 
 
 def test_a5_marker_fast_path_never_calls_the_rich_view(
