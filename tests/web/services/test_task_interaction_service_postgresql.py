@@ -58,6 +58,7 @@ from sqlalchemy.orm import sessionmaker
 
 import xagent.web.models.database as database_module
 from tests.web.services.task_interaction_schema_shared import (
+    anchor_event_id,
     assert_rejected,
     make_row,
     make_task,
@@ -163,22 +164,6 @@ def _make_trace_event(db, *, task_id: int, run_partition: str = "run-a") -> int:
     return int(event.id)
 
 
-def _anchor_event_id(db, resume_trace_event_id: int | None) -> str:
-    """The ``event_id`` carried by the trace row an anchor points at.
-
-    The write direction stores exactly this string in the interaction row's
-    ``resume_event_id``, and the read-direction resolver compares the two,
-    so an anchor resolves only when the fixture takes the value from the
-    row it names."""
-
-    trace_row = (
-        None
-        if resume_trace_event_id is None
-        else db.get(TraceEvent, resume_trace_event_id)
-    )
-    return "no-anchor-row" if trace_row is None else str(trace_row.event_id)
-
-
 def _make_active_row(
     db,
     *,
@@ -204,7 +189,7 @@ def _make_active_row(
         },
         request_idempotency_key=f"pg-key-{next(_key_counter)}",
         resume_trace_event_id=resume_trace_event_id,
-        resume_event_id=_anchor_event_id(db, resume_trace_event_id),
+        resume_event_id=anchor_event_id(db, resume_trace_event_id),
         resume_execution_id="exec-1",
         resume_locator_format="trace_event_pk_v1",
         resume_checkpoint_type="agent_execution_checkpoint",

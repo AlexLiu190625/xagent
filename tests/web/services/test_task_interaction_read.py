@@ -20,7 +20,11 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import xagent.web.services.chat_history_service as chat_history_service
 import xagent.web.services.task_interaction_service as interaction_service_module
-from tests.web.services.task_interaction_schema_shared import make_task, make_user
+from tests.web.services.task_interaction_schema_shared import (
+    anchor_event_id,
+    make_task,
+    make_user,
+)
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.models.database import Base
@@ -135,29 +139,11 @@ def _make_trace_event(
     return int(event.id)
 
 
-def _anchor_event_id(db: Session, resume_trace_event_id: int | None) -> str:
-    """The ``event_id`` carried by the trace row an anchor points at.
-
-    The write direction stores exactly this string in the interaction row's
-    ``resume_event_id``, and the read-direction resolver compares the two,
-    so an anchor resolves only when the fixture takes the value from the
-    row it names. A cell that wants an unresolvable anchor breaks one of
-    the other conditions on purpose rather than leaving this one mismatched
-    by accident."""
-
-    trace_row = (
-        None
-        if resume_trace_event_id is None
-        else db.get(TraceEvent, resume_trace_event_id)
-    )
-    return "no-anchor-row" if trace_row is None else str(trace_row.event_id)
-
-
 def _make_active_row(
     db: Session,
     *,
     task_id: int,
-    resume_trace_event_id: int | None,
+    resume_trace_event_id: int,
     run_id: str = "run-a",
     resume_run_partition: str = "run-a",
     resume_execution_id: str = "exec-1",
@@ -183,7 +169,7 @@ def _make_active_row(
         },
         request_idempotency_key=f"read-key-{task_id}",
         resume_trace_event_id=resume_trace_event_id,
-        resume_event_id=_anchor_event_id(db, resume_trace_event_id),
+        resume_event_id=anchor_event_id(db, resume_trace_event_id),
         resume_execution_id=resume_execution_id,
         resume_locator_format="trace_event_pk_v1",
         resume_checkpoint_type="agent_execution_checkpoint",

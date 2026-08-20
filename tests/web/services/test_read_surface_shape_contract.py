@@ -53,6 +53,7 @@ from sqlalchemy.orm import Session
 
 import xagent.web.api.websocket as websocket_module
 import xagent.web.services.task_interaction_service as interaction_service_module
+from tests.web.services.task_interaction_schema_shared import anchor_event_id
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from xagent.core.agent.transcript import build_assistant_transcript_content
 from xagent.web.api.agents import router as agents_router
@@ -283,29 +284,12 @@ def _make_trace_event(db: Session, *, task_id: int, run_partition: str) -> int:
     return int(event.id)
 
 
-def _anchor_event_id(db: Session, resume_trace_event_id: int | None) -> str:
-    """The ``event_id`` carried by the trace row an anchor points at.
-
-    The write direction stores exactly this string in the interaction row's
-    ``resume_event_id``, and the read-direction resolver compares the two,
-    so an anchor resolves only when the fixture takes the value from the
-    row it names. The T3 tier below breaks the run partition on purpose;
-    every other tier is meant to resolve."""
-
-    trace_row = (
-        None
-        if resume_trace_event_id is None
-        else db.get(TraceEvent, resume_trace_event_id)
-    )
-    return "no-anchor-row" if trace_row is None else str(trace_row.event_id)
-
-
 def _make_active_row(
     db: Session,
     *,
     task_id: int,
     run_id: str,
-    resume_trace_event_id: int | None,
+    resume_trace_event_id: int,
     resume_run_partition: str,
     request_payload: dict[str, Any] | None = None,
 ) -> None:
@@ -328,7 +312,7 @@ def _make_active_row(
         },
         request_idempotency_key=f"shape-contract-key-{uuid.uuid4()}",
         resume_trace_event_id=resume_trace_event_id,
-        resume_event_id=_anchor_event_id(db, resume_trace_event_id),
+        resume_event_id=anchor_event_id(db, resume_trace_event_id),
         resume_execution_id="exec-1",
         resume_locator_format="trace_event_pk_v1",
         resume_checkpoint_type="agent_execution_checkpoint",
