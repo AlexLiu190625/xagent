@@ -14,6 +14,7 @@ matters).
 
 import asyncio
 import json
+import uuid
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
@@ -25,6 +26,7 @@ from fastapi.testclient import TestClient
 from xagent.core.agent.trace import (
     ACTION_END_TOOL,
     ACTION_START_TOOL,
+    AI_MESSAGE,
     TraceAction,
     TraceCategory,
 )
@@ -2844,13 +2846,15 @@ async def test_nonfinite_step_data_values_are_normalized_to_null_on_the_wire():
     field's nesting depth -- so every ``step.*`` frame this module emits
     is already immune to this failure mode with no additional guard in
     ``_step_wire_frame`` itself. This test pins that implicit
-    invariant by exercising a real ``_step_wire_frame`` call (the
-    shared choke point) with three-deep nested non-finite values and
-    asserting the resulting wire text is strict-JSON-clean. It changes
-    no production code -- if this ever regresses (e.g. a future
-    producer bypasses ``model_dump(mode="json")`` and hands
-    ``_step_wire_frame`` a dict straight from application code), this
-    test is the tripwire.
+    invariant by handing three-deep nested non-finite values to
+    ``_step_content_frame`` -- production's only caller of
+    ``_step_wire_frame``, and where the normalization actually happens
+    -- and asserting the resulting wire text is strict-JSON-clean. The
+    raw dict goes in exactly as a projector produces it; normalizing it
+    in test setup first would have left the assertions green even if
+    ``_step_content_frame`` regressed to passing the raw dict straight
+    through. It changes no production code -- if that regression ever
+    happens, this test is the tripwire.
     """
     nested_nonfinite_data = {
         "name": "search",
@@ -2864,15 +2868,16 @@ async def test_nonfinite_step_data_values_are_normalized_to_null_on_the_wire():
         },
         "result": float("inf"),
     }
-    step = es.PublicStep(
-        id="tool_call:call-nonfinite",
-        type="tool_call",
-        status="completed",
-        started_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
-        completed_at=datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC),
-        data=nested_nonfinite_data,
+    frame_text = es._step_content_frame(
+        {
+            "id": "tool_call:call-nonfinite",
+            "type": "tool_call",
+            "status": "completed",
+            "started_at": datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+            "completed_at": datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC),
+            "data": nested_nonfinite_data,
+        }
     )
-    frame_text = es._step_wire_frame(step.model_dump(mode="json"))
 
     assert "NaN" not in frame_text
     assert "Infinity" not in frame_text
@@ -3091,36 +3096,45 @@ async def test_known_divergence_message_step_id_differs_between_the_two_paths():
     to correlate a message step across ``steps()`` and the live stream by
     id. Content itself still matches -- ``data`` is the only field
     compared below; ``started_at``/``completed_at`` aren't, since this
-    fixture doesn't mirror a timestamp into the live frame either."""
+    fixture doesn't mirror a timestamp into the live frame either.
+
+    Both legs fork from one ``CoreTraceEvent`` through the real
+    producers -- ``_persist_core_event`` for the persisted row,
+    ``_broadcast_frame_for`` for the live frame -- so neither id is
+    written down here. If production ever forwarded the canonical event
+    id to the live frame, the inequality below fails; if uuid minting
+    changed shape, the uuid assertion fails. This test takes no position
+    on what the public id contract *should* be -- that is tracked
+    elsewhere."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id)
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-    _insert_trace_event(
-        task_id=task_id,
-        event_type="ai_message",
-        event_id="persisted-id-123",
-        timestamp=base,
+    event = CoreTraceEvent(
+        AI_MESSAGE,
+        task_id=str(task_id),
+        timestamp=base.timestamp(),
         data={"content": "the answer"},
     )
+    _persist_core_event(event, task_id=task_id)
 
     steps_resp = client.get(
         f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
     )
     polled = steps_resp.json()["steps"][0]
-    assert polled["id"] == "message:persisted-id-123"
+    # The persisted leg's id is the event's own id, written by the
+    # persistence path as ``event_id=str(event.id)``.
+    assert polled["id"] == f"message:{event.id}"
 
     sink = _make_sink(task_id=task_id)
-    await sink.send_text(
-        _trace_event_frame(
-            "ai_message",
-            task_id=task_id,
-            event_id="live-frame-uuid-456",
-            data={"content": "the answer"},
-        )
-    )
+    await sink.send_text(_broadcast_frame_for(event, task_id=task_id))
     frame_text, _ = sink.queue.get_nowait()
     step_via_live = json.loads(frame_text.split("data: ", 1)[1])["step"]
-    assert step_via_live["id"] == "message:live-frame-uuid-456"
+    # The live leg's id is minted per broadcast by ``create_stream_event``,
+    # so it is a fresh uuid that is neither the event's id nor stable
+    # across two conversions of the same event.
+    live_id = step_via_live["id"].removeprefix("message:")
+    assert uuid.UUID(live_id).version == 4
+    assert live_id != str(event.id)
     assert step_via_live["id"] != polled["id"]
     assert step_via_live["data"] == polled["data"]
 
