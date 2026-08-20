@@ -282,20 +282,21 @@ def requeue_stale_background_jobs(
     refresh updated_at, so an actively progressing job is never swept just
     because it has been running a long time. A RUNNING row whose updated_at is
     still NULL (no write since creation) is swept by the NULL-updated_at
-    branch below, which carries no status condition; that behavior is
-    unchanged.
+    branch below, which carries no status condition; rows created by this
+    code always have updated_at set (server_default), so that branch exists
+    for legacy rows only.
 
     A job whose attempts already reached max_attempts is marked FAILED instead
-    of requeued; its last progress snapshot is kept under the result key
-    "last_progress". Returns only the rows it attempted to requeue, never the
-    ones it failed.
+    of requeued; its failure result carries "status", "message", and the last
+    progress snapshot under "last_progress". Returns only the rows it
+    attempted to requeue, never the ones it failed.
 
     There is no execution lease on this table, so a worker that is alive but
     silent past the cutoff can still race this sweep and later overwrite the
-    terminal state it writes. Once a redelivery is refused because the row
-    still shows recent progress, Celery acks the message and no further
-    redelivery exists for it, so this sweep is then the only path that turns
-    the row terminal.
+    terminal state it writes. A redelivery of a budget-exhausted row is always
+    refused without writing anything, so Celery acks the message and no further redelivery exists for
+    it; the sweep is the path that later turns such a row terminal, though
+    other enqueue paths can still transition a row independently before then.
     """
     stale_seconds = stale_after_seconds or get_background_job_stale_seconds()
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
@@ -333,10 +334,14 @@ def requeue_stale_background_jobs(
         .all()
     )
 
+    # The partition below commits (or rolls back) per row, so it must finish
+    # before the requeue mutation loop: a rollback here may only ever discard
+    # this row's own half-written state, never pending requeue mutations.
     requeue_targets: list[BackgroundJob] = []
+    failed_count = 0
     for job in stale_jobs:
         if int(job.attempts or 0) >= int(job.max_attempts or 1):
-            logger.warning(
+            logger.error(
                 "Failing stale background job %s type=%s status=%s: retry budget exhausted (attempts=%s, max_attempts=%s)",
                 job.id,
                 job.job_type,
@@ -344,18 +349,38 @@ def requeue_stale_background_jobs(
                 job.attempts,
                 job.max_attempts,
             )
-            mark_job_failed(
-                db,
-                job,
-                error_message=(
-                    f"Background job exceeded its retry budget "
-                    f"(attempts={int(job.attempts or 0)} of {int(job.max_attempts or 1)}); "
-                    "not requeueing"
-                ),
-                result={"last_progress": dict(job.progress or {})},
+            error_message = (
+                f"Background job exceeded its retry budget "
+                f"(attempts={int(job.attempts or 0)} of {int(job.max_attempts or 1)}); "
+                "not requeueing"
             )
+            try:
+                mark_job_failed(
+                    db,
+                    job,
+                    error_message=error_message,
+                    result={
+                        "status": "error",
+                        "message": error_message,
+                        "last_progress": dict(job.progress or {}),
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to mark budget-exhausted background job %s as failed",
+                    job.id,
+                )
+                db.rollback()
+                continue
+            failed_count += 1
         else:
             requeue_targets.append(job)
+
+    if failed_count:
+        logger.error(
+            "Stale sweep marked %s budget-exhausted background job(s) failed",
+            failed_count,
+        )
 
     requeued: list[BackgroundJob] = []
     for job in requeue_targets:
