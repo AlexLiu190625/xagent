@@ -1044,7 +1044,14 @@ def test_a_recheck_that_finds_an_active_row_counts_no_read_fallback(
     """The recheck exists to stop a legacy answer being returned, so the
     run it saves is not a fallback and must not be counted. The active row
     is made to appear on the second look only, which is the shape a
-    concurrent publication produces."""
+    concurrent publication produces.
+
+    ``interactions`` is asserted rather than discarded: the
+    ``anchor_dangling`` tier hands back the same question text with
+    ``interactions=None``, so a test that only checked the text would stay
+    green if the recheck's fallthrough landed there instead of on the
+    native tier.
+    """
 
     task = _make_task(_db, marker=1)
     trace_event_id = _make_trace_event(_db, task_id=int(task.id))
@@ -1063,7 +1070,8 @@ def test_a_recheck_that_finds_an_active_row_counts_no_read_fallback(
     )
 
     before = _read_fallback_count()
-    question, _ = read_surface.get_pending_interaction_question(_db, task)
+    question, interactions = read_surface.get_pending_interaction_question(_db, task)
 
     assert question == "Which environment?"
+    assert interactions is not None
     assert _read_fallback_count() == before
