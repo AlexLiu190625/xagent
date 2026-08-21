@@ -1,5 +1,5 @@
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from .....config import get_openrouter_official_providers_only
 from ..exceptions import LLMRetryableError, LLMToolProtocolError
@@ -126,6 +126,148 @@ def _deepseek_tool_protocol_retry_error(response: Any) -> LLMRetryableError | No
     )
 
 
+# Normalized intents translated into OpenRouter's reasoning/thinking request body.
+_DISABLE_DOWNSTREAM_THINKING = {"type": "disabled", "enable": False}
+_ENABLE_DOWNSTREAM_THINKING = {"type": "enabled", "enable": True}
+
+_ACTION_ENABLE_THINKING = "enable_thinking"
+_ACTION_DISABLE_THINKING = "disable_thinking"
+_ACTION_RELAX_TOOL_CHOICE = "relax_tool_choice"
+
+
+def _should_retry_with_thinking(
+    exc: Exception,
+    *,
+    thinking: Optional[Dict[str, Any]],
+) -> bool:
+    # This is the primary stop condition after a retry swaps in enabled thinking;
+    # retry-action tracking remains defense in depth for the shared retry loop.
+    if isinstance(thinking, dict) and (
+        thinking.get("type") == "enabled" or thinking.get("enable") is True
+    ):
+        return False
+
+    # OpenRouter currently exposes this provider constraint only through an
+    # untyped 400 response. Retry the same selected model once with reasoning
+    # enabled instead of repeating the rejected payload or rerouting.
+    # Replace string matching with typed provider errors when available.
+    exc_msg = str(exc).lower()
+    return "reasoning is mandatory" in exc_msg and "cannot be disabled" in exc_msg
+
+
+def _should_retry_without_thinking(
+    exc: Exception,
+    *,
+    thinking: Optional[Dict[str, Any]],
+    tool_choice: Optional[str | Dict[str, Any]],
+) -> bool:
+    # Deliberate OpenRouter/DeepSeek compatibility bridge: the provider returns
+    # an OpenAI-compatible 400 without a typed error for this thinking/tool_choice
+    # conflict. Replace this with provider-owned typed exceptions once the
+    # follow-up tracking issue lands.
+    exc_msg = str(exc).lower()
+    return (
+        (thinking is None or isinstance(thinking, dict))
+        and tool_choice is not None
+        and "thinking" in exc_msg
+        and "tool_choice" in exc_msg
+    )
+
+
+def _should_retry_with_relaxed_tool_choice(
+    exc: Exception,
+    *,
+    tools: Optional[List[Dict[str, Any]]],
+    tool_choice: Optional[str | Dict[str, Any]],
+) -> bool:
+    if not tools or tool_choice in (None, "auto", "none"):
+        return False
+
+    # Deliberate OpenRouter compatibility bridge: official provider routing can
+    # reject strict tool_choice values before selecting an endpoint. This
+    # degrades forced tool use to "auto" instead of failing the whole agent run.
+    # Replace string matching with typed provider errors when available.
+    exc_msg = str(exc).lower()
+    return "no endpoints found" in exc_msg and "tool_choice" in exc_msg
+
+
+def _next_compat_adjustment(
+    exc: Exception,
+    *,
+    tools: Optional[List[Dict[str, Any]]],
+    tool_choice: Optional[str | Dict[str, Any]],
+    thinking: Optional[Dict[str, Any]],
+    attempted: set[str],
+    render: Callable[[Optional[Dict[str, Any]]], Dict[str, Any]],
+) -> tuple[Optional[str | Dict[str, Any]], Optional[Dict[str, Any]], str, str] | None:
+    """Pick the next OpenRouter provider-compatibility adjustment for a failure.
+
+    Rules are checked strictest-first (relax tool_choice, then disable
+    thinking, then enable thinking): a message that happens to match more than
+    one predicate is resolved by its most specific cause instead of by
+    declaration order. A rule that matches but would leave the actually
+    rendered request unchanged compared to the current ``(tool_choice,
+    render(thinking))`` state is a no-op and is skipped without spending its
+    retry budget, so a rule that cannot fix anything does not block a later
+    rule that can. A rule whose action was already attempted stops the search
+    outright: the same shared one-attempt-per-action budget this logic
+    replaces (router.py's ``attempted_retry_actions``) applies here too.
+    """
+    current_state = (tool_choice, render(thinking))
+    candidates: tuple[
+        tuple[Optional[str | Dict[str, Any]], Optional[Dict[str, Any]], str, str]
+        | None,
+        ...,
+    ] = (
+        (
+            (
+                "auto",
+                thinking,
+                "selected OpenRouter endpoint rejected tool_choice; retrying with tool_choice=auto",
+                _ACTION_RELAX_TOOL_CHOICE,
+            )
+            if _should_retry_with_relaxed_tool_choice(
+                exc, tools=tools, tool_choice=tool_choice
+            )
+            else None
+        ),
+        (
+            (
+                tool_choice,
+                _DISABLE_DOWNSTREAM_THINKING,
+                "selected model rejected thinking with tool_choice; retrying without thinking",
+                _ACTION_DISABLE_THINKING,
+            )
+            if _should_retry_without_thinking(
+                exc, thinking=thinking, tool_choice=tool_choice
+            )
+            else None
+        ),
+        (
+            (
+                tool_choice,
+                _ENABLE_DOWNSTREAM_THINKING,
+                "selected model requires reasoning; retrying with thinking enabled",
+                _ACTION_ENABLE_THINKING,
+            )
+            if _should_retry_with_thinking(exc, thinking=thinking)
+            else None
+        ),
+    )
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        next_tool_choice, next_thinking, _log_message, action_key = candidate
+        if (next_tool_choice, render(next_thinking)) == current_state:
+            continue
+        if action_key in attempted:
+            return None
+        return candidate
+
+    return None
+
+
 class OpenRouterLLM(OpenAILLM):
     """OpenRouter client using the OpenAI SDK with OpenRouter-specific options."""
 
@@ -184,6 +326,66 @@ class OpenRouterLLM(OpenAILLM):
     ) -> Any:
         if self._uses_deepseek_tool_protocol:
             tool_choice = _force_single_required_deepseek_tool(tools, tool_choice)
+        response = await self._run_chat_with_compat_retry(
+            self._chat_with_prefix_retry,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            kwargs=kwargs,
+        )
+
+        if not self._uses_deepseek_tool_protocol:
+            return response
+        response = normalize_deepseek_response(response, tools=tools)
+        retry_error = _deepseek_tool_protocol_retry_error(response)
+        if retry_error is not None:
+            raise retry_error
+        return response
+
+    async def vision_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str | Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        # Vision requests carry no DeepSeek prefix-retry need, so the inner
+        # call goes straight to the OpenAI implementation.
+        return await self._run_chat_with_compat_retry(
+            super().vision_chat,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            kwargs=kwargs,
+        )
+
+    async def _chat_with_prefix_retry(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str | Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
         try:
             response = await super().chat(
                 messages=messages,
@@ -219,13 +421,77 @@ class OpenRouterLLM(OpenAILLM):
                 **kwargs,
             )
 
-        if not self._uses_deepseek_tool_protocol:
-            return response
-        response = normalize_deepseek_response(response, tools=tools)
-        retry_error = _deepseek_tool_protocol_retry_error(response)
-        if retry_error is not None:
-            raise retry_error
         return response
+
+    async def _run_chat_with_compat_retry(
+        self,
+        call: Callable[..., Any],
+        messages: List[Dict[str, Any]],
+        *,
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: Optional[str | Dict[str, Any]],
+        response_format: Optional[Dict[str, Any]],
+        thinking: Optional[Dict[str, Any]],
+        output_config: Optional[Dict[str, Any]],
+        kwargs: Dict[str, Any],
+    ) -> Any:
+        """Retry ``call`` once per matching OpenRouter provider-compat rule.
+
+        Shared by ``chat`` (wrapping ``_chat_with_prefix_retry``) and
+        ``vision_chat`` (wrapping the inherited ``OpenAILLM.vision_chat``
+        directly). A retryable error raised by the inner call (e.g. the
+        DeepSeek tool-protocol error surfaced after prefix retry) is left for
+        the shared LLM retry wrapper and is never treated as a compat
+        adjustment opportunity.
+        """
+        current_tool_choice = tool_choice
+        current_thinking = thinking
+        attempted: set[str] = set()
+
+        def render(candidate_thinking: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+            return self._prepare_provider_reasoning_extra_body(
+                extra_body={},
+                thinking=candidate_thinking,
+                tools=tools,
+                response_format=response_format,
+                output_config=output_config,
+                is_streaming=False,
+            )
+
+        while True:
+            try:
+                return await call(
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice=current_tool_choice,
+                    response_format=response_format,
+                    thinking=current_thinking,
+                    output_config=output_config,
+                    **kwargs,
+                )
+            except LLMRetryableError:
+                raise
+            except RuntimeError as exc:
+                adjustment = _next_compat_adjustment(
+                    exc,
+                    tools=tools,
+                    tool_choice=current_tool_choice,
+                    thinking=current_thinking,
+                    attempted=attempted,
+                    render=render,
+                )
+                if adjustment is None:
+                    raise
+
+                current_tool_choice, current_thinking, log_message, action_key = (
+                    adjustment
+                )
+                attempted.add(action_key)
+                logger.info(log_message)
 
     async def _stream_chat_with_prefix_retry(
         self,
@@ -280,6 +546,110 @@ class OpenRouterLLM(OpenAILLM):
             yield chunk
 
     async def stream_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str | Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        async for chunk in self._run_stream_chat_with_compat_retry(
+            self._stream_chat_inner,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            kwargs=kwargs,
+        ):
+            yield chunk
+
+    async def _run_stream_chat_with_compat_retry(
+        self,
+        call: Callable[..., AsyncIterator[StreamChunk]],
+        messages: List[Dict[str, Any]],
+        *,
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: Optional[str | Dict[str, Any]],
+        response_format: Optional[Dict[str, Any]],
+        thinking: Optional[Dict[str, Any]],
+        output_config: Optional[Dict[str, Any]],
+        kwargs: Dict[str, Any],
+    ) -> AsyncIterator[StreamChunk]:
+        """Streaming counterpart of ``_run_chat_with_compat_retry``.
+
+        Only retries while nothing has reached the caller yet: once a chunk
+        has actually been yielded, replaying the request would duplicate
+        output, so any later error is raised as-is. Note that for the
+        DeepSeek dict-tool_choice path ``call`` (``_stream_chat_inner``)
+        buffers chunks internally until the tool protocol is validated, so an
+        inner chunk being produced is not the same thing as one having been
+        yielded from here.
+        """
+        has_yielded = False
+        current_tool_choice = tool_choice
+        current_thinking = thinking
+        attempted: set[str] = set()
+
+        def render(candidate_thinking: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+            return self._prepare_provider_reasoning_extra_body(
+                extra_body={},
+                thinking=candidate_thinking,
+                tools=tools,
+                response_format=response_format,
+                output_config=output_config,
+                is_streaming=True,
+            )
+
+        while True:
+            try:
+                async for chunk in call(
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice=current_tool_choice,
+                    response_format=response_format,
+                    thinking=current_thinking,
+                    output_config=output_config,
+                    **kwargs,
+                ):
+                    has_yielded = True
+                    yield chunk
+                return
+            except LLMRetryableError:
+                raise
+            except RuntimeError as exc:
+                if has_yielded:
+                    raise
+
+                adjustment = _next_compat_adjustment(
+                    exc,
+                    tools=tools,
+                    tool_choice=current_tool_choice,
+                    thinking=current_thinking,
+                    attempted=attempted,
+                    render=render,
+                )
+                if adjustment is None:
+                    raise
+
+                current_tool_choice, current_thinking, log_message, action_key = (
+                    adjustment
+                )
+                attempted.add(action_key)
+                logger.info(log_message)
+
+    async def _stream_chat_inner(
         self,
         messages: List[Dict[str, Any]],
         temperature: Optional[float] = None,
