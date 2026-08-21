@@ -1337,19 +1337,29 @@ async def test_openrouter_stream_error_after_first_chunk_not_retried(mocker):
 
 @pytest.mark.asyncio
 async def test_openrouter_compat_retry_does_not_catch_llm_retryable_error(mocker):
-    """A retryable protocol error from the inner call is never a compat adjustment."""
+    """A retryable protocol error is re-raised even when its text matches a rule.
+
+    The error message deliberately matches the relaxed-tool_choice predicate
+    and the call carries tools with tool_choice="required": without the
+    LLMRetryableError guard the compat retry would swallow the error and
+    replay the request, so the single-call assertion pins the guard itself.
+    """
     protocol_error = LLMToolProtocolError(
         provider="deepseek",
         code="malformed_tool_arguments",
-        message="DeepSeek returned malformed arguments.",
+        message=("No endpoints found that support the provided 'tool_choice' value."),
     )
     llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
     prefix_retry_mock = mocker.patch.object(
         llm, "_chat_with_prefix_retry", side_effect=protocol_error
     )
 
-    with pytest.raises(LLMToolProtocolError, match="malformed arguments"):
-        await llm.chat([{"role": "user", "content": "score?"}])
+    with pytest.raises(LLMToolProtocolError, match="No endpoints found"):
+        await llm.chat(
+            [{"role": "user", "content": "score?"}],
+            tools=_two_tool_schema(),
+            tool_choice="required",
+        )
 
     assert prefix_retry_mock.call_count == 1
 
