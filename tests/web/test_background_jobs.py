@@ -1483,7 +1483,8 @@ def test_requeue_stale_skips_actively_progressing_running_job(tmp_path, monkeypa
         db.commit()
         db.refresh(job)
 
-        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        sweep = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        requeued = sweep.requeued
 
         assert requeued == []
         db.refresh(job)
@@ -1514,7 +1515,8 @@ def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monke
         db.commit()
         db.refresh(job)
 
-        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        sweep = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        requeued = sweep.requeued
 
         assert [item.id for item in requeued] == [job.id]
         db.refresh(job)
@@ -1562,7 +1564,8 @@ def test_requeue_stale_fails_job_with_exhausted_attempts(tmp_path, monkeypatch, 
         db.commit()
         db.refresh(job)
 
-        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        sweep = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        requeued = sweep.requeued
 
         assert requeued == []
         db.refresh(job)
@@ -1632,7 +1635,8 @@ def test_requeue_stale_with_celery_never_dispatches_exhausted_job(
         db.refresh(under_budget)
         under_budget_id = under_budget.id
 
-        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        sweep = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        requeued = sweep.requeued
 
         assert apply_async_calls == [under_budget_id]
         assert [item.id for item in requeued] == [under_budget_id]
@@ -1673,11 +1677,62 @@ def test_requeue_stale_skips_job_with_real_progress_write(tmp_path, monkeypatch)
 
         update_job_progress(db, job, message="tick")
 
-        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        sweep = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        requeued = sweep.requeued
 
         assert requeued == []
         db.refresh(job)
         assert job.status == BackgroundJobStatus.RUNNING.value
+    finally:
+        db.close()
+
+
+def test_update_job_progress_with_identical_content_still_advances_updated_at(
+    tmp_path, monkeypatch
+):
+    """A heartbeat write whose content repeats the stored progress must still
+    advance updated_at, or a live job idles straight into the sweep.
+
+    Reachable for real: a web crawl reporting "Crawled N pages" during a
+    stretch with no net-new pages calls update_job_progress with the exact
+    same message/completed/total it already stored.
+    """
+    SessionLocal = _init_test_db(tmp_path / "jobs-identical-progress-heartbeat.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="identical-progress-heartbeat")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"collection": "kb"},
+        )
+        setattr(job, "status", BackgroundJobStatus.RUNNING.value)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        update_job_progress(db, job, message="Crawled 5 pages", completed=5, total=20)
+        stored_progress = dict(job.progress or {})
+
+        old = datetime.now(timezone.utc) - timedelta(hours=3)
+        setattr(job, "updated_at", old)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        aged_updated_at = job.updated_at
+
+        update_job_progress(
+            db,
+            job,
+            message=stored_progress["message"],
+            completed=stored_progress["completed"],
+            total=stored_progress["total"],
+        )
+
+        db.refresh(job)
+        assert job.progress == stored_progress
+        assert job.updated_at != aged_updated_at
     finally:
         db.close()
 
@@ -1731,7 +1786,8 @@ def test_requeue_stale_mixed_batch_returns_only_requeued(tmp_path, monkeypatch):
         db.refresh(under_budget)
         under_budget_id = under_budget.id
 
-        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        sweep = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        requeued = sweep.requeued
 
         assert [item.id for item in requeued] == [under_budget_id]
 
@@ -1795,7 +1851,8 @@ def test_requeue_stale_mixed_batch_returns_only_requeued(tmp_path, monkeypatch):
         db.refresh(under_budget)
         under_budget_id = under_budget.id
 
-        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        sweep = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        requeued = sweep.requeued
 
         assert apply_async_calls == [under_budget_id]
         assert [item.id for item in requeued] == [under_budget_id]
@@ -1865,7 +1922,8 @@ def test_requeue_stale_survives_mark_failed_error(tmp_path, monkeypatch):
         exhausted_prior_status = exhausted.status
         under_budget_id = under_budget.id
 
-        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        sweep = requeue_stale_background_jobs(db, stale_after_seconds=60)
+        requeued = sweep.requeued
 
         assert [item.id for item in requeued] == [under_budget_id]
 

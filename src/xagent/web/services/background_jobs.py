@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from ...config import (
     get_background_job_max_retries,
@@ -40,6 +41,11 @@ TERMINAL_JOB_STATUSES = frozenset(
         BackgroundJobStatus.CANCELLED.value,
     }
 )
+
+
+class SweepResult(NamedTuple):
+    requeued: list["BackgroundJob"]
+    failed_count: int
 
 
 def _is_redis_broker_reachable(broker_url: str) -> bool:
@@ -259,6 +265,10 @@ def update_job_progress(
     if extra:
         progress.update(extra)
     setattr(job, "progress", progress)
+    # A replaced dict that compares equal to the stored value emits no UPDATE,
+    # so onupdate would not advance updated_at; force the write so progress
+    # calls always refresh the liveness timestamp the stale sweep reads.
+    flag_modified(job, "progress")
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -270,7 +280,7 @@ def requeue_stale_background_jobs(
     *,
     stale_after_seconds: int | None = None,
     limit: int = 100,
-) -> list[BackgroundJob]:
+) -> SweepResult:
     """Requeue stale non-terminal jobs that still have retry budget.
 
     Redis/Celery can lose in-flight delivery state during broker loss or worker
@@ -282,14 +292,16 @@ def requeue_stale_background_jobs(
     refresh updated_at, so an actively progressing job is never swept just
     because it has been running a long time. A RUNNING row whose updated_at is
     still NULL (no write since creation) is swept by the NULL-updated_at
-    branch below, which carries no status condition; rows created by this
-    code always have updated_at set (server_default), so that branch exists
-    for legacy rows only.
+    branch below, which carries no status condition. No current code path
+    produces a NULL updated_at -- the column has had a server default since
+    the table's first migration -- so that branch is kept defensively.
 
     A job whose attempts already reached max_attempts is marked FAILED instead
     of requeued; its failure result carries "status", "message", and the last
-    progress snapshot under "last_progress". Returns only the rows it
-    attempted to requeue, never the ones it failed.
+    progress snapshot under "last_progress". Returns a SweepResult: the rows
+    it attempted to requeue (never the ones it failed) and the count of rows
+    it marked failed this pass (only successful mark_job_failed calls count;
+    a row skipped by the per-row guard above is not counted).
 
     This table has not yet adopted the lease pattern used elsewhere in the
     repo (task_lease_service), so a worker that is alive but silent past the
@@ -323,6 +335,10 @@ def requeue_stale_background_jobs(
                     BackgroundJob.updated_at.is_not(None),
                     BackgroundJob.updated_at <= cutoff,
                 ),
+                # A RUNNING row with a NULL updated_at would match this branch
+                # and skip the started_at/liveness check entirely; unreachable
+                # today (updated_at has a server default), kept as a
+                # defensive net.
                 and_(
                     BackgroundJob.updated_at.is_(None),
                     BackgroundJob.created_at.is_not(None),
@@ -403,14 +419,14 @@ def requeue_stale_background_jobs(
         db.add(job)
 
     if not requeue_targets:
-        return requeued
+        return SweepResult(requeued=requeued, failed_count=failed_count)
 
     db.commit()
     for job in requeue_targets:
         db.refresh(job)
 
     if not get_celery_enabled():
-        return requeue_targets
+        return SweepResult(requeued=requeue_targets, failed_count=failed_count)
 
     if get_celery_broker_url() is None:
         error_message = "Celery background jobs are enabled but no broker URL is set"
@@ -422,7 +438,7 @@ def requeue_stale_background_jobs(
         db.commit()
         for job in requeue_targets:
             db.refresh(job)
-        return requeue_targets
+        return SweepResult(requeued=requeue_targets, failed_count=failed_count)
 
     from ..jobs.tasks import execute_background_job
 
@@ -452,7 +468,7 @@ def requeue_stale_background_jobs(
     for job in requeued:
         db.refresh(job)
 
-    return requeued
+    return SweepResult(requeued=requeued, failed_count=failed_count)
 
 
 def mark_job_succeeded(

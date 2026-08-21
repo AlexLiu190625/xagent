@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from ..models.background_job import BackgroundJob
 from ..models.database import get_session_local, init_db
 from ..services.background_jobs import (
+    SweepResult,
     requeue_stale_background_jobs,
     update_job_progress,
 )
@@ -43,6 +44,21 @@ def _reap_and_pause_stale_preview_runs(db: Session) -> int:
             )
         )
     return len(reaped_pause_targets)
+
+
+def _sweep_stale_jobs(db: Session) -> SweepResult:
+    """Run the stale-job sweep without letting its failure poison the tick.
+
+    Shared by both sync trigger-scan entrypoints below. A flush-level failure
+    inside the sweep leaves the session needing rollback; roll it back here so
+    the rest of the tick keeps a usable session.
+    """
+    try:
+        return requeue_stale_background_jobs(db)
+    except Exception:
+        logger.exception("Stale background job sweep failed this tick")
+        db.rollback()
+        return SweepResult(requeued=[], failed_count=0)
 
 
 def handle_trigger_event(db: Session, job: BackgroundJob) -> dict[str, Any]:
@@ -95,11 +111,7 @@ def handle_trigger_event(db: Session, job: BackgroundJob) -> dict[str, Any]:
 def handle_trigger_scan(db: Session, job: BackgroundJob) -> dict[str, Any]:
     payload = dict(job.payload or {})
     update_job_progress(db, job, message="Scanning scheduled triggers")
-    try:
-        requeued_jobs = requeue_stale_background_jobs(db)
-    except Exception:
-        logger.exception("Stale background job sweep failed this tick")
-        requeued_jobs = []
+    sweep = _sweep_stale_jobs(db)
     runs = scan_due_scheduled_triggers(db)
     # This is the BackgroundJob-driven variant of the same scan
     # `scan_due_triggers` below runs for Celery Beat -- the reaper must run
@@ -109,7 +121,8 @@ def handle_trigger_scan(db: Session, job: BackgroundJob) -> dict[str, Any]:
     return {
         "status": "scanned",
         "scan_scope": payload.get("scope", "all"),
-        "requeued_stale_jobs": len(requeued_jobs),
+        "requeued_stale_jobs": len(sweep.requeued),
+        "failed_stale_jobs": sweep.failed_count,
         "trigger_runs_created": len(runs),
         "reaped_preview_run_pause_dispatches": reaped_preview_run_pause_dispatches,
         "processed_at": datetime.now(timezone.utc).isoformat(),
@@ -134,18 +147,15 @@ def scan_due_triggers() -> dict[str, Any]:
 
     db = SessionLocal()
     try:
-        try:
-            requeued_jobs = requeue_stale_background_jobs(db)
-        except Exception:
-            logger.exception("Stale background job sweep failed this tick")
-            requeued_jobs = []
+        sweep = _sweep_stale_jobs(db)
         runs = scan_due_scheduled_triggers(db)
         # Only counts reaped runs whose Task was still RUNNING (i.e. that
         # needed an explicit PAUSE dispatch), not every reaped run.
         reaped_preview_run_pause_dispatches = _reap_and_pause_stale_preview_runs(db)
         return {
             "status": "ok",
-            "requeued_stale_jobs": len(requeued_jobs),
+            "requeued_stale_jobs": len(sweep.requeued),
+            "failed_stale_jobs": sweep.failed_count,
             "trigger_runs_created": len(runs),
             "reaped_preview_run_pause_dispatches": reaped_preview_run_pause_dispatches,
             "processed_at": datetime.now(timezone.utc).isoformat(),
