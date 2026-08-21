@@ -1480,3 +1480,159 @@ async def test_openrouter_deepseek_no_op_thinking_retry_falls_through_to_next_ru
     assert mock_client.chat.completions.create.await_count == 2
     second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
     assert second_call["extra_body"]["thinking"] == {"type": "enabled"}
+
+
+# ==========================================================================
+# Client-layer equivalents of the RouterLLM-level retry tests that used to
+# live in tests/core/model/test_router_provider_config.py (moved here because
+# RouterLLM no longer retries on its own; see router.py).
+# ==========================================================================
+
+
+@pytest.mark.asyncio
+async def test_openrouter_direct_disables_thinking_for_tool_choice_conflict(mocker):
+    """chat: a thinking/tool_choice 400 retries once with thinking disabled.
+
+    Starting from an already-enabled thinking value keeps the disable
+    adjustment a real change (not a no-op), isolating this single rule.
+    """
+    calls: list[dict] = []
+
+    async def fake_inner(messages, **kwargs):
+        del messages
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError(_THINKING_TOOL_CHOICE_ERROR)
+        return "ok"
+
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    mocker.patch.object(llm, "_chat_with_prefix_retry", side_effect=fake_inner)
+
+    result = await llm.chat(
+        [{"role": "user", "content": "score?"}],
+        tool_choice="required",
+        thinking={"type": "enabled", "enable": True},
+    )
+
+    assert result == "ok"
+    assert len(calls) == 2
+    assert calls[0]["tool_choice"] == "required"
+    assert calls[0]["thinking"] == {"type": "enabled", "enable": True}
+    assert calls[1]["tool_choice"] == "required"
+    assert calls[1]["thinking"] == openrouter_module._DISABLE_DOWNSTREAM_THINKING
+
+
+@pytest.mark.asyncio
+async def test_openrouter_stream_disables_thinking_for_tool_choice_conflict(mocker):
+    """stream_chat: same rule as above, exercised on the streaming entrypoint."""
+    calls: list[dict] = []
+
+    async def rejects(**_kwargs):
+        if False:
+            yield None
+        raise RuntimeError(_THINKING_TOOL_CHOICE_ERROR)
+
+    async def succeeds(**_kwargs):
+        yield StreamChunk(type=ChunkType.TOKEN, content="ok", delta="ok")
+
+    def fake_inner(messages, **kwargs):
+        del messages
+        calls.append(kwargs)
+        return rejects() if len(calls) == 1 else succeeds()
+
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    mocker.patch.object(llm, "_stream_chat_inner", side_effect=fake_inner)
+
+    chunks = [
+        chunk
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            tool_choice="required",
+            thinking={"type": "enabled", "enable": True},
+        )
+    ]
+
+    assert [chunk.delta for chunk in chunks] == ["ok"]
+    assert len(calls) == 2
+    assert calls[0]["tool_choice"] == "required"
+    assert calls[0]["thinking"] == {"type": "enabled", "enable": True}
+    assert calls[1]["tool_choice"] == "required"
+    assert calls[1]["thinking"] == openrouter_module._DISABLE_DOWNSTREAM_THINKING
+
+
+@pytest.mark.asyncio
+async def test_openrouter_stream_disables_thinking_when_unspecified_non_deepseek(
+    mocker,
+):
+    """stream_chat: an unspecified (None) thinking value still gets a real
+    disable retry for a non-DeepSeek model.
+
+    DeepSeek's None default already renders as disabled (see the no-op test
+    below), so this covers the case where starting from None is a genuine
+    adjustment: any non-DeepSeek slug, where an unset thinking value renders
+    as an empty extra_body rather than an explicit disabled one.
+    """
+    calls: list[dict] = []
+
+    async def rejects(**_kwargs):
+        if False:
+            yield None
+        raise RuntimeError(_THINKING_TOOL_CHOICE_ERROR)
+
+    async def succeeds(**_kwargs):
+        yield StreamChunk(type=ChunkType.TOKEN, content="ok", delta="ok")
+
+    def fake_inner(messages, **kwargs):
+        del messages
+        calls.append(kwargs)
+        return rejects() if len(calls) == 1 else succeeds()
+
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    mocker.patch.object(llm, "_stream_chat_inner", side_effect=fake_inner)
+
+    chunks = [
+        chunk
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            tool_choice="required",
+        )
+    ]
+
+    assert [chunk.delta for chunk in chunks] == ["ok"]
+    assert len(calls) == 2
+    assert calls[0]["thinking"] is None
+    assert calls[1]["tool_choice"] == "required"
+    assert calls[1]["thinking"] == openrouter_module._DISABLE_DOWNSTREAM_THINKING
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_stream_no_op_thinking_default_propagates(mocker):
+    """stream_chat: DeepSeek's unspecified (None) thinking already renders
+    disabled, so a thinking/tool_choice 400 is a no-op for rule 2; with no
+    other rule matching this text, the error surfaces after exactly one call
+    instead of wasting a retry replaying an unchanged request.
+    """
+    calls = 0
+
+    async def rejects():
+        if False:
+            yield None
+        raise RuntimeError(_THINKING_TOOL_CHOICE_ERROR)
+
+    def fake_inner(*_args, **kwargs):
+        nonlocal calls
+        del kwargs
+        calls += 1
+        return rejects()
+
+    llm = OpenRouterLLM(model_name="deepseek/deepseek-v4-flash", api_key="test-key")
+    mocker.patch.object(llm, "_stream_chat_inner", side_effect=fake_inner)
+
+    with pytest.raises(RuntimeError, match="Thinking mode does not support"):
+        async for _chunk in llm.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            tool_choice="required",
+        ):
+            pass
+
+    assert calls == 1
