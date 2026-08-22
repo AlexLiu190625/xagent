@@ -40,6 +40,12 @@ def register_background_job_handler(
 ) -> None:
     """Register a handler for a job type defined outside this package.
 
+    A handler that runs longer than the stale window must call
+    update_job_progress from within its own run, not just at the start: that
+    is what the stale sweep reads to tell a live handler from a hung one. A
+    handler that goes silent past the window is treated as hung, and once its
+    retry budget is exhausted the sweep marks the row FAILED.
+
     Args:
         job_type: Durable ``BackgroundJob.job_type`` value the handler owns.
         handler: Callable invoked by ``_execute_job_handler`` for that job type.

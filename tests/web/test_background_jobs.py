@@ -1790,6 +1790,7 @@ def test_requeue_stale_mixed_batch_returns_only_requeued(tmp_path, monkeypatch):
         requeued = sweep.requeued
 
         assert [item.id for item in requeued] == [under_budget_id]
+        assert sweep.failed_count == 1
 
         db.refresh(exhausted)
         assert exhausted.status == BackgroundJobStatus.FAILED.value
@@ -1856,6 +1857,7 @@ def test_requeue_stale_mixed_batch_returns_only_requeued(tmp_path, monkeypatch):
 
         assert apply_async_calls == [under_budget_id]
         assert [item.id for item in requeued] == [under_budget_id]
+        assert sweep.failed_count == 1
 
         db.refresh(exhausted)
         assert exhausted.status == BackgroundJobStatus.FAILED.value
@@ -1944,6 +1946,125 @@ def test_requeue_stale_survives_mark_failed_error(tmp_path, monkeypatch):
 
         db.refresh(under_budget)
         assert under_budget.status == BackgroundJobStatus.PENDING.value
+    finally:
+        db.close()
+
+
+def test_requeue_stale_skips_row_that_reached_terminal_state_mid_sweep(
+    tmp_path, monkeypatch
+):
+    """A row that reaches a terminal state between the sweep's SELECT and its
+    write must not be overwritten, and must not be counted as failed.
+
+    Simulates a live worker finishing the job concurrently with the sweep: the
+    row is exhausted and stale at SELECT time, but a separate session flips it
+    to SUCCEEDED before the sweep's own write. Hooked at the per-row log call
+    that fires right after selection and right before the write -- the only
+    point available without an actual second thread/process racing the sweep.
+    """
+    from xagent.web.services import background_jobs as bg_module
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-terminal-race.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="terminal-race")
+        old = datetime.now(timezone.utc) - timedelta(hours=3)
+
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"collection": "kb"},
+            max_attempts=3,
+        )
+        setattr(job, "status", BackgroundJobStatus.RUNNING.value)
+        setattr(job, "attempts", 3)
+        setattr(job, "started_at", old)
+        setattr(job, "updated_at", old)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+        real_result = {"status": "success", "message": "finished before the sweep"}
+        real_warning = bg_module.logger.warning
+        hook_calls: list[str] = []
+
+        def hooked_warning(msg, *args, **kwargs):
+            hook_calls.append(msg)
+            if len(hook_calls) == 1:
+                other_db = SessionLocal()
+                try:
+                    other_job = (
+                        other_db.query(BackgroundJob)
+                        .filter(BackgroundJob.id == job_id)
+                        .first()
+                    )
+                    setattr(other_job, "status", BackgroundJobStatus.SUCCEEDED.value)
+                    setattr(other_job, "error_message", None)
+                    setattr(other_job, "result", real_result)
+                    other_db.add(other_job)
+                    other_db.commit()
+                finally:
+                    other_db.close()
+            return real_warning(msg, *args, **kwargs)
+
+        monkeypatch.setattr(bg_module.logger, "warning", hooked_warning)
+
+        sweep = requeue_stale_background_jobs(db, stale_after_seconds=60)
+
+        assert hook_calls, "the hook never fired; this test proves nothing"
+        assert sweep.requeued == []
+        assert sweep.failed_count == 0
+
+        db.expire_all()
+        refreshed = db.query(BackgroundJob).filter(BackgroundJob.id == job_id).first()
+        assert refreshed is not None
+        assert refreshed.status == BackgroundJobStatus.SUCCEEDED.value
+        assert refreshed.result == real_result
+        assert refreshed.error_message is None
+    finally:
+        db.close()
+
+
+def test_requeue_stale_requeues_job_one_attempt_below_budget(tmp_path, monkeypatch):
+    """A row one attempt below max_attempts is still under budget: requeued,
+    not retired. Pins the boundary itself (attempts == max_attempts - 1),
+    distinct from the exhausted case (attempts == max_attempts).
+    """
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-one-below-budget.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="one-below-budget")
+        old = datetime.now(timezone.utc) - timedelta(hours=3)
+
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"collection": "kb"},
+            max_attempts=3,
+        )
+        setattr(job, "status", BackgroundJobStatus.RUNNING.value)
+        setattr(job, "attempts", 2)
+        setattr(job, "started_at", old)
+        setattr(job, "updated_at", old)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        sweep = requeue_stale_background_jobs(db, stale_after_seconds=60)
+
+        assert [item.id for item in sweep.requeued] == [job.id]
+        assert sweep.failed_count == 0
+        db.refresh(job)
+        assert job.status == BackgroundJobStatus.PENDING.value
     finally:
         db.close()
 

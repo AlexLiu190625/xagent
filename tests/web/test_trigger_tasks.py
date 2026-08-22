@@ -144,7 +144,7 @@ def test_handle_trigger_scan_survives_stale_sweep_failure(
         )
         db_arg.add(duplicate)
         db_arg.flush()
-        return []
+        return SweepResult(requeued=[], failed_count=0)
 
     scan_calls: list[object] = []
 
@@ -207,7 +207,7 @@ def test_scan_due_triggers_survives_stale_sweep_failure(tmp_path, monkeypatch) -
         )
         db_arg.add(duplicate)
         db_arg.flush()
-        return []
+        return SweepResult(requeued=[], failed_count=0)
 
     scan_calls: list[int] = []
 
@@ -228,3 +228,60 @@ def test_scan_due_triggers_survives_stale_sweep_failure(tmp_path, monkeypatch) -
 
     assert result["requeued_stale_jobs"] == 0
     assert scan_calls == [0]
+
+
+def test_handle_trigger_scan_surfaces_failed_stale_jobs_count(
+    tmp_path, monkeypatch
+) -> None:
+    """failed_stale_jobs in the result must reflect the sweep's own count,
+    not be silently dropped or hardcoded."""
+    SessionLocal = _init_test_db(tmp_path / "trigger-scan-failed-count.db")
+    db = SessionLocal()
+    user = _create_user(db)
+
+    monkeypatch.setattr(
+        trigger_tasks,
+        "requeue_stale_background_jobs",
+        lambda _db: SweepResult(requeued=[], failed_count=2),
+    )
+    monkeypatch.setattr(trigger_tasks, "scan_due_scheduled_triggers", lambda _db: [])
+    monkeypatch.setattr(
+        trigger_tasks, "reap_stale_preview_workforce_runs", MagicMock(return_value=[])
+    )
+
+    job = BackgroundJob(
+        user_id=int(user.id),
+        job_type=BackgroundJobType.TRIGGER_SCAN.value,
+        payload={},
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    result = trigger_tasks.handle_trigger_scan(db, job)
+
+    assert result["failed_stale_jobs"] == 2
+    assert result["requeued_stale_jobs"] == 0
+
+
+def test_scan_due_triggers_surfaces_failed_stale_jobs_count(
+    tmp_path, monkeypatch
+) -> None:
+    """Same propagation check as handle_trigger_scan's, for the Celery Beat
+    entrypoint."""
+    _init_test_db(tmp_path / "scan-due-triggers-failed-count.db")
+
+    monkeypatch.setattr(
+        trigger_tasks,
+        "requeue_stale_background_jobs",
+        lambda _db: SweepResult(requeued=[], failed_count=2),
+    )
+    monkeypatch.setattr(trigger_tasks, "scan_due_scheduled_triggers", lambda _db: [])
+    monkeypatch.setattr(
+        trigger_tasks, "reap_stale_preview_workforce_runs", MagicMock(return_value=[])
+    )
+
+    result = trigger_tasks.scan_due_triggers()
+
+    assert result["failed_stale_jobs"] == 2
+    assert result["requeued_stale_jobs"] == 0

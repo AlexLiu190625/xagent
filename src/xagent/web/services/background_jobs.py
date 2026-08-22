@@ -44,7 +44,7 @@ TERMINAL_JOB_STATUSES = frozenset(
 
 
 class SweepResult(NamedTuple):
-    requeued: list["BackgroundJob"]
+    requeued: list[BackgroundJob]
     failed_count: int
 
 
@@ -306,12 +306,13 @@ def requeue_stale_background_jobs(
     This table has not yet adopted the lease pattern used elsewhere in the
     repo (task_lease_service), so a worker that is alive but silent past the
     cutoff can still race this sweep and later overwrite the terminal state
-    it writes. A redelivery of a budget-exhausted row is always
-    refused without writing anything, so Celery acks the message and no further redelivery exists for
-    it; the sweep is the path that later turns such a row terminal, though
-    other enqueue paths can still transition a row independently before then.
+    it writes. This function owns the transaction boundary of the session it
+    is given: it commits per retired row and rolls back on a failed write.
     """
     stale_seconds = stale_after_seconds or get_background_job_stale_seconds()
+    # cutoff is computed on the app server's clock; updated_at is written by
+    # the database's clock. The default window (hours) dwarfs realistic clock
+    # skew between the two, so no synchronization between them is attempted.
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
     requeue_statuses = {
         BackgroundJobStatus.PENDING.value,
@@ -358,7 +359,7 @@ def requeue_stale_background_jobs(
     failed_count = 0
     for job in stale_jobs:
         if int(job.attempts or 0) >= int(job.max_attempts or 1):
-            logger.error(
+            logger.warning(
                 "Failing stale background job %s type=%s status=%s: retry budget exhausted (attempts=%s, max_attempts=%s)",
                 job.id,
                 job.job_type,
@@ -372,6 +373,14 @@ def requeue_stale_background_jobs(
                 "not requeueing"
             )
             try:
+                db.refresh(job)
+                if str(job.status) in TERMINAL_JOB_STATUSES:
+                    logger.info(
+                        "Skipping stale background job %s: already %s",
+                        job.id,
+                        job.status,
+                    )
+                    continue
                 mark_job_failed(
                     db,
                     job,
@@ -387,6 +396,21 @@ def requeue_stale_background_jobs(
                     "Failed to mark budget-exhausted background job %s as failed",
                     job.id,
                 )
+                # The commit inside mark_job_failed may have durably succeeded
+                # even though a later step in that call (e.g. its post-commit
+                # refresh) raised; check what actually landed instead of
+                # assuming the write was lost. This session's sessionmaker has
+                # autoflush=False (models/database.py), so this query only
+                # ever reads what is already committed, never triggers the
+                # very write we are trying to classify.
+                committed_status = (
+                    db.query(BackgroundJob.status)
+                    .filter(BackgroundJob.id == job.id)
+                    .scalar()
+                )
+                if committed_status == BackgroundJobStatus.FAILED.value:
+                    failed_count += 1
+                    continue
                 db.rollback()
                 continue
             failed_count += 1
