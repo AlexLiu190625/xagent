@@ -46,6 +46,7 @@ from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import ops_signals
 from xagent.web.services.task_interaction_close import (
     _classify_close_rowcount,
+    active_interaction_id_sync,
     clear_interaction_marker_if_unpaired,
     close_legacy_resume_interaction,
     close_legacy_resume_interaction_sync,
@@ -372,6 +373,57 @@ def test_clear_marker_if_unpaired_no_ops_when_the_interaction_table_does_not_exi
         db.query(Task).filter(Task.id == task_id).one().interaction_protocol_version
         == 1
     )
+
+
+# --------------------------------------------------------------------------
+# active_interaction_id_sync -- the pre-injection read whose result the close
+# binds to. Every caller reaches it through a patched name, so the body is
+# exercised here: the id it returns for a live row, and the two shapes that
+# must degrade to None rather than to a wrong id.
+# --------------------------------------------------------------------------
+
+
+def test_active_interaction_id_sync_returns_the_live_rows_id(db) -> None:
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    row_id = seed_active_row(db, task_id=task_id, run_id="run-a")
+
+    assert active_interaction_id_sync(task_id) == row_id
+
+
+def test_active_interaction_id_sync_returns_none_without_the_interaction_table(
+    db_without_interaction_table,
+) -> None:
+    db = db_without_interaction_table
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    db.query(Task).filter(Task.id == task_id).update(
+        {Task.run_id: "run-a", Task.interaction_protocol_version: 1}
+    )
+    db.commit()
+
+    assert active_interaction_id_sync(task_id) is None
+
+
+def test_active_interaction_id_sync_returns_none_when_the_read_fails(
+    db, monkeypatch, caplog
+) -> None:
+    """A failing read must return None, not raise: the caller is on the
+    injection path, and None closes nothing, while an exception would take
+    the injection down with it."""
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    seed_active_row(db, task_id=task_id, run_id="run-a")
+
+    def _fail():
+        raise sa.exc.OperationalError("SELECT 1", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(
+        "xagent.web.services.task_interaction_close.get_session_local", _fail
+    )
+
+    with caplog.at_level(logging.WARNING, logger=_CLOSE_MODULE_NAME):
+        assert active_interaction_id_sync(task_id) is None
+
+    assert [record.levelno for record in caplog.records] == [logging.WARNING]
 
 
 # --------------------------------------------------------------------------
