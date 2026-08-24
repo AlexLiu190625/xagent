@@ -376,10 +376,15 @@ def error_frame(code: str, *, message: str | None = None) -> str:
     either way, so an unrecognized ``code`` raises ``KeyError`` whether
     or not a ``message`` was passed -- the check is on the code, not on
     which optional argument the caller supplied.
+
+    An explicitly empty ``message`` is kept as-is rather than falling
+    back to the default: only an omitted override (``None``) selects
+    ``_ERROR_MESSAGES[code]``.
     """
     default_message = _ERROR_MESSAGES[code]
     return _sse_frame(
-        "stream.error", {"code": code, "message": message or default_message}
+        "stream.error",
+        {"code": code, "message": message if message is not None else default_message},
     )
 
 

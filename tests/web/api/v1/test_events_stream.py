@@ -286,6 +286,17 @@ def test_error_frame_rejects_an_unknown_code_with_or_without_a_message():
     assert data == {"code": "task_deleted", "message": "custom text"}
 
 
+def test_error_frame_keeps_an_explicitly_empty_message():
+    """``message or default_message`` used to fold an explicitly empty
+    string into the code's default wording -- indistinguishable from
+    the caller never having passed an override at all. Only an omitted
+    override (``None``) should select the default; an explicit ``""``
+    is a value the caller chose and must reach the client as-is."""
+    frame = es.error_frame("task_deleted", message="")
+    data = json.loads(frame.split("data: ", 1)[1])
+    assert data == {"code": "task_deleted", "message": ""}
+
+
 # ===== sink.send_text never raises =====
 
 
