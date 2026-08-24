@@ -203,6 +203,37 @@ describe("OfficialMcpSettingsDialog connected-state actions", () => {
 
     expect(screen.queryByRole("button", { name: "tools.mcp.dialog.configure" })).toBeNull()
   })
+
+  it("shows the ownership badge for an unconnected entry that carries a sharing status (#1623)", () => {
+    authState.inTeam = true
+    renderDialog({
+      app: app({
+        auth_type: "mcp_oauth",
+        is_custom: true,
+        server_id: 9,
+        shared: true,
+        is_owner: false,
+        needs_config: false,
+      }),
+      isGloballyConnected: false,
+    })
+
+    expect(screen.getByText("tools.mcp.sharing.teamTool")).toBeInTheDocument()
+  })
+
+  it("withholds the ownership badge for an entry with no sharing status (#1623)", () => {
+    authState.inTeam = true
+    // The Tools page's hand-built shape: a server_id, isGloballyConnected
+    // true, and no shared/is_owner/needs_config at all.
+    renderDialog({
+      app: app({ auth_type: "builtin_oauth", server_id: 9 }),
+      isGloballyConnected: true,
+    })
+
+    expect(screen.queryByText("tools.mcp.sharing.private")).toBeNull()
+    expect(screen.queryByText("tools.mcp.sharing.shared")).toBeNull()
+    expect(screen.queryByText("tools.mcp.sharing.teamTool")).toBeNull()
+  })
 })
 
 describe("OfficialMcpSettingsDialog connect trigger", () => {

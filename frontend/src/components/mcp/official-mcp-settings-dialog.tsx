@@ -218,7 +218,18 @@ export function OfficialMcpSettingsDialog({
             </div>
           )}
 
-          {inTeam && isGloballyConnected && Number.isInteger(app.server_id) && (
+          {/* The ownership badge reports team-sharing status, which is not a
+              credential fact, so it does not gate on isGloballyConnected.
+              Number.isInteger(app.server_id) requires the entry to have a
+              sharing identity at all; without it an entry with no connector id
+              would render "Private" from a shared field nobody set.
+              app.shared !== undefined holds only once the sharing route has
+              actually answered for this entry -- the picker's merge only ever
+              writes a sanitized triple, and the Tools page only spreads
+              shared/is_owner/needs_config here when its own lookup through the
+              same sanitizer survives -- so this term can never be true from a
+              guess. */}
+          {inTeam && Number.isInteger(app.server_id) && app.shared !== undefined && (
             <div className={`mb-4 inline-flex items-center px-3 py-1 rounded-full text-sm font-medium border ${app.shared ? 'bg-blue-50 border-blue-100 text-blue-700' : 'bg-slate-50 border-slate-200 text-slate-600'}`}>
               {!app.shared
                 ? t('tools.mcp.sharing.private')
