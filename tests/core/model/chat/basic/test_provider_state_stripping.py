@@ -15,12 +15,22 @@ not need this file to change.
 
 from __future__ import annotations
 
+import importlib
+import pkgutil
 from typing import Any
 
 import pytest
 
+import xagent.core.model.chat.basic as basic_pkg
+from xagent.core.model.chat.basic.azure_openai import AzureOpenAILLM
+from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.claude import ClaudeLLM
+from xagent.core.model.chat.basic.dashscope import DashScopeLLM
+from xagent.core.model.chat.basic.deepseek import DeepSeekLLM
 from xagent.core.model.chat.basic.gemini import GeminiLLM
+from xagent.core.model.chat.basic.openai import OpenAICompatibleLLM, OpenAILLM
+from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
+from xagent.core.model.chat.basic.router import RouterLLM, _ResolvedRouterLLM
 from xagent.core.model.chat.basic.xinference import XinferenceLLM
 from xagent.core.model.chat.basic.zhipu import ZhipuLLM
 from xagent.core.model.chat.types import PROVIDER_STATE_METADATA_KEY
@@ -117,3 +127,115 @@ async def test_xinference_chat_strips_internal_keys_before_the_sdk_call(mocker):
     await llm.chat(_MARKED_HISTORY)
 
     _assert_no_internal_keys(handle.received_messages)
+
+
+# --- Discovery guard: every BaseLLM subclass must be accounted for ---------
+#
+# The tests above cover four clients by name. That list goes stale silently
+# the moment a new BaseLLM subclass is added and nobody remembers to give it
+# the same coverage. The two registries and the test below turn that into a
+# loud failure: every concrete BaseLLM subclass found anywhere under
+# ``xagent.core.model.chat.basic`` must appear in one of them, or the
+# discovery test fails and names the class that is missing.
+
+# Classes with a dedicated leak-guard test, here or elsewhere:
+#   - ClaudeLLM / GeminiLLM / ZhipuLLM / XinferenceLLM: the four tests above.
+#   - OpenAILLM: test_openai.py::test_internal_xagent_message_keys_are_stripped
+#     exercises _build_request_messages -> _strip_internal_message_keys
+#     directly.
+#   - DeepSeekLLM / OpenRouterLLM / AzureOpenAILLM / DashScopeLLM: none of
+#     these override _prepare_messages_for_request's sanitization step or
+#     _strip_internal_message_keys, so they run OpenAILLM's own
+#     _build_request_messages unchanged and are covered by the same test.
+_STRIP_GUARD_COVERED: frozenset[type] = frozenset(
+    {
+        ClaudeLLM,
+        GeminiLLM,
+        ZhipuLLM,
+        XinferenceLLM,
+        OpenAILLM,
+        DeepSeekLLM,
+        OpenRouterLLM,
+        AzureOpenAILLM,
+        DashScopeLLM,
+    }
+)
+
+# Classes deliberately excluded, with why leaking is structurally impossible
+# for them rather than merely untested:
+_STRIP_GUARD_EXEMPT: dict[type, str] = {
+    OpenAICompatibleLLM: (
+        "intermediate base for the OpenAI-protocol clients above; never "
+        "constructed directly as a provider, so it has no wire request of "
+        "its own to check."
+    ),
+    RouterLLM: (
+        "the virtual auto-router: chat/vision_chat/stream_chat resolve a "
+        "downstream BaseLLM and forward the same message list object to it "
+        "unchanged (see router.py); it never reads or copies a message "
+        "dict itself, so the downstream client's own guard is what runs."
+    ),
+    _ResolvedRouterLLM: (
+        "a thin per-call wrapper around one resolved downstream client; "
+        "same reasoning as RouterLLM above."
+    ),
+}
+
+
+def _all_basellm_subclasses() -> set[type]:
+    """Recursively discover every production BaseLLM subclass registered so far.
+
+    Imports every module under ``xagent.core.model.chat.basic`` first, so a
+    subclass defined in a module nothing else in this test file happens to
+    import still gets registered on ``BaseLLM.__subclasses__()`` before the
+    walk below runs.
+
+    ``BaseLLM.__subclasses__()`` is a process-wide registry: it also picks up
+    test-double subclasses defined inside other test modules once pytest has
+    collected them (e.g. a scripted fake LLM used to exercise the router).
+    Those are excluded by module, not by name, since this file has no way to
+    tell "a fake used only in one test" from "a real provider" other than
+    where the class is defined: only classes whose ``__module__`` lives
+    under ``xagent.core.model.chat.basic`` itself count as production
+    clients this guard is responsible for.
+    """
+    for _, module_name, _ in pkgutil.iter_modules(basic_pkg.__path__):
+        importlib.import_module(f"{basic_pkg.__name__}.{module_name}")
+
+    discovered: set[type] = set()
+
+    def _walk(cls: type) -> None:
+        for subclass in cls.__subclasses__():
+            if subclass in discovered:
+                continue
+            discovered.add(subclass)
+            _walk(subclass)
+
+    _walk(BaseLLM)
+    _production_prefix = f"{basic_pkg.__name__}."
+    return {
+        subclass
+        for subclass in discovered
+        if subclass.__module__.startswith(_production_prefix)
+    }
+
+
+def test_every_basellm_subclass_is_accounted_for_by_the_strip_guard():
+    """A newly added BaseLLM subclass with no leak-guard coverage must fail
+    here, not go unnoticed. This test does not re-verify the four dedicated
+    tests' outcome (they already do); it only verifies that every subclass
+    that exists is *known* to one of the two registries above.
+    """
+    discovered = _all_basellm_subclasses()
+    unaccounted = discovered - _STRIP_GUARD_COVERED - set(_STRIP_GUARD_EXEMPT)
+
+    assert not unaccounted, (
+        "New BaseLLM subclass(es) with no _xagent_ leak-guard coverage: "
+        f"{sorted(cls.__qualname__ for cls in unaccounted)}. Add a "
+        "dedicated test asserting no '_xagent_'-prefixed message key "
+        "reaches this client's wire request (see the ClaudeLLM/ZhipuLLM "
+        "tests above for the two known-good shapes) and add the class to "
+        "_STRIP_GUARD_COVERED, or if it never reads/copies a message dict "
+        "itself, add it to _STRIP_GUARD_EXEMPT with a comment explaining "
+        "why."
+    )

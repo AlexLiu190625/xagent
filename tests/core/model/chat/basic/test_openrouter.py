@@ -2443,6 +2443,63 @@ async def test_openrouter_deepseek_stream_provider_state_survives_tool_truncatio
 
 
 @pytest.mark.asyncio
+async def test_openrouter_deepseek_stream_replays_reasoning_content(mocker):
+    """Streaming counterpart of I-4 (``test_openrouter_deepseek_replays_
+    reasoning_content``): ``stream_chat`` runs through the same
+    ``_build_request_messages`` / ``_prepare_messages_for_request`` path as
+    ``chat``, so captured provider state on a prior assistant tool-call
+    message must be translated back to ``reasoning_content`` on the request
+    the stream entry point actually sends, not just on the non-streaming
+    entry point.
+    """
+
+    async def stream():
+        yield _tool_call_delta_chunk(
+            call_id="call_2",
+            index=0,
+            name="search",
+            arguments='{"query":"xagent"}',
+            finish_reason="tool_calls",
+        )
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = stream()
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(model_name="deepseek/deepseek-v4-flash", api_key="test-key")
+    messages = [
+        {"role": "user", "content": "Search xagent"},
+        {
+            "role": "assistant",
+            "content": "",
+            PROVIDER_STATE_METADATA_KEY: _deepseek_provider_state("prior thought"),
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+    ]
+
+    chunks = [
+        chunk
+        async for chunk in llm.stream_chat(
+            messages, tools=_single_tool_schema("search")
+        )
+    ]
+
+    assert chunks, "expected at least one streamed chunk"
+    call_messages = mock_client.chat.completions.create.call_args.kwargs["messages"]
+    assert call_messages[1]["reasoning_content"] == "prior thought"
+    assert PROVIDER_STATE_METADATA_KEY not in call_messages[1]
+
+
+@pytest.mark.asyncio
 async def test_openrouter_deepseek_default_first_turn_request_is_byte_identical(
     mocker, mock_chat_completion
 ):
@@ -2826,6 +2883,104 @@ async def test_openrouter_deepseek_no_warning_when_thinking_not_requested(
             tools=_single_tool_schema("search"),
         )
 
+    assert not any(
+        "no reasoning content was captured" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_stream_warns_when_capture_misses_all_known_spellings(
+    mocker, caplog
+):
+    """Streaming counterpart of
+    ``test_openrouter_deepseek_warns_when_capture_misses_all_known_spellings``:
+    the non-streaming WARNING in ``_response_provider_state`` has no
+    streaming equivalent before this test -- ``_check_stream_reasoning_
+    capture`` closes that gap. Same gate, checked over the whole stream
+    instead of one response body: thinking requested, the stream ends with
+    a tool call, but no delta ever carried a recognized reasoning field.
+    """
+    import logging
+
+    async def stream():
+        yield _tool_call_delta_chunk(
+            call_id="call_1",
+            index=0,
+            name="search",
+            arguments='{"query":"xagent"}',
+            finish_reason="tool_calls",
+        )
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = stream()
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(model_name="deepseek/deepseek-v4-flash", api_key="test-key")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.model.chat.basic.openrouter"
+    ):
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Search xagent"}],
+                tools=_single_tool_schema("search"),
+                thinking={"type": "enabled"},
+            )
+        ]
+
+    assert chunks
+    assert any(
+        "no reasoning content was captured" in record.message
+        for record in caplog.records
+    )
+    assert not any("Search xagent" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_stream_no_warning_when_thinking_not_requested(
+    mocker, caplog
+):
+    """Streaming counterpart of
+    ``test_openrouter_deepseek_no_warning_when_thinking_not_requested``: an
+    empty capture is expected (not a spelling-drift signal) on the ordinary
+    path where thinking was never requested -- the current PR-1 default for
+    every deepseek slug, and the highest-traffic streaming path today.
+    """
+    import logging
+
+    async def stream():
+        yield _tool_call_delta_chunk(
+            call_id="call_1",
+            index=0,
+            name="search",
+            arguments='{"query":"xagent"}',
+            finish_reason="tool_calls",
+        )
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = stream()
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(model_name="deepseek/deepseek-v4-flash", api_key="test-key")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.model.chat.basic.openrouter"
+    ):
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Search xagent"}],
+                tools=_single_tool_schema("search"),
+            )
+        ]
+
+    assert chunks
     assert not any(
         "no reasoning content was captured" in record.message
         for record in caplog.records

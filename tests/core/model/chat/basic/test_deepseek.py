@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -734,6 +735,73 @@ class TestDeepSeekLLM:
 
         call_messages = mock_client.chat.completions.create.call_args.kwargs["messages"]
         assert call_messages[0]["reasoning_content"] == ""
+
+    @pytest.mark.asyncio
+    async def test_replay_logs_info_summary_of_capture_vs_fallback_counts(
+        self, llm, mock_chat_completion, mocker, caplog
+    ):
+        """Design §6's second default observation: one INFO summary per
+        request counting how many assistant tool-call messages replayed
+        real captured reasoning content versus how many hit the
+        empty-string fallback. Two of the three tool-call messages below
+        carry captured provider state; the third does not.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        def _assistant_tool_call_message(call_id, *, reasoning_content=None):
+            message = {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"},
+                    }
+                ],
+            }
+            if reasoning_content is not None:
+                message[PROVIDER_STATE_METADATA_KEY] = {
+                    DEEPSEEK_PROVIDER_STATE_NAMESPACE: {
+                        DEEPSEEK_REASONING_CONTENT_STATE_KEY: reasoning_content
+                    }
+                }
+            return message
+
+        messages = [
+            {"role": "user", "content": "Search xagent"},
+            _assistant_tool_call_message("call_1", reasoning_content="first thought"),
+            {"role": "tool", "tool_call_id": "call_1", "content": "result 1"},
+            _assistant_tool_call_message("call_2", reasoning_content="second thought"),
+            {"role": "tool", "tool_call_id": "call_2", "content": "result 2"},
+            _assistant_tool_call_message("call_3"),
+            {"role": "tool", "tool_call_id": "call_3", "content": "result 3"},
+        ]
+
+        with caplog.at_level(
+            logging.INFO,
+            logger="xagent.core.model.chat.basic.deepseek_tool_protocol",
+        ):
+            await llm.chat(messages)
+
+        summaries = [
+            record.getMessage()
+            for record in caplog.records
+            if "reasoning replay" in record.getMessage()
+        ]
+        assert len(summaries) == 1
+        summary = summaries[0]
+        assert llm.model_name in summary
+        assert "2 assistant message(s) replayed captured reasoning content" in summary
+        assert "1 used the empty-string fallback" in summary
+        # Only counts and the model name are logged, never the captured text.
+        assert "first thought" not in summary
+        assert "second thought" not in summary
 
     @pytest.mark.asyncio
     async def test_final_answer_call_replays_empty_reasoning_content_without_tools(

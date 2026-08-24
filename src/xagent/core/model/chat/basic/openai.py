@@ -83,12 +83,17 @@ def _format_openai_error(prefix: str, error: BaseException) -> str:
     return formatted
 
 
-def _field_content(message: Any, field_name: str) -> tuple[bool, Any]:
+def field_content(message: Any, field_name: str) -> tuple[bool, Any]:
     """Return whether a provider message/delta explicitly set ``field_name``.
 
     Checks, in order, a plain dict, a pydantic model's declared fields, its
     ``model_extra`` (unknown fields the SDK still preserves), and finally
     ``__dict__`` as a last resort for other object shapes.
+
+    Public (not ``_``-prefixed) because it is a general-purpose probe over
+    any OpenAI-SDK-shaped message or delta object, not an implementation
+    detail private to this module: ``OpenRouterLLM`` reuses it as-is to
+    widen its own reasoning-field check across multiple wire spellings.
     """
     if isinstance(message, dict):
         if field_name not in message:
@@ -116,7 +121,33 @@ def _field_content(message: Any, field_name: str) -> tuple[bool, Any]:
 
 def _message_reasoning_content(message: Any) -> tuple[bool, Any]:
     """Return whether a provider explicitly included reasoning content."""
-    return _field_content(message, "reasoning_content")
+    return field_content(message, "reasoning_content")
+
+
+def _delta_field_names(delta: Any) -> tuple[str, ...]:
+    """Return every field name actually set on a streaming delta object.
+
+    Checks the same shapes ``field_content`` does -- a plain dict, a
+    pydantic model's declared fields, its ``model_extra``, and finally
+    ``__dict__`` -- but returns key names rather than one field's value.
+    Used to log which reasoning-like field (if any) a delta carried without
+    ever logging its content.
+    """
+    if isinstance(delta, dict):
+        return tuple(delta.keys())
+
+    names: set[str] = set()
+    model_fields_set = getattr(delta, "model_fields_set", None)
+    if isinstance(model_fields_set, set):
+        names.update(model_fields_set)
+    model_extra = getattr(delta, "model_extra", None)
+    if isinstance(model_extra, dict):
+        names.update(model_extra.keys())
+    if not names:
+        delta_attrs = getattr(delta, "__dict__", None)
+        if isinstance(delta_attrs, dict):
+            names.update(delta_attrs.keys())
+    return tuple(names)
 
 
 def _is_retryable_stream_transport_error(error: BaseException) -> bool:
@@ -244,6 +275,26 @@ class OpenAICompatibleLLM(BaseLLM):
         historical behavior exactly.
         """
         return _message_reasoning_content(delta)
+
+    def _check_stream_reasoning_capture(
+        self,
+        *,
+        thinking: Optional[Dict[str, Any]],
+        has_tool_calls: bool,
+        has_reasoning_content: bool,
+        observed_field_names: tuple[str, ...],
+    ) -> None:
+        """Hook called once after a stream ends, for a silent-capture check.
+
+        Mirrors ``_response_provider_state``'s non-streaming warning, but for
+        the streaming path: called with the whole stream's outcome (whether
+        any delta ever carried a recognized reasoning field, whether the
+        response ended with tool calls, and every field name -- never a
+        value -- seen on any delta), so a subclass can warn when thinking
+        was requested but nothing recognized was ever captured. Default is a
+        no-op; only ``OpenRouterLLM`` currently overrides it.
+        """
+        _ = thinking, has_tool_calls, has_reasoning_content, observed_field_names
 
     def _build_request_messages(
         self,
@@ -987,6 +1038,7 @@ class OpenAICompatibleLLM(BaseLLM):
             accumulated_tool_calls: Dict[str, Dict] = {}
             accumulated_reasoning_content = ""
             has_reasoning_content = False
+            observed_reasoning_field_names: set[str] = set()
             last_raw_chunk = None  # Track last raw chunk for usage extraction
             usage_received = False
 
@@ -1029,6 +1081,11 @@ class OpenAICompatibleLLM(BaseLLM):
                         accumulated_reasoning_content += str(
                             delta_reasoning_content or ""
                         )
+                    observed_reasoning_field_names.update(
+                        name
+                        for name in _delta_field_names(delta)
+                        if name.startswith("reasoning")
+                    )
 
                 chunk = self._parse_stream_chunk(
                     raw_chunk,
@@ -1040,6 +1097,17 @@ class OpenAICompatibleLLM(BaseLLM):
                     if chunk.is_usage():
                         usage_received = True
                     yield chunk
+
+            # One-time hook for a subclass to detect a silent streaming
+            # capture failure (thinking requested, tool calls in the
+            # response, but no recognized reasoning field ever captured).
+            # See ``_check_stream_reasoning_capture``'s docstring.
+            self._check_stream_reasoning_capture(
+                thinking=thinking,
+                has_tool_calls=bool(accumulated_tool_calls),
+                has_reasoning_content=has_reasoning_content,
+                observed_field_names=tuple(sorted(observed_reasoning_field_names)),
+            )
 
             # Fallback: Ensure usage chunk is always sent
             # If no usage chunk was received, try to extract from the last raw chunk

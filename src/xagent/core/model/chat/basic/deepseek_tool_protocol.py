@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -13,6 +14,8 @@ from ..tool_protocol import (
     tool_protocol_error_response,
 )
 from ..types import PROVIDER_STATE_METADATA_KEY, ChunkType, StreamChunk
+
+logger = logging.getLogger(__name__)
 
 _PROVIDER = "deepseek"
 
@@ -196,6 +199,8 @@ def deepseek_reasoning_provider_state(
 
 def restore_deepseek_reasoning_content(
     messages: list[dict[str, Any]],
+    *,
+    model_name: str,
 ) -> list[dict[str, Any]]:
     """Replay captured DeepSeek reasoning content onto assistant history.
 
@@ -209,11 +214,23 @@ def restore_deepseek_reasoning_content(
     This is unconditional: it does not look at whether thinking is enabled
     for the *current* request, because the replay requirement is about the
     history's own shape, not this call's configuration.
+
+    Logs one INFO summary per call (only when at least one assistant
+    tool-call message actually needed replay) counting how many messages
+    replayed real captured content versus how many hit the empty-string
+    fallback. A rising fallback count is the signal that something upstream
+    is losing captured state (a rebuilt task history, a synthesized
+    tool-call message) before it reaches here -- that loss does not raise on
+    its own, since the fallback keeps the request valid. The log carries
+    only the counts and ``model_name``, never the reasoning text itself.
     """
     prepared: list[dict[str, Any]] = []
+    replayed_count = 0
+    fallback_count = 0
     for message in messages:
         prepared_message = dict(message)
         provider_state = prepared_message.get(PROVIDER_STATE_METADATA_KEY)
+        replayed_captured_content = False
         if isinstance(provider_state, dict):
             deepseek_metadata = provider_state.get(DEEPSEEK_PROVIDER_STATE_NAMESPACE)
             if (
@@ -223,13 +240,25 @@ def restore_deepseek_reasoning_content(
                 prepared_message[DEEPSEEK_REASONING_CONTENT_STATE_KEY] = (
                     deepseek_metadata[DEEPSEEK_REASONING_CONTENT_STATE_KEY]
                 )
-        if (
-            prepared_message.get("role") == "assistant"
-            and prepared_message.get("tool_calls")
-            and DEEPSEEK_REASONING_CONTENT_STATE_KEY not in prepared_message
+                replayed_captured_content = True
+        if prepared_message.get("role") == "assistant" and prepared_message.get(
+            "tool_calls"
         ):
-            prepared_message[DEEPSEEK_REASONING_CONTENT_STATE_KEY] = ""
+            if replayed_captured_content:
+                replayed_count += 1
+            elif DEEPSEEK_REASONING_CONTENT_STATE_KEY not in prepared_message:
+                prepared_message[DEEPSEEK_REASONING_CONTENT_STATE_KEY] = ""
+                fallback_count += 1
         prepared.append(prepared_message)
+    if replayed_count or fallback_count:
+        logger.info(
+            "DeepSeek reasoning replay for model %s: %d assistant message(s) "
+            "replayed captured reasoning content, %d used the empty-string "
+            "fallback",
+            model_name,
+            replayed_count,
+            fallback_count,
+        )
     return prepared
 
 

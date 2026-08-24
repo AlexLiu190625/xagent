@@ -153,7 +153,7 @@ class DeepSeekLLM(OpenAICompatibleLLM):
         ``restore_deepseek_reasoning_content`` for the exact rules.
         """
         _ = thinking
-        return restore_deepseek_reasoning_content(messages)
+        return restore_deepseek_reasoning_content(messages, model_name=self._model_name)
 
     def _response_provider_state(
         self,
