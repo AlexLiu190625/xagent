@@ -1522,11 +1522,11 @@ async def test_openrouter_vision_chat_retries_mandatory_reasoning(mocker):
     that happens to go through vision_chat. The spies pin both directions of
     the fork: OpenAILLM.vision_chat must be the method that actually issues
     the request, and OpenRouterLLM.chat / _chat_with_prefix_retry (the
-    DeepSeek prefix-retry path) must never run for a vision call. Mutation
-    check performed by hand: temporarily making OpenRouterLLM.vision_chat
-    call super().chat(...) instead of super().vision_chat(...) turns this red
-    (chat_spy and prefix_retry_spy stop being zero), confirming the
-    assertions actually discriminate between the two dispatch paths.
+    DeepSeek prefix-retry path) must never run for a vision call. Rewiring
+    vision_chat to super().chat(...) turns this red via the vision_chat spy
+    dropping to zero (super() bypasses the OpenRouterLLM.chat spy), while
+    rewiring it to self.chat(...) is caught by the chat and prefix-retry
+    spies — together the spies discriminate both dispatch mistakes.
     """
     success_response = SimpleNamespace(
         choices=[
@@ -1580,6 +1580,8 @@ async def test_openrouter_vision_chat_retries_mandatory_reasoning(mocker):
     assert vision_chat_spy.call_count == 2
     assert chat_spy.call_count == 0
     assert prefix_retry_spy.call_count == 0
+    for call in mock_client.chat.completions.create.call_args_list:
+        assert "sanitized_out" not in call.kwargs
 
 
 @pytest.mark.asyncio
