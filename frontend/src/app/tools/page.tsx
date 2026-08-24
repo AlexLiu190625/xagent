@@ -587,8 +587,11 @@ function ToolsPageContent() {
       // Same key derivation the card uses to read connectorStatus, so the
       // settings dialog shows the same ownership label as the card it was
       // opened from. Sanitized so the dialog's badge gate (which requires
-      // app.shared !== undefined) only ever sees a well-formed answer.
-      const connType = server.transport === 'custom_api' ? 'custom_api' : 'mcp'
+      // app.shared to be a real boolean) only ever sees a well-formed answer.
+      // This branch only runs for isOfficial servers, which are always
+      // transport === 'oauth' (see the isOfficial check above), so the key
+      // prefix here is always 'mcp'.
+      const connType = 'mcp'
       const sharingStatus = sanitizeConnectorStatusEntry(connectorStatus[`${connType}:${server.id}`])
 
       // Create an AppIntegration-like object for the dialog

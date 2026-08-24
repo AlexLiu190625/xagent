@@ -1491,13 +1491,14 @@ export function ConnectMcpDialog({
                                     connectorRef(app) requires the entry to have a sharing identity
                                     at all (a numeric server_id); without it an unconnected catalog
                                     entry would render "Private" from a shared field nobody set.
-                                    app.shared !== undefined holds for a well-formed answer from the
-                                    sharing route (the merge above only ever writes a sanitized
-                                    triple), or for a shared field the /api/mcp/apps listing itself
-                                    chose to supply -- sanitizeAppIntegrations does not strip unknown
-                                    fields. connectorRef(app) is what keeps that second case from
-                                    rendering a badge on an entry with no sharing identity at all. */}
-                                {inTeam && connectorRef(app) && app.shared !== undefined && (
+                                    typeof app.shared === "boolean" holds for a well-formed answer
+                                    from the sharing route (the merge above only ever writes a
+                                    sanitized triple), or for a shared field the /api/mcp/apps
+                                    listing itself chose to supply -- sanitizeAppIntegrations does
+                                    not strip unknown fields. connectorRef(app) is what keeps that
+                                    second case from rendering a badge on an entry with no sharing
+                                    identity at all. */}
+                                {inTeam && connectorRef(app) && typeof app.shared === "boolean" && (
                                   <Badge variant="secondary" className={`font-medium px-2 py-0.5 rounded-md border shadow-none ${app.shared ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-slate-100 text-slate-600 border-slate-200'}`}>
                                     {!app.shared
                                       ? t('tools.mcp.sharing.private')

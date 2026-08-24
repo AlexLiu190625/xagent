@@ -223,15 +223,19 @@ export function OfficialMcpSettingsDialog({
               Number.isInteger(app.server_id) requires the entry to have a
               sharing identity at all; without it an entry with no connector id
               would render "Private" from a shared field nobody set.
-              app.shared !== undefined holds for a well-formed answer from the
-              sharing route -- the picker's merge and the Tools page's own
-              lookup both only ever write a sanitized triple -- or for a
+              typeof app.shared === "boolean" holds for a well-formed answer
+              from the sharing route -- the picker's merge and the Tools page's
+              own lookup both only ever write a sanitized triple -- or for a
               shared field the /api/mcp/apps listing itself chose to supply
               (sanitizeAppIntegrations does not strip unknown fields).
               Number.isInteger(app.server_id) is what keeps that second case
               from rendering a badge on an entry with no sharing identity at
-              all. */}
-          {inTeam && Number.isInteger(app.server_id) && app.shared !== undefined && (
+              all. The button gate below (isNonOwnedTeamTool) deliberately
+              keeps reading app.shared for truthiness rather than matching
+              this boolean check -- that gate only needs to know whether
+              sharing is active at all, not whether the field is well-formed,
+              so the mismatch with this badge condition is intentional. */}
+          {inTeam && Number.isInteger(app.server_id) && typeof app.shared === "boolean" && (
             <div className={`mb-4 inline-flex items-center px-3 py-1 rounded-full text-sm font-medium border ${app.shared ? 'bg-blue-50 border-blue-100 text-blue-700' : 'bg-slate-50 border-slate-200 text-slate-600'}`}>
               {!app.shared
                 ? t('tools.mcp.sharing.private')
