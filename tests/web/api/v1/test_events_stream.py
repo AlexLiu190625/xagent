@@ -3057,6 +3057,45 @@ async def test_fast_path_snapshot_admits_a_frame_exactly_at_the_byte_budget(
     assert total_steps == 2
 
 
+async def test_fast_path_snapshot_marks_truncation_when_the_window_ends_unmeasurable():
+    """An unserializable step is admitted so the emit loop can reach it
+    and report it (see ``_snapshot_steps_within_wire_budget``), but
+    admitting it also ends the measuring pass, so any steps behind it
+    fall out of the snapshot. The returned total must then mark the
+    snapshot truncated -- fewer steps go out than the task has -- even
+    though the step-count cap alone never bound anything here.
+    """
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    class _Unserializable:
+        pass
+
+    def _step(step_id, data):
+        return es.PublicStep(
+            id=step_id,
+            type="tool_call",
+            status="completed",
+            started_at=base,
+            completed_at=base,
+            data=data,
+        )
+
+    steps = [
+        _step("tool_call:call-1", {"name": "search", "result": "ok"}),
+        _step("tool_call:call-2", {"x": _Unserializable()}),
+        _step("tool_call:call-3", {"name": "search", "result": "ok"}),
+    ]
+
+    def _read_task_steps_response(task_id_, principal_):
+        return SimpleNamespace(steps=steps)
+
+    admitted, total_steps = await es._fast_path_step_snapshot(
+        1, None, _read_task_steps_response
+    )
+    assert [s.id for s in admitted] == ["tool_call:call-1", "tool_call:call-2"]
+    assert total_steps == 3
+
+
 # ===== fast-path generation fence (steps read outlives the snapshot) =====
 
 
