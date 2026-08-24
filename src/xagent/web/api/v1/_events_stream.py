@@ -1614,28 +1614,35 @@ async def _fast_path_generation_changed(
     principal: "ApiKeyPrincipal",
     read_task_snapshot: TaskSnapshotReader,
 ) -> bool:
-    """Whether the task has moved to a new run/state generation since
-    ``original`` was read, checked by rereading the task row and
-    comparing ``run_id``/``state_version`` against it -- the two fields
-    that change on a restart (a ``POST reply`` resuming a
-    ``WAITING_FOR_USER`` task, or a WS ``APPEND`` resuming a
-    ``COMPLETED``/``FAILED`` one) but not on an ordinary read.
+    """Whether the task row has been written at all since ``original``
+    was read, checked by rereading it and comparing
+    ``run_id``/``state_version`` against it.
 
-    Called by both attach-time fast paths, and only when their own
-    steps read returned at least one step (see each caller's own
-    docstring for why an empty list skips this call entirely) -- step
-    content only goes out once this call has confirmed it still belongs
-    to ``original``'s own generation, not just whatever generation the
-    steps read happened to observe.
+    ``state_version`` is the field that actually carries this. Every
+    lifecycle write increments it monotonically
+    (``services/task_execution_controller.py`` bumps it unconditionally
+    on the same UPDATE that sets the control state), whether or not a
+    new run begins. ``run_id`` is the narrower of the two and cannot
+    stand alone: a ``POST reply`` resuming a ``WAITING_FOR_USER`` task
+    deliberately keeps the same ``run_id`` (``task_lease_service``'s
+    ``lease_run_id_case`` writes the same candidate back for that
+    status), and that resume is the most common trigger of the
+    waiting-for-user fast path. A fence comparing ``run_id`` alone would
+    be a no-op for exactly that case.
 
-    A reread failure is not folded into the return value: it propagates
-    to the caller instead of being reported as ``True``, so "confirmed
-    changed" and "could not confirm either way" stay two different
-    outcomes rather than collapsing into one. Callers classify the
-    propagated exception themselves (see
-    ``_fast_path_generation_reread_error_frame``), the same way they
-    already classify a failed steps read via
-    ``_fast_path_steps_read_error_frame``.
+    So the contract enforced here is "any lifecycle write invalidates
+    this snapshot", not "a new run started". Ordinary intra-run writes
+    -- finalizing into COMPLETED/FAILED/WAITING_FOR_USER/PAUSED, a lease
+    release, a lease-expiry recovery -- bump ``state_version`` without
+    touching ``run_id``, and each of them can land in the window right
+    after the task reaches the state that selected this fast path. A
+    write there withholds a snapshot that was in fact still current and
+    sends the client to ``steps()`` instead. That is the deliberate
+    trade: this reread cannot tell a write that superseded the snapshot
+    from one that did not, so it treats every write as superseding.
+    Losing a snapshot costs one ``steps()`` call; pairing a conclusion
+    with step content from a generation this path never confirmed has no
+    bounded cost.
     """
     current = await run_db_io_cancellation_safe(
         lambda: read_task_snapshot(original.task_id, principal)
@@ -1691,8 +1698,9 @@ def _fast_path_step_serialize_error_frame(task_id: int, path_name: str) -> str:
     Always ``resync_required``, never ``task_deleted``: the task row was
     already read successfully to get here, so a failure at this point is
     about one step's own content, not the task's existence.
-    ``PublicStep.data`` is typed ``Any`` because tools return arbitrary
-    JSON, and ``model_dump(mode="json")`` raises
+    ``PublicStep.data`` is a ``Dict[str, Any]`` -- the keys are fixed per
+    step type, the values are arbitrary tool JSON -- and
+    ``model_dump(mode="json")`` raises
     ``PydanticSerializationError`` on a value it has no encoding rule
     for. This loop runs after ``StreamingResponse`` has already sent 200
     and the headers, a position where an escaped exception becomes an
@@ -1743,11 +1751,13 @@ async def _fast_path_snapshot_stream(
     steps read, a withheld generation mismatch, or a failed step
     serialization never confirmed a snapshot to report a truncation count
     for.
-    ``path_name`` plays no part in any branching decision in this body;
-    it only labels the log line and the ``resync_required`` /
-    serialization-failure frame text so a client or an operator can tell
-    which fast path emitted them -- see ``_fast_path_steps_read_error_frame``
-    and the other error-frame builders below.
+    ``path_name`` plays no part in any branching decision in this body,
+    and never reaches the client: it is passed only into the
+    ``logger.exception`` calls inside the error-frame builders below, so
+    an operator reading the logs can tell which fast path failed. The
+    ``stream.error`` text those builders put on the wire is fixed per
+    failure kind and carries no path label -- see
+    ``_fast_path_steps_read_error_frame``.
 
     ``task.status`` is emitted first, then the steps read runs inside
     its own ``try``/``except``. A bare exception here
