@@ -2824,12 +2824,17 @@ async def test_openrouter_deepseek_warns_when_capture_misses_all_known_spellings
 ):
     """V2-6: the WARNING that fires when thinking was requested, the
     response is a tool call, but neither known reasoning spelling was
-    captured -- must only report key names via ``reasoning_field_names``,
-    never reasoning content.
+    captured -- must report the unrecognized key names it did observe
+    (its entire diagnostic value), never reasoning content.
     """
     import logging
 
-    response = _openrouter_tool_call_response(reasoning_content="unset")
+    response = _openrouter_tool_call_response(
+        reasoning_content="unset",
+        raw_message_extra={
+            "reasoning_details": [{"type": "reasoning.text", "text": "SECRET-THOUGHT"}]
+        },
+    )
     mock_client = mocker.AsyncMock()
     mock_client.chat.completions.create.return_value = response
     mocker.patch(
@@ -2847,11 +2852,16 @@ async def test_openrouter_deepseek_warns_when_capture_misses_all_known_spellings
             thinking={"type": "enabled"},
         )
 
-    assert any(
-        "no reasoning content was captured" in record.message
+    warning_messages = [
+        record.getMessage()
         for record in caplog.records
-    )
-    assert not any("Search xagent" in record.message for record in caplog.records)
+        if "no reasoning content was captured" in record.message
+    ]
+    assert warning_messages
+    assert any("reasoning_details" in message for message in warning_messages)
+    for record in caplog.records:
+        assert "SECRET-THOUGHT" not in record.getMessage()
+        assert "Search xagent" not in record.getMessage()
 
 
 @pytest.mark.asyncio
@@ -2904,13 +2914,17 @@ async def test_openrouter_deepseek_stream_warns_when_capture_misses_all_known_sp
     import logging
 
     async def stream():
-        yield _tool_call_delta_chunk(
+        chunk = _tool_call_delta_chunk(
             call_id="call_1",
             index=0,
             name="search",
             arguments='{"query":"xagent"}',
             finish_reason="tool_calls",
         )
+        chunk.choices[0].delta.reasoning_details = [
+            {"type": "reasoning.text", "text": "SECRET-THOUGHT"}
+        ]
+        yield chunk
 
     mock_client = mocker.AsyncMock()
     mock_client.chat.completions.create.return_value = stream()
@@ -2933,11 +2947,16 @@ async def test_openrouter_deepseek_stream_warns_when_capture_misses_all_known_sp
         ]
 
     assert chunks
-    assert any(
-        "no reasoning content was captured" in record.message
+    warning_messages = [
+        record.getMessage()
         for record in caplog.records
-    )
-    assert not any("Search xagent" in record.message for record in caplog.records)
+        if "no reasoning content was captured" in record.message
+    ]
+    assert warning_messages
+    assert any("reasoning_details" in message for message in warning_messages)
+    for record in caplog.records:
+        assert "SECRET-THOUGHT" not in record.getMessage()
+        assert "Search xagent" not in record.getMessage()
 
 
 @pytest.mark.asyncio
@@ -2977,6 +2996,50 @@ async def test_openrouter_deepseek_stream_no_warning_when_thinking_not_requested
             async for chunk in llm.stream_chat(
                 [{"role": "user", "content": "Search xagent"}],
                 tools=_single_tool_schema("search"),
+            )
+        ]
+
+    assert chunks
+    assert not any(
+        "no reasoning content was captured" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_openrouter_non_deepseek_stream_no_capture_warning(mocker, caplog):
+    """The streaming capture sentinel is gated on deepseek-authored slugs:
+    a non-deepseek model streaming a tool call with thinking requested and
+    no reasoning field is that provider's normal shape, not spelling drift.
+    """
+    import logging
+
+    async def stream():
+        yield _tool_call_delta_chunk(
+            call_id="call_1",
+            index=0,
+            name="search",
+            arguments='{"query":"xagent"}',
+            finish_reason="tool_calls",
+        )
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = stream()
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(model_name="openai/gpt-5.6-sol", api_key="test-key")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.model.chat.basic.openrouter"
+    ):
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Search xagent"}],
+                tools=_single_tool_schema("search"),
+                thinking={"type": "enabled"},
             )
         ]
 

@@ -165,15 +165,17 @@ _STRIP_GUARD_COVERED: frozenset[type] = frozenset(
 # for them rather than merely untested:
 _STRIP_GUARD_EXEMPT: dict[type, str] = {
     OpenAICompatibleLLM: (
-        "intermediate base for the OpenAI-protocol clients above; never "
-        "constructed directly as a provider, so it has no wire request of "
-        "its own to check."
+        "intermediate base that implements the stripping call itself; never "
+        "constructed directly as a provider, and its behavior is covered "
+        "transitively by the five registered concrete subclasses above -- "
+        "removing the stripping call turns their tests red."
     ),
     RouterLLM: (
         "the virtual auto-router: chat/vision_chat/stream_chat resolve a "
         "downstream BaseLLM and forward the same message list object to it "
-        "unchanged (see router.py); it never reads or copies a message "
-        "dict itself, so the downstream client's own guard is what runs."
+        "unchanged (see router.py); it reads message content for routing "
+        "but never constructs any provider-bound message dict itself, so "
+        "the downstream client's own guard is what runs."
     ),
     _ResolvedRouterLLM: (
         "a thin per-call wrapper around one resolved downstream client; "
