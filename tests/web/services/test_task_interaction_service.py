@@ -1014,6 +1014,101 @@ def test_ca3_create_rejects_a_user_principal_carrying_no_user_id(
     assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
 
 
+def test_ca4_an_unauthorized_principal_learns_nothing_about_the_payload(
+    _db: Session, _seeded_task: int
+) -> None:
+    """A caller with no claim on the task must not learn which envelope
+    shapes this service accepts. Authorization now runs before any envelope
+    check, so a malformed envelope from an unauthorized caller is still
+    reported as unauthorized, not as a validation rejection."""
+
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task,
+        principal=_owning_principal(task.user_id + 1000),
+        envelope=_valid_envelope(kind="not_a_kind"),
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+
+
+def test_ca4_an_absent_task_is_reported_before_the_payload_is_judged(
+    _db: Session, _seeded_task: int
+) -> None:
+    """Mirrors the unauthorized case for the other id-only outcome: an
+    admin against a task that does not exist learns task_missing, never a
+    validation reason, regardless of how malformed the envelope is."""
+
+    outcome = svc.create(
+        _db,
+        task_id=_ABSENT_TASK_ID,
+        principal=_admin_principal(1),
+        envelope=_valid_envelope(kind="not_a_kind"),
+    )
+    assert outcome == svc.CreateUnavailable(reason="task_missing")
+
+
+@pytest.mark.parametrize(
+    ("envelope_overrides", "expected_reason"),
+    [
+        pytest.param({"kind": "not_a_kind"}, "unknown_kind", id="bad_kind"),
+        pytest.param(
+            {"protocol_version": 999},
+            "unknown_protocol_version",
+            id="bad_protocol_version",
+        ),
+        pytest.param(
+            {"request_idempotency_key": "not url safe!"},
+            "malformed_idempotency_key",
+            id="bad_idempotency_key",
+        ),
+        pytest.param(
+            {"values": {"not": "a valid payload"}},
+            "invalid_values",
+            id="bad_values",
+        ),
+    ],
+)
+def test_cv_authorized_caller_still_gets_every_validation_reason(
+    _db: Session,
+    _seeded_task: int,
+    envelope_overrides: dict[str, Any],
+    expected_reason: str,
+) -> None:
+    """Authorization moving ahead of validation must not change what an
+    authorized caller sees: the same four reasons, unchanged, for the same
+    four malformed shapes."""
+
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task,
+        principal=_owning_principal(task.user_id),
+        envelope=_valid_envelope(**envelope_overrides),
+    )
+    assert outcome == svc.CreateValidationRejected(reason=expected_reason)
+
+
+def test_create_logs_the_refused_payload_diagnostic(
+    _db: Session, _seeded_task: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    values = _values(
+        [_interaction(type="select_one", options=[{"label": "", "value": "a"}])]
+    )
+    with caplog.at_level(logging.WARNING):
+        outcome = svc.create(
+            _db,
+            task_id=_seeded_task,
+            principal=_owning_principal(task.user_id),
+            envelope=_valid_envelope(values=values),
+        )
+
+    assert outcome == svc.CreateValidationRejected(reason="invalid_values")
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    assert "interactions[0].options[0] has a blank label or value" in caplog.text
+
+
 def test_cw1_fully_valid_call_returns_not_wired(
     _db: Session, _seeded_task: int
 ) -> None:

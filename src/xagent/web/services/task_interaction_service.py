@@ -1123,8 +1123,8 @@ _MAX_INTERACTION_TTL_SECONDS = 7 * 24 * 3600
 class CreateInteractionEnvelope:
     """The caller-supplied intent for ``create()``: what interaction to
     publish, not yet validated. Every field is checked by ``create()``'s
-    validation step before anything else runs; none of them are trusted
-    as-is."""
+    validation step, which runs after that call has authorized the
+    principal against the task; none of them are trusted as-is."""
 
     kind: str
     protocol_version: int
@@ -1151,8 +1151,13 @@ def create(
     together -- i.e. the wiring change that supplies this seam's call body,
     not this one.
 
-    Validation order, each step short-circuiting on the first failure:
-    ``kind`` against ``str`` first (a non-string value -- a ``list``, a
+    Authorization runs first, against a task this call itself loads. Only a
+    caller that has been authorized against a real task row reaches the
+    envelope checks below, so a rejection reason describing the payload
+    shape is never returned to a caller that is not entitled to the task in
+    the first place. Validation order within that step, each step
+    short-circuiting on the first failure: ``kind`` against ``str`` first (a
+    non-string value -- a ``list``, a
     ``dict`` -- is rejected before the ``in _KIND_VOCABULARY`` membership
     test ever runs, not caught as a side effect of the ``TypeError:
     unhashable type`` that test would otherwise raise for an unhashable
@@ -1176,8 +1181,7 @@ def create(
     an unrenderable interaction type or a select with no options is
     refused), and an optional ``ttl_seconds``
     against this facade's policy interval -- out of range is a rejection,
-    never a silent clamp. Authorization runs only after every one of those
-    passes, against a task this call itself loads.
+    never a silent clamp.
 
     The load is owner-scoped for the branch that can express ownership in
     SQL and id-only for the two that cannot, and the difference is
@@ -1266,53 +1270,6 @@ def create(
     built on this module, not only to ``create()``'s own two variants.
     """
 
-    if not isinstance(envelope.kind, str) or envelope.kind not in _KIND_VOCABULARY:
-        return CreateValidationRejected(reason="unknown_kind")
-    if (
-        not isinstance(envelope.protocol_version, int)
-        or isinstance(envelope.protocol_version, bool)
-        or envelope.protocol_version != INTERACTION_PROTOCOL_VERSION
-    ):
-        return CreateValidationRejected(reason="unknown_protocol_version")
-    if not isinstance(envelope.request_idempotency_key, str):
-        return CreateValidationRejected(reason="malformed_idempotency_key")
-    try:
-        _normalize_command_id(envelope.request_idempotency_key)
-    except ValueError:
-        return CreateValidationRejected(reason="malformed_idempotency_key")
-    try:
-        parsed_values = parse_v1_request_payload(envelope.values)
-    except _PydanticValidationError:
-        return CreateValidationRejected(reason="invalid_values")
-    try:
-        build_v1_request_payload(parsed_values)
-    except ValueError:
-        # e.g. a NaN/Infinity default_value: shape-valid per
-        # AskUserQuestionArgs, but not JSON-serializable with
-        # allow_nan=False -- see build_v1_request_payload's own docstring.
-        return CreateValidationRejected(reason="invalid_values")
-    try:
-        validate_v1_write_payload(parsed_values)
-    except ValueError:
-        # Shape-valid and serializable, but not a question this service is
-        # willing to persist -- an unrenderable interaction type, a select
-        # with nothing to select, a duplicated field name, an inverted
-        # numeric range. Same reason as every other payload rejection: the
-        # caller learns its values were not accepted, not which of the
-        # checks in front of them said so.
-        return CreateValidationRejected(reason="invalid_values")
-    if envelope.ttl_seconds is not None:
-        if isinstance(envelope.ttl_seconds, bool) or not isinstance(
-            envelope.ttl_seconds, (int, float)
-        ):
-            return CreateValidationRejected(reason="invalid_values")
-        if not (
-            _MIN_INTERACTION_TTL_SECONDS
-            <= envelope.ttl_seconds
-            <= _MAX_INTERACTION_TTL_SECONDS
-        ):
-            return CreateValidationRejected(reason="invalid_values")
-
     if principal.kind == "user" and principal.user_id is None:
         # Rejected before the lookup, on both branches. An admin passing
         # on the flag alone would reach the write point with no identity to
@@ -1353,6 +1310,74 @@ def create(
         authorized = False
     if not authorized:
         return CreateUnauthorized(reason="not_task_principal")
+
+    if not isinstance(envelope.kind, str) or envelope.kind not in _KIND_VOCABULARY:
+        return CreateValidationRejected(reason="unknown_kind")
+    if (
+        not isinstance(envelope.protocol_version, int)
+        or isinstance(envelope.protocol_version, bool)
+        or envelope.protocol_version != INTERACTION_PROTOCOL_VERSION
+    ):
+        return CreateValidationRejected(reason="unknown_protocol_version")
+    if not isinstance(envelope.request_idempotency_key, str):
+        return CreateValidationRejected(reason="malformed_idempotency_key")
+    try:
+        _normalize_command_id(envelope.request_idempotency_key)
+    except ValueError:
+        return CreateValidationRejected(reason="malformed_idempotency_key")
+    try:
+        parsed_values = parse_v1_request_payload(envelope.values)
+    except _PydanticValidationError:
+        return CreateValidationRejected(reason="invalid_values")
+    try:
+        build_v1_request_payload(parsed_values)
+    except ValueError:
+        # e.g. a NaN/Infinity default_value: shape-valid per
+        # AskUserQuestionArgs, but not JSON-serializable with
+        # allow_nan=False -- see build_v1_request_payload's own docstring.
+        return CreateValidationRejected(reason="invalid_values")
+    try:
+        validate_v1_write_payload(parsed_values)
+    except ValueError as exc:
+        # Shape-valid and serializable, but not a question this service is
+        # willing to persist -- an unrenderable interaction type, a select
+        # with nothing to select, a blank or duplicated field name, two
+        # options sharing a value, a blank option half, an inverted numeric
+        # range. Same reason as every other payload rejection: the caller
+        # learns its values were not accepted, not which of the checks in
+        # front of them said so.
+        #
+        # The precise diagnostic is not lost, only kept server-side: this
+        # validator names the exact position it refused
+        # ("request_payload.interactions[3].options[1] has a blank label or
+        # value"), which is the only thing an operator debugging a rejected
+        # write has to go on. Logged at warning, unconditionally -- an
+        # observability line that can be switched off is one that is off
+        # when it is needed.
+        #
+        # What the message can contain: positions, and the two identifiers
+        # the question's author chose -- an interaction's ``field`` and an
+        # option's ``value``, both quoted by the rules that refuse a
+        # duplicate of either. Neither is anything a user typed; the
+        # response side is not reachable from here at all. The payload is
+        # never logged whole.
+        logger.warning(
+            "v1 interaction write payload refused for task_id=%s: %s",
+            task_id,
+            exc,
+        )
+        return CreateValidationRejected(reason="invalid_values")
+    if envelope.ttl_seconds is not None:
+        if isinstance(envelope.ttl_seconds, bool) or not isinstance(
+            envelope.ttl_seconds, (int, float)
+        ):
+            return CreateValidationRejected(reason="invalid_values")
+        if not (
+            _MIN_INTERACTION_TTL_SECONDS
+            <= envelope.ttl_seconds
+            <= _MAX_INTERACTION_TTL_SECONDS
+        ):
+            return CreateValidationRejected(reason="invalid_values")
 
     return CreateNotWired(reason="seam_not_wired")
 
