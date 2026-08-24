@@ -1696,7 +1696,142 @@ def _fast_path_step_serialize_error_frame(task_id: int, path_name: str) -> str:
     )
 
 
-async def _terminal_snapshot_stream(
+async def _fast_path_snapshot_stream(
+    snapshot: "_TaskInfoSnapshot",
+    principal: "ApiKeyPrincipal",
+    read_task_steps_response: TaskStepsResponseReader,
+    read_task_snapshot: TaskSnapshotReader,
+    *,
+    conclusion: str,
+    path_name: str,
+) -> AsyncIterator[str]:
+    """Body shared by both attach-time fast paths (``_terminal_snapshot_stream``,
+    ``_input_required_snapshot_stream``): emit ``task.status``, the
+    task's current steps, then ``conclusion``, and end. No sink, no
+    registration, no watchdog -- there's nothing left to watch.
+
+    ``conclusion`` is built by the caller from its own authoritative row
+    read (``completed_frame`` for the terminal path,
+    ``input_required_frame`` for the waiting-for-user one) before this
+    generator is ever entered, and is passed in already built rather
+    than constructed here so the two callers each describe their own
+    generation's conclusion, not a copy that could drift between them.
+    ``path_name`` plays no part in any branching decision in this body;
+    it only labels the log line and the ``resync_required`` /
+    serialization-failure frame text so a client or an operator can tell
+    which fast path emitted them -- see ``_fast_path_steps_read_error_frame``
+    and the other error-frame builders below.
+
+    ``task.status`` is emitted first, then the steps read runs inside
+    its own ``try``/``except``. A bare exception here
+    would not produce a different HTTP status: ``StreamingResponse``
+    sends the response start (200, headers) before ever pulling a chunk
+    from this generator, so letting the read's exception propagate
+    unguarded just ends an already-started 200 response with no bytes
+    at all -- indistinguishable, from the client's side, from the
+    connection merely dropping. Catching the failure and closing with a
+    ``stream.error`` frame instead keeps this module's own invariant
+    that a close frame is always how a client tells "the task ended"
+    apart from "the stream ended" -- ``task_deleted`` when the task
+    disappeared out from under this read, ``resync_required`` for
+    everything else; see ``_fast_path_steps_read_error_frame``.
+
+    ``snapshot`` was already resolved, from its own authoritative read,
+    before this function was ever called, so ``conclusion`` describes
+    the generation this path was picked for. What this path
+    will not do is pair that conclusion with step content from a
+    generation it never confirmed. Step content is a different matter:
+    the steps this path is about to read reflect whatever run/state
+    generation the task row is in *at that read*, and a concurrent
+    restart (a ``POST reply`` resuming a ``WAITING_FOR_USER`` task, or a
+    WS ``APPEND`` resuming a ``COMPLETED``/``FAILED`` one) can move the
+    row to a new generation in the gap between ``snapshot`` and that
+    read. The rule this path enforces: ``conclusion`` goes out on
+    every exit, and the fence decides only whether step content joins
+    it. The conclusion describes ``snapshot``'s own generation -- the
+    authoritative read that selected this fast path -- so a client that
+    tracks only lifecycle gets the same single conclusion frame it
+    would get if this path carried no step content at all. When the
+    reread below confirms a newer generation, ``snapshot`` is
+    superseded, and it is the ``stream.error(resync_required)`` that
+    follows which tells the client to refetch, not a retraction of the
+    conclusion already sent. Step content is the part that can go
+    stale, so it goes out only once the task row has been read once
+    more and confirmed to still be ``snapshot``'s own generation
+    (``_fast_path_generation_changed``); that reread runs only when
+    there is step content to protect, so a failed steps read (nothing
+    to protect) and an empty one (nothing that could be stale) both
+    skip it. A confirmed match sends the steps, then the conclusion. A
+    confirmed change means the steps just read belong to a generation
+    this path never confirmed against, so the steps are withheld and
+    the conclusion is followed by ``stream.error(resync_required)``. A
+    reread that fails outright can't tell a match from a change and is
+    handled the same way, except that its ``stream.error`` names the
+    reread failure rather than claiming the task moved
+    (``_fast_path_generation_reread_error_frame``, same
+    ``task_deleted``-vs-everything-else split as
+    ``_fast_path_steps_read_error_frame``). Serializing a step can fail
+    too -- ``PublicStep.data`` carries arbitrary tool JSON -- which ends
+    the step content there and closes the same way, so no exit leaves
+    the client with an already-started 200 response and no close frame.
+    """
+    yield status_frame(snapshot.status.value)
+    try:
+        steps, snapshot_total_steps = await _fast_path_step_snapshot(
+            snapshot.task_id, principal, read_task_steps_response
+        )
+    except Exception as exc:
+        # The conclusion goes out first -- see the docstring above -- so a
+        # step-read failure never also swallows the fact that this task
+        # already reached this terminal state.
+        yield conclusion
+        yield _fast_path_steps_read_error_frame(exc, snapshot.task_id, path_name)
+        return
+    if steps:
+        try:
+            changed = await _fast_path_generation_changed(
+                snapshot, principal, read_task_snapshot
+            )
+        except Exception as exc:
+            # Same conclusion-first ordering as the steps-read ``except``
+            # block above -- see the docstring for why a reread failure
+            # gets the same treatment as a steps-read failure.
+            yield conclusion
+            yield _fast_path_generation_reread_error_frame(
+                exc, snapshot.task_id, path_name
+            )
+            return
+        if changed:
+            yield conclusion
+            yield error_frame(
+                "resync_required",
+                message=(
+                    "The task moved to a new run while this attach was "
+                    "reading its steps; call steps() to resync, then "
+                    "re-attach."
+                ),
+            )
+            return
+    for index, step in enumerate(steps):
+        try:
+            step_frame = _step_wire_frame(
+                step,
+                snapshot_total_steps=snapshot_total_steps if index == 0 else None,
+            )
+        except Exception:
+            # Only the serialization is inside the ``try``, not the
+            # ``yield``: a consumer going away arrives as
+            # ``GeneratorExit``/``CancelledError``, both
+            # ``BaseException``, so this handler cannot turn a client
+            # disconnect into a close frame nobody reads.
+            yield conclusion
+            yield _fast_path_step_serialize_error_frame(snapshot.task_id, path_name)
+            return
+        yield step_frame
+    yield conclusion
+
+
+def _terminal_snapshot_stream(
     snapshot: "_TaskInfoSnapshot",
     principal: "ApiKeyPrincipal",
     read_task_steps_response: TaskStepsResponseReader,
@@ -1759,75 +1894,30 @@ async def _terminal_snapshot_stream(
     too -- ``PublicStep.data`` carries arbitrary tool JSON -- which ends
     the step content there and closes the same way, so no exit leaves
     the client with an already-started 200 response and no close frame.
+
+    The body both fast paths share lives in
+    ``_fast_path_snapshot_stream``; this function supplies the
+    conclusion frame and the path label.
     """
-    # Built once, before anything is read, because every exit below emits
-    # it: it describes ``snapshot``'s own generation -- the authoritative
-    # read that selected this fast path. When the reread below confirms a
-    # newer generation, this snapshot is superseded, and the
-    # ``stream.error(resync_required)`` that follows is what tells the
-    # client to refetch -- not a retraction of the conclusion already
-    # sent. One expression in one place, rather than a copy per exit that
-    # could drift.
+    # Built here, before the shared body is entered, from ``snapshot``'s
+    # own authoritative read -- the read that selected this fast path --
+    # so that read is what the conclusion describes, not whatever the
+    # steps read or the generation reread inside the shared body observe
+    # afterward.
     conclusion = completed_frame(
         status=snapshot.status.value, output=snapshot.output, error=snapshot.error
     )
-    yield status_frame(snapshot.status.value)
-    try:
-        steps, snapshot_total_steps = await _fast_path_step_snapshot(
-            snapshot.task_id, principal, read_task_steps_response
-        )
-    except Exception as exc:
-        # The conclusion goes out first -- see the docstring above -- so a
-        # step-read failure never also swallows the fact that this task
-        # already reached this terminal state.
-        yield conclusion
-        yield _fast_path_steps_read_error_frame(exc, snapshot.task_id, "terminal")
-        return
-    if steps:
-        try:
-            changed = await _fast_path_generation_changed(
-                snapshot, principal, read_task_snapshot
-            )
-        except Exception as exc:
-            # Same conclusion-first ordering as the steps-read ``except``
-            # block above -- see the docstring for why a reread failure
-            # gets the same treatment as a steps-read failure.
-            yield conclusion
-            yield _fast_path_generation_reread_error_frame(
-                exc, snapshot.task_id, "terminal"
-            )
-            return
-        if changed:
-            yield conclusion
-            yield error_frame(
-                "resync_required",
-                message=(
-                    "The task moved to a new run while this attach was "
-                    "reading its steps; call steps() to resync, then "
-                    "re-attach."
-                ),
-            )
-            return
-    for index, step in enumerate(steps):
-        try:
-            step_frame = _step_wire_frame(
-                step,
-                snapshot_total_steps=snapshot_total_steps if index == 0 else None,
-            )
-        except Exception:
-            # Only the serialization is inside the ``try``, not the
-            # ``yield``: a consumer going away arrives as
-            # ``GeneratorExit``/``CancelledError``, both
-            # ``BaseException``, so this handler cannot turn a client
-            # disconnect into a close frame nobody reads.
-            yield conclusion
-            yield _fast_path_step_serialize_error_frame(snapshot.task_id, "terminal")
-            return
-        yield step_frame
-    yield conclusion
+    return _fast_path_snapshot_stream(
+        snapshot,
+        principal,
+        read_task_steps_response,
+        read_task_snapshot,
+        conclusion=conclusion,
+        path_name="terminal",
+    )
 
 
-async def _input_required_snapshot_stream(
+def _input_required_snapshot_stream(
     snapshot: "_TaskInfoSnapshot",
     principal: "ApiKeyPrincipal",
     read_task_steps_response: TaskStepsResponseReader,
@@ -1850,63 +1940,19 @@ async def _input_required_snapshot_stream(
     ``task.input_required`` goes out on every exit regardless of what
     the fence decides about step content.
     """
-    # Built once, before anything is read, for the same reason as
-    # ``_terminal_snapshot_stream``'s own conclusion: every exit below
-    # emits it, and it describes the authoritative read that selected
-    # this fast path.
+    # Built here, before the shared body is entered, for the same reason
+    # as ``_terminal_snapshot_stream``'s own conclusion: it describes the
+    # authoritative read that selected this fast path, not whatever the
+    # shared body's own reads observe afterward.
     conclusion = input_required_frame(snapshot.task_id, snapshot.pending_question)
-    yield status_frame(snapshot.status.value)
-    try:
-        steps, snapshot_total_steps = await _fast_path_step_snapshot(
-            snapshot.task_id, principal, read_task_steps_response
-        )
-    except Exception as exc:
-        # Same conclusion-first ordering as ``_terminal_snapshot_stream``'s
-        # own ``except`` block -- see that function's docstring.
-        yield conclusion
-        yield _fast_path_steps_read_error_frame(exc, snapshot.task_id, "input-required")
-        return
-    if steps:
-        try:
-            changed = await _fast_path_generation_changed(
-                snapshot, principal, read_task_snapshot
-            )
-        except Exception as exc:
-            # Same conclusion-first ordering as the steps-read ``except``
-            # block above -- see ``_terminal_snapshot_stream``'s docstring.
-            yield conclusion
-            yield _fast_path_generation_reread_error_frame(
-                exc, snapshot.task_id, "input-required"
-            )
-            return
-        if changed:
-            yield conclusion
-            yield error_frame(
-                "resync_required",
-                message=(
-                    "The task moved to a new run while this attach was "
-                    "reading its steps; call steps() to resync, then "
-                    "re-attach."
-                ),
-            )
-            return
-    for index, step in enumerate(steps):
-        try:
-            step_frame = _step_wire_frame(
-                step,
-                snapshot_total_steps=snapshot_total_steps if index == 0 else None,
-            )
-        except Exception:
-            # Same narrow guard as ``_terminal_snapshot_stream``'s own
-            # serialization loop -- only the serialization, not the
-            # ``yield``.
-            yield conclusion
-            yield _fast_path_step_serialize_error_frame(
-                snapshot.task_id, "input-required"
-            )
-            return
-        yield step_frame
-    yield conclusion
+    return _fast_path_snapshot_stream(
+        snapshot,
+        principal,
+        read_task_steps_response,
+        read_task_snapshot,
+        conclusion=conclusion,
+        path_name="input-required",
+    )
 
 
 async def _generate(

@@ -2769,7 +2769,28 @@ async def test_fast_path_task_not_found_closes_with_task_deleted_not_resync_requ
     )
 
 
-async def test_fast_path_step_snapshot_is_bounded_by_replay_max_steps():
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_step_snapshot_is_bounded_by_replay_max_steps(
+    stream_fn, status, conclusion_event, extra_snapshot
+):
     """The attach-time step snapshot is the one thing this stream sends
     in a single unpaced burst -- no admission/deadline/heartbeat loop --
     so it needs its own bound. This pins it: a task with 600 public
@@ -2796,19 +2817,18 @@ async def test_fast_path_step_snapshot_is_bounded_by_replay_max_steps():
     def _unchanged_read_task_snapshot(task_id_, principal_):
         return SimpleNamespace(run_id="run-1", state_version=1)
 
-    terminal_snapshot = SimpleNamespace(
+    snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
-        status=TaskStatus.COMPLETED,
-        output="done",
-        error=None,
+        status=status,
         run_id="run-1",
         state_version=1,
+        **extra_snapshot,
     )
     frames = [
         chunk
-        async for chunk in es._terminal_snapshot_stream(
-            terminal_snapshot,
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
             principal=None,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_unchanged_read_task_snapshot,
@@ -2827,6 +2847,7 @@ async def test_fast_path_step_snapshot_is_bounded_by_replay_max_steps():
     )
     second_step_data = json.loads(blocks[2].split("data: ", 1)[1])
     assert "snapshot_truncated" not in second_step_data
+    assert body.count(f"event: {conclusion_event}") == 1
 
 
 @pytest.mark.parametrize(
@@ -3059,7 +3080,28 @@ async def test_fast_path_generation_change_withholds_steps_but_still_concludes(
     assert conclusion_marker in body
 
 
-async def test_fast_path_terminal_empty_steps_skips_the_generation_reread():
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_empty_steps_skips_the_generation_reread(
+    stream_fn, status, conclusion_event, extra_snapshot
+):
     """An empty step list carries no step content from a possibly-newer
     run, so there is nothing for the generation reread to protect
     against -- this pins that the fast path skips it entirely rather
@@ -3077,15 +3119,14 @@ async def test_fast_path_terminal_empty_steps_skips_the_generation_reread():
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
-        status=TaskStatus.COMPLETED,
-        output="done",
-        error=None,
+        status=status,
         run_id="run-1",
         state_version=1,
+        **extra_snapshot,
     )
     frames = [
         chunk
-        async for chunk in es._terminal_snapshot_stream(
+        async for chunk in getattr(es, stream_fn)(
             snapshot,
             principal=None,
             read_task_steps_response=_read_task_steps_response,
@@ -3094,7 +3135,7 @@ async def test_fast_path_terminal_empty_steps_skips_the_generation_reread():
     ]
     body = "".join(frames)
     assert reread_calls == []
-    assert body.count("event: task.completed") == 1
+    assert body.count(f"event: {conclusion_event}") == 1
     assert "resync_required" not in body
 
 
@@ -3175,7 +3216,28 @@ async def test_fast_path_generation_reread_failure_concludes_then_closes_for_res
     assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
 
 
-async def test_fast_path_terminal_generation_reread_task_deleted_closes_with_task_deleted():
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_generation_reread_task_deleted_closes_with_task_deleted(
+    stream_fn, status, conclusion_event, extra_snapshot
+):
     """A task deleted in the gap between the steps read and the
     generation reread surfaces from the reread as
     ``V1ApiError(TASK_NOT_FOUND)``, the same exception shape a task
@@ -3205,15 +3267,14 @@ async def test_fast_path_terminal_generation_reread_task_deleted_closes_with_tas
     snapshot = SimpleNamespace(
         task_id=1,
         agent_id=1,
-        status=TaskStatus.COMPLETED,
-        output="done",
-        error=None,
+        status=status,
         run_id="run-1",
         state_version=1,
+        **extra_snapshot,
     )
     frames = [
         chunk
-        async for chunk in es._terminal_snapshot_stream(
+        async for chunk in getattr(es, stream_fn)(
             snapshot,
             principal=None,
             read_task_steps_response=_read_task_steps_response,
@@ -3222,11 +3283,14 @@ async def test_fast_path_terminal_generation_reread_task_deleted_closes_with_tas
     ]
     body = "".join(frames)
     assert body.count("event: task.status") == 1
-    assert body.count("event: task.completed") == 1
+    assert body.count(f"event: {conclusion_event}") == 1
     assert "event: step.completed" not in body
     assert body.count("event: stream.error") == 1
     assert "task_deleted" in body
     assert "resync_required" not in body
+    # The conclusion precedes the error, same ordering pinned on every
+    # other failure exit on this path.
+    assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
 
 
 # ===== fast-path step serialization failure (after the first yield) =====
