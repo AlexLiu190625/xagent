@@ -1250,6 +1250,48 @@ async def test_openrouter_direct_relaxes_tool_choice_after_bare_bad_request_erro
 
 
 @pytest.mark.asyncio
+async def test_openrouter_vision_relaxes_tool_choice_after_bare_bad_request_error(
+    mock_chat_completion, mocker
+):
+    """The vision path recovers from the bare BadRequestError escape too.
+
+    ``vision_chat`` is the entrypoint with a live response_format producer in
+    this repository, so the escape guarded here is reachable in production:
+    ``OpenAILLM.vision_chat``'s pop-and-retry resend sits inside its own
+    ``except openai.BadRequestError`` block and a second failure escapes
+    unwrapped, exactly like ``chat``'s.
+    """
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        _bad_request_error(
+            "the model does not support response_format for this request"
+        ),
+        _bad_request_error(_OPENROUTER_TOOL_CHOICE_ERROR),
+        mock_chat_completion,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="z-ai/glm-5.2",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "vision"],
+    )
+
+    await llm.vision_chat(
+        [{"role": "user", "content": "score?"}],
+        tools=_two_tool_schema(),
+        tool_choice="required",
+        response_format={"type": "json_object"},
+    )
+
+    assert mock_client.chat.completions.create.await_count == 3
+    final_call = mock_client.chat.completions.create.call_args_list[2].kwargs
+    assert final_call["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
 async def test_openrouter_direct_does_not_repeat_mandatory_reasoning_retry(mocker):
     """Each compat action fires at most once per call, even across a 3-error run."""
     mock_client = mocker.AsyncMock()
@@ -1857,6 +1899,8 @@ async def test_openrouter_stream_thinking_retry_changes_rendered_extra_body(mock
     assert extra_bodies[0] != extra_bodies[1]
     assert extra_bodies[0]["thinking"] == {"type": "disabled"}
     assert extra_bodies[1]["thinking"] == {"type": "enabled"}
+    for call in mock_client.chat.completions.create.call_args_list:
+        assert "sanitized_out" not in call.kwargs
 
 
 @pytest.mark.asyncio

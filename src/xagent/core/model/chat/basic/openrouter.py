@@ -20,16 +20,18 @@ logger = logging.getLogger(__name__)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _DEEPSEEK_FUNCTION_PREFIX_ERROR = "function call should not be used with prefix"
 
-# OpenAILLM.chat/stream_chat normally convert every openai.BadRequestError into
-# a RuntimeError before returning. Their response_format pop-and-retry path is
-# an exception, though: it re-issues the request from inside its own
+# OpenAILLM.chat/vision_chat normally convert every openai.BadRequestError
+# into a RuntimeError before returning. Their response_format pop-and-retry
+# path is an exception, though: it re-issues the request from inside its own
 # ``except openai.BadRequestError`` block, and if that retried call also fails
 # with a BadRequestError, nothing wraps the second failure -- it escapes as a
-# bare SDK exception. openai.BadRequestError's MRO does not include
-# RuntimeError, so the compat retry loops below must catch both explicitly to
-# keep covering that case. The historical implementation caught bare
-# ``Exception`` here; this tuple is the precise, intentionally narrowed
-# replacement.
+# bare SDK exception. (stream_chat is not affected: its resend sits in a
+# nested try, so the outer handler still wraps a second failure; the streaming
+# loop catches the tuple for symmetry and defense.) openai.BadRequestError's
+# MRO does not include RuntimeError, so the compat retry loops below must
+# catch both explicitly to keep covering that case. The historical
+# implementation caught bare ``Exception`` here; this tuple is the precise,
+# intentionally narrowed replacement.
 _COMPAT_RETRYABLE_ERRORS = (RuntimeError, openai.BadRequestError)
 
 # Pinning to these provider slugs via `only` + `allow_fallbacks: False` routes
@@ -489,9 +491,10 @@ class OpenRouterLLM(OpenAILLM):
         5xx error that ``retry_on`` recognizes via ``__cause__``) is left for
         the shared LLM retry wrapper and is never treated as a compat
         adjustment opportunity. A single ``call`` invocation may itself issue
-        up to one additional upstream request: ``OpenAILLM.chat``'s
-        response_format pop-and-retry path can resend once internally before
-        returning or raising.
+        up to one additional upstream request: the response_format
+        pop-and-retry path in ``OpenAILLM.chat`` and ``vision_chat`` (both
+        served by this helper) can resend once internally before returning or
+        raising.
 
         Known limitation: ``OpenAILLM.chat``'s structured-output degrade path
         can rewrite ``thinking`` internally (disabling it after a non-JSON
