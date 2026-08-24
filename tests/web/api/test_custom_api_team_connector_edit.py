@@ -1,0 +1,291 @@
+"""The edit right on a team-linked Custom API: ``GET``/``PUT
+/api/custom-apis/{api_id}`` resolve a caller with no personal row through
+the connector access hook instead of 404ing outright, ``can_edit`` falls
+back to that verdict for a caller with no personal row, an ``is_active``
+payload from such a caller rejects outright instead of writing a shadow
+attribute the response then reads back, and a raising hook surfaces as its
+declared status rather than a 500.
+
+Every test installs the access hook through ``snapshot_connector_team_hooks``
+so no hook state leaks between tests or into suites that run after this one.
+"""
+
+from __future__ import annotations
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
+from xagent.web.api.custom_api import (
+    CustomApiUpdate,
+    get_custom_api,
+    update_custom_api,
+)
+from xagent.web.models.custom_api import CustomApi, UserCustomApi
+from xagent.web.models.database import Base
+from xagent.web.models.user import User
+from xagent.web.services.connector_team_scope import (
+    ConnectorAccess,
+    set_connector_team_hooks,
+    snapshot_connector_team_hooks,
+)
+
+
+@pytest.fixture()
+def db():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    session = session_factory()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+def _make_user(db, user_id: int, *, is_admin: bool = False) -> User:
+    user = User(
+        id=user_id, username=f"user-{user_id}", password_hash="x", is_admin=is_admin
+    )
+    db.add(user)
+    db.commit()
+    return user
+
+
+def _make_owned_api(db, owner_id: int, *, name: str = "shared-api") -> CustomApi:
+    api = CustomApi(name=name, url="https://example.test/api", method="GET")
+    db.add(api)
+    db.flush()
+    db.add(
+        UserCustomApi(
+            user_id=owner_id,
+            custom_api_id=api.id,
+            is_owner=True,
+            can_edit=True,
+            can_delete=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+    return api
+
+
+async def _get(api_id, current_user, db):
+    return await get_custom_api(api_id, current_user=current_user, db=db)
+
+
+async def _put(api_id, payload, current_user, db):
+    return await update_custom_api(api_id, payload, current_user=current_user, db=db)
+
+
+class TestGateHelperOnGetAndPut:
+    @pytest.mark.asyncio
+    async def test_get_404s_for_an_unrelated_user_with_no_link_and_no_team_access(
+        self, db
+    ):
+        owner = _make_user(db, 1)
+        stranger = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=lambda *_a, **_k: None)
+            with pytest.raises(HTTPException) as exc:
+                await _get(api.id, stranger, db)
+        assert exc.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_get_returns_the_stand_in_for_a_team_member_with_no_personal_row(
+        self, db
+    ):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda *_a, **_k: ConnectorAccess(team_owned=True, can_edit=True)
+            )
+            response = await _get(api.id, member, db)
+
+        assert response.id == api.id
+        assert response.user_id == member.id
+
+    @pytest.mark.asyncio
+    async def test_get_owner_behaviour_is_unchanged_with_no_hook_installed(self, db):
+        owner = _make_user(db, 1)
+        api = _make_owned_api(db, owner.id)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks()
+            response = await _get(api.id, owner, db)
+
+        assert response.id == api.id
+        assert response.user_id == owner.id
+
+
+class TestPutWiringForATeamEditor:
+    @pytest.mark.asyncio
+    async def test_team_editor_edit_is_durable_and_creates_no_association_row(self, db):
+        owner = _make_user(db, 1)
+        editor = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id)
+        api_id = api.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda *_a, **_k: ConnectorAccess(team_owned=True, can_edit=True)
+            )
+            response = await _put(
+                api_id,
+                CustomApiUpdate(description="edited by the team"),
+                editor,
+                db,
+            )
+
+        assert response.description == "edited by the team"
+
+        # Durability, not staging -- a same-session query would still see
+        # an uncommitted UPDATE even if the route never committed.
+        db.rollback()
+        refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert refreshed.description == "edited by the team"
+
+        # The edit did not fabricate a personal association for the team
+        # editor -- that would be a get-or-create write on an
+        # authorization path.
+        assert (
+            db.query(UserCustomApi).filter(UserCustomApi.user_id == editor.id).first()
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_view_only_team_member_cannot_tamper_the_shared_config(self, db):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda *_a, **_k: ConnectorAccess(
+                    team_owned=True, can_edit=False
+                )
+            )
+            with pytest.raises(HTTPException) as exc:
+                await _put(
+                    api.id,
+                    CustomApiUpdate(description="should not land"),
+                    member,
+                    db,
+                )
+        assert exc.value.status_code == 403
+
+
+class TestIsActiveRejectionForAStandIn:
+    @pytest.mark.asyncio
+    async def test_is_active_from_a_caller_with_no_personal_row_is_400_not_a_silent_drop(
+        self, db
+    ):
+        owner = _make_user(db, 1)
+        editor = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id, name="unchanged-name")
+        api_id = api.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda *_a, **_k: ConnectorAccess(team_owned=True, can_edit=True)
+            )
+            with pytest.raises(HTTPException) as exc:
+                await _put(
+                    api_id,
+                    CustomApiUpdate(is_active=False),
+                    editor,
+                    db,
+                )
+
+        # 1. the declared status.
+        assert exc.value.status_code == 400
+        assert "personal connection" in str(exc.value.detail)
+
+        # 2. nothing persisted -- the exception was raised before any
+        # commit, so a same-session rollback-then-requery must still show
+        # no personal association row for this caller.
+        db.rollback()
+        assert (
+            db.query(UserCustomApi).filter(UserCustomApi.user_id == editor.id).first()
+            is None
+        )
+
+        # 3. the response body does not claim the change -- the call
+        # raised rather than returning, so no ``CustomApiResponse`` ever
+        # left the route carrying an ``is_active`` value nothing wrote.
+        refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert refreshed.name == "unchanged-name"
+
+
+class TestTypedErrorArm:
+    @pytest.mark.asyncio
+    async def test_get_surfaces_a_raising_hooks_declared_status(self, db):
+        owner = _make_user(db, 1)
+        api = _make_owned_api(db, owner.id)
+
+        def boom(*_a, **_k):
+            raise ValueError("hook exploded")
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=boom)
+            with pytest.raises(HTTPException) as exc:
+                await _get(api.id, owner, db)
+
+        assert exc.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_put_surfaces_a_raising_hooks_declared_status_and_leaves_the_row_unchanged(
+        self, db
+    ):
+        owner = _make_user(db, 1)
+        api = _make_owned_api(db, owner.id, name="pristine")
+        api_id = api.id
+
+        def boom(*_a, **_k):
+            raise ValueError("hook exploded")
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=boom)
+            with pytest.raises(HTTPException) as exc:
+                await _put(
+                    api_id,
+                    CustomApiUpdate(name="should-not-land"),
+                    owner,
+                    db,
+                )
+
+        assert exc.value.status_code == 503
+
+        db.rollback()
+        refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert refreshed.name == "pristine"
+
+    @pytest.mark.asyncio
+    async def test_put_passes_through_a_planted_connector_runtime_error_by_its_own_status(
+        self, db
+    ):
+        owner = _make_user(db, 1)
+        api = _make_owned_api(db, owner.id)
+
+        def boom(*_a, **_k):
+            raise ConnectorRuntimeError("planted", "planted failure", status_code=409)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=boom)
+            with pytest.raises(HTTPException) as exc:
+                await _put(
+                    api.id,
+                    CustomApiUpdate(description="irrelevant"),
+                    owner,
+                    db,
+                )
+
+        assert exc.value.status_code == 409
+        assert exc.value.detail == "planted failure"

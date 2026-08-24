@@ -7,13 +7,14 @@ in the web application.
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ...core.tools.adapters.vibe.connector_runtime import (
+    ConnectorRuntimeError,
     validate_runtime_config_declaration,
 )
 from ...core.utils.encryption import encrypt_value
@@ -21,6 +22,10 @@ from ..auth_dependencies import get_current_user
 from ..models.custom_api import CustomApi, UserCustomApi
 from ..models.database import get_db
 from ..models.user import User
+
+if TYPE_CHECKING:
+    from ..services.connector_team_scope import ConnectorAccess
+    from .mcp import _TeamOwnedUserApi
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +116,7 @@ custom_api_router = APIRouter(prefix="/api/custom-apis", tags=["Custom API Manag
 
 def _db_api_to_response(
     api: CustomApi,
-    user_api: UserCustomApi,
+    user_api: "UserCustomApi | _TeamOwnedUserApi",
 ) -> CustomApiResponse:
     """Convert database CustomApi to response model with masked env values."""
 
@@ -259,6 +264,67 @@ async def create_custom_api(
     return _db_api_to_response(new_api, user_api)
 
 
+def _resolve_custom_api_for_request(
+    db: Session, user_id: int, api_id: int
+) -> "tuple[UserCustomApi | _TeamOwnedUserApi, CustomApi, ConnectorAccess | None]":
+    """Resolve the caller's association, the definition row, and the
+    caller's team access verdict, for ``GET``/``PUT /api/custom-apis/{id}``.
+
+    Looks up the caller's own personal link row first, with the same query
+    both routes have always run. When that row exists and its ``custom_api``
+    relationship resolves, the association and the definition row both come
+    from it and nothing else runs. When it does not -- no row, or a row
+    whose relationship is unexpectedly empty -- the definition row is
+    looked up on its own -- a team-owned API's shared row must still be
+    found even though this caller has no personal link to it -- and the
+    caller's team access verdict decides what happens next:
+
+    - no working personal row and no team access (``access is None``) ->
+      404, the same outcome every caller without an association has
+      always gotten.
+    - no working personal row but the caller's team links the API -> the
+      existing ``_TeamOwnedUserApi`` stand-in takes the association's
+      place, the same stand-in the aggregate connector list already
+      constructs for this case.
+
+    Raises ``ConnectorRuntimeError`` when access resolution itself fails;
+    callers translate that into an ``HTTPException``.
+    """
+    from ..services.connector_team_scope import resolve_connector_access_or_raise
+    from .mcp import _TeamOwnedUserApi
+
+    user_api = (
+        db.query(UserCustomApi)
+        .filter(
+            UserCustomApi.custom_api_id == api_id,
+            UserCustomApi.user_id == user_id,
+        )
+        .first()
+    )
+    if user_api is not None and user_api.custom_api is not None:
+        api: Optional[CustomApi] = user_api.custom_api
+    else:
+        user_api = None
+        api = db.query(CustomApi).filter(CustomApi.id == api_id).first()
+
+    access: "ConnectorAccess | None" = None
+    if api is not None:
+        access = resolve_connector_access_or_raise(
+            db, int(user_id), "custom_api", int(api.id)
+        )
+
+    if user_api is None and access is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Custom API not found",
+        )
+
+    resolved_user_api: "UserCustomApi | _TeamOwnedUserApi" = (
+        user_api if user_api is not None else _TeamOwnedUserApi(int(user_id))
+    )
+    return resolved_user_api, cast(CustomApi, api), access
+
+
 @custom_api_router.get("/{api_id}", response_model=CustomApiResponse)
 async def get_custom_api(
     api_id: int,
@@ -267,22 +333,16 @@ async def get_custom_api(
 ) -> CustomApiResponse:
     """Get a specific Custom API by ID."""
 
-    user_api = (
-        db.query(UserCustomApi)
-        .filter(
-            UserCustomApi.custom_api_id == api_id,
-            UserCustomApi.user_id == current_user.id,
+    try:
+        user_api, api, _team_access = _resolve_custom_api_for_request(
+            db, int(current_user.id), api_id
         )
-        .first()
-    )
-
-    if not user_api or not user_api.custom_api:
+    except ConnectorRuntimeError as exc:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Custom API not found",
-        )
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
 
-    return _db_api_to_response(user_api.custom_api, user_api)
+    return _db_api_to_response(api, user_api)
 
 
 @custom_api_router.put("/{api_id}", response_model=CustomApiResponse)
@@ -294,29 +354,42 @@ async def update_custom_api(
 ) -> CustomApiResponse:
     """Update an existing Custom API."""
 
-    user_api = (
-        db.query(UserCustomApi)
-        .filter(
-            UserCustomApi.custom_api_id == api_id,
-            UserCustomApi.user_id == current_user.id,
+    try:
+        user_api, api, team_access = _resolve_custom_api_for_request(
+            db, int(current_user.id), api_id
         )
-        .first()
-    )
-
-    if not user_api or not user_api.custom_api:
+    except ConnectorRuntimeError as exc:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Custom API not found",
-        )
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
 
-    if not user_api.can_edit:
+    is_stand_in = not isinstance(user_api, UserCustomApi)
+    can_edit = bool(user_api.can_edit) or bool(
+        team_access is not None and team_access.can_edit
+    )
+    if not can_edit:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have permission to edit this Custom API",
         )
 
-    api = user_api.custom_api
+    # is_active lives on the personal association row; a caller with no
+    # personal row (the stand-in) has none to hold it, so a payload
+    # carrying it must be rejected outright -- writing it onto the
+    # stand-in would only set a shadowing instance attribute that
+    # persists nothing, and the response below would then read that
+    # shadow back and report a change that never happened.
+    if is_stand_in and api_data.is_active is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No personal connection exists to configure is_active for this API",
+        )
+
     old_name = str(api.name)
+    # The row's declared type from here on is loosened for mypy's sake: the
+    # column-typed attributes below (name, description, env, ...) are all
+    # mutated directly by this route, exactly as before this gate existed.
+    mutable_api = cast(Any, api)
 
     # Check name uniqueness if name is changed
     if api_data.name and api_data.name != api.name:
@@ -326,23 +399,25 @@ async def update_custom_api(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Custom API with name '{api_data.name}' already exists",
             )
-        api.name = api_data.name
+        mutable_api.name = api_data.name
 
     # Update fields
     if api_data.description is not None:
-        api.description = api_data.description
+        mutable_api.description = api_data.description
     if api_data.url is not None:
-        api.url = api_data.url
+        mutable_api.url = api_data.url
     if api_data.method is not None:
-        api.method = api_data.method
+        mutable_api.method = api_data.method
     if api_data.headers is not None:
-        api.headers = api_data.headers
+        mutable_api.headers = api_data.headers
     if api_data.body is not None:
-        api.body = api_data.body
+        mutable_api.body = api_data.body
 
     # Process env variables
     if api_data.env is not None:
-        existing_env = api.env if isinstance(api.env, dict) else {}
+        existing_env: Dict[str, str] = (
+            mutable_api.env if isinstance(api.env, dict) else {}
+        )
         try:
             processed_env = _process_env_vars(api_data.env, existing_env)
         except ValueError as exc:
@@ -350,7 +425,7 @@ async def update_custom_api(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid environment variables: {exc}",
             ) from exc
-        api.env = processed_env
+        mutable_api.env = processed_env
 
     fields_set = api_data.model_fields_set
     runtime_input_schema = (
@@ -374,7 +449,7 @@ async def update_custom_api(
             runtime_input_schema=runtime_input_schema,
             runtime_bindings=runtime_bindings,
             allow_delegated_authorization=allow_delegated_authorization,
-            static_headers=api.headers,
+            static_headers=mutable_api.headers,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -382,11 +457,11 @@ async def update_custom_api(
             detail=f"Invalid runtime configuration: {exc}",
         ) from exc
     if "runtime_input_schema" in fields_set:
-        api.runtime_input_schema = runtime_input_schema
+        mutable_api.runtime_input_schema = runtime_input_schema
     if "runtime_bindings" in fields_set:
-        api.runtime_bindings = runtime_bindings
+        mutable_api.runtime_bindings = runtime_bindings
     if "allow_delegated_authorization" in fields_set:
-        api.allow_delegated_authorization = allow_delegated_authorization
+        mutable_api.allow_delegated_authorization = allow_delegated_authorization
 
     from ..services.connector_team_scope import rename_team_connector
 
@@ -401,7 +476,7 @@ async def update_custom_api(
 
     # Update UserCustomApi link
     if api_data.is_active is not None:
-        user_api.is_active = api_data.is_active  # type: ignore[assignment]
+        user_api.is_active = api_data.is_active
 
     db.commit()
     db.refresh(api)
