@@ -161,11 +161,19 @@ def active_interaction_id_sync(task_id: int) -> int | None:
     returns to ``close_legacy_resume_interaction`` -- see this module's
     docstring for why that ordering is the whole point.
 
-    Opens and closes its own short session. All four legacy-resume paths
-    call it from a point where they hold no session of their own: the two
-    fence-transaction paths (``a2a.py``, ``v1/task_reply.py``) open their
-    fence only after the injection has already committed, and the two
-    WebSocket paths hold none at all.
+    Opens and closes its own short session. Three legacy-resume injection
+    paths call it from a point where they hold no session of their own: the
+    two fence-transaction paths (``a2a.py``, ``v1/task_reply.py``) open
+    their fence only after the injection has already committed, and the
+    WebSocket online chat injection holds none at all. The fourth
+    legacy-resume path -- the WebSocket deferred injection reached through
+    ``execute_resume_background`` -- does not call this function itself; it
+    reuses the id the online handler already read, carried through
+    ``pending_user_message["interaction_id"]``
+    (``tests/web/api/test_websocket_owner_actor.py`` pins that it must not
+    read again). A fourth call site does exist in ``src/``, but it is not
+    an injection path at all -- see the resume command seam paragraph
+    below.
 
     Keys off ``_active_native_row_criteria``
     (``task_interaction_service.py``), the same four-field predicate every
@@ -184,32 +192,75 @@ def active_interaction_id_sync(task_id: int) -> int | None:
     unbound predicate when the read fails -- is the retire-the-wrong-row
     bug this function exists to prevent, so an unreadable id must never
     widen what the close matches.
+
+    Two branches decide "no id" before the row lookup runs, and both mean
+    the same thing as an empty lookup, not a failure:
+    ``get_optional_session_local()`` returning ``None`` (no database
+    configured in this process -- expected in tests, never in production),
+    and ``tasks.interaction_protocol_version`` being ``NULL``. The marker
+    gate is the write side of the same first step
+    ``get_pending_interaction_question`` (``task_interaction_read.py``)
+    takes on the read side: a NULL marker means no native row was ever
+    staged for this task's current wait, so the interaction table goes
+    unqueried. Keeping the two sides on one judgment is the point -- a
+    question the read surface will not show must not be a question this
+    close retires -- and the cost it removes is real: this function runs on
+    every A2A resume, every v1 chat reply and every live WebSocket chat
+    message, and under a NULL marker it now costs one primary-key lookup
+    instead of an uncached catalog inspection plus a two-table join.
+
+    This is also the resume command seam's reader (``websocket.py``'s
+    refusal gate for a resume whose payload cannot prove it answered the
+    active question). That seam used to carry a byte-identical copy of the
+    query; one reader is what keeps the close, the refusal gate and the
+    read surface from drifting into three notions of "the live row".
     """
+    from ..models.database import get_optional_session_local
     from .task_interaction_service import _active_native_row_criteria
 
+    SessionLocal = get_optional_session_local()
+    if SessionLocal is None:
+        return None
     try:
-        SessionLocal = get_session_local()
-        with SessionLocal() as db:
-            if not interaction_requests_table_exists(db):
-                return None
-            row = (
-                db.query(TaskInteractionRequest.id)
-                .join(Task, Task.id == TaskInteractionRequest.task_id)
-                .filter(
-                    TaskInteractionRequest.task_id == task_id,
-                    *_active_native_row_criteria(),
-                )
-                .first()
-            )
-            return int(row[0]) if row is not None else None
+        db = SessionLocal()
     except Exception:
         logger.warning(
-            "could not read the active interaction row before injection for "
-            "task_id=%s; the close will match no row",
+            "could not open a session to read the active interaction row "
+            "for task_id=%s; the close will match no row",
             task_id,
             exc_info=True,
         )
         return None
+    try:
+        marker = (
+            db.query(Task.interaction_protocol_version)
+            .filter(Task.id == task_id)
+            .scalar()
+        )
+        if marker is None:
+            return None
+        if not interaction_requests_table_exists(db):
+            return None
+        row = (
+            db.query(TaskInteractionRequest.id)
+            .join(Task, Task.id == TaskInteractionRequest.task_id)
+            .filter(
+                TaskInteractionRequest.task_id == task_id,
+                *_active_native_row_criteria(),
+            )
+            .first()
+        )
+        return int(row[0]) if row is not None else None
+    except Exception:
+        logger.warning(
+            "the active interaction row lookup failed for task_id=%s; "
+            "the close will match no row",
+            task_id,
+            exc_info=True,
+        )
+        return None
+    finally:
+        db.close()
 
 
 def _active_row_exists(*, task_id: int, run_id: str) -> sa.Exists:

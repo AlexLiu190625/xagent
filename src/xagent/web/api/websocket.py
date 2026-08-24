@@ -7759,93 +7759,6 @@ async def handle_resume_task(
     )
 
 
-def _active_native_interaction_id_sync(task_id: int) -> int | None:
-    """The id of this task's active native interaction row, scoped to the
-    task's current run, or ``None`` if there is none.
-
-    Uses the identical four-field predicate
-    (``task_interaction_service._active_native_row_criteria``) every reader
-    of "this task's one live row" keys off: status, active_slot, and a join
-    against ``Task.run_id``. That predicate has three call sites in this
-    tree -- ``task_interaction_service``'s own ``list_active`` and
-    ``_active_native_row`` (the latter is how
-    ``materialize_compatibility_view`` reads the row), plus this seam. The
-    answer fence is a fourth, future caller: it does not exist here yet and
-    lands with ``respond()``. All of them must keep changing together, or
-    the read surface, this resume seam, and the fence once it arrives would
-    disagree about which row -- if any -- is "the" live one for a given
-    task. An active row anchored to a run the task has since moved past is
-    invisible here for the same reason it is invisible to the other
-    readers: ``_reclaim_stale_slot_stmt``
-    (``task_interaction_staging.py``) recycles it on the next question, so
-    it carries no obligation for this seam either.
-
-    Gated on ``interaction_requests_table_exists`` for the same reason
-    ``materialize_compatibility_view`` gates on it: a deployment can run
-    this code before the migration that creates
-    ``task_interaction_requests`` has been applied, and this seam must
-    survive that window rather than raising.
-
-    Uses ``get_optional_session_local`` rather than ``get_session_local``,
-    and wraps the read in a broad ``except Exception`` -- the same
-    fail-open shape ``_resolve_read_direction_anchor``
-    (``task_interaction_service.py``) already uses for its own read against
-    this same kind of infrastructure. Every production entry point into
-    this handler runs after ``configure_db()``/``init_db()`` against one
-    database for the life of the process, so neither branch is expected to
-    ever fire there. Both exist for this handler's test callers, which
-    mock the rest of the resume path precisely to avoid needing a database
-    at all, and which do not each get an isolated process: a session
-    factory some other test left installed as the process-global default
-    can point at a since-removed temporary database file by the time an
-    unrelated test reaches this call. Either way, "cannot determine
-    whether there is an active row" is treated as "assume there is not" --
-    refusing every resume because this one read failed would be a worse
-    failure mode than the one legacy-resume window this seam closes.
-    """
-
-    from ..models.database import get_optional_session_local
-    from ..models.task import Task
-    from ..models.task_interaction import TaskInteractionRequest
-    from ..services.task_interaction_schema import interaction_requests_table_exists
-    from ..services.task_interaction_service import _active_native_row_criteria
-
-    SessionLocal = get_optional_session_local()
-    if SessionLocal is None:
-        return None
-    try:
-        db = SessionLocal()
-    except Exception:
-        logger.warning(
-            "resume interaction seam: could not open a session for task_id=%s",
-            task_id,
-            exc_info=True,
-        )
-        return None
-    try:
-        if not interaction_requests_table_exists(db):
-            return None
-        row = (
-            db.query(TaskInteractionRequest.id)
-            .join(Task, Task.id == TaskInteractionRequest.task_id)
-            .filter(
-                TaskInteractionRequest.task_id == task_id,
-                *_active_native_row_criteria(),
-            )
-            .first()
-        )
-        return int(row[0]) if row is not None else None
-    except Exception:
-        logger.warning(
-            "resume interaction seam: active-row lookup failed for task_id=%s",
-            task_id,
-            exc_info=True,
-        )
-        return None
-    finally:
-        db.close()
-
-
 async def _handle_resume_task_unserialized(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
@@ -7936,7 +7849,12 @@ async def _handle_resume_task_unserialized(
         # continuation respond() staged, refuse rather than let either path
         # append to or replan around an unanswered question. This runs
         # before agent_service is built (below) so a refused request never
-        # pays for constructing one.
+        # pays for constructing one. Gated on tasks.interaction_protocol_
+        # version first, though: under a NULL marker the read below returns
+        # None regardless of whether an active row exists, so this refusal
+        # never fires for that state -- deliberately, matching what the
+        # read surface would show for the same task (see
+        # active_interaction_id_sync's own docstring).
         #
         # Residual window, named here rather than closed here: this lookup
         # opens and closes its own session, and no lock spans it and either
@@ -7944,8 +7862,12 @@ async def _handle_resume_task_unserialized(
         # between this read and the transition. Nothing can drive that
         # change until respond()'s finalizer exists, and that finalizer --
         # not this seam -- is what must own the window when it lands.
+        #
+        # The read itself is task_interaction_close.active_interaction_id_sync
+        # -- the same reader the three legacy-resume injection sites use, so
+        # this gate and the close cannot disagree about which row is live.
         active_interaction_id = await run_db_io_cancellation_safe(
-            lambda: _active_native_interaction_id_sync(task_id)
+            lambda: active_interaction_id_sync(task_id)
         )
         if active_interaction_id is not None:
             receipt_interaction_id = message_data.get("interaction_id")

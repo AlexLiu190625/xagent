@@ -228,6 +228,14 @@ class Task(Base):  # type: ignore
     # worker-owned short session of its own rather than a request-scoped
     # one, but it resolves and loads the same Task row before asking, so
     # the same free-attribute-access argument applies to it unchanged.
+    # ``task_interaction_close.active_interaction_id_sync`` reads this same
+    # marker too, ahead of the interaction-table query it guards, but it is
+    # not one of the four above: it never holds a loaded Task row, so it
+    # pays for its own single-column primary-key query rather than getting
+    # the check for free. That is the trade against the alternative it
+    # replaced -- an uncached catalog inspection plus a two-table join --
+    # not a violation of the free-access argument above, which is about the
+    # read surface specifically.
     # While every waiting task predates the native protocol (and during
     # any rollback), the marker is NULL for all of them and the
     # interaction table receives zero queries from the read path.

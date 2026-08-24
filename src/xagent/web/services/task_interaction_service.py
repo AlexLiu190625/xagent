@@ -65,8 +65,10 @@ Not delivered here, and named so a reader does not go looking for them in
 this module: the compatibility seam that routes the existing resume
 coordinator (``websocket.py``'s ``_handle_resume_task_unserialized``)
 through ``_active_native_row_criteria()`` shipped as its own change in this
-same series and has already merged -- ``websocket.py`` now imports
-``_active_native_row_criteria`` from this module -- but is not part of this
+same series and has already merged -- the seam now reads through
+``task_interaction_close.active_interaction_id_sync``, which imports
+``_active_native_row_criteria`` from this module; ``websocket.py`` itself
+no longer imports it directly -- but is not part of this
 change. ``create()``'s own call body -- the write
 that actually stages a row -- is not delivered here either; its own
 zero-production-caller gate

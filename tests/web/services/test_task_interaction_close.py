@@ -411,32 +411,157 @@ def test_active_interaction_id_sync_returns_none_without_the_interaction_table(
     assert active_interaction_id_sync(task_id) is None
 
 
-def test_active_interaction_id_sync_returns_none_when_the_read_fails(
-    db, monkeypatch, caplog
+def test_active_interaction_id_sync_returns_none_when_the_task_marker_is_null(
+    db, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A failing read must return None, not raise: the caller is on the
-    injection path, and None closes nothing, while an exception would take
-    the injection down with it.
+    """``tasks.interaction_protocol_version`` being ``NULL`` means no native
+    row was ever staged for this task's current wait -- the same first step
+    ``get_pending_interaction_question`` takes on the read side -- so the
+    interaction table goes unqueried even though a real active row exists
+    here. Not a failure, so no warning."""
+
+    task_id = seed_task_with_run(db, run_id="run-a", marker=None)
+    seed_active_row(db, task_id=task_id, run_id="run-a")
+
+    with caplog.at_level(logging.WARNING, logger=_CLOSE_MODULE_NAME):
+        result = active_interaction_id_sync(task_id)
+
+    assert result is None
+    assert caplog.records == []
+
+
+def test_active_interaction_id_sync_returns_none_for_an_absent_task(
+    db, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger=_CLOSE_MODULE_NAME):
+        result = active_interaction_id_sync(999_999_999)
+
+    assert result is None
+    assert caplog.records == []
+
+
+# --------------------------------------------------------------------------
+# active_interaction_id_sync's own four fail-open branches, migrated from
+# tests/web/api/test_resume_interaction_seam.py where this function used to
+# live as websocket.py's own _active_native_interaction_id_sync: no database
+# configured yet, a session that fails to open, the interaction table not
+# existing yet, and the row lookup itself raising. The module docstring
+# argues at length for why each one resolves to "assume no active row"
+# instead of propagating -- these pin that argument down to actual
+# behavior, and distinguish the two branches that are expected in normal
+# operation (no session factory yet, table not migrated yet -- no warning)
+# from the two that represent a genuine failure worth a log line (session
+# open failure, lookup failure).
+# --------------------------------------------------------------------------
+
+
+def test_active_interaction_id_sync_returns_none_without_a_session_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``get_optional_session_local() is None`` -- no database configured yet
+    for this process -- is the cheap, expected-in-tests case: it must return
+    ``None`` without ever calling the (nonexistent) session factory, and
+    without logging a warning. A caller that removed this branch would fall
+    through to ``SessionLocal()`` with ``SessionLocal is None``, which raises
+    ``TypeError`` and is instead caught by the *next* branch below -- still
+    returning ``None``, but only after logging a warning this branch is
+    specifically here to avoid."""
+
+    monkeypatch.setattr(database_module, "get_optional_session_local", lambda: None)
+
+    with caplog.at_level(logging.WARNING, logger=_CLOSE_MODULE_NAME):
+        result = active_interaction_id_sync(1)
+
+    assert result is None
+    assert caplog.records == []
+
+
+def test_active_interaction_id_sync_returns_none_when_opening_a_session_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A session factory that is installed but raises when called -- e.g. a
+    prior test left a factory pointed at a since-removed temporary database
+    file -- must also resolve to "no active row", but unlike the branch
+    above this is a genuine failure and must be logged.
 
     What "closes nothing" costs is pinned separately, by
     test_close_keeps_the_marker_when_the_pre_injection_read_failed below:
-    the close matches no row and the marker stays, so the live question
-    the read could not see keeps its reader.
+    the close matches no row and the marker stays, so the live question the
+    read could not see keeps its reader.
     """
-    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
-    seed_active_row(db, task_id=task_id, run_id="run-a")
 
-    def _fail():
-        raise sa.exc.OperationalError("SELECT 1", {}, Exception("database is locked"))
+    def _broken_session_local() -> None:
+        raise RuntimeError("database file has been removed")
 
     monkeypatch.setattr(
-        "xagent.web.services.task_interaction_close.get_session_local", _fail
+        database_module, "get_optional_session_local", lambda: _broken_session_local
     )
 
     with caplog.at_level(logging.WARNING, logger=_CLOSE_MODULE_NAME):
-        assert active_interaction_id_sync(task_id) is None
+        result = active_interaction_id_sync(1)
 
-    assert [record.levelno for record in caplog.records] == [logging.WARNING]
+    assert result is None
+    assert len(caplog.records) == 1
+    assert "could not open a session" in caplog.records[0].message
+
+
+def test_active_interaction_id_sync_returns_none_when_the_table_is_missing(
+    db,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A deployment that has not yet run the migration creating
+    ``task_interaction_requests`` must not raise -- and, since this is a
+    known, temporary deployment window rather than a bug, must not log a
+    warning either. A real active row is seeded so that a caller which
+    removed this gate would find it -- proving the gate, not an empty table,
+    is what produces ``None`` here."""
+
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    seed_active_row(db, task_id=task_id, run_id="run-a")
+
+    monkeypatch.setattr(
+        "xagent.web.services.task_interaction_close.interaction_requests_table_exists",
+        lambda db: False,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=_CLOSE_MODULE_NAME):
+        result = active_interaction_id_sync(task_id)
+
+    assert result is None
+    assert caplog.records == []
+
+
+def test_active_interaction_id_sync_returns_none_when_the_lookup_raises(
+    db,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failure inside the row lookup itself -- reproduced here by making
+    the shared active-row predicate raise, the same seam
+    ``_answer_fence_stmt`` reuses -- must resolve to "no active row" and log
+    a warning naming the lookup, not the session-open failure above's
+    message."""
+
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    seed_active_row(db, task_id=task_id, run_id="run-a")
+
+    def _broken_criteria() -> list[object]:
+        raise RuntimeError("criteria unavailable")
+
+    monkeypatch.setattr(
+        "xagent.web.services.task_interaction_service._active_native_row_criteria",
+        _broken_criteria,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=_CLOSE_MODULE_NAME):
+        result = active_interaction_id_sync(task_id)
+
+    assert result is None
+    assert len(caplog.records) == 1
+    assert "the active interaction row lookup failed" in caplog.records[0].message
 
 
 def test_close_keeps_the_marker_when_the_pre_injection_read_failed(
@@ -456,12 +581,12 @@ def test_close_keeps_the_marker_when_the_pre_injection_read_failed(
     task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     row_id = seed_active_row(db, task_id=task_id, run_id="run-a")
 
-    def _fail():
+    def _broken_session_local():
         raise sa.exc.OperationalError("SELECT 1", {}, Exception("database is locked"))
 
     with monkeypatch.context() as failing_read:
         failing_read.setattr(
-            "xagent.web.services.task_interaction_close.get_session_local", _fail
+            database_module, "get_optional_session_local", lambda: _broken_session_local
         )
         observed_id = active_interaction_id_sync(task_id)
 
