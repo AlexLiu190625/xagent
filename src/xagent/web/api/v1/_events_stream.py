@@ -323,9 +323,19 @@ def status_frame(status: str) -> str:
 # untruncated ``data``. The recovery channel for these two is
 # ``GET /v1/chat/tasks/{task_id}``: ``TaskInfoResponse.output`` and
 # ``TaskInfoResponse.pending_interaction.question``. Cost of the
-# exemption is bounded by construction: each is sent once per stream, as
-# its closing frame (``enqueue_close`` on the live path, the last yield
-# on each attach-time fast path), never repeatedly.
+# exemption is bounded by construction: each is sent exactly once per
+# stream, as that stream's conclusion frame -- ``enqueue_close`` on the
+# live path, and on each attach-time fast path the frame every exit
+# emits before returning. On the fast paths that conclusion is not
+# necessarily the last frame on the wire: four of the five exits follow
+# it with a ``stream.error`` (a failed steps read, a failed generation
+# reread, a confirmed generation change, or a failed step
+# serialization), and only the ordinary exit ends there. That two-frame
+# close order -- conclusion first, then the error naming why the step
+# snapshot is incomplete -- is what
+# ``GET /v1/chat/tasks/{task_id}/events`` documents for these paths.
+# What this exemption bounds is how many times the uncapped payload
+# itself goes out, which is once either way.
 def completed_frame(*, status: str, output: str | None, error: str | None) -> str:
     return _sse_frame(
         "task.completed", {"status": status, "output": output, "error": error}
