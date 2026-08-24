@@ -1522,6 +1522,12 @@ def _resolve_mcp_server_for_request(
       place, the same stand-in the list endpoint's team-owned branch
       already constructs.
 
+    An owner's personal row already decides the edit answer on its own --
+    ``_check_mcp_permission``'s edit branch returns ``True`` on ``is_owner``
+    without ever consulting a verdict -- so resolving one for an owner would
+    only add an unnecessary hook call; this skips the call entirely for an
+    owner's row and returns ``access=None``.
+
     Raises ``ConnectorRuntimeError`` when access resolution itself fails;
     callers translate that into an ``HTTPException``.
     """
@@ -1540,8 +1546,12 @@ def _resolve_mcp_server_for_request(
         user_mcp = None
         server = db.query(MCPServer).filter(MCPServer.id == server_id).first()
 
+    already_decided = user_mcp is not None and bool(
+        getattr(user_mcp, "is_owner", False)
+    )
+
     access: "ConnectorAccess | None" = None
-    if server is not None:
+    if server is not None and not already_decided:
         access = resolve_connector_access_or_raise(
             db, int(user_id), "mcp", int(server.id)
         )
@@ -1570,12 +1580,15 @@ def _db_server_to_response(
     """Convert database MCPServer to response model.
 
     ``team_access`` is the caller's team access verdict for this connector,
-    forwarded to ``_check_mcp_permission`` unchanged -- ``None`` when the
-    caller owns the row outright (a verdict cannot change what an owner
-    already gets) or when nothing in the deployment supplies one. Every
+    forwarded to ``_check_mcp_permission`` unchanged. ``None`` covers every
+    case where this function has nothing further to add: the caller's own
+    personal row already decided the answer so no hook was ever called for
+    it, a hook was called and genuinely answered "not linked", a hook call
+    was attempted and failed and the caller degraded rather than failing
+    the request, or no hook is installed in this deployment at all. Every
     caller of this function decides for itself whether resolving a verdict
-    is worth a hook call before passing one in; this function never resolves
-    one on its own.
+    is worth a hook call before passing one in; this function never
+    resolves one on its own.
     """
     # Get status from manager if available
     config = server.to_config_dict()
@@ -3203,11 +3216,24 @@ def connect_mcp_app(
     # is_owner=False (connecting never grants ownership) -- resolved so the
     # response's can_edit_global can reflect a granting team verdict rather
     # than default to False for every connector this route ever returns.
+    # The association has already committed by this point, so a verdict
+    # failure here must not fail the request -- it only degrades
+    # can_edit_global to False, the value this route always reported before
+    # the verdict existed at all.
     from ..services.connector_team_scope import resolve_connector_access_or_raise
 
-    team_access = resolve_connector_access_or_raise(
-        db, int(current_user.id), "mcp", int(server.id)
-    )
+    team_access: "ConnectorAccess | None" = None
+    try:
+        team_access = resolve_connector_access_or_raise(
+            db, int(current_user.id), "mcp", int(server.id)
+        )
+    except ConnectorRuntimeError:
+        logger.warning(
+            "Connector access resolution failed for MCP server %s after "
+            "connecting it for user %s; reporting can_edit_global=False",
+            server.id,
+            current_user.id,
+        )
     return _db_server_to_response(
         server,
         assoc,
@@ -3890,14 +3916,26 @@ async def toggle_mcp_server(
             f"{status_text.capitalize()} MCP server '{server.name}' for user {user_id}"
         )
 
-        # The gate above is unchanged (still 404s without a personal row);
-        # only the reported field below now reflects a team verdict, for a
-        # non-owner personal row this route already required to reach here.
+        # The gate above is unchanged (still 404s without a personal row,
+        # owner or not); only the reported field below draws on a team
+        # verdict. The toggle has already committed by the time this runs,
+        # so a verdict failure here must not fail the request -- it only
+        # degrades can_edit_global to False, the same answer this route
+        # reported before the verdict existed at all.
         from ..services.connector_team_scope import resolve_connector_access_or_raise
 
-        team_access = resolve_connector_access_or_raise(
-            db, int(user_id), "mcp", int(server.id)
-        )
+        team_access: "ConnectorAccess | None" = None
+        try:
+            team_access = resolve_connector_access_or_raise(
+                db, int(user_id), "mcp", int(server.id)
+            )
+        except ConnectorRuntimeError:
+            logger.warning(
+                "Connector access resolution failed for MCP server %s after "
+                "toggling it for user %s; reporting can_edit_global=False",
+                server.id,
+                user_id,
+            )
         return _db_server_to_response(
             server,
             user_mcp,
@@ -3908,11 +3946,6 @@ async def toggle_mcp_server(
 
     except HTTPException:
         raise
-    except ConnectorRuntimeError as exc:
-        db.rollback()
-        raise HTTPException(
-            status_code=exc.status_code, detail=exc.safe_message
-        ) from exc
     except Exception as e:
         db.rollback()
         logger.error(f"Failed to toggle MCP server: {e}")

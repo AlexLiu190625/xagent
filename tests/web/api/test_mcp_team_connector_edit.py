@@ -12,20 +12,27 @@ into suites that run after this one.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
+from xagent.web.api import mcp as mcp_module
 from xagent.web.api.mcp import (
+    MCPAppConnectRequest,
     MCPServerUpdate,
     _check_mcp_permission,
+    connect_mcp_app,
     get_mcp_server,
+    toggle_mcp_server,
     update_mcp_server,
 )
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.services.connector_team_scope import (
     ConnectorAccess,
@@ -322,8 +329,16 @@ class TestUserEnvAndIsActiveRejectionForAStandIn:
 
 
 class TestTypedErrorArm:
+    """A raising hook still surfaces its declared status for a caller whose
+    own personal row does not already decide the answer -- the verdict is
+    genuinely the gate for that population, and must stay fail-closed. An
+    owner's row already decides the answer on its own, so a hook is never
+    called for it at all; that population is pinned separately, below, in
+    ``TestOwnerIsImmuneToAHookFailure``."""
+
     def test_get_surfaces_a_raising_hooks_declared_status(self, db):
         owner = _make_user(db, 1)
+        member = _make_user(db, 2)
         server = _make_owned_server(db, owner.id)
 
         def boom(*_a, **_k):
@@ -332,7 +347,7 @@ class TestTypedErrorArm:
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=boom)
             with pytest.raises(HTTPException) as exc:
-                get_mcp_server(server.id, current_user=owner, db=db)
+                get_mcp_server(server.id, current_user=member, db=db)
 
         assert exc.value.status_code == 503
 
@@ -340,6 +355,7 @@ class TestTypedErrorArm:
         self, db
     ):
         owner = _make_user(db, 1)
+        member = _make_user(db, 2)
         server = _make_owned_server(db, owner.id, name="pristine")
         server_id = server.id
 
@@ -352,7 +368,7 @@ class TestTypedErrorArm:
                 update_mcp_server(
                     server_id,
                     MCPServerUpdate(name="should-not-land"),
-                    current_user=owner,
+                    current_user=member,
                     db=db,
                 )
 
@@ -366,6 +382,7 @@ class TestTypedErrorArm:
         self, db
     ):
         owner = _make_user(db, 1)
+        member = _make_user(db, 2)
         server = _make_owned_server(db, owner.id)
 
         def boom(*_a, **_k):
@@ -377,9 +394,151 @@ class TestTypedErrorArm:
                 update_mcp_server(
                     server.id,
                     MCPServerUpdate(name="irrelevant"),
-                    current_user=owner,
+                    current_user=member,
                     db=db,
                 )
 
         assert exc.value.status_code == 409
         assert exc.value.detail == "planted failure"
+
+
+class TestOwnerIsImmuneToAHookFailure:
+    """An owner's row already decides the edit answer on its own -- the
+    edit branch returns True on ``is_owner`` without ever consulting a
+    verdict -- so ``GET``/``PUT`` never call the hook for an owner's row at
+    all. A hook that would raise must therefore never surface: both routes
+    return their normal success status, unaffected by whatever the hook
+    would have done."""
+
+    def test_get_and_put_succeed_for_an_owner_even_though_the_hook_would_raise(
+        self, db
+    ):
+        owner = _make_user(db, 1)
+        server = _make_owned_server(db, owner.id, name="owner-immune")
+        server_id = server.id
+
+        def boom(*_a, **_k):
+            raise ValueError("hook exploded")
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=boom)
+            get_response = get_mcp_server(server_id, current_user=owner, db=db)
+            put_response = update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="edited by the owner"),
+                current_user=owner,
+                db=db,
+            )
+
+        assert get_response.can_edit_global is True
+        assert put_response.can_edit_global is True
+        assert put_response.description == "edited by the owner"
+
+
+def _make_catalog_app(db, app_id: str) -> None:
+    db.add(
+        PublicMCPApp(
+            app_id=app_id,
+            name=app_id,
+            transport="stdio",
+            launch_config={"command": "true", "args": []},
+        )
+    )
+    db.commit()
+
+
+class TestDecorationDegradesAfterTheWriteCommits:
+    """``toggle`` and ``connect`` both commit their write before resolving
+    the verdict, purely to decorate the response's ``can_edit_global`` --
+    a hook failure there must degrade that field to False rather than fail
+    a request whose write already landed."""
+
+    async def test_toggle_degrades_and_keeps_its_effect_when_the_hook_raises(
+        self, db, monkeypatch
+    ):
+        # A non-owner personal row, not the owner's: an owner's
+        # can_edit_global cannot be moved by any verdict at all (is_owner
+        # wins outright), so only a non-owner's reported field actually
+        # depends on whether the verdict resolved or degraded.
+        owner = _make_user(db, 1)
+        editor = _make_user(db, 2)
+        server = _make_owned_server(db, owner.id)
+        server_id = server.id
+        db.add(
+            UserMCPServer(
+                user_id=editor.id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        before = (
+            db.query(UserMCPServer)
+            .filter(
+                UserMCPServer.user_id == editor.id,
+                UserMCPServer.mcpserver_id == server_id,
+            )
+            .one()
+            .is_active
+        )
+
+        def boom(*_a, **_k):
+            raise ValueError("hook exploded")
+
+        fake_logger = MagicMock()
+        monkeypatch.setattr(mcp_module, "logger", fake_logger)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=boom)
+            response = await toggle_mcp_server(server_id, current_user=editor, db=db)
+
+        assert response.can_edit_global is False
+        fake_logger.warning.assert_called_once()
+
+        db.rollback()
+        refreshed = (
+            db.query(UserMCPServer)
+            .filter(
+                UserMCPServer.user_id == editor.id,
+                UserMCPServer.mcpserver_id == server_id,
+            )
+            .one()
+        )
+        assert refreshed.is_active is (not before)
+
+    def test_connect_degrades_and_keeps_its_effect_when_the_hook_raises(
+        self, db, monkeypatch
+    ):
+        user = _make_user(db, 1)
+        _make_catalog_app(db, "decorate-only-app")
+
+        def boom(*_a, **_k):
+            raise ValueError("hook exploded")
+
+        fake_logger = MagicMock()
+        monkeypatch.setattr(mcp_module, "logger", fake_logger)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=boom)
+            response = connect_mcp_app(
+                "decorate-only-app",
+                MCPAppConnectRequest(),
+                current_user=user,
+                db=db,
+            )
+
+        assert response.can_edit_global is False
+        fake_logger.warning.assert_called_once()
+
+        db.rollback()
+        server = db.query(MCPServer).filter(MCPServer.name == "decorate-only-app").one()
+        assoc = (
+            db.query(UserMCPServer)
+            .filter(
+                UserMCPServer.user_id == user.id,
+                UserMCPServer.mcpserver_id == server.id,
+            )
+            .one()
+        )
+        assert assoc.is_owner is False

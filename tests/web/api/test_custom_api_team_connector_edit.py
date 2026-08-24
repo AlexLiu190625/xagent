@@ -225,9 +225,18 @@ class TestIsActiveRejectionForAStandIn:
 
 
 class TestTypedErrorArm:
+    """A raising hook still surfaces its declared status for a caller with
+    no working personal row -- the verdict is genuinely the gate for that
+    population and must stay fail-closed. An owner's row already decides
+    ``GET``'s answer (it never reads the verdict at all) and ``PUT``'s
+    (``can_edit`` is already ``True``), so neither ever calls the hook for
+    an owner's row; that population is pinned separately, below, in
+    ``TestOwnerIsImmuneToAHookFailure``."""
+
     @pytest.mark.asyncio
     async def test_get_surfaces_a_raising_hooks_declared_status(self, db):
         owner = _make_user(db, 1)
+        member = _make_user(db, 2)
         api = _make_owned_api(db, owner.id)
 
         def boom(*_a, **_k):
@@ -236,7 +245,7 @@ class TestTypedErrorArm:
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=boom)
             with pytest.raises(HTTPException) as exc:
-                await _get(api.id, owner, db)
+                await _get(api.id, member, db)
 
         assert exc.value.status_code == 503
 
@@ -245,6 +254,7 @@ class TestTypedErrorArm:
         self, db
     ):
         owner = _make_user(db, 1)
+        member = _make_user(db, 2)
         api = _make_owned_api(db, owner.id, name="pristine")
         api_id = api.id
 
@@ -257,7 +267,7 @@ class TestTypedErrorArm:
                 await _put(
                     api_id,
                     CustomApiUpdate(name="should-not-land"),
-                    owner,
+                    member,
                     db,
                 )
 
@@ -272,6 +282,7 @@ class TestTypedErrorArm:
         self, db
     ):
         owner = _make_user(db, 1)
+        member = _make_user(db, 2)
         api = _make_owned_api(db, owner.id)
 
         def boom(*_a, **_k):
@@ -283,9 +294,42 @@ class TestTypedErrorArm:
                 await _put(
                     api.id,
                     CustomApiUpdate(description="irrelevant"),
-                    owner,
+                    member,
                     db,
                 )
 
         assert exc.value.status_code == 409
         assert exc.value.detail == "planted failure"
+
+
+class TestOwnerIsImmuneToAHookFailure:
+    """An owner's row already decides both routes' answers on its own --
+    ``GET`` never reads the verdict at all, and ``PUT``'s ``can_edit`` is
+    already ``True`` -- so neither ever calls the hook for an owner's row.
+    A hook that would raise must therefore never surface: both routes
+    return their normal success status, unaffected by whatever the hook
+    would have done."""
+
+    @pytest.mark.asyncio
+    async def test_get_and_put_succeed_for_an_owner_even_though_the_hook_would_raise(
+        self, db
+    ):
+        owner = _make_user(db, 1)
+        api = _make_owned_api(db, owner.id, name="owner-immune")
+        api_id = api.id
+
+        def boom(*_a, **_k):
+            raise ValueError("hook exploded")
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=boom)
+            get_response = await _get(api_id, owner, db)
+            put_response = await _put(
+                api_id,
+                CustomApiUpdate(description="edited by the owner"),
+                owner,
+                db,
+            )
+
+        assert get_response.id == api_id
+        assert put_response.description == "edited by the owner"

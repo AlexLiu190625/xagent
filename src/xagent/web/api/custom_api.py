@@ -7,7 +7,7 @@ in the web application.
 
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -265,7 +265,11 @@ async def create_custom_api(
 
 
 def _resolve_custom_api_for_request(
-    db: Session, user_id: int, api_id: int
+    db: Session,
+    user_id: int,
+    api_id: int,
+    *,
+    skip_resolution_when: "Callable[[UserCustomApi], bool] | None" = None,
 ) -> "tuple[UserCustomApi | _TeamOwnedUserApi, CustomApi, ConnectorAccess | None]":
     """Resolve the caller's association, the definition row, and the
     caller's team access verdict, for ``GET``/``PUT /api/custom-apis/{id}``.
@@ -287,6 +291,19 @@ def _resolve_custom_api_for_request(
       place, the same stand-in the aggregate connector list already
       constructs for this case.
 
+    ``skip_resolution_when`` lets a caller declare when its own working
+    personal row already decides the answer on its own, so resolving a
+    verdict would only add an unnecessary hook call: ``get_custom_api``
+    passes a predicate that is always true, because it never reads the
+    verdict at all and a personal row -- owner or not -- already decides
+    what it returns; ``update_custom_api`` passes one that checks
+    ``can_edit``, because only an owner's ``can_edit=True`` decides the
+    edit answer on its own -- a non-owner's ``can_edit=False`` personal row
+    does not, since a granting team verdict can still widen it. Left
+    unset (the default), resolution is never skipped, which is what a
+    caller with no working personal row always needs -- the verdict is the
+    gate there and must stay fail-closed.
+
     Raises ``ConnectorRuntimeError`` when access resolution itself fails;
     callers translate that into an ``HTTPException``.
     """
@@ -307,8 +324,12 @@ def _resolve_custom_api_for_request(
         user_api = None
         api = db.query(CustomApi).filter(CustomApi.id == api_id).first()
 
+    already_decided = user_api is not None and (
+        skip_resolution_when is not None and skip_resolution_when(user_api)
+    )
+
     access: "ConnectorAccess | None" = None
-    if api is not None:
+    if api is not None and not already_decided:
         access = resolve_connector_access_or_raise(
             db, int(user_id), "custom_api", int(api.id)
         )
@@ -334,8 +355,15 @@ async def get_custom_api(
     """Get a specific Custom API by ID."""
 
     try:
+        # This route never reads the verdict at all (see _db_api_to_response),
+        # so a working personal row -- owner or not -- always already
+        # decides everything this route returns; resolving one would only
+        # add an unnecessary hook call.
         user_api, api, _team_access = _resolve_custom_api_for_request(
-            db, int(current_user.id), api_id
+            db,
+            int(current_user.id),
+            api_id,
+            skip_resolution_when=lambda _user_api: True,
         )
     except ConnectorRuntimeError as exc:
         raise HTTPException(
@@ -355,8 +383,16 @@ async def update_custom_api(
     """Update an existing Custom API."""
 
     try:
+        # An owner's can_edit=True already decides the edit answer on its
+        # own (below), so resolving a verdict for that row would only add
+        # an unnecessary hook call; a non-owner's can_edit=False personal
+        # row does not decide it, since a granting team verdict can still
+        # widen it.
         user_api, api, team_access = _resolve_custom_api_for_request(
-            db, int(current_user.id), api_id
+            db,
+            int(current_user.id),
+            api_id,
+            skip_resolution_when=lambda ua: bool(ua.can_edit),
         )
     except ConnectorRuntimeError as exc:
         raise HTTPException(
