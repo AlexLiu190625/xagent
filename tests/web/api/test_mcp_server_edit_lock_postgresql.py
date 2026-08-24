@@ -30,6 +30,10 @@ from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.user import User
+from xagent.web.services.connector_team_scope import (
+    set_connector_team_hooks,
+    snapshot_connector_team_hooks,
+)
 
 pytestmark = pytest.mark.postgresql
 
@@ -152,6 +156,103 @@ def test_a_second_editor_blocks_until_the_first_editors_transaction_finishes(
             second.result(timeout=10)
 
         assert second_finished.is_set()
+    finally:
+        mcp_api._build_server_config = real_build_server_config
+        session_a.close()
+        session_b.close()
+
+
+def test_the_second_editors_rename_reports_the_first_editors_committed_name_as_old(
+    session_factory, seeded
+) -> None:
+    """``rename_team_connector``'s ``old`` argument must be the name this
+    transaction's own lock actually holds once acquired, not whatever the
+    pre-lock read saw.
+
+    Interleaving under test: the first editor renames the connector and
+    commits while the second editor is blocked on the lock. The second
+    editor then acquires the lock, refreshed to the first editor's
+    committed name, and renames again. If the second editor's ``old``
+    argument were captured before its own lock instead, it would report
+    the connector's *original* name -- not the name every team agent's
+    selector was already rewritten to by the first editor's own call --
+    and the second rewrite would search for a name nothing holds anymore,
+    leaving the first rewrite's result permanently dangling with no error.
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    owner_id, server_id = seeded
+    current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+    second_finished = threading.Event()
+    first_call_claimed = threading.Event()
+    first_call_lock = threading.Lock()
+
+    renamed_calls: list[tuple[str, str]] = []
+    renamed_calls_lock = threading.Lock()
+
+    def spy_renamed_hook(_db, _user_id, _connector_type, _connector_id, old, new):
+        with renamed_calls_lock:
+            renamed_calls.append((old, new))
+
+    real_build_server_config = mcp_api._build_server_config
+
+    def paced_build_server_config(update_data, server):
+        with first_call_lock:
+            is_first_call = not first_call_claimed.is_set()
+            first_call_claimed.set()
+        if is_first_call:
+            lock_acquired.set()
+            assert release_lock.wait(timeout=10), "the first editor was never released"
+        return real_build_server_config(update_data, server)
+
+    mcp_api._build_server_config = paced_build_server_config
+    session_a = session_factory()
+    session_b = session_factory()
+    try:
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(renamed=spy_renamed_hook)
+
+            def run_first():
+                return mcp_api.update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(name="renamed-by-first-editor"),
+                    current_user=current_user,
+                    db=session_a,
+                )
+
+            def run_second():
+                result = mcp_api.update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(name="renamed-by-second-editor"),
+                    current_user=current_user,
+                    db=session_b,
+                )
+                second_finished.set()
+                return result
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(run_first)
+                assert lock_acquired.wait(timeout=5), (
+                    "the first editor never reached the lock"
+                )
+
+                second = executor.submit(run_second)
+                assert not second_finished.wait(timeout=1.0), (
+                    "the second editor finished before the first one released the row"
+                )
+
+                release_lock.set()
+                first.result(timeout=10)
+                second.result(timeout=10)
+
+        assert renamed_calls == [
+            ("edit-lock-target", "renamed-by-first-editor"),
+            ("renamed-by-first-editor", "renamed-by-second-editor"),
+        ]
     finally:
         mcp_api._build_server_config = real_build_server_config
         session_a.close()

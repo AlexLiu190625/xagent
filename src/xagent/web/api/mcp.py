@@ -3308,7 +3308,6 @@ def update_mcp_server(
             db, int(user_id), server_id
         )
         is_stand_in = isinstance(user_mcp, _TeamOwnedUserMCP)
-        old_name = str(server.name)
         can_edit_global = _check_mcp_permission(
             user_mcp,
             getattr(current_user, "is_admin", False),
@@ -3352,6 +3351,14 @@ def update_mcp_server(
                 status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
             )
         server = locked_server
+        # Read only after the lock: rename_team_connector's "old" argument
+        # must be the name this transaction actually holds locked, not
+        # whatever was there at the pre-lock read above -- a concurrent
+        # committed rename in between would otherwise make this stale, and
+        # the rewrite below would then look for a name that no longer
+        # exists anywhere, leaving the previous renamer's selectors
+        # dangling with no error.
+        old_name = str(server.name)
 
         # Non-owners may not touch the shared global config (env, command, etc.);
         # they only get to set their own per-user env override below. Reject a
