@@ -1781,9 +1781,9 @@ async def _fast_path_snapshot_stream(
             snapshot.task_id, principal, read_task_steps_response
         )
     except Exception as exc:
-        # The conclusion goes out first -- see the docstring above -- so a
-        # step-read failure never also swallows the fact that this task
-        # already reached this terminal state.
+        # The conclusion goes out first -- see the docstring above -- so
+        # a step-read failure never also swallows the outcome the
+        # conclusion frame carries.
         yield conclusion
         yield _fast_path_steps_read_error_frame(exc, snapshot.task_id, path_name)
         return
@@ -1842,62 +1842,11 @@ def _terminal_snapshot_stream(
     and end. No sink, no registration, no watchdog -- there's nothing
     left to watch.
 
-    ``task.status`` is emitted first, then the steps read runs inside
-    its own ``try``/``except``. A bare exception here
-    would not produce a different HTTP status: ``StreamingResponse``
-    sends the response start (200, headers) before ever pulling a chunk
-    from this generator, so letting the read's exception propagate
-    unguarded just ends an already-started 200 response with no bytes
-    at all -- indistinguishable, from the client's side, from the
-    connection merely dropping. Catching the failure and closing with a
-    ``stream.error`` frame instead keeps this module's own invariant
-    that a close frame is always how a client tells "the task ended"
-    apart from "the stream ended" -- ``task_deleted`` when the task
-    disappeared out from under this read, ``resync_required`` for
-    everything else; see ``_fast_path_steps_read_error_frame``.
-
-    ``snapshot`` was already resolved, from its own authoritative read,
-    before this function was ever called, so ``task.completed``
-    describes the generation this path was picked for. What this path
-    will not do is pair that conclusion with step content from a
-    generation it never confirmed. Step content is a different matter:
-    the steps this path is about to read reflect whatever run/state
-    generation the task row is in *at that read*, and a concurrent
-    restart (a ``POST reply`` resuming a ``WAITING_FOR_USER`` task, or a
-    WS ``APPEND`` resuming a ``COMPLETED``/``FAILED`` one) can move the
-    row to a new generation in the gap between ``snapshot`` and that
-    read. The rule this path enforces: ``task.completed`` goes out on
-    every exit, and the fence decides only whether step content joins
-    it. The conclusion describes ``snapshot``'s own generation -- the
-    authoritative read that selected this fast path -- so a client that
-    tracks only lifecycle gets the same single conclusion frame it
-    would get if this path carried no step content at all. When the
-    reread below confirms a newer generation, ``snapshot`` is
-    superseded, and it is the ``stream.error(resync_required)`` that
-    follows which tells the client to refetch, not a retraction of the
-    conclusion already sent. Step content is the part that can go
-    stale, so it goes out only once the task row has been read once
-    more and confirmed to still be ``snapshot``'s own generation
-    (``_fast_path_generation_changed``); that reread runs only when
-    there is step content to protect, so a failed steps read (nothing
-    to protect) and an empty one (nothing that could be stale) both
-    skip it. A confirmed match sends the steps, then the conclusion. A
-    confirmed change means the steps just read belong to a generation
-    this path never confirmed against, so the steps are withheld and
-    the conclusion is followed by ``stream.error(resync_required)``. A
-    reread that fails outright can't tell a match from a change and is
-    handled the same way, except that its ``stream.error`` names the
-    reread failure rather than claiming the task moved
-    (``_fast_path_generation_reread_error_frame``, same
-    ``task_deleted``-vs-everything-else split as
-    ``_fast_path_steps_read_error_frame``). Serializing a step can fail
-    too -- ``PublicStep.data`` carries arbitrary tool JSON -- which ends
-    the step content there and closes the same way, so no exit leaves
-    the client with an already-started 200 response and no close frame.
-
-    The body both fast paths share lives in
-    ``_fast_path_snapshot_stream``; this function supplies the
-    conclusion frame and the path label.
+    The frame order, the generation fence, and how every failure exit
+    still closes with a frame all live in ``_fast_path_snapshot_stream``,
+    the body both fast paths share; this function supplies the
+    conclusion frame -- built from the authoritative read that selected
+    this path -- and the ``"terminal"`` path label.
     """
     # Built here, before the shared body is entered, from ``snapshot``'s
     # own authoritative read -- the read that selected this fast path --
@@ -1932,13 +1881,13 @@ def _input_required_snapshot_stream(
 
     Same ordering, the same read-failure handling, the same pre-steps
     generation fence, and the same guard around step serialization as
-    ``_terminal_snapshot_stream`` -- see that function's docstring for
-    why the steps read is guarded in its own ``try``/``except`` rather
-    than left to raise past this generator's first ``yield``, why step
-    content is withheld until a reread confirms the task row is still
-    the generation ``snapshot`` was read from, and why
-    ``task.input_required`` goes out on every exit regardless of what
-    the fence decides about step content.
+    ``_terminal_snapshot_stream`` -- ``_fast_path_snapshot_stream``, the
+    body both paths share, documents why the steps read is guarded in
+    its own ``try``/``except`` rather than left to raise past the
+    generator's first ``yield``, why step content is withheld until a
+    reread confirms the task row is still the generation ``snapshot``
+    was read from, and why the conclusion goes out on every exit
+    regardless of what the fence decides about step content.
     """
     # Built here, before the shared body is entered, for the same reason
     # as ``_terminal_snapshot_stream``'s own conclusion: it describes the
