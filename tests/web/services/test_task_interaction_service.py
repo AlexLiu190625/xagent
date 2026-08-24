@@ -558,6 +558,32 @@ def _values(interactions: list[dict[str, Any]], message: str = "Which one?") -> 
             _values([_interaction(type="number_input", min=10, max=3)]),
             id="min_greater_than_max",
         ),
+        pytest.param(
+            _values(
+                [_interaction(type="select_one", options=[{"label": "", "value": "a"}])]
+            ),
+            id="option_with_a_blank_label",
+        ),
+        pytest.param(
+            _values(
+                [_interaction(type="select_one", options=[{"label": "A", "value": ""}])]
+            ),
+            id="option_with_a_blank_value",
+        ),
+        pytest.param(
+            _values(
+                [
+                    _interaction(
+                        type="action_cards",
+                        options=[
+                            {"label": "A", "value": "a"},
+                            {"label": "", "value": ""},
+                        ],
+                    )
+                ]
+            ),
+            id="one_blank_option_among_usable_ones",
+        ),
     ],
 )
 def test_cv4_write_side_payload_rules_reject_the_envelope(

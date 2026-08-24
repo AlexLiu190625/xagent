@@ -204,12 +204,24 @@ class InteractionPrincipal:
         an identity and is not one: a missing id interpolated into the
         literal ``"user:None"`` / ``"guest:None"``, and an unrecognized
         ``kind`` falling through to the user branch and being recorded as a
-        user. Nothing downstream stops either --
+        user.
+
+        Nothing downstream stops either --
         ``ck_task_interaction_requests_responder_identity_nonempty``
         (``models/task_interaction.py``) only requires a non-empty string,
         and both of those are non-empty -- and this column is the one field
         this table's audit trail can rely on staying populated, so a value
         it cannot trust is worse here than a failure.
+
+        The empty string is the same gap wearing a different shape: a
+        ``guest_id`` of ``""`` used to render as the literal ``"guest:"``,
+        another non-empty value the CHECK above lets through, and it names
+        nobody either. The falsy test below is the same one the ownership
+        predicates in this module already use for ``guest_id``. It stops
+        at falsy and does not strip: the two token decoders that build
+        these principals do not agree on whitespace, and the widget path
+        admits a guest id that is only spaces, so stripping here would
+        start rejecting principals that path produces today.
 
         ``ValueError``, not a typed rejection, because this is a pure
         function of the principal: reaching it with one this incomplete
@@ -222,7 +234,7 @@ class InteractionPrincipal:
         """
 
         if self.kind == "guest":
-            if self.guest_id is None:
+            if not self.guest_id:
                 raise ValueError("guest principal carries no guest_id")
             return f"guest:{self.guest_id}"
         if self.kind != "user":
@@ -975,6 +987,23 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
             raise ValueError(f"{where} is a {interaction.type} carrying no options")
         if interaction.type in _V1_TYPES_REJECTING_OPTIONS and interaction.options:
             raise ValueError(f"{where} is a {interaction.type} carrying options")
+        # Either half blank, not both: an option the user can see but not
+        # submit, and one they can submit but not see, are both unusable,
+        # and the renderer already treats them the same way -- its own
+        # filter keeps an option only when value and label are both
+        # truthy (clarification-form.tsx). An option dropped there leaves
+        # a select the user cannot complete, or, if it was the only one, a
+        # form with an empty control; refusing the write is the only place
+        # that outcome can still be prevented. Falsy, not stripped: the
+        # two fields are required ``str`` on ``InteractionOption``
+        # (ask_user_tool.py), so a payload that got this far can only be
+        # blank by being the empty string, and stripping would start
+        # rejecting a whitespace label the renderer does display.
+        for option_index, option in enumerate(interaction.options or ()):
+            if not option.label or not option.value:
+                raise ValueError(
+                    f"{where}.options[{option_index}] has a blank label or value"
+                )
         if (
             interaction.min is not None
             and interaction.max is not None

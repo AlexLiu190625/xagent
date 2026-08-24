@@ -437,6 +437,17 @@ def test_identity_string_for_user_principal() -> None:
         ),
         pytest.param(
             InteractionPrincipal(
+                kind="guest",
+                user_id=7,
+                is_admin=False,
+                auth_mode="widget",
+                widget_agent_id=1,
+                guest_id="",
+            ),
+            id="guest_with_an_empty_guest_id",
+        ),
+        pytest.param(
+            InteractionPrincipal(
                 kind="robot", user_id=7, is_admin=False, auth_mode=None
             ),
             id="unrecognized_kind",
