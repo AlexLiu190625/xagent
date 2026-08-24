@@ -15,7 +15,18 @@ import shlex
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+    cast,
+)
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -27,6 +38,7 @@ from sqlalchemy.orm import Session
 
 from ...config import get_app_base_url, get_public_api_base_url, get_session_secret
 from ...core.tools.adapters.vibe.connector_runtime import (
+    ConnectorRuntimeError,
     validate_runtime_config_declaration,
 )
 from ...core.tools.core.mcp.data_config import MCPServerConfig
@@ -76,6 +88,9 @@ from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     list_scoped_user_oauth_accounts,
 )
+
+if TYPE_CHECKING:
+    from ..services.connector_team_scope import ConnectorAccess
 
 logger = logging.getLogger(__name__)
 
@@ -1363,11 +1378,20 @@ def _check_mcp_permission(
     user_mcp: "UserMCPServer | _TeamOwnedUserMCP",
     is_admin: bool,
     require: str = "edit",
+    *,
+    team_access: "ConnectorAccess | None" = None,
 ) -> bool:
     """Whether the user may mutate shared MCP config.
 
     ``edit`` gates changes to the shared global config; ``delete`` gates
     removing the shared server. Admins bypass both.
+
+    ``team_access`` is the caller's team access verdict for this connector
+    (``None`` when the caller's team does not link it, or when standalone
+    xagent has no access hook installed at all). It is a fallback only: an
+    owner's ``is_owner`` still wins the ``edit`` branch outright, with no
+    verdict consulted at all, and the ``delete`` branch does not read it --
+    ``can_delete`` is not part of the verdict this seam reports.
     """
     if is_admin:
         return True
@@ -1377,7 +1401,9 @@ def _check_mcp_permission(
         # non-owner. Checking is_owner too covers rows created before can_delete
         # was set (e.g. OAuth provisioning, migration-skipped is_owner rows).
         return is_owner or bool(getattr(user_mcp, "can_delete", False))
-    return is_owner
+    if is_owner:
+        return True
+    return bool(team_access is not None and team_access.can_edit)
 
 
 # Owner-only global fields that are safe to compare (non-secret; secret values
@@ -1459,6 +1485,62 @@ class _TeamOwnedUserApi:
 
     def __init__(self, user_id: int) -> None:
         self.user_id = int(user_id)
+
+
+def _resolve_mcp_server_for_request(
+    db: Session, user_id: int, server_id: int
+) -> "tuple[UserMCPServer | _TeamOwnedUserMCP, MCPServer, ConnectorAccess | None]":
+    """Resolve the caller's association, the definition row, and the
+    caller's team access verdict, for ``GET``/``PUT /api/mcp/servers/{id}``.
+
+    Looks up the caller's own personal link row first, with the same
+    two-table join both routes have always run. When that row exists, the
+    association and the definition row both come from it and nothing else
+    runs. When it does not, the definition row is looked up on its own --
+    a team-owned connector's shared row must still be found even though
+    this caller has no personal link to it -- and the caller's team access
+    verdict decides what happens next:
+
+    - no personal row and no team access (``access is None``) -> 404, the
+      same outcome every caller without an association has always gotten.
+    - no personal row but the caller's team links the connector -> the
+      existing ``_TeamOwnedUserMCP`` stand-in takes the association's
+      place, the same stand-in the list endpoint's team-owned branch
+      already constructs.
+
+    Raises ``ConnectorRuntimeError`` when access resolution itself fails;
+    callers translate that into an ``HTTPException``.
+    """
+    from ..services.connector_team_scope import resolve_connector_access_or_raise
+
+    result = (
+        db.query(UserMCPServer, MCPServer)
+        .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+        .filter(UserMCPServer.user_id == user_id, MCPServer.id == server_id)
+        .first()
+    )
+    if result is not None:
+        user_mcp: "UserMCPServer | _TeamOwnedUserMCP | None" = result[0]
+        server: Optional[MCPServer] = result[1]
+    else:
+        user_mcp = None
+        server = db.query(MCPServer).filter(MCPServer.id == server_id).first()
+
+    access: "ConnectorAccess | None" = None
+    if server is not None:
+        access = resolve_connector_access_or_raise(
+            db, int(user_id), "mcp", int(server.id)
+        )
+
+    if user_mcp is None and access is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
+        )
+
+    if user_mcp is None:
+        user_mcp = _TeamOwnedUserMCP(int(user_id))
+
+    return user_mcp, cast(MCPServer, server), access
 
 
 def _db_server_to_response(
@@ -2595,20 +2677,11 @@ def get_mcp_server(
         manager = DatabaseMCPServerManager(db)
         user_id = current_user.id
 
-        # Check user has access to this server
-        result = (
-            db.query(UserMCPServer, MCPServer)
-            .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
-            .filter(UserMCPServer.user_id == user_id, MCPServer.id == server_id)
-            .first()
+        # Check user has access to this server: a personal row, or a team
+        # access verdict for a connector the caller has none for.
+        user_mcp, server, _team_access = _resolve_mcp_server_for_request(
+            db, int(user_id), server_id
         )
-
-        if not result:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
-            )
-
-        user_mcp, server = result
 
         # Actor credentials are not personal server connections.
         oauth_accounts = list_scoped_user_oauth_accounts(
@@ -2638,6 +2711,10 @@ def get_mcp_server(
 
     except HTTPException:
         raise
+    except ConnectorRuntimeError as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
     except Exception as e:
         logger.error(f"Failed to get MCP server: {e}")
         raise HTTPException(
@@ -3225,24 +3302,56 @@ def update_mcp_server(
         manager = DatabaseMCPServerManager(db)
         user_id = current_user.id
 
-        # Check user has access to this server
-        result = (
-            db.query(UserMCPServer, MCPServer)
-            .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
-            .filter(UserMCPServer.user_id == user_id, MCPServer.id == server_id)
-            .first()
+        # Check user has access to this server: a personal row, or a team
+        # access verdict for a connector the caller has none for.
+        user_mcp, server, team_access = _resolve_mcp_server_for_request(
+            db, int(user_id), server_id
+        )
+        is_stand_in = isinstance(user_mcp, _TeamOwnedUserMCP)
+        old_name = str(server.name)
+        can_edit_global = _check_mcp_permission(
+            user_mcp,
+            getattr(current_user, "is_admin", False),
+            require="edit",
+            team_access=team_access,
         )
 
-        if not result:
+        # user_env and is_active both live on the personal association row;
+        # a caller with no personal row (the stand-in) has none to hold
+        # them, so a payload carrying either must be rejected outright --
+        # silently dropping them would report a 200 for a write that never
+        # happened. This is independent of can_edit_global: even a team
+        # editor with edit rights on the shared config has no personal row
+        # of their own to store a per-user override or activation flag on.
+        if is_stand_in and (
+            server_data.user_env is not None or server_data.is_active is not None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "No personal connection exists to configure user_env or "
+                    "is_active for this server"
+                ),
+            )
+
+        # A second, single-table lock on the definition row, taken before any
+        # tamper check or config build below reads or mutates it. The read
+        # above is a two-table join and cannot itself lock just this table;
+        # this is a fresh statement, so a row deleted between the two still
+        # yields None here (handled as the same 404) rather than surfacing
+        # as an unrelated error out of the write path below.
+        locked_server = (
+            db.query(MCPServer)
+            .filter(MCPServer.id == server_id)
+            .populate_existing()
+            .with_for_update()
+            .first()
+        )
+        if locked_server is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
             )
-
-        user_mcp, server = result
-        old_name = str(server.name)
-        can_edit_global = _check_mcp_permission(
-            user_mcp, getattr(current_user, "is_admin", False), require="edit"
-        )
+        server = locked_server
 
         # Non-owners may not touch the shared global config (env, command, etc.);
         # they only get to set their own per-user env override below. Reject a
@@ -3358,7 +3467,7 @@ def update_mcp_server(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid user environment variables: {exc}",
                 ) from exc
-            user_mcp.env = encrypt_env_dict(merged_user_env) or None
+            cast(Any, user_mcp).env = encrypt_env_dict(merged_user_env) or None
 
         # Update user association if needed
         if server_data.is_active is not None:
@@ -3372,7 +3481,9 @@ def update_mcp_server(
 
         db.commit()
         db.refresh(server)
-        db.refresh(user_mcp)
+        # The stand-in is not an ORM instance -- there is no row to refresh.
+        if not is_stand_in:
+            db.refresh(user_mcp)
 
         logger.info(f"Updated MCP server '{server.name}' for user {user_id}")
         return _db_server_to_response(
@@ -3381,6 +3492,11 @@ def update_mcp_server(
 
     except HTTPException:
         raise
+    except ConnectorRuntimeError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
     except Exception as e:
         db.rollback()
         logger.error(f"Failed to update MCP server: {e}")
