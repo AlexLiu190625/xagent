@@ -1613,10 +1613,12 @@ async def _fast_path_generation_changed(
     ``run_id``/``state_version`` against it.
 
     ``state_version`` is the field that actually carries this. Every
-    lifecycle write increments it monotonically
-    (``services/task_execution_controller.py`` bumps it unconditionally
-    on the same UPDATE that sets the control state), whether or not a
-    new run begins. ``run_id`` is the narrower of the two and cannot
+    lifecycle transition increments it
+    (``web/services/task_execution_controller.py`` bumps it
+    unconditionally on the same UPDATE that sets the control state, and
+    the lease service's own case bumps it whenever a write changes the
+    row's (status, control_state) pair), whether or not a new run
+    begins. ``run_id`` is the narrower of the two and cannot
     stand alone: a ``POST reply`` resuming a ``WAITING_FOR_USER`` task
     deliberately keeps the same ``run_id`` (``task_lease_service``'s
     ``lease_run_id_case`` writes the same candidate back for that

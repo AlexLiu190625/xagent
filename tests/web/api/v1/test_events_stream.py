@@ -2885,8 +2885,8 @@ async def test_fast_path_step_snapshot_is_bounded_by_replay_max_steps(
     in a single unpaced burst -- no admission/deadline/heartbeat loop --
     so it needs its own bound. This pins it: a task with 600 public
     steps (more than ``REPLAY_MAX_STEPS`` == 512) gets only its most
-    recent 512, with a ``snapshot_truncated``/``snapshot_total_steps``
-    marker on the first one."""
+    recent 512, with the ``snapshot_truncated``/``snapshot_total_steps``
+    marker on the conclusion frame and on no ``step.*`` frame."""
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     total = es.REPLAY_MAX_STEPS + 88
     steps = [
