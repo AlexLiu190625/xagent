@@ -101,6 +101,7 @@ from ...core.agent.checkpoint import (
     checkpoint_execution_id,
 )
 from ...core.tools.adapters.vibe.ask_user_tool import AskUserQuestionArgs
+from ...core.tools.adapters.vibe.interaction_types import INTERACTION_TYPES
 from ..models.task import Task, TaskStatus, TaskStatusPredicate, TraceEvent
 from ..models.task_command import TaskExecutionCommand
 from ..models.task_interaction import (
@@ -898,12 +899,22 @@ def build_v1_request_payload(parsed: AskUserQuestionArgs) -> dict[str, Any]:
     return payload
 
 
-# The seven interaction types the render surface implements, kept as a set
-# here rather than as a ``Literal`` on ``InteractionArg.type``: that model
-# is also the ``ask_user_question`` tool's argument schema, so narrowing it
-# would narrow what the model itself is allowed to emit, which is a
-# different decision from what this service is willing to persist. The
-# seven are the same ones the frontend's own normalizer accepts
+# The seven interaction types the render surface implements. The list
+# itself lives on ``interaction_types.INTERACTION_TYPES``
+# (``core/tools/adapters/vibe/``), an import-free module beside the tool
+# whose argument schema carries the field; this is the write side's
+# membership view of it. Importing rather than restating is what keeps the tool's
+# JSON-Schema enum, the tool's own argument description and this
+# admissibility set from drifting apart -- all three used to carry the
+# same seven names independently.
+#
+# Deriving the set here does not narrow ``InteractionArg.type`` to a
+# ``Literal``: that model is also the ``ask_user_question`` tool's
+# argument schema, so narrowing it would narrow what the model itself is
+# allowed to emit, which is a different decision from what this service is
+# willing to persist.
+#
+# The seven are the same ones the frontend's own normalizer accepts
 # (``normalizeInteractions``, ``frontend/src/contexts/app-context-chat.tsx``),
 # which drops an item typed anything else before it reaches a renderer.
 # That normalizer is not the only way in, though, so an unknown type is
@@ -914,17 +925,7 @@ def build_v1_request_payload(parsed: AskUserQuestionArgs) -> dict[str, Any]:
 # ``clarification-form.tsx``'s ``default`` branch and shows the user a
 # red "unsupported type" line. Rejecting the type here on the write side
 # is what keeps either surface from having to.
-_V1_INTERACTION_TYPES = frozenset(
-    {
-        "select_one",
-        "select_multiple",
-        "text_input",
-        "file_upload",
-        "confirm",
-        "number_input",
-        "action_cards",
-    }
-)
+_V1_INTERACTION_TYPES = frozenset(INTERACTION_TYPES)
 
 # The three types whose whole purpose is picking from a supplied list, and
 # the four that render their own control and have nothing to pick from.
