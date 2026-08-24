@@ -153,11 +153,8 @@ describe("ToolsPage official settings dialog ownership badge (#1623)", () => {
 
     fireEvent.click(screen.getByText("Records MCP"))
 
-    let dialog: HTMLElement
-    await waitFor(() => {
-      dialog = screen.getByRole("dialog")
-    })
-    expect(within(dialog!).getByText("tools.mcp.sharing.shared")).toBeInTheDocument()
+    const dialog = await screen.findByRole("dialog")
+    expect(within(dialog).getByText("tools.mcp.sharing.shared")).toBeInTheDocument()
     // Spreading the sanitized status onto this entry has a second consumer
     // besides the badge: the share-toggle button reads app.shared to decide
     // its own label and the direction it POSTs (handleToggleShare's share
@@ -165,7 +162,7 @@ describe("ToolsPage official settings dialog ownership badge (#1623)", () => {
     // undefined here, so this button read "Share" even for an
     // already-shared connector -- pinning the correct "Unshare" direction.
     expect(
-      within(dialog!).getByRole("button", { name: "tools.mcp.sharing.unshare" }),
+      within(dialog).getByRole("button", { name: "tools.mcp.sharing.unshare" }),
     ).toBeInTheDocument()
   })
 
@@ -175,13 +172,10 @@ describe("ToolsPage official settings dialog ownership badge (#1623)", () => {
 
     fireEvent.click(screen.getByText("Records MCP"))
 
-    let dialog: HTMLElement
-    await waitFor(() => {
-      dialog = screen.getByRole("dialog")
-    })
-    expect(within(dialog!).getByText("tools.mcp.sharing.private")).toBeInTheDocument()
+    const dialog = await screen.findByRole("dialog")
+    expect(within(dialog).getByText("tools.mcp.sharing.private")).toBeInTheDocument()
     expect(
-      within(dialog!).getByRole("button", { name: "tools.mcp.sharing.share" }),
+      within(dialog).getByRole("button", { name: "tools.mcp.sharing.share" }),
     ).toBeInTheDocument()
   })
 
@@ -198,14 +192,11 @@ describe("ToolsPage official settings dialog ownership badge (#1623)", () => {
 
     fireEvent.click(screen.getByText("Records MCP"))
 
-    let dialog: HTMLElement
-    await waitFor(() => {
-      dialog = screen.getByRole("dialog")
-    })
+    const dialog = await screen.findByRole("dialog")
     // Scoped to the dialog: the card behind it renders its own (unsanitized,
     // untouched) badge off the same malformed status and would otherwise
     // make this assertion about a different element entirely.
-    const dialogQueries = within(dialog!)
+    const dialogQueries = within(dialog)
     expect(dialogQueries.queryByText("tools.mcp.sharing.private")).toBeNull()
     expect(dialogQueries.queryByText("tools.mcp.sharing.shared")).toBeNull()
     expect(dialogQueries.queryByText("tools.mcp.sharing.teamTool")).toBeNull()
