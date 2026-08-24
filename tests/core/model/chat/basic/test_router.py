@@ -23,7 +23,11 @@ from xagent.core.model.chat.basic.router import (
 )
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
-from xagent.core.model.chat.types import ChunkType, StreamChunk
+from xagent.core.model.chat.types import (
+    PROVIDER_STATE_METADATA_KEY,
+    ChunkType,
+    StreamChunk,
+)
 from xagent.core.retry.strategy import FixedDelay
 from xagent.core.retry.wrapper import create_retry_wrapper
 
@@ -714,3 +718,128 @@ async def test_sandwiched_deepseek_prefix_sanitizes_messages_once(monkeypatch, m
     # sanitized success: the sanitized messages carry over across compat
     # iterations, so the prefix rejection never fires a second time.
     assert mock_client.chat.completions.create.await_count == 3
+
+
+# ---------------------------------------------------------------------------
+# ``_resolve_route``'s fallback branch (no injected ``downstream_resolver``):
+# the abilities passed to the ``ChatModelConfig`` it builds must be the
+# caller's original configuration, not ``RouterLLM._abilities`` (which always
+# excludes vision/thinking_mode -- see ``_UNROUTED_ROUTER_ABILITIES`` -- since
+# a virtual router cannot claim a candidate's dynamic abilities before
+# routing picks one). See the design's V2-2/V3 attack: before this fix, a
+# user-declared ``thinking_mode``/``vision`` ability was silently dropped
+# from the actually-constructed downstream client on this branch.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_router_fallback_downstream_supports_thinking_mode_matches_configured_abilities(
+    monkeypatch,
+):
+    router = RouterLLM(
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+    monkeypatch.setattr(router, "_select_model", _select_deepseek)
+
+    model_id, downstream = await router._resolve_route(
+        [{"role": "user", "content": "hi"}]
+    )
+
+    assert model_id == "deepseek/deepseek-v4-flash"
+    # The router's own advertised abilities never include thinking_mode...
+    assert router.supports_thinking_mode is False
+    # ...but the downstream client the fallback branch actually built must
+    # still see it, because that is what the user configured.
+    assert downstream.supports_thinking_mode is True
+
+
+@pytest.mark.asyncio
+async def test_router_fallback_downstream_has_ability_vision_matches_configured_abilities(
+    monkeypatch,
+):
+    router = RouterLLM(
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "vision"],
+    )
+    monkeypatch.setattr(router, "_select_model", _select_deepseek)
+
+    _model_id, downstream = await router._resolve_route(
+        [{"role": "user", "content": "hi"}]
+    )
+
+    assert router.has_ability("vision") is False
+    assert downstream.has_ability("vision") is True
+
+
+@pytest.mark.asyncio
+async def test_router_auto_fallback_vision_deepseek_round_trips_reasoning(
+    monkeypatch, mocker
+):
+    """I-20: auto routing's fallback branch, picking a deepseek model, on a
+    vision-input call -- the whole combination must still run end-to-end and
+    reasoning capture must still fire. This is the concrete scenario V2-1's
+    "vision inherits capture for free" and V2-2's "fallback abilities fix"
+    combine into: a user with an image in the conversation, no explicit
+    model chosen, routed by "auto" to a deepseek slug, on the code path with
+    no injected downstream_resolver.
+    """
+    tool_call = SimpleNamespace(
+        id="call_1",
+        type="function",
+        function=SimpleNamespace(name="search", arguments="{}"),
+    )
+    message = SimpleNamespace(
+        content=None,
+        tool_calls=[tool_call],
+        reasoning_content="Looking at the picture first.",
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message)],
+        usage=None,
+        model_dump=lambda: {"id": "auto-fallback-vision-deepseek"},
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = response
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    async def select_deepseek(_prompt: str, **_kwargs: Any) -> str:
+        return "deepseek/deepseek-v4-flash"
+
+    router = RouterLLM(
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "vision", "thinking_mode"],
+    )
+    monkeypatch.setattr(router, "_select_model", select_deepseek)
+    monkeypatch.setattr(router, "_profile_context_window", lambda _model_id: None)
+    monkeypatch.setattr(
+        RouterLLM,
+        "_profile_input_modalities",
+        staticmethod(lambda _model_id: ("image",)),
+    )
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is in this image?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
+            ],
+        }
+    ]
+
+    prepared = await router.prepare_for_call(messages)
+    # xrouter's profile reports this model supports the image modality, so
+    # the resolved wrapper's own abilities pick up "vision" too (separate
+    # from the fallback-construction fix above, but both must hold for this
+    # combined scenario to actually reach vision_chat successfully).
+    assert prepared.has_ability("vision") is True
+
+    result = await prepared.vision_chat(messages, thinking={"type": "enabled"})
+
+    assert result[PROVIDER_STATE_METADATA_KEY] == {
+        "deepseek": {"reasoning_content": "Looking at the picture first."}
+    }
