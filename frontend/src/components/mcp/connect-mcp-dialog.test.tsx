@@ -2178,6 +2178,35 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     })
   })
 
+  it("shows the private badge for an answered shared:false status (#1623)", async () => {
+    // The only positive pin on this gate's Private arm: every other fixture in
+    // this file answers shared: true or a malformed shape, so a gate that
+    // regressed to truthiness (rendering nothing for shared: false) would pass
+    // all of them.
+    useAuthMock.mockReturnValue({ token: "token", inTeam: true })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [hookResolvedCustomMcp()] })
+      }
+      if (url.endsWith("/api/connectors/status")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ "mcp:9": { shared: false, is_owner: true, needs_config: false } }),
+        })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+    await screen.findByText("Records MCP")
+
+    await waitFor(() => {
+      within(screen.getByTestId("connector-card-records")).getByText(
+        "tools.mcp.sharing.private",
+      )
+    })
+  })
+
   it("withholds the ownership badge when the sharing route does not answer for an entry (#1623)", async () => {
     useAuthMock.mockReturnValue({ token: "token", inTeam: true })
     apiRequestMock.mockImplementation((url: string) => {

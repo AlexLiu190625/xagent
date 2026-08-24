@@ -594,8 +594,13 @@ function ToolsPageContent() {
       const connType = 'mcp'
       const sharingStatus = sanitizeConnectorStatusEntry(connectorStatus[`${connType}:${server.id}`])
 
-      // Create an AppIntegration-like object for the dialog
+      // Create an AppIntegration-like object for the dialog. The sanitized
+      // sharing status is spread FIRST: today it carries exactly the three
+      // sharing keys, but spreading it last would let any extra key a future
+      // sanitizer change lets through silently override the identity fields
+      // set below (server_id, is_connected, auth_type).
       setEditingOfficialApp({
+        ...(sharingStatus ?? {}),
         id: appId, // Store the app ID for OAuth flow
         server_id: server.id, // Store the actual server ID for disconnect
         name: server.name,
@@ -609,7 +614,6 @@ function ToolsPageContent() {
         // above); set auth_type explicitly so the settings dialog's isKeyBased
         // check stays correct if this path is ever reused for other transports.
         auth_type: "builtin_oauth",
-        ...(sharingStatus ?? {}),
       })
       setIsOfficialAppDialogOpen(true)
     } else if (server.transport === "custom_api") {
