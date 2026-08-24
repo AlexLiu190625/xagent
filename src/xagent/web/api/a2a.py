@@ -467,6 +467,23 @@ async def _resume_input_required_a2a_task(
         # Read before the injection below, not inside
         # _update_a2a_resume_input_sync, whose session opens only afterwards.
         # See task_interaction_close's module docstring for why.
+        #
+        # This site's turn id is deterministic (f"a2a:{task_id}:{message_id}"
+        # below), so a retried A2A message replays the same turn:
+        # AgentRunner.inject_user_message short-circuits a repeated turn id
+        # by returning the existing context without persisting anything, and
+        # reports the same truthy `posted` a first attempt does. On such a
+        # replay the id read here is not the question the replayed message
+        # answered but whatever the resumed agent has asked since, and the
+        # close would retire a live question. Nothing can be retired today:
+        # the only INSERT into task_interaction_requests is
+        # stage_interaction_request (task_interaction_staging.py), which has
+        # no caller in src/ and is held at none by
+        # tests/web/services/test_interaction_staging_production_gate.py, so
+        # this read returns None on every call. Closing the window is a
+        # precondition on the change that wires the first production writer,
+        # stated once at the online WebSocket injection site (websocket.py)
+        # and binding here identically.
         active_interaction_id = await run_db_io_cancellation_safe(
             lambda: active_interaction_id_sync(task_id)
         )

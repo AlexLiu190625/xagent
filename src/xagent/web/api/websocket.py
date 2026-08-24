@@ -6098,14 +6098,25 @@ async def _handle_chat_message_unserialized(
                         # -- that one was retired by the first attempt -- but
                         # whatever the resumed agent has asked since, and
                         # retiring it discards a live question nobody
-                        # answered. Nothing in the interaction table is
-                        # reachable today (no production writer inserts into
-                        # it yet), so the window costs nothing right now. The
+                        # answered. This close call is live production code --
+                        # it runs on every websocket chat message that
+                        # reaches a running task -- so what makes the window
+                        # harmless today is not that the code is dormant. It
+                        # is that there is nothing for it to retire: the only
+                        # INSERT into task_interaction_requests is
+                        # stage_interaction_request
+                        # (task_interaction_staging.py), which has no caller
+                        # in src/ and is held at none by
+                        # tests/web/services/test_interaction_staging_production_gate.py.
+                        # The pre-injection read therefore returns None on
+                        # every call, and the close matches zero rows. The
                         # change that wires the first production writer has
-                        # to close it before that writer ships: the runner
-                        # has to report whether it persisted a new message or
-                        # replayed an existing turn, and this site has to
-                        # skip the close on the replay answer.
+                        # to close this window before that writer ships:
+                        # the runner has to report whether it persisted a
+                        # new message or replayed an existing turn, and this
+                        # site has to skip the close on the replay answer.
+                        # The A2A injection site (a2a.py) carries the same
+                        # window and the same precondition.
                         #
                         # The run fence
                         # is live_task_lease.run_id, not task_run_id: posted
