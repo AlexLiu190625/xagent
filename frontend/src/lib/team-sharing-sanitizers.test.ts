@@ -77,5 +77,7 @@ describe("team sharing response sanitizers", () => {
     })
     expect(sanitizeConnectorStatus("bad")).toEqual({})
     expect(sanitizeConnectorStatus(null)).toEqual({})
+    expect(sanitizeConnectorStatus(undefined)).toEqual({})
+    expect(sanitizeConnectorStatus([1, 2])).toEqual({})
   })
 })

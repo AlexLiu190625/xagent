@@ -200,5 +200,33 @@ describe("ToolsPage official settings dialog ownership badge (#1623)", () => {
     expect(dialogQueries.queryByText("tools.mcp.sharing.private")).toBeNull()
     expect(dialogQueries.queryByText("tools.mcp.sharing.shared")).toBeNull()
     expect(dialogQueries.queryByText("tools.mcp.sharing.teamTool")).toBeNull()
+    // The badge labels above pass whether or not the sanitizer runs -- both
+    // a rejected entry and a never-spread one leave app.shared undefined,
+    // so a malformed entry alone can't tell the two apart. The share
+    // button's direction can: it reads app.shared for truthiness, so an
+    // unsanitized "yes" would read truthy and show "Unshare" here instead.
+    expect(
+      within(dialog).getByRole("button", { name: "tools.mcp.sharing.share" }),
+    ).toBeInTheDocument()
+  })
+
+  it("shows no ownership label when needs_config is not a boolean", async () => {
+    // needs_config: "yes" is the only malformed field here; shared and
+    // is_owner are well-formed. sanitizeConnectorStatusEntry rejects the
+    // whole entry when any one field fails its boolean check, so this pins
+    // that field-level rejection is entry-wide, not per-field.
+    installApiMock({ "mcp:9": { shared: true, is_owner: true, needs_config: "yes" } })
+    await renderPage()
+
+    fireEvent.click(screen.getByText("Records MCP"))
+
+    const dialog = await screen.findByRole("dialog")
+    const dialogQueries = within(dialog)
+    expect(dialogQueries.queryByText("tools.mcp.sharing.private")).toBeNull()
+    expect(dialogQueries.queryByText("tools.mcp.sharing.shared")).toBeNull()
+    expect(dialogQueries.queryByText("tools.mcp.sharing.teamTool")).toBeNull()
+    // Positive anchor: the dialog did render past the malformed status,
+    // it just withheld every sharing badge.
+    expect(dialogQueries.getByRole("button", { name: "tools.mcp.sharing.share" })).toBeInTheDocument()
   })
 })
