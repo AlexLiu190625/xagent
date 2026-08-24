@@ -53,6 +53,12 @@ describe("team sharing response sanitizers", () => {
     expect(
       sanitizeConnectorStatusEntry({ shared: "yes", is_owner: false, needs_config: false }),
     ).toBeNull()
+    expect(
+      sanitizeConnectorStatusEntry({ shared: true, is_owner: "yes", needs_config: false }),
+    ).toBeNull()
+    expect(
+      sanitizeConnectorStatusEntry({ shared: true, is_owner: false, needs_config: "no" }),
+    ).toBeNull()
     expect(sanitizeConnectorStatusEntry("bad")).toBeNull()
     expect(sanitizeConnectorStatusEntry(null)).toBeNull()
   })

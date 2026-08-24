@@ -239,6 +239,24 @@ describe("OfficialMcpSettingsDialog connected-state actions", () => {
     expect(screen.queryByText("tools.mcp.sharing.shared")).toBeNull()
     expect(screen.queryByText("tools.mcp.sharing.teamTool")).toBeNull()
   })
+
+  it("withholds the ownership badge for a team entry with no connector id (#1623)", () => {
+    authState.inTeam = true
+    // A well-formed sharing triple, but no server_id at all -- the factory
+    // default carries none -- so the badge must stay withheld regardless of
+    // shared/is_owner/needs_config.
+    renderDialog({
+      app: app({ auth_type: "mcp_oauth", shared: true, is_owner: false, needs_config: false }),
+      isGloballyConnected: true,
+    })
+
+    // Anchor: proves the dialog actually rendered its content before the
+    // three negatives below are checked.
+    expect(screen.getByText("Chrome")).toBeInTheDocument()
+    expect(screen.queryByText("tools.mcp.sharing.private")).toBeNull()
+    expect(screen.queryByText("tools.mcp.sharing.shared")).toBeNull()
+    expect(screen.queryByText("tools.mcp.sharing.teamTool")).toBeNull()
+  })
 })
 
 describe("OfficialMcpSettingsDialog connect trigger", () => {
