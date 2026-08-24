@@ -495,6 +495,86 @@ async def test_sse_responses_disable_proxy_buffering(task_state):
         await resp.body_iterator.aclose()
 
 
+async def test_fast_path_failure_sends_the_response_start_before_its_close_frames():
+    """The fast paths' failure exits (see
+    ``_fast_path_steps_read_error_frame``) rely on ``StreamingResponse``
+    having already sent the 200 response start and headers before the
+    first chunk is ever pulled from the generator -- that is what makes
+    catching the failure and closing with a ``stream.error`` frame
+    meaningful instead of redundant. Every other test in this file only
+    checks the frame *text* (``resp.text`` via the real HTTP client, or
+    the chunks read off ``resp.body_iterator``), never the raw ASGI
+    messages the response actually sends on the wire. This is the only
+    test in the suite that drives the response's ASGI interface
+    directly and inspects the message sequence, to pin that the 200 and
+    its headers really do arrive as the first message, before
+    ``task.status`` and everything after it -- not merely that the text
+    ends up assembled in the right order once it has all been read.
+
+    ``scope["asgi"]["spec_version"]`` is set to ``"2.4"`` so
+    ``StreamingResponse.__call__`` takes the branch that awaits
+    ``stream_response(send)`` directly without ever touching
+    ``receive``. ``receive`` here is defined but never invoked on that
+    branch; it is shaped to await forever rather than return or raise,
+    so that on the older branch (which awaits ``receive`` in a second
+    task and cancels it once ``stream_response`` finishes) this test
+    would still behave correctly instead of finishing early or
+    erroring -- both branches are correct with this ``receive``, only
+    the 2.4 one is actually exercised here.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    _set_task_status(task_id, TaskStatus.COMPLETED, output="done")
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    def _broken_read_task_steps_response(task_id_, principal_):
+        raise RuntimeError("boom - transient read failure")
+
+    def _unreachable_read_task_snapshot(task_id_, principal_):
+        raise AssertionError(
+            "the generation reread must not run when the steps read itself failed"
+        )
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=_unreachable_read_task_snapshot,
+        read_task_steps_response=_broken_read_task_steps_response,
+    )
+
+    messages: list[dict] = []
+
+    async def send(message):
+        messages.append(message)
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}}
+    await resp(scope, receive, send)
+
+    assert messages[0]["type"] == "http.response.start"
+    assert messages[0]["status"] == 200
+    headers = dict(messages[0]["headers"])
+    assert headers[b"content-type"].startswith(b"text/event-stream")
+    assert headers[b"x-accel-buffering"] == b"no"
+    assert all(message["type"] == "http.response.body" for message in messages[1:])
+
+    body = b"".join(message["body"] for message in messages[1:]).decode()
+    # Conclusion-first, error-second -- the same ordering every other
+    # steps-read-failure test in this file pins on the assembled text;
+    # this test's own job is only the ASGI message layer around it.
+    assert body.index("event: task.status") < body.index("event: task.completed")
+    assert body.index("event: task.completed") < body.index("event: stream.error")
+    assert "resync_required" in body
+
+    last_message = messages[-1]
+    assert last_message["body"] == b""
+    assert last_message["more_body"] is False
+
+
 # ===== bounded outbound queue, overflow closes with resync_required =====
 
 
