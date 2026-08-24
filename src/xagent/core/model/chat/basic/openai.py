@@ -678,17 +678,18 @@ class OpenAICompatibleLLM(BaseLLM):
             is_streaming=False,
         )
 
+        async def _make_api_call() -> Any:
+            assert self._client is not None
+            if extra_body:
+                return await self._client.chat.completions.create(
+                    extra_body=extra_body, **completion_params
+                )
+            return await self._client.chat.completions.create(**completion_params)
+
         try:
             # Make the API call with extra_body if needed
             try:
-                if extra_body:
-                    response = await self._client.chat.completions.create(
-                        extra_body=extra_body, **completion_params
-                    )
-                else:
-                    response = await self._client.chat.completions.create(
-                        **completion_params
-                    )
+                response = await _make_api_call()
             except openai.BadRequestError as e:
                 # Check if error is related to response_format
                 error_msg = _format_openai_error("OpenAI bad request", e)
@@ -706,14 +707,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     # here is not caught by this clause -- it propagates to
                     # the outer ``except openai.BadRequestError`` below, which
                     # wraps it into RuntimeError like every other failure path.
-                    if extra_body:
-                        response = await self._client.chat.completions.create(
-                            extra_body=extra_body, **completion_params
-                        )
-                    else:
-                        response = await self._client.chat.completions.create(
-                            **completion_params
-                        )
+                    response = await _make_api_call()
                 else:
                     raise
 
