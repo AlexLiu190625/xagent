@@ -11,12 +11,14 @@ from ....utils.security import redact_sensitive_text
 from ..exceptions import LLMEmptyContentError, LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
-from ..types import ChunkType, StreamChunk
+from ..types import PROVIDER_STATE_METADATA_KEY, ChunkType, StreamChunk
 from .base import BaseLLM
 
 logger = logging.getLogger(__name__)
 
-PROVIDER_STATE_METADATA_KEY = "_xagent_provider_state"
+# ``PROVIDER_STATE_METADATA_KEY`` now lives in ``chat.types`` (see there for
+# why); imported here so existing code and tests that import it from this
+# transport module keep working unchanged.
 
 
 def _truncate_error_detail(value: Any, limit: int = 4000) -> str:
@@ -81,30 +83,40 @@ def _format_openai_error(prefix: str, error: BaseException) -> str:
     return formatted
 
 
-def _message_reasoning_content(message: Any) -> tuple[bool, Any]:
-    """Return whether a provider explicitly included reasoning content."""
+def _field_content(message: Any, field_name: str) -> tuple[bool, Any]:
+    """Return whether a provider message/delta explicitly set ``field_name``.
+
+    Checks, in order, a plain dict, a pydantic model's declared fields, its
+    ``model_extra`` (unknown fields the SDK still preserves), and finally
+    ``__dict__`` as a last resort for other object shapes.
+    """
     if isinstance(message, dict):
-        if "reasoning_content" not in message:
+        if field_name not in message:
             return False, None
-        value = message.get("reasoning_content")
+        value = message.get(field_name)
         return value is not None, value
 
     model_fields_set = getattr(message, "model_fields_set", None)
-    if isinstance(model_fields_set, set) and "reasoning_content" in model_fields_set:
-        value = getattr(message, "reasoning_content", None)
+    if isinstance(model_fields_set, set) and field_name in model_fields_set:
+        value = getattr(message, field_name, None)
         return value is not None, value
 
     model_extra = getattr(message, "model_extra", None)
-    if isinstance(model_extra, dict) and "reasoning_content" in model_extra:
-        value = model_extra.get("reasoning_content")
+    if isinstance(model_extra, dict) and field_name in model_extra:
+        value = model_extra.get(field_name)
         return value is not None, value
 
     message_attrs = getattr(message, "__dict__", {})
-    if not isinstance(message_attrs, dict) or "reasoning_content" not in message_attrs:
+    if not isinstance(message_attrs, dict) or field_name not in message_attrs:
         return False, None
 
-    value = message_attrs["reasoning_content"]
+    value = message_attrs[field_name]
     return value is not None, value
+
+
+def _message_reasoning_content(message: Any) -> tuple[bool, Any]:
+    """Return whether a provider explicitly included reasoning content."""
+    return _field_content(message, "reasoning_content")
 
 
 def _is_retryable_stream_transport_error(error: BaseException) -> bool:
@@ -210,25 +222,28 @@ class OpenAICompatibleLLM(BaseLLM):
         _ = thinking
         return messages
 
-    def _response_provider_state(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Return opaque provider-owned message state for future LLM requests."""
-        _ = result
+    def _response_provider_state(
+        self,
+        result: Dict[str, Any],
+        *,
+        thinking: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Return opaque provider-owned message state for future LLM requests.
+
+        ``thinking`` is the request's thinking configuration, made available
+        so a subclass can tell whether reasoning content was actually asked
+        for (e.g. to decide whether an empty capture is worth a warning).
+        """
+        _ = result, thinking
         return {}
 
-    def _strip_internal_message_keys(
-        self, messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Remove Xagent-only message metadata before sending provider calls."""
-        sanitized: List[Dict[str, Any]] = []
-        for message in messages:
-            sanitized.append(
-                {
-                    key: value
-                    for key, value in message.items()
-                    if not key.startswith("_xagent_")
-                }
-            )
-        return sanitized
+    def _delta_reasoning_content(self, delta: Any) -> tuple[bool, Any]:
+        """Hook for subclasses that watch additional reasoning field spellings.
+
+        Default implementation only recognizes ``reasoning_content``, matching
+        historical behavior exactly.
+        """
+        return _message_reasoning_content(delta)
 
     def _build_request_messages(
         self,
@@ -412,7 +427,9 @@ class OpenAICompatibleLLM(BaseLLM):
                 if has_reasoning_content:
                     result["reasoning_content"] = reasoning_content
                     result["reasoning"] = reasoning_content
-                provider_state = self._response_provider_state(result)
+                provider_state = self._response_provider_state(
+                    result, thinking=thinking
+                )
                 if provider_state:
                     result[PROVIDER_STATE_METADATA_KEY] = provider_state
                 return result
@@ -766,7 +783,9 @@ class OpenAICompatibleLLM(BaseLLM):
                 if has_reasoning_content:
                     result["reasoning_content"] = reasoning_content
                     result["reasoning"] = reasoning_content
-                provider_state = self._response_provider_state(result)
+                provider_state = self._response_provider_state(
+                    result, thinking=thinking
+                )
                 if provider_state:
                     result[PROVIDER_STATE_METADATA_KEY] = provider_state
                 return result
@@ -1003,7 +1022,7 @@ class OpenAICompatibleLLM(BaseLLM):
                 if hasattr(raw_chunk, "choices") and raw_chunk.choices:
                     delta = raw_chunk.choices[0].delta
                     delta_has_reasoning, delta_reasoning_content = (
-                        _message_reasoning_content(delta)
+                        self._delta_reasoning_content(delta)
                     )
                     if delta_has_reasoning:
                         has_reasoning_content = True

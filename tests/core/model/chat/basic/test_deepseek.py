@@ -840,9 +840,24 @@ class TestDeepSeekLLM:
         token_chunks = [chunk for chunk in chunks if chunk.type == ChunkType.TOKEN]
         assert [chunk.delta for chunk in token_chunks] == ["Final answer"]
         assert token_chunks[0].raw["reasoning_content"] == "Think first."
+        # Covers the provider-state branch of ``_attach_reasoning_content_to_raw``
+        # (deepseek.py), which the assertions above never exercised: they only
+        # checked the mirrored ``reasoning_content`` field the base class also
+        # sets, not the ``_xagent_provider_state`` marker DeepSeek's own
+        # streaming override adds on top of it.
+        assert token_chunks[0].raw[PROVIDER_STATE_METADATA_KEY] == {
+            DEEPSEEK_PROVIDER_STATE_NAMESPACE: {
+                DEEPSEEK_REASONING_CONTENT_STATE_KEY: "Think first."
+            }
+        }
 
         end_chunk = next(chunk for chunk in chunks if chunk.type == ChunkType.END)
         assert end_chunk.raw["reasoning_content"] == "Think first."
+        assert end_chunk.raw[PROVIDER_STATE_METADATA_KEY] == {
+            DEEPSEEK_PROVIDER_STATE_NAMESPACE: {
+                DEEPSEEK_REASONING_CONTENT_STATE_KEY: "Think first."
+            }
+        }
 
     @pytest.mark.asyncio
     async def test_list_available_models_returns_curated_v4_models(self):
