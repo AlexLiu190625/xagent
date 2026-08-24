@@ -1237,6 +1237,17 @@ async def stream_chat_task_events(
         elsewhere in this router; the two error-code vocabularies do
         not overlap.
 
+      On the two attach-time fast paths described under Behavior below,
+      whichever of these two conclusion frames the path emits carries two
+      extra fields, ``snapshot_truncated: true`` and
+      ``snapshot_total_steps`` (the task's full public step count at
+      attach time), whenever that attach's one-shot step snapshot sent
+      fewer steps than the task has -- absent otherwise, and absent on
+      every other producer of these two frames. They ride the conclusion
+      rather than a ``step.*`` frame because the snapshot's byte budget
+      can admit no steps at all, leaving no ``step.*`` frame to carry
+      them.
+
     The other four project the task's step-by-step execution and
     streamed message text onto the same connection, from the same
     ``PublicStep`` shape and public step-type list ``GET
@@ -1246,19 +1257,15 @@ async def stream_chat_task_events(
       - ``step.completed``: ``{step}``, the same step once its end event
         (or failure) resolves it -- ``status`` is ``"completed"`` or
         ``"failed"``. On the two attach-time fast paths below (the task
-        is already finished, or already waiting on user input), the
-        first ``step.*`` frame carries two extra fields,
-        ``snapshot_truncated: true`` and ``snapshot_total_steps``,
-        whenever that one-shot step snapshot sends fewer steps than the
-        task has -- absent otherwise. Two bounds can cut it short: a
-        step-count cap (512), and a total-wire-bytes budget over the
-        snapshot's serialized frames. ``snapshot_total_steps`` is the
-        task's full step count at attach time. The frames are in
+        is already finished, or already waiting on user input), these
+        frames are that attach's one-shot step snapshot: in
         ``started_at`` order, drawn from the task's most recent steps
-        up to the count cap; when the byte budget is what binds, it
-        keeps that window's oldest contiguous run, so the very latest
-        steps may be the ones missing -- ``GET .../steps`` is the
-        authoritative full history either way.
+        up to a step-count cap (512) and a total-wire-bytes budget over the
+        snapshot's serialized frames. When the byte budget is what binds,
+        it keeps that window's oldest contiguous run, so the very latest
+        steps may be the ones missing. Whether the snapshot was cut short
+        is reported on the conclusion frame, not on these -- ``GET
+        .../steps`` is the authoritative full history either way.
       - ``message.delta``: ``{message_id, text}``, one chunk of a
         streamed final answer as the agent generates it.
       - ``message.completed``: ``{message_id, content}``, that same
@@ -1501,7 +1508,7 @@ async def stream_chat_task_events(
             snapshot is bounded by a step-count cap and a
             total-wire-bytes budget; a snapshot cut short by either
             carries the ``snapshot_truncated``/``snapshot_total_steps``
-            marker on the first ``step.*`` frame described above. When a
+            marker on its conclusion frame as described above. When a
             shared cache backend is configured (Redis; see
             ``hot_path_cache.get_cache_backend``), a burst of fast-path
             attaches on one task (or repeated attaches after it's

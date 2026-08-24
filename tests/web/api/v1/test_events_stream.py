@@ -2644,6 +2644,8 @@ def test_fast_path_terminal_attach_includes_current_steps():
     assert step["id"] == "tool_call:call-1"
     assert step["status"] == "completed"
     assert step["data"]["result"] == "sunny"
+    conclusion_data = json.loads(blocks[2].split("data: ", 1)[1])
+    assert "snapshot_truncated" not in conclusion_data
 
 
 def test_fast_path_step_snapshot_hits_the_steps_cache(monkeypatch):
@@ -2918,8 +2920,7 @@ async def test_fast_path_step_snapshot_is_bounded_by_replay_max_steps(
     assert body.count("event: step.completed") == es.REPLAY_MAX_STEPS
     blocks = [b for b in body.split("\n\n") if b.strip()]
     first_step_data = json.loads(blocks[1].split("data: ", 1)[1])
-    assert first_step_data["snapshot_truncated"] is True
-    assert first_step_data["snapshot_total_steps"] == total
+    assert "snapshot_truncated" not in first_step_data
     # The emitted frames are the *most recent* steps -- the first one
     # here is the (total - REPLAY_MAX_STEPS)'th step, not the very first.
     assert (
@@ -2928,6 +2929,12 @@ async def test_fast_path_step_snapshot_is_bounded_by_replay_max_steps(
     second_step_data = json.loads(blocks[2].split("data: ", 1)[1])
     assert "snapshot_truncated" not in second_step_data
     assert body.count(f"event: {conclusion_event}") == 1
+    conclusion_block = next(
+        b for b in blocks if b.startswith(f"event: {conclusion_event}")
+    )
+    conclusion_data = json.loads(conclusion_block.split("data: ", 1)[1])
+    assert conclusion_data["snapshot_truncated"] is True
+    assert conclusion_data["snapshot_total_steps"] == total
 
 
 @pytest.mark.parametrize(
@@ -3000,21 +3007,112 @@ async def test_fast_path_step_snapshot_is_bounded_by_the_wire_byte_budget(
     # The byte budget bound this well short of all 128 steps -- not zero
     # (some steps still fit) and not all of them (the budget did bind).
     assert 0 < len(step_frames) < total
-    # The truncation marker on the first frame costs a little more than
-    # the measuring pass counted for it (see
-    # ``_fast_path_step_snapshot``'s docstring) -- a bounded overrun, not
-    # an unbounded one.
-    assert sum(len(chunk) for chunk in step_frames) <= es.MAX_SNAPSHOT_WIRE_BYTES + 64
+    # The truncation marker now rides the conclusion frame, not a step
+    # frame, so the measuring pass's count is exactly what the step
+    # frames put on the wire -- no marker overrun left to allow for.
+    assert sum(len(chunk) for chunk in step_frames) <= es.MAX_SNAPSHOT_WIRE_BYTES
     first_step_block = next(
         block for block in body.split("\n\n") if block.startswith("event: step.")
     )
     first_step_data = json.loads(first_step_block.split("data: ", 1)[1])
-    assert first_step_data["snapshot_truncated"] is True
-    assert first_step_data["snapshot_total_steps"] == total
+    assert "snapshot_truncated" not in first_step_data
     assert body.count(f"event: {conclusion_event}") == 1
+    blocks = [b for b in body.split("\n\n") if b.strip()]
+    conclusion_block = next(
+        b for b in blocks if b.startswith(f"event: {conclusion_event}")
+    )
+    conclusion_data = json.loads(conclusion_block.split("data: ", 1)[1])
+    assert conclusion_data["snapshot_truncated"] is True
+    assert conclusion_data["snapshot_total_steps"] == total
     # A byte-budget cut is a truncated snapshot, not a stream error -- the
     # client is told via ``snapshot_truncated``, not a close frame.
     assert "event: stream.error" not in body
+
+
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_snapshot_marks_truncation_when_the_budget_admits_no_steps(
+    monkeypatch, stream_fn, status, conclusion_event, extra_snapshot
+):
+    """The byte budget can cut a snapshot to zero steps, not just to a
+    shorter one: with the budget set below a single step's own wire
+    length, ``_snapshot_steps_within_wire_budget`` admits none of the
+    task's steps at all. No ``step.*`` frame is ever emitted in that
+    case, so the truncation marker has nowhere to ride but the
+    conclusion frame -- this pins that it still gets there. Production
+    can reach this without an artificially tiny budget: ``PublicStep.id``
+    is built from the event's own ``tool_call_id``, which nothing in
+    this stream bounds the length of, so one tool call minting an
+    unusually long id can by itself push that step's frame past
+    ``MAX_SNAPSHOT_WIRE_BYTES``.
+    """
+    monkeypatch.setattr(es, "MAX_SNAPSHOT_WIRE_BYTES", 8)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    steps = [
+        es.PublicStep(
+            id=f"tool_call:call-{i}",
+            type="tool_call",
+            status="completed",
+            started_at=base,
+            completed_at=base,
+            data={"name": "search", "result": "ok"},
+        )
+        for i in range(2)
+    ]
+
+    def _read_task_steps_response(task_id_, principal_):
+        return SimpleNamespace(steps=steps)
+
+    def _unused_read_task_snapshot(task_id_, principal_):
+        raise AssertionError(
+            "the generation reread must not run when no step was admitted"
+        )
+
+    snapshot = SimpleNamespace(
+        task_id=1,
+        agent_id=1,
+        status=status,
+        run_id="run-1",
+        state_version=1,
+        **extra_snapshot,
+    )
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=None,
+            read_task_steps_response=_read_task_steps_response,
+            read_task_snapshot=_unused_read_task_snapshot,
+        )
+    ]
+    body = "".join(frames)
+    assert body.count("event: step.") == 0
+    assert body.count(f"event: {conclusion_event}") == 1
+    assert "event: stream.error" not in body
+    blocks = [b for b in body.split("\n\n") if b.strip()]
+    conclusion_block = next(
+        b for b in blocks if b.startswith(f"event: {conclusion_event}")
+    )
+    conclusion_data = json.loads(conclusion_block.split("data: ", 1)[1])
+    assert conclusion_data["snapshot_truncated"] is True
+    assert conclusion_data["snapshot_total_steps"] == 2
 
 
 async def test_fast_path_snapshot_admits_a_frame_exactly_at_the_byte_budget(

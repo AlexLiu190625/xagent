@@ -96,14 +96,21 @@ values it deliberately leaves unbounded, in one place:
     below, so nothing else bounds how many such responses run at once.
     The step cap keeps the most recent steps (in ``started_at`` order);
     the byte budget then admits that window from its oldest end, so the
-    snapshot stays a contiguous run in wire order. Either way the first
-    ``step.*`` frame carries ``snapshot_truncated`` (``true``) and
-    ``snapshot_total_steps`` (the task's full public step count), so the
-    client can tell a bounded snapshot from a complete one and knows how
-    much of it is missing -- ``GET .../steps`` is the authoritative full
-    history. These bound how much one response may hold, not how much
-    backlog may accumulate: the fast paths ``yield`` their frames
-    straight from the generator, so no sink and no outbound queue exist
+    snapshot stays a contiguous run in wire order. Either way the
+    conclusion frame (``task.completed`` / ``task.input_required``)
+    carries ``snapshot_truncated`` (``true``) and ``snapshot_total_steps``
+    (the task's full public step count), so the client can tell a bounded
+    snapshot from a complete one and knows how much of it is missing --
+    ``GET .../steps`` is the authoritative full history. The conclusion
+    carries it, not a ``step.*`` frame, because the conclusion is the one
+    frame every exit of these paths emits: a snapshot the byte budget cut
+    to zero steps still has to be reportable, and a ``step.*`` frame that
+    does not exist cannot report it. ``MAX_SNAPSHOT_WIRE_BYTES`` measures
+    only the step frames' own wire bytes -- the marker riding the
+    conclusion is not part of what it bounds. These bound how much one
+    response may hold, not how much backlog may accumulate: the fast
+    paths ``yield`` their frames straight from the generator, so no sink
+    and no outbound queue exist
     on those paths and neither queue bound above applies to them. Each
     of those frames is still subject to the 64 KiB per-step ``data``
     cap, which is applied per frame wherever the frame is built.
@@ -248,9 +255,9 @@ MAX_RAW_FRAME_TEXT_CHARS = 4 * MAX_FRAME_CONTENT_BYTES
 # heartbeat loop and no per-attach outbound queue of their own to
 # otherwise bound how much one response can hold. Exceeding it keeps
 # only the most recent ``REPLAY_MAX_STEPS`` steps (in ``started_at``
-# order, same as everywhere else) and marks the first frame as
-# truncated -- see ``_fast_path_step_snapshot``. Bounds the count only;
-# ``MAX_SNAPSHOT_WIRE_BYTES`` below bounds the size.
+# order, same as everywhere else) and marks the response's conclusion
+# frame as truncated -- see ``_fast_path_step_snapshot``. Bounds the
+# count only; ``MAX_SNAPSHOT_WIRE_BYTES`` below bounds the size.
 REPLAY_MAX_STEPS = 512
 # The attach-time snapshot's second bound, on the total wire bytes one
 # response may hold rather than on its step count -- the fast paths'
@@ -326,6 +333,17 @@ TaskSnapshotReader = Callable[[int, "ApiKeyPrincipal"], Any]
 # and re-projecting the task's full trace history independently.
 TaskStepsResponseReader = Callable[[int, "ApiKeyPrincipal"], Any]
 
+# A callable of one argument -- ``snapshot_total_steps`` -- returning the
+# already-built conclusion frame (``task.completed`` /
+# ``task.input_required``) for one attach-time fast path. Bound by each
+# fast path to its own authoritative snapshot (see
+# ``_terminal_snapshot_stream`` / ``_input_required_snapshot_stream``), so
+# the shared body (``_fast_path_snapshot_stream``) can supply the one
+# thing only it knows -- whether the step snapshot it just read was cut
+# short -- without either caller handing over a pre-built string that
+# could go stale by the time the body decides how to build it.
+ConclusionFrameBuilder = Callable[[int | None], str]
+
 
 # -- Wire format --------------------------------------------------------
 
@@ -364,13 +382,27 @@ def status_frame(status: str) -> str:
 # ``GET /v1/chat/tasks/{task_id}/events`` documents for these paths.
 # What this exemption bounds is how many times the uncapped payload
 # itself goes out, which is once either way.
-def completed_frame(*, status: str, output: str | None, error: str | None) -> str:
+def completed_frame(
+    *,
+    status: str,
+    output: str | None,
+    error: str | None,
+    snapshot_total_steps: int | None = None,
+) -> str:
     return _sse_frame(
-        "task.completed", {"status": status, "output": output, "error": error}
+        "task.completed",
+        {
+            "status": status,
+            "output": output,
+            "error": error,
+            **_snapshot_marker_fields(snapshot_total_steps),
+        },
     )
 
 
-def input_required_frame(task_id: int, prompt: str | None) -> str:
+def input_required_frame(
+    task_id: int, prompt: str | None, *, snapshot_total_steps: int | None = None
+) -> str:
     # ``prompt`` is uncapped for the reason stated above
     # ``completed_frame``, which covers both conclusion-frame fields.
     # ``prompt`` comes straight from ``_TaskInfoSnapshot.pending_question``
@@ -380,7 +412,14 @@ def input_required_frame(task_id: int, prompt: str | None) -> str:
     # snapshot in hand from its own authoritative row read, so this
     # never triggers a query of its
     # own and never sniffs live agent_message frames for question text.
-    return _sse_frame("task.input_required", {"task_id": task_id, "prompt": prompt})
+    return _sse_frame(
+        "task.input_required",
+        {
+            "task_id": task_id,
+            "prompt": prompt,
+            **_snapshot_marker_fields(snapshot_total_steps),
+        },
+    )
 
 
 _ERROR_MESSAGES = {
@@ -612,42 +651,33 @@ def _capped_step_data(data: dict[str, Any]) -> dict[str, Any]:
     return bare_marker
 
 
-def _step_frame_data(
-    public_step: dict[str, Any], *, snapshot_total_steps: int | None
-) -> dict[str, Any]:
-    """Shared payload builder for ``step_started_frame``/``step_completed_frame``
-    so the truncation-marker fields (see ``REPLAY_MAX_STEPS``) are built
-    identically on both -- a fast path's truncated step snapshot can lead
-    with either a running or an already-resolved step."""
-    data: dict[str, Any] = {"step": public_step}
-    if snapshot_total_steps is not None:
-        # Folded onto this one frame rather than sent as a frame of its
-        # own: a standalone marker would be a 9th SSE event type on top
-        # of the 8 the endpoint docstring documents, for a condition
-        # that's rare (a task with more than ``REPLAY_MAX_STEPS`` public
-        # steps) and already has a client-side recovery story
-        # (``steps()`` for the authoritative full history).
-        data["snapshot_truncated"] = True
-        data["snapshot_total_steps"] = snapshot_total_steps
-    return data
+def _snapshot_marker_fields(snapshot_total_steps: int | None) -> dict[str, Any]:
+    """The attach-time snapshot's truncation marker, or nothing when the
+    snapshot was complete.
+
+    Folded onto the conclusion frame rather than sent as a frame of its
+    own: a standalone marker would be a 9th SSE event type on top of the
+    8 the endpoint docstring documents, for a condition that already has
+    a client-side recovery story (``steps()`` for the authoritative full
+    history). The conclusion is the carrier because it is the one frame
+    every exit of these paths emits -- a snapshot the byte budget cut to
+    zero steps still has to be reportable, and a ``step.*`` frame that
+    does not exist cannot report it.
+    """
+    if snapshot_total_steps is None:
+        return {}
+    return {
+        "snapshot_truncated": True,
+        "snapshot_total_steps": snapshot_total_steps,
+    }
 
 
-def step_started_frame(
-    public_step: dict[str, Any], *, snapshot_total_steps: int | None = None
-) -> str:
-    return _sse_frame(
-        "step.started",
-        _step_frame_data(public_step, snapshot_total_steps=snapshot_total_steps),
-    )
+def step_started_frame(public_step: dict[str, Any]) -> str:
+    return _sse_frame("step.started", {"step": public_step})
 
 
-def step_completed_frame(
-    public_step: dict[str, Any], *, snapshot_total_steps: int | None = None
-) -> str:
-    return _sse_frame(
-        "step.completed",
-        _step_frame_data(public_step, snapshot_total_steps=snapshot_total_steps),
-    )
+def step_completed_frame(public_step: dict[str, Any]) -> str:
+    return _sse_frame("step.completed", {"step": public_step})
 
 
 def message_delta_frame(message_id: str, text: str) -> str:
@@ -666,9 +696,7 @@ def message_completed_frame(message_id: str, content: str) -> str:
     return _sse_frame("message.completed", data)
 
 
-def _step_wire_frame(
-    step: "PublicStep", *, snapshot_total_steps: int | None = None
-) -> str:
+def _step_wire_frame(step: "PublicStep") -> str:
     """Turn one validated ``PublicStep`` into its ``step.started`` /
     ``step.completed`` frame: normalize it to JSON-safe values, apply the
     single-frame content cap to its ``data`` sub-object, then pick the
@@ -684,18 +712,12 @@ def _step_wire_frame(
     apart. Taking the model rather than an already-dumped dict is what
     makes that structural: a caller cannot supply un-normalized values
     without going around the type.
-
-    ``snapshot_total_steps`` is set on the first frame of a fast-path
-    snapshot that exceeded ``REPLAY_MAX_STEPS`` (see
-    ``_fast_path_step_snapshot``); the live folding caller never passes
-    it, because the live path emits one frame per event and so has
-    nothing to truncate.
     """
     public_step_json = step.model_dump(mode="json")
     capped = {**public_step_json, "data": _capped_step_data(public_step_json["data"])}
     if capped["status"] == "running":
-        return step_started_frame(capped, snapshot_total_steps=snapshot_total_steps)
-    return step_completed_frame(capped, snapshot_total_steps=snapshot_total_steps)
+        return step_started_frame(capped)
+    return step_completed_frame(capped)
 
 
 def _step_content_frame(step: dict[str, Any]) -> str:
@@ -1478,8 +1500,9 @@ def _snapshot_steps_within_wire_budget(
     the window, where it suppresses every good step behind it, or force
     the failure to be folded into "snapshot truncated" and never
     reported. The budget only binds on a window averaging more than 8 KiB
-    per step, and a client whose snapshot was cut is told so by
-    ``snapshot_truncated`` and sent to ``GET .../steps`` either way.
+    per step, and a client whose snapshot was cut is told so by the
+    conclusion frame's ``snapshot_truncated`` and sent to
+    ``GET .../steps`` either way.
     """
     budget_remaining = MAX_SNAPSHOT_WIRE_BYTES
     admitted = 0
@@ -1531,11 +1554,10 @@ async def _fast_path_step_snapshot(
     function's docstring).
     The second element is the task's true total public step count
     whenever the returned list is short of it, by either bound, or
-    ``None`` when the whole history fits. The first serialized frame's
-    truncation marker then costs it about 52 bytes more than the
-    measuring pass counted for it -- a bounded overrun, accepted the same
-    way the queue's own byte budget leaves its per-string object header
-    uncounted.
+    ``None`` when the whole history fits. The truncation marker built
+    from it rides the conclusion frame, not a step frame, so it is never
+    counted against ``MAX_SNAPSHOT_WIRE_BYTES``: what the measuring pass
+    above counts is exactly what the step frames put on the wire.
     """
     steps_response = await run_db_io_cancellation_safe(
         lambda: read_task_steps_response(task_id, principal)
@@ -1702,20 +1724,25 @@ async def _fast_path_snapshot_stream(
     read_task_steps_response: TaskStepsResponseReader,
     read_task_snapshot: TaskSnapshotReader,
     *,
-    conclusion: str,
+    build_conclusion: ConclusionFrameBuilder,
     path_name: str,
 ) -> AsyncIterator[str]:
     """Body shared by both attach-time fast paths (``_terminal_snapshot_stream``,
     ``_input_required_snapshot_stream``): emit ``task.status``, the
-    task's current steps, then ``conclusion``, and end. No sink, no
+    task's current steps, then the conclusion frame, and end. No sink, no
     registration, no watchdog -- there's nothing left to watch.
 
-    ``conclusion`` is built by the caller from its own authoritative row
-    read (``completed_frame`` for the terminal path,
-    ``input_required_frame`` for the waiting-for-user one) before this
-    generator is ever entered, and is passed in already built rather
-    than constructed here so the two callers each describe their own
-    generation's conclusion, not a copy that could drift between them.
+    ``build_conclusion`` is supplied by the caller, bound to its own
+    authoritative row read (``completed_frame`` for the terminal path,
+    ``input_required_frame`` for the waiting-for-user one), before this
+    generator is ever entered -- so each caller's own generation is what
+    its conclusion describes, not a copy that could drift between them.
+    This body calls it with the one field only it knows: the step
+    snapshot's ``snapshot_total_steps`` on the one exit that confirmed and
+    sent that snapshot in full, ``None`` on every other exit -- a failed
+    steps read, a withheld generation mismatch, or a failed step
+    serialization never confirmed a snapshot to report a truncation count
+    for.
     ``path_name`` plays no part in any branching decision in this body;
     it only labels the log line and the ``resync_required`` /
     serialization-failure frame text so a client or an operator can tell
@@ -1737,7 +1764,7 @@ async def _fast_path_snapshot_stream(
     everything else; see ``_fast_path_steps_read_error_frame``.
 
     ``snapshot`` was already resolved, from its own authoritative read,
-    before this function was ever called, so ``conclusion`` describes
+    before this function was ever called, so the conclusion describes
     the generation this path was picked for. What this path
     will not do is pair that conclusion with step content from a
     generation it never confirmed. Step content is a different matter:
@@ -1746,7 +1773,7 @@ async def _fast_path_snapshot_stream(
     restart (a ``POST reply`` resuming a ``WAITING_FOR_USER`` task, or a
     WS ``APPEND`` resuming a ``COMPLETED``/``FAILED`` one) can move the
     row to a new generation in the gap between ``snapshot`` and that
-    read. The rule this path enforces: ``conclusion`` goes out on
+    read. The rule this path enforces: the conclusion goes out on
     every exit, and the fence decides only whether step content joins
     it. The conclusion describes ``snapshot``'s own generation -- the
     authoritative read that selected this fast path -- so a client that
@@ -1783,8 +1810,9 @@ async def _fast_path_snapshot_stream(
     except Exception as exc:
         # The conclusion goes out first -- see the docstring above -- so
         # a step-read failure never also swallows the outcome the
-        # conclusion frame carries.
-        yield conclusion
+        # conclusion frame carries. No snapshot was confirmed here, so
+        # the conclusion carries no truncation marker.
+        yield build_conclusion(None)
         yield _fast_path_steps_read_error_frame(exc, snapshot.task_id, path_name)
         return
     if steps:
@@ -1796,13 +1824,13 @@ async def _fast_path_snapshot_stream(
             # Same conclusion-first ordering as the steps-read ``except``
             # block above -- see the docstring for why a reread failure
             # gets the same treatment as a steps-read failure.
-            yield conclusion
+            yield build_conclusion(None)
             yield _fast_path_generation_reread_error_frame(
                 exc, snapshot.task_id, path_name
             )
             return
         if changed:
-            yield conclusion
+            yield build_conclusion(None)
             yield error_frame(
                 "resync_required",
                 message=(
@@ -1812,23 +1840,20 @@ async def _fast_path_snapshot_stream(
                 ),
             )
             return
-    for index, step in enumerate(steps):
+    for step in steps:
         try:
-            step_frame = _step_wire_frame(
-                step,
-                snapshot_total_steps=snapshot_total_steps if index == 0 else None,
-            )
+            step_frame = _step_wire_frame(step)
         except Exception:
             # Only the serialization is inside the ``try``, not the
             # ``yield``: a consumer going away arrives as
             # ``GeneratorExit``/``CancelledError``, both
             # ``BaseException``, so this handler cannot turn a client
             # disconnect into a close frame nobody reads.
-            yield conclusion
+            yield build_conclusion(None)
             yield _fast_path_step_serialize_error_frame(snapshot.task_id, path_name)
             return
         yield step_frame
-    yield conclusion
+    yield build_conclusion(snapshot_total_steps)
 
 
 def _terminal_snapshot_stream(
@@ -1848,20 +1873,27 @@ def _terminal_snapshot_stream(
     conclusion frame -- built from the authoritative read that selected
     this path -- and the ``"terminal"`` path label.
     """
-    # Built here, before the shared body is entered, from ``snapshot``'s
-    # own authoritative read -- the read that selected this fast path --
-    # so that read is what the conclusion describes, not whatever the
-    # steps read or the generation reread inside the shared body observe
-    # afterward.
-    conclusion = completed_frame(
-        status=snapshot.status.value, output=snapshot.output, error=snapshot.error
-    )
+
+    # Bound here, before the shared body is entered, to ``snapshot``'s own
+    # authoritative read -- the read that selected this fast path -- so
+    # that read is what every call the shared body makes describes, not
+    # whatever the steps read or the generation reread inside the shared
+    # body observe afterward. The shared body supplies only the one field
+    # it alone knows: whether the step snapshot it read was truncated.
+    def build_conclusion(snapshot_total_steps: int | None) -> str:
+        return completed_frame(
+            status=snapshot.status.value,
+            output=snapshot.output,
+            error=snapshot.error,
+            snapshot_total_steps=snapshot_total_steps,
+        )
+
     return _fast_path_snapshot_stream(
         snapshot,
         principal,
         read_task_steps_response,
         read_task_snapshot,
-        conclusion=conclusion,
+        build_conclusion=build_conclusion,
         path_name="terminal",
     )
 
@@ -1889,17 +1921,24 @@ def _input_required_snapshot_stream(
     was read from, and why the conclusion goes out on every exit
     regardless of what the fence decides about step content.
     """
-    # Built here, before the shared body is entered, for the same reason
-    # as ``_terminal_snapshot_stream``'s own conclusion: it describes the
-    # authoritative read that selected this fast path, not whatever the
-    # shared body's own reads observe afterward.
-    conclusion = input_required_frame(snapshot.task_id, snapshot.pending_question)
+
+    # Bound here, before the shared body is entered, for the same reason
+    # as ``_terminal_snapshot_stream``'s own ``build_conclusion``: it
+    # describes the authoritative read that selected this fast path, not
+    # whatever the shared body's own reads observe afterward.
+    def build_conclusion(snapshot_total_steps: int | None) -> str:
+        return input_required_frame(
+            snapshot.task_id,
+            snapshot.pending_question,
+            snapshot_total_steps=snapshot_total_steps,
+        )
+
     return _fast_path_snapshot_stream(
         snapshot,
         principal,
         read_task_steps_response,
         read_task_snapshot,
-        conclusion=conclusion,
+        build_conclusion=build_conclusion,
         path_name="input-required",
     )
 
