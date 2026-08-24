@@ -25,6 +25,7 @@ def test_agent_team_hooks_install_as_one_group():
 def test_connector_team_hooks_delegate_and_reset():
     deleted_calls = []
     renamed_calls = []
+    access_calls = []
 
     connector_scope.set_connector_team_hooks(
         visibility=lambda db, user_id: {"mcp": {11}, "custom_api": {22}},
@@ -37,6 +38,10 @@ def test_connector_team_hooks_delegate_and_reset():
         ),
         renamed=lambda db, user_id, kind, connector_id, old, new: renamed_calls.append(
             (db, user_id, kind, connector_id, old, new)
+        ),
+        access=lambda db, user_id, kind, connector_id: (
+            access_calls.append((db, user_id, kind, connector_id))
+            or connector_scope.ConnectorAccess(team_owned=True, can_edit=True)
         ),
     )
     try:
@@ -51,11 +56,15 @@ def test_connector_team_hooks_delegate_and_reset():
         decision = connector_scope.delete_team_connector(None, 7, "mcp", 11)
         assert decision.team_owned and decision.authorized
         connector_scope.rename_team_connector(None, 7, "mcp", 11, "old", "new")
+        access = connector_scope.resolve_connector_access(None, 7, "mcp", 11)
+        assert access == connector_scope.ConnectorAccess(team_owned=True, can_edit=True)
         assert deleted_calls == [(None, 7, "mcp", 11)]
         assert renamed_calls == [(None, 7, "mcp", 11, "old", "new")]
+        assert access_calls == [(None, 7, "mcp", 11)]
     finally:
         connector_scope.set_connector_team_hooks()
     assert connector_scope.team_connector_hook_installed() is False
+    assert connector_scope.resolve_connector_access(None, 7, "mcp", 11) is None
 
 
 def test_knowledge_base_team_hooks_delegate_with_none_session():

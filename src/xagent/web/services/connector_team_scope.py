@@ -8,7 +8,8 @@ the application's team tables.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -41,6 +42,25 @@ class ConnectorDeleteDecision:
 
 
 ConnectorDeletedHook = Callable[[Any, int, ConnectorType, int], ConnectorDeleteDecision]
+
+
+@dataclass(frozen=True)
+class ConnectorAccess:
+    """Whether the caller's team links a connector, and may edit it.
+
+    ``team_owned`` and ``can_edit`` are independent facts: a team can link
+    a connector without granting edit rights to it, which is a legal
+    answer on its own, not an intermediate or partial state. The only
+    shape this seam rejects between the two is ``can_edit`` set without
+    ``team_owned`` -- edit rights presuppose a link, so that combination
+    can never be a legitimate answer (see ``_validate_connector_access_answer``).
+    """
+
+    team_owned: bool = False
+    can_edit: bool = False
+
+
+ConnectorAccessHook = Callable[[Any, int, ConnectorType, int], "ConnectorAccess | None"]
 
 ConnectorVisibilityHook = Callable[[Any, int], dict[str, set[int]]]
 
@@ -110,6 +130,7 @@ _connector_deleted_hook: ConnectorDeletedHook | None = None
 _connector_renamed_hook: ConnectorRenamedHook | None = None
 _connector_visibility_hook: ConnectorVisibilityHook | None = None
 _team_connector_visibility_hook: TeamConnectorVisibilityHook | None = None
+_connector_access_hook: ConnectorAccessHook | None = None
 
 
 def set_connector_team_hooks(
@@ -118,6 +139,7 @@ def set_connector_team_hooks(
     renamed: ConnectorRenamedHook | None = None,
     visibility: ConnectorVisibilityHook | None = None,
     team_visibility: TeamConnectorVisibilityHook | None = None,
+    access: ConnectorAccessHook | None = None,
 ) -> None:
     """Install application-owned connector lifecycle hooks.
 
@@ -129,10 +151,12 @@ def set_connector_team_hooks(
 
     global _connector_deleted_hook, _connector_renamed_hook
     global _connector_visibility_hook, _team_connector_visibility_hook
+    global _connector_access_hook
     _connector_deleted_hook = deleted
     _connector_renamed_hook = renamed
     _connector_visibility_hook = visibility
     _team_connector_visibility_hook = team_visibility
+    _connector_access_hook = access
 
 
 def visible_team_connector_ids(db: Any, user_id: int) -> dict[str, set[int]]:
@@ -212,6 +236,55 @@ def team_connector_hook_installed() -> bool:
     return _team_connector_visibility_hook is not None
 
 
+def _validate_connector_access_answer(answer: Any) -> "ConnectorAccess | None":
+    """Validate the access hook's answer shape.
+
+    An authorization input, not user-facing data: a malformed answer must
+    fail loudly, never be normalized, coerced, or defaulted to empty. The
+    only two accepted shapes are ``None`` -- meaning the caller's team does
+    not link the connector at all, nothing else -- and a ``ConnectorAccess``
+    instance. A linked connector always answers a ``ConnectorAccess``, with
+    ``can_edit`` reflecting whatever predicate the application applied;
+    ``ConnectorAccess(team_owned=True, can_edit=False)`` is therefore a
+    legal answer on its own, not rejected. The one shape a ``ConnectorAccess``
+    instance can still fail on is ``can_edit`` set without ``team_owned``,
+    which is rejected because edit rights presuppose a link.
+    """
+    if answer is None:
+        return None
+    if not isinstance(answer, ConnectorAccess):
+        raise ValueError(
+            "connector access hook returned a malformed answer: expected "
+            f"ConnectorAccess or None, got {type(answer).__name__}"
+        )
+    if answer.can_edit and not answer.team_owned:
+        raise ValueError(
+            "connector access hook returned a malformed answer: can_edit "
+            "is True but team_owned is not True"
+        )
+    return answer
+
+
+def resolve_connector_access(
+    db: Any, user_id: int, connector_type: ConnectorType, connector_id: int
+) -> "ConnectorAccess | None":
+    """Whether the caller's team links ``connector_id``, and may edit it.
+
+    Returns ``None`` when no access hook is installed, and also when an
+    installed hook itself answers ``None`` -- both mean "the caller's team
+    does not link this connector," which is the only thing ``None`` ever
+    means here (a linked connector always answers a ``ConnectorAccess``).
+    The hook, when installed, is called positionally with
+    ``connector_type`` as a plain ``str`` matching the ``ConnectorType``
+    literal. The answer is shape-validated (see
+    ``_validate_connector_access_answer``) before it reaches any caller.
+    """
+    if _connector_access_hook is None:
+        return None
+    answer = _connector_access_hook(db, int(user_id), connector_type, int(connector_id))
+    return _validate_connector_access_answer(answer)
+
+
 def resolve_team_connector_ids_or_raise(
     db: Any, *, team_id: int | None, log_subject: int | None
 ) -> dict[str, set[int]]:
@@ -254,6 +327,84 @@ def resolve_team_connector_ids_or_raise(
             details={"reason": "team_scope_resolution_failed"},
             status_code=503,
         ) from exc
+
+
+def resolve_connector_access_or_raise(
+    db: Any, user_id: int, connector_type: ConnectorType, connector_id: int
+) -> "ConnectorAccess | None":
+    """``resolve_connector_access(db, user_id, connector_type,
+    connector_id)``, with every non-typed failure converted into the
+    seam's one typed 503.
+
+    A ``ConnectorRuntimeError`` -- whether raised by the hook itself or by
+    ``resolve_connector_access``'s own answer validation -- passes through
+    unchanged (same object, not re-wrapped). Any other exception is logged
+    at ``WARNING`` and converted into
+    ``ConnectorRuntimeError(ERROR_CONNECTOR_RUNTIME_UNAVAILABLE, "Connector
+    access is unavailable.", details={"reason":
+    "connector_access_resolution_failed"}, status_code=503)``. Unlike
+    ``resolve_team_connector_ids_or_raise``, there is no separate
+    ``log_subject`` parameter: ``user_id`` here already identifies the
+    caller directly, so it doubles as the value logged.
+    """
+    try:
+        return resolve_connector_access(db, user_id, connector_type, connector_id)
+    except ConnectorRuntimeError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Failed to resolve connector access for user %s, connector %s:%s",
+            user_id,
+            connector_type,
+            connector_id,
+            exc_info=True,
+        )
+        raise ConnectorRuntimeError(
+            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+            "Connector access is unavailable.",
+            details={"reason": "connector_access_resolution_failed"},
+            status_code=503,
+        ) from exc
+
+
+@contextmanager
+def snapshot_connector_team_hooks() -> Iterator[None]:
+    """Save every module-level hook slot, restore it on exit.
+
+    Intended for tests: entering the block, replacing any slot (through
+    ``set_connector_team_hooks`` or a direct module-attribute monkeypatch),
+    and leaving restores every slot to the exact object it held before the
+    block, including a slot the block never touched. A slot added to this
+    module later must be added here too, or a snapshot taken before that
+    slot exists will silently fail to restore it -- covered by the
+    discovery-based coverage test in
+    tests/web/services/test_connector_team_scope.py, which enumerates every
+    module global ending in ``_hook`` and asserts this snapshot restores
+    each one by identity. Saving and restoring lives on the module because
+    the state being saved lives on the module: a test-side helper would
+    have to name and reach these globals from outside, and would go stale
+    the moment a slot is added here.
+    """
+    global _connector_deleted_hook, _connector_renamed_hook
+    global _connector_visibility_hook, _team_connector_visibility_hook
+    global _connector_access_hook
+    saved = (
+        _connector_deleted_hook,
+        _connector_renamed_hook,
+        _connector_visibility_hook,
+        _team_connector_visibility_hook,
+        _connector_access_hook,
+    )
+    try:
+        yield
+    finally:
+        (
+            _connector_deleted_hook,
+            _connector_renamed_hook,
+            _connector_visibility_hook,
+            _team_connector_visibility_hook,
+            _connector_access_hook,
+        ) = saved
 
 
 def connector_visible_to_user(

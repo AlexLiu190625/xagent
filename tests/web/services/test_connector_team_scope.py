@@ -115,6 +115,211 @@ def test_team_hook_positional_only_callable_raises():
 
 
 # ---------------------------------------------------------------------------
+# ConnectorAccess and the access hook slot.
+# ---------------------------------------------------------------------------
+
+
+def test_connector_access_defaults_are_both_false():
+    access = connector_team_scope.ConnectorAccess()
+    assert access.team_owned is False
+    assert access.can_edit is False
+
+
+def test_resolve_connector_access_returns_none_without_hook_installed():
+    for connector_type, connector_id in [("mcp", 1), ("custom_api", 1), ("mcp", 999)]:
+        assert (
+            connector_team_scope.resolve_connector_access(
+                None, 7, connector_type, connector_id
+            )
+            is None
+        )
+
+
+def test_resolve_connector_access_calls_hook_with_str_connector_type():
+    calls = []
+
+    def _hook(db, user_id, connector_type, connector_id):
+        calls.append((db, user_id, connector_type, connector_id))
+        assert isinstance(connector_type, str)
+        return connector_team_scope.ConnectorAccess(team_owned=True, can_edit=True)
+
+    connector_team_scope.set_connector_team_hooks(access=_hook)
+    try:
+        result = connector_team_scope.resolve_connector_access(None, 7, "mcp", 11)
+        assert result == connector_team_scope.ConnectorAccess(
+            team_owned=True, can_edit=True
+        )
+        assert calls == [(None, 7, "mcp", 11)]
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+def test_resolve_connector_access_passes_through_none_answer():
+    """None means the caller's team does not link this connector -- nothing
+    else -- and is a legal answer distinct from a rejected malformed one."""
+    connector_team_scope.set_connector_team_hooks(access=lambda *a: None)
+    try:
+        assert connector_team_scope.resolve_connector_access(None, 7, "mcp", 11) is None
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+# ---------------------------------------------------------------------------
+# Validation of the access hook's answer shape at the boundary.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "malformed_answer",
+    [
+        "dict",
+        "connector-delete-decision",
+        "tuple",
+        "truthy-object-with-right-attrs",
+        "can-edit-without-team-owned",
+    ],
+)
+def test_resolve_connector_access_rejects_malformed_answer(malformed_answer):
+    # Built inside the test body, not the parametrize list: a couple of
+    # these shapes are instances of types this module defines, and
+    # constructing them at collection time would make the whole file
+    # uncollectable while those types don't exist yet.
+    answer = {
+        "dict": {"team_owned": True, "can_edit": True},
+        "connector-delete-decision": connector_team_scope.ConnectorDeleteDecision(
+            team_owned=True, authorized=True
+        ),
+        "tuple": (True, True),
+        "truthy-object-with-right-attrs": SimpleNamespace(
+            team_owned=True, can_edit=True
+        ),
+        "can-edit-without-team-owned": connector_team_scope.ConnectorAccess(
+            team_owned=False, can_edit=True
+        ),
+    }[malformed_answer]
+
+    connector_team_scope.set_connector_team_hooks(access=lambda *a: answer)
+    try:
+        with pytest.raises(ValueError):
+            connector_team_scope.resolve_connector_access(None, 7, "mcp", 11)
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+def test_resolve_connector_access_accepts_linked_but_not_editable():
+    """A linked-but-not-editable answer is legal on its own -- the seam does
+    not require can_edit to be True just because team_owned is."""
+    answer = connector_team_scope.ConnectorAccess(team_owned=True, can_edit=False)
+    connector_team_scope.set_connector_team_hooks(access=lambda *a: answer)
+    try:
+        assert (
+            connector_team_scope.resolve_connector_access(None, 7, "mcp", 11) == answer
+        )
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+# ---------------------------------------------------------------------------
+# The typed-failure wrapper.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_connector_access_or_raise_converts_value_error_to_503():
+    def _hook(db, user_id, connector_type, connector_id):
+        raise ValueError("hook returned garbage")
+
+    connector_team_scope.set_connector_team_hooks(access=_hook)
+    try:
+        with pytest.raises(ConnectorRuntimeError) as excinfo:
+            connector_team_scope.resolve_connector_access_or_raise(None, 7, "mcp", 11)
+        assert excinfo.value.status_code == 503
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+def test_resolve_connector_access_or_raise_passes_through_planted_error():
+    planted = ConnectorRuntimeError(
+        "planted_code", "planted", details={"reason": "planted_reason"}
+    )
+
+    def _hook(db, user_id, connector_type, connector_id):
+        raise planted
+
+    connector_team_scope.set_connector_team_hooks(access=_hook)
+    try:
+        with pytest.raises(ConnectorRuntimeError) as excinfo:
+            connector_team_scope.resolve_connector_access_or_raise(None, 7, "mcp", 11)
+        assert excinfo.value is planted
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+def test_resolve_connector_access_or_raise_converts_malformed_answer_too():
+    """The validator's ValueError for a malformed answer goes through the
+    same conversion as any other hook-side failure."""
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: connector_team_scope.ConnectorAccess(
+            team_owned=False, can_edit=True
+        )
+    )
+    try:
+        with pytest.raises(ConnectorRuntimeError) as excinfo:
+            connector_team_scope.resolve_connector_access_or_raise(None, 7, "mcp", 11)
+        assert excinfo.value.status_code == 503
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+# ---------------------------------------------------------------------------
+# snapshot_connector_team_hooks and its discovery-based coverage test.
+# ---------------------------------------------------------------------------
+
+
+def _connector_hook_slot_names() -> list[str]:
+    return [name for name in vars(connector_team_scope) if name.endswith("_hook")]
+
+
+def test_connector_hook_slot_names_are_discoverable():
+    # Sanity check the enumeration itself finds all five known slots, so
+    # the coverage test below is not vacuously true.
+    names = _connector_hook_slot_names()
+    assert names.count("_connector_deleted_hook") == 1
+    assert names.count("_connector_renamed_hook") == 1
+    assert names.count("_connector_visibility_hook") == 1
+    assert names.count("_team_connector_visibility_hook") == 1
+    assert names.count("_connector_access_hook") == 1
+    assert len(names) == 5
+
+
+def test_snapshot_connector_team_hooks_restores_every_slot_by_identity():
+    names = _connector_hook_slot_names()
+    originals = {name: getattr(connector_team_scope, name) for name in names}
+
+    with connector_team_scope.snapshot_connector_team_hooks():
+        for name in names:
+            setattr(connector_team_scope, name, lambda *a, **k: None)
+        for name in names:
+            assert getattr(connector_team_scope, name) is not originals[name]
+
+    for name in names:
+        assert getattr(connector_team_scope, name) is originals[name]
+
+
+def test_snapshot_connector_team_hooks_restores_on_exception():
+    names = _connector_hook_slot_names()
+    originals = {name: getattr(connector_team_scope, name) for name in names}
+
+    with pytest.raises(RuntimeError):
+        with connector_team_scope.snapshot_connector_team_hooks():
+            for name in names:
+                setattr(connector_team_scope, name, lambda *a, **k: None)
+            raise RuntimeError("boom inside the block")
+
+    for name in names:
+        assert getattr(connector_team_scope, name) is originals[name]
+
+
+# ---------------------------------------------------------------------------
 # DB-backed fixtures for the checks below.
 # ---------------------------------------------------------------------------
 
