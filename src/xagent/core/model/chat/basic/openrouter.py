@@ -18,8 +18,8 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _DEEPSEEK_FUNCTION_PREFIX_ERROR = "function call should not be used with prefix"
 
 # Pinning to these provider slugs via `only` + `allow_fallbacks: False` routes
-# every request for the author to that single official endpoint. Before adding
-# an author here, confirm its official OpenRouter endpoint actually supports
+# every request for the author to one of the listed official endpoints. Before
+# adding an author here, confirm each of its official endpoints actually supports
 # every parameter this client can send (tools, tool_choice, response_format,
 # structured outputs, temperature) — an unsupported parameter is now silently
 # ignored by the endpoint rather than rejected, so a wrong entry degrades
