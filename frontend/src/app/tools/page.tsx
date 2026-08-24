@@ -39,6 +39,7 @@ import { getApiUrl, cn } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { ConnectMcpDialog, AppIntegration } from "@/components/mcp/connect-mcp-dialog"
 import { OfficialMcpSettingsDialog } from "@/components/mcp/official-mcp-settings-dialog"
+import { sanitizeConnectorStatusEntry } from "@/lib/team-sharing-sanitizers"
 import { CustomApiForm, MCPServerFormData } from "@/components/mcp/custom-api-form"
 import { CustomMcpForm } from "@/components/mcp/custom-mcp-form"
 import {
@@ -583,6 +584,13 @@ function ToolsPageContent() {
       // We need to fetch the icon or use a generic one
       let icon = getAppIcon(server.name) || "";
 
+      // Same key derivation the card uses to read connectorStatus, so the
+      // settings dialog shows the same ownership label as the card it was
+      // opened from. Sanitized so the dialog's badge gate (which requires
+      // app.shared !== undefined) only ever sees a well-formed answer.
+      const connType = server.transport === 'custom_api' ? 'custom_api' : 'mcp'
+      const sharingStatus = sanitizeConnectorStatusEntry(connectorStatus[`${connType}:${server.id}`])
+
       // Create an AppIntegration-like object for the dialog
       setEditingOfficialApp({
         id: appId, // Store the app ID for OAuth flow
@@ -597,7 +605,8 @@ function ToolsPageContent() {
         // This reconstruction path is only reached for oauth servers (gated
         // above); set auth_type explicitly so the settings dialog's isKeyBased
         // check stays correct if this path is ever reused for other transports.
-        auth_type: "builtin_oauth"
+        auth_type: "builtin_oauth",
+        ...(sharingStatus ?? {}),
       })
       setIsOfficialAppDialogOpen(true)
     } else if (server.transport === "custom_api") {
