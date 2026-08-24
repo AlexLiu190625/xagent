@@ -890,6 +890,11 @@ _LOG_SCALAR_COST = 16
 _QUOTE_COST = 2
 
 
+def _rendered_width(text: str) -> int:
+    """UTF-8 byte width of ``text`` as it will appear in the rendered log."""
+    return len(text.encode("utf-8", errors="replace"))
+
+
 def _shrink_within_budget(value: Any, budget: int) -> Any:
     """Copy ``value`` while spending a single shared byte budget.
 
@@ -926,7 +931,7 @@ def _shrink_node(value: Any, remaining: List[int], depth: int) -> Any:
         return _LOG_BUDGET_SPENT
     if depth >= _MAX_TRACE_DEPTH:
         too_deep = f"...[truncated: depth exceeds {_MAX_TRACE_DEPTH}]"
-        remaining[0] -= len(too_deep) + _QUOTE_COST
+        remaining[0] -= _rendered_width(too_deep) + _QUOTE_COST
         return too_deep
 
     if isinstance(value, str):
@@ -943,7 +948,7 @@ def _shrink_node(value: Any, remaining: List[int], depth: int) -> Any:
             "utf-8", errors="ignore"
         )
         marked = f"{head}...[truncated {len(value) - len(head)} chars]"
-        remaining[0] -= len(marked.encode("utf-8")) + _QUOTE_COST
+        remaining[0] -= _rendered_width(marked) + _QUOTE_COST
         return marked
 
     if isinstance(value, dict):
@@ -953,7 +958,7 @@ def _shrink_node(value: Any, remaining: List[int], depth: int) -> Any:
             if remaining[0] <= 0:
                 shrunk[_LOG_OMITTED_KEYS_KEY] = f"{len(value) - len(shrunk)} more keys"
                 break
-            remaining[0] -= len(f"{key!r}: , ")
+            remaining[0] -= _rendered_width(f"{key!r}: , ")
             shrunk[key] = _shrink_node(item, remaining, depth + 1)
         return shrunk
 
@@ -1007,9 +1012,13 @@ def _render_event_data_for_log(data: Any, max_bytes: Optional[int] = None) -> st
         return f"{data}"
 
     rendered = f"{_shrink_within_budget(data, max_bytes)}"
-    if len(rendered) <= max_bytes:
+    encoded = rendered.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
         return rendered
-    return f"{rendered[:max_bytes]}...[truncated {len(rendered) - max_bytes} chars]"
+    # Slice on a byte boundary and drop an incomplete trailing multi-byte
+    # char, matching the string-leaf truncation above.
+    head = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return f"{head}...[truncated {len(rendered) - len(head)} chars]"
 
 
 class ConsoleTraceHandler(BaseTraceHandler):

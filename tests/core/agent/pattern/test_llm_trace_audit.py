@@ -785,7 +785,8 @@ def test_render_event_data_bounds_multi_megabyte_checkpoint(
     out = _render_event_data_for_log(payload, max_bytes=50_000)
 
     # Slack covers the trailing "...[truncated N chars]" marker.
-    assert len(out) <= 50_000 + 100, f"log render not bounded: {len(out)}"
+    out_bytes = len(out.encode("utf-8"))
+    assert out_bytes <= 50_000 + 100, f"log render not bounded: {out_bytes}"
     assert out.startswith("{'checkpoint_type': 'step_complete'")
 
 
@@ -809,11 +810,110 @@ def test_render_event_data_bounds_wide_dict() -> None:
     assert len(f"{truncate_for_trace(payload, max_bytes=50_000)}") > 1_000_000
 
     out = _render_event_data_for_log(payload, max_bytes=50_000)
-    assert len(out) <= 50_000 + 100, f"log render not bounded: {len(out)}"
+    out_bytes = len(out.encode("utf-8"))
+    assert out_bytes <= 50_000 + 100, f"log render not bounded: {out_bytes}"
 
     # The dropped keys are accounted for, not silently swallowed.
     shrunk = _shrink_within_budget(payload, 50_000)
     assert "more keys" in shrunk["snapshot"]["__omitted_keys__"]
+
+
+def _chinese_step_results_payload(n_steps: int, id_len: int) -> Dict[str, Any]:
+    """A checkpoint-shaped payload with Chinese plan step ids as dict keys.
+
+    Mirrors ``step_results`` in a real execution checkpoint, where each key
+    is the plan's own step id — often a short Chinese phrase — rather than
+    an ASCII index.
+    """
+    return {
+        "checkpoint_type": "step_complete",
+        "step_results": {
+            f"步骤{i}-{'验证与执行' * id_len}": {
+                "status": "done",
+                "output": "结果" * 50,
+            }
+            for i in range(n_steps)
+        },
+    }
+
+
+def test_render_event_data_bounds_wide_chinese_keyed_dict() -> None:
+    """A dict with many Chinese keys must stay within the byte budget.
+
+    ``_shrink_node`` charges each dict key's rendered width with
+    ``len(f"{key!r}: , ")``, which counts Python characters, not the UTF-8
+    bytes the log line actually spends once encoded. Before the fix this
+    payload rendered 144,594 bytes against a 50,000 byte budget — a 189%
+    overrun — because every 200-character Chinese key was charged as if it
+    cost 200 bytes when it actually costs about 600.
+
+    ``_shrink_within_budget`` is asserted on directly (not only through
+    ``_render_event_data_for_log``) because the final hard byte-cut in
+    ``_render_event_data_for_log`` bounds total output size on its own —
+    it would mask a regression in the per-key accounting. Checking the
+    shrink step's own output is what actually pins the accounting fix.
+    """
+    from xagent.core.agent.trace import (
+        _render_event_data_for_log,
+        _shrink_within_budget,
+    )
+
+    payload = {f"键{i}" + "中" * 200: "v" for i in range(3_000)}
+
+    shrunk = _shrink_within_budget(payload, 50_000)
+    shrunk_bytes = len(f"{shrunk}".encode("utf-8"))
+    assert shrunk_bytes <= 50_000 + 1_000, (
+        f"per-key byte accounting broken: {shrunk_bytes}"
+    )
+
+    out = _render_event_data_for_log(payload, max_bytes=50_000)
+    out_bytes = len(out.encode("utf-8"))
+    assert out_bytes <= 50_000 + 100, f"log render not bounded: {out_bytes}"
+
+
+def test_render_event_data_bounds_chinese_step_results_checkpoint() -> None:
+    """A checkpoint-shaped payload with Chinese plan step ids as dict keys
+    renders within the byte budget end to end, matching the shape a real
+    execution checkpoint produces once a plan's step ids are Chinese text.
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload = _chinese_step_results_payload(n_steps=800, id_len=8)
+
+    out = _render_event_data_for_log(payload, max_bytes=50_000)
+    out_bytes = len(out.encode("utf-8"))
+    assert out_bytes <= 50_000 + 100, f"log render not bounded: {out_bytes}"
+
+
+def test_render_event_data_bounds_chinese_tuple_payload() -> None:
+    """Tuples are not walked by ``_shrink_node`` — only str/dict/list are —
+    so they pass through unshrunk and the final byte-domain hard cut in
+    ``_render_event_data_for_log`` is the only thing bounding them.
+
+    Before the fix this payload rendered 135,743 bytes against a 50,000
+    byte budget because the cap sliced with ``rendered[:max_bytes]``, a
+    Python character offset, instead of a UTF-8 byte offset.
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload = tuple("中文内容测试" * 4 for _ in range(20_000))
+
+    out = _render_event_data_for_log(payload, max_bytes=50_000)
+    out_bytes = len(out.encode("utf-8"))
+    assert out_bytes <= 50_000 + 100, f"log render not bounded: {out_bytes}"
+
+
+def test_render_event_data_bounds_chinese_set_payload() -> None:
+    """Sets take the same unshrunk path as tuples, so the byte-domain hard
+    cut must bound them too.
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload = {f"中文集合元素{i}" * 4 for i in range(20_000)}
+
+    out = _render_event_data_for_log(payload, max_bytes=50_000)
+    out_bytes = len(out.encode("utf-8"))
+    assert out_bytes <= 50_000 + 100, f"log render not bounded: {out_bytes}"
 
 
 @pytest.mark.parametrize(
@@ -878,5 +978,6 @@ async def test_console_handler_caps_every_scope(
 
     assert len(caplog.records) == 1
     message = caplog.records[0].getMessage()
-    assert len(message) <= 50_000 + 200, f"log line not bounded: {len(message)}"
+    message_bytes = len(message.encode("utf-8"))
+    assert message_bytes <= 50_000 + 200, f"log line not bounded: {message_bytes}"
     assert "[truncated" in message
