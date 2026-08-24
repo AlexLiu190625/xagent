@@ -12,7 +12,7 @@ The v2-runtime audit injection (centralized in
 follow-up PR.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 import pytest
 
@@ -885,9 +885,17 @@ def test_render_event_data_bounds_chinese_step_results_checkpoint() -> None:
     assert out_bytes <= 50_000 + 100, f"log render not bounded: {out_bytes}"
 
 
-def test_render_event_data_bounds_chinese_tuple_payload() -> None:
-    """Tuples are not walked by ``_shrink_node`` — only str/dict/list are —
-    so they pass through unshrunk and the final byte-domain hard cut in
+@pytest.mark.parametrize(
+    "payload",
+    [
+        tuple("中文内容测试" * 4 for _ in range(20_000)),
+        {f"中文集合元素{i}" * 4 for i in range(20_000)},
+    ],
+    ids=["tuple", "set"],
+)
+def test_render_event_data_bounds_chinese_unwalked_container(payload: Any) -> None:
+    """Tuples and sets are not walked by ``_shrink_node`` — only str/dict/list
+    are — so they pass through unshrunk and the final byte-domain hard cut in
     ``_render_event_data_for_log`` is the only thing bounding them.
 
     Before the fix this payload rendered 135,743 bytes against a 50,000
@@ -896,35 +904,278 @@ def test_render_event_data_bounds_chinese_tuple_payload() -> None:
     """
     from xagent.core.agent.trace import _render_event_data_for_log
 
-    payload = tuple("中文内容测试" * 4 for _ in range(20_000))
-
-    out = _render_event_data_for_log(payload, max_bytes=50_000)
-    out_bytes = len(out.encode("utf-8"))
-    assert out_bytes <= 50_000 + 100, f"log render not bounded: {out_bytes}"
-
-
-def test_render_event_data_bounds_chinese_set_payload() -> None:
-    """Sets take the same unshrunk path as tuples, so the byte-domain hard
-    cut must bound them too.
-    """
-    from xagent.core.agent.trace import _render_event_data_for_log
-
-    payload = {f"中文集合元素{i}" * 4 for i in range(20_000)}
-
     out = _render_event_data_for_log(payload, max_bytes=50_000)
     out_bytes = len(out.encode("utf-8"))
     assert out_bytes <= 50_000 + 100, f"log render not bounded: {out_bytes}"
 
 
 @pytest.mark.parametrize(
-    "payload",
-    [None, "plain string", 42, [], {}, object(), {"obj": object()}, ("a", "b")],
+    "payload,check",
+    [
+        (None, lambda out: out == "None"),
+        ("plain string", lambda out: out == "plain string"),
+        (42, lambda out: out == "42"),
+        ([], lambda out: out == "[]"),
+        ({}, lambda out: out == "{}"),
+        (
+            object(),
+            lambda out: out.startswith("<object object at ") and out.endswith(">"),
+        ),
+        (
+            {"obj": object()},
+            lambda out: (
+                out.startswith("{'obj': <object object at ") and out.endswith(">}")
+            ),
+        ),
+        (("a", "b"), lambda out: out == "('a', 'b')"),
+    ],
 )
-def test_render_event_data_tolerates_unusual_payloads(payload: Any) -> None:
-    """Non-dict and non-serializable payloads render without raising."""
+def test_render_event_data_tolerates_unusual_payloads(
+    payload: Any, check: Callable[[str], bool]
+) -> None:
+    """Non-dict and non-serializable payloads render to their exact expected
+    text, not just to *some* string.
+
+    A bare payload at depth 0 renders through ``str()`` (no quotes, no
+    escapes); ``object()`` two levels above depth 0 renders through the
+    container's ``repr()``. The ``object()`` cases use ``startswith`` /
+    ``endswith`` because the memory address in the default ``repr`` varies
+    per run.
+    """
     from xagent.core.agent.trace import _render_event_data_for_log
 
-    assert isinstance(_render_event_data_for_log(payload, max_bytes=50_000), str)
+    out = _render_event_data_for_log(payload, max_bytes=50_000)
+    assert check(out), out
+
+
+def test_render_event_data_keeps_wide_scalar_dict_verbatim() -> None:
+    """A dict of many small-int leaves that fits the budget must render
+    byte-identical to plain interpolation.
+
+    Before the fix, the scalar branch charged a flat 16 bytes per leaf
+    regardless of what the leaf actually renders as, so this 45,780-byte
+    payload — inside the 50,000 byte budget — was shrunk down to 23,378
+    bytes with 2,107 keys collapsed into ``__omitted_keys__``.
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload = {i: i for i in range(4_000)}
+    assert len(f"{payload}".encode("utf-8")) == 45_780
+    assert _render_event_data_for_log(payload, max_bytes=50_000) == f"{payload}"
+
+
+def test_render_event_data_keeps_llm_call_records_verbatim() -> None:
+    """The real ``llm_calls`` shape from ``ExecutionContext.to_dict()`` —
+    a list of dicts of six integer fields plus an ISO timestamp string —
+    must render verbatim when it fits the budget.
+
+    Before the fix this 39,918-byte payload was shrunk to 36,267 bytes by
+    the same flat per-leaf charge as the scalar dict case above.
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload = {
+        "checkpoint_type": "step_complete",
+        "snapshot": {
+            "context": {
+                "llm_calls": [
+                    {
+                        "input_tokens": 12_000 + i,
+                        "output_tokens": 300 + i,
+                        "total_tokens": 12_300 + 2 * i,
+                        "message_index": i,
+                        "prompt_message_count": i % 40,
+                        "prompt_content_chars": 48_000 + i,
+                        "timestamp": "2026-08-24T05:33:21.123456+00:00",
+                    }
+                    for i in range(200)
+                ]
+            }
+        },
+    }
+    assert len(f"{payload}".encode("utf-8")) == 39_918
+    assert _render_event_data_for_log(payload, max_bytes=50_000) == f"{payload}"
+
+
+def test_render_event_data_bounds_escape_heavy_strings() -> None:
+    """A dict of many multi-line traceback strings must fit the budget in
+    the shrink step itself, so the final hard cut never fires.
+
+    Before the fix, a string leaf was charged its raw UTF-8 length while
+    the log line renders it through ``repr()`` escaping, so this payload's
+    shrunk copy reached 52,501 bytes against the same 50,000 byte budget
+    and the final hard cut landed in the middle of a string value instead
+    of on a container boundary.
+    """
+    from xagent.core.agent.trace import (
+        _render_event_data_for_log,
+        _shrink_within_budget,
+    )
+
+    traceback_text = (
+        "Traceback (most recent call last):\n"
+        '  File "/a/b/c.py", line 42, in run\n'
+        "    raise ValueError('boom')\n"
+        "ValueError: boom\n"
+    ) * 2
+    payload = {f"e{i}": traceback_text for i in range(400)}
+
+    shrunk = _shrink_within_budget(payload, 50_000)
+    shrunk_bytes = len(f"{shrunk}".encode("utf-8"))
+    assert shrunk_bytes <= 50_000, f"escape-heavy accounting broken: {shrunk_bytes}"
+
+    # No hard cut fired, so the output is exactly the shrunk copy's
+    # rendering -- a truncation marker sliced mid-marker is not possible.
+    out = _render_event_data_for_log(payload, max_bytes=50_000)
+    assert out == f"{shrunk}", "hard cut fired: the shrunk copy overshot the budget"
+
+
+def test_render_event_data_fits_single_leaf_inflated_by_escaping() -> None:
+    """A single string leaf whose raw byte length is well inside the budget
+    but whose ``repr()``-escaped rendering is not must still fit, and the
+    fit loop's first slice must not be wider than the string itself.
+
+    ``"\\x00" * 20_000`` is only 20,000 raw bytes, but every ``\\x00`` repr's
+    as the four-character escape ``\\x00``, so the escaped rendering (about
+    80,000 bytes) is the one that overflows the budget. The fit loop's
+    starting slice was computed from the *budget*, not from the string's
+    own length: when the budget-derived slice was wider than the 20,000
+    raw bytes available, slicing did nothing, and the loop appended a
+    truncation marker reporting 0 chars removed onto the untouched string
+    -- an internally contradictory result that also overshot the budget
+    (the escaped string plus the marker suffix is wider than either alone).
+    """
+    from xagent.core.agent.trace import (
+        _render_event_data_for_log,
+        _shrink_within_budget,
+    )
+
+    payload = {"blob": "\x00" * 20_000, "step": "s3"}
+
+    shrunk = _shrink_within_budget(payload, 50_000)
+    shrunk_bytes = len(f"{shrunk}".encode("utf-8"))
+    assert shrunk_bytes <= 50_000, f"single-leaf accounting broken: {shrunk_bytes}"
+    assert "truncated 0 chars" not in f"{shrunk}", (
+        "marker claims nothing was cut from a leaf that had to be cut"
+    )
+
+    out = _render_event_data_for_log(payload, max_bytes=50_000)
+    assert out == f"{shrunk}", "hard cut fired: the shrunk copy overshot the budget"
+
+
+def test_render_event_data_marks_cyclic_dict() -> None:
+    """A dict that references one of its own ancestors must be replaced by
+    a cycle marker instead of being re-expanded.
+
+    Before the fix there was no cycle detection: this self-referential dict
+    rendered at 967 bytes (plain ``repr()`` renders the same dict at 23
+    bytes, marking the cycle with ``{...}``).
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload: Dict[str, Any] = {"a": 1}
+    payload["self"] = payload
+
+    out = _render_event_data_for_log(payload, max_bytes=50_000)
+    assert "...[cyclic reference]" in out
+    assert len(out.encode("utf-8")) < 200, len(out.encode("utf-8"))
+    assert "depth exceeds" not in out, "cycle should be caught before the depth guard"
+
+
+def test_render_event_data_marks_cyclic_list() -> None:
+    """A list that contains itself must be replaced by a cycle marker.
+
+    Before the fix this rendered at 5,266 bytes instead of being cut short.
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload: List[Any] = ["x" * 100]
+    payload.append(payload)
+
+    out = _render_event_data_for_log(payload, max_bytes=50_000)
+    assert "...[cyclic reference]" in out
+    assert len(out.encode("utf-8")) < 300, len(out.encode("utf-8"))
+
+
+def test_render_event_data_marks_mutually_referencing_dicts() -> None:
+    """Two dicts that reference each other must be replaced by a cycle
+    marker on the back-edge, not re-expanded indefinitely.
+
+    Before the fix this rendered at 1,215 bytes instead of being cut short.
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    first: Dict[str, Any] = {"name": "a"}
+    second: Dict[str, Any] = {"name": "b", "peer": first}
+    first["peer"] = second
+
+    out = _render_event_data_for_log(first, max_bytes=50_000)
+    assert "...[cyclic reference]" in out
+    assert len(out.encode("utf-8")) < 200, len(out.encode("utf-8"))
+
+
+def test_render_event_data_renders_shared_subtree_at_every_position() -> None:
+    """The same acyclic container referenced from two places is not a
+    cycle -- both positions must render it in full.
+
+    This is the reverse guard for cycle detection: a "visited" set that
+    only ever grows (instead of dropping ids on the way back up) would
+    mistake this shape for a cycle at the second occurrence.
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    shared = {"x": 1, "y": "hello"}
+    payload = {"first": shared, "second": shared}
+    assert _render_event_data_for_log(payload, max_bytes=50_000) == f"{payload}"
+
+    message = {"role": "user", "content": "hi"}
+    wide = {"messages": [message] * 500, "tail": "END"}
+    out = _render_event_data_for_log(wide, max_bytes=50_000)
+    assert "...[cyclic reference]" not in out
+    assert "'tail'" in out
+
+
+def test_render_event_data_keeps_real_omitted_keys_key() -> None:
+    """A real payload key literally named ``__omitted_keys__`` must survive
+    truncation instead of being overwritten by the omission-count sentinel.
+
+    Real ``event.data`` keys are the tracer's own literals
+    (``checkpoint_type``, ``snapshot``, ``sequence``), so this is a
+    defensive guard against a payload the tracer doesn't control, not a
+    scenario observed in production. Data outranks the omission count: if
+    the sentinel key already holds real payload data, no omission count is
+    reported at all.
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload = {
+        "__omitted_keys__": "REAL DATA",
+        "big": "x" * 100_000,
+        "z": "zz",
+    }
+    out = _render_event_data_for_log(payload, max_bytes=50_000)
+    assert "REAL DATA" in out, "sentinel clobbered a real payload key"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["z" * 49_999, "a\n" * 24_999],
+    ids=["plain", "newlines"],
+)
+def test_render_event_data_keeps_top_level_string_verbatim(payload: str) -> None:
+    """A bare string payload renders through ``str()``, not ``repr()``, so
+    it must be charged without the quotes and escapes ``repr()`` would add.
+
+    Before the fix, a top-level string was charged as if it would be
+    wrapped in quotes like a nested one: ``"z" * 49_999`` (49,999 bytes,
+    inside the budget) was charged as ``49,999 + 2 = 50,001`` bytes,
+    truncated, and then truncated again by the final hard cut, ending up
+    at 50,023 bytes even though ``f"{data}"`` renders it whole.
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    assert len(payload.encode("utf-8")) <= 50_000
+    assert _render_event_data_for_log(payload, max_bytes=50_000) == payload
 
 
 def test_render_event_data_zero_cap_disables_truncation() -> None:
