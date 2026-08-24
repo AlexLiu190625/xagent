@@ -98,9 +98,10 @@ def _make_owned_api(db, owner_id: int, *, name: str = "shared-api") -> CustomApi
 
 
 class TestListEndpointAccessHookCallBudget:
-    """D1: zero hook calls for an is_owner=True row, one for is_owner=False,
-    one for every stand-in row -- pinned with a counting test double, not a
-    query listener."""
+    """The list endpoint calls the access hook zero times for an
+    is_owner=True row, once for an is_owner=False row, and once for every
+    stand-in row -- pinned with a counting test double, not a query
+    listener."""
 
     def test_hook_is_called_exactly_once_per_non_owner_row_and_never_for_owner_rows(
         self, db
@@ -158,9 +159,9 @@ class TestListEndpointAccessHookCallBudget:
 
 
 class TestReportedEditPermissionConsistencyMcp:
-    """D2: the response's can_edit_global must agree across every surface
-    that reports it, for the same (user, connector) -- for MCP connectors,
-    across the list, GET, PUT's response and toggle's response."""
+    """The response's can_edit_global must agree across every surface that
+    reports it, for the same (user, connector) -- for MCP connectors, across
+    the list, GET, PUT's response and toggle's response."""
 
     @pytest.mark.parametrize(
         "population,access_answer,has_personal_row",
@@ -230,7 +231,7 @@ class TestReportedEditPermissionConsistencyMcp:
 
 
 class TestReportedEditPermissionConsistencyCustomApi:
-    """D2, for the Custom API kind: ``_custom_api_to_mcp_response`` has no
+    """The same agreement, for the Custom API kind: ``_custom_api_to_mcp_response`` has no
     ``_check_mcp_permission``-shaped gate to compare against and Custom
     API's own ``GET``/``PUT`` response model carries no ``can_edit_global``
     field at all -- so the surface to agree with is not a second reported
@@ -302,10 +303,10 @@ class TestReportedEditPermissionConsistencyCustomApi:
 
 
 class TestLocalCanConfigureWidening:
-    """D3: ``_local_mcp_can_configure`` now also answers True for a
-    stand-in whose team access verdict links the connector but denies edit
-    -- previously invisible (``association is None`` alone), now visible
-    and reachable, for both connector kinds."""
+    """``_local_mcp_can_configure`` answers True for a stand-in whose team
+    access verdict links the connector but denies edit -- visible and
+    reachable rather than invisible on ``association is None`` alone, for
+    both connector kinds."""
 
     def test_mcp_stand_in_with_a_linked_but_not_editable_verdict_is_configurable(
         self, db
@@ -359,8 +360,8 @@ class TestLocalCanConfigureWidening:
 
 
 class TestOAuthRoutesKeepTheirOwnGate:
-    """D5: the four MCP OAuth routes keep the old personal-row-only helper
-    and still 404 a team member with no personal row, verdict or not."""
+    """The four MCP OAuth routes keep the old personal-row-only helper and
+    still 404 a team member with no personal row, verdict or not."""
 
     async def test_all_four_oauth_routes_404_a_team_member_with_no_personal_row(
         self, db
@@ -401,9 +402,9 @@ class TestOAuthRoutesKeepTheirOwnGate:
 
 
 class TestDenyingVerdictIsFalseEverywhere:
-    """D5: a connector whose verdict denies edit reports can_edit_global
-    False in the list, in the response from GET, and in the response from
-    PUT alike."""
+    """A connector whose verdict denies edit reports can_edit_global False
+    in the list, in the response from GET, and in the response from PUT
+    alike."""
 
     async def test_a_denying_verdict_yields_false_in_the_list_get_and_put_response(
         self, db
@@ -433,10 +434,9 @@ class TestDenyingVerdictIsFalseEverywhere:
 
 
 class TestRenameStaysScopedToItsOwnConnector:
-    """D5: renaming one connector must not touch an outsider's own,
-    unrelated connector -- a regression guard on the rename call's scope,
-    unchanged by this stage but exercised again after threading the
-    verdict through the same route's response."""
+    """Renaming one connector must not touch an outsider's own, unrelated
+    connector -- a regression guard on the rename call's scope, exercised
+    again here alongside the response now carrying the verdict too."""
 
     def test_renaming_one_connector_does_not_touch_an_outsiders_own_connector(self, db):
         owner_a = _make_user(db, 60)
@@ -474,9 +474,9 @@ class TestRenameStaysScopedToItsOwnConnector:
 
 
 class TestStandaloneParityWithNoHookInstalled:
-    """D5: with no hook installed at all, every route in scope across
-    Stages A-D -- both GETs, both PUTs, toggle, and the list -- behaves
-    exactly as it did before any of this work started."""
+    """With no hook installed at all, every route touched by this work --
+    both GETs, both PUTs, toggle, and the list -- behaves exactly as it did
+    before any of it started."""
 
     async def test_every_route_in_scope_behaves_as_before_with_no_hook_installed(
         self, db
