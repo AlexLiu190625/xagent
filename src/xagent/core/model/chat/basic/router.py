@@ -283,10 +283,16 @@ class RouterLLM(BaseLLM):
 
         The returned wrapper dispatches directly to the selected downstream
         model without routing a second time, and carries the selected model's
-        context window from xrouter's model profile catalog. Provider-compat
-        retries (a rejected tool_choice, a thinking/tool_choice conflict, a
-        model that mandates reasoning) are the downstream OpenRouter client's
-        own responsibility, not this router's.
+        context window from xrouter's model profile catalog. Both resolver
+        branches in ``_resolve_route`` currently build an ``OpenRouterLLM``
+        client for the chosen slug (the injected ``_downstream_resolver`` in
+        practice, and the ``create_base_llm`` fallback always, since it is
+        given ``model_provider="openrouter"``), so provider-compat retries (a
+        rejected tool_choice, a thinking/tool_choice conflict, a model that
+        mandates reasoning) are that client's own responsibility today, not
+        this router's. ``_downstream_resolver`` is typed as
+        ``Callable[[str], BaseLLM]``, not ``OpenRouterLLM``, so this is a
+        statement about current call sites, not a type-level guarantee.
 
         ``preferred_input_modalities`` supplied by the caller (task runtime
         extensions) is *advisory*: a router that cannot honour it degrades by

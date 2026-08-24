@@ -552,9 +552,10 @@ async def test_sandwiched_pure_404_bounds_total_upstream_calls(monkeypatch, mock
             tool_choice="required",
         )
 
-    # Upper bound, not the exact value: 1 original + at most 3 compat
-    # adjustments (one per rule) is this layer's per-call ceiling.
-    assert mock_client.chat.completions.create.await_count <= 4
+    # 1 original call + 1 tool_choice relaxation: the second identical 404
+    # then fails rule 3's own precondition (tool_choice is already "auto"),
+    # so no further adjustment is possible and the exact count is pinned.
+    assert mock_client.chat.completions.create.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -709,4 +710,7 @@ async def test_sandwiched_deepseek_prefix_sanitizes_messages_once(monkeypatch, m
 
     assert result["content"] == "ok"
     assert prefix_error_count == 1
-    assert mock_client.chat.completions.create.await_count <= 5
+    # 1 prefix rejection + 1 sanitized-but-mandatory-reasoning failure + 1
+    # sanitized success: the sanitized messages carry over across compat
+    # iterations, so the prefix rejection never fires a second time.
+    assert mock_client.chat.completions.create.await_count == 3

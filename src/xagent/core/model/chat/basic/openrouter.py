@@ -1,6 +1,8 @@
 import logging
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
+import openai
+
 from .....config import get_openrouter_official_providers_only
 from ..error import retry_on
 from ..exceptions import LLMRetryableError, LLMToolProtocolError
@@ -17,6 +19,18 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _DEEPSEEK_FUNCTION_PREFIX_ERROR = "function call should not be used with prefix"
+
+# OpenAILLM.chat/stream_chat normally convert every openai.BadRequestError into
+# a RuntimeError before returning. Their response_format pop-and-retry path is
+# an exception, though: it re-issues the request from inside its own
+# ``except openai.BadRequestError`` block, and if that retried call also fails
+# with a BadRequestError, nothing wraps the second failure -- it escapes as a
+# bare SDK exception. openai.BadRequestError's MRO does not include
+# RuntimeError, so the compat retry loops below must catch both explicitly to
+# keep covering that case. The historical implementation caught bare
+# ``Exception`` here; this tuple is the precise, intentionally narrowed
+# replacement.
+_COMPAT_RETRYABLE_ERRORS = (RuntimeError, openai.BadRequestError)
 
 # Pinning to these provider slugs via `only` + `allow_fallbacks: False` routes
 # every request for the author to one of the listed official endpoints. Before
@@ -203,16 +217,23 @@ def _next_compat_adjustment(
 ) -> tuple[Optional[str | Dict[str, Any]], Optional[Dict[str, Any]], str, str] | None:
     """Pick the next OpenRouter provider-compatibility adjustment for a failure.
 
-    Rules are checked strictest-first (relax tool_choice, then disable
-    thinking, then enable thinking): a message that happens to match more than
-    one predicate is resolved by its most specific cause instead of by
-    declaration order. A rule that matches but would leave the actually
-    rendered request unchanged compared to the current ``(tool_choice,
-    render(thinking))`` state is a no-op and is skipped without spending its
-    retry budget, so a rule that cannot fix anything does not block a later
-    rule that can. A rule whose action was already attempted stops the search
-    outright: the same shared one-attempt-per-action budget this logic
-    replaces (router.py's ``attempted_retry_actions``) applies here too.
+    Candidates are checked strictest-first (relax tool_choice, then disable
+    thinking, then enable thinking) and tried in that written order: the
+    first candidate whose predicate matches and would actually change the
+    rendered request wins. Order is the mechanism here, not a side detail --
+    this deliberately reverses the candidate order used by the predecessor
+    implementation this logic replaces. Pairing strictest-first with the
+    no-op skip below means that when a failure message matches more than one
+    predicate, every matching rule can still be tried in turn rather than the
+    first match blocking the rest; reordering the ``candidates`` tuple
+    changes which adjustment fires first and is not a safe refactor. A rule
+    that matches but would leave the actually rendered request unchanged
+    compared to the current ``(tool_choice, render(thinking))`` state is a
+    no-op and is skipped without spending its retry budget, so a rule that
+    cannot fix anything does not block a later rule that can. A rule whose
+    action was already attempted stops the search outright: the same shared
+    one-attempt-per-action budget this logic replaces (router.py's
+    ``attempted_retry_actions``) applies here too.
     """
     current_state = (tool_choice, render(thinking))
     candidates: tuple[
@@ -362,7 +383,12 @@ class OpenRouterLLM(OpenAILLM):
         **kwargs: Any,
     ) -> Any:
         # Vision requests carry no DeepSeek prefix-retry need, so the inner
-        # call goes straight to the OpenAI implementation.
+        # call goes straight to the OpenAI implementation. This also skips
+        # chat()'s DeepSeek tool-protocol handling (_force_single_required_
+        # deepseek_tool, normalize_deepseek_response, the protocol-error
+        # retry), which is a deliberate omission rather than an oversight:
+        # those branches only take effect when tools are passed, and no
+        # current caller passes tools into vision_chat.
         return await self._run_chat_with_compat_retry(
             super().vision_chat,
             messages,
@@ -458,10 +484,14 @@ class OpenRouterLLM(OpenAILLM):
         ``sanitize_messages=True``) and ``vision_chat`` (wrapping the
         inherited ``OpenAILLM.vision_chat`` directly, which has no
         ``sanitized_out`` parameter and must never receive one). A retryable
-        error raised by the inner call (e.g. the DeepSeek tool-protocol error
-        surfaced after prefix retry, or a wrapped 429/5xx recognized by
-        ``retry_on``) is left for the shared LLM retry wrapper and is never
-        treated as a compat adjustment opportunity.
+        error raised by the inner call (e.g. ``LLMEmptyContentError`` after an
+        empty-content response, or a ``RuntimeError`` wrapping a rate-limit or
+        5xx error that ``retry_on`` recognizes via ``__cause__``) is left for
+        the shared LLM retry wrapper and is never treated as a compat
+        adjustment opportunity. A single ``call`` invocation may itself issue
+        up to one additional upstream request: ``OpenAILLM.chat``'s
+        response_format pop-and-retry path can resend once internally before
+        returning or raising.
 
         Known limitation: ``OpenAILLM.chat``'s structured-output degrade path
         can rewrite ``thinking`` internally (disabling it after a non-JSON
@@ -506,7 +536,7 @@ class OpenRouterLLM(OpenAILLM):
                 return await call(current_messages, **call_kwargs)
             except LLMRetryableError:
                 raise
-            except RuntimeError as exc:
+            except _COMPAT_RETRYABLE_ERRORS as exc:
                 if retry_on(exc):
                     raise
 
@@ -683,7 +713,7 @@ class OpenRouterLLM(OpenAILLM):
                 return
             except LLMRetryableError:
                 raise
-            except RuntimeError as exc:
+            except _COMPAT_RETRYABLE_ERRORS as exc:
                 if has_yielded:
                     raise
                 if retry_on(exc):
