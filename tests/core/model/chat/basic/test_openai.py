@@ -5,6 +5,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import httpx
+import openai
 import pytest
 
 from xagent.core.model.chat.basic.base import BaseLLM
@@ -36,6 +38,18 @@ def _tool_call_delta(index, call_id, name, arguments, call_type="function"):
         id=call_id,
         type=call_type,
         function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def _response_format_bad_request(message: str) -> openai.BadRequestError:
+    """A 400 whose text matches the response_format fallback's trigger check."""
+    return openai.BadRequestError(
+        f"Error code: 400 - {{'error': {{'message': '{message}'}}}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        ),
+        body={"error": {"message": message, "code": 400}},
     )
 
 
@@ -1278,3 +1292,125 @@ class TestOpenAILLM:
 
         assert final_chunk is not None
         assert final_chunk.tool_calls[0]["function"]["arguments"] == expected
+
+    @pytest.mark.asyncio
+    async def test_chat_response_format_retry_failure_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """A second BadRequestError from the response_format resend must be
+        wrapped into RuntimeError, not escape as a bare SDK exception, just
+        like every other ``chat()`` failure path."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.chat(
+                [{"role": "user", "content": "hi"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert isinstance(exc_info.value.__cause__, openai.BadRequestError)
+        assert mock_client.chat.completions.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_chat_response_format_retry_success_returns_result(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """When the resend succeeds, ``chat()`` already returns the processed
+        result today; this pins that behavior against the same failure-path
+        restructuring."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat(
+            [{"role": "user", "content": "hi"}],
+            response_format={"type": "json_object"},
+        )
+
+        assert result.get("content") == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_format_retry_failure_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """Same guarantee as ``chat()``: the vision path must not leak a bare
+        BadRequestError when the response_format resend also fails."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.vision_chat(
+                [{"role": "user", "content": "describe this"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert isinstance(exc_info.value.__cause__, openai.BadRequestError)
+        assert mock_client.chat.completions.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_format_retry_success_returns_result(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """A successful resend must return the processed result, not fall
+        through to an implicit ``None`` (the vision_chat() half of #1650)."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        result = await llm.vision_chat(
+            [{"role": "user", "content": "describe this"}],
+            response_format={"type": "json_object"},
+        )
+
+        assert result is not None
+        assert result.get("type") == "text"
+        assert result.get("content") == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
