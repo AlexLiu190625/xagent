@@ -590,3 +590,72 @@ class TestStandaloneParityWithNoHookInstalled:
                     db=db,
                 )
             assert exc.value.status_code == 404
+
+
+class TestListMcpAppsPerRowDegradation:
+    """A raising hook inside ``list_mcp_apps``'s local-connector loop must
+    not blank the whole response list -- only the affected row's
+    ``can_configure`` degrades to False, and every other row keeps
+    reporting its correct value."""
+
+    def test_a_raising_hook_for_one_mcp_connector_degrades_only_that_row(self, db):
+        owner = _make_user(db, 80)
+        member = _make_user(db, 81)
+        broken = _make_owned_server(db, owner.id, name="broken-connector")
+        healthy = _make_owned_server(db, owner.id, name="healthy-connector")
+        broken_id, healthy_id = broken.id, healthy.id
+
+        def selective_access(_db, _user_id, _connector_type, connector_id):
+            if connector_id == broken_id:
+                raise ValueError("hook exploded")
+            return ConnectorAccess(team_owned=True, can_edit=True)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=selective_access,
+                visibility=lambda _db, _uid: {
+                    "mcp": {broken_id, healthy_id},
+                    "custom_api": set(),
+                },
+            )
+            entries = list_mcp_apps(location="local", current_user=member, db=db)
+
+        broken_entry = next(e for e in entries if e["server_id"] == broken_id)
+        healthy_entry = next(e for e in entries if e["server_id"] == healthy_id)
+        assert broken_entry["can_configure"] is False
+        assert healthy_entry["can_configure"] is True
+
+    def test_a_raising_hook_for_one_custom_api_degrades_only_that_row(self, db):
+        owner = _make_user(db, 82)
+        member = _make_user(db, 83)
+        broken = _make_owned_api(db, owner.id, name="broken-api")
+        healthy = _make_owned_api(db, owner.id, name="healthy-api")
+        broken_id, healthy_id = broken.id, healthy.id
+
+        def selective_access(_db, _user_id, _connector_type, connector_id):
+            if connector_id == broken_id:
+                raise ValueError("hook exploded")
+            return ConnectorAccess(team_owned=True, can_edit=True)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=selective_access,
+                visibility=lambda _db, _uid: {
+                    "mcp": set(),
+                    "custom_api": {broken_id, healthy_id},
+                },
+            )
+            entries = list_mcp_apps(location="local", current_user=member, db=db)
+
+        broken_entry = next(
+            e
+            for e in entries
+            if e["server_id"] == broken_id and e["transport"] == "custom_api"
+        )
+        healthy_entry = next(
+            e
+            for e in entries
+            if e["server_id"] == healthy_id and e["transport"] == "custom_api"
+        )
+        assert broken_entry["can_configure"] is False
+        assert healthy_entry["can_configure"] is True

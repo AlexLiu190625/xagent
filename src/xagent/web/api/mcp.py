@@ -2474,13 +2474,25 @@ def list_mcp_apps(
 
             # A personal row already answers can_configure on its own; only
             # a team-owned row with none (user_mcp is None) needs a verdict.
-            local_team_access = (
-                None
-                if user_mcp is not None
-                else resolve_connector_access_or_raise(
-                    db, cast(int, current_user.id), "mcp", cast(int, server.id)
-                )
-            )
+            # A verdict resolution failure here must not blank the whole
+            # response list -- it only degrades this one row's
+            # can_configure to False, the same answer a caller with no
+            # verdict at all would get; every other row is built the same
+            # way and is unaffected.
+            local_team_access: "ConnectorAccess | None" = None
+            if user_mcp is None:
+                try:
+                    local_team_access = resolve_connector_access_or_raise(
+                        db, cast(int, current_user.id), "mcp", cast(int, server.id)
+                    )
+                except ConnectorRuntimeError:
+                    logger.warning(
+                        "Connector access resolution failed for MCP server "
+                        "%s while listing apps for user %s; reporting "
+                        "can_configure=False for this row",
+                        server.id,
+                        current_user.id,
+                    )
 
             entry = {
                 "id": server.name,
@@ -2580,13 +2592,23 @@ def list_mcp_apps(
             if category and category != "All":
                 continue
 
-            local_team_access = (
-                None
-                if user_api is not None
-                else resolve_connector_access_or_raise(
-                    db, cast(int, current_user.id), "custom_api", cast(int, api.id)
-                )
-            )
+            # Same per-row degradation as the MCP loop above: a resolution
+            # failure only blanks this one row's can_configure, never the
+            # rest of the response list.
+            local_team_access = None
+            if user_api is None:
+                try:
+                    local_team_access = resolve_connector_access_or_raise(
+                        db, cast(int, current_user.id), "custom_api", cast(int, api.id)
+                    )
+                except ConnectorRuntimeError:
+                    logger.warning(
+                        "Connector access resolution failed for Custom API "
+                        "%s while listing apps for user %s; reporting "
+                        "can_configure=False for this row",
+                        api.id,
+                        current_user.id,
+                    )
 
             results.append(
                 {
