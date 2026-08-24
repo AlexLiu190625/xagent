@@ -33,14 +33,12 @@ const translateDynamic = vi.hoisted(() => (_key: string, fallback: string) => fa
 const i18nValue = vi.hoisted(() => ({ t: translate, tDynamic: translateDynamic, locale: "en" }))
 
 // ./page.tsx has no top-level React import (it relies on the automatic JSX
-// runtime everywhere else in this app config), but this harness's esbuild
-// transform for .tsx test-reachable modules resolves classic-mode
-// React.createElement calls against a global binding. vi.hoisted runs before
-// any static import in this file, including the one that pulls in ./page, so
-// this is the only point at which the binding can be supplied.
-vi.hoisted(() => {
-  ;(globalThis as unknown as { React: unknown }).React = require("react")
-})
+// runtime everywhere else in this app config), while this harness's esbuild
+// transform resolves its React.createElement calls against a global binding.
+// The binding is read when the component renders, not when the module is
+// imported, so stubbing it per test is early enough -- and vi.stubGlobal is
+// tracked, so the afterEach below restores the global instead of leaving one
+// behind for the other files sharing this worker.
 
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
 
@@ -130,13 +128,17 @@ async function renderPage() {
 }
 
 beforeEach(() => {
+  vi.stubGlobal("React", React)
   apiRequestMock.mockReset()
   routerReplaceMock.mockReset()
   routerPushMock.mockReset()
   searchParamsMock.value = new URLSearchParams()
 })
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.unstubAllGlobals()
+})
 
 describe("ToolsPage official settings dialog ownership badge (#1623)", () => {
   it("shows the matching three-way label when the server carries a real sharing status", async () => {
