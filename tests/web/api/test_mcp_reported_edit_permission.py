@@ -31,6 +31,7 @@ from xagent.web.api.mcp import (
     toggle_mcp_server,
     update_mcp_server,
 )
+from xagent.web.models.agent import Agent
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -509,11 +510,16 @@ class TestDenyingVerdictIsFalseEverywhere:
 
 
 class TestRenameStaysScopedToItsOwnConnector:
-    """Renaming one connector must not touch an outsider's own, unrelated
-    connector -- a regression guard on the rename call's scope, exercised
-    again here alongside the response now carrying the verdict too."""
+    """Renaming one connector must not reach outside the connector actually
+    being renamed."""
 
     def test_renaming_one_connector_does_not_touch_an_outsiders_own_connector(self, db):
+        """A narrower, database-level regression guard, kept alongside the
+        selector oracle below because it pins a different failure mode: a
+        stray write to the wrong MCPServer row entirely. Passing this
+        alone does not prove the rename call is scoped correctly against
+        an outsider who links the *same* connector being renamed -- that
+        is what the second test in this class checks."""
         owner_a = _make_user(db, 60)
         editor = _make_user(db, 61)
         outsider = _make_user(db, 62)
@@ -546,6 +552,65 @@ class TestRenameStaysScopedToItsOwnConnector:
         db.rollback()
         outsiders_server = db.query(MCPServer).filter(MCPServer.id == server_b_id).one()
         assert outsiders_server.name == "outsiders-own-connector"
+
+    def test_renaming_a_connector_does_not_rewrite_an_outsiders_own_agent_selectors(
+        self, db
+    ):
+        """The rename call itself installs no selector fan-out of its own:
+        rewriting a stored name-based selector is entirely the installed
+        renamed-hook's job (not exercised here at all -- no ``renamed``
+        hook is installed), never something the core rename call does on
+        its own reach. An outsider who also links the exact connector
+        being renamed, and whose own agent selects it by name in
+        ``tool_categories``, must see that selector completely untouched
+        by the call. Constructing that second association and reading
+        back ``tool_categories`` is the point: a test that only checks an
+        unrelated connector's own row (the test above) would stay green
+        even if this call directly rewrote every agent's selectors on its
+        own, because it never looks at an agent at all."""
+        owner = _make_user(db, 63)
+        editor = _make_user(db, 64)
+        outsider = _make_user(db, 65)
+
+        server = _make_owned_server(db, owner.id, name="rename-target-selected")
+        server_id = server.id
+
+        # The second association: the outsider also personally links this
+        # exact connector, on a verdict that passes -- not the separate,
+        # unrelated connector the test above uses.
+        db.add(
+            UserMCPServer(
+                user_id=outsider.id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        outsiders_agent = Agent(
+            user_id=outsider.id,
+            name="outsiders-agent",
+            tool_categories=["rename-target-selected"],
+        )
+        db.add(outsiders_agent)
+        db.commit()
+        agent_id = outsiders_agent.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda *_a, **_k: ConnectorAccess(
+                    team_owned=True, can_edit=True
+                ),
+            )
+            update_mcp_server(
+                server_id,
+                MCPServerUpdate(name="renamed-target-selected"),
+                current_user=editor,
+                db=db,
+            )
+
+        db.rollback()
+        refreshed_agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        assert refreshed_agent.tool_categories == ["rename-target-selected"]
 
 
 class TestStandaloneParityWithNoHookInstalled:
