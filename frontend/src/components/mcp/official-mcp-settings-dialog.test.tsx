@@ -230,6 +230,11 @@ describe("OfficialMcpSettingsDialog connected-state actions", () => {
       isGloballyConnected: true,
     })
 
+    // Anchor: proves the dialog actually rendered its content, so the three
+    // negatives below aren't trivially satisfied by an empty document (the
+    // component's own `if (!app) return null` is the failure mode this
+    // guards against).
+    expect(screen.getByText("Chrome")).toBeInTheDocument()
     expect(screen.queryByText("tools.mcp.sharing.private")).toBeNull()
     expect(screen.queryByText("tools.mcp.sharing.shared")).toBeNull()
     expect(screen.queryByText("tools.mcp.sharing.teamTool")).toBeNull()
