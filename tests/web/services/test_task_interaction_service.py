@@ -646,6 +646,143 @@ def test_cv4_write_side_payload_rules_accept_a_legal_payload(
     assert outcome == svc.CreateNotWired(reason="seam_not_wired")
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="all_whitespace"),
+    ],
+)
+def test_validate_rejects_a_blank_interaction_field(
+    _db: Session, _seeded_task: int, field: str
+) -> None:
+    values = _values([_interaction(field=field)])
+    parsed = svc.parse_v1_request_payload(values)
+    with pytest.raises(ValueError, match=r"interactions\[0\]\.field is blank"):
+        svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_rejects_a_field_with_surrounding_whitespace(
+    _db: Session, _seeded_task: int
+) -> None:
+    """Non-blank once stripped, but the stored key still would not be the
+    key a strip-agnostic answer-side comparison would need: ``" a "`` never
+    equal-matches an answer keyed ``"a"``, the same key-integrity reason a
+    blank field is refused."""
+
+    values = _values([_interaction(field=" a ")])
+    parsed = svc.parse_v1_request_payload(values)
+    with pytest.raises(
+        ValueError, match=r"interactions\[0\]\.field carries surrounding whitespace"
+    ):
+        svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_accepts_a_field_with_no_surrounding_whitespace(
+    _db: Session, _seeded_task: int
+) -> None:
+    values = _values([_interaction(field="a")])
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_reports_a_blank_field_as_blank_not_as_duplicated(
+    _db: Session, _seeded_task: int
+) -> None:
+    """Two blank fields would also be equal to each other, so the blank
+    check has to run before the duplicate check reaches them -- otherwise
+    the caller learns "duplicated" for a payload whose real problem is that
+    neither interaction names a field at all."""
+
+    values = _values([_interaction(field=""), _interaction(field="", label="Second")])
+    parsed = svc.parse_v1_request_payload(values)
+    with pytest.raises(ValueError) as excinfo:
+        svc.validate_v1_write_payload(parsed)
+    assert "field is blank" in str(excinfo.value)
+    assert "is duplicated" not in str(excinfo.value)
+
+
+def test_validate_rejects_duplicate_option_values_within_one_interaction(
+    _db: Session, _seeded_task: int
+) -> None:
+    values = _values(
+        [
+            _interaction(
+                type="select_one",
+                options=[
+                    {"label": "First", "value": "a"},
+                    {"label": "Second", "value": "a"},
+                ],
+            )
+        ]
+    )
+    parsed = svc.parse_v1_request_payload(values)
+    with pytest.raises(
+        ValueError, match=r"interactions\[0\]\.options\[1\]\.value 'a' is duplicated"
+    ):
+        svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_accepts_duplicate_option_labels(
+    _db: Session, _seeded_task: int
+) -> None:
+    """Labels may repeat -- the renderer resolves a submitted answer back to
+    an option by matching on value, so two options sharing a label are only
+    confusing to look at; the answer still names exactly one of them."""
+
+    values = _values(
+        [
+            _interaction(
+                type="select_one",
+                options=[
+                    {"label": "Same", "value": "a"},
+                    {"label": "Same", "value": "b"},
+                ],
+            )
+        ]
+    )
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_accepts_a_blank_interaction_label(
+    _db: Session, _seeded_task: int
+) -> None:
+    """This is the decision that a blank ``label`` is not refused, pinned
+    down: ``clarification-form.tsx`` renders ``interaction.label ||
+    interaction.field`` (line 492), so the field name stands in for a blank
+    label, and ``_normalize_ask_user_interactions`` (``react.py``) repairs a
+    blank ``field`` on every ``ask_user_question`` payload but never touches
+    ``label``, so a model that emits ``label=""`` reaches
+    ``build_clarification_payload`` with it. Refusing it would refuse a
+    shape the second producer really emits."""
+
+    values = _values([_interaction(label="")])
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_accepts_an_empty_accept_list_on_file_upload(
+    _db: Session, _seeded_task: int
+) -> None:
+    values = _values([_interaction(type="file_upload", field="doc", accept=[])])
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_accepts_min_and_max_on_a_non_number_type(
+    _db: Session, _seeded_task: int
+) -> None:
+    """Only number_input reads min/max; on every other type they are an
+    ignored hint, and the question still asks exactly what it asks, so the
+    min > max rule stays type-agnostic rather than being scoped to
+    number_input."""
+
+    values = _values([_interaction(type="text_input", min=1, max=5)])
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)
+
+
 def test_cv4_the_read_direction_parser_still_accepts_what_the_write_side_rejects(
     _db: Session, _seeded_task: int
 ) -> None:

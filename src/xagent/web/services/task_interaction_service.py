@@ -971,6 +971,29 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
     classifies a payload whose message is blank after filtering as
     ``NotApplicable("empty_question")`` and never offers it for writing.
 
+    Every rule here refuses something that makes the *answer* wrong or
+    unrecoverable, and nothing here refuses something that only makes the
+    *rendering* worse. Three shapes are deliberately accepted for that
+    reason, each of them a thing the render surface already handles and
+    none of them changing what answer comes back:
+
+    * A blank interaction-level ``label``. ``clarification-form.tsx``
+      renders ``interaction.label || interaction.field``, so the field name
+      stands in. Refusing it would also start refusing payloads the second
+      producer really emits: ``_normalize_ask_user_interactions``
+      (``react.py``), which every ``ask_user_question`` payload passes
+      through, repairs a blank ``field`` and never touches ``label``, so a
+      model that emits ``label=""`` reaches ``build_clarification_payload``
+      with it -- and losing the whole question to the legacy transcript is
+      a worse outcome than a label that reads as the field name.
+    * ``accept=[]`` on a ``file_upload``. It renders as ``accept=""``,
+      which is what the browser does with no restriction at all.
+    * ``min``/``max`` on a type that does not render them. Only
+      ``number_input`` reads the pair; on the other six they are an ignored
+      hint, and the question still asks exactly what it asks. The
+      ``min > max`` rule below stays type-agnostic for the same reason: it
+      refuses a range no answer can satisfy, wherever it appears.
+
     Answers are out of scope here and in every other function in this
     module. Until the answer-side field schema lands (issue #1368),
     everything downstream of an interaction row must treat
@@ -988,6 +1011,37 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
         where = f"request_payload.interactions[{index}]"
         if interaction.type not in _V1_INTERACTION_TYPES:
             raise ValueError(f"{where}.type {interaction.type!r} is not a v1 type")
+        # A blank field is refused for the same reason a duplicated one is,
+        # and not for the reason the rules above exist. The renderer copes
+        # with both: clarification-form.tsx substitutes ``response_{index}``
+        # for a blank or all-whitespace field and appends ``_{index}`` to a
+        # repeat, so neither one produces a form the user cannot complete.
+        # What neither substitution can fix is that the answer then arrives
+        # under a key the persisted question never named. Today nothing
+        # compares the two; the answer-side field schema (#1368) is what
+        # will, and it will compare against what is stored here. Refusing
+        # the write is the only point at which the stored key can still be
+        # made to be the key the answer will carry.
+        #
+        # Two checks, not one: blank (including all-whitespace) and
+        # surrounding whitespace on an otherwise non-blank field are both
+        # refused, for the same key-integrity reason -- ``" a "`` never
+        # equal-matches an answer keyed ``"a"``, so a stored field with
+        # leading or trailing whitespace is exactly as unmatchable against
+        # #1368 as a blank one. Stripped here only to test, not to
+        # normalize what gets stored: the model-facing producer
+        # (``_normalize_ask_user_interactions``, ``react.py``) already
+        # trims a field and substitutes for a blank one before it ever
+        # reaches this validator -- on both the single-tool
+        # ``ask_user_question`` path and the multi-tool waiting path,
+        # whose own dedup loop only appends a numeric suffix to an
+        # already-trimmed base -- so a well-formed field arrives here
+        # pre-trimmed and this pair of checks costs that producer nothing;
+        # they exist for whatever reaches this write side some other way.
+        if not interaction.field.strip():
+            raise ValueError(f"{where}.field is blank")
+        if interaction.field != interaction.field.strip():
+            raise ValueError(f"{where}.field carries surrounding whitespace")
         if interaction.field in seen_fields:
             raise ValueError(f"{where}.field {interaction.field!r} is duplicated")
         seen_fields.add(interaction.field)
@@ -1012,6 +1066,21 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
                 raise ValueError(
                     f"{where}.options[{option_index}] has a blank label or value"
                 )
+        # Values, not labels: the renderer resolves a submitted answer back
+        # to an option by matching on ``value`` and taking the first hit
+        # (clarification-form.tsx's ``options.find(o => o.value === value)``,
+        # used by select_one, select_multiple and action_cards alike), so two
+        # options sharing a value make the answer unable to say which of them
+        # was chosen. Two options sharing a label are merely confusing to
+        # look at; the answer still names exactly one of them.
+        seen_option_values: set[str] = set()
+        for option_index, option in enumerate(interaction.options or ()):
+            if option.value in seen_option_values:
+                raise ValueError(
+                    f"{where}.options[{option_index}].value "
+                    f"{option.value!r} is duplicated"
+                )
+            seen_option_values.add(option.value)
         if (
             interaction.min is not None
             and interaction.max is not None
