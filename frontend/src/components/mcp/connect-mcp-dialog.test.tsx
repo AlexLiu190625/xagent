@@ -2195,7 +2195,8 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
 
     // The status request must actually have been issued -- a pure negative
     // here would also pass if the fixture lost its server_id or the route
-    // was never called.
+    // was never called. This is the only case in this test, so a match here
+    // can only come from this test's own mock.
     await waitFor(() => {
       expect(apiRequestMock).toHaveBeenCalledWith(
         "http://api.local/api/connectors/status",
@@ -2207,12 +2208,14 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     expect(card.queryByText("tools.mcp.sharing.private")).toBeNull()
     expect(card.queryByText("tools.mcp.sharing.shared")).toBeNull()
     expect(card.queryByText("tools.mcp.sharing.teamTool")).toBeNull()
+  })
 
-    // Same withholding when the route answers 200 but the payload for this
-    // ref is malformed (needs_config is not a boolean) -- distinct from the
-    // non-ok case above, and the one that actually depends on the merge
-    // going through sanitizeConnectorStatus rather than a raw cast.
-    cleanup()
+  it("withholds the ownership badge when the sharing route answers with a malformed entry (#1623)", async () => {
+    // Distinct from the non-ok case above, and the one that actually depends
+    // on the merge going through sanitizeConnectorStatus rather than a raw
+    // cast: needs_config is not a boolean, so the whole entry must be
+    // dropped, not just the one field.
+    useAuthMock.mockReturnValue({ token: "token", inTeam: true })
     apiRequestMock.mockImplementation((url: string) => {
       if (url.includes("/api/mcp/apps?")) {
         return Promise.resolve({ ok: true, json: async () => [hookResolvedCustomMcp()] })
@@ -2228,6 +2231,10 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
 
     renderDialog()
     await screen.findByText("Records MCP")
+
+    // Own test, own mock, own call history (this file's beforeEach resets
+    // apiRequestMock before every test) -- so this can only be satisfied by
+    // the request this test's own render issued.
     await waitFor(() => {
       expect(apiRequestMock).toHaveBeenCalledWith(
         "http://api.local/api/connectors/status",
@@ -2235,10 +2242,10 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
       )
     })
 
-    const cardAfterMalformedAnswer = within(screen.getByTestId("connector-card-records"))
-    expect(cardAfterMalformedAnswer.queryByText("tools.mcp.sharing.private")).toBeNull()
-    expect(cardAfterMalformedAnswer.queryByText("tools.mcp.sharing.shared")).toBeNull()
-    expect(cardAfterMalformedAnswer.queryByText("tools.mcp.sharing.teamTool")).toBeNull()
+    const card = within(screen.getByTestId("connector-card-records"))
+    expect(card.queryByText("tools.mcp.sharing.private")).toBeNull()
+    expect(card.queryByText("tools.mcp.sharing.shared")).toBeNull()
+    expect(card.queryByText("tools.mcp.sharing.teamTool")).toBeNull()
   })
 
   it("shows no ownership badge for a listing entry carrying shared but no connector id (#1623)", async () => {
