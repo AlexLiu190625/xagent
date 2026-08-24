@@ -158,15 +158,41 @@ describe("ToolsPage official settings dialog ownership badge (#1623)", () => {
       dialog = screen.getByRole("dialog")
     })
     expect(within(dialog!).getByText("tools.mcp.sharing.shared")).toBeInTheDocument()
+    // Spreading the sanitized status onto this entry has a second consumer
+    // besides the badge: the share-toggle button reads app.shared to decide
+    // its own label and the direction it POSTs (handleToggleShare's share
+    // argument is !app.shared). Before this change app.shared was always
+    // undefined here, so this button read "Share" even for an
+    // already-shared connector -- pinning the correct "Unshare" direction.
+    expect(
+      within(dialog!).getByRole("button", { name: "tools.mcp.sharing.unshare" }),
+    ).toBeInTheDocument()
+  })
+
+  it("shows the private label and the share direction for an unshared server", async () => {
+    installApiMock({ "mcp:9": { shared: false, is_owner: true, needs_config: false } })
+    await renderPage()
+
+    fireEvent.click(screen.getByText("Records MCP"))
+
+    let dialog: HTMLElement
+    await waitFor(() => {
+      dialog = screen.getByRole("dialog")
+    })
+    expect(within(dialog!).getByText("tools.mcp.sharing.private")).toBeInTheDocument()
+    expect(
+      within(dialog!).getByRole("button", { name: "tools.mcp.sharing.share" }),
+    ).toBeInTheDocument()
   })
 
   it("shows no ownership label when the sharing status is malformed", async () => {
     // shared is not a boolean. is_owner: true and needs_config: false keep
-    // the card's own (unsanitized, F1 sub-decision a) isNonOwnedTeamTool
-    // check reading this as the viewer's own tool (card stays clickable) and
-    // keep the badge div's needs_config suffix from ever appending -- both
-    // deliberate, so this isolates the assertion to the dialog's sanitized
-    // lookup, which must reject the whole entry and withhold its badge.
+    // the card's own isNonOwnedTeamTool check (which reads the raw status
+    // and is deliberately left alone by this change) reading this as the
+    // viewer's own tool, so the card stays clickable, and keep the badge
+    // div's needs_config suffix from ever appending -- both deliberate, so
+    // this isolates the assertion to the dialog's sanitized lookup, which
+    // must reject the whole entry and withhold its badge.
     installApiMock({ "mcp:9": { shared: "yes", is_owner: true, needs_config: false } })
     await renderPage()
 
