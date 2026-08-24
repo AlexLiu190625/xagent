@@ -44,6 +44,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
 from tests.web.services.task_interaction_schema_shared import (
+    anchor_event_id,
     make_row,
     make_trace_event,
     row_state,
@@ -221,7 +222,7 @@ def _stage_a_replacement_question_the_way_a_resumed_agent_would(
         run_id=run_id,
         anchor=InteractionAnchor(
             trace_event_id=anchor_id,
-            resume_event_id="resume-event-1",
+            resume_event_id=anchor_event_id(db, anchor_id),
             resume_execution_id="resume-exec-1",
             resume_run_partition=run_id,
         ),
@@ -252,7 +253,7 @@ def _stage_a_replacement_question_the_way_a_resumed_agent_would(
         run_id=run_id,
         anchor=InteractionAnchor(
             trace_event_id=anchor_id,
-            resume_event_id="resume-event-1",
+            resume_event_id=anchor_event_id(db, anchor_id),
             resume_execution_id="resume-exec-1",
             resume_run_partition=run_id,
         ),
