@@ -2153,6 +2153,118 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     within(screen.getByTestId("connector-card-records")).getByTestId("connected-check")
   })
 
+  it("shows the team-ownership badge for a hook-resolved connector that lists as unconnected (#1623)", async () => {
+    useAuthMock.mockReturnValue({ token: "token", inTeam: true })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [hookResolvedCustomMcp()] })
+      }
+      if (url.endsWith("/api/connectors/status")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ "mcp:9": { shared: true, is_owner: false, needs_config: false } }),
+        })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+    await screen.findByText("Records MCP")
+
+    await waitFor(() => {
+      within(screen.getByTestId("connector-card-records")).getByText(
+        "tools.mcp.sharing.teamTool",
+      )
+    })
+  })
+
+  it("withholds the ownership badge when the sharing route does not answer for an entry (#1623)", async () => {
+    useAuthMock.mockReturnValue({ token: "token", inTeam: true })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [hookResolvedCustomMcp()] })
+      }
+      if (url.endsWith("/api/connectors/status")) {
+        return Promise.resolve({ ok: false, status: 500, json: async () => ({}) })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+    await screen.findByText("Records MCP")
+
+    // The status request must actually have been issued -- a pure negative
+    // here would also pass if the fixture lost its server_id or the route
+    // was never called.
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/connectors/status",
+        expect.objectContaining({ method: "POST" }),
+      )
+    })
+
+    const card = within(screen.getByTestId("connector-card-records"))
+    expect(card.queryByText("tools.mcp.sharing.private")).toBeNull()
+    expect(card.queryByText("tools.mcp.sharing.shared")).toBeNull()
+    expect(card.queryByText("tools.mcp.sharing.teamTool")).toBeNull()
+
+    // Same withholding when the route answers 200 but the payload for this
+    // ref is malformed (needs_config is not a boolean) -- distinct from the
+    // non-ok case above, and the one that actually depends on the merge
+    // going through sanitizeConnectorStatus rather than a raw cast.
+    cleanup()
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [hookResolvedCustomMcp()] })
+      }
+      if (url.endsWith("/api/connectors/status")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ "mcp:9": { shared: true, is_owner: false, needs_config: "no" } }),
+        })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+    await screen.findByText("Records MCP")
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/connectors/status",
+        expect.objectContaining({ method: "POST" }),
+      )
+    })
+
+    const cardAfterMalformedAnswer = within(screen.getByTestId("connector-card-records"))
+    expect(cardAfterMalformedAnswer.queryByText("tools.mcp.sharing.private")).toBeNull()
+    expect(cardAfterMalformedAnswer.queryByText("tools.mcp.sharing.shared")).toBeNull()
+    expect(cardAfterMalformedAnswer.queryByText("tools.mcp.sharing.teamTool")).toBeNull()
+  })
+
+  it("shows no ownership badge for a listing entry carrying shared but no connector id (#1623)", async () => {
+    useAuthMock.mockReturnValue({ token: "token", inTeam: true })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => [{ ...mcpOauthApp(), shared: true, is_owner: false }],
+        })
+      }
+      if (url.endsWith("/api/connectors/status")) {
+        return Promise.resolve({ ok: true, json: async () => ({}) })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+    await screen.findByText("Granola")
+
+    const card = within(screen.getByTestId("connector-card-granola"))
+    expect(card.queryByText("tools.mcp.sharing.private")).toBeNull()
+    expect(card.queryByText("tools.mcp.sharing.shared")).toBeNull()
+    expect(card.queryByText("tools.mcp.sharing.teamTool")).toBeNull()
+  })
+
   it("offers Authorize, and refuses selection, for a connector whose consent was never started (#1323)", async () => {
     // The fail-early half of #1347: attaching this connector would load zero
     // tools, so the card is not selectable -- but the flow repaired in #1323
