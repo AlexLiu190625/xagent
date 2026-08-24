@@ -7,8 +7,11 @@ retries the downstream call on its own.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
+import httpx
+import openai
 import pytest
 
 from xagent.core.context_ref import CONTEXT_REFS_KEY, ContextReference
@@ -493,11 +496,27 @@ _MANDATORY_REASONING_ONLY = (
 )
 
 
-def _sandwiched_openrouter_llm(mocker, *, side_effect, max_retries: int):
+def _sandwiched_openrouter_llm(
+    mocker,
+    *,
+    side_effect,
+    max_retries: int,
+    model_name: str = "z-ai/glm-5.2",
+):
     """RouterLLM wired to create_retry_wrapper(OpenRouterLLM), matching how
-    adapter.py wraps a resolved downstream model in production."""
-    inner = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
-    mocker.patch.object(inner, "_chat_with_prefix_retry", side_effect=side_effect)
+    adapter.py wraps a resolved downstream model in production.
+
+    The OpenAI client itself is mocked (not ``_chat_with_prefix_retry``), so
+    ``mock_client.chat.completions.create.await_count`` reflects the real
+    number of upstream requests OpenRouterLLM actually issues.
+    """
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = side_effect
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    inner = OpenRouterLLM(model_name=model_name, api_key="test-key")
     wrapped = create_retry_wrapper(
         inner,
         BaseLLM,  # type: ignore[type-abstract]
@@ -507,7 +526,7 @@ def _sandwiched_openrouter_llm(mocker, *, side_effect, max_retries: int):
         retry_on=retry_on,
     )
     router = RouterLLM(downstream_resolver=lambda _model_id: wrapped)
-    return router
+    return router, mock_client
 
 
 @pytest.mark.asyncio
@@ -519,15 +538,11 @@ async def test_sandwiched_pure_404_bounds_total_upstream_calls(monkeypatch, mock
     longer a strict value), so the compat retry gives up with a plain
     RuntimeError that create_retry_wrapper's retry_on() does not retry.
     """
-    calls = 0
-
-    async def fake_inner(messages, **kwargs):
-        nonlocal calls
-        del messages, kwargs
-        calls += 1
-        raise RuntimeError(_PURE_TOOL_CHOICE_404)
-
-    router = _sandwiched_openrouter_llm(mocker, side_effect=fake_inner, max_retries=2)
+    router, mock_client = _sandwiched_openrouter_llm(
+        mocker,
+        side_effect=RuntimeError(_PURE_TOOL_CHOICE_404),
+        max_retries=2,
+    )
     monkeypatch.setattr(router, "_select_model", _select_glm)
 
     with pytest.raises(RuntimeError, match="No endpoints found"):
@@ -539,7 +554,7 @@ async def test_sandwiched_pure_404_bounds_total_upstream_calls(monkeypatch, mock
 
     # Upper bound, not the exact value: 1 original + at most 3 compat
     # adjustments (one per rule) is this layer's per-call ceiling.
-    assert calls <= 4
+    assert mock_client.chat.completions.create.await_count <= 4
 
 
 @pytest.mark.asyncio
@@ -552,9 +567,9 @@ async def test_sandwiched_alternating_errors_bounds_total_upstream_calls(
     """
     calls = 0
 
-    async def fake_inner(messages, **kwargs):
+    def fake_create(*_args, **kwargs):
         nonlocal calls
-        del messages, kwargs
+        del kwargs
         calls += 1
         position = (calls - 1) % 4
         if position == 0:
@@ -573,8 +588,8 @@ async def test_sandwiched_alternating_errors_bounds_total_upstream_calls(
         )
 
     wrapper_budget = 2
-    router = _sandwiched_openrouter_llm(
-        mocker, side_effect=fake_inner, max_retries=wrapper_budget
+    router, mock_client = _sandwiched_openrouter_llm(
+        mocker, side_effect=fake_create, max_retries=wrapper_budget
     )
     monkeypatch.setattr(router, "_select_model", _select_glm)
 
@@ -586,4 +601,112 @@ async def test_sandwiched_alternating_errors_bounds_total_upstream_calls(
             thinking={"type": "enabled", "enable": True},
         )
 
-    assert calls <= wrapper_budget * 4
+    assert mock_client.chat.completions.create.await_count <= wrapper_budget * 4
+
+
+def _deepseek_prefix_error() -> openai.BadRequestError:
+    return openai.BadRequestError(
+        "Error code: 400 - {'error': {'message': 'Provider returned error'}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://openrouter.ai/api/v1/chat/completions"
+            ),
+        ),
+        body={
+            "error": {
+                "message": "Provider returned error",
+                "code": 400,
+                "metadata": {
+                    "provider_name": "DeepSeek",
+                    "raw": (
+                        '{"error":{"message":'
+                        '"Function call should not be used with prefix"}}'
+                    ),
+                },
+            }
+        },
+    )
+
+
+def _deepseek_tool_call_history() -> list[dict]:
+    return [
+        {"role": "user", "content": "Generate music"},
+        {
+            "role": "assistant",
+            "content": "I will generate the music first.",
+            "tool_calls": [
+                {
+                    "id": "call_music",
+                    "type": "function",
+                    "function": {
+                        "name": "generate_music",
+                        "arguments": '{"prompt":"intro"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_music", "content": '{"success":true}'},
+    ]
+
+
+async def _select_deepseek(_prompt: str) -> str:
+    return "deepseek/deepseek-v4-flash"
+
+
+@pytest.mark.asyncio
+async def test_sandwiched_deepseek_prefix_sanitizes_messages_once(monkeypatch, mocker):
+    """A DeepSeek prefix rejection sanitizes messages once per call, not once
+    per compat iteration.
+
+    Before the out-param fix, ``_run_chat_with_compat_retry`` replayed the
+    same unsanitized messages on every compat iteration, so a DeepSeek model
+    chaining a prefix rejection with a compat-adjustable error re-triggered
+    the prefix rejection (and its sanitize-and-retry) on every iteration
+    too, doubling the real upstream call count. With the fix, the sanitized
+    messages from the first iteration carry over, so the prefix rejection
+    only ever fires once and the total call count stays bounded.
+    """
+    calls = 0
+    prefix_error_count = 0
+    post_sanitize_calls = 0
+    success_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="ok", tool_calls=None, reasoning_content=None
+                )
+            )
+        ],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-sandwiched-deepseek"},
+    )
+
+    def fake_create(*_args, **kwargs):
+        nonlocal calls, prefix_error_count, post_sanitize_calls
+        calls += 1
+        messages = kwargs["messages"]
+        assistant_message = next(
+            message for message in messages if message.get("tool_calls")
+        )
+        if assistant_message.get("content"):
+            prefix_error_count += 1
+            raise _deepseek_prefix_error()
+        post_sanitize_calls += 1
+        if post_sanitize_calls == 1:
+            raise RuntimeError(_MANDATORY_REASONING_ONLY)
+        return success_response
+
+    router, mock_client = _sandwiched_openrouter_llm(
+        mocker,
+        side_effect=fake_create,
+        max_retries=2,
+        model_name="deepseek/deepseek-v4-flash",
+    )
+    monkeypatch.setattr(router, "_select_model", _select_deepseek)
+
+    result = await router.chat(_deepseek_tool_call_history())
+
+    assert result["content"] == "ok"
+    assert prefix_error_count == 1
+    assert mock_client.chat.completions.create.await_count <= 5

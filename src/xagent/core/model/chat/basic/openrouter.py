@@ -2,6 +2,7 @@ import logging
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from .....config import get_openrouter_official_providers_only
+from ..error import retry_on
 from ..exceptions import LLMRetryableError, LLMToolProtocolError
 from ..timeout_config import TimeoutConfig
 from ..tool_protocol import TOOL_PROTOCOL_ERROR_KEY, get_tool_protocol_error
@@ -337,6 +338,7 @@ class OpenRouterLLM(OpenAILLM):
             thinking=thinking,
             output_config=output_config,
             kwargs=kwargs,
+            sanitize_messages=True,
         )
 
         if not self._uses_deepseek_tool_protocol:
@@ -384,8 +386,17 @@ class OpenRouterLLM(OpenAILLM):
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
         output_config: Optional[Dict[str, Any]] = None,
+        sanitized_out: Optional[List[List[Dict[str, Any]]]] = None,
         **kwargs: Any,
     ) -> Any:
+        """Send ``messages``, retrying once with DeepSeek's prefix stripped.
+
+        ``sanitized_out``, when given, receives the sanitized message list at
+        the moment a prefix retry fires, so a caller looping over repeated
+        provider-compat errors (see ``_run_chat_with_compat_retry``) can reuse
+        the already-sanitized messages instead of re-triggering this same
+        prefix rejection on every iteration.
+        """
         try:
             response = await super().chat(
                 messages=messages,
@@ -404,6 +415,9 @@ class OpenRouterLLM(OpenAILLM):
             )
             if sanitized_messages is None:
                 raise
+
+            if sanitized_out is not None:
+                sanitized_out.append(sanitized_messages)
 
             logger.info(
                 "OpenRouter DeepSeek rejected function-call history with an "
@@ -436,23 +450,37 @@ class OpenRouterLLM(OpenAILLM):
         thinking: Optional[Dict[str, Any]],
         output_config: Optional[Dict[str, Any]],
         kwargs: Dict[str, Any],
+        sanitize_messages: bool = False,
     ) -> Any:
         """Retry ``call`` once per matching OpenRouter provider-compat rule.
 
-        Shared by ``chat`` (wrapping ``_chat_with_prefix_retry``) and
-        ``vision_chat`` (wrapping the inherited ``OpenAILLM.vision_chat``
-        directly). A retryable error raised by the inner call (e.g. the
-        DeepSeek tool-protocol error surfaced after prefix retry) is left for
-        the shared LLM retry wrapper and is never treated as a compat
-        adjustment opportunity.
+        Shared by ``chat`` (wrapping ``_chat_with_prefix_retry``, with
+        ``sanitize_messages=True``) and ``vision_chat`` (wrapping the
+        inherited ``OpenAILLM.vision_chat`` directly, which has no
+        ``sanitized_out`` parameter and must never receive one). A retryable
+        error raised by the inner call (e.g. the DeepSeek tool-protocol error
+        surfaced after prefix retry, or a wrapped 429/5xx recognized by
+        ``retry_on``) is left for the shared LLM retry wrapper and is never
+        treated as a compat adjustment opportunity.
+
+        Known limitation: ``OpenAILLM.chat``'s structured-output degrade path
+        can rewrite ``thinking`` internally (disabling it after a non-JSON
+        response) without reporting the change back here, so
+        ``current_thinking`` does not necessarily reflect what was actually
+        sent on that path. No caller in this repository currently passes
+        ``response_format`` into ``chat``, so this gap has no live caller
+        today.
         """
         current_tool_choice = tool_choice
         current_thinking = thinking
+        current_messages = messages
         attempted: set[str] = set()
 
         def render(candidate_thinking: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             return self._prepare_provider_reasoning_extra_body(
-                extra_body={},
+                extra_body=self._prepare_extra_body(
+                    dict(kwargs.get("extra_body") or {})
+                ),
                 thinking=candidate_thinking,
                 tools=tools,
                 response_format=response_format,
@@ -461,21 +489,27 @@ class OpenRouterLLM(OpenAILLM):
             )
 
         while True:
+            sanitized_out: List[List[Dict[str, Any]]] = []
+            call_kwargs: Dict[str, Any] = dict(
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=current_tool_choice,
+                response_format=response_format,
+                thinking=current_thinking,
+                output_config=output_config,
+                **kwargs,
+            )
+            if sanitize_messages:
+                call_kwargs["sanitized_out"] = sanitized_out
             try:
-                return await call(
-                    messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    tool_choice=current_tool_choice,
-                    response_format=response_format,
-                    thinking=current_thinking,
-                    output_config=output_config,
-                    **kwargs,
-                )
+                return await call(current_messages, **call_kwargs)
             except LLMRetryableError:
                 raise
             except RuntimeError as exc:
+                if retry_on(exc):
+                    raise
+
                 adjustment = _next_compat_adjustment(
                     exc,
                     tools=tools,
@@ -491,6 +525,8 @@ class OpenRouterLLM(OpenAILLM):
                     adjustment
                 )
                 attempted.add(action_key)
+                if sanitized_out:
+                    current_messages = sanitized_out[-1]
                 logger.info(log_message)
 
     async def _stream_chat_with_prefix_retry(
@@ -503,8 +539,15 @@ class OpenRouterLLM(OpenAILLM):
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
         output_config: Optional[Dict[str, Any]] = None,
+        sanitized_out: Optional[List[List[Dict[str, Any]]]] = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
+        """Streaming counterpart of ``_chat_with_prefix_retry``.
+
+        ``sanitized_out`` carries the same contract as the non-streaming
+        version: when the prefix retry fires, the sanitized messages are
+        appended to it so a caller looping over compat errors can reuse them.
+        """
         has_yielded = False
         try:
             async for chunk in super().stream_chat(
@@ -527,6 +570,9 @@ class OpenRouterLLM(OpenAILLM):
             )
             if has_yielded or sanitized_messages is None:
                 raise
+
+        if sanitized_out is not None:
+            sanitized_out.append(sanitized_messages)
 
         logger.info(
             "OpenRouter DeepSeek rejected streaming function-call history with an "
@@ -593,16 +639,23 @@ class OpenRouterLLM(OpenAILLM):
         DeepSeek dict-tool_choice path ``call`` (``_stream_chat_inner``)
         buffers chunks internally until the tool protocol is validated, so an
         inner chunk being produced is not the same thing as one having been
-        yielded from here.
+        yielded from here. ``call`` is always ``_stream_chat_inner``, which
+        forwards its ``**kwargs`` straight through to
+        ``_stream_chat_with_prefix_retry``, so the ``sanitized_out`` list
+        built here reaches that function's out-param without either function
+        needing to know about it explicitly.
         """
         has_yielded = False
         current_tool_choice = tool_choice
         current_thinking = thinking
+        current_messages = messages
         attempted: set[str] = set()
 
         def render(candidate_thinking: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             return self._prepare_provider_reasoning_extra_body(
-                extra_body={},
+                extra_body=self._prepare_extra_body(
+                    dict(kwargs.get("extra_body") or {})
+                ),
                 thinking=candidate_thinking,
                 tools=tools,
                 response_format=response_format,
@@ -611,9 +664,10 @@ class OpenRouterLLM(OpenAILLM):
             )
 
         while True:
+            sanitized_out: List[List[Dict[str, Any]]] = []
             try:
                 async for chunk in call(
-                    messages,
+                    current_messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     tools=tools,
@@ -621,6 +675,7 @@ class OpenRouterLLM(OpenAILLM):
                     response_format=response_format,
                     thinking=current_thinking,
                     output_config=output_config,
+                    sanitized_out=sanitized_out,
                     **kwargs,
                 ):
                     has_yielded = True
@@ -630,6 +685,8 @@ class OpenRouterLLM(OpenAILLM):
                 raise
             except RuntimeError as exc:
                 if has_yielded:
+                    raise
+                if retry_on(exc):
                     raise
 
                 adjustment = _next_compat_adjustment(
@@ -647,6 +704,8 @@ class OpenRouterLLM(OpenAILLM):
                     adjustment
                 )
                 attempted.add(action_key)
+                if sanitized_out:
+                    current_messages = sanitized_out[-1]
                 logger.info(log_message)
 
     async def _stream_chat_inner(
