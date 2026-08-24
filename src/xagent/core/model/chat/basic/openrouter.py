@@ -184,10 +184,7 @@ def _should_retry_without_thinking(
     # follow-up tracking issue lands.
     exc_msg = str(exc).lower()
     return (
-        (thinking is None or isinstance(thinking, dict))
-        and tool_choice is not None
-        and "thinking" in exc_msg
-        and "tool_choice" in exc_msg
+        tool_choice is not None and "thinking" in exc_msg and "tool_choice" in exc_msg
     )
 
 
@@ -222,20 +219,16 @@ def _next_compat_adjustment(
     Candidates are checked strictest-first (relax tool_choice, then disable
     thinking, then enable thinking) and tried in that written order: the
     first candidate whose predicate matches and would actually change the
-    rendered request wins. Order is the mechanism here, not a side detail --
-    this deliberately reverses the candidate order used by the predecessor
-    implementation this logic replaces. Pairing strictest-first with the
-    no-op skip below means that when a failure message matches more than one
-    predicate, every matching rule can still be tried in turn rather than the
-    first match blocking the rest; reordering the ``candidates`` tuple
-    changes which adjustment fires first and is not a safe refactor. A rule
-    that matches but would leave the actually rendered request unchanged
-    compared to the current ``(tool_choice, render(thinking))`` state is a
-    no-op and is skipped without spending its retry budget, so a rule that
-    cannot fix anything does not block a later rule that can. A rule whose
-    action was already attempted stops the search outright: the same shared
-    one-attempt-per-action budget this logic replaces (router.py's
-    ``attempted_retry_actions``) applies here too.
+    rendered request wins. Order is the mechanism here, not a side detail:
+    reordering the ``candidates`` tuple changes which adjustment fires first
+    and is not a safe refactor. A rule that matches but would leave the
+    actually rendered request unchanged compared to the current
+    ``(tool_choice, render(thinking))`` state is a no-op and is skipped
+    without spending its retry budget, so a rule that cannot fix anything
+    does not block a later rule that can. A rule whose action was already
+    attempted stops the search outright, even if a later, not-yet-attempted
+    rule would also match: one exhausted rule ends the whole search rather
+    than yielding to the next candidate.
     """
     current_state = (tool_choice, render(thinking))
     candidates: tuple[
@@ -348,6 +341,14 @@ class OpenRouterLLM(OpenAILLM):
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
+        """Send a chat completion through OpenRouter.
+
+        Applies DeepSeek-specific request shaping and DeepSeek tool-protocol
+        handling, plus OpenRouter provider-compatibility retries: a retry may
+        relax a strict ``tool_choice`` down to ``"auto"``, or flip
+        ``thinking`` between enabled and disabled, each adjustment at most
+        once per call (see ``_next_compat_adjustment``).
+        """
         if self._uses_deepseek_tool_protocol:
             tool_choice = _force_single_required_deepseek_tool(tools, tool_choice)
         response = await self._run_chat_with_compat_retry(
@@ -384,6 +385,15 @@ class OpenRouterLLM(OpenAILLM):
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
+        """Send a vision-capable chat completion through OpenRouter.
+
+        Applies the same OpenRouter provider-compatibility retries as
+        ``chat``: a retry may relax a strict ``tool_choice`` down to
+        ``"auto"``, or flip ``thinking`` between enabled and disabled, each
+        adjustment at most once per call. Unlike ``chat``, this skips
+        DeepSeek prefix retries and DeepSeek tool-protocol handling entirely
+        (see the comment below).
+        """
         # Vision requests carry no DeepSeek prefix-retry need, so the inner
         # call goes straight to the OpenAI implementation. This also skips
         # chat()'s DeepSeek tool-protocol handling (_force_single_required_
@@ -491,24 +501,57 @@ class OpenRouterLLM(OpenAILLM):
         5xx error that ``retry_on`` recognizes via ``__cause__``) is left for
         the shared LLM retry wrapper and is never treated as a compat
         adjustment opportunity. A single ``call`` invocation may itself issue
-        up to one additional upstream request: the response_format
-        pop-and-retry path in ``OpenAILLM.chat`` and ``vision_chat`` (both
-        served by this helper) can resend once internally before returning or
-        raising.
+        one additional upstream request through the response_format
+        pop-and-retry path shared by ``OpenAILLM.chat`` and ``vision_chat``,
+        but the two behave differently on a successful resend: ``chat``'s
+        branch returns the processed result of the resent call, or lets that
+        second call's failure propagate uncaught; ``vision_chat``'s
+        same-named branch does neither on a successful resend -- it falls
+        out of the ``except`` block with no ``return`` statement, so the
+        call implicitly yields ``None`` instead of the resent response
+        (tracked by #1650). No caller in this repository currently passes
+        ``response_format`` into ``chat``; the one caller that does supply
+        it in this repository (``vision_tool.py``) calls ``vision_chat``.
 
         Known limitation: ``OpenAILLM.chat``'s structured-output degrade path
         can rewrite ``thinking`` internally (disabling it after a non-JSON
         response) without reporting the change back here, so
         ``current_thinking`` does not necessarily reflect what was actually
-        sent on that path. No caller in this repository currently passes
-        ``response_format`` into ``chat``, so this gap has no live caller
-        today.
+        sent on that path.
+
+        Upstream request bounds for one logical call (one ``chat``/
+        ``vision_chat`` invocation, i.e. one attempt as seen by the
+        per-model ``RetryWrapper`` around this class): the compat-retry loop
+        below tries the initial request plus at most one attempt per
+        distinct action (``relax_tool_choice``, ``disable_thinking``,
+        ``enable_thinking``), so at most 4 requests come from this loop
+        itself. Without ``response_format``, ``chat``'s ``call`` adds at
+        most 1 more request in total (not per loop iteration) from
+        ``_chat_with_prefix_retry``'s DeepSeek function-call-prefix resend,
+        since the sanitized messages carry forward into later iterations
+        instead of re-triggering the same prefix rejection -- at most 5
+        upstream requests per logical call. With ``response_format``
+        supplied (``vision_chat`` today), the inner pop-and-retry can instead
+        fire independently on every one of the up to 4 loop iterations,
+        since each iteration's ``tool_choice``/``thinking`` differs -- at
+        most 8 upstream requests per logical call. Under
+        ``ModelConfig.max_retries``'s default outer budget of 10 attempts, a
+        run whose errors keep alternating between a compat-fixable shape and
+        an outer-retryable one can reach at most 50 upstream requests without
+        ``response_format`` or 80 with it.
         """
         current_tool_choice = tool_choice
         current_thinking = thinking
         current_messages = messages
         attempted: set[str] = set()
 
+        # ``render`` only models extra_body. Thinking also reaches the request
+        # through ``_build_request_messages(messages, thinking=...)``, which
+        # ``render`` never sees; that second path is a no-op today only because
+        # this class's MRO resolves to ``OpenAILLM._prepare_messages_for_request``
+        # (ignores ``thinking``), not ``DeepSeekLLM``'s rewrite. If a class on
+        # this MRO ever starts consuming ``thinking`` there, this no-op
+        # comparison must model the message body too, not just extra_body.
         def render(candidate_thinking: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             return self._prepare_provider_reasoning_extra_body(
                 extra_body=self._prepare_extra_body(
@@ -636,6 +679,16 @@ class OpenRouterLLM(OpenAILLM):
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
+        """Stream a chat completion through OpenRouter.
+
+        Applies the same OpenRouter provider-compatibility retries as
+        ``chat``: a retry may relax a strict ``tool_choice`` down to
+        ``"auto"``, or flip ``thinking`` between enabled and disabled, each
+        adjustment at most once per call. Once the first chunk has been
+        yielded to the caller, no further compat retry happens: a later
+        error on that same stream is raised as-is, since replaying it would
+        duplicate output already sent.
+        """
         async for chunk in self._run_stream_chat_with_compat_retry(
             self._stream_chat_inner,
             messages,
@@ -684,6 +737,9 @@ class OpenRouterLLM(OpenAILLM):
         current_messages = messages
         attempted: set[str] = set()
 
+        # ``render`` only models extra_body, not the thinking that also flows
+        # into ``_build_request_messages``'s messages -- see the ``render``
+        # closure in ``_run_chat_with_compat_retry`` for why that is safe today.
         def render(candidate_thinking: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             return self._prepare_provider_reasoning_extra_body(
                 extra_body=self._prepare_extra_body(
