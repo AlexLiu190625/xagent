@@ -52,3 +52,31 @@ export const sanitizeAppIntegrations = (value: unknown): AppIntegration[] => {
       typeof item.icon === "string",
   )
 }
+
+export interface ConnectorStatus {
+  shared: boolean
+  is_owner: boolean
+  needs_config: boolean
+}
+
+export const sanitizeConnectorStatusEntry = (value: unknown): ConnectorStatus | null => {
+  if (!isRecord(value)) return null
+  if (
+    typeof value.shared !== "boolean" ||
+    typeof value.is_owner !== "boolean" ||
+    typeof value.needs_config !== "boolean"
+  ) {
+    return null
+  }
+  return { shared: value.shared, is_owner: value.is_owner, needs_config: value.needs_config }
+}
+
+export const sanitizeConnectorStatus = (value: unknown): Record<string, ConnectorStatus> => {
+  if (!isRecord(value)) return {}
+  const result: Record<string, ConnectorStatus> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    const sanitized = sanitizeConnectorStatusEntry(entry)
+    if (sanitized) result[key] = sanitized
+  }
+  return result
+}
