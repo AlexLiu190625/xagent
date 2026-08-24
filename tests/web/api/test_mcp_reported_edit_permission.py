@@ -178,13 +178,28 @@ class TestReportedEditPermissionConsistencyMcp:
                 ConnectorAccess(team_owned=True, can_edit=False),
                 False,
             ),
+            (
+                # The admin bypass in _check_mcp_permission wins even over a
+                # verdict that itself denies edit -- this is the one
+                # population where the two connector kinds genuinely
+                # diverge (Custom API's own gate has no admin bypass at
+                # all), so it is pinned per kind, not by cross-kind equality.
+                "platform_admin",
+                ConnectorAccess(team_owned=True, can_edit=False),
+                False,
+            ),
         ],
     )
     async def test_can_edit_global_agrees_across_list_get_put_and_toggle(
         self, db, population, access_answer, has_personal_row
     ):
         owner = _make_user(db, 10)
-        caller = owner if population == "owner" else _make_user(db, 11)
+        if population == "owner":
+            caller = owner
+        elif population == "platform_admin":
+            caller = _make_user(db, 12, is_admin=True)
+        else:
+            caller = _make_user(db, 11)
         server = _make_owned_server(db, owner.id, name=f"consistency-mcp-{population}")
         server_id = server.id
 
@@ -199,7 +214,7 @@ class TestReportedEditPermissionConsistencyMcp:
             )
             db.commit()
 
-        expected = population == "owner" or bool(
+        expected = population in ("owner", "platform_admin") or bool(
             access_answer is not None and access_answer.can_edit
         )
 
@@ -252,13 +267,27 @@ class TestReportedEditPermissionConsistencyCustomApi:
                 "stand_in_denying_edit",
                 ConnectorAccess(team_owned=True, can_edit=False),
             ),
+            (
+                # Unlike the MCP kind, update_custom_api's own gate has no
+                # admin bypass at all -- so a platform admin with no
+                # personal row and a denying verdict is refused just like
+                # any other caller, and the list must agree by reporting
+                # False, not by copying MCP's True.
+                "platform_admin",
+                ConnectorAccess(team_owned=True, can_edit=False),
+            ),
         ],
     )
     async def test_list_can_edit_global_agrees_with_whether_put_actually_succeeds(
         self, db, population, access_answer
     ):
         owner = _make_user(db, 20)
-        caller = owner if population == "owner" else _make_user(db, 21)
+        if population == "owner":
+            caller = owner
+        elif population == "platform_admin":
+            caller = _make_user(db, 22, is_admin=True)
+        else:
+            caller = _make_user(db, 21)
         api = _make_owned_api(db, owner.id, name=f"consistency-api-{population}")
         api_id = api.id
 
@@ -300,6 +329,14 @@ class TestReportedEditPermissionConsistencyCustomApi:
                 put_succeeded = False
 
         assert list_entry.can_edit_global == put_succeeded
+        if population == "platform_admin":
+            # Pinned by value, not only by cross-surface agreement: a
+            # regression that adds an admin bypass to the list's formula
+            # alone would leave this False on one side and True on the
+            # other, which the equality assertion above already catches --
+            # this makes the intended, current answer explicit too.
+            assert list_entry.can_edit_global is False
+            assert put_succeeded is False
 
 
 class TestLocalCanConfigureWidening:
