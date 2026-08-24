@@ -1812,10 +1812,11 @@ async def _fast_path_snapshot_stream(
     the step content there and closes the same way, so no exit leaves
     the client with an already-started 200 response and no close frame.
     """
+    task_id = snapshot.task_id
     yield status_frame(snapshot.status.value)
     try:
         steps, snapshot_total_steps = await _fast_path_step_snapshot(
-            snapshot.task_id, principal, read_task_steps_response
+            task_id, principal, read_task_steps_response
         )
     except Exception as exc:
         # The conclusion goes out first -- see the docstring above -- so
@@ -1823,7 +1824,7 @@ async def _fast_path_snapshot_stream(
         # conclusion frame carries. No snapshot was confirmed here, so
         # the conclusion carries no truncation marker.
         yield build_conclusion(None)
-        yield _fast_path_steps_read_error_frame(exc, snapshot.task_id, path_name)
+        yield _fast_path_steps_read_error_frame(exc, task_id, path_name)
         return
     if steps:
         try:
@@ -1835,9 +1836,7 @@ async def _fast_path_snapshot_stream(
             # block above -- see the docstring for why a reread failure
             # gets the same treatment as a steps-read failure.
             yield build_conclusion(None)
-            yield _fast_path_generation_reread_error_frame(
-                exc, snapshot.task_id, path_name
-            )
+            yield _fast_path_generation_reread_error_frame(exc, task_id, path_name)
             return
         if changed:
             yield build_conclusion(None)
@@ -1860,7 +1859,7 @@ async def _fast_path_snapshot_stream(
             # ``BaseException``, so this handler cannot turn a client
             # disconnect into a close frame nobody reads.
             yield build_conclusion(None)
-            yield _fast_path_step_serialize_error_frame(snapshot.task_id, path_name)
+            yield _fast_path_step_serialize_error_frame(task_id, path_name)
             return
         yield step_frame
     yield build_conclusion(snapshot_total_steps)
