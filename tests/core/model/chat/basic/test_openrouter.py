@@ -1212,15 +1212,13 @@ def _bad_request_error(message: str) -> openai.BadRequestError:
 async def test_openrouter_direct_relaxes_tool_choice_after_bare_bad_request_error(
     mock_chat_completion, mocker
 ):
-    """A bare ``openai.BadRequestError`` must still reach the compat retry loop.
+    """The compat retry recovers when the response_format resend also 400s.
 
-    ``OpenAILLM.chat`` normally converts every ``openai.BadRequestError`` into
-    a ``RuntimeError`` before returning, but its response_format pop-and-retry
-    path (openai.py's ``except openai.BadRequestError`` block) re-issues the
-    request from inside that except clause: if the retried call also raises
-    ``openai.BadRequestError``, that second error is not wrapped by anything
-    and escapes as a bare SDK exception. The compat retry loop must catch it
-    the same way it catches the RuntimeError case, not just replay-fail.
+    ``OpenAILLM.chat`` converts every ``openai.BadRequestError`` into a
+    ``RuntimeError``, including a failure of its response_format pop-and-retry
+    resend, so the compat loop sees the wrapped form here. The loop's catch
+    tuple still includes the bare SDK exception as defense in depth for any
+    future base-client path that leaks one unwrapped.
     """
     mock_client = mocker.AsyncMock()
     mock_client.chat.completions.create.side_effect = [
@@ -1253,13 +1251,13 @@ async def test_openrouter_direct_relaxes_tool_choice_after_bare_bad_request_erro
 async def test_openrouter_vision_relaxes_tool_choice_after_bare_bad_request_error(
     mock_chat_completion, mocker
 ):
-    """The vision path recovers from the bare BadRequestError escape too.
+    """The vision path recovers when the response_format resend also 400s.
 
     ``vision_chat`` is the entrypoint with a live response_format producer in
-    this repository, so the escape guarded here is reachable in production:
-    ``OpenAILLM.vision_chat``'s pop-and-retry resend sits inside its own
-    ``except openai.BadRequestError`` block and a second failure escapes
-    unwrapped, exactly like ``chat``'s.
+    this repository, so this recovery is reachable in production. A failed
+    resend arrives here wrapped as ``RuntimeError`` by the base client; the
+    compat loop's catch tuple keeps the bare SDK exception as defense in
+    depth.
     """
     mock_client = mocker.AsyncMock()
     mock_client.chat.completions.create.side_effect = [
