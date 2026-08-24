@@ -3309,6 +3309,13 @@ async def test_fast_path_generation_change_withholds_steps_but_still_concludes(
     assert "event: step.completed" not in body
     assert body.count("event: stream.error") == 1
     assert "resync_required" in body
+    # The wording names what the fence actually knows -- a lifecycle
+    # write -- not a claim that a new run started: an intra-run write
+    # (a reply resume, a lease release) bumps state_version without
+    # touching run_id at all, and this leg's own ``run-id-moved`` case
+    # is the only one of the two that even could be a new run.
+    assert "The task changed while this attach was reading" in body
+    assert "moved to a new run" not in body
     # The conclusion precedes the error, same ordering as every other
     # failure exit on this path.
     assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")

@@ -1754,7 +1754,7 @@ def _fast_path_generation_reread_error_frame(
     if isinstance(exc, V1ApiError) and exc.code is V1ErrorCode.TASK_NOT_FOUND:
         return error_frame("task_deleted")
     logger.exception(
-        "v1 SSE %s fast-path generation reread failed for task %s; "
+        "v1 SSE %s fast-path staleness recheck failed for task %s; "
         "closing for resync instead of leaving the client with a bare "
         "disconnect and no close frame",
         path_name,
@@ -1903,7 +1903,9 @@ async def _fast_path_snapshot_stream(
     ran by then). A step-carrying attach that reaches this fence
     therefore costs two cursor queries when ``read_task_steps_version``
     is supplied -- the baseline and the recheck -- on top of the one
-    run_id/state_version reread it already paid; an attach whose steps
+    run_id/state_version reread it already paid, except when that
+    reread already confirmed a change, which short-circuits the
+    recheck; an attach whose steps
     turn out empty, or whose steps read fails, still pays for the
     baseline alone. A confirmed match on both signals sends the steps,
     then the conclusion. A confirmed change on either means the steps
@@ -1973,8 +1975,8 @@ async def _fast_path_snapshot_stream(
             yield error_frame(
                 "resync_required",
                 message=(
-                    "The task moved to a new run while this attach was "
-                    "reading its steps; call steps() to resync, then "
+                    "The task changed while this attach was reading "
+                    "its steps; call steps() to resync, then "
                     "re-attach."
                 ),
             )
