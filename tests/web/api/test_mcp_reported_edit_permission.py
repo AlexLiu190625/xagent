@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from xagent.web.api.custom_api import CustomApiUpdate, get_custom_api, update_custom_api
@@ -100,8 +100,11 @@ def _make_owned_api(db, owner_id: int, *, name: str = "shared-api") -> CustomApi
 class TestListEndpointAccessHookCallBudget:
     """The list endpoint calls the access hook zero times for an
     is_owner=True row, once for an is_owner=False row, and once for every
-    stand-in row -- pinned with a counting test double, not a query
-    listener."""
+    stand-in row -- pinned with a counting test double. Counting hook calls
+    alone would hide the query cost the gate helper and the per-row
+    definition lookups add, so a SQLAlchemy ``before_cursor_execute``
+    listener additionally pins the number of SQL statements the endpoint
+    issues for this exact population."""
 
     def test_hook_is_called_exactly_once_per_non_owner_row_and_never_for_owner_rows(
         self, db
@@ -136,6 +139,18 @@ class TestListEndpointAccessHookCallBudget:
             for i in range(2)
         ]
 
+        # Read every id the hooks below will need before the query listener
+        # attaches: the objects above were expired by their own setup
+        # commits (session default expire_on_commit=True), so reading
+        # .id for the first time inside the measured window would count as
+        # a query the *endpoint* issues, when it is really just this test's
+        # own setup catching up. caller.id specifically: get_mcp_servers
+        # reads current_user.id as its very first act.
+        _ = caller.id
+        owned_ids = {s.id for s in owned}
+        shared_personal_ids = {s.id for s in shared_personal}
+        stand_in_ids = {s.id for s in stand_in}
+
         calls: list[tuple[int, str, int]] = []
 
         def counting_access_hook(_db, user_id, connector_type, connector_id):
@@ -143,19 +158,42 @@ class TestListEndpointAccessHookCallBudget:
             return None
 
         def visibility_hook(_db, _user_id):
-            return {"mcp": {s.id for s in stand_in}, "custom_api": set()}
+            return {"mcp": set(stand_in_ids), "custom_api": set()}
 
-        with snapshot_connector_team_hooks():
-            set_connector_team_hooks(
-                access=counting_access_hook, visibility=visibility_hook
-            )
-            get_mcp_servers(current_user=caller, db=db)
+        queries: list[str] = []
+
+        def record_query(conn, cursor, statement, parameters, context, executemany):
+            del conn, cursor, parameters, context, executemany
+            queries.append(statement)
+
+        engine = db.get_bind()
+        event.listen(engine, "before_cursor_execute", record_query)
+        try:
+            with snapshot_connector_team_hooks():
+                set_connector_team_hooks(
+                    access=counting_access_hook, visibility=visibility_hook
+                )
+                get_mcp_servers(current_user=caller, db=db)
+        finally:
+            event.remove(engine, "before_cursor_execute", record_query)
 
         assert len(calls) == 3 + 2
         # Sanity: never called for an owned row's id.
         called_ids = {connector_id for _uid, _kind, connector_id in calls}
-        assert called_ids.isdisjoint({s.id for s in owned})
-        assert called_ids == {s.id for s in shared_personal} | {s.id for s in stand_in}
+        assert called_ids.isdisjoint(owned_ids)
+        assert called_ids == shared_personal_ids | stand_in_ids
+
+        # The hook-call count above cannot see the SQL the gate helper and
+        # the per-row definition lookups issue on top of it. Observed by
+        # running this exact population and reading the recorded
+        # statements, not derived from a formula: one query for the
+        # caller's own MCP rows (P + Q personal rows in one join), one for
+        # the OAuth-account lookup, one for the caller's own Custom API
+        # rows (none here), and one for the stand-in rows' MCPServer lookup
+        # (one statement, batched with an IN clause over both stand-in
+        # ids) -- 4 statements total for this population, none of them
+        # growing per row within P, Q or R.
+        assert len(queries) == 4, queries
 
 
 class TestReportedEditPermissionConsistencyMcp:
