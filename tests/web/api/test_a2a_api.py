@@ -953,12 +953,21 @@ def test_message_send_closes_the_legacy_resume_interaction_row_on_successful_inj
         db.close()
 
 
+# A fabricated id, not the seeded row's -- test_message_send_reads_the_
+# interaction_row_before_injecting hands this to the close instead of the
+# real row id, so a site that re-read the row at close time would hand the
+# close the real id and fail there instead.
+_OBSERVED_INTERACTION_ID = 4321
+
+
 def test_message_send_reads_the_interaction_row_before_injecting() -> None:
     """The close is keyed on the row observed *before* the injection,
     and only the ordering makes that true -- see task_interaction_close's
     module docstring. Moving the read after the injection leaves the whole
     change doing nothing while the row-level assertions in the test above
-    stay green."""
+    stay green. The observed value is a fabricated id, not the seeded row's,
+    so a site that re-read the row at close time would hand the close the
+    real id and fail here."""
 
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()
@@ -980,7 +989,11 @@ def test_message_send_reads_the_interaction_row_before_injecting() -> None:
         db.commit()
         db.refresh(task)
         task_id = int(task.id)
-        row_id = _seed_active_interaction_row(
+        # Kept real and distinct from _OBSERVED_INTERACTION_ID: a site that
+        # re-read the row at close time (instead of using the id observed
+        # before injection) would hand the close this real id and fail the
+        # assertion below.
+        _seed_active_interaction_row(
             db,
             task_id=task_id,
             run_id="run-close-order",
@@ -993,7 +1006,7 @@ def test_message_send_reads_the_interaction_row_before_injecting() -> None:
 
     def record_read(_task_id: int) -> int:
         order.append("read")
-        return row_id
+        return _OBSERVED_INTERACTION_ID
 
     async def record_injection(*_args: object, **_kwargs: object) -> bool:
         order.append("inject")
@@ -1011,6 +1024,9 @@ def test_message_send_reads_the_interaction_row_before_injecting() -> None:
             "xagent.web.api.a2a.active_interaction_id_sync",
             side_effect=record_read,
         ),
+        patch(
+            "xagent.web.api.a2a.close_legacy_resume_interaction", return_value=1
+        ) as close_mock,
     ):
         response = client.post(
             f"/api/a2a/agents/{agent_id}/message:send",
@@ -1028,6 +1044,10 @@ def test_message_send_reads_the_interaction_row_before_injecting() -> None:
 
     assert response.status_code == 200, response.text
     assert order == ["read", "inject"]
+    close_mock.assert_called_once()
+    assert close_mock.call_args.kwargs["task_id"] == task_id
+    assert close_mock.call_args.kwargs["run_id"] == "run-close-order"
+    assert close_mock.call_args.kwargs["interaction_id"] == _OBSERVED_INTERACTION_ID
 
 
 @pytest.mark.asyncio

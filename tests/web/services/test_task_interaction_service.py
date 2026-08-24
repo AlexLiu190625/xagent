@@ -907,6 +907,14 @@ _ABSENT_TASK_ID = 999999999
 # an admin and a guest load by id alone. That difference is what decides
 # which of the two "no row" outcomes each branch can return, so the table
 # below is the single place all of it is asserted.
+#
+# The guest branch's positive cell is not in this table: it needs a task
+# whose agent_config carries the widget binding, which this table's
+# _seeded_task fixture does not build. It lives in
+# test_ca1_guest_principal_is_authorized_on_its_own_task. The row below is
+# the negative half against a real existing row -- the branch whose
+# ownership check is a post-load Python predicate
+# (task_is_owned_by_public_principal) rather than a SQL filter.
 @pytest.mark.parametrize(
     ("make_principal", "task_exists", "expected"),
     [
@@ -947,6 +955,14 @@ _ABSENT_TASK_ID = 999999999
             False,
             svc.CreateUnavailable(reason="task_missing"),
             id="guest_on_an_absent_task",
+        ),
+        pytest.param(
+            lambda owner_id: _widget_workforce_guest_principal(
+                user_id=owner_id, workforce_id=9
+            ),
+            True,
+            svc.CreateUnauthorized(reason="not_task_principal"),
+            id="guest_on_an_existing_non_matching_task",
         ),
     ],
 )
@@ -1128,7 +1144,16 @@ def test_create_never_touches_staging_or_stages_a_row(
 ) -> None:
     """create() must not call stage_interaction_request -- confirmed here
     by asserting the table it would write to stays empty across a
-    successful (CreateNotWired) call."""
+    successful (CreateNotWired) call.
+
+    The principal here is a foreign admin, not the admin-with-no-user-id
+    this test used to carry: create() now rejects the latter before the
+    lookup, so it can no longer reach the staging seam this test is about.
+    That input did not lose its coverage -- it moved to
+    test_ca3_create_rejects_a_user_principal_carrying_no_user_id, whose four
+    cells (is_admin x task_exists) pin the rejection itself. What this test
+    still owns is the seam: a call that gets all the way to CreateNotWired
+    writes no interaction row."""
 
     task = _db.query(Task).filter(Task.id == _seeded_task).first()
     envelope = _valid_envelope()
@@ -2413,42 +2438,6 @@ def test_module_issues_zero_sa_text_calls() -> None:
     assert text_calls == []
 
 
-def test_no_production_module_outside_this_one_renders_a_responder_identity() -> None:
-    """``responder_identity`` values exist only where ``identity_string()``
-    is called, and every such call is in this module -- inside
-    ``respond()``, which the create/respond gate holds at zero production
-    callers.
-
-    That chain is what makes the fail-closed tightening in
-    ``identity_string()`` a no-op for today's behavior rather than a
-    change to it: no production path reaches the function at all, so no
-    caller can be relying on the ``"user:None"`` string it used to
-    produce. Written as a scan rather than as a behavior case because the
-    claim is about the absence of call sites, which no constructed call
-    can demonstrate.
-
-    Shares the blind spots of every AST scan over this package
-    (``interaction_static_scan_shared``): dynamic access, alias chains,
-    the ``scripts/`` tree, and use in value position are all invisible.
-    """
-
-    import ast
-
-    from tests.web.services.interaction_static_scan_shared import _scan_root
-
-    callers = []
-    for path in _scan_root("task_interaction_service"):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "identity_string"
-            ):
-                callers.append(f"{path.name}:{node.lineno}")
-    assert callers == []
-
-
 # ---------------------------------------------------------------------------
 # respond(): the answer-side entry point. respond() owns and retires its own
 # session (see its docstring), so every test below patches
@@ -3111,6 +3100,63 @@ def test_respond_rejects_a_guest_principal_with_zero_populated_directions(
             interaction_id=interaction_id,
             task_id=task_id,
             principal=guest,
+            envelope=_respond_envelope(),
+        )
+
+        assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [
+        pytest.param(
+            svc.InteractionPrincipal(
+                kind="user", user_id=None, is_admin=True, auth_mode=None
+            ),
+            id="user_without_an_id",
+        ),
+        pytest.param(
+            svc.InteractionPrincipal(
+                kind="guest",
+                user_id=1,
+                is_admin=False,
+                auth_mode="widget",
+                widget_workforce_id=9,
+                guest_id="",
+            ),
+            id="guest_with_a_blank_guest_id",
+        ),
+        pytest.param(
+            svc.InteractionPrincipal(
+                kind="service", user_id=1, is_admin=False, auth_mode=None
+            ),
+            id="unrecognized_kind",
+        ),
+    ],
+)
+def test_respond_rejects_every_principal_identity_string_cannot_name(
+    _respond_db, principal: svc.InteractionPrincipal
+) -> None:
+    """``identity_string()`` raises for exactly three principal shapes, and
+    ``respond()`` calls it at four points with no guard of its own. What
+    keeps those four calls safe is the authorization gate above them, which
+    happens to require the same fields -- a real coupling that nothing
+    enforced until this test. Each shape below must come back as
+    ``RespondUnauthorized(reason="not_task_principal")``, never as a raised
+    ``ValueError`` escaping the function."""
+
+    with pytest.raises(ValueError):
+        principal.identity_string()
+
+    _owner_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=principal,
             envelope=_respond_envelope(),
         )
 

@@ -541,16 +541,29 @@ def test_reply_closes_the_legacy_resume_interaction_row_on_successful_injection(
         db.close()
 
 
+# A fabricated id, not the seeded row's -- test_reply_reads_the_interaction_
+# row_before_injecting hands this to the close instead of the real row id,
+# so a site that re-read the row at close time would hand the close the
+# real id and fail there instead.
+_OBSERVED_INTERACTION_ID = 4321
+
+
 def test_reply_reads_the_interaction_row_before_injecting(mock_start_task):
     """The close is keyed on the row observed *before* the injection,
     and only the ordering makes that true -- see task_interaction_close's
     module docstring. Moving the read after the injection leaves the whole
     change doing nothing while the row-level assertions in the test above
-    stay green."""
+    stay green. The observed value is a fabricated id, not the seeded row's,
+    so a site that re-read the row at close time would hand the close the
+    real id and fail here."""
 
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_waiting_task(full_key, agent_id, run_id="run-close-order")
-    row_id = _seed_active_interaction_row(
+    # Kept real and distinct from _OBSERVED_INTERACTION_ID: a site that
+    # re-read the row at close time (instead of using the id observed before
+    # injection) would hand the close this real id and fail the assertion
+    # below.
+    _seed_active_interaction_row(
         task_id, run_id="run-close-order", idempotency_key="reply-close-order-q1"
     )
 
@@ -558,7 +571,7 @@ def test_reply_reads_the_interaction_row_before_injecting(mock_start_task):
 
     def record_read(_task_id: int) -> int:
         order.append("read")
-        return row_id
+        return _OBSERVED_INTERACTION_ID
 
     async def record_injection(*_args: object, **_kwargs: object) -> bool:
         order.append("inject")
@@ -577,6 +590,10 @@ def test_reply_reads_the_interaction_row_before_injecting(mock_start_task):
             "xagent.web.api.v1.task_reply.active_interaction_id_sync",
             side_effect=record_read,
         ),
+        patch(
+            "xagent.web.api.v1.task_reply.close_legacy_resume_interaction",
+            return_value=1,
+        ) as close_mock,
     ):
         resp = client.post(
             f"/v1/chat/tasks/{task_id}/reply",
@@ -586,6 +603,10 @@ def test_reply_reads_the_interaction_row_before_injecting(mock_start_task):
 
     assert resp.status_code == 202, resp.text
     assert order == ["read", "inject"]
+    close_mock.assert_called_once()
+    assert close_mock.call_args.kwargs["task_id"] == task_id
+    assert close_mock.call_args.kwargs["run_id"] == "run-close-order"
+    assert close_mock.call_args.kwargs["interaction_id"] == _OBSERVED_INTERACTION_ID
 
 
 def test_update_reply_input_rolls_back_the_interaction_close_with_the_fence() -> None:
