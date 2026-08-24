@@ -3194,6 +3194,14 @@ async def test_fast_path_snapshot_marks_truncation_when_the_window_ends_unmeasur
     assert total_steps == 3
 
 
+# A sentinel distinguishable from any real ``ApiKeyPrincipal`` (and from
+# ``None``, the placeholder every other fast-path test in this file
+# passes), so the fence tests below can pin that the reread genuinely
+# receives the same ``(task_id, principal)`` pair the steps read did,
+# not just some value.
+_FENCE_PRINCIPAL = object()
+
+
 # ===== fast-path generation fence (steps read outlives the snapshot) =====
 
 
@@ -3264,11 +3272,15 @@ async def test_fast_path_generation_change_withholds_steps_but_still_concludes(
         data={"name": "search", "result": "ok"},
     )
     original = {"run_id": "run-1", "state_version": 1}
+    steps_calls: list[tuple[int, object]] = []
+    reread_calls: list[tuple[int, object]] = []
 
     def _read_task_steps_response(task_id_, principal_):
+        steps_calls.append((task_id_, principal_))
         return SimpleNamespace(steps=[step])
 
     def _reread_task_snapshot(task_id_, principal_):
+        reread_calls.append((task_id_, principal_))
         return SimpleNamespace(**{**original, changed_field: changed_value})
 
     snapshot = SimpleNamespace(
@@ -3278,7 +3290,7 @@ async def test_fast_path_generation_change_withholds_steps_but_still_concludes(
         chunk
         async for chunk in getattr(es, stream_fn)(
             snapshot,
-            principal=None,
+            principal=_FENCE_PRINCIPAL,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_reread_task_snapshot,
         )
@@ -3295,6 +3307,8 @@ async def test_fast_path_generation_change_withholds_steps_but_still_concludes(
     # The conclusion still carries ``snapshot``'s own values, not a
     # placeholder standing in for the superseded run.
     assert conclusion_marker in body
+    assert steps_calls == [(snapshot.task_id, _FENCE_PRINCIPAL)]
+    assert reread_calls == [(snapshot.task_id, _FENCE_PRINCIPAL)]
 
 
 @pytest.mark.parametrize(
@@ -3324,13 +3338,16 @@ async def test_fast_path_empty_steps_skips_the_generation_reread(
     against -- this pins that the fast path skips it entirely rather
     than paying for a read whose answer can't change the outcome."""
 
+    steps_calls: list[tuple[int, object]] = []
+
     def _read_task_steps_response(task_id_, principal_):
+        steps_calls.append((task_id_, principal_))
         return SimpleNamespace(steps=[])
 
-    reread_calls: list[int] = []
+    reread_calls: list[tuple[int, object]] = []
 
     def _reread_task_snapshot(task_id_, principal_):
-        reread_calls.append(1)
+        reread_calls.append((task_id_, principal_))
         return SimpleNamespace(run_id="run-1", state_version=1)
 
     snapshot = SimpleNamespace(
@@ -3345,12 +3362,13 @@ async def test_fast_path_empty_steps_skips_the_generation_reread(
         chunk
         async for chunk in getattr(es, stream_fn)(
             snapshot,
-            principal=None,
+            principal=_FENCE_PRINCIPAL,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_reread_task_snapshot,
         )
     ]
     body = "".join(frames)
+    assert steps_calls == [(snapshot.task_id, _FENCE_PRINCIPAL)]
     assert reread_calls == []
     assert body.count(f"event: {conclusion_event}") == 1
     assert "resync_required" not in body
@@ -3398,10 +3416,15 @@ async def test_fast_path_generation_reread_failure_concludes_then_closes_for_res
         data={"name": "search", "result": "ok"},
     )
 
+    steps_calls: list[tuple[int, object]] = []
+    reread_calls: list[tuple[int, object]] = []
+
     def _read_task_steps_response(task_id_, principal_):
+        steps_calls.append((task_id_, principal_))
         return SimpleNamespace(steps=[step])
 
     def _raising_reread(task_id_, principal_):
+        reread_calls.append((task_id_, principal_))
         raise RuntimeError("transient DB error rereading task snapshot")
 
     snapshot = SimpleNamespace(
@@ -3416,7 +3439,7 @@ async def test_fast_path_generation_reread_failure_concludes_then_closes_for_res
         chunk
         async for chunk in getattr(es, stream_fn)(
             snapshot,
-            principal=None,
+            principal=_FENCE_PRINCIPAL,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_raising_reread,
         )
@@ -3431,6 +3454,8 @@ async def test_fast_path_generation_reread_failure_concludes_then_closes_for_res
     # The conclusion precedes the error on this exit too -- neither leg
     # asserted that before, so a reordered yield would have passed both.
     assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
+    assert steps_calls == [(snapshot.task_id, _FENCE_PRINCIPAL)]
+    assert reread_calls == [(snapshot.task_id, _FENCE_PRINCIPAL)]
 
 
 @pytest.mark.parametrize(
@@ -3475,10 +3500,15 @@ async def test_fast_path_generation_reread_task_deleted_closes_with_task_deleted
         data={"name": "search", "result": "ok"},
     )
 
+    steps_calls: list[tuple[int, object]] = []
+    reread_calls: list[tuple[int, object]] = []
+
     def _read_task_steps_response(task_id_, principal_):
+        steps_calls.append((task_id_, principal_))
         return SimpleNamespace(steps=[step])
 
     def _deleted_reread(task_id_, principal_):
+        reread_calls.append((task_id_, principal_))
         raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
 
     snapshot = SimpleNamespace(
@@ -3493,7 +3523,7 @@ async def test_fast_path_generation_reread_task_deleted_closes_with_task_deleted
         chunk
         async for chunk in getattr(es, stream_fn)(
             snapshot,
-            principal=None,
+            principal=_FENCE_PRINCIPAL,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_deleted_reread,
         )
@@ -3508,6 +3538,8 @@ async def test_fast_path_generation_reread_task_deleted_closes_with_task_deleted
     # The conclusion precedes the error, same ordering pinned on every
     # other failure exit on this path.
     assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
+    assert steps_calls == [(snapshot.task_id, _FENCE_PRINCIPAL)]
+    assert reread_calls == [(snapshot.task_id, _FENCE_PRINCIPAL)]
 
 
 # ===== fast-path step serialization failure (after the first yield) =====
