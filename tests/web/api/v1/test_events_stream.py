@@ -2829,6 +2829,133 @@ async def test_fast_path_step_snapshot_is_bounded_by_replay_max_steps():
     assert "snapshot_truncated" not in second_step_data
 
 
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_step_snapshot_is_bounded_by_the_wire_byte_budget(
+    stream_fn, status, conclusion_event, extra_snapshot
+):
+    """``REPLAY_MAX_STEPS`` alone doesn't stop a snapshot from getting
+    huge: 128 steps at 48 KiB of ``data`` each (well under the 64 KiB
+    per-step cap, so ``_capped_step_data`` never fires) is ~6 MiB, over
+    ``MAX_SNAPSHOT_WIRE_BYTES`` (4 MiB) while nowhere near
+    ``REPLAY_MAX_STEPS`` (512). This pins that the byte budget -- not
+    the step count -- is what cuts this particular snapshot short."""
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    total = 128
+    steps = [
+        es.PublicStep(
+            id=f"tool_call:call-{i}",
+            type="tool_call",
+            status="completed",
+            started_at=base,
+            completed_at=base,
+            data={"name": "search", "result": "x" * (48 * 1024)},
+        )
+        for i in range(total)
+    ]
+
+    def _read_task_steps_response(task_id_, principal_):
+        return SimpleNamespace(steps=steps)
+
+    def _unchanged_read_task_snapshot(task_id_, principal_):
+        return SimpleNamespace(run_id="run-1", state_version=1)
+
+    snapshot = SimpleNamespace(
+        task_id=1,
+        agent_id=1,
+        status=status,
+        run_id="run-1",
+        state_version=1,
+        **extra_snapshot,
+    )
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=None,
+            read_task_steps_response=_read_task_steps_response,
+            read_task_snapshot=_unchanged_read_task_snapshot,
+        )
+    ]
+    body = "".join(frames)
+    step_frames = [chunk for chunk in frames if "event: step." in chunk]
+    # The byte budget bound this well short of all 128 steps -- not zero
+    # (some steps still fit) and not all of them (the budget did bind).
+    assert 0 < len(step_frames) < total
+    # The truncation marker on the first frame costs a little more than
+    # the measuring pass counted for it (see
+    # ``_fast_path_step_snapshot``'s docstring) -- a bounded overrun, not
+    # an unbounded one.
+    assert sum(len(chunk) for chunk in step_frames) <= es.MAX_SNAPSHOT_WIRE_BYTES + 64
+    first_step_block = next(
+        block for block in body.split("\n\n") if block.startswith("event: step.")
+    )
+    first_step_data = json.loads(first_step_block.split("data: ", 1)[1])
+    assert first_step_data["snapshot_truncated"] is True
+    assert first_step_data["snapshot_total_steps"] == total
+    assert body.count(f"event: {conclusion_event}") == 1
+    # A byte-budget cut is a truncated snapshot, not a stream error -- the
+    # client is told via ``snapshot_truncated``, not a close frame.
+    assert "event: stream.error" not in body
+
+
+async def test_fast_path_snapshot_admits_a_frame_exactly_at_the_byte_budget(
+    monkeypatch,
+):
+    """Same boundary rule as the queue's own byte budget (see
+    ``test_backlog_exactly_at_the_byte_budget_does_not_close``): strictly
+    over the budget cuts the snapshot short, landing exactly on it does
+    not. Drives ``_fast_path_step_snapshot`` directly with two identical
+    steps and a budget set to exactly two frames' worth of wire bytes,
+    then one byte short of that, so the boundary is pinned to the exact
+    byte that tips it rather than one before or after."""
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    step = es.PublicStep(
+        id="tool_call:call-1",
+        type="tool_call",
+        status="completed",
+        started_at=base,
+        completed_at=base,
+        data={"name": "search", "result": "ok"},
+    )
+    frame_len = len(es._step_wire_frame(step))
+    steps = [step, step]
+
+    def _read_task_steps_response(task_id_, principal_):
+        return SimpleNamespace(steps=steps)
+
+    monkeypatch.setattr(es, "MAX_SNAPSHOT_WIRE_BYTES", frame_len * 2)
+    admitted, total_steps = await es._fast_path_step_snapshot(
+        1, None, _read_task_steps_response
+    )
+    assert len(admitted) == 2
+    assert total_steps is None
+
+    monkeypatch.setattr(es, "MAX_SNAPSHOT_WIRE_BYTES", frame_len * 2 - 1)
+    admitted, total_steps = await es._fast_path_step_snapshot(
+        1, None, _read_task_steps_response
+    )
+    assert len(admitted) == 1
+    assert total_steps == 2
+
+
 # ===== fast-path generation fence (steps read outlives the snapshot) =====
 
 

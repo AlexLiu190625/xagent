@@ -87,16 +87,26 @@ values it deliberately leaves unbounded, in one place:
     that leaves ordinary traffic alone -- against the ~16 MiB a full
     element-capped queue of maximum frames would otherwise hold.
   - One attach-time fast-path step snapshot: ``REPLAY_MAX_STEPS`` (512
-    steps). A task with more public steps than that sends only its most
-    recent 512, and the first ``step.*`` frame carries
-    ``snapshot_truncated``/``snapshot_total_steps`` so the client can
-    tell a bounded snapshot from a complete one. This bounds how much
-    one response may hold, not how much backlog may accumulate: the
-    fast paths ``yield`` their frames straight from the generator, so no
-    sink and no outbound queue exist on those paths and neither queue
-    bound above applies to them. Each of those frames is still subject
-    to the 64 KiB per-step ``data`` cap, which is applied per frame
-    wherever the frame is built.
+    steps) *and* ``MAX_SNAPSHOT_WIRE_BYTES`` (4 MiB of serialized frame
+    text). Whichever binds first cuts the snapshot short: the step cap
+    binds on a long history of ordinary steps, the byte budget on a
+    short history of large ones -- 512 steps each carrying a ``data``
+    sub-object right at the 64 KiB cap is ~32 MiB generated into one
+    response, and these paths are exempt from the concurrency caps
+    below, so nothing else bounds how many such responses run at once.
+    The step cap keeps the most recent steps (in ``started_at`` order);
+    the byte budget then admits that window from its oldest end, so the
+    snapshot stays a contiguous run in wire order. Either way the first
+    ``step.*`` frame carries ``snapshot_truncated`` (``true``) and
+    ``snapshot_total_steps`` (the task's full public step count), so the
+    client can tell a bounded snapshot from a complete one and knows how
+    much of it is missing -- ``GET .../steps`` is the authoritative full
+    history. These bound how much one response may hold, not how much
+    backlog may accumulate: the fast paths ``yield`` their frames
+    straight from the generator, so no sink and no outbound queue exist
+    on those paths and neither queue bound above applies to them. Each
+    of those frames is still subject to the 64 KiB per-step ``data``
+    cap, which is applied per frame wherever the frame is built.
   - Concurrent streams: ``PER_TASK_STREAM_CAP`` (2) and
     ``PER_PRINCIPAL_STREAM_CAP`` (32), both rejected with 429 at
     attach, before any sink exists.
@@ -117,7 +127,9 @@ values it deliberately leaves unbounded, in one place:
     sits outside the ``data`` sub-object the 64 KiB cap covers. A step
     id derives from the event's own ``tool_call_id``/``step_id``, so
     what bounds it is the 256 KiB check on the inbound frame carrying
-    it, and the queue's byte budget bounds ids in aggregate. Today's
+    it, and in aggregate the queue's byte budget on the live path or
+    ``MAX_SNAPSHOT_WIRE_BYTES`` on the two attach-time fast paths, which
+    have no queue of their own. Today's
     only ``message_id`` producer emits a fixed 45 characters
     (``f"final_answer_{uuid4().hex}"``,
     ``core/agent/runtime.py``'s ``start_final_answer_stream``), but
@@ -237,8 +249,24 @@ MAX_RAW_FRAME_TEXT_CHARS = 4 * MAX_FRAME_CONTENT_BYTES
 # otherwise bound how much one response can hold. Exceeding it keeps
 # only the most recent ``REPLAY_MAX_STEPS`` steps (in ``started_at``
 # order, same as everywhere else) and marks the first frame as
-# truncated -- see ``_fast_path_step_snapshot``.
+# truncated -- see ``_fast_path_step_snapshot``. Bounds the count only;
+# ``MAX_SNAPSHOT_WIRE_BYTES`` below bounds the size.
 REPLAY_MAX_STEPS = 512
+# The attach-time snapshot's second bound, on the total wire bytes one
+# response may hold rather than on its step count -- the fast paths'
+# analogue of the queue's ``MAX_QUEUED_WIRE_BYTES``, and sized the same
+# way (64 largest-possible content frames, expressed against
+# ``MAX_FRAME_CONTENT_BYTES`` so it tracks that cap instead of drifting
+# from it). ``REPLAY_MAX_STEPS`` alone does not bound size: 512 steps
+# each carrying a ``data`` sub-object right at the 64 KiB cap is ~32 MiB
+# generated into a single response, and these paths return before the
+# per-task / per-principal caps are checked, so nothing bounds how many
+# of those run concurrently. Strictly over the budget stops the
+# snapshot, exactly on it does not -- the same boundary rule the queue
+# budget and ``MAX_RAW_FRAME_TEXT_CHARS`` use. Frames are pure ASCII
+# (``json.dumps`` runs with the default ``ensure_ascii=True``), so
+# ``len(frame_text)`` is the wire byte count and no encode is needed.
+MAX_SNAPSHOT_WIRE_BYTES = 64 * MAX_FRAME_CONTENT_BYTES
 # Floor for the final wait when the 1-hour deadline is close: keeps the
 # queue wait from being called with a near-zero timeout, which would spin
 # the loop instead of actually waiting.
@@ -1420,6 +1448,56 @@ def _sse_response(body: AsyncIterator[str]) -> StreamingResponse:
     return StreamingResponse(body, media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
+def _snapshot_steps_within_wire_budget(
+    steps: "list[PublicStep]",
+) -> "list[PublicStep]":
+    """The longest prefix of ``steps`` whose serialized frames fit
+    ``MAX_SNAPSHOT_WIRE_BYTES``.
+
+    Measures with ``_step_wire_frame`` -- the same builder the emit loop
+    uses -- and throws the text away, so at most one frame is
+    materialized at a time. Serializing twice is what buys that: the fast
+    paths return before the per-task / per-principal caps are checked, so
+    a design that held the admitted frames to avoid the second pass would
+    hold up to the whole budget per attach with nothing bounding how many
+    attaches run at once. The doubled work is bounded by the budget
+    itself (2 x 4 MiB), against the ~32 MiB a single unbounded snapshot
+    could serialize today, so this pass lowers the worst case rather than
+    adding to it. ``_step_wire_frame`` is a pure function of the step
+    (``_capped_step_data`` builds new dicts and never mutates its input),
+    so the second pass produces byte-identical frames.
+
+    A prefix, not a suffix, even though ``REPLAY_MAX_STEPS`` keeps the
+    most recent steps: a step whose ``data`` cannot be serialized cannot
+    be measured either, and admitting it here is what keeps the emit loop
+    reaching it and reporting it through
+    ``_fast_path_step_serialize_error_frame`` -- with the steps before it
+    already on the wire, which is the behavior
+    ``GET /v1/chat/tasks/{task_id}/events`` documents. Dropping from the
+    oldest end instead would put an unserializable step at the head of
+    the window, where it suppresses every good step behind it, or force
+    the failure to be folded into "snapshot truncated" and never
+    reported. The budget only binds on a window averaging more than 8 KiB
+    per step, and a client whose snapshot was cut is told so by
+    ``snapshot_truncated`` and sent to ``GET .../steps`` either way.
+    """
+    budget_remaining = MAX_SNAPSHOT_WIRE_BYTES
+    admitted = 0
+    for step in steps:
+        try:
+            frame_bytes = len(_step_wire_frame(step))
+        except Exception:
+            # Unmeasurable: admit it so the emit loop fails on it -- see
+            # the docstring above.
+            admitted += 1
+            break
+        if frame_bytes > budget_remaining:
+            break
+        budget_remaining -= frame_bytes
+        admitted += 1
+    return steps[:admitted]
+
+
 async def _fast_path_step_snapshot(
     task_id: int,
     principal: "ApiKeyPrincipal",
@@ -1431,31 +1509,43 @@ async def _fast_path_step_snapshot(
     burst of fast-path attaches on one task collapses into a cache hit
     instead of each one re-reading and re-projecting independently.
 
-    Bounded to ``REPLAY_MAX_STEPS``: without that bound, a fast-path
-    attach to a task with an unusually long step history returned every
-    step from this cached list in one shot, with no admission /
-    deadline / heartbeat loop to pace it, unlike everything else this
-    stream serves. The cached list is already in ``started_at`` order
-    (``map_trace_events_to_public_steps``'s own docstring: "in the
-    order their start events first appeared"), so
+    Bounded by two caps, whichever binds first: ``REPLAY_MAX_STEPS``
+    (step count) and ``MAX_SNAPSHOT_WIRE_BYTES`` (serialized size, via
+    ``_snapshot_steps_within_wire_budget``). Without them, a fast-path
+    attach to a task with an unusually long or heavy step history
+    returned every step from this cached list in one shot, with no
+    admission / deadline / heartbeat loop to pace it, unlike everything
+    else this stream serves. The cached list is already in
+    ``started_at`` order (``map_trace_events_to_public_steps``'s own
+    docstring: "in the order their start events first appeared"), so
     ``steps[-REPLAY_MAX_STEPS:]`` keeps the most recent steps and drops
-    the oldest. Returns the validated
+    the oldest; the byte budget is then applied to that window from its
+    oldest end (see ``_snapshot_steps_within_wire_budget`` for why a
+    prefix, not a suffix, is what it keeps). Returns the validated
     ``PublicStep`` objects themselves, not their serialized frame text
     -- serialization happens one frame at a time in each fast path's own
     yield loop below instead, so a large step list is never fully
-    materialized as SSE text (or held as a list of strings) all at once.
-    The second element is the task's true total step count
-    (``snapshot_total_steps`` for the first serialized frame) when
-    truncation happened, or ``None`` when the full list fit.
+    materialized as SSE text (or held as a list of strings) all at once;
+    the byte budget's own measuring pass is the one place that comes
+    close, and it holds at most one frame's text at a time (see that
+    function's docstring).
+    The second element is the task's true total public step count
+    whenever the returned list is short of it, by either bound, or
+    ``None`` when the whole history fits. The first serialized frame's
+    truncation marker then costs it about 52 bytes more than the
+    measuring pass counted for it -- a bounded overrun, accepted the same
+    way the queue's own byte budget leaves its per-string object header
+    uncounted.
     """
     steps_response = await run_db_io_cancellation_safe(
         lambda: read_task_steps_response(task_id, principal)
     )
     steps = steps_response.steps
     total_steps = len(steps)
-    if total_steps > REPLAY_MAX_STEPS:
-        return steps[-REPLAY_MAX_STEPS:], total_steps
-    return steps, None
+    admitted = _snapshot_steps_within_wire_budget(steps[-REPLAY_MAX_STEPS:])
+    if len(admitted) < total_steps:
+        return admitted, total_steps
+    return admitted, None
 
 
 def _fast_path_steps_read_error_frame(
