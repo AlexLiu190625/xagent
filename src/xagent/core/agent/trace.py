@@ -1117,8 +1117,11 @@ def _render_event_data_for_log(data: Any, max_bytes: Optional[int] = None) -> st
 
     Args:
         data: The event payload to render.
-        max_bytes: Byte bound for the rendered string. When ``None``, reads
-            ``XAGENT_MAX_TRACE_PAYLOAD_BYTES`` (default 50_000, 0 disables).
+        max_bytes: Byte bound for the rendered string. A value of 0 or
+            less disables truncation. When ``None``, reads
+            ``XAGENT_MAX_TRACE_PAYLOAD_BYTES`` (default 50_000; that path
+            accepts 0 to disable but rejects negatives, falling back to
+            the default).
 
     Returns:
         A string no longer than ``max_bytes`` plus a truncation marker.

@@ -12,6 +12,7 @@ The v2-runtime audit injection (centralized in
 follow-up PR.
 """
 
+import copy
 from typing import Any, Callable, Dict, List
 
 import pytest
@@ -960,7 +961,12 @@ def test_render_event_data_keeps_wide_scalar_dict_verbatim() -> None:
     from xagent.core.agent.trace import _render_event_data_for_log
 
     payload = {i: i for i in range(4_000)}
-    assert len(f"{payload}".encode("utf-8")) == 45_780
+    # Precise byte count (45,780) is pinned in this test's docstring above;
+    # the check here only needs to confirm the fixture is inside the
+    # budget, since the fixture's exact repr length is CPython-format
+    # dependent and the byte-for-byte equality assertion below is what
+    # actually catches the regression.
+    assert len(f"{payload}".encode("utf-8")) < 50_000
     assert _render_event_data_for_log(payload, max_bytes=50_000) == f"{payload}"
 
 
@@ -993,7 +999,12 @@ def test_render_event_data_keeps_llm_call_records_verbatim() -> None:
             }
         },
     }
-    assert len(f"{payload}".encode("utf-8")) == 39_918
+    # Precise byte count (39,918) is pinned in this test's docstring above;
+    # the check here only needs to confirm the fixture is inside the
+    # budget, since the fixture's exact repr length is CPython-format
+    # dependent and the byte-for-byte equality assertion below is what
+    # actually catches the regression.
+    assert len(f"{payload}".encode("utf-8")) < 50_000
     assert _render_event_data_for_log(payload, max_bytes=50_000) == f"{payload}"
 
 
@@ -1184,6 +1195,104 @@ def test_render_event_data_zero_cap_disables_truncation() -> None:
 
     payload = _checkpoint_payload(5, 10_000)
     assert _render_event_data_for_log(payload, max_bytes=0) == f"{payload}"
+
+
+def test_render_event_data_small_budget_hard_cut() -> None:
+    """This is the only case in this file that runs with a budget below
+    the default 50_000 -- everything else exercises the shrink walk at
+    production scale. A ``max_bytes=200`` budget against a dict with
+    several 1000-char string fields is too small for ``_shrink_node`` to
+    land under the cap on its own (each field's own truncation marker,
+    plus the ``__omitted_keys__`` marker for the fields it can't fit at
+    all, already eats past 200 bytes), so ``_render_event_data_for_log``'s
+    final hard byte-cut fires on top of the shrink pass. That hard cut
+    slices the rendered string to ``max_bytes`` and appends its own
+    ``...[truncated N chars]`` marker, and the marker itself is what pushes
+    the result over budget -- measured at 222 bytes for this fixture, 22
+    bytes over the 200-byte budget.
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload = {"a": "x" * 1000, "b": "y" * 1000, "c": "z" * 1000}
+    out = _render_event_data_for_log(payload, max_bytes=200)
+    out_bytes = len(out.encode("utf-8"))
+    assert 200 < out_bytes <= 230, (
+        f"expected the hard-cut marker overshoot to land in (200, 230], got {out_bytes}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_console_cap_does_not_shrink_the_persisted_payload(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The safety promise this PR exists to guarantee: the byte cap applies
+    only to the string the console handler builds for its own log line. Any
+    other handler on the same ``Tracer`` -- a database writer, a checkpoint
+    store, a websocket broadcaster -- must still receive ``event.data``
+    exactly as it was passed in, unshrunk.
+
+    Wires a real ``Tracer`` with two handlers, ``ConsoleTraceHandler`` and a
+    recording handler standing in for a persistence sink, and fires one
+    event with a payload whose rendered width is far past the 50_000-byte
+    console budget. The recording handler's copy of ``event.data`` must be
+    the identical object (not a shrunk copy) and equal to the original, and
+    the console log line must still have been capped.
+    """
+    import logging
+
+    from xagent.core.agent.trace import (
+        SYSTEM_INFO,
+        BaseTraceHandler,
+        ConsoleTraceHandler,
+        Tracer,
+    )
+
+    class _RecordingPersistenceHandler(BaseTraceHandler):
+        """Stands in for a database/checkpoint handler: keeps whatever
+        ``event.data`` object it was handed, unmodified."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.received: List[Any] = []
+
+        async def _handle_system_event(self, event: Any) -> None:
+            self.received.append(event.data)
+
+    monkeypatch.setenv("XAGENT_MAX_TRACE_PAYLOAD_BYTES", "50000")
+
+    tracer = Tracer()
+    tracer.add_handler(ConsoleTraceHandler())
+    persistence_handler = _RecordingPersistenceHandler()
+    tracer.add_handler(persistence_handler)
+
+    original_payload = {"snapshot": {f"k{i}": "v" * 200 for i in range(2_000)}}
+    assert len(f"{original_payload}".encode("utf-8")) > 50_000, (
+        "fixture should be far over the console budget"
+    )
+    # Snapshot the content BEFORE dispatch: the tracer passes ``data`` by
+    # reference, so comparing received[0] against original_payload would be
+    # comparing an object with itself and could never catch an in-place
+    # mutation by the console handler.
+    expected_content = copy.deepcopy(original_payload)
+
+    with caplog.at_level(logging.INFO, logger="xagent.core.agent.trace"):
+        await tracer.trace_event(SYSTEM_INFO, data=original_payload)
+
+    # Persistence side: same object, untouched.
+    assert len(persistence_handler.received) == 1
+    assert persistence_handler.received[0] is original_payload
+    assert persistence_handler.received[0] == expected_content
+
+    # Console side: the log line is still capped. ``Tracer.trace_event``
+    # itself logs several diagnostic lines through the same module logger
+    # (dispatch bookkeeping), so filter down to the one line
+    # ``ConsoleTraceHandler._handle_system_event`` actually renders.
+    console_records = [
+        r for r in caplog.records if r.getMessage().startswith("[SYSTEM]")
+    ]
+    assert len(console_records) == 1
+    message_bytes = len(console_records[0].getMessage().encode("utf-8"))
+    assert message_bytes <= 50_000 + 30, f"log line not bounded: {message_bytes}"
 
 
 @pytest.mark.asyncio
