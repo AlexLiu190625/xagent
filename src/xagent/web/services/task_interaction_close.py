@@ -65,10 +65,20 @@ together. A crash between those two commits leaves the interaction row
 message already answered the question. That window is benign for the same
 reason as the reader fallback documented above: a reader keys off
 ``status`` first, so a stale active row here just makes it fall back to
-asking the legacy question again -- the same family of harmless window
-as the message-injection replay that
-``AgentRunner.inject_user_message`` short-circuits on a repeated turn
-id.
+asking the legacy question again.
+
+The replay ``AgentRunner.inject_user_message`` short-circuits on a
+repeated turn id is not a window of that same benign family, and is
+not covered by the argument above. A replay persists nothing and still
+reports success to its caller, so an injection site cannot tell it from
+a first attempt; the row that site observed before calling is then not
+the question the replayed message answered but whatever the resumed
+agent has asked since, and closing it retires a live question instead
+of leaving a stale one behind. That is the opposite failure from the
+one this paragraph describes, and it is not fixed here -- see the
+comment at the online WebSocket injection site (``websocket.py``) for
+the precondition it puts on the change that wires the first production
+writer.
 
 The close statement binds to one primary key, read before the injection
 by ``active_interaction_id_sync`` and carried to the close by whichever

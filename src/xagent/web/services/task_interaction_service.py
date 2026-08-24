@@ -902,8 +902,16 @@ def build_v1_request_payload(parsed: AskUserQuestionArgs) -> dict[str, Any]:
 # would narrow what the model itself is allowed to emit, which is a
 # different decision from what this service is willing to persist. The
 # seven are the same ones the frontend's own normalizer accepts
-# (``frontend/src/contexts/app-context-chat.tsx``); an item typed anything
-# else is dropped there and renders as nothing at all.
+# (``normalizeInteractions``, ``frontend/src/contexts/app-context-chat.tsx``),
+# which drops an item typed anything else before it reaches a renderer.
+# That normalizer is not the only way in, though, so an unknown type is
+# not simply invisible: the agent builder's chat
+# (``frontend/src/components/build/agent-builder-chat.tsx``) takes the
+# interactions off its own stream and hands them to the same renderer
+# unnormalized, where an unrecognized type falls to
+# ``clarification-form.tsx``'s ``default`` branch and shows the user a
+# red "unsupported type" line. Rejecting the type here on the write side
+# is what keeps either surface from having to.
 _V1_INTERACTION_TYPES = frozenset(
     {
         "select_one",

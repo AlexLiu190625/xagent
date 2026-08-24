@@ -6079,17 +6079,35 @@ async def _handle_chat_message_unserialized(
                                 turn_id,
                                 exc_info=True,
                             )
-                        # `posted` is true, meaning a message with this
-                        # turn id is in a live checkpoint -- written by this
-                        # call, or already present from an earlier attempt
-                        # with the same turn id, which short-circuits without
-                        # persisting anything new (see
-                        # AgentRunner.inject_user_message) -- instead of
-                        # going through the native interaction
-                        # protocol's answer path, so any question this run
-                        # had open under that protocol is answered by other
-                        # means now. Retire it and clear the task's
-                        # marker in the same short transaction. The run fence
+                        # `posted` is true, meaning a message with this turn
+                        # id is in a live checkpoint. Retire the interaction
+                        # row observed before the injection and clear the
+                        # task's marker in the same short transaction: the
+                        # message went in outside the native interaction
+                        # protocol's answer path, so a question this run had
+                        # open under that protocol was answered by other
+                        # means.
+                        #
+                        # That reading holds for a first attempt and not for
+                        # a replay, and `posted` cannot tell the two apart.
+                        # AgentRunner.inject_user_message short-circuits a
+                        # repeated turn id by returning the existing context
+                        # without persisting anything, which reaches here as
+                        # the same `True`. On a replay the id read just above
+                        # is not the question the replayed message answered
+                        # -- that one was retired by the first attempt -- but
+                        # whatever the resumed agent has asked since, and
+                        # retiring it discards a live question nobody
+                        # answered. Nothing in the interaction table is
+                        # reachable today (no production writer inserts into
+                        # it yet), so the window costs nothing right now. The
+                        # change that wires the first production writer has
+                        # to close it before that writer ships: the runner
+                        # has to report whether it persisted a new message or
+                        # replayed an existing turn, and this site has to
+                        # skip the close on the replay answer.
+                        #
+                        # The run fence
                         # is live_task_lease.run_id, not task_run_id: posted
                         # being true only happens by way of the
                         # live_task_lease is not None branch above, which is
