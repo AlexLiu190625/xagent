@@ -1461,8 +1461,15 @@ def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> 
 
 class _TeamOwnedUserMCP:
     """Stand-in for a missing UserMCPServer row: a team connector the user does
-    not personally own. Exposes the attributes the response builders read with
-    not-owned defaults (usable, but not editable/deletable)."""
+    not personally own. Its class attributes report the same not-owned
+    defaults a real, ownerless row would (``is_owner``, ``can_edit`` and
+    ``can_delete`` all ``False``) -- reading the attributes alone never
+    grants anything. The route-level gate (``_check_mcp_permission``) looks
+    past those defaults only on the ``edit`` branch, falling back to the
+    caller's own team access verdict when one links this connector. Nothing
+    reads past them on the ``delete`` branch: this stand-in grants no delete
+    right, and none of its attributes changes that.
+    """
 
     is_owner = False
     can_edit = False
@@ -1477,8 +1484,15 @@ class _TeamOwnedUserMCP:
 
 
 class _TeamOwnedUserApi:
-    """Stand-in for a missing UserCustomApi row (team-owned, not user-owned)."""
+    """Stand-in for a missing UserCustomApi row (team-owned, not user-owned).
 
+    Same shape as ``_TeamOwnedUserMCP``: ``is_owner`` and ``can_edit`` both
+    report the not-owned default. ``update_custom_api`` (custom_api.py)
+    looks past ``can_edit`` for a caller whose own team access verdict
+    grants edit; there is no delete counterpart for Custom API at all.
+    """
+
+    is_owner = False
     can_edit = False
     is_active = True
     is_default = False
@@ -1551,8 +1565,18 @@ def _db_server_to_response(
     app_id: Optional[str] = None,
     provider: Optional[str] = None,
     is_admin: bool = False,
+    team_access: "ConnectorAccess | None" = None,
 ) -> MCPServerResponse:
-    """Convert database MCPServer to response model."""
+    """Convert database MCPServer to response model.
+
+    ``team_access`` is the caller's team access verdict for this connector,
+    forwarded to ``_check_mcp_permission`` unchanged -- ``None`` when the
+    caller owns the row outright (a verdict cannot change what an owner
+    already gets) or when nothing in the deployment supplies one. Every
+    caller of this function decides for itself whether resolving a verdict
+    is worth a hook call before passing one in; this function never resolves
+    one on its own.
+    """
     # Get status from manager if available
     config = server.to_config_dict()
 
@@ -1583,7 +1607,9 @@ def _db_server_to_response(
         runtime_input_schema=server.runtime_input_schema,
         runtime_bindings=server.runtime_bindings,
         allow_delegated_authorization=bool(server.allow_delegated_authorization),
-        can_edit_global=_check_mcp_permission(user_mcp, is_admin, require="edit"),
+        can_edit_global=_check_mcp_permission(
+            user_mcp, is_admin, require="edit", team_access=team_access
+        ),
         transport_display=server.transport_display,
         created_at=_format_optional_datetime(server.created_at),
         updated_at=_format_optional_datetime(server.updated_at),
@@ -1596,8 +1622,17 @@ def _db_server_to_response(
 def _custom_api_to_mcp_response(
     api: CustomApi,
     user_api: UserCustomApi | _TeamOwnedUserApi,
+    team_access: "ConnectorAccess | None" = None,
 ) -> MCPServerResponse:
-    """Project a Custom API into the aggregate connector response contract."""
+    """Project a Custom API into the aggregate connector response contract.
+
+    ``can_edit_global`` mirrors the exact predicate ``update_custom_api``
+    (custom_api.py) gates its write on -- ``user_api.can_edit`` or a
+    granting team verdict -- duplicated here rather than shared, because
+    that route's gate lives in a different module this function cannot
+    reach into. Keep the two in lockstep: this field must never read
+    ``False`` for a connector whose ``PUT`` would return 2xx.
+    """
     masked_env: dict[str, Any] = _mask_env(api.env) if isinstance(api.env, dict) else {}
     config: dict[str, Any] = {"env": masked_env}
     for field_name in ("url", "method", "headers", "body"):
@@ -1618,7 +1653,8 @@ def _custom_api_to_mcp_response(
         runtime_input_schema=api.runtime_input_schema,
         runtime_bindings=api.runtime_bindings,
         allow_delegated_authorization=bool(api.allow_delegated_authorization),
-        can_edit_global=bool(user_api.can_edit),
+        can_edit_global=bool(user_api.can_edit)
+        or bool(team_access is not None and team_access.can_edit),
         transport_display="Custom API",
         created_at=_format_optional_datetime(api.created_at),
         updated_at=_format_optional_datetime(api.updated_at),
@@ -2114,39 +2150,48 @@ def _local_mcp_can_authorize(
 
 def _local_mcp_can_configure(
     association: Union[UserMCPServer, UserCustomApi, None],
+    team_access: "ConnectorAccess | None" = None,
 ) -> bool:
     """Whether this viewer's configuration route would resolve for a local entry.
 
     One rule for both local branches: the four routes the picker's Configure
-    button reaches all take the same first gate -- a personal association row
-    for the calling user -- and answer 404 without one. ``GET``/``PUT
-    /api/mcp/servers/{id}`` (mcp.py) and ``GET``/``PUT /api/custom-apis/{id}``
-    (custom_api.py) each query by ``user_id`` + connector id and raise 404 on
-    an empty result, which is why a team-owned connector reaching a member
-    through the visibility overlay alone (``association is None``) is not
-    configurable however visible or attachable it is.
+    button reaches -- ``GET``/``PUT /api/mcp/servers/{id}`` (mcp.py) and
+    ``GET``/``PUT /api/custom-apis/{id}`` (custom_api.py) -- each resolve the
+    caller from the same two sources: a personal association row for the
+    calling user, or, when there is none, the caller's team access verdict
+    for the connector. Either source alone is enough to reach the route;
+    404 only when both are absent. A team-owned connector reaching a member
+    through the visibility overlay alone (``association is None``) is
+    therefore configurable exactly when that member's own verdict links it
+    (``team_access is not None``), independent of whatever the visibility
+    overlay itself decided.
 
-    Deliberately reads nothing but the association's existence:
+    Deliberately reads nothing else:
 
     - Not the connector's shape. Unlike ``can_attach``/``can_authorize``, no
       route this answers for treats the mcp_oauth shape differently.
     - Not ``is_active``. Neither route filters it, so a deactivated connector's
       owner can still open and save its form -- and withholding the button
       there would remove the only affordance that population has left.
-    - Not ``can_edit``. Existence alone is what the four routes' first gate
+    - Not ``can_edit``, and not the verdict's own ``can_edit`` field. A
+      verdict that links the connector but denies edit still resolves the
+      route -- the form opens, and a save attempt is refused owner-side, not
+      here. Existence of either source is what the four routes' first gate
       reads, and it is what this answers. Custom API's ``PUT`` has a second,
-      owner-side gate on ``can_edit`` (403), so this field's accuracy there
-      rests on a convention rather than an identity: the one production write
-      point sets ``can_edit=True`` (custom_api.py), and no other code path
-      creates the row. A future writer that leaves the column at its ``False``
-      default would make this field claim an editable entry whose save is
-      refused -- add that gate here if that ever happens.
+      owner-side gate on ``can_edit``/the verdict (403), so this field's
+      accuracy there rests on a convention rather than an identity: the one
+      production write point sets ``can_edit=True`` (custom_api.py), and no
+      other code path creates the row. A future writer that leaves the
+      column at its ``False`` default would make this field claim an
+      editable entry whose save is refused -- add that gate here if that
+      ever happens.
 
     This is a UI hint, never a permission. Editing the shared configuration is
     additionally gated owner-side (``_check_mcp_permission(require="edit")``
-    for MCP, ``can_edit`` for Custom API), and a forged value grants nothing.
+    for MCP, ``can_edit``/the verdict for Custom API), and a forged value
+    grants nothing.
     """
-    return association is not None
+    return association is not None or team_access is not None
 
 
 @mcp_router.get("/apps", response_model=List[dict])
@@ -2350,6 +2395,7 @@ def list_mcp_apps(
         # they always did.
         from ..services.connector_team_scope import (
             connector_visible_to_user,
+            resolve_connector_access_or_raise,
             visible_team_connector_ids,
         )
 
@@ -2413,6 +2459,16 @@ def list_mcp_apps(
             if category and category != "All":
                 continue
 
+            # A personal row already answers can_configure on its own; only
+            # a team-owned row with none (user_mcp is None) needs a verdict.
+            local_team_access = (
+                None
+                if user_mcp is not None
+                else resolve_connector_access_or_raise(
+                    db, cast(int, current_user.id), "mcp", cast(int, server.id)
+                )
+            )
+
             entry = {
                 "id": server.name,
                 "name": server.name,
@@ -2444,7 +2500,7 @@ def list_mcp_apps(
                     user_mcp,
                     token_resolver_installed=token_resolver_installed,
                 ),
-                "can_configure": _local_mcp_can_configure(user_mcp),
+                "can_configure": _local_mcp_can_configure(user_mcp, local_team_access),
             }
             # The picker dispatches its Connect button on auth_type, and custom
             # entries used to omit the field entirely — so an mcp_oauth server
@@ -2511,6 +2567,14 @@ def list_mcp_apps(
             if category and category != "All":
                 continue
 
+            local_team_access = (
+                None
+                if user_api is not None
+                else resolve_connector_access_or_raise(
+                    db, cast(int, current_user.id), "custom_api", cast(int, api.id)
+                )
+            )
+
             results.append(
                 {
                     "id": api.name,
@@ -2539,7 +2603,9 @@ def list_mcp_apps(
                         team_ids=team_ids["custom_api"],
                     ),
                     "can_authorize": False,
-                    "can_configure": _local_mcp_can_configure(user_api),
+                    "can_configure": _local_mcp_can_configure(
+                        user_api, local_team_access
+                    ),
                     "runtime_input_schema": api.runtime_input_schema,
                     "runtime_bindings": api.runtime_bindings,
                     "allow_delegated_authorization": bool(
@@ -2588,11 +2654,27 @@ def get_mcp_servers(
             if oauth.email and _oauth_account_can_connect(oauth)
         }
 
+        from ..services.connector_team_scope import (
+            resolve_connector_access_or_raise,
+            visible_team_connector_ids,
+        )
+
         is_admin = getattr(current_user, "is_admin", False)
         responses = []
         for user_mcp, server in user_mcps:
             app_id, provider, connected_account = _enrich_oauth_server_info(
                 db, server, oauth_emails
+            )
+            # An owner's reported right cannot change with a verdict (the
+            # edit branch returns True on is_owner alone), so only a
+            # non-owner personal row is worth a hook call: zero calls for
+            # is_owner=True rows, one call for is_owner=False rows.
+            team_access = (
+                None
+                if bool(getattr(user_mcp, "is_owner", False))
+                else resolve_connector_access_or_raise(
+                    db, effective_user_id, "mcp", int(server.id)
+                )
             )
             responses.append(
                 _db_server_to_response(
@@ -2603,6 +2685,7 @@ def get_mcp_servers(
                     app_id,
                     provider,
                     is_admin=is_admin,
+                    team_access=team_access,
                 )
             )
 
@@ -2615,12 +2698,19 @@ def get_mcp_servers(
         )
 
         for user_api, api in user_custom_apis:
-            responses.append(_custom_api_to_mcp_response(api, user_api))
+            team_access = (
+                None
+                if bool(getattr(user_api, "is_owner", False))
+                else resolve_connector_access_or_raise(
+                    db, effective_user_id, "custom_api", int(api.id)
+                )
+            )
+            responses.append(
+                _custom_api_to_mcp_response(api, user_api, team_access=team_access)
+            )
 
         # Append team-owned connectors the user has no personal row for, so a
         # team member sees the team's shared connectors in their own list.
-        from ..services.connector_team_scope import visible_team_connector_ids
-
         team_ids = visible_team_connector_ids(db, effective_user_id)
 
         own_mcp_ids = {int(server.id) for _um, server in user_mcps}
@@ -2632,6 +2722,11 @@ def get_mcp_servers(
                 app_id, provider, connected_account = _enrich_oauth_server_info(
                     db, server, oauth_emails
                 )
+                # No personal row at all -- every stand-in row is worth a
+                # hook call, unconditionally.
+                team_access = resolve_connector_access_or_raise(
+                    db, effective_user_id, "mcp", int(server.id)
+                )
                 responses.append(
                     _db_server_to_response(
                         server,
@@ -2641,6 +2736,7 @@ def get_mcp_servers(
                         app_id,
                         provider,
                         is_admin=is_admin,
+                        team_access=team_access,
                     )
                 )
 
@@ -2648,9 +2744,14 @@ def get_mcp_servers(
         missing_api = [aid for aid in team_ids["custom_api"] if aid not in own_api_ids]
         if missing_api:
             for api in db.query(CustomApi).filter(CustomApi.id.in_(missing_api)).all():
+                team_access = resolve_connector_access_or_raise(
+                    db, effective_user_id, "custom_api", int(api.id)
+                )
                 responses.append(
                     _custom_api_to_mcp_response(
-                        api, _TeamOwnedUserApi(effective_user_id)
+                        api,
+                        _TeamOwnedUserApi(effective_user_id),
+                        team_access=team_access,
                     )
                 )
 
@@ -2658,6 +2759,10 @@ def get_mcp_servers(
 
     except HTTPException:
         raise
+    except ConnectorRuntimeError as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
     except Exception as e:
         logger.error(f"Failed to list MCP servers: {e}")
         raise HTTPException(
@@ -2679,7 +2784,7 @@ def get_mcp_server(
 
         # Check user has access to this server: a personal row, or a team
         # access verdict for a connector the caller has none for.
-        user_mcp, server, _team_access = _resolve_mcp_server_for_request(
+        user_mcp, server, team_access = _resolve_mcp_server_for_request(
             db, int(user_id), server_id
         )
 
@@ -2707,6 +2812,7 @@ def get_mcp_server(
             app_id,
             provider,
             is_admin=getattr(current_user, "is_admin", False),
+            team_access=team_access,
         )
 
     except HTTPException:
@@ -3093,12 +3199,22 @@ def connect_mcp_app(
 
     db.refresh(assoc)
     logger.info(f"User {current_user.id} connected MCP app '{server_name}'")
+    # assoc is a personal row this call just created or updated, always with
+    # is_owner=False (connecting never grants ownership) -- resolved so the
+    # response's can_edit_global can reflect a granting team verdict rather
+    # than default to False for every connector this route ever returns.
+    from ..services.connector_team_scope import resolve_connector_access_or_raise
+
+    team_access = resolve_connector_access_or_raise(
+        db, int(current_user.id), "mcp", int(server.id)
+    )
     return _db_server_to_response(
         server,
         assoc,
         manager,
         app_id=str(app_info["id"]),
         is_admin=getattr(current_user, "is_admin", False),
+        team_access=team_access,
     )
 
 
@@ -3275,6 +3391,9 @@ def create_mcp_server(
         db.refresh(user_mcp)
 
         logger.info(f"Created MCP server '{server_data.name}' for user {user_id}")
+        # No verdict to resolve: user_mcp was just constructed above with
+        # is_owner=True, so _check_mcp_permission's edit branch returns True
+        # on that alone -- a team access verdict could not change the value.
         return _db_server_to_response(
             server, user_mcp, manager, is_admin=getattr(current_user, "is_admin", False)
         )
@@ -3494,7 +3613,11 @@ def update_mcp_server(
 
         logger.info(f"Updated MCP server '{server.name}' for user {user_id}")
         return _db_server_to_response(
-            server, user_mcp, manager, is_admin=getattr(current_user, "is_admin", False)
+            server,
+            user_mcp,
+            manager,
+            is_admin=getattr(current_user, "is_admin", False),
+            team_access=team_access,
         )
 
     except HTTPException:
@@ -3767,12 +3890,29 @@ async def toggle_mcp_server(
             f"{status_text.capitalize()} MCP server '{server.name}' for user {user_id}"
         )
 
+        # The gate above is unchanged (still 404s without a personal row);
+        # only the reported field below now reflects a team verdict, for a
+        # non-owner personal row this route already required to reach here.
+        from ..services.connector_team_scope import resolve_connector_access_or_raise
+
+        team_access = resolve_connector_access_or_raise(
+            db, int(user_id), "mcp", int(server.id)
+        )
         return _db_server_to_response(
-            server, user_mcp, manager, is_admin=getattr(current_user, "is_admin", False)
+            server,
+            user_mcp,
+            manager,
+            is_admin=getattr(current_user, "is_admin", False),
+            team_access=team_access,
         )
 
     except HTTPException:
         raise
+    except ConnectorRuntimeError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
     except Exception as e:
         db.rollback()
         logger.error(f"Failed to toggle MCP server: {e}")

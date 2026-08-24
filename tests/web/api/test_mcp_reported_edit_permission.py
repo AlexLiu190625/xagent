@@ -1,0 +1,555 @@
+"""The reported ``can_edit_global``/``can_configure`` fields agree with what
+the gates in earlier stages actually enforce, across every response-builder
+call site and both connector kinds -- and the four MCP OAuth routes, the
+rename call's scope, and every route's no-hook-installed shape are all
+unchanged by threading that verdict through.
+
+Every test installs hooks (or explicitly installs none) through
+``snapshot_connector_team_hooks`` so no hook state leaks between tests or
+into suites that run after this one.
+"""
+
+from __future__ import annotations
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from xagent.web.api.custom_api import CustomApiUpdate, get_custom_api, update_custom_api
+from xagent.web.api.mcp import (
+    MCPOAuthConnectRequest,
+    MCPOAuthDiscoverRequest,
+    MCPServerUpdate,
+    connect_mcp_oauth,
+    delete_mcp_oauth_grant,
+    discover_mcp_oauth,
+    get_mcp_oauth_status,
+    get_mcp_server,
+    get_mcp_servers,
+    list_mcp_apps,
+    toggle_mcp_server,
+    update_mcp_server,
+)
+from xagent.web.models.custom_api import CustomApi, UserCustomApi
+from xagent.web.models.database import Base
+from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.user import User
+from xagent.web.services.connector_team_scope import (
+    ConnectorAccess,
+    set_connector_team_hooks,
+    snapshot_connector_team_hooks,
+)
+
+
+@pytest.fixture()
+def db():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    session = session_factory()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+def _make_user(db, user_id: int, *, is_admin: bool = False) -> User:
+    user = User(
+        id=user_id, username=f"user-{user_id}", password_hash="x", is_admin=is_admin
+    )
+    db.add(user)
+    db.commit()
+    return user
+
+
+def _make_owned_server(db, owner_id: int, *, name: str = "shared-server") -> MCPServer:
+    server = MCPServer(name=name, transport="stdio", managed="external", command="true")
+    db.add(server)
+    db.flush()
+    db.add(
+        UserMCPServer(
+            user_id=owner_id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+    return server
+
+
+def _make_owned_api(db, owner_id: int, *, name: str = "shared-api") -> CustomApi:
+    api = CustomApi(name=name, url="https://example.com/api", method="GET")
+    db.add(api)
+    db.flush()
+    db.add(
+        UserCustomApi(
+            user_id=owner_id,
+            custom_api_id=api.id,
+            is_owner=True,
+            can_edit=True,
+            can_delete=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+    return api
+
+
+class TestListEndpointAccessHookCallBudget:
+    """D1: zero hook calls for an is_owner=True row, one for is_owner=False,
+    one for every stand-in row -- pinned with a counting test double, not a
+    query listener."""
+
+    def test_hook_is_called_exactly_once_per_non_owner_row_and_never_for_owner_rows(
+        self, db
+    ):
+        caller = _make_user(db, 1)
+        other_owner = _make_user(db, 2)
+
+        # P = 2 personal rows the caller owns outright.
+        owned = [_make_owned_server(db, caller.id, name=f"owned-{i}") for i in range(2)]
+
+        # Q = 3 personal rows the caller holds but does not own (a second
+        # link on a connector someone else owns).
+        shared_personal = []
+        for i in range(3):
+            server = _make_owned_server(db, other_owner.id, name=f"shared-personal-{i}")
+            db.add(
+                UserMCPServer(
+                    user_id=caller.id,
+                    mcpserver_id=server.id,
+                    is_owner=False,
+                    is_active=True,
+                )
+            )
+            db.commit()
+            shared_personal.append(server)
+
+        # R = 2 rows the caller has no personal row for at all, made visible
+        # through the separate visibility hook (not the access hook under
+        # test here).
+        stand_in = [
+            _make_owned_server(db, other_owner.id, name=f"stand-in-{i}")
+            for i in range(2)
+        ]
+
+        calls: list[tuple[int, str, int]] = []
+
+        def counting_access_hook(_db, user_id, connector_type, connector_id):
+            calls.append((user_id, connector_type, connector_id))
+            return None
+
+        def visibility_hook(_db, _user_id):
+            return {"mcp": {s.id for s in stand_in}, "custom_api": set()}
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=counting_access_hook, visibility=visibility_hook
+            )
+            get_mcp_servers(current_user=caller, db=db)
+
+        assert len(calls) == 3 + 2
+        # Sanity: never called for an owned row's id.
+        called_ids = {connector_id for _uid, _kind, connector_id in calls}
+        assert called_ids.isdisjoint({s.id for s in owned})
+        assert called_ids == {s.id for s in shared_personal} | {s.id for s in stand_in}
+
+
+class TestReportedEditPermissionConsistencyMcp:
+    """D2: the response's can_edit_global must agree across every surface
+    that reports it, for the same (user, connector) -- for MCP connectors,
+    across the list, GET, PUT's response and toggle's response."""
+
+    @pytest.mark.parametrize(
+        "population,access_answer,has_personal_row",
+        [
+            ("owner", None, True),
+            ("personal_non_owner_no_team_link", None, True),
+            (
+                "stand_in_granting_edit",
+                ConnectorAccess(team_owned=True, can_edit=True),
+                False,
+            ),
+            (
+                "stand_in_denying_edit",
+                ConnectorAccess(team_owned=True, can_edit=False),
+                False,
+            ),
+        ],
+    )
+    async def test_can_edit_global_agrees_across_list_get_put_and_toggle(
+        self, db, population, access_answer, has_personal_row
+    ):
+        owner = _make_user(db, 10)
+        caller = owner if population == "owner" else _make_user(db, 11)
+        server = _make_owned_server(db, owner.id, name=f"consistency-mcp-{population}")
+        server_id = server.id
+
+        if population == "personal_non_owner_no_team_link":
+            db.add(
+                UserMCPServer(
+                    user_id=caller.id,
+                    mcpserver_id=server_id,
+                    is_owner=False,
+                    is_active=True,
+                )
+            )
+            db.commit()
+
+        expected = population == "owner" or bool(
+            access_answer is not None and access_answer.can_edit
+        )
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda *_a, **_k: access_answer,
+                visibility=lambda _db, _uid: {"mcp": {server_id}, "custom_api": set()},
+            )
+
+            list_entries = get_mcp_servers(current_user=caller, db=db)
+            list_entry = next(r for r in list_entries if r.id == server_id)
+
+            get_response = get_mcp_server(server_id, current_user=caller, db=db)
+            put_response = update_mcp_server(
+                server_id, MCPServerUpdate(), current_user=caller, db=db
+            )
+
+            toggle_response = None
+            if has_personal_row:
+                toggle_response = await toggle_mcp_server(
+                    server_id, current_user=caller, db=db
+                )
+
+        assert list_entry.can_edit_global == expected
+        assert get_response.can_edit_global == expected
+        assert put_response.can_edit_global == expected
+        if toggle_response is not None:
+            assert toggle_response.can_edit_global == expected
+
+
+class TestReportedEditPermissionConsistencyCustomApi:
+    """D2, for the Custom API kind: ``_custom_api_to_mcp_response`` has no
+    ``_check_mcp_permission``-shaped gate to compare against and Custom
+    API's own ``GET``/``PUT`` response model carries no ``can_edit_global``
+    field at all -- so the surface to agree with is not a second reported
+    field but ``update_custom_api``'s actual 2xx/403 outcome, exactly the
+    motivating case: the list must not report ``False`` for a connector
+    whose ``PUT`` now succeeds."""
+
+    @pytest.mark.parametrize(
+        "population,access_answer",
+        [
+            ("owner", None),
+            ("personal_non_owner_no_team_link", None),
+            (
+                "stand_in_granting_edit",
+                ConnectorAccess(team_owned=True, can_edit=True),
+            ),
+            (
+                "stand_in_denying_edit",
+                ConnectorAccess(team_owned=True, can_edit=False),
+            ),
+        ],
+    )
+    async def test_list_can_edit_global_agrees_with_whether_put_actually_succeeds(
+        self, db, population, access_answer
+    ):
+        owner = _make_user(db, 20)
+        caller = owner if population == "owner" else _make_user(db, 21)
+        api = _make_owned_api(db, owner.id, name=f"consistency-api-{population}")
+        api_id = api.id
+
+        if population == "personal_non_owner_no_team_link":
+            db.add(
+                UserCustomApi(
+                    user_id=caller.id,
+                    custom_api_id=api_id,
+                    is_owner=False,
+                    can_edit=False,
+                    is_active=True,
+                )
+            )
+            db.commit()
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda *_a, **_k: access_answer,
+                visibility=lambda _db, _uid: {"mcp": set(), "custom_api": {api_id}},
+            )
+
+            list_entries = get_mcp_servers(current_user=caller, db=db)
+            list_entry = next(
+                r
+                for r in list_entries
+                if r.id == api_id and r.transport == "custom_api"
+            )
+
+            try:
+                await update_custom_api(
+                    api_id,
+                    CustomApiUpdate(description="edited by the consistency test"),
+                    current_user=caller,
+                    db=db,
+                )
+                put_succeeded = True
+            except HTTPException as exc:
+                assert exc.status_code == 403
+                put_succeeded = False
+
+        assert list_entry.can_edit_global == put_succeeded
+
+
+class TestLocalCanConfigureWidening:
+    """D3: ``_local_mcp_can_configure`` now also answers True for a
+    stand-in whose team access verdict links the connector but denies edit
+    -- previously invisible (``association is None`` alone), now visible
+    and reachable, for both connector kinds."""
+
+    def test_mcp_stand_in_with_a_linked_but_not_editable_verdict_is_configurable(
+        self, db
+    ):
+        owner = _make_user(db, 30)
+        member = _make_user(db, 31)
+        server = _make_owned_server(db, owner.id, name="visible-not-editable-mcp")
+        server_id = server.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda *_a, **_k: ConnectorAccess(
+                    team_owned=True, can_edit=False
+                ),
+                visibility=lambda _db, _uid: {"mcp": {server_id}, "custom_api": set()},
+            )
+            entries = list_mcp_apps(location="local", current_user=member, db=db)
+            entry = next(e for e in entries if e["server_id"] == server_id)
+            assert entry["can_configure"] is True
+
+            # The actual route (fixed independently of this UI hint) already
+            # resolves for this population -- this proves the hint agrees.
+            response = get_mcp_server(server_id, current_user=member, db=db)
+        assert response.id == server_id
+
+    async def test_custom_api_stand_in_with_a_linked_but_not_editable_verdict_is_configurable(
+        self, db
+    ):
+        owner = _make_user(db, 32)
+        member = _make_user(db, 33)
+        api = _make_owned_api(db, owner.id, name="visible-not-editable-api")
+        api_id = api.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda *_a, **_k: ConnectorAccess(
+                    team_owned=True, can_edit=False
+                ),
+                visibility=lambda _db, _uid: {"mcp": set(), "custom_api": {api_id}},
+            )
+            entries = list_mcp_apps(location="local", current_user=member, db=db)
+            entry = next(
+                e
+                for e in entries
+                if e["server_id"] == api_id and e["transport"] == "custom_api"
+            )
+            assert entry["can_configure"] is True
+
+            response = await get_custom_api(api_id, current_user=member, db=db)
+        assert response.id == api_id
+
+
+class TestOAuthRoutesKeepTheirOwnGate:
+    """D5: the four MCP OAuth routes keep the old personal-row-only helper
+    and still 404 a team member with no personal row, verdict or not."""
+
+    async def test_all_four_oauth_routes_404_a_team_member_with_no_personal_row(
+        self, db
+    ):
+        owner = _make_user(db, 40)
+        member = _make_user(db, 41)
+        server = _make_owned_server(db, owner.id, name="oauth-gate-untouched")
+        server_id = server.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda *_a, **_k: ConnectorAccess(team_owned=True, can_edit=True)
+            )
+
+            with pytest.raises(HTTPException) as exc:
+                await discover_mcp_oauth(
+                    server_id, MCPOAuthDiscoverRequest(), current_user=member, db=db
+                )
+            assert exc.value.status_code == 404
+
+            with pytest.raises(HTTPException) as exc:
+                await connect_mcp_oauth(
+                    server_id,
+                    MCPOAuthConnectRequest(),
+                    current_user=member,
+                    db=db,
+                    accept=None,
+                )
+            assert exc.value.status_code == 404
+
+            with pytest.raises(HTTPException) as exc:
+                await get_mcp_oauth_status(server_id, current_user=member, db=db)
+            assert exc.value.status_code == 404
+
+            with pytest.raises(HTTPException) as exc:
+                await delete_mcp_oauth_grant(server_id, 1, current_user=member, db=db)
+            assert exc.value.status_code == 404
+
+
+class TestDenyingVerdictIsFalseEverywhere:
+    """D5: a connector whose verdict denies edit reports can_edit_global
+    False in the list, in the response from GET, and in the response from
+    PUT alike."""
+
+    async def test_a_denying_verdict_yields_false_in_the_list_get_and_put_response(
+        self, db
+    ):
+        owner = _make_user(db, 50)
+        member = _make_user(db, 51)
+        server = _make_owned_server(db, owner.id, name="denied-everywhere")
+        server_id = server.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda *_a, **_k: ConnectorAccess(
+                    team_owned=True, can_edit=False
+                ),
+                visibility=lambda _db, _uid: {"mcp": {server_id}, "custom_api": set()},
+            )
+            list_entries = get_mcp_servers(current_user=member, db=db)
+            list_entry = next(r for r in list_entries if r.id == server_id)
+            get_response = get_mcp_server(server_id, current_user=member, db=db)
+            put_response = update_mcp_server(
+                server_id, MCPServerUpdate(), current_user=member, db=db
+            )
+
+        assert list_entry.can_edit_global is False
+        assert get_response.can_edit_global is False
+        assert put_response.can_edit_global is False
+
+
+class TestRenameStaysScopedToItsOwnConnector:
+    """D5: renaming one connector must not touch an outsider's own,
+    unrelated connector -- a regression guard on the rename call's scope,
+    unchanged by this stage but exercised again after threading the
+    verdict through the same route's response."""
+
+    def test_renaming_one_connector_does_not_touch_an_outsiders_own_connector(self, db):
+        owner_a = _make_user(db, 60)
+        editor = _make_user(db, 61)
+        outsider = _make_user(db, 62)
+
+        server_a = _make_owned_server(db, owner_a.id, name="rename-target")
+        server_b = _make_owned_server(db, outsider.id, name="outsiders-own-connector")
+        server_a_id, server_b_id = server_a.id, server_b.id
+
+        renamed_calls: list[tuple[int, str, str]] = []
+
+        def spy_renamed_hook(_db, _user_id, _connector_type, connector_id, old, new):
+            renamed_calls.append((connector_id, old, new))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda *_a, **_k: ConnectorAccess(
+                    team_owned=True, can_edit=True
+                ),
+                renamed=spy_renamed_hook,
+            )
+            update_mcp_server(
+                server_a_id,
+                MCPServerUpdate(name="renamed-target"),
+                current_user=editor,
+                db=db,
+            )
+
+        assert renamed_calls == [(server_a_id, "rename-target", "renamed-target")]
+
+        db.rollback()
+        outsiders_server = db.query(MCPServer).filter(MCPServer.id == server_b_id).one()
+        assert outsiders_server.name == "outsiders-own-connector"
+
+
+class TestStandaloneParityWithNoHookInstalled:
+    """D5: with no hook installed at all, every route in scope across
+    Stages A-D -- both GETs, both PUTs, toggle, and the list -- behaves
+    exactly as it did before any of this work started."""
+
+    async def test_every_route_in_scope_behaves_as_before_with_no_hook_installed(
+        self, db
+    ):
+        owner = _make_user(db, 70)
+        stranger = _make_user(db, 71)
+        server = _make_owned_server(db, owner.id, name="standalone-parity-mcp")
+        server_id = server.id
+        api = _make_owned_api(db, owner.id, name="standalone-parity-api")
+        api_id = api.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks()  # explicit reset: no hooks installed
+
+            get_response = get_mcp_server(server_id, current_user=owner, db=db)
+            assert get_response.can_edit_global is True
+
+            with pytest.raises(HTTPException) as exc:
+                get_mcp_server(server_id, current_user=stranger, db=db)
+            assert exc.value.status_code == 404
+
+            put_response = update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="parity"),
+                current_user=owner,
+                db=db,
+            )
+            assert put_response.can_edit_global is True
+
+            with pytest.raises(HTTPException) as exc:
+                update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(description="x"),
+                    current_user=stranger,
+                    db=db,
+                )
+            assert exc.value.status_code == 404
+
+            toggle_response = await toggle_mcp_server(
+                server_id, current_user=owner, db=db
+            )
+            assert toggle_response.can_edit_global is True
+
+            list_entries = get_mcp_servers(current_user=owner, db=db)
+            mcp_entry = next(r for r in list_entries if r.id == server_id)
+            assert mcp_entry.can_edit_global is True
+            custom_api_entry = next(
+                r
+                for r in list_entries
+                if r.id == api_id and r.transport == "custom_api"
+            )
+            assert custom_api_entry.can_edit_global is True
+
+            api_get_response = await get_custom_api(api_id, current_user=owner, db=db)
+            assert api_get_response.id == api_id
+
+            with pytest.raises(HTTPException) as exc:
+                await get_custom_api(api_id, current_user=stranger, db=db)
+            assert exc.value.status_code == 404
+
+            api_put_response = await update_custom_api(
+                api_id,
+                CustomApiUpdate(description="parity"),
+                current_user=owner,
+                db=db,
+            )
+            assert api_put_response.id == api_id
+
+            with pytest.raises(HTTPException) as exc:
+                await update_custom_api(
+                    api_id,
+                    CustomApiUpdate(description="x"),
+                    current_user=stranger,
+                    db=db,
+                )
+            assert exc.value.status_code == 404
