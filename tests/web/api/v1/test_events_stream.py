@@ -297,6 +297,14 @@ def test_error_frame_keeps_an_explicitly_empty_message():
     assert data == {"code": "task_deleted", "message": ""}
 
 
+def test_error_frame_defaults_to_the_code_s_own_message():
+    """The default wording is part of what a client reads; a dedup pass
+    left it with no assertion of its own."""
+    frame = es.error_frame("task_deleted")
+    data = json.loads(frame.split("data: ", 1)[1])
+    assert data == {"code": "task_deleted", "message": "The task no longer exists."}
+
+
 # ===== sink.send_text never raises =====
 
 
