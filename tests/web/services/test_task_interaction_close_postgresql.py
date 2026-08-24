@@ -31,6 +31,16 @@ claims (blocking a concurrent purge, not blocking a concurrent KEY SHARE
 stager) -- every case here runs one session against one fixture at a
 time. The lock-ordering guard is therefore statement-order-in-source-code
 evidence only, not lock-behavior evidence.
+
+The marker column travels with that grid and is asserted here too: the
+clear's own NOT EXISTS subquery is rendered by the dialect, so "the
+marker survives while a live row remains, and goes once none does" is
+not something the SQLite run can settle for PostgreSQL. What stays
+SQLite-only is the composition with a failing pre-injection read
+(test_task_interaction_close.py's
+test_close_keeps_the_marker_when_the_pre_injection_read_failed) --
+that one exercises Python control flow around the same two statements
+and has no dialect content.
 """
 
 from __future__ import annotations
@@ -146,9 +156,16 @@ def test_close_is_a_no_op_replaying_an_already_terminated_row(db) -> None:
     assert task_marker(db, task_id) is None
 
 
-def test_close_is_a_no_op_with_no_interaction_rows_at_all(db) -> None:
-    """Today's 100% case: the table has no production writer yet."""
-    task_id = seed_task_with_run(db, run_id="run-a", marker=None)
+@pytest.mark.parametrize("seeded_marker", [None, 1])
+def test_close_is_a_no_op_with_no_interaction_rows_at_all(
+    db, seeded_marker: int | None
+) -> None:
+    """No interaction row was ever staged for this run -- today's 100%
+    case, since the table has no production writer yet. The condition on
+    the clear is "no active row remains", not "the close matched
+    something", so the marker is zeroed the same way whether it started
+    unset or set."""
+    task_id = seed_task_with_run(db, run_id="run-a", marker=seeded_marker)
 
     rowcount = close_legacy_resume_interaction(
         db, task_id=task_id, run_id="run-a", interaction_id=None
@@ -294,13 +311,18 @@ def test_close_leaves_a_question_staged_after_the_injection_alone(db) -> None:
     assert survivor.status == "active"
     assert survivor.terminal_reason is None
     assert row_state(db, observed_id).status == "terminated"
+    assert task_marker(db, task_id) == 1
 
 
-def test_close_with_no_observed_row_still_clears_the_marker(db) -> None:
+def test_close_keeps_the_marker_when_no_row_was_observed_but_one_is_active(
+    db,
+) -> None:
     """interaction_id=None renders as ``id IS NULL``, never true of a
-    primary key, so the close matches nothing -- while the marker clear
-    runs regardless. Identical to the SQLite result, confirmed here
-    because the rendering is the dialect's, not this module's."""
+    primary key, so the close matches nothing -- and here the marker stays,
+    because the row the pre-injection read failed to name is still active.
+    Identical to the SQLite result, confirmed here because both the ``IS
+    NULL`` rendering and the NOT EXISTS subquery are the dialect's, not
+    this module's."""
 
     task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     row_id = seed_active_row(db, task_id=task_id, run_id="run-a")
@@ -312,4 +334,4 @@ def test_close_with_no_observed_row_still_clears_the_marker(db) -> None:
 
     assert rowcount == 0
     assert row_state(db, row_id).status == "active"
-    assert task_marker(db, task_id) is None
+    assert task_marker(db, task_id) == 1

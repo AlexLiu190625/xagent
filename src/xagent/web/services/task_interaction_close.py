@@ -15,11 +15,14 @@ means.
 
 Three resume-abandonment paths (the WebSocket lease restore, the A2A
 prelease restore, and the v1 reply prelease restore) do the mirror-image
-cleanup when a resume is undone instead of completed: if the marker no
-longer corresponds to any active row, clear it. That clear is conditioned
-on ``NOT EXISTS`` rather than unconditional, because an abandonment can
-also race a resume that never even reached the injection call -- clearing
-unconditionally there would erase a marker that is still correct for a
+cleanup when a resume is undone instead of completed: there is no row to
+retire, only a marker to reconcile. Both clears -- theirs and the
+injection paths' -- are conditioned on the same ``NOT EXISTS``
+(``_active_row_exists``), for the same reason from two directions. An
+abandonment can race a resume that never even reached the injection
+call, and an injection can be handed no id because the pre-injection
+read failed while a question was in fact live; in either case an
+unconditional clear would erase a marker that is still correct for a
 question that is still active.
 
 A fourth WebSocket exit path does not clear the marker at all:
@@ -162,13 +165,15 @@ def active_interaction_id_sync(task_id: int) -> int | None:
 
     Returns ``None`` when the read cannot be made at all -- no table yet,
     no session, a failing query. ``None`` closes nothing: the close
-    statement matches zero rows and the active row survives, which
-    degrades to a reader falling back to the legacy transcript question,
-    the same benign outcome the module docstring describes for a stale
-    marker. The alternative -- closing on the old unbound predicate when
-    the read fails -- is the retire-the-wrong-row bug this function exists
-    to prevent, so an unreadable id must never widen what the close
-    matches.
+    statement matches zero rows and the active row survives -- and so
+    does the marker, because the clear beside the close is conditioned on
+    no active row remaining for this ``(task_id, run_id)`` pair (see
+    ``close_legacy_resume_interaction``). A reader keeps seeing the live
+    native question the read could not see, instead of falling back to
+    the legacy transcript question. The alternative -- closing on the old
+    unbound predicate when the read fails -- is the retire-the-wrong-row
+    bug this function exists to prevent, so an unreadable id must never
+    widen what the close matches.
     """
     from .task_interaction_service import _active_native_row_criteria
 
@@ -197,6 +202,51 @@ def active_interaction_id_sync(task_id: int) -> int | None:
         return None
 
 
+def _active_row_exists(*, task_id: int, run_id: str) -> sa.Exists:
+    """The EXISTS clause both marker clears in this module are conditioned on.
+
+    "This ``(task_id, run_id)`` pair still has a live interaction row":
+    the row's own lifecycle state (``status == "active"`` and
+    ``active_slot IS NOT NULL``) plus the pair itself. Written once and
+    referenced from both UPDATE statements instead of twice, because the
+    two clears mean the same thing by "no longer names any active row"
+    and must not drift into two readings of it.
+
+    Negated at both use sites -- neither clear runs while a live row
+    remains. The ``run_id`` leg compares against the value the caller
+    passed, which in both cases is the run the caller is finishing or
+    abandoning, so a live row belonging to some other run of the same
+    task is out of scope in both directions: it does not hold this
+    clear back, and this clear does not touch its marker.
+
+    Not the same predicate as ``_active_native_row_criteria``
+    (``task_interaction_service.py``), which this module also imports, in
+    ``active_interaction_id_sync``. That one's third leg is
+    ``TaskInteractionRequest.run_id == Task.run_id`` -- a comparison
+    against the task row a reader has already joined -- while this one
+    compares against a caller-supplied value. Today the two select the
+    same rows at both use sites, but only because each outer UPDATE
+    already pins ``Task.run_id == run_id``; the agreement is a
+    consequence of the surrounding statement, not a property of either
+    predicate. Swapping this clause for that one is therefore not a
+    simplification: it would turn both subqueries into correlated
+    subqueries against the row being updated, and it would re-point the
+    compensation paths' clear at whichever run the task currently
+    carries instead of at the run being abandoned.
+    """
+
+    return (
+        sa.select(sa.literal(1))
+        .where(
+            TaskInteractionRequest.task_id == task_id,
+            TaskInteractionRequest.run_id == run_id,
+            TaskInteractionRequest.status == "active",
+            TaskInteractionRequest.active_slot.isnot(None),
+        )
+        .exists()
+    )
+
+
 def close_legacy_resume_interaction(
     db: Session,
     *,
@@ -212,12 +262,18 @@ def close_legacy_resume_interaction(
     docstring carries the argument for why the value has to come from
     before the injection.
 
-    ``interaction_id=None`` means there was no active row to answer at
-    injection time. SQLAlchemy renders it as ``id IS NULL``, which is
-    never true of a primary key, so the close matches zero rows -- and the
-    marker clear below still runs, which is the whole behavior that case
-    needs. Do not "simplify" this into skipping the statement or dropping
-    the predicate: both change which rows the close can touch.
+    ``interaction_id=None`` means the pre-injection read produced no id --
+    either because no row was active at injection time, or because the
+    read could not be made at all (see ``active_interaction_id_sync``).
+    SQLAlchemy renders it as ``id IS NULL``, which is never true of a
+    primary key, so the close matches zero rows. What happens to the
+    marker then is not fixed by this argument and depends on which of
+    those two cases it was: the clear below runs its own check, and
+    zeroes the marker only if nothing active is left. Nothing was ever
+    there in the first case, so the marker clears; a live row the read
+    could not see is still there in the second, so it does not. Do not
+    "simplify" this into skipping the close statement or dropping its id
+    predicate: both change which rows the close can touch.
 
     Caller obligations, because neither happens here: the caller has
     already confirmed ``interaction_requests_table_exists(db)`` -- this
@@ -225,11 +281,24 @@ def close_legacy_resume_interaction(
     targets both tables -- and the caller owns the transaction; this
     function never commits or rolls back.
 
-    Both statements always run, regardless of the close statement's
-    rowcount: the clear is not conditioned on having actually closed a
-    row, because a task's marker can legitimately need clearing even when
-    this run never staged an interaction row at all (today's 100% case,
-    since this table has no production writer yet).
+    Both statements always run, and neither is conditioned on the other's
+    rowcount -- but the clear carries a condition of its own: it zeroes
+    the marker only when no active row for this ``(task_id, run_id)``
+    pair remains once the close above has had its turn. That covers the
+    case this function is normally in (the close retired the one live
+    row, so nothing is left and the marker goes) and today's 100% case
+    (this run never staged a row at all, so nothing was ever there and
+    the marker still goes, since the table has no production writer yet),
+    while refusing the case that used to lose a question: the
+    pre-injection read came back ``None`` -- or came back with an id the
+    close did not match -- while a live row is in fact still sitting
+    there. Zeroing the marker then would point every reader at the legacy
+    transcript question while the native row it named is still active and
+    unanswered.
+
+    The condition is ``_active_row_exists``, the same clause
+    ``clear_interaction_marker_if_unpaired`` is built on: "no active row
+    for this pair" has to mean one thing in this module, not two.
 
     Returns the close statement's rowcount, classified and logged by
     ``_classify_close_rowcount`` -- see the module docstring for why a
@@ -263,7 +332,11 @@ def close_legacy_resume_interaction(
     _classify_close_rowcount(rowcount, task_id=task_id, run_id=run_id)
     db.execute(
         sa.update(Task)
-        .where(Task.id == task_id, Task.run_id == run_id)
+        .where(
+            Task.id == task_id,
+            Task.run_id == run_id,
+            ~_active_row_exists(task_id=task_id, run_id=run_id),
+        )
         .values(interaction_protocol_version=None)
     )
     return rowcount
@@ -354,22 +427,12 @@ def clear_interaction_marker_if_unpaired(
     """
     if not interaction_requests_table_exists(db):
         return
-    still_active = (
-        sa.select(sa.literal(1))
-        .where(
-            TaskInteractionRequest.task_id == task_id,
-            TaskInteractionRequest.run_id == run_id,
-            TaskInteractionRequest.status == "active",
-            TaskInteractionRequest.active_slot.isnot(None),
-        )
-        .exists()
-    )
     db.execute(
         sa.update(Task)
         .where(
             Task.id == task_id,
             Task.run_id == run_id,
-            ~still_active,
+            ~_active_row_exists(task_id=task_id, run_id=run_id),
         )
         .values(interaction_protocol_version=None)
     )

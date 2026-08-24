@@ -172,15 +172,23 @@ def test_close_is_a_no_op_replaying_an_already_terminated_row(db) -> None:
     row = row_state(db, row_id)
     assert row.status == "terminated"
     assert row.terminal_reason == original_terminal_reason
-    # The clear runs unconditionally: a marker left dangling by an earlier,
-    # incomplete write still gets zeroed even though this close matched no
-    # row of its own.
+    # The clear does not need this close to have matched anything -- it
+    # needs nothing active to be left, and this row is already terminated.
+    # A marker left dangling by an earlier, incomplete write still gets
+    # zeroed here.
     assert task_marker(db, task_id) is None
 
 
-def test_close_is_a_no_op_with_no_interaction_rows_at_all(db) -> None:
-    """Today's 100% case: the table has no production writer yet."""
-    task_id = seed_task_with_run(db, run_id="run-a", marker=None)
+@pytest.mark.parametrize("seeded_marker", [None, 1])
+def test_close_is_a_no_op_with_no_interaction_rows_at_all(
+    db, seeded_marker: int | None
+) -> None:
+    """No interaction row was ever staged for this run -- today's 100%
+    case, since the table has no production writer yet. The condition on
+    the clear is "no active row remains", not "the close matched
+    something", so the marker is zeroed the same way whether it started
+    unset or set."""
+    task_id = seed_task_with_run(db, run_id="run-a", marker=seeded_marker)
 
     rowcount = close_legacy_resume_interaction(
         db, task_id=task_id, run_id="run-a", interaction_id=None
@@ -240,17 +248,19 @@ def test_close_does_not_overwrite_a_row_already_recycled_by_another_terminal_rea
 
 # What the primary-key predicate does on its own, holding everything else
 # constant: one active row for this task and run, and only the id handed to
-# the close varies.
+# the close varies. The marker follows the row, not the rowcount: it clears
+# when nothing active is left, and survives when the close missed the live
+# row -- whatever the reason it missed.
 @pytest.mark.parametrize(
-    ("id_to_pass", "expected_rowcount"),
+    ("id_to_pass", "expected_rowcount", "expected_marker"),
     [
-        pytest.param("the_active_row", 1, id="the_row_observed_before_injection"),
-        pytest.param(None, 0, id="no_row_was_active_at_injection_time"),
-        pytest.param("another_row", 0, id="a_row_that_is_not_this_tasks_active_one"),
+        pytest.param("the_active_row", 1, None, id="the_row_observed_before_injection"),
+        pytest.param(None, 0, 1, id="no_row_was_active_at_injection_time"),
+        pytest.param("another_row", 0, 1, id="a_row_that_is_not_this_tasks_active_one"),
     ],
 )
 def test_close_retires_only_the_row_it_was_given(
-    db, id_to_pass: str | None, expected_rowcount: int
+    db, id_to_pass: str | None, expected_rowcount: int, expected_marker: int | None
 ) -> None:
     task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     row_id = seed_active_row(db, task_id=task_id, run_id="run-a")
@@ -272,10 +282,7 @@ def test_close_retires_only_the_row_it_was_given(
     assert (row_state(db, row_id).status == "terminated") is (expected_rowcount == 1)
     # The other task's row is out of range of this close regardless.
     assert row_state(db, other_row_id).status == "active"
-    # The marker clear is not conditioned on the close matching anything: a
-    # run that had no active row at injection time still needs its marker
-    # zeroed.
-    assert task_marker(db, task_id) is None
+    assert task_marker(db, task_id) == expected_marker
 
 
 def test_close_sync_opens_its_own_transaction_and_commits(db) -> None:
@@ -409,7 +416,13 @@ def test_active_interaction_id_sync_returns_none_when_the_read_fails(
 ) -> None:
     """A failing read must return None, not raise: the caller is on the
     injection path, and None closes nothing, while an exception would take
-    the injection down with it."""
+    the injection down with it.
+
+    What "closes nothing" costs is pinned separately, by
+    test_close_keeps_the_marker_when_the_pre_injection_read_failed below:
+    the close matches no row and the marker stays, so the live question
+    the read could not see keeps its reader.
+    """
     task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     seed_active_row(db, task_id=task_id, run_id="run-a")
 
@@ -424,6 +437,41 @@ def test_active_interaction_id_sync_returns_none_when_the_read_fails(
         assert active_interaction_id_sync(task_id) is None
 
     assert [record.levelno for record in caplog.records] == [logging.WARNING]
+
+
+def test_close_keeps_the_marker_when_the_pre_injection_read_failed(
+    db, monkeypatch
+) -> None:
+    """The two halves composed: the pre-injection read fails, so the close
+    is handed ``None`` and matches nothing -- and the marker survives,
+    because the question the read could not see is still active and still
+    unanswered. Clearing it there would point every reader at the legacy
+    transcript question while the native row it named waits for an answer.
+
+    The failure is injected only for the read: the close below opens its
+    own session through the same factory and has to reach a working
+    database, which is exactly the production shape -- one unreadable
+    query, not an unreachable database.
+    """
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    row_id = seed_active_row(db, task_id=task_id, run_id="run-a")
+
+    def _fail():
+        raise sa.exc.OperationalError("SELECT 1", {}, Exception("database is locked"))
+
+    with monkeypatch.context() as failing_read:
+        failing_read.setattr(
+            "xagent.web.services.task_interaction_close.get_session_local", _fail
+        )
+        observed_id = active_interaction_id_sync(task_id)
+
+    assert observed_id is None
+
+    rowcount = close_legacy_resume_interaction_sync(task_id, "run-a", observed_id)
+
+    assert rowcount == 0
+    assert row_state(db, row_id).status == "active"
+    assert task_marker(db, task_id) == 1
 
 
 # --------------------------------------------------------------------------
@@ -565,6 +613,11 @@ def test_close_leaves_a_question_staged_after_the_injection_alone(db) -> None:
     # The row that was observed before injection is terminal either way --
     # the reclaim retired it as expired when the new question took the slot.
     assert row_state(db, observed_id).status == "terminated"
+    # The marker stays with the surviving question. This is the whole
+    # reason the clear is conditioned: the run does have a live native
+    # question, and zeroing the marker would send every reader to the
+    # legacy transcript question instead of to this one.
+    assert task_marker(db, task_id) == 1
 
 
 def test_close_lets_a_second_question_on_the_same_run_become_active(db) -> None:
