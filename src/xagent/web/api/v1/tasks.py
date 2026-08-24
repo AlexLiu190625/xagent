@@ -1437,18 +1437,25 @@ async def stream_chat_task_events(
         hand from the snapshot that picked this path. Step content goes
         out at all only once the task row has been read once more and
         confirmed to still be the same run/state generation as the
-        snapshot that picked this path -- a task that restarted in
-        between (a ``POST reply`` resuming a waiting task, or a WS
-        append resuming a finished one) moves the row to a new
+        snapshot that picked this path, *and* the steps cursor
+        (``max_event_id``) is confirmed unmoved since -- a task that
+        restarted in between (a ``POST reply`` resuming a waiting task,
+        or a WS append resuming a finished one) moves the row to a new
         generation, which means the steps just read may already belong
-        to it while the conclusion still describes the old one. A
-        confirmed match sends both the steps and the conclusion; a
-        confirmed change still sends the conclusion but withholds the
-        steps, closing with ``resync_required`` instead; and a reread
-        that fails outright is treated like the steps-read failure
-        above -- no step content goes out, but the conclusion (already
-        known-good, independent of this reread) still does, followed by
-        ``stream.error`` naming why -- ``task_deleted`` or
+        to it while the conclusion still describes the old one; a trace
+        row landing in that same window can advance the cursor without
+        touching ``run_id``/``state_version`` at all (trace rows write
+        through their own commit, which can update the task row's own
+        checkpoint-pointer columns while the task is running but never
+        touches those two fields), so the generation check alone cannot
+        see it. Both checks have to pass for the steps to go out: a
+        confirmed match on both sends the steps, then the conclusion; a
+        confirmed change on either still sends the conclusion but
+        withholds the steps, closing with ``resync_required`` instead;
+        and a reread that fails outright is treated like the steps-read
+        failure above -- no step content goes out, but the conclusion
+        (already known-good, independent of this reread) still does,
+        followed by ``stream.error`` naming why -- ``task_deleted`` or
         ``resync_required`` by the same rule. A failure while
         serializing an individual step is handled the same way: the
         conclusion frame goes out, followed by
@@ -1546,4 +1553,5 @@ async def stream_chat_task_events(
         initial_snapshot=snapshot,
         read_task_snapshot=_load_task_info_snapshot,
         read_task_steps_response=_get_chat_task_steps_sync,
+        read_task_steps_version=_load_task_steps_version_snapshot,
     )

@@ -3320,6 +3320,403 @@ async def test_fast_path_generation_change_withholds_steps_but_still_concludes(
 
 
 @pytest.mark.parametrize(
+    ("second_max_event_id", "expect_resync"),
+    [
+        pytest.param(101, True, id="trace-row-landed"),
+        pytest.param(100, False, id="cursor-unchanged"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_trace_row_landing_between_reads_forces_resync(
+    stream_fn,
+    status,
+    conclusion_event,
+    extra_snapshot,
+    second_max_event_id,
+    expect_resync,
+):
+    """``DatabaseTraceHandler`` commits trace rows through its own
+    session; even on the commits that also write this task row's own
+    checkpoint-pointer columns, that write never touches ``run_id`` or
+    ``state_version``. So a trace row that lands after the steps read
+    and before the fence's recheck moves the steps cursor
+    (``max_event_id``) without moving either of those fields -- invisible
+    to ``_fast_path_generation_changed`` on its own. This pins the
+    second signal, ``_fast_path_steps_cursor_changed``: the cursor is
+    read once before the steps read and once more after the generation
+    reread passes, and a moved cursor takes the same withhold-and-resync
+    exit a moved generation does. The cursor-unchanged leg pins the
+    negative: two matching reads never withhold the step or close with
+    an error.
+    """
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    step = es.PublicStep(
+        id="tool_call:call-1",
+        type="tool_call",
+        status="completed",
+        started_at=base,
+        completed_at=base,
+        data={"name": "search", "result": "ok"},
+    )
+
+    def _read_task_steps_response(task_id_, principal_):
+        return SimpleNamespace(steps=[step])
+
+    def _unchanged_read_task_snapshot(task_id_, principal_):
+        return SimpleNamespace(run_id="run-1", state_version=1)
+
+    version_calls: list[tuple[int, object]] = []
+    version_replies = iter([100, second_max_event_id])
+
+    def _read_task_steps_version(task_id_, principal_):
+        version_calls.append((task_id_, principal_))
+        return SimpleNamespace(max_event_id=next(version_replies))
+
+    snapshot = SimpleNamespace(
+        task_id=1,
+        agent_id=1,
+        status=status,
+        run_id="run-1",
+        state_version=1,
+        **extra_snapshot,
+    )
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=_FENCE_PRINCIPAL,
+            read_task_steps_response=_read_task_steps_response,
+            read_task_snapshot=_unchanged_read_task_snapshot,
+            read_task_steps_version=_read_task_steps_version,
+        )
+    ]
+    body = "".join(frames)
+    assert version_calls == [
+        (snapshot.task_id, _FENCE_PRINCIPAL),
+        (snapshot.task_id, _FENCE_PRINCIPAL),
+    ]
+    assert body.count(f"event: {conclusion_event}") == 1
+    if expect_resync:
+        assert "event: step.completed" not in body
+        assert body.count("event: stream.error") == 1
+        assert "resync_required" in body
+        assert body.index(f"event: {conclusion_event}") < body.index(
+            "event: stream.error"
+        )
+    else:
+        assert body.count("event: step.completed") == 1
+        assert "event: stream.error" not in body
+
+
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_steps_cursor_baseline_is_captured_before_the_steps_read(
+    stream_fn, status, conclusion_event, extra_snapshot
+):
+    """The cursor baseline (``read_task_steps_version``'s first call) is
+    captured before the steps read runs, not after it returns -- pinned
+    here with a steps-read stub that advances the cursor as a side
+    effect, the shape a trace row landing mid-read actually takes: the
+    read and the row's commit interleave, rather than the row landing
+    only after the read has already finished. If the baseline were
+    captured after the steps read instead, it would already observe the
+    advanced cursor, and the recheck that follows would see no further
+    movement -- silently hiding exactly the race this second signal
+    exists to catch. The trace-row-landing test above stubs the version
+    reader with a fixed two-value sequence, which can't tell "captured
+    before the read" from "captured after" apart; this test can, because
+    the cursor's own value moves as a side effect of the steps read
+    itself.
+    """
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    step = es.PublicStep(
+        id="tool_call:call-1",
+        type="tool_call",
+        status="completed",
+        started_at=base,
+        completed_at=base,
+        data={"name": "search", "result": "ok"},
+    )
+    cursor_state = {"max_event_id": 100}
+
+    def _read_task_steps_response(task_id_, principal_):
+        # A trace row commits while this read is "in flight" -- the
+        # cursor moves as a side effect of the steps read itself, not
+        # via a separately-scripted later call.
+        cursor_state["max_event_id"] = 101
+        return SimpleNamespace(steps=[step])
+
+    def _unchanged_read_task_snapshot(task_id_, principal_):
+        return SimpleNamespace(run_id="run-1", state_version=1)
+
+    version_calls: list[int] = []
+
+    def _read_task_steps_version(task_id_, principal_):
+        version_calls.append(cursor_state["max_event_id"])
+        return SimpleNamespace(max_event_id=cursor_state["max_event_id"])
+
+    snapshot = SimpleNamespace(
+        task_id=1,
+        agent_id=1,
+        status=status,
+        run_id="run-1",
+        state_version=1,
+        **extra_snapshot,
+    )
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=_FENCE_PRINCIPAL,
+            read_task_steps_response=_read_task_steps_response,
+            read_task_snapshot=_unchanged_read_task_snapshot,
+            read_task_steps_version=_read_task_steps_version,
+        )
+    ]
+    body = "".join(frames)
+    # The baseline call observed 100 (before the steps read mutated the
+    # counter); the recheck call observed 101 (after). A baseline
+    # captured post-read would have observed 101 both times, and the
+    # assertions below would fail.
+    assert version_calls == [100, 101]
+    assert "event: step.completed" not in body
+    assert body.count("event: stream.error") == 1
+    assert "resync_required" in body
+    assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
+
+
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_steps_cursor_baseline_read_failure_closes_before_the_steps_read(
+    stream_fn, status, conclusion_event, extra_snapshot
+):
+    """The cursor baseline read can fail the same way any other DB read
+    in this module can, and it fails before the steps read is ever
+    reached (see the call site in ``_fast_path_snapshot_stream``) -- so
+    the steps reader must never run, and the failure is classified
+    exactly like a failed steps read
+    (``_fast_path_steps_read_error_frame``): a task deleted in the gap
+    gets ``task_deleted``, everything else gets ``resync_required``. The
+    conclusion frame (already known-good from ``snapshot``) goes out
+    first either way.
+    """
+
+    def _unreachable_read_task_steps_response(task_id_, principal_):
+        raise AssertionError(
+            "the steps read must not run when the cursor baseline read failed"
+        )
+
+    def _unreachable_read_task_snapshot(task_id_, principal_):
+        raise AssertionError(
+            "the generation reread must not run when the cursor baseline read failed"
+        )
+
+    snapshot = SimpleNamespace(
+        task_id=1,
+        agent_id=1,
+        status=status,
+        run_id="run-1",
+        state_version=1,
+        **extra_snapshot,
+    )
+
+    def _transient_read_task_steps_version(task_id_, principal_):
+        raise RuntimeError("transient DB error reading the steps cursor")
+
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=None,
+            read_task_steps_response=_unreachable_read_task_steps_response,
+            read_task_snapshot=_unreachable_read_task_snapshot,
+            read_task_steps_version=_transient_read_task_steps_version,
+        )
+    ]
+    body = "".join(frames)
+    assert body.count(f"event: {conclusion_event}") == 1
+    assert body.count("event: stream.error") == 1
+    assert "resync_required" in body
+    assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
+
+    def _deleted_read_task_steps_version(task_id_, principal_):
+        raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
+
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=None,
+            read_task_steps_response=_unreachable_read_task_steps_response,
+            read_task_snapshot=_unreachable_read_task_snapshot,
+            read_task_steps_version=_deleted_read_task_steps_version,
+        )
+    ]
+    body = "".join(frames)
+    assert body.count(f"event: {conclusion_event}") == 1
+    assert "task_deleted" in body
+    assert "resync_required" not in body
+    assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
+
+
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_steps_cursor_recheck_failure_closes_for_resync_or_deleted(
+    stream_fn, status, conclusion_event, extra_snapshot
+):
+    """The cursor recheck (``read_task_steps_version``'s second call,
+    which only runs once the run_id/state_version reread has already
+    confirmed no change) can itself fail. It shares
+    ``_fast_path_generation_reread_error_frame`` with the
+    run_id/state_version reread's own failure -- by the time this call
+    raises, the generation was already confirmed unchanged, only the
+    cursor wasn't, which is exactly why that shared frame builder's
+    wording no longer names "generation" specifically.
+    """
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    step = es.PublicStep(
+        id="tool_call:call-1",
+        type="tool_call",
+        status="completed",
+        started_at=base,
+        completed_at=base,
+        data={"name": "search", "result": "ok"},
+    )
+
+    def _read_task_steps_response(task_id_, principal_):
+        return SimpleNamespace(steps=[step])
+
+    def _unchanged_read_task_snapshot(task_id_, principal_):
+        return SimpleNamespace(run_id="run-1", state_version=1)
+
+    snapshot = SimpleNamespace(
+        task_id=1,
+        agent_id=1,
+        status=status,
+        run_id="run-1",
+        state_version=1,
+        **extra_snapshot,
+    )
+
+    calls = {"n": 0}
+
+    def _flaky_read_task_steps_version(task_id_, principal_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return SimpleNamespace(max_event_id=100)
+        raise RuntimeError("transient DB error rereading the steps cursor")
+
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=None,
+            read_task_steps_response=_read_task_steps_response,
+            read_task_snapshot=_unchanged_read_task_snapshot,
+            read_task_steps_version=_flaky_read_task_steps_version,
+        )
+    ]
+    body = "".join(frames)
+    assert body.count(f"event: {conclusion_event}") == 1
+    assert body.count("event: stream.error") == 1
+    assert "resync_required" in body
+    assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
+
+    calls2 = {"n": 0}
+
+    def _flaky_read_task_steps_version_deleted(task_id_, principal_):
+        calls2["n"] += 1
+        if calls2["n"] == 1:
+            return SimpleNamespace(max_event_id=100)
+        raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
+
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=None,
+            read_task_steps_response=_read_task_steps_response,
+            read_task_snapshot=_unchanged_read_task_snapshot,
+            read_task_steps_version=_flaky_read_task_steps_version_deleted,
+        )
+    ]
+    body = "".join(frames)
+    assert body.count(f"event: {conclusion_event}") == 1
+    assert "task_deleted" in body
+    assert "resync_required" not in body
+    assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
+
+
+@pytest.mark.parametrize(
     ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
     [
         pytest.param(
@@ -3412,7 +3809,11 @@ async def test_fast_path_generation_reread_failure_concludes_then_closes_for_res
     this path read is withheld since its generation was never confirmed,
     and the accompanying ``stream.error`` must describe what actually
     happened -- the reread itself failed -- not claim the task moved to a
-    new run, which was never established either way.
+    new run, which was never established either way. ``read_task_steps_version``
+    is not supplied here, so this exercises
+    ``_fast_path_generation_reread_error_frame``'s generic wording on
+    its own, independent of the cursor recheck that can also route
+    through it (see ``test_fast_path_steps_cursor_recheck_failure_closes_for_resync_or_deleted``).
     """
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     step = es.PublicStep(
@@ -3458,6 +3859,10 @@ async def test_fast_path_generation_reread_failure_concludes_then_closes_for_res
     assert "event: step.completed" not in body
     assert body.count("event: stream.error") == 1
     assert "resync_required" in body
+    # The wording names what actually failed to confirm -- the reread --
+    # not a claim that the task moved to a new run, which this failure
+    # never established either way.
+    assert "Confirming the task's steps are still current failed" in body
     assert "moved to a new run" not in body
     # The conclusion precedes the error on this exit too -- neither leg
     # asserted that before, so a reordered yield would have passed both.

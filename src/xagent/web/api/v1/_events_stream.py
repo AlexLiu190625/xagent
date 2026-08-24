@@ -327,6 +327,18 @@ TaskSnapshotReader = Callable[[int, "ApiKeyPrincipal"], Any]
 # and re-projecting the task's full trace history independently.
 TaskStepsResponseReader = Callable[[int, "ApiKeyPrincipal"], Any]
 
+# A sync callable: (task_id, principal) -> ``_TaskStepsVersionSnapshot``-
+# shaped object (duck-typed: ``.task_id`` / ``.agent_id`` /
+# ``.max_event_id``) -- the same cheap ``max(TraceEvent.id)`` read
+# ``tasks.py``'s ``_load_task_steps_version_snapshot`` runs for the
+# ``GET .../steps`` cache key. Distinct from ``TaskSnapshotReader``
+# because the two readers return different shapes: this one carries
+# ``max_event_id``, not ``run_id``/``state_version``. Used only by the
+# attach-time fast paths' steps-cursor fence (see
+# ``_fast_path_steps_cursor_changed``) to catch a trace row landing
+# between the steps read and the fence's recheck.
+TaskStepsVersionReader = Callable[[int, "ApiKeyPrincipal"], Any]
+
 # A callable of one argument -- ``snapshot_total_steps`` -- returning the
 # already-built conclusion frame (``task.completed`` /
 # ``task.input_required``) for one attach-time fast path. Bound by each
@@ -1639,6 +1651,19 @@ async def _fast_path_generation_changed(
     Losing a snapshot costs one ``steps()`` call; pairing a conclusion
     with step content from a generation this path never confirmed has no
     bounded cost.
+
+    This is one of two signals the caller checks before trusting the
+    steps it already read -- see ``_fast_path_steps_cursor_changed`` for
+    the other. Trace rows commit through ``DatabaseTraceHandler``'s own
+    session, and that commit can itself write this same task row: when
+    a checkpoint anchor lands while the task is ``RUNNING``,
+    ``trace_handlers.py`` issues an ``UPDATE tasks`` in the same commit
+    for ``last_checkpoint_event_id``/``last_checkpoint_trace_event_id``.
+    That UPDATE never sets ``run_id`` or ``state_version`` --
+    ``state_version`` has no ``onupdate``, so nothing bumps it but the
+    lifecycle writers named above -- so a trace row landing in the same
+    window this function is guarding still cannot move either field,
+    and this reread alone cannot see it.
     """
     current = await run_db_io_cancellation_safe(
         lambda: read_task_snapshot(original.task_id, principal)
@@ -1649,24 +1674,82 @@ async def _fast_path_generation_changed(
     )
 
 
+async def _fast_path_steps_cursor_changed(
+    task_id: int,
+    original_max_event_id: int,
+    principal: "ApiKeyPrincipal",
+    read_task_steps_version: TaskStepsVersionReader,
+) -> bool:
+    """Whether a trace row has landed since ``original_max_event_id`` was
+    captured, checked by rereading the steps cursor and comparing.
+
+    The companion signal to ``_fast_path_generation_changed``:
+    ``DatabaseTraceHandler`` commits trace rows (mapped to public
+    ``step.*`` content by ``read_task_steps_response``) through its own
+    session, and a checkpoint anchor row's commit can carry its own
+    ``UPDATE tasks`` (``last_checkpoint_event_id``/
+    ``last_checkpoint_trace_event_id``, gated on the task being
+    ``RUNNING``) -- but that UPDATE never sets ``run_id`` or
+    ``state_version``, so a trace row that lands after the steps read
+    returns and before this reread runs is invisible to the
+    run_id/state_version fence even on the commits that do write the
+    row. Reuses the same ``max(TraceEvent.id)`` query ``tasks.py``'s
+    ``_load_task_steps_version_snapshot`` already runs for the
+    ``GET .../steps`` cache key, so a landed row is caught at the same
+    cursor precision that cache already keys reads on.
+
+    ``original_max_event_id`` is captured before the steps read even
+    runs (see the call site in ``_fast_path_snapshot_stream``), not
+    after it returns -- the window this guards starts there, because a
+    trace row can land while that read is still in flight. That makes
+    the window this function actually checks slightly wider than "after
+    the steps read, before this recheck": a row landing *during* the
+    steps read is already reflected in the steps this call receives
+    (they were read after the baseline), yet the cursor still moved
+    between the baseline and this recheck, so this comparison flags it
+    as changed anyway. That is an accepted false positive, the same
+    trade ``_fast_path_generation_changed`` makes for an ordinary
+    intra-run write: the cost is one extra ``steps()`` call for a
+    client that already had a perfectly good snapshot, never a silent
+    gap.
+    """
+    current = await run_db_io_cancellation_safe(
+        lambda: read_task_steps_version(task_id, principal)
+    )
+    return bool(current.max_event_id != original_max_event_id)
+
+
 def _fast_path_generation_reread_error_frame(
     exc: BaseException, task_id: int, path_name: str
 ) -> str:
-    """Close frame for a failed ``_fast_path_generation_changed`` reread,
-    called from inside the ``except`` block it serves (same traceback-
-    attachment requirement as ``_fast_path_steps_read_error_frame``).
+    """Close frame for a failed reread inside the fence, called from
+    inside the ``except`` block it serves (same traceback-attachment
+    requirement as ``_fast_path_steps_read_error_frame``).
 
-    Classifies the same way that function does: a task deleted in the
-    gap between the steps read and this reread surfaces the same
-    ``V1ApiError(TASK_NOT_FOUND)`` and gets the same ``task_deleted``
-    frame; everything else gets ``resync_required``, logged.
+    Shared by two different rereads, and the wording below is written
+    to be true of either: ``_fast_path_generation_changed``'s
+    run_id/state_version reread, and, when it runs,
+    ``_fast_path_steps_cursor_changed``'s cursor recheck that follows
+    it. The two share one ``try``/``except`` (see the call site), so
+    this function cannot tell which of them actually raised -- and by
+    the time the cursor recheck runs at all, the generation reread has
+    already returned cleanly, so a failure here must never be described
+    as a failure to confirm the run/state generation specifically; that
+    part may already be confirmed, with only the cursor check left
+    unresolved.
+
+    Classifies the same way ``_fast_path_steps_read_error_frame`` does:
+    a task deleted in the gap between the steps read and this reread
+    surfaces the same ``V1ApiError(TASK_NOT_FOUND)`` and gets the same
+    ``task_deleted`` frame; everything else gets ``resync_required``,
+    logged.
 
     Kept separate from ``_fast_path_steps_read_error_frame`` rather than
     reused outright because the two failures warrant different
     ``resync_required`` wording -- the steps read never learned anything
-    about the task's generation, while this reread specifically failed
-    to confirm one, so the default steps-read wording would describe a
-    cause this failure didn't have.
+    about the task's generation or cursor, while this reread specifically
+    failed to confirm one of them, so the default steps-read wording
+    would describe a cause this failure didn't have.
     """
     if isinstance(exc, V1ApiError) and exc.code is V1ErrorCode.TASK_NOT_FOUND:
         return error_frame("task_deleted")
@@ -1680,8 +1763,8 @@ def _fast_path_generation_reread_error_frame(
     return error_frame(
         "resync_required",
         message=(
-            "Confirming the task's run/state generation failed; call "
-            "steps() to resync, then re-attach."
+            "Confirming the task's steps are still current failed; "
+            "call steps() to resync, then re-attach."
         ),
     )
 
@@ -1730,6 +1813,7 @@ async def _fast_path_snapshot_stream(
     *,
     build_conclusion: ConclusionFrameBuilder,
     path_name: str,
+    read_task_steps_version: TaskStepsVersionReader | None = None,
 ) -> AsyncIterator[str]:
     """Body shared by both attach-time fast paths (``_terminal_snapshot_stream``,
     ``_input_required_snapshot_stream``): emit ``task.status``, the
@@ -1755,8 +1839,11 @@ async def _fast_path_snapshot_stream(
     failure kind and carries no path label -- see
     ``_fast_path_steps_read_error_frame``.
 
-    ``task.status`` is emitted first, then the steps read runs inside
-    its own ``try``/``except``. A bare exception here
+    ``task.status`` is emitted first, then the steps read runs inside a
+    ``try``/``except`` that also covers the cursor baseline capture
+    below (when ``read_task_steps_version`` is supplied) -- both reads
+    have to succeed before any step content is trusted, so a failure in
+    either is handled identically. A bare exception here
     would not produce a different HTTP status: ``StreamingResponse``
     sends the response start (200, headers) before ever pulling a chunk
     from this generator, so letting the read's exception propagate
@@ -1791,16 +1878,41 @@ async def _fast_path_snapshot_stream(
     conclusion already sent. Step content is the part that can go
     stale, so it goes out only once the task row has been read once
     more and confirmed to still be ``snapshot``'s own generation
-    (``_fast_path_generation_changed``); that reread runs only when
-    there is step content to protect, so a failed steps read (nothing
-    to protect) and an empty one (nothing that could be stale) both
-    skip it. A confirmed match sends the steps, then the conclusion. A
-    confirmed change means the steps just read belong to a generation
-    this path never confirmed against, so the steps are withheld and
+    (``_fast_path_generation_changed``), and, when
+    ``read_task_steps_version`` is supplied, once the steps cursor
+    (``max_event_id``) is confirmed unmoved too
+    (``_fast_path_steps_cursor_changed``). A trace row can land after
+    the steps read and before this recheck; the same commit that lands
+    it can also write this task row's checkpoint-pointer columns
+    (``last_checkpoint_event_id``/``last_checkpoint_trace_event_id``,
+    ``trace_handlers.py``, gated on the task being ``RUNNING``) without
+    ever setting ``run_id`` or ``state_version``, so the
+    run_id/state_version reread alone cannot see that write either way.
+    ``read_task_steps_version`` defaults to ``None`` for callers that
+    don't need this second signal (existing unit tests exercising the
+    run_id/state_version fence on its own); the live attach endpoint
+    always supplies it. When it is supplied, its *baseline* read is
+    unconditional -- captured before the steps read even runs, inside
+    the same guard block described above, whether or not that read
+    ends up returning any steps or fails outright -- because the window
+    this second signal guards starts at that read, not after it. The
+    *recheck* against that baseline is what actually gates on step
+    content: like the run_id/state_version reread, it runs only once
+    there is step content to protect, so a failed steps read and an
+    empty one both skip the recheck (not the baseline, which already
+    ran by then). A step-carrying attach that reaches this fence
+    therefore costs two cursor queries when ``read_task_steps_version``
+    is supplied -- the baseline and the recheck -- on top of the one
+    run_id/state_version reread it already paid; an attach whose steps
+    turn out empty, or whose steps read fails, still pays for the
+    baseline alone. A confirmed match on both signals sends the steps,
+    then the conclusion. A confirmed change on either means the steps
+    just read may belong to content this path never confirmed against,
+    so the steps are withheld and
     the conclusion is followed by ``stream.error(resync_required)``. A
     reread that fails outright can't tell a match from a change and is
     handled the same way, except that its ``stream.error`` names the
-    reread failure rather than claiming the task moved
+    failed confirmation rather than claiming the task moved
     (``_fast_path_generation_reread_error_frame``, same
     ``task_deleted``-vs-everything-else split as
     ``_fast_path_steps_read_error_frame``). Serializing a step can fail
@@ -1811,6 +1923,16 @@ async def _fast_path_snapshot_stream(
     task_id = snapshot.task_id
     yield status_frame(snapshot.status.value)
     try:
+        # Captured before the steps read below, not after: the window this
+        # guards is "a trace row lands after steps are read, before the
+        # fence rechecks", so the reference point has to predate the read
+        # it is meant to protect. See ``_fast_path_steps_cursor_changed``.
+        steps_version_before = None
+        if read_task_steps_version is not None:
+            version_reader = read_task_steps_version
+            steps_version_before = await run_db_io_cancellation_safe(
+                lambda: version_reader(task_id, principal)
+            )
         steps, snapshot_total_steps = await _fast_path_step_snapshot(
             task_id, principal, read_task_steps_response
         )
@@ -1827,6 +1949,18 @@ async def _fast_path_snapshot_stream(
             changed = await _fast_path_generation_changed(
                 snapshot, principal, read_task_snapshot
             )
+            if not changed and read_task_steps_version is not None:
+                # ``steps_version_before`` was captured above under the
+                # same ``read_task_steps_version is not None`` guard, so
+                # it is never ``None`` here -- mypy can't carry that
+                # invariant across the two ``if`` blocks on its own.
+                assert steps_version_before is not None
+                changed = await _fast_path_steps_cursor_changed(
+                    task_id,
+                    steps_version_before.max_event_id,
+                    principal,
+                    read_task_steps_version,
+                )
         except Exception as exc:
             # Same conclusion-first ordering as the steps-read ``except``
             # block above -- see the docstring for why a reread failure
@@ -1866,6 +2000,7 @@ def _terminal_snapshot_stream(
     principal: "ApiKeyPrincipal",
     read_task_steps_response: TaskStepsResponseReader,
     read_task_snapshot: TaskSnapshotReader,
+    read_task_steps_version: TaskStepsVersionReader | None = None,
 ) -> AsyncIterator[str]:
     """Attach-time fast path for an already-terminal task: emit
     ``task.status``, the task's current steps, then ``task.completed``,
@@ -1900,6 +2035,7 @@ def _terminal_snapshot_stream(
         read_task_snapshot,
         build_conclusion=build_conclusion,
         path_name="terminal",
+        read_task_steps_version=read_task_steps_version,
     )
 
 
@@ -1908,6 +2044,7 @@ def _input_required_snapshot_stream(
     principal: "ApiKeyPrincipal",
     read_task_steps_response: TaskStepsResponseReader,
     read_task_snapshot: TaskSnapshotReader,
+    read_task_steps_version: TaskStepsVersionReader | None = None,
 ) -> AsyncIterator[str]:
     """Attach-time fast path for a task already waiting on user input (and
     not mid-resume): emit ``task.status``, the task's current steps, then
@@ -1945,6 +2082,7 @@ def _input_required_snapshot_stream(
         read_task_snapshot,
         build_conclusion=build_conclusion,
         path_name="input-required",
+        read_task_steps_version=read_task_steps_version,
     )
 
 
@@ -2099,6 +2237,7 @@ async def build_event_stream_response(
     initial_snapshot: "_TaskInfoSnapshot",
     read_task_snapshot: TaskSnapshotReader,
     read_task_steps_response: TaskStepsResponseReader,
+    read_task_steps_version: TaskStepsVersionReader | None = None,
     watchdog_interval_seconds: float = WATCHDOG_INTERVAL_SECONDS,
     stream_max_duration_seconds: float = STREAM_MAX_DURATION_SECONDS,
     heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
@@ -2118,7 +2257,15 @@ async def build_event_stream_response(
     directly, the same reader that authorized ``initial_snapshot``, to
     reread the task row once their own steps read returns non-empty
     content and confirm nothing restarted the task in between (see
-    ``_fast_path_generation_changed``).
+    ``_fast_path_generation_changed``), and ``read_task_steps_version``
+    to reread the steps cursor (``max_event_id``) the same way -- a
+    trace row can land in that same window, and even the commits that
+    write the task row itself (a checkpoint-pointer ``UPDATE``, see
+    ``_fast_path_steps_cursor_changed``) never touch ``run_id`` or
+    ``state_version``, so the run_id/state_version reread alone cannot
+    see it either way. Defaults to ``None``
+    (skips the cursor reread) only so callers that aren't exercising it
+    don't have to supply a reader; the router below always does.
     """
     close_reason = _stream_close_reason(
         initial_snapshot.status, initial_snapshot.control_state
@@ -2130,6 +2277,7 @@ async def build_event_stream_response(
                 principal,
                 read_task_steps_response,
                 read_task_snapshot,
+                read_task_steps_version=read_task_steps_version,
             )
         )
 
@@ -2140,6 +2288,7 @@ async def build_event_stream_response(
                 principal,
                 read_task_steps_response,
                 read_task_snapshot,
+                read_task_steps_version=read_task_steps_version,
             )
         )
 
