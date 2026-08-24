@@ -487,15 +487,19 @@ class OpenAICompatibleLLM(BaseLLM):
                         f"API doesn't support response_format, retrying without it. Error: {error_msg}"
                     )
                     completion_params.pop("response_format")
+                    response_format = None
 
-                    # Retry without response_format. A BadRequestError raised
-                    # here is not caught by this clause -- it propagates to
-                    # the outer ``except openai.BadRequestError`` below, which
-                    # wraps it into RuntimeError like every other failure path.
+                    # Retry without response_format and fall through to the
+                    # main flow (the structured-output degrade check below is
+                    # gated on response_format, now None). A BadRequestError
+                    # raised here is not caught by this clause -- it
+                    # propagates to the outer ``except openai.BadRequestError``
+                    # below, which wraps it into RuntimeError like every other
+                    # failure path.
                     response = await _make_api_call()
-                    return _process_response(response)
 
-                raise
+                else:
+                    raise
 
             result = _process_response(response)
 
