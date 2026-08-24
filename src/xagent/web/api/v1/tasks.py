@@ -1248,12 +1248,17 @@ async def stream_chat_task_events(
         ``"failed"``. On the two attach-time fast paths below (the task
         is already finished, or already waiting on user input), the
         first ``step.*`` frame carries two extra fields,
-        ``snapshot_truncated: true`` and ``snapshot_total_steps``, when
-        that one-shot step snapshot was bounded because the task has
-        more public steps than this stream sends at once (512) --
-        absent otherwise. ``snapshot_total_steps`` is the task's full
-        step count at attach time; the frames themselves are always its
-        most recent steps in ``started_at`` order.
+        ``snapshot_truncated: true`` and ``snapshot_total_steps``,
+        whenever that one-shot step snapshot sends fewer steps than the
+        task has -- absent otherwise. Two bounds can cut it short: a
+        step-count cap (512), and a total-wire-bytes budget over the
+        snapshot's serialized frames. ``snapshot_total_steps`` is the
+        task's full step count at attach time. The frames are in
+        ``started_at`` order, drawn from the task's most recent steps
+        up to the count cap; when the byte budget is what binds, it
+        keeps that window's oldest contiguous run, so the very latest
+        steps may be the ones missing -- ``GET .../steps`` is the
+        authoritative full history either way.
       - ``message.delta``: ``{message_id, text}``, one chunk of a
         streamed final answer as the agent generates it.
       - ``message.completed``: ``{message_id, content}``, that same
@@ -1493,10 +1498,10 @@ async def stream_chat_task_events(
             registers a sink at all, so it never counts toward either
             cap -- its step snapshot read goes through the same
             ``max_event_id``-keyed cache ``GET .../steps`` uses. That
-            snapshot is bounded: a task with more public steps than the
-            cap returns only its most recent ones on this fast path,
-            with the ``snapshot_truncated``/``snapshot_total_steps`` marker
-            on the first ``step.*`` frame described above. When a
+            snapshot is bounded by a step-count cap and a
+            total-wire-bytes budget; a snapshot cut short by either
+            carries the ``snapshot_truncated``/``snapshot_total_steps``
+            marker on the first ``step.*`` frame described above. When a
             shared cache backend is configured (Redis; see
             ``hot_path_cache.get_cache_backend``), a burst of fast-path
             attaches on one task (or repeated attaches after it's
