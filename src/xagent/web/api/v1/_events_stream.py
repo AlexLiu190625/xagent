@@ -261,18 +261,12 @@ MAX_RAW_FRAME_TEXT_CHARS = 4 * MAX_FRAME_CONTENT_BYTES
 REPLAY_MAX_STEPS = 512
 # The attach-time snapshot's second bound, on the total wire bytes one
 # response may hold rather than on its step count -- the fast paths'
-# analogue of the queue's ``MAX_QUEUED_WIRE_BYTES``, and sized the same
-# way (64 largest-possible content frames, expressed against
-# ``MAX_FRAME_CONTENT_BYTES`` so it tracks that cap instead of drifting
-# from it). ``REPLAY_MAX_STEPS`` alone does not bound size: 512 steps
-# each carrying a ``data`` sub-object right at the 64 KiB cap is ~32 MiB
-# generated into a single response, and these paths return before the
-# per-task / per-principal caps are checked, so nothing bounds how many
-# of those run concurrently. Strictly over the budget stops the
-# snapshot, exactly on it does not -- the same boundary rule the queue
-# budget and ``MAX_RAW_FRAME_TEXT_CHARS`` use. Frames are pure ASCII
-# (``json.dumps`` runs with the default ``ensure_ascii=True``), so
-# ``len(frame_text)`` is the wire byte count and no encode is needed.
+# analogue of the queue's ``MAX_QUEUED_WIRE_BYTES``, sized the same way
+# and measured the same way. Why this value, and why the step-count cap
+# alone leaves the response unbounded, is argued once in the module
+# docstring's size-bounds section, not repeated here. Strictly over the
+# budget stops the snapshot, exactly on it does not -- the same boundary
+# rule the queue budget and ``MAX_RAW_FRAME_TEXT_CHARS`` use.
 MAX_SNAPSHOT_WIRE_BYTES = 64 * MAX_FRAME_CONTENT_BYTES
 # Floor for the final wait when the 1-hour deadline is close: keeps the
 # queue wait from being called with a near-zero timeout, which would spin
