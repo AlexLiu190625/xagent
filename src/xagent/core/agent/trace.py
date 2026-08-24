@@ -879,31 +879,170 @@ class BaseTraceHandler(TraceHandler):
         pass
 
 
+_LOG_BUDGET_SPENT = "...[truncated: log budget exhausted]"
+_LOG_OMITTED_KEYS_KEY = "__omitted_keys__"
+
+# Nominal budget charged per non-container leaf. Roughly the rendered
+# width of a small number or ``None`` plus its separator.
+_LOG_SCALAR_COST = 16
+
+# Quotes a rendered repr puts around a nested string.
+_QUOTE_COST = 2
+
+
+def _shrink_within_budget(value: Any, budget: int) -> Any:
+    """Copy ``value`` while spending a single shared byte budget.
+
+    ``truncate_for_trace`` gives every leaf its own slice of the budget,
+    so its result still grows with the number of leaves: a payload with a
+    few thousand message entries stays in the hundreds of kilobytes even
+    after per-leaf trimming. Here the budget is shared across the whole
+    walk instead — once it is spent, the remaining keys and list items are
+    replaced by a short marker — so the copy has a bounded node count and
+    therefore a bounded rendered length.
+
+    Containers are rebuilt with their keys and order intact and leaves are
+    reused as-is, so a payload that fits the budget renders exactly as the
+    original would.
+
+    Args:
+        value: Original event payload.
+        budget: Total byte budget for the whole subtree; must be > 0.
+
+    Returns:
+        The original value or a bounded copy of it.
+    """
+    remaining = [budget]
+    return _shrink_node(value, remaining, 0)
+
+
+def _shrink_node(value: Any, remaining: List[int], depth: int) -> Any:
+    """Recursive worker for :func:`_shrink_within_budget`.
+
+    ``remaining`` is a single-element list used as a mutable counter so
+    every branch of the walk draws from the same budget.
+    """
+    if remaining[0] <= 0:
+        return _LOG_BUDGET_SPENT
+    if depth >= _MAX_TRACE_DEPTH:
+        too_deep = f"...[truncated: depth exceeds {_MAX_TRACE_DEPTH}]"
+        remaining[0] -= len(too_deep) + _QUOTE_COST
+        return too_deep
+
+    if isinstance(value, str):
+        # ``_QUOTE_COST`` accounts for the quotes the rendered repr adds
+        # around a nested string; without it a container of many short
+        # strings renders a few hundred bytes over the budget.
+        encoded = value.encode("utf-8", errors="replace")
+        if len(encoded) + _QUOTE_COST <= remaining[0]:
+            remaining[0] -= len(encoded) + _QUOTE_COST
+            return value
+        # Slice on a byte boundary and drop an incomplete trailing
+        # multi-byte char, so the reported char count stays accurate.
+        head = encoded[: max(0, remaining[0] - _QUOTE_COST)].decode(
+            "utf-8", errors="ignore"
+        )
+        marked = f"{head}...[truncated {len(value) - len(head)} chars]"
+        remaining[0] -= len(marked.encode("utf-8")) + _QUOTE_COST
+        return marked
+
+    if isinstance(value, dict):
+        shrunk: Dict[Any, Any] = {}
+        remaining[0] -= 2  # rendered braces
+        for key, item in value.items():
+            if remaining[0] <= 0:
+                shrunk[_LOG_OMITTED_KEYS_KEY] = f"{len(value) - len(shrunk)} more keys"
+                break
+            remaining[0] -= len(f"{key!r}: , ")
+            shrunk[key] = _shrink_node(item, remaining, depth + 1)
+        return shrunk
+
+    if isinstance(value, list):
+        items: List[Any] = []
+        remaining[0] -= 2  # rendered brackets
+        for item in value:
+            if remaining[0] <= 0:
+                items.append(f"...[{len(value) - len(items)} more items]")
+                break
+            remaining[0] -= 2  # rendered separator
+            items.append(_shrink_node(item, remaining, depth + 1))
+        return items
+
+    # Numbers, bools, None and anything else: reused as-is, charged a
+    # nominal cost so a wide container of scalars still exhausts the
+    # budget. An unusually long repr is caught by the final string cap in
+    # ``_render_event_data_for_log``.
+    remaining[0] -= _LOG_SCALAR_COST
+    return value
+
+
+def _render_event_data_for_log(data: Any, max_bytes: Optional[int] = None) -> str:
+    """Render ``event.data`` into a size-bounded string for console logging.
+
+    This is the log-rendering sink only. Trace payloads are not capped per
+    category at the tracer boundary (only LLM events go through
+    ``normalize_llm_trace_payload``), and checkpoint events carry a full
+    execution snapshot, so interpolating ``event.data`` straight into a log
+    line produces multi-megabyte lines on long-context tasks.
+
+    Persistence paths must keep the full payload — truncating a durable
+    checkpoint record would break task recovery — so the bound lives here,
+    at the point where the string is built, and nowhere else.
+
+    Args:
+        data: The event payload to render.
+        max_bytes: Byte bound for the rendered string. When ``None``, reads
+            ``XAGENT_MAX_TRACE_PAYLOAD_BYTES`` (default 50_000, 0 disables).
+
+    Returns:
+        A string no longer than ``max_bytes`` plus a truncation marker.
+    """
+    if max_bytes is None:
+        # Local import to avoid circular dependency at module load
+        from ...config import get_max_trace_payload_bytes
+
+        max_bytes = get_max_trace_payload_bytes()
+
+    if max_bytes <= 0:
+        return f"{data}"
+
+    rendered = f"{_shrink_within_budget(data, max_bytes)}"
+    if len(rendered) <= max_bytes:
+        return rendered
+    return f"{rendered[:max_bytes]}...[truncated {len(rendered) - max_bytes} chars]"
+
+
 class ConsoleTraceHandler(BaseTraceHandler):
-    """Trace handler that logs events to console with clear scope information."""
+    """Trace handler that logs events to console with clear scope information.
+
+    Payloads are rendered through ``_render_event_data_for_log`` so a large
+    event (a checkpoint snapshot, for instance) cannot turn into a
+    multi-megabyte log line. This handler is observational only; the
+    persistence handlers keep the untrimmed payload.
+    """
 
     async def _handle_task_event(self, event: TraceEvent) -> None:
         """Handle task-level events."""
         logger.info(
-            f"[TASK] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Task {event.task_id} - {event.data}"
+            f"[TASK] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Task {event.task_id} - {_render_event_data_for_log(event.data)}"
         )
 
     async def _handle_step_event(self, event: TraceEvent) -> None:
         """Handle step-level events."""
         logger.info(
-            f"[STEP] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {event.data}"
+            f"[STEP] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {_render_event_data_for_log(event.data)}"
         )
 
     async def _handle_action_event(self, event: TraceEvent) -> None:
         """Handle action-level events."""
         logger.info(
-            f"[ACTION] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {event.data}"
+            f"[ACTION] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {_render_event_data_for_log(event.data)}"
         )
 
     async def _handle_system_event(self, event: TraceEvent) -> None:
         """Handle system-level events."""
         logger.info(
-            f"[SYSTEM] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - {event.data}"
+            f"[SYSTEM] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - {_render_event_data_for_log(event.data)}"
         )
 
 

@@ -708,3 +708,175 @@ class _RecordingTracer:
             }
         )
         return "evt"
+
+
+# ---------------------------------------------------------------------------
+# ConsoleTraceHandler log-render cap
+# ---------------------------------------------------------------------------
+
+
+def _checkpoint_payload(n_messages: int, chars_per_message: int) -> Dict[str, Any]:
+    """A checkpoint-shaped payload: bulky content nested under ``snapshot``.
+
+    Mirrors what ``TraceCheckpointStore`` emits — the top-level keys carry
+    no truncatable field name, so the LLM-payload normalizer leaves this
+    shape untouched and the console renderer is the only thing standing
+    between it and the log line.
+    """
+    return {
+        "checkpoint_type": "step_complete",
+        "sequence": 42,
+        "snapshot": {
+            "task_id": 12345,
+            "context": {
+                "messages": [
+                    {"role": "assistant", "content": "y" * chars_per_message}
+                    for _ in range(n_messages)
+                ],
+                "variables": {"scratch": "z" * chars_per_message},
+            },
+        },
+    }
+
+
+def test_render_event_data_small_payload_unchanged() -> None:
+    """A payload inside the budget renders exactly as plain interpolation."""
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload = {
+        "step": 3,
+        "status": "running",
+        "tool": "search",
+        "args": {"q": "hello"},
+        "history": [1, 2, [3, 4]],
+    }
+    assert _render_event_data_for_log(payload, max_bytes=50_000) == f"{payload}"
+
+
+def test_render_event_data_multibyte_small_payload_unchanged() -> None:
+    """Multi-byte content inside the budget is not sliced."""
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload = {"content": "中文测试" * 20}
+    assert _render_event_data_for_log(payload, max_bytes=50_000) == f"{payload}"
+
+
+@pytest.mark.parametrize(
+    "n_messages,chars_per_message",
+    [
+        (20, 200_000),  # few very large messages
+        (2_000, 2_000),  # many medium messages
+        (50_000, 100),  # very wide message list
+    ],
+)
+def test_render_event_data_bounds_multi_megabyte_checkpoint(
+    n_messages: int, chars_per_message: int
+) -> None:
+    """Multi-MB checkpoint payloads render within the cap.
+
+    Covers the shape ``truncate_for_trace`` alone cannot bound: it splits
+    the budget per leaf, so a wide message list still renders megabytes.
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload = _checkpoint_payload(n_messages, chars_per_message)
+    assert len(f"{payload}") > 500_000, "fixture should be far over the cap"
+
+    out = _render_event_data_for_log(payload, max_bytes=50_000)
+
+    # Slack covers the trailing "...[truncated N chars]" marker.
+    assert len(out) <= 50_000 + 100, f"log render not bounded: {len(out)}"
+    assert out.startswith("{'checkpoint_type': 'step_complete'")
+
+
+def test_render_event_data_bounds_wide_dict() -> None:
+    """Key-count explosion is bounded too: the budget is shared, so the
+    remaining keys collapse into one marker instead of each getting a
+    minimum slice of their own.
+
+    ``truncate_for_trace`` cannot do this — its per-leaf split gives every
+    one of the 100k keys a floor of its own, so its output stays in the
+    megabytes.
+    """
+    from xagent.core.agent.trace import (
+        _render_event_data_for_log,
+        _shrink_within_budget,
+        truncate_for_trace,
+    )
+
+    payload = {"snapshot": {f"k{i}": "v" * 200 for i in range(100_000)}}
+
+    assert len(f"{truncate_for_trace(payload, max_bytes=50_000)}") > 1_000_000
+
+    out = _render_event_data_for_log(payload, max_bytes=50_000)
+    assert len(out) <= 50_000 + 100, f"log render not bounded: {len(out)}"
+
+    # The dropped keys are accounted for, not silently swallowed.
+    shrunk = _shrink_within_budget(payload, 50_000)
+    assert "more keys" in shrunk["snapshot"]["__omitted_keys__"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [None, "plain string", 42, [], {}, object(), {"obj": object()}, ("a", "b")],
+)
+def test_render_event_data_tolerates_unusual_payloads(payload: Any) -> None:
+    """Non-dict and non-serializable payloads render without raising."""
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    assert isinstance(_render_event_data_for_log(payload, max_bytes=50_000), str)
+
+
+def test_render_event_data_zero_cap_disables_truncation() -> None:
+    """``XAGENT_MAX_TRACE_PAYLOAD_BYTES=0`` keeps the old behaviour."""
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload = _checkpoint_payload(5, 10_000)
+    assert _render_event_data_for_log(payload, max_bytes=0) == f"{payload}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scope_kwargs",
+    [
+        {"scope": "TASK", "action": "START", "task_id": "t1"},
+        {"scope": "STEP", "action": "UPDATE", "step_id": "s1"},
+        {"scope": "ACTION", "action": "INFO", "step_id": "s1"},
+        {"scope": "SYSTEM", "action": "UPDATE"},
+    ],
+)
+async def test_console_handler_caps_every_scope(
+    scope_kwargs: Dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """All four ConsoleTraceHandler scopes cap the payload they log."""
+    import logging
+
+    from xagent.core.agent.trace import (
+        ConsoleTraceHandler,
+        TraceAction,
+        TraceCategory,
+        TraceEvent,
+        TraceEventType,
+        TraceScope,
+    )
+
+    attribution = dict(scope_kwargs)
+    scope_name = attribution.pop("scope")
+    action_name = attribution.pop("action")
+
+    event_type = TraceEventType(
+        getattr(TraceScope, scope_name),
+        getattr(TraceAction, action_name),
+        TraceCategory.GENERAL,
+    )
+    event = TraceEvent(
+        event_type, data=_checkpoint_payload(2_000, 2_000), **attribution
+    )
+
+    with caplog.at_level(logging.INFO, logger="xagent.core.agent.trace"):
+        await ConsoleTraceHandler().handle_event(event)
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert len(message) <= 50_000 + 200, f"log line not bounded: {len(message)}"
+    assert "[truncated" in message
