@@ -1582,3 +1582,90 @@ class TestSingleServerAccessResolutionFailure:
         # caller's own personal fields: the verdict is the gate that
         # decides whether this caller may write at all.
         assert exc.value.status_code == 503
+
+
+class TestAdminInspectingAnotherUsersListReportsPerKindSubject:
+    """``GET /api/mcp/servers?user_id=<target>`` reports ``can_edit_global``
+    from a different subject depending on connector kind, today: an MCP
+    row blends the *acting admin's own* bypass with the target's team
+    verdict (``_check_mcp_permission``'s ``is_admin`` short-circuit runs
+    before any verdict is even consulted), while a Custom API row reports
+    purely the *target's own* ``can_edit`` and team verdict, since Custom
+    API's write gate has no admin bypass at all
+    (``_custom_api_to_mcp_response`` never reads ``is_admin``).
+
+    This pins the subject mix as it exists today -- it is not an
+    endorsement of it. "Whose capability should this field describe" is
+    an undecided product rule, tracked in xorbitsai/xagent#1703. This
+    test is a regression guard against either subject silently changing,
+    not a statement that the current split is correct.
+    """
+
+    async def test_admin_inspecting_another_users_list_reports_each_kind_from_its_own_subject(
+        self, db
+    ):
+        admin = _make_user(db, 800, is_admin=True)
+        target = _make_user(db, 801)
+        other_owner = _make_user(db, 802)
+
+        server = _make_owned_server(db, other_owner.id, name="admin-subject-mcp")
+        server_id = server.id
+        db.add(
+            UserMCPServer(
+                user_id=target.id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        api = _make_owned_api(db, target.id, name="admin-subject-api")
+        api_id = api.id
+        db.commit()
+
+        # Answers only for the target -- never for the admin's own id, so
+        # any row whose value tracks the admin instead of the target would
+        # be exposed by getting an empty (not-linked) answer instead.
+        def denying_access_for_target_only(_db, user_id, refs):
+            if user_id != target.id:
+                return {}
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=False) for ref in refs
+            }
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=denying_access_for_target_only)
+            list_entries = get_mcp_servers(user_id=target.id, current_user=admin, db=db)
+
+        mcp_entry = next(r for r in list_entries if r.id == server_id)
+        api_entry = next(
+            r for r in list_entries if r.id == api_id and r.transport == "custom_api"
+        )
+
+        # The MCP row's subject is the acting admin: True here, even
+        # though the target's own verdict (fetched for the target, not
+        # the admin) denies edit -- the admin bypass wins before any
+        # verdict is consulted.
+        assert mcp_entry.can_edit_global is True
+
+        # The Custom API row's subject is the target: True because the
+        # target owns this API outright (can_edit=True on their own row),
+        # independent of the acting admin's identity or the denying
+        # verdict above -- if this test's admin were somehow the subject
+        # here too, this would need to be False (the verdict denies it).
+        assert api_entry.can_edit_global is True
+
+        # The list said the Custom API row is editable, but that value
+        # describes the target, not the caller -- acting as themselves,
+        # the admin has no personal row and no team link to this API
+        # (the hook above answers nothing for the admin's own id), so a
+        # real write attempt 404s despite what the list just reported.
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=denying_access_for_target_only)
+            with pytest.raises(HTTPException) as exc:
+                await update_custom_api(
+                    api_id,
+                    CustomApiUpdate(description="admin-attempted-edit"),
+                    current_user=admin,
+                    db=db,
+                )
+        assert exc.value.status_code == 404
