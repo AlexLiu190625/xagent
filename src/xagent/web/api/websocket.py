@@ -3281,17 +3281,21 @@ async def execute_resume_background(
             # apply inside a nested closure.
             assert lease.run_id is not None
             close_run_id = lease.run_id
-            # Observed by the online handler before it injected -- carried
-            # here through pending_user_message rather than read now, since
-            # this path injects later still. Bound to a plain local before
-            # the lambda below, like close_run_id above.
+            # Read by the online handler before this message was injected,
+            # and carried here rather than read now for the opposite reason
+            # to the one it looks like: the injection is not still to come,
+            # it is the post_user_message call above and has already
+            # committed by this line. Injecting is what resumes the agent,
+            # so a read here could name a question the resumed agent has
+            # staged since, not the one the message answered. Bound to a
+            # plain local before the lambda below, like close_run_id above.
             close_interaction_id = pending_user_message.get("interaction_id")
             try:
                 await run_db_io_cancellation_safe(
                     lambda: close_legacy_resume_interaction_sync(
-                        task_id,
-                        close_run_id,
-                        close_interaction_id,
+                        task_id=task_id,
+                        run_id=close_run_id,
+                        interaction_id=close_interaction_id,
                     )
                 )
             except Exception:
@@ -6134,9 +6138,9 @@ async def _handle_chat_message_unserialized(
                         try:
                             await run_db_io_cancellation_safe(
                                 lambda: close_legacy_resume_interaction_sync(
-                                    task_id,
-                                    close_run_id,
-                                    close_interaction_id,
+                                    task_id=task_id,
+                                    run_id=close_run_id,
+                                    interaction_id=close_interaction_id,
                                 )
                             )
                         except Exception:

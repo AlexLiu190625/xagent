@@ -100,9 +100,13 @@ yet) and logs at debug, carrying with it a short description of why
 nothing matched (``_unmatched_close_row``) -- "nothing was ever there"
 and "something was there and is no longer this run's live question" are
 the same rowcount and different situations; more than one row is
-impossible under
-``uq_task_interaction_active_slot`` (it allows at most one row per task
-with a non-NULL ``active_slot``), but if that schema invariant were ever
+impossible twice over. The close statement binds to a primary key
+(``id == interaction_id``), which matches at most one row on its own, and
+its ``active_slot`` predicate falls under
+``uq_task_interaction_active_slot``, which allows at most one row per task
+with a non-NULL ``active_slot``. Both are named because a rowcount above
+one means a different thing under each: the unique constraint gone, or the
+primary key itself no longer unique. If either schema invariant were ever
 broken, this module logs at error and registers a degradation signal
 rather than raising -- a resume injection or an already-durable input
 write must not be turned into a failure by a check meant only to catch
@@ -260,6 +264,11 @@ def active_interaction_id_sync(task_id: int) -> int | None:
     every A2A resume, every v1 chat reply and every live WebSocket chat
     message, and under a NULL marker it now costs one primary-key lookup
     instead of an uncached catalog inspection plus a two-table join.
+
+    That gate decides every call today: the only statements in ``src/``
+    that write the column are this module's two clears, and both of them
+    write ``NULL``, so the marker is NULL for every task and this branch
+    returns ``None`` before anything below it runs.
 
     This is also the resume command seam's reader (``websocket.py``'s
     refusal gate for a resume whose payload cannot prove it answered the
@@ -469,7 +478,7 @@ def close_legacy_resume_interaction(
 
 
 def close_legacy_resume_interaction_sync(
-    task_id: int, run_id: str, interaction_id: int | None
+    *, task_id: int, run_id: str, interaction_id: int | None
 ) -> int:
     """Close + clear from a synchronous or ``asyncio.to_thread`` caller.
 
@@ -477,6 +486,12 @@ def close_legacy_resume_interaction_sync(
     handler and the deferred ``execute_resume_background`` path): each
     calls this via ``run_db_io_cancellation_safe`` with no transaction of
     its own open first, and this function commits before returning.
+
+    Keyword-only, matching the function it wraps. The three arguments are
+    an int, a str and an optional int, and the two that are ints are a task
+    primary key and an interaction primary key -- a positional call that
+    transposed them would be accepted by every type in the signature and
+    would close some other task's row.
 
     ``interaction_id`` is passed straight through -- see
     ``close_legacy_resume_interaction`` for where it has to come from and

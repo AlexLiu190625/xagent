@@ -119,9 +119,11 @@ def test_classify_close_rowcount_logs_debug_for_the_common_no_op_case(
 def test_classify_close_rowcount_logs_error_and_registers_a_signal_for_an_impossible_rowcount(
     caplog,
 ) -> None:
-    """rowcount > 1 is impossible under uq_task_interaction_active_slot
-    unless that constraint has already been violated -- see this module's
-    docstring. Logged at error and surfaced on /health, not raised."""
+    """rowcount > 1 needs either the primary key the close binds to or
+    uq_task_interaction_active_slot to have stopped holding -- see the
+    close module's docstring. Called directly here, because no database
+    this suite can build produces that rowcount. Logged at error and
+    surfaced on /health, not raised."""
     with caplog.at_level(logging.ERROR, logger=_CLOSE_MODULE_NAME):
         _classify_close_rowcount(2, task_id=7, run_id="run-b", unmatched_row=None)
 
@@ -367,7 +369,9 @@ def test_close_sync_opens_its_own_transaction_and_commits(db) -> None:
     task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     row_id = seed_active_row(db, task_id=task_id, run_id="run-a")
 
-    rowcount = close_legacy_resume_interaction_sync(task_id, "run-a", row_id)
+    rowcount = close_legacy_resume_interaction_sync(
+        task_id=task_id, run_id="run-a", interaction_id=row_id
+    )
 
     assert rowcount == 1
     assert row_state(db, row_id).status == "terminated"
@@ -424,7 +428,9 @@ def test_close_no_ops_when_the_interaction_table_does_not_exist(
     )
     db.commit()
 
-    rowcount = close_legacy_resume_interaction_sync(task_id, "run-a", None)
+    rowcount = close_legacy_resume_interaction_sync(
+        task_id=task_id, run_id="run-a", interaction_id=None
+    )
 
     assert rowcount == 0
     # The gate is checked before the marker clear too: close_legacy_resume_
@@ -794,7 +800,9 @@ def test_close_keeps_the_marker_when_the_pre_injection_read_failed(
 
     assert observed_id is None
 
-    rowcount = close_legacy_resume_interaction_sync(task_id, "run-a", observed_id)
+    rowcount = close_legacy_resume_interaction_sync(
+        task_id=task_id, run_id="run-a", interaction_id=observed_id
+    )
 
     assert rowcount == 0
     assert row_state(db, row_id).status == "active"

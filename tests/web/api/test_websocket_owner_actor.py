@@ -1710,7 +1710,9 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
         )
 
     assert order == ["read", "inject"]
-    close_mock.assert_called_once_with(int(task.id), "close-order-run", 4321)
+    close_mock.assert_called_once_with(
+        task_id=int(task.id), run_id="close-order-run", interaction_id=4321
+    )
 
 
 @pytest.mark.asyncio
@@ -1761,7 +1763,9 @@ async def test_live_close_failure_after_registered_handoff_is_still_accepted(
         )
 
     bg_mgr.register_reserved_resume.assert_called_once()
-    close_mock.assert_called_once_with(int(task.id), "close-failure-run", None)
+    close_mock.assert_called_once_with(
+        task_id=int(task.id), run_id="close-failure-run", interaction_id=None
+    )
     accepted = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
@@ -1821,7 +1825,9 @@ async def test_live_close_cancellation_does_not_abort_registered_handoff(
         )
 
     bg_mgr.register_reserved_resume.assert_called_once()
-    close_mock.assert_called_once_with(int(task.id), "close-cancel-run", None)
+    close_mock.assert_called_once_with(
+        task_id=int(task.id), run_id="close-cancel-run", interaction_id=None
+    )
     accepted = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
@@ -3597,9 +3603,7 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
     # after the `with` block, outside that handler's reach.
     observed_close_calls: list[tuple[int, str, str | None]] = []
 
-    def fail_close(
-        task_id_arg: int, run_id_arg: str, interaction_id_arg: int | None
-    ) -> int:
+    def fail_close(*, task_id: int, run_id: str, interaction_id: int | None) -> int:
         # A fresh session, not db_session: this runs inside the worker
         # thread run_db_io_cancellation_safe schedules it on, while the
         # test's own db_session sits unused on the main thread -- sharing
@@ -3607,10 +3611,10 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
         # elsewhere.
         probe = next(get_db())
         try:
-            live_run_id = probe.query(Task).filter(Task.id == task_id_arg).one().run_id
+            live_run_id = probe.query(Task).filter(Task.id == task_id).one().run_id
         finally:
             probe.close()
-        observed_close_calls.append((task_id_arg, run_id_arg, live_run_id))
+        observed_close_calls.append((task_id, run_id, live_run_id))
         raise RuntimeError("interaction close unavailable")
 
     with (
@@ -3724,8 +3728,8 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
         )
 
     close_mock.assert_called_once()
-    assert close_mock.call_args.args[0] == int(task.id)
-    assert close_mock.call_args.args[2] == 9876
+    assert close_mock.call_args.kwargs["task_id"] == int(task.id)
+    assert close_mock.call_args.kwargs["interaction_id"] == 9876
 
 
 @pytest.mark.asyncio
@@ -3777,14 +3781,14 @@ async def test_deferred_injection_close_cancellation_does_not_abort_resume(
     observed_close_calls: list[tuple[int, str, str | None]] = []
 
     def raise_cancelled(
-        task_id_arg: int, run_id_arg: str, interaction_id_arg: int | None
+        *, task_id: int, run_id: str, interaction_id: int | None
     ) -> int:
         probe = next(get_db())
         try:
-            live_run_id = probe.query(Task).filter(Task.id == task_id_arg).one().run_id
+            live_run_id = probe.query(Task).filter(Task.id == task_id).one().run_id
         finally:
             probe.close()
-        observed_close_calls.append((task_id_arg, run_id_arg, live_run_id))
+        observed_close_calls.append((task_id, run_id, live_run_id))
         raise asyncio.CancelledError
 
     with (

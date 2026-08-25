@@ -1040,12 +1040,23 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
         # normalize what gets stored: the model-facing producer
         # (``_normalize_ask_user_interactions``, ``react.py``) already
         # trims a field and substitutes for a blank one before it ever
-        # reaches this validator -- on both the single-tool
-        # ``ask_user_question`` path and the multi-tool waiting path,
-        # whose own dedup loop only appends a numeric suffix to an
-        # already-trimmed base -- so a well-formed field arrives here
+        # reaches this validator, so a well-formed field arrives here
         # pre-trimmed and this pair of checks costs that producer nothing;
         # they exist for whatever reaches this write side some other way.
+        #
+        # Both react.py paths run that normalizer, so both arrive
+        # pre-trimmed, and there the resemblance stops -- whoever wires the
+        # first production writer is wiring one of two different producers.
+        # The single-tool ``ask_user_question`` path calls the normalizer
+        # and stops: it does not deduplicate, so two interactions the model
+        # named the same field reach this validator unchanged and the
+        # duplicate rule below refuses the write, costing that path the
+        # whole question rather than one field. The multi-tool waiting path
+        # (``_pause_for_tool_results``) runs its own dedup loop afterwards
+        # across every waiting tool, appending ``_2``, ``_3`` to a repeated
+        # base: it cannot trip that rule, and the field it hands over is
+        # the renamed one, so the key stored for #1368 to match answers
+        # against is not the key the tool asked under.
         if not interaction.field.strip():
             raise ValueError(f"{where}.field is blank")
         if interaction.field != interaction.field.strip():
@@ -1089,11 +1100,9 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
                     f"{option.value!r} is duplicated"
                 )
             seen_option_values.add(option.value)
-        # Scoped to the one type that reads the pair. ``number_input`` is
-        # the only branch in ``clarification-form.tsx`` that passes ``min``
-        # and ``max`` to the rendered control, so an inverted range is a
-        # question no answer can satisfy there and an ignored hint
-        # everywhere else.
+        # Scoped to ``number_input`` deliberately -- this function's
+        # docstring carries the reason, under the third of the three
+        # deliberately accepted shapes.
         if (
             interaction.type == "number_input"
             and interaction.min is not None
@@ -1206,6 +1215,11 @@ def create(
       never loads a row it does not own.
     - An admin ``"user"`` principal is authorized without owning the task,
       so there is no owner predicate to add; the lookup stays id-only.
+      Authorized here is not allowed to write: ``respond()`` lets an admin
+      clear the same step and then refuses it at the write point, on
+      ``_answer_fence_task_predicate``'s ``Task.user_id`` term. This seam
+      writes nothing and so has no such fence -- a writer wired behind it
+      inherits an admin whose ownership nothing has checked.
     - A ``"guest"`` principal's ownership is split across the two. The
       column-level half is the same ``Task.user_id == principal.user_id``:
       a guest's owning user is the entity owner the guest is chatting
@@ -1224,28 +1238,21 @@ def create(
       refuses exactly that at its write point
       (``_answer_fence_task_predicate``'s ``Task.user_id`` term).
     - A ``"user"`` or ``"guest"`` principal carrying no ``user_id`` is
-      unauthorized before the lookup is even built. An admin passing on
-      the flag alone would reach the write point with no identity to
-      record, and an owner-scoped branch's predicate built from that
-      absent id would reject only by way of ``Task.user_id`` being NOT
-      NULL.
+      unauthorized before the lookup is even built; the guard itself
+      carries why it is placed there.
 
     A principal whose ``kind`` is neither ``"user"`` nor ``"guest"`` is
     always unauthorized -- there is no third branch that defaults to allow
-    -- and is rejected before the lookup is built, not by falling off the
-    end of the branch chain. Both orderings return the same outcome; only
-    the earlier one keeps such a principal off the id-only lookup path,
-    which would otherwise answer ``CreateUnavailable(reason="task_missing")``
-    and tell a caller this module cannot name whether a ``task_id`` exists.
-    This is the authorization-side half of the same judgment
-    ``InteractionPrincipal.identity_string`` makes on the audit side, where
-    an unrecognized ``kind`` raises ``ValueError`` rather than being
-    recorded as a user: neither side has a default that treats an unknown
-    kind as one of the two known ones. The two are not redundant. This gate
-    decides whether the caller may act at all and returns a typed outcome;
-    that one runs at the write point on a caller already authorized, and
-    raises, because a principal that got that far and still cannot be named
-    is a programming error rather than a rejection to report.
+    -- and is rejected before the lookup is built rather than at the end of
+    the branch chain, because an unrecognized kind is not owner-scoped, so
+    the lookup it would have reached is the id-only one that reports
+    ``task_missing``.
+    ``InteractionPrincipal.identity_string`` refuses the same principal on
+    the audit side by raising ``ValueError``; the two are not redundant.
+    This one decides whether a caller may act at all and answers with a
+    typed outcome, while that one runs at the write point on a caller
+    already authorized, where being unnameable is a programming error and
+    not a rejection to report.
 
     A malformed principal that populates zero or more than one of the guest
     entity-binding fields makes the ownership predicate raise
@@ -1260,9 +1267,21 @@ def create(
     exist" and "this task is not yours" are the same empty result set, and
     both return ``CreateUnauthorized(reason="not_task_principal")``.
     Neither principal can use this function to learn whether a ``task_id``
-    exists. ``CreateUnavailable(reason="task_missing")`` remains reachable
-    only from the one id-only branch -- an admin, who is told nothing by it
-    that their own branch does not already tell them.
+    exists. ``CreateUnavailable(reason="task_missing")`` stays reachable
+    from the id-only admin branch, and that puts an obligation on whoever
+    consumes these outcomes: exposing the distinction externally hands the
+    requester a task-existence oracle, so an endpoint mapping this
+    function's outcome onto an HTTP response has to collapse the two into
+    one client-facing shape. The three existing public-chat entry points
+    already do the equivalent one layer up: a task that does not exist and
+    a task whose ``guest_id`` belongs to another visitor both produce the
+    identical not-found-shaped 403. The same obligation covers the
+    respond-side twin pair (``RespondUnavailable(reason="task_missing")``
+    versus ``RespondUnauthorized(reason="not_task_principal")``), which
+    stays distinguishable for every principal kind because ``respond()``
+    loads its task by id under a lock -- and it covers every other outcome
+    consumer built on this module, not only ``create()``'s own two
+    variants.
 
     ``origin`` is deliberately not part of this envelope or this
     validation step in this delivery: the reason vocabulary deliberately
@@ -1287,26 +1306,6 @@ def create(
     function has no call to any of the staging module's exception-raising
     code at all in this delivery, since it never calls
     ``stage_interaction_request``.
-
-    ``CreateUnavailable(reason="task_missing")`` and
-    ``CreateUnauthorized(reason="not_task_principal")`` remain
-    distinguishable outcomes on the id-only admin branch above, and a
-    caller that exposes that distinction externally hands an
-    unauthenticated or unauthorized requester a task-existence oracle:
-    "unavailable" versus "unauthorized" reveals whether ``task_id`` exists
-    at all. Any future endpoint that calls this function directly and maps
-    its outcome onto an HTTP response shape must collapse both to the same
-    client-facing shape. The three existing public-chat entry points
-    already do the equivalent one layer up, at the HTTP boundary: a task
-    that does not exist and a task whose ``guest_id`` belongs to another
-    visitor both produce the identical not-found-shaped 403. The same
-    obligation applies to the respond-side twin pair
-    (``RespondUnavailable(reason="task_missing")`` versus
-    ``RespondUnauthorized(reason="not_task_principal")``): ``respond()``
-    loads its task by id under a lock for every principal kind, so both of
-    its variants stay distinguishable for every caller, and that side
-    carries the obligation in full. This applies to every outcome consumer
-    built on this module, not only to ``create()``'s own two variants.
     """
 
     if principal.kind in ("user", "guest") and principal.user_id is None:
@@ -1342,10 +1341,8 @@ def create(
     task = task_lookup.first()
     if task is None:
         # An owner-scoped lookup cannot tell "no such task" from "not your
-        # task" -- both are the empty result set, and reporting either one
-        # specifically would make this function an existence oracle for a
-        # principal that is not entitled to one. The admin branch, the only
-        # one that loads by id alone, keeps reporting task_missing.
+        # task", and must not appear to -- see the consequence paragraph in
+        # this function's docstring.
         if owner_scoped:
             return CreateUnauthorized(reason="not_task_principal")
         return CreateUnavailable(reason="task_missing")
