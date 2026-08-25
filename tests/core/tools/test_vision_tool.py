@@ -13,6 +13,7 @@ import pytest
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.retry.wrapper import create_retry_wrapper
 from xagent.core.tools.adapters.vibe.vision_tool import VisionTool, get_vision_tool
+from xagent.core.tools.core.vision_tool import _normalize_vision_response
 from xagent.web.services.model_service import get_default_vision_model
 
 
@@ -158,6 +159,153 @@ def sample_images_data():
             "format": "png",
         },
     ]
+
+
+# Each row is (label, response, expected_kind, expected_text,
+# expected_tool_calls, expected_raw_display). Rows cover every shape
+# ``_normalize_vision_response`` must classify: bare strings (empty,
+# whitespace-only, and non-empty are tested as separate rows so a
+# whitespace string cannot satisfy two rows' criteria at once), text/
+# tool_call/unrecognized envelopes, a missing "type" key, ``None``, and
+# other Python types.
+_VISION_RESPONSE_SHAPE_MATRIX = [
+    (
+        "non_empty_str",
+        "a plain text reply",
+        "text",
+        "a plain text reply",
+        [],
+        "a plain text reply",
+    ),
+    ("empty_str", "", "empty", "", [], ""),
+    ("whitespace_only_str", "   ", "empty", "   ", [], "   "),
+    (
+        "text_envelope",
+        {"type": "text", "content": "hello from the envelope"},
+        "text",
+        "hello from the envelope",
+        [],
+        "hello from the envelope",
+    ),
+    (
+        "text_envelope_empty_content",
+        {"type": "text", "content": ""},
+        "empty",
+        "",
+        [],
+        "",
+    ),
+    (
+        "text_envelope_whitespace_content",
+        {"type": "text", "content": "   "},
+        "empty",
+        "   ",
+        [],
+        "   ",
+    ),
+    (
+        "text_envelope_non_str_content",
+        {"type": "text", "content": 5},
+        "unknown",
+        None,
+        [],
+        str({"type": "text", "content": 5}),
+    ),
+    (
+        "tool_call_envelope",
+        {"type": "tool_call", "tool_calls": [{"id": "c1", "type": "function"}]},
+        "tool_call",
+        None,
+        [{"id": "c1", "type": "function"}],
+        str({"type": "tool_call", "tool_calls": [{"id": "c1", "type": "function"}]}),
+    ),
+    (
+        "unknown_type_dict",
+        {"type": "mystery", "payload": 1},
+        "unknown",
+        None,
+        [],
+        str({"type": "mystery", "payload": 1}),
+    ),
+    (
+        "dict_without_type_key",
+        {"payload": 1},
+        "unknown",
+        None,
+        [],
+        str({"payload": 1}),
+    ),
+    ("none", None, "unknown", None, [], "None"),
+    ("other_type_int", 123, "unknown", None, [], "123"),
+    (
+        "other_type_list",
+        [1, 2, 3],
+        "unknown",
+        None,
+        [],
+        str([1, 2, 3]),
+    ),
+]
+
+
+class TestNormalizeVisionResponse:
+    """Behavior of the response classifier shared by detect_objects and
+    understand_media. Exercised directly against the pure function -- the
+    call sites are exercised separately against the shapes they actually
+    branch on."""
+
+    @pytest.mark.parametrize(
+        "label,response,expected_kind,expected_text,expected_tool_calls,expected_raw_display",
+        _VISION_RESPONSE_SHAPE_MATRIX,
+        ids=[row[0] for row in _VISION_RESPONSE_SHAPE_MATRIX],
+    )
+    def test_shape_matrix(
+        self,
+        label,
+        response,
+        expected_kind,
+        expected_text,
+        expected_tool_calls,
+        expected_raw_display,
+    ):
+        result = _normalize_vision_response(response)
+        assert result.kind == expected_kind
+        assert result.text == expected_text
+        assert result.tool_calls == expected_tool_calls
+        assert result.raw_display == expected_raw_display
+
+    def test_shape_matrix_covers_exactly_four_kinds(self):
+        kinds = {row[2] for row in _VISION_RESPONSE_SHAPE_MATRIX}
+        assert kinds == {"text", "empty", "tool_call", "unknown"}
+
+    @pytest.mark.parametrize(
+        "response",
+        [row[1] for row in _VISION_RESPONSE_SHAPE_MATRIX]
+        + [object(), 3.14, {"nested": {"type": "text"}}],
+    )
+    def test_never_raises(self, response):
+        result = _normalize_vision_response(response)
+        assert result.kind in {"text", "empty", "tool_call", "unknown"}
+
+    @pytest.mark.parametrize(
+        "label,response,expected_kind,expected_text,expected_tool_calls,expected_raw_display",
+        _VISION_RESPONSE_SHAPE_MATRIX,
+        ids=[row[0] for row in _VISION_RESPONSE_SHAPE_MATRIX],
+    )
+    def test_text_field_type_follows_kind(
+        self,
+        label,
+        response,
+        expected_kind,
+        expected_text,
+        expected_tool_calls,
+        expected_raw_display,
+    ):
+        result = _normalize_vision_response(response)
+        if result.kind in {"text", "empty"}:
+            assert isinstance(result.text, str)
+        else:
+            assert result.text is None
 
 
 class TestVisionToolInitialization:

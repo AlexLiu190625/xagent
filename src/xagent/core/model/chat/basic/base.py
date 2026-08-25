@@ -202,14 +202,18 @@ class BaseLLM(ABC):
             **kwargs: Additional parameters specific to the underlying model (e.g. top_p, user, stop).
 
         Returns:
-            If the model returns a natural language response:
-                -> string (the assistant reply content)
-
-            If the model triggers a tool call:
-                -> dict with fields:
-                    - "type": "tool_call"
-                    - "tool_calls": list of tool call objects
-                    - "raw": the full response JSON
+            The return type is a union; the concrete shape depends on the
+            implementation:
+                -> str: some implementations (e.g. Zhipu, Claude, Gemini)
+                   return the assistant reply content as a bare string.
+                -> dict: OpenAI-family implementations (OpenAI, OpenRouter,
+                   DashScope) wrap the reply in an envelope instead:
+                     - {"type": "text", "content": <str>, "raw": ...} for a
+                       natural language response
+                     - {"type": "tool_call", "tool_calls": [...], "raw": ...}
+                       for a tool call
+                   Callers that must accept either provider family need to
+                   branch on the shape rather than assume a bare string.
 
         Raises:
             RuntimeError if the model call fails or returns an unexpected format.
@@ -246,14 +250,18 @@ class BaseLLM(ABC):
             **kwargs: Additional parameters specific to the underlying model.
 
         Returns:
-            If the model returns a natural language response:
-                -> string (the assistant reply content)
-
-            If the model triggers a tool call:
-                -> dict with fields:
-                    - "type": "tool_call"
-                    - "tool_calls": list of tool call objects
-                    - "raw": the full response JSON
+            The return type is a union; the concrete shape depends on the
+            implementation:
+                -> str: some implementations (e.g. Zhipu, Claude, Gemini)
+                   return the assistant reply content as a bare string.
+                -> dict: OpenAI-family implementations (OpenAI, OpenRouter,
+                   DashScope) wrap the reply in an envelope instead:
+                     - {"type": "text", "content": <str>, "raw": ...} for a
+                       natural language response
+                     - {"type": "tool_call", "tool_calls": [...], "raw": ...}
+                       for a tool call
+                   Callers that must accept either provider family need to
+                   branch on the shape rather than assume a bare string.
 
         Raises:
             RuntimeError if the model doesn't support vision or the call fails.

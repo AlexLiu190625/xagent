@@ -294,7 +294,7 @@ class OpenAICompatibleLLM(BaseLLM):
             **kwargs: Additional parameters to pass to the OpenAI API
 
         Returns:
-            - If normal text reply: return string
+            - If normal text reply: return dict with type "text" and content
             - If tool call triggered: return dict with type "tool_call" and tool_calls list
 
         Raises:
@@ -615,7 +615,7 @@ class OpenAICompatibleLLM(BaseLLM):
             **kwargs: Additional parameters to pass to the OpenAI API
 
         Returns:
-            - If normal text reply: return string
+            - If normal text reply: return dict with type "text" and content
             - If tool call triggered: return dict with type "tool_call" and tool_calls list
 
         Raises:

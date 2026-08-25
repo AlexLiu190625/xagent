@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Union
 from urllib.parse import unquote_to_bytes, urlsplit
 
 import httpx
@@ -36,6 +36,129 @@ logger = logging.getLogger(__name__)
 
 _MAX_INLINE_VIDEO_BYTES = 64 * 1024 * 1024
 _MAX_INLINE_SVG_SOURCE_CHARS = 32_000
+
+_VISION_RAW_DISPLAY_TRUNCATION_LIMIT = 4000
+
+
+def _truncate_vision_raw_display(
+    value: str, limit: int = _VISION_RAW_DISPLAY_TRUNCATION_LIMIT
+) -> str:
+    """Cap a diagnostic string so a provider payload cannot balloon a tool result.
+
+    Mirrors the truncation shape already used for chat error bodies
+    (``openai.py``'s ``_truncate_error_detail``) so vision diagnostics look
+    the same as the rest of the model layer's truncated output. This bounds
+    length only; it performs no key-level redaction of provider-internal
+    fields (e.g. ``system_fingerprint``) that may happen to fall within the
+    limit.
+    """
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...<truncated {len(value) - limit} chars>"
+
+
+class _NormalizedVisionResponse(NamedTuple):
+    """One of four shapes a ``chat``/``vision_chat`` return value reduces to.
+
+    ``kind`` is one of ``"text"``, ``"empty"``, ``"tool_call"``, ``"unknown"``.
+    ``text`` is a ``str`` when ``kind`` is ``"text"`` or ``"empty"``, and
+    ``None`` for ``"tool_call"``/``"unknown"``. ``tool_calls`` is populated
+    only for ``"tool_call"`` and is otherwise an empty list. ``raw_display``
+    is always a length-capped string meant for logging and diagnostic
+    fields; it must never be surfaced as a user-visible answer.
+    """
+
+    kind: str
+    text: Optional[str]
+    tool_calls: List[Any]
+    raw_display: str
+
+
+def _normalize_vision_response(result: Any) -> _NormalizedVisionResponse:
+    """Reduce a ``vision_chat`` return value to a text/empty/tool_call/unknown shape.
+
+    ``vision_chat`` is typed ``str | dict[str, Any]``: OpenAI-family
+    providers wrap a reply in an envelope (``{"type": "text", "content":
+    ..., "raw": ...}`` or a tool-call envelope), while other providers
+    return a bare string. This function is a pure classifier: it never
+    raises, and it never decides whether a shape counts as a failure --
+    callers own that decision because only they know what they need from
+    the response. An exception raised by ``vision_chat`` itself never
+    reaches this function; it is handled by the caller's own exception
+    handling before a return value exists to classify.
+    """
+    if isinstance(result, str):
+        if not result.strip():
+            return _NormalizedVisionResponse(
+                kind="empty", text=result, tool_calls=[], raw_display=result
+            )
+        return _NormalizedVisionResponse(
+            kind="text",
+            text=result,
+            tool_calls=[],
+            raw_display=_truncate_vision_raw_display(result),
+        )
+
+    if result is None:
+        return _NormalizedVisionResponse(
+            kind="unknown", text=None, tool_calls=[], raw_display="None"
+        )
+
+    if isinstance(result, dict):
+        response_type = result.get("type")
+
+        if response_type == "text":
+            content = result.get("content")
+            if isinstance(content, str):
+                if not content.strip():
+                    # xinference's text exit gates on bare truthiness, so
+                    # whitespace-only content is not rejected there; openai
+                    # rejects it via .strip().
+                    return _NormalizedVisionResponse(
+                        kind="empty",
+                        text=content,
+                        tool_calls=[],
+                        raw_display=content,
+                    )
+                return _NormalizedVisionResponse(
+                    kind="text",
+                    text=content,
+                    tool_calls=[],
+                    raw_display=_truncate_vision_raw_display(content),
+                )
+            # A "text" envelope whose content is not a string carries no
+            # usable text payload, so it is classified as unknown rather
+            # than text.
+            return _NormalizedVisionResponse(
+                kind="unknown",
+                text=None,
+                tool_calls=[],
+                raw_display=_truncate_vision_raw_display(str(result)),
+            )
+
+        if response_type == "tool_call":
+            return _NormalizedVisionResponse(
+                kind="tool_call",
+                text=None,
+                tool_calls=result.get("tool_calls", []),
+                raw_display=_truncate_vision_raw_display(str(result)),
+            )
+
+        # Unrecognized envelope shape: unknown or missing "type" key.
+        return _NormalizedVisionResponse(
+            kind="unknown",
+            text=None,
+            tool_calls=[],
+            raw_display=_truncate_vision_raw_display(str(result)),
+        )
+
+    # Any other type (int, list, custom object, ...).
+    return _NormalizedVisionResponse(
+        kind="unknown",
+        text=None,
+        tool_calls=[],
+        raw_display=_truncate_vision_raw_display(str(result)),
+    )
 
 
 class UnderstandMediaResult(BaseModel):
