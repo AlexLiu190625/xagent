@@ -1209,7 +1209,7 @@ def _bad_request_error(message: str) -> openai.BadRequestError:
 
 
 @pytest.mark.asyncio
-async def test_openrouter_direct_relaxes_tool_choice_after_bare_bad_request_error(
+async def test_openrouter_direct_relaxes_tool_choice_after_wrapped_resend_failure(
     mock_chat_completion, mocker
 ):
     """The compat retry recovers when the response_format resend also 400s.
@@ -1248,7 +1248,7 @@ async def test_openrouter_direct_relaxes_tool_choice_after_bare_bad_request_erro
 
 
 @pytest.mark.asyncio
-async def test_openrouter_vision_relaxes_tool_choice_after_bare_bad_request_error(
+async def test_openrouter_vision_relaxes_tool_choice_after_wrapped_resend_failure(
     mock_chat_completion, mocker
 ):
     """The vision path recovers when the response_format resend also 400s.
@@ -1287,6 +1287,38 @@ async def test_openrouter_vision_relaxes_tool_choice_after_bare_bad_request_erro
     assert mock_client.chat.completions.create.await_count == 3
     final_call = mock_client.chat.completions.create.call_args_list[2].kwargs
     assert final_call["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_compat_loop_catches_bare_sdk_bad_request(mocker):
+    """A bare ``openai.BadRequestError`` reaching the compat loop is handled.
+
+    The base client wraps provider 4xx failures into ``RuntimeError`` on
+    every known path, so this pin drives the loop directly: the inner call
+    raises the bare SDK error once, and the loop must treat it as a compat
+    adjustment opportunity rather than let it escape. This is the only test
+    that fails when ``openai.BadRequestError`` is removed from
+    ``_COMPAT_RETRYABLE_ERRORS``.
+    """
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    prefix_retry_mock = mocker.patch.object(
+        llm,
+        "_chat_with_prefix_retry",
+        side_effect=[
+            _bad_request_error(_OPENROUTER_TOOL_CHOICE_ERROR),
+            {"type": "text", "content": "Hello World", "tool_calls": None},
+        ],
+    )
+
+    result = await llm.chat(
+        [{"role": "user", "content": "score?"}],
+        tools=_two_tool_schema(),
+        tool_choice="required",
+    )
+
+    assert result["content"] == "Hello World"
+    assert prefix_retry_mock.call_count == 2
+    assert prefix_retry_mock.call_args_list[1].kwargs["tool_choice"] == "auto"
 
 
 @pytest.mark.asyncio
