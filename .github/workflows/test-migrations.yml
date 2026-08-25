@@ -50,6 +50,11 @@ on:
       - 'tests/shared/postgres_disposable.py'
       - 'tests/web/services/checkpoint_anchor_shared.py'
       - 'tests/web/api/test_mcp_server_edit_lock_postgresql.py'
+      - 'src/xagent/web/api/mcp.py'
+      - 'src/xagent/web/api/custom_api.py'
+      - 'src/xagent/web/services/connector_team_scope.py'
+      - 'tests/web/api/test_custom_api_edit_lock_postgresql.py'
+      - 'tests/web/api/test_connector_hook_session_fault_postgresql.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -136,6 +141,11 @@ jobs:
             tests/shared/postgres_disposable.py
             tests/web/services/checkpoint_anchor_shared.py
             tests/web/api/test_mcp_server_edit_lock_postgresql.py
+            src/xagent/web/api/mcp.py
+            src/xagent/web/api/custom_api.py
+            src/xagent/web/services/connector_team_scope.py
+            tests/web/api/test_custom_api_edit_lock_postgresql.py
+            tests/web/api/test_connector_hook_session_fault_postgresql.py
           )
 
           case "$EVENT_NAME" in
@@ -443,6 +453,20 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/api/test_mcp_server_edit_lock_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test Custom API edit row lock (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/api/test_custom_api_edit_lock_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test connector hook session fault recovery (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/api/test_connector_hook_session_fault_postgresql.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
