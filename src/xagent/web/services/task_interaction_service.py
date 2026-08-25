@@ -992,10 +992,15 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
     * ``accept=[]`` on a ``file_upload``. It renders as ``accept=""``,
       which is what the browser does with no restriction at all.
     * ``min``/``max`` on a type that does not render them. Only
-      ``number_input`` reads the pair; on the other six they are an ignored
-      hint, and the question still asks exactly what it asks. The
-      ``min > max`` rule below stays type-agnostic for the same reason: it
-      refuses a range no answer can satisfy, wherever it appears.
+      ``number_input`` reads the pair -- ``clarification-form.tsx`` passes
+      ``min``/``max`` to the input in its ``number_input`` branch and
+      nowhere else -- so on the other six they are an ignored hint, and the
+      question still asks exactly what it asks. The ``min > max`` rule
+      below is scoped to ``number_input`` for that same reason: on the type
+      that reads the pair, an inverted range makes every answer invalid and
+      the write is refused; on the six that ignore it, the pair never
+      reaches the user at all, so an inverted one is a hint nobody reads
+      rather than a question nobody can answer.
 
     Answers are out of scope here and in every other function in this
     module. Until the answer-side field schema lands (issue #1368),
@@ -1084,8 +1089,14 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
                     f"{option.value!r} is duplicated"
                 )
             seen_option_values.add(option.value)
+        # Scoped to the one type that reads the pair. ``number_input`` is
+        # the only branch in ``clarification-form.tsx`` that passes ``min``
+        # and ``max`` to the rendered control, so an inverted range is a
+        # question no answer can satisfy there and an ignored hint
+        # everywhere else.
         if (
-            interaction.min is not None
+            interaction.type == "number_input"
+            and interaction.min is not None
             and interaction.max is not None
             and interaction.min > interaction.max
         ):

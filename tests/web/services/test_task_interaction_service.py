@@ -774,11 +774,23 @@ def test_validate_accepts_min_and_max_on_a_non_number_type(
     _db: Session, _seeded_task: int
 ) -> None:
     """Only number_input reads min/max; on every other type they are an
-    ignored hint, and the question still asks exactly what it asks, so the
-    min > max rule stays type-agnostic rather than being scoped to
-    number_input."""
+    ignored hint, and the question still asks exactly what it asks."""
 
     values = _values([_interaction(type="text_input", min=1, max=5)])
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_accepts_an_inverted_min_max_on_a_non_number_type(
+    _db: Session, _seeded_task: int
+) -> None:
+    """The min > max rule is scoped to the one type that reads the pair.
+    ``clarification-form.tsx`` passes min and max to the rendered control
+    only in its number_input branch, so on a text_input an inverted range
+    never reaches the user: it is a hint nobody reads, not a question
+    nobody can answer, and the write is not refused for it."""
+
+    values = _values([_interaction(type="text_input", min=10, max=3)])
     parsed = svc.parse_v1_request_payload(values)
     svc.validate_v1_write_payload(parsed)
 
