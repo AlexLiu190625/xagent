@@ -2027,7 +2027,7 @@ class AgentServiceManager:
             agent_config, workforce_runtime, task_id=task_id
         )
         workspace_owner_id = int(task.user_id)
-        # Actor-logical access policy + CA-physical mount intent, built by
+        # Actor-logical access policy + CA mount intent, built by
         # the single shared projection (see build_chat_workspace_binding's
         # docstring for the covered/covering/disjoint folding it applies).
         workspace_binding = build_chat_workspace_binding(workspace_owner_id, scope)
@@ -2654,7 +2654,7 @@ class AgentServiceManager:
                     raise ValueError(f"Task {task_id} has no resolved owner")
                 workspace_owner_id = int(runtime_user_id)
                 scope_segments = scope.workspace_segments if scope is not None else ()
-                # Actor-logical access policy + CA-physical mount intent,
+                # Actor-logical access policy + CA mount intent,
                 # built by the single shared projection (see
                 # build_chat_workspace_binding's docstring for the
                 # covered/covering/disjoint folding it applies).
