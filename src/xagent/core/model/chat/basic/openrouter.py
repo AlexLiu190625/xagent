@@ -30,6 +30,8 @@ _DEEPSEEK_FUNCTION_PREFIX_ERROR = "function call should not be used with prefix"
 # of letting the call hard-fail. The historical implementation caught bare
 # ``Exception`` here; this tuple is the precise, intentionally narrowed
 # replacement.
+# No production path currently produces a bare ``openai.BadRequestError``
+# here; the only coverage is a stub test that patches an internal method.
 _COMPAT_RETRYABLE_ERRORS = (RuntimeError, openai.BadRequestError)
 
 # Pinning to these provider slugs via `only` + `allow_fallbacks: False` routes
