@@ -17,29 +17,30 @@ specifically (confirmed by running it against a real server with that line
 removed); it stays green on SQLite regardless, which is exactly why this
 shape needs its own PostgreSQL-only proof.
 
-The three route-level tests below (toggle, connect, the apps listing) are
-also run here for completeness -- they pin the *correct* end-to-end
-behavior (2xx, durable writes) under this exact failure shape on a real
-server. They are not independently mutation-sensitive for this specific
-shape on these specific routes, though: each response builder happens to
-read the connector row's attributes once *before* the hook ever runs
-(e.g. toggle_mcp_server's own log line touches ``server.name``), which
-loads those attributes into the ORM instance. Since ``poison_by_raw_statement``
-aborts the underlying transaction without SQLAlchemy's ORM-level "expire
-everything" cleanup (unlike a failed flush -- see poison_by_orm_flush's
-docstring and TestSessionRecoveryAfterHookFailure in the SQLite suite,
-which *is* mutation-sensitive on both backends), no attribute on that
-already-loaded row needs reloading afterward, so these three routes never
-actually issue a new statement on the poisoned connection either way. The
-seam-level test above is what actually exercises the poisoned connection.
+The four route-level tests below (toggle, connect, the apps listing, the
+servers listing) are also run here for completeness -- they pin the
+*correct* end-to-end behavior (2xx, durable writes) under this exact
+failure shape on a real server. They are not independently
+mutation-sensitive for this specific shape on these specific routes,
+though: each response builder happens to read the connector row's
+attributes once *before* the hook ever runs (e.g. toggle_mcp_server's own
+log line touches ``server.name``), which loads those attributes into the
+ORM instance. Since ``poison_by_raw_statement`` aborts the underlying
+transaction without SQLAlchemy's ORM-level "expire everything" cleanup
+(unlike a failed flush -- see poison_by_orm_flush's docstring and
+TestSessionRecoveryAfterHookFailure in the SQLite suite, which *is*
+mutation-sensitive on both backends), no attribute on that already-loaded
+row needs reloading afterward, so these four routes never actually issue a
+new statement on the poisoned connection either way. The seam-level test
+above is what actually exercises the poisoned connection.
 
-There is no fourth route-level test here for ``/api/mcp/servers`` (the
-sister listing to the apps listing above): that route has no per-request
-degradation catch of its own yet today -- a hook failure there still fails
-the whole request, matching its pre-existing behavior. The matching test
-is added once that catch lands, alongside the rest of the servers-listing
-degradation coverage (see the sibling note in
-test_mcp_reported_edit_permission.py's TestSessionRecoveryAfterHookFailure).
+``/api/mcp/servers`` (the sister listing to the apps listing above) now
+has its own per-request degradation catch, added in this same revision, so
+its route-level test below joins the other three rather than being
+deferred -- see the sibling note in
+test_mcp_reported_edit_permission.py's TestListMcpServersPerRowDegradation
+for the SQLite-side proof of this same route using the ORM-flush failure
+shape, which *is* mutation-sensitive there.
 
 Obtains its database through ``tests/shared/postgres_disposable.py``
 (``disposable_database_factory``), the same disposable-CREATE-DATABASE
@@ -236,6 +237,41 @@ def test_the_apps_listing_still_returns_every_row_when_the_hook_poisons_the_sess
 
         entry = next(e for e in entries if e["server_id"] == server_id)
         assert entry["can_configure"] is False
+    finally:
+        db.close()
+
+
+def test_the_servers_listing_still_returns_every_row_when_the_hook_poisons_the_session(
+    session_factory, seeded
+) -> None:
+    import xagent.web.api.mcp as mcp_api
+
+    owner_id, server_id = seeded
+    member = User(username="session-fault-servers-member", password_hash="x")
+
+    def poisoning_access(db, user_id, refs):
+        poison_by_raw_statement(db)
+        return {}
+
+    db = session_factory()
+    try:
+        db.add(member)
+        db.commit()
+        member_id = int(member.id)
+        current_user = SimpleNamespace(id=member_id, is_admin=False)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=poisoning_access,
+                visibility=lambda _db, _uid: {
+                    "mcp": {server_id},
+                    "custom_api": set(),
+                },
+            )
+            entries = mcp_api.get_mcp_servers(current_user=current_user, db=db)
+
+        entry = next(e for e in entries if e.id == server_id)
+        assert entry.can_edit_global is False
     finally:
         db.close()
 

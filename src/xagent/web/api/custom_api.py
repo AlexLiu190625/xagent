@@ -24,7 +24,7 @@ from ..models.database import get_db
 from ..models.user import User
 
 if TYPE_CHECKING:
-    from ..services.connector_team_scope import ConnectorAccess, ConnectorRef
+    from ..services.connector_team_scope import ConnectorAccess
     from .mcp import _TeamOwnedUserApi
 
 logger = logging.getLogger(__name__)
@@ -307,7 +307,7 @@ def _resolve_custom_api_for_request(
     Raises ``ConnectorRuntimeError`` when access resolution itself fails;
     callers translate that into an ``HTTPException``.
     """
-    from ..services.connector_team_scope import resolve_connector_access_or_raise
+    from ..services.connector_team_scope import resolve_one_connector_access_or_raise
     from .mcp import _TeamOwnedUserApi
 
     user_api = (
@@ -330,8 +330,9 @@ def _resolve_custom_api_for_request(
 
     access: "ConnectorAccess | None" = None
     if api is not None and not already_decided:
-        ref: "ConnectorRef" = ("custom_api", int(api.id))
-        access = resolve_connector_access_or_raise(db, int(user_id), [ref]).get(ref)
+        access = resolve_one_connector_access_or_raise(
+            db, int(user_id), ("custom_api", int(api.id))
+        )
 
     if user_api is None and access is None:
         raise HTTPException(

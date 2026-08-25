@@ -1547,7 +1547,7 @@ def _resolve_mcp_server_for_request(
     ``user_mcp is None``: the verdict *is* the gate in that case, not a
     decoration on top of one.
     """
-    from ..services.connector_team_scope import resolve_connector_access_or_raise
+    from ..services.connector_team_scope import resolve_one_connector_access_or_raise
 
     result = (
         db.query(UserMCPServer, MCPServer)
@@ -1568,9 +1568,10 @@ def _resolve_mcp_server_for_request(
 
     access: "ConnectorAccess | None" = None
     if server is not None and not already_decided:
-        ref: "ConnectorRef" = ("mcp", int(server.id))
         try:
-            access = resolve_connector_access_or_raise(db, int(user_id), [ref]).get(ref)
+            access = resolve_one_connector_access_or_raise(
+                db, int(user_id), ("mcp", int(server.id))
+            )
         except ConnectorRuntimeError:
             # Degrade only when the caller's own personal row already got
             # them past the gate. With no personal row the verdict *is*
@@ -2533,9 +2534,15 @@ def list_mcp_apps(
         }
         verdicts: "dict[ConnectorRef, ConnectorAccess]" = {}
         if access_refs:
+            # Captured before the resolution call below: a failed hook can
+            # leave the shared session in a state where a lazy ORM attribute
+            # read triggers a query of its own, so the log line below reads
+            # a plain int gathered ahead of time rather than current_user.id
+            # off the row.
+            user_id_for_log = int(current_user.id)
             try:
                 verdicts = resolve_connector_access_or_raise(
-                    db, cast(int, current_user.id), access_refs
+                    db, user_id_for_log, access_refs
                 )
             except ConnectorRuntimeError:
                 logger.warning(
@@ -2543,7 +2550,7 @@ def list_mcp_apps(
                     "local connectors for user %s; reporting "
                     "can_configure=False for those rows",
                     len(access_refs),
-                    current_user.id,
+                    user_id_for_log,
                 )
 
         library_keys = {key for app in library_apps for key in _catalog_app_keys(app)}
@@ -3333,7 +3340,7 @@ def connect_mcp_app(
     # failure here must not fail the request -- it only degrades
     # can_edit_global to False, the value this route always reported before
     # the verdict existed at all.
-    from ..services.connector_team_scope import resolve_connector_access_or_raise
+    from ..services.connector_team_scope import resolve_one_connector_access_or_raise
 
     # Captured before the resolution call below: a failed hook can leave the
     # shared session in a state where a lazy ORM attribute read triggers a
@@ -3343,10 +3350,9 @@ def connect_mcp_app(
     user_id_for_log = int(current_user.id)
 
     team_access: "ConnectorAccess | None" = None
-    ref: "ConnectorRef" = ("mcp", server_id_for_log)
     try:
-        team_access = resolve_connector_access_or_raise(db, user_id_for_log, [ref]).get(
-            ref
+        team_access = resolve_one_connector_access_or_raise(
+            db, user_id_for_log, ("mcp", server_id_for_log)
         )
     except ConnectorRuntimeError:
         logger.warning(
@@ -4043,7 +4049,9 @@ async def toggle_mcp_server(
         # so a verdict failure here must not fail the request -- it only
         # degrades can_edit_global to False, the same answer this route
         # reported before the verdict existed at all.
-        from ..services.connector_team_scope import resolve_connector_access_or_raise
+        from ..services.connector_team_scope import (
+            resolve_one_connector_access_or_raise,
+        )
 
         # Captured before the resolution call below: a failed hook can leave
         # the shared session in a state where a lazy ORM attribute read
@@ -4054,11 +4062,10 @@ async def toggle_mcp_server(
         user_id_for_log = int(user_id)
 
         team_access: "ConnectorAccess | None" = None
-        ref: "ConnectorRef" = ("mcp", server_id_for_log)
         try:
-            team_access = resolve_connector_access_or_raise(
-                db, user_id_for_log, [ref]
-            ).get(ref)
+            team_access = resolve_one_connector_access_or_raise(
+                db, user_id_for_log, ("mcp", server_id_for_log)
+            )
         except ConnectorRuntimeError:
             logger.warning(
                 "Connector access resolution failed for MCP server %s after "

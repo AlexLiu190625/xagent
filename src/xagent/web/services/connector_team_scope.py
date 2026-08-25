@@ -471,6 +471,21 @@ def resolve_connector_access_or_raise(
         ) from exc
 
 
+def resolve_one_connector_access_or_raise(
+    db: Any, user_id: int, ref: "ConnectorRef"
+) -> "ConnectorAccess | None":
+    """Single-``ref`` convenience wrapper around
+    ``resolve_connector_access_or_raise``: wraps ``ref`` in a one-element
+    collection, calls the batch resolver, and unwraps the answer for that
+    ref. ``None`` means the same thing it means for any ref missing from a
+    batch answer -- not linked, or a legitimate answer the hook chose to
+    omit -- never a failure, which still raises ``ConnectorRuntimeError``
+    same as the batch form. Exists so item GET/PUT call sites do not each
+    repeat the wrap-then-``.get(ref)`` shape by hand.
+    """
+    return resolve_connector_access_or_raise(db, user_id, [ref]).get(ref)
+
+
 @contextmanager
 def snapshot_connector_team_hooks() -> Iterator[None]:
     """Save every module-level hook slot, restore it on exit.
