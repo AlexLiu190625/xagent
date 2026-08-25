@@ -501,13 +501,12 @@ class OpenRouterLLM(OpenAILLM):
         adjustment opportunity. A single ``call`` invocation may itself issue
         one additional upstream request through the response_format
         pop-and-retry path shared by ``OpenAILLM.chat`` and ``vision_chat``,
-        but the two behave differently on a successful resend: ``chat``'s
-        branch returns the processed result of the resent call, or lets that
-        second call's failure propagate uncaught; ``vision_chat``'s
-        same-named branch does neither on a successful resend -- it falls
-        out of the ``except`` block with no ``return`` statement, so the
-        call implicitly yields ``None`` instead of the resent response
-        (tracked by #1650). No caller in this repository currently passes
+        and the two behave identically: a successful resend flows through
+        the method's normal response processing and is returned, while a
+        resend that fails again is wrapped into ``RuntimeError`` by the
+        outer handler like every other failure path, so no bare
+        ``openai.BadRequestError`` reaches this loop from either
+        entrypoint. No caller in this repository currently passes
         ``response_format`` into ``chat``; the one caller that does supply
         it in this repository (``vision_tool.py``) calls ``vision_chat``.
 
