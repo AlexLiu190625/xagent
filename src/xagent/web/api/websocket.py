@@ -98,6 +98,11 @@ from ..services.db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
+from ..services.external_task_cancel import (
+    EXTERNAL_COMMAND_SCOPE,
+    EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+    cancel_external_task_unserialized,
+)
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
@@ -400,14 +405,22 @@ def client_safe_error_message(error: BaseException) -> str:
 
 
 def client_safe_task_command_failure(
-    kind: TaskCommandKind, error: BaseException
+    kind: TaskCommandKind, error: BaseException, *, scope: str | None = None
 ) -> str:
     """Terminal command failure: server-owned kind prefix + redacted detail.
 
     The frontend renders ``message`` verbatim for ``agent_error``, so dropping
     the prefix entirely removed user-visible context. The kind comes from our
     own enum, never from the exception, which is what makes the prefix safe.
+
+    An external-scope cancel is the one command a task's audience issues
+    without any account behind it, and its whole meaning is "stop this
+    response". Whatever exhausted the command's budget, the audience gets the
+    same sentence the terminal event carries, with no command identity or
+    exception detail attached.
     """
+    if kind == TaskCommandKind.CANCEL and scope == EXTERNAL_COMMAND_SCOPE:
+        return EXTERNAL_TURN_INTERRUPTED_MESSAGE
     return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
 
 
@@ -8445,8 +8458,6 @@ async def _execute_durable_task_command(
                     message_data,
                 )
             elif command.kind == TaskCommandKind.CANCEL:
-                from .a2a import _cancel_task_unserialized
-
                 agent_id_value = message_data.get("agent_id")
                 if agent_id_value is None:
                     raise ValueError(
@@ -8469,13 +8480,27 @@ async def _execute_durable_task_command(
                         "state-version target",
                         reason="stale_run",
                     )
+                # The A2A execution core loads its target as an A2A task, so
+                # a cancel for any other task source needs its own core. The
+                # scope names which one; a payload without it is an A2A
+                # cancel, the only shape this command had before.
                 async with task_execution_controller.command(command.task_id):
-                    await _cancel_task_unserialized(
-                        task_id=command.task_id,
-                        agent_id=agent_id,
-                        expected_run_id=command.target_run_id,
-                        expected_state_version=target_state_version,
-                    )
+                    if message_data.get("scope") == EXTERNAL_COMMAND_SCOPE:
+                        await cancel_external_task_unserialized(
+                            task_id=command.task_id,
+                            agent_id=agent_id,
+                            expected_run_id=command.target_run_id,
+                            expected_state_version=target_state_version,
+                        )
+                    else:
+                        from .a2a import _cancel_task_unserialized
+
+                        await _cancel_task_unserialized(
+                            task_id=command.task_id,
+                            agent_id=agent_id,
+                            expected_run_id=command.target_run_id,
+                            expected_state_version=target_state_version,
+                        )
             else:  # pragma: no cover - enum construction rejects this earlier
                 raise ValueError(f"Unsupported task command kind: {command.kind}")
         except StaleTaskRunError as exc:
@@ -8490,6 +8515,13 @@ async def _execute_durable_task_command(
     }
 
 
+def _command_scope(command: ClaimedTaskCommand) -> str | None:
+    """The scope a command payload names, or ``None`` when it names none."""
+
+    scope = command.payload.get("scope")
+    return scope if isinstance(scope, str) else None
+
+
 async def _broadcast_terminal_command_error(
     command: ClaimedTaskCommand,
     error: BaseException,
@@ -8500,7 +8532,14 @@ async def _broadcast_terminal_command_error(
             # A blessed constructor rather than an f-string at the call
             # site: the guard cannot see inside an interpolation. The kind
             # also travels as a structured field for consumers that want it.
-            "message": client_safe_task_command_failure(command.kind, error),
+            # The scope goes with it because the audience of an
+            # external-scope command is not the audience the default
+            # wording was written for.
+            "message": client_safe_task_command_failure(
+                command.kind,
+                error,
+                scope=_command_scope(command),
+            ),
             "command_kind": command.kind.value,
             "task_id": command.task_id,
             "command_id": command.command_id,
