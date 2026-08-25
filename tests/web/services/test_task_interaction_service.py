@@ -903,18 +903,34 @@ _ABSENT_TASK_ID = 999999999
 
 # create()'s task lookup, one row per (principal branch x ownership x
 # whether the task exists). The three branches load differently on
-# purpose: a non-admin "user" carries an owner predicate into the lookup,
-# an admin and a guest load by id alone. That difference is what decides
-# which of the two "no row" outcomes each branch can return, so the table
-# below is the single place all of it is asserted.
+# purpose: a non-admin "user" and a guest both carry the same owner
+# predicate (Task.user_id == principal.user_id) into the lookup, while an
+# admin loads by id alone. That difference is what decides which of the
+# two "no row" outcomes each branch can return, so the table below is the
+# single place all of it is asserted.
 #
 # The guest branch's positive cell is not in this table: it needs a task
 # whose agent_config carries the widget binding, which this table's
 # _seeded_task fixture does not build. It lives in
-# test_ca1_guest_principal_is_authorized_on_its_own_task. The row below is
-# the negative half against a real existing row -- the branch whose
-# ownership check is a post-load Python predicate
-# (task_is_owned_by_public_principal) rather than a SQL filter.
+# test_ca1_guest_principal_is_authorized_on_its_own_task.
+#
+# The three guest rows below all end in the same outcome and get there by
+# three different routes, which is the point of listing them separately:
+#
+#   guest_on_an_absent_task            no row for that id at all
+#   guest_of_another_owner_...         a row exists, the owner term in the
+#                                      lookup excludes it, so nothing loads
+#   guest_on_an_existing_non_matching  the owner term admits the row, and
+#                                      the post-load Python predicate
+#                                      (task_is_owned_by_public_principal)
+#                                      refuses it on agent_config
+#
+# None of the three separates the owner term from the Python predicate on
+# its own -- _seeded_task carries no agent_config, so the second row would
+# still be refused with the owner term removed. The cell that does
+# separate them needs a task whose agent_config matches in full and whose
+# user_id does not, and it lives in
+# test_ca1_guest_principal_is_rejected_on_another_owners_matching_task.
 @pytest.mark.parametrize(
     ("make_principal", "task_exists", "expected"),
     [
@@ -953,8 +969,16 @@ _ABSENT_TASK_ID = 999999999
                 user_id=owner_id, workforce_id=9
             ),
             False,
-            svc.CreateUnavailable(reason="task_missing"),
+            svc.CreateUnauthorized(reason="not_task_principal"),
             id="guest_on_an_absent_task",
+        ),
+        pytest.param(
+            lambda owner_id: _widget_workforce_guest_principal(
+                user_id=owner_id + 1000, workforce_id=9
+            ),
+            True,
+            svc.CreateUnauthorized(reason="not_task_principal"),
+            id="guest_of_another_owner_on_an_existing_task",
         ),
         pytest.param(
             lambda owner_id: _widget_workforce_guest_principal(
@@ -966,7 +990,7 @@ _ABSENT_TASK_ID = 999999999
         ),
     ],
 )
-def test_ca2_task_lookup_is_owner_scoped_for_non_admin_user_principals(
+def test_ca2_task_lookup_is_owner_scoped_for_every_branch_but_admin(
     _db: Session,
     _seeded_task: int,
     make_principal: Any,
@@ -1267,6 +1291,74 @@ def test_ca1_guest_principal_is_rejected_on_a_non_matching_task(
     assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
 
 
+def test_ca1_guest_principal_is_rejected_on_another_owners_matching_task(
+    _db: Session, _session_factory
+) -> None:
+    """Every conjunct task_is_owned_by_public_principal evaluates matches
+    -- auth_mode, the workforce binding, and guest_id are all the task's
+    own values -- and the task still belongs to a different user. The
+    predicate deliberately does not carry the Task.user_id term (see its
+    docstring: the four public-chat entry points enforce it as a filter on
+    the query that loads the task, never as a post-load check), so the
+    only thing that can refuse this call is create()'s own owner-scoped
+    lookup. Drop Task.user_id from that lookup and this call is
+    authorized against another user's task."""
+
+    db = _session_factory()
+    owner_id = make_user(db)
+    other_user_id = make_user(db)
+    task_id = _widget_workforce_task(db, user_id=owner_id, workforce_id=9)
+    db.close()
+
+    assert other_user_id != owner_id
+    principal = _widget_workforce_guest_principal(user_id=other_user_id, workforce_id=9)
+    outcome = svc.create(
+        _db, task_id=task_id, principal=principal, envelope=_valid_envelope()
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+
+
+def test_ca3_create_rejects_a_guest_principal_carrying_no_user_id(
+    _db: Session, _session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guest lookup is owner-scoped, so a guest with no user_id would
+    compile to Task.user_id IS NULL and reject only because the column is
+    NOT NULL. create() rejects before the lookup instead, and the outcome
+    object cannot tell the two apart -- both are
+    Unauthorized(not_task_principal). What separates them is whether the
+    query was built at all, so that is what this test asserts: with the
+    pre-lookup guard in place db.query is never called; delete the guard
+    and it is, even though the outcome stays the same."""
+
+    db = _session_factory()
+    owner_id = make_user(db)
+    task_id = _widget_workforce_task(db, user_id=owner_id, workforce_id=9)
+    db.close()
+
+    queried: list[Any] = []
+    real_query = _db.query
+
+    def _recording_query(*args: Any, **kwargs: Any) -> Any:
+        queried.append(args)
+        return real_query(*args, **kwargs)
+
+    monkeypatch.setattr(_db, "query", _recording_query)
+
+    principal = svc.InteractionPrincipal(
+        kind="guest",
+        user_id=None,
+        is_admin=False,
+        auth_mode="widget",
+        widget_workforce_id=9,
+        guest_id="guest-1",
+    )
+    outcome = svc.create(
+        _db, task_id=task_id, principal=principal, envelope=_valid_envelope()
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+    assert queried == []
+
+
 def test_ca1_guest_principal_with_two_populated_directions_is_unauthorized_not_raised(
     _db: Session, _seeded_task: int
 ) -> None:
@@ -1276,9 +1368,14 @@ def test_ca1_guest_principal_with_two_populated_directions_is_unauthorized_not_r
     Unauthorized(not_task_principal), not let it escape as an unhandled
     exception."""
 
+    # The guest lookup is owner-scoped, so this has to be the task's real
+    # owner: a mismatched user_id would return the empty result set and
+    # reject before the predicate is ever called, and this test would pass
+    # without exercising the ValueError translation it exists for.
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
     principal = svc.InteractionPrincipal(
         kind="guest",
-        user_id=1,
+        user_id=task.user_id,
         is_admin=False,
         auth_mode="widget",
         widget_agent_id=1,
@@ -1294,9 +1391,11 @@ def test_ca1_guest_principal_with_two_populated_directions_is_unauthorized_not_r
 def test_ca1_guest_principal_with_zero_populated_directions_is_unauthorized_not_raised(
     _db: Session, _seeded_task: int
 ) -> None:
+    # Owner-scoped for the same reason as the two-directions test above.
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
     principal = svc.InteractionPrincipal(
         kind="guest",
-        user_id=1,
+        user_id=task.user_id,
         is_admin=False,
         auth_mode="widget",
         guest_id="guest-1",
@@ -3107,35 +3206,51 @@ def test_respond_rejects_a_guest_principal_with_zero_populated_directions(
 
 
 @pytest.mark.parametrize(
-    "principal",
+    ("make_principal", "agent_config"),
     [
         pytest.param(
-            svc.InteractionPrincipal(
+            lambda owner_id: svc.InteractionPrincipal(
                 kind="user", user_id=None, is_admin=True, auth_mode=None
             ),
+            None,
             id="user_without_an_id",
         ),
         pytest.param(
-            svc.InteractionPrincipal(
+            lambda owner_id: svc.InteractionPrincipal(
                 kind="guest",
-                user_id=1,
+                user_id=owner_id,
                 is_admin=False,
                 auth_mode="widget",
                 widget_workforce_id=9,
                 guest_id="",
             ),
+            # Every conjunct ahead of the guest_id pair matches -- the
+            # auth_mode and the workforce binding -- and the task's own
+            # guest_id is blank too, so the equality below the guard
+            # ("" == "") would pass as well. The one thing left to refuse
+            # this call is the guard that requires principal.guest_id to
+            # be non-empty before the comparison runs. Without an
+            # agent_config the task carries none at all, the auth_mode
+            # conjunct does the refusing, and the guard is never the
+            # reason the assertion holds.
+            {
+                "auth_mode": "widget",
+                "widget_workforce_id": 9,
+                "guest_id": "",
+            },
             id="guest_with_a_blank_guest_id",
         ),
         pytest.param(
-            svc.InteractionPrincipal(
-                kind="service", user_id=1, is_admin=False, auth_mode=None
+            lambda owner_id: svc.InteractionPrincipal(
+                kind="service", user_id=owner_id, is_admin=False, auth_mode=None
             ),
+            None,
             id="unrecognized_kind",
         ),
     ],
 )
 def test_respond_rejects_every_principal_identity_string_cannot_name(
-    _respond_db, principal: svc.InteractionPrincipal
+    _respond_db, make_principal: Any, agent_config: dict[str, Any] | None
 ) -> None:
     """``identity_string()`` raises for exactly three principal shapes, and
     ``respond()`` calls it at four points with no guard of its own. What
@@ -3145,10 +3260,12 @@ def test_respond_rejects_every_principal_identity_string_cannot_name(
     ``RespondUnauthorized(reason="not_task_principal")``, never as a raised
     ``ValueError`` escaping the function."""
 
+    owner_id, task_id = _waiting_task(_respond_db, agent_config=agent_config)
+    principal = make_principal(owner_id)
+
     with pytest.raises(ValueError):
         principal.identity_string()
 
-    _owner_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
     with _asserts_no_side_effects(
         _respond_db, task_id=task_id, interaction_id=interaction_id

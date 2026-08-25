@@ -1184,9 +1184,9 @@ def create(
     against this facade's policy interval -- out of range is a rejection,
     never a silent clamp.
 
-    The load is owner-scoped for the branch that can express ownership in
-    SQL and id-only for the two that cannot, and the difference is
-    deliberate:
+    The load is owner-scoped for the two branches whose ownership includes
+    a column-level term and id-only for the one that has none, and the
+    difference is deliberate:
 
     - A non-admin ``"user"`` principal's ownership is one equality on a
       column, so it is a predicate on the lookup itself
@@ -1195,16 +1195,29 @@ def create(
       never loads a row it does not own.
     - An admin ``"user"`` principal is authorized without owning the task,
       so there is no owner predicate to add; the lookup stays id-only.
-    - Either way, a ``"user"`` principal carrying no ``user_id`` is
+    - A ``"guest"`` principal's ownership is split across the two. The
+      column-level half is the same ``Task.user_id == principal.user_id``:
+      a guest's owning user is the entity owner the guest is chatting
+      through, and all three entry points that build a guest principal
+      already load their task under ``Task.user_id ==
+      access_context.user.id`` (``web/api/public_chat_access.py``).
+      ``task_is_owned_by_public_principal`` deliberately excludes that term
+      from its own conjunction and leaves it to whatever loads the task
+      (see its docstring), so this lookup carries it. The rest of the
+      guest conjunction reads the task's ``agent_config`` JSON, which
+      cannot be compiled into this lookup's WHERE clause, and stays in the
+      shared Python predicate ``respond()`` reuses rather than being
+      re-derived here. Without the column-level half, a guest whose
+      ``agent_config`` values happened to match would be authorized
+      against a task belonging to another user; the answer side already
+      refuses exactly that at its write point
+      (``_answer_fence_task_predicate``'s ``Task.user_id`` term).
+    - A ``"user"`` or ``"guest"`` principal carrying no ``user_id`` is
       unauthorized before the lookup is even built. An admin passing on
       the flag alone would reach the write point with no identity to
-      record, and a non-admin's owner predicate built from that absent id
-      would reject only by way of ``Task.user_id`` being NOT NULL.
-    - A ``"guest"`` principal's ownership is
-      ``task_is_owned_by_public_principal``, which reads the task's
-      ``agent_config`` JSON and cannot be compiled into this lookup's WHERE
-      clause. That branch keeps the id-only load and the shared Python
-      predicate ``respond()`` reuses, not a re-derived conjunction.
+      record, and an owner-scoped branch's predicate built from that
+      absent id would reject only by way of ``Task.user_id`` being NOT
+      NULL.
 
     A principal whose ``kind`` is neither ``"user"`` nor ``"guest"`` is
     always unauthorized -- there is no third branch that defaults to allow.
@@ -1217,14 +1230,13 @@ def create(
 
     Consequence of the owner-scoped lookup, and the reason it is stated
     here rather than left for a reader to derive from the SQL: for a
-    non-admin ``"user"`` principal, "this task does not exist" and "this
-    task is not yours" are the same empty result set, and both return
-    ``CreateUnauthorized(reason="not_task_principal")``. That principal
-    cannot use this function to learn whether a ``task_id`` exists.
-    ``CreateUnavailable(reason="task_missing")`` remains reachable only
-    from the two id-only branches -- an admin and a guest, neither of whom
-    is told anything by it that their own branch does not already tell
-    them.
+    non-admin ``"user"`` principal and for a guest, "this task does not
+    exist" and "this task is not yours" are the same empty result set, and
+    both return ``CreateUnauthorized(reason="not_task_principal")``.
+    Neither principal can use this function to learn whether a ``task_id``
+    exists. ``CreateUnavailable(reason="task_missing")`` remains reachable
+    only from the one id-only branch -- an admin, who is told nothing by it
+    that their own branch does not already tell them.
 
     ``origin`` is deliberately not part of this envelope or this
     validation step in this delivery: the reason vocabulary deliberately
@@ -1252,7 +1264,7 @@ def create(
 
     ``CreateUnavailable(reason="task_missing")`` and
     ``CreateUnauthorized(reason="not_task_principal")`` remain
-    distinguishable outcomes on the two id-only branches above, and a
+    distinguishable outcomes on the id-only admin branch above, and a
     caller that exposes that distinction externally hands an
     unauthenticated or unauthorized requester a task-existence oracle:
     "unavailable" versus "unauthorized" reveals whether ``task_id`` exists
@@ -1271,17 +1283,20 @@ def create(
     built on this module, not only to ``create()``'s own two variants.
     """
 
-    if principal.kind == "user" and principal.user_id is None:
-        # Rejected before the lookup, on both branches. An admin passing
-        # on the flag alone would reach the write point with no identity to
-        # record as who acted. A non-admin's owner predicate would be built
-        # from that same absent id and render as ``Task.user_id IS NULL``,
-        # which rejects only because ``Task.user_id`` is NOT NULL today --
-        # an explicit rejection here says what is meant instead of
-        # borrowing a schema detail to mean it.
+    if principal.kind in ("user", "guest") and principal.user_id is None:
+        # Rejected before the lookup, on every branch that carries a
+        # user_id at all. An admin passing on the flag alone would reach
+        # the write point with no identity to record as who acted. An
+        # owner-scoped branch's predicate would be built from that same
+        # absent id and render as ``Task.user_id IS NULL``, which rejects
+        # only because ``Task.user_id`` is NOT NULL today -- an explicit
+        # rejection here says what is meant instead of borrowing a schema
+        # detail to mean it.
         return CreateUnauthorized(reason="not_task_principal")
 
-    owner_scoped = principal.kind == "user" and not principal.is_admin
+    owner_scoped = principal.kind == "guest" or (
+        principal.kind == "user" and not principal.is_admin
+    )
 
     task_lookup = db.query(Task).filter(Task.id == task_id)
     if owner_scoped:
@@ -1291,8 +1306,8 @@ def create(
         # An owner-scoped lookup cannot tell "no such task" from "not your
         # task" -- both are the empty result set, and reporting either one
         # specifically would make this function an existence oracle for a
-        # principal that is not entitled to one. The id-only branches
-        # (admin, guest) keep reporting task_missing.
+        # principal that is not entitled to one. The admin branch, the only
+        # one that loads by id alone, keeps reporting task_missing.
         if owner_scoped:
             return CreateUnauthorized(reason="not_task_principal")
         return CreateUnavailable(reason="task_missing")
@@ -1303,6 +1318,10 @@ def create(
         # authorized on the flag alone.
         authorized = True
     elif principal.kind == "guest":
+        # The owner term is already proved by the lookup above, the same
+        # way the three public-chat entry points prove it; what is left for
+        # the Python predicate is the agent_config conjunction, which no
+        # WHERE clause can express.
         try:
             authorized = task_is_owned_by_public_principal(task, principal)
         except ValueError:
@@ -1356,12 +1375,17 @@ def create(
         # observability line that can be switched off is one that is off
         # when it is needed.
         #
-        # What the message can contain: positions, and the two identifiers
-        # the question's author chose -- an interaction's ``field`` and an
-        # option's ``value``, both quoted by the rules that refuse a
-        # duplicate of either. Neither is anything a user typed; the
-        # response side is not reachable from here at all. The payload is
-        # never logged whole.
+        # What the message can contain: positions, and three identifiers
+        # the question's author chose -- an interaction's ``type`` (quoted
+        # by the rule that refuses a type outside the v1 vocabulary), an
+        # interaction's ``field``, and an option's ``value`` (the latter
+        # two quoted by the rules that refuse a duplicate of either). All
+        # three are unconstrained ``str`` on the tool model, so nothing at
+        # the type level keeps caller text out of them; what keeps it out
+        # today is that no production path puts user input in any of the
+        # three, and the response side is not reachable from here at all.
+        # Constraining them belongs at the schema, not here. The payload
+        # is never logged whole.
         logger.warning(
             "v1 interaction write payload refused for task_id=%s: %s",
             task_id,
