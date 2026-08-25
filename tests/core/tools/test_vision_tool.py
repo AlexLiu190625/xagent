@@ -1627,19 +1627,30 @@ class TestVisionToolDetectObjects:
     ):
         """A response with no text payload must be reported as a failure
         with a non-empty error, and must never reach the marking step that
-        writes a bounding-box image to disk."""
+        writes a bounding-box image to disk. Uses a real local file (rather
+        than a data: URL) so the mark_objects=True rows exercise the actual
+        marking code path instead of being rejected earlier by the
+        local-file-only guard for URL/data images."""
         model = Mock(spec=BaseLLM)
         model.vision_chat = AsyncMock(return_value=response)
         model.has_ability = Mock(return_value=True)
 
         vision_tool = VisionTool(model)
-        with patch.object(vision_tool.core, "_draw_bounding_boxes") as mock_draw:
-            result = await vision_tool.detect_objects(
-                "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
-                task="Find all objects in the image",
-                mark_objects=mark_objects,
-            )
-            mock_draw.assert_not_called()
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
+            temp_image_path = temp_file.name
+            temp_file.write(b"fake_image_data")
+
+        try:
+            with patch.object(vision_tool.core, "_draw_bounding_boxes") as mock_draw:
+                result = await vision_tool.detect_objects(
+                    temp_image_path,
+                    task="Find all objects in the image",
+                    mark_objects=mark_objects,
+                )
+                mock_draw.assert_not_called()
+        finally:
+            if os.path.exists(temp_image_path):
+                os.unlink(temp_image_path)
 
         assert result.success is False
         assert result.error
