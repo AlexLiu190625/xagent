@@ -1298,7 +1298,9 @@ async def test_openrouter_compat_loop_catches_bare_sdk_bad_request(mocker):
     raises the bare SDK error once, and the loop must treat it as a compat
     adjustment opportunity rather than let it escape. This is the only test
     that fails when ``openai.BadRequestError`` is removed from
-    ``_COMPAT_RETRYABLE_ERRORS``.
+    ``_COMPAT_RETRYABLE_ERRORS``. The streaming compat loop in
+    ``_run_stream_chat_with_compat_retry`` consumes the same tuple but has
+    no equivalent bare-error stub coverage yet.
     """
     llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
     prefix_retry_mock = mocker.patch.object(
