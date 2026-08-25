@@ -91,19 +91,28 @@ def test_classify_close_rowcount_logs_info_for_the_expected_single_row_case(
     caplog,
 ) -> None:
     with caplog.at_level(logging.INFO, logger=_CLOSE_MODULE_NAME):
-        _classify_close_rowcount(1, task_id=1, run_id="run-a")
+        _classify_close_rowcount(1, task_id=1, run_id="run-a", unmatched_row=None)
 
     assert [record.levelno for record in caplog.records] == [logging.INFO]
     assert ops_signals.active_degradations() == {}
 
 
+@pytest.mark.parametrize(
+    "unmatched_row", ["no_id_read", "row_absent", "row_status=terminated"]
+)
 def test_classify_close_rowcount_logs_debug_for_the_common_no_op_case(
-    caplog,
+    caplog, unmatched_row: str
 ) -> None:
+    """The zero branch carries the description through to the log line
+    verbatim: the level says a close matched nothing, and this says which
+    of the situations that fold into that rowcount it was."""
     with caplog.at_level(logging.DEBUG, logger=_CLOSE_MODULE_NAME):
-        _classify_close_rowcount(0, task_id=1, run_id="run-a")
+        _classify_close_rowcount(
+            0, task_id=1, run_id="run-a", unmatched_row=unmatched_row
+        )
 
     assert [record.levelno for record in caplog.records] == [logging.DEBUG]
+    assert f"unmatched_row={unmatched_row}" in caplog.records[0].getMessage()
     assert ops_signals.active_degradations() == {}
 
 
@@ -114,7 +123,7 @@ def test_classify_close_rowcount_logs_error_and_registers_a_signal_for_an_imposs
     unless that constraint has already been violated -- see this module's
     docstring. Logged at error and surfaced on /health, not raised."""
     with caplog.at_level(logging.ERROR, logger=_CLOSE_MODULE_NAME):
-        _classify_close_rowcount(2, task_id=7, run_id="run-b")
+        _classify_close_rowcount(2, task_id=7, run_id="run-b", unmatched_row=None)
 
     assert [record.levelno for record in caplog.records] == [logging.ERROR]
     assert (
@@ -283,6 +292,73 @@ def test_close_retires_only_the_row_it_was_given(
     # The other task's row is out of range of this close regardless.
     assert row_state(db, other_row_id).status == "active"
     assert task_marker(db, task_id) == expected_marker
+
+
+# A zero rowcount is one number for situations an operator has to tell
+# apart, so the debug line carries a description of which one it was,
+# resolved from the database at the close's own call point. Four shapes,
+# all of them misses, and a different set from the grid above: that one
+# keeps the seeded rows fixed and varies only the id the close is handed,
+# including the id that matches; these vary the seeded row too.
+@pytest.mark.parametrize(
+    ("row_to_seed", "id_to_pass", "expected_description"),
+    [
+        pytest.param(None, None, "no_id_read", id="the_read_produced_no_id"),
+        pytest.param(None, 999_999_999, "row_absent", id="the_id_names_no_row"),
+        pytest.param(
+            "terminated",
+            "the_seeded_row",
+            "row_status=terminated",
+            id="another_path_closed_the_row_first",
+        ),
+        pytest.param(
+            "active",
+            "the_seeded_row",
+            "row_status=active",
+            id="the_row_is_live_but_belongs_to_another_run",
+        ),
+    ],
+)
+def test_close_records_why_it_matched_no_row(
+    db,
+    caplog: pytest.LogCaptureFixture,
+    row_to_seed: str | None,
+    id_to_pass: object,
+    expected_description: str,
+) -> None:
+    """The last case is the one that used to be indistinguishable from an
+    empty table: a row that is still active, and still missed, because this
+    close fences on run_id as well as on the id."""
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    seeded_row_id: int | None = None
+    if row_to_seed == "terminated":
+        anchor_id = make_trace_event(db, task_id=task_id)
+        row = TaskInteractionRequest(
+            **make_row(
+                task_id=task_id,
+                resume_trace_event_id=anchor_id,
+                run_id="run-a",
+                status="terminated",
+            )
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        seeded_row_id = int(row.id)
+    elif row_to_seed == "active":
+        seeded_row_id = seed_active_row(db, task_id=task_id, run_id="run-b")
+
+    interaction_id = seeded_row_id if id_to_pass == "the_seeded_row" else id_to_pass
+
+    with caplog.at_level(logging.DEBUG, logger=_CLOSE_MODULE_NAME):
+        rowcount = close_legacy_resume_interaction(
+            db, task_id=task_id, run_id="run-a", interaction_id=interaction_id
+        )
+    db.commit()
+
+    assert rowcount == 0
+    assert [record.levelno for record in caplog.records] == [logging.DEBUG]
+    assert f"unmatched_row={expected_description}" in caplog.records[0].getMessage()
 
 
 def test_close_sync_opens_its_own_transaction_and_commits(db) -> None:

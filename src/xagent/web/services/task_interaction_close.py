@@ -96,7 +96,11 @@ way, at the one place the classification happens
 (``_classify_close_rowcount``): exactly one row closed is the expected
 case and logs at info; zero rows is the overwhelmingly common case today
 (no production writer has inserted into ``task_interaction_requests``
-yet) and logs at debug; more than one row is impossible under
+yet) and logs at debug, carrying with it a short description of why
+nothing matched (``_unmatched_close_row``) -- "nothing was ever there"
+and "something was there and is no longer this run's live question" are
+the same rowcount and different situations; more than one row is
+impossible under
 ``uq_task_interaction_active_slot`` (it allows at most one row per task
 with a non-NULL ``active_slot``), but if that schema invariant were ever
 broken, this module logs at error and registers a degradation signal
@@ -126,7 +130,54 @@ from .task_lease_service import _rowcount
 logger = logging.getLogger(__name__)
 
 
-def _classify_close_rowcount(rowcount: int, *, task_id: int, run_id: str) -> None:
+def _unmatched_close_row(db: Session, *, interaction_id: int | None) -> str:
+    """Why the close statement matched nothing, for the zero-rowcount log.
+
+    A zero rowcount folds together outcomes an operator has to tell apart:
+    nothing was ever there to close, and something was there but is no
+    longer this run's live question -- another path retired it first, or it
+    belongs to a run this close is not finishing. The rowcount alone cannot
+    say which, and the difference decides whether a stale marker is the
+    expected 100% case or the trace of a close that lost a race.
+
+    Three answers, in increasing cost. ``no_id_read`` costs nothing and is
+    every call today: the pre-injection read produced no id, either because
+    no row was active or because the read could not be made at all (see
+    ``active_interaction_id_sync``). Only a real id makes this issue a
+    statement, a primary-key lookup on a table the caller's transaction has
+    already written to: ``row_absent`` when no row carries that id at all,
+    and ``row_status=<status>`` when one does -- which is the case that
+    used to be invisible. ``status`` is NOT NULL, so a NULL scalar here
+    means no row, never a row with an unset status.
+
+    A row reported as ``row_status=active`` is not a contradiction: the
+    close also fences on ``task_id`` and ``run_id``, so an id belonging to
+    another task or another run of this task reads back active and still
+    matches nothing.
+    """
+    if interaction_id is None:
+        return "no_id_read"
+    status = db.execute(
+        sa.select(TaskInteractionRequest.status).where(
+            TaskInteractionRequest.id == interaction_id
+        )
+    ).scalar()
+    if status is None:
+        return "row_absent"
+    return f"row_status={status}"
+
+
+def _classify_close_rowcount(
+    rowcount: int, *, task_id: int, run_id: str, unmatched_row: str | None
+) -> None:
+    """Log one close statement's rowcount at the level its case deserves.
+
+    ``unmatched_row`` describes why nothing matched and is read only on the
+    zero branch; the caller passes ``None`` on the other two, where there
+    is nothing unmatched to describe. It is a required argument rather than
+    a defaulted one so that a caller has to decide, instead of silently
+    getting a log line that has lost the distinction.
+    """
     if rowcount == 1:
         logger.info(
             "legacy resume closing the active interaction row task_id=%s run_id=%s",
@@ -136,9 +187,10 @@ def _classify_close_rowcount(rowcount: int, *, task_id: int, run_id: str) -> Non
     elif rowcount == 0:
         logger.debug(
             "legacy resume close matched no active interaction row "
-            "task_id=%s run_id=%s",
+            "task_id=%s run_id=%s unmatched_row=%s",
             task_id,
             run_id,
+            unmatched_row,
         )
     else:
         logger.error(
@@ -390,7 +442,20 @@ def close_legacy_resume_interaction(
         )
     )
     rowcount = _rowcount(close_result)
-    _classify_close_rowcount(rowcount, task_id=task_id, run_id=run_id)
+    _classify_close_rowcount(
+        rowcount,
+        task_id=task_id,
+        run_id=run_id,
+        # Only the zero branch has anything to describe, and only a
+        # non-None id makes this reach the database at all, so today's
+        # every-call path (no id read, zero rows) still issues nothing
+        # extra.
+        unmatched_row=(
+            _unmatched_close_row(db, interaction_id=interaction_id)
+            if rowcount == 0
+            else None
+        ),
+    )
     db.execute(
         sa.update(Task)
         .where(
