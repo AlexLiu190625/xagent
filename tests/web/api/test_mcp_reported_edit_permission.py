@@ -20,7 +20,12 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
-from xagent.web.api.custom_api import CustomApiUpdate, get_custom_api, update_custom_api
+from xagent.web.api.custom_api import (
+    CustomApiUpdate,
+    delete_custom_api,
+    get_custom_api,
+    update_custom_api,
+)
 from xagent.web.api.mcp import (
     MCPAppConnectRequest,
     MCPOAuthConnectRequest,
@@ -29,6 +34,7 @@ from xagent.web.api.mcp import (
     connect_mcp_app,
     connect_mcp_oauth,
     delete_mcp_oauth_grant,
+    delete_mcp_server,
     discover_mcp_oauth,
     get_mcp_oauth_status,
     get_mcp_server,
@@ -741,37 +747,243 @@ class TestRenameStaysScopedToItsOwnConnector:
 
 
 class TestStandaloneParityWithNoHookInstalled:
-    """With no hook installed at all, every route touched by this work --
-    both GETs, both PUTs, toggle, and the list -- behaves exactly as it did
-    before any of it started."""
+    """With no hook installed at all, every route touched by this work
+    behaves exactly as it did before any of it started -- across every one
+    of the design matrix's thirteen rows (design-v1.md section 32, I26),
+    for both populations standalone xagent can actually construct: A (the
+    connector's owner) and B (a caller with a personal, non-owner link
+    row -- legacy per-connector sharing that predates team editing). A
+    third population, a complete stranger with neither row nor link,
+    exists in the matrix's constructible-population footnote too and is
+    covered separately below.
 
-    async def test_every_route_in_scope_behaves_as_before_with_no_hook_installed(
-        self, db
+    Two additional route legs this same work touched but that fall
+    outside the thirteen-row matrix -- ``/api/mcp/apps``'s
+    ``can_configure`` and ``connect_mcp_app``'s ``can_edit_global`` -- are
+    pinned for both populations at the end of this class, so this
+    module's own docstring claim ("every route touched by this work") is
+    backed by actual coverage rather than just asserted.
+
+    Row numbering below matches the design doc's matrix exactly (13 rows):
+    1/2 GET /servers list (presence, can_edit_global), 3 GET /servers/{id},
+    4 PUT changing a global field, 5 PUT resubmitting a global field's
+    current value unchanged, 6 PUT touching only a personal field, 7 PUT
+    touching both at once, 8 DELETE /servers/{id}, 9 POST .../toggle,
+    10 GET /custom-apis/{id}, 11 PUT any editable Custom API field,
+    12 PUT only Custom API's is_active, 13 DELETE /custom-apis/{id}.
+    """
+
+    @pytest.mark.parametrize(
+        "population", ["owner", "personal_non_owner"], ids=["A=owner", "B=personal"]
+    )
+    async def test_the_matrix_rows_match_pre_change_behavior_with_no_hook(
+        self, db, population
     ):
-        owner = _make_user(db, 70)
-        stranger = _make_user(db, 71)
-        server = _make_owned_server(db, owner.id, name="standalone-parity-mcp")
+        owner = _make_user(db, 700)
+        member = _make_user(db, 701)
+        caller = owner if population == "owner" else member
+
+        server = _make_owned_server(db, owner.id, name=f"parity-mcp-{population}")
         server_id = server.id
-        api = _make_owned_api(db, owner.id, name="standalone-parity-api")
+        api = _make_owned_api(db, owner.id, name=f"parity-api-{population}")
         api_id = api.id
+
+        if population == "personal_non_owner":
+            db.add(
+                UserMCPServer(
+                    user_id=member.id,
+                    mcpserver_id=server_id,
+                    is_owner=False,
+                    is_active=True,
+                )
+            )
+            db.add(
+                UserCustomApi(
+                    user_id=member.id,
+                    custom_api_id=api_id,
+                    is_owner=False,
+                    can_edit=False,
+                    is_active=True,
+                )
+            )
+            db.commit()
+
+        # Whether an *actual global-config change* (rows 4 and 7) is
+        # expected to succeed for this population -- owner always can,
+        # a personal-but-non-owner caller never can with no hook and thus
+        # no team verdict.
+        can_edit_global_config = population == "owner"
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks()  # explicit reset: no hooks installed
 
-            get_response = get_mcp_server(server_id, current_user=owner, db=db)
-            assert get_response.can_edit_global is True
+            # Rows 1-2: GET /servers list -- presence and can_edit_global.
+            list_entries = get_mcp_servers(current_user=caller, db=db)
+            mcp_entry = next(r for r in list_entries if r.id == server_id)
+            assert mcp_entry.can_edit_global is can_edit_global_config
+
+            # Row 3: GET /servers/{id}.
+            get_response = get_mcp_server(server_id, current_user=caller, db=db)
+            assert get_response.can_edit_global is can_edit_global_config
+
+            # Row 4: PUT changing a global field (description).
+            if can_edit_global_config:
+                put_response = update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(description="row4-changed"),
+                    current_user=caller,
+                    db=db,
+                )
+                assert put_response.can_edit_global is True
+                current_description = "row4-changed"
+            else:
+                with pytest.raises(HTTPException) as exc:
+                    update_mcp_server(
+                        server_id,
+                        MCPServerUpdate(description="row4-attempted"),
+                        current_user=caller,
+                        db=db,
+                    )
+                assert exc.value.status_code == 403
+                current_description = None  # unchanged from creation (None)
+
+            # Row 5: PUT resubmitting a global field's *current* value --
+            # not an actual change, so it must succeed regardless of edit
+            # rights (the tamper check compares against the stored value).
+            row5_response = update_mcp_server(
+                server_id,
+                MCPServerUpdate(description=current_description),
+                current_user=caller,
+                db=db,
+            )
+            assert row5_response.can_edit_global is can_edit_global_config
+
+            # Row 6: PUT touching only a personal field (is_active) --
+            # always allowed for a caller with a personal row, independent
+            # of global edit rights.
+            row6_response = update_mcp_server(
+                server_id,
+                MCPServerUpdate(is_active=False),
+                current_user=caller,
+                db=db,
+            )
+            assert row6_response.can_edit_global is can_edit_global_config
+            assert row6_response.is_active is False
+
+            # Row 7: PUT touching a global field and a personal field at
+            # the same time -- the global half decides the outcome.
+            if can_edit_global_config:
+                row7_response = update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(description="row7-changed", is_active=True),
+                    current_user=caller,
+                    db=db,
+                )
+                assert row7_response.can_edit_global is True
+                assert row7_response.is_active is True
+            else:
+                with pytest.raises(HTTPException) as exc:
+                    update_mcp_server(
+                        server_id,
+                        MCPServerUpdate(description="row7-attempted", is_active=True),
+                        current_user=caller,
+                        db=db,
+                    )
+                assert exc.value.status_code == 403
+
+            # Row 9: POST .../toggle -- gated on a personal row's mere
+            # existence, not on edit rights; both populations have one.
+            toggle_response = await toggle_mcp_server(
+                server_id, current_user=caller, db=db
+            )
+            assert toggle_response.can_edit_global is can_edit_global_config
+
+            # Row 10: GET /custom-apis/{id} -- never reads a verdict for a
+            # caller who already has a working personal row, of either
+            # population, so this always succeeds.
+            api_get_response = await get_custom_api(api_id, current_user=caller, db=db)
+            assert api_get_response.id == api_id
+
+            # Row 11: PUT any editable Custom API field -- gated on
+            # user_api.can_edit OR the team verdict; with no hook and no
+            # can_edit on a non-owner's row, this is 403 for population B.
+            if population == "owner":
+                api_put_response = await update_custom_api(
+                    api_id,
+                    CustomApiUpdate(description="row11-changed"),
+                    current_user=caller,
+                    db=db,
+                )
+                assert api_put_response.id == api_id
+            else:
+                with pytest.raises(HTTPException) as exc:
+                    await update_custom_api(
+                        api_id,
+                        CustomApiUpdate(description="row11-attempted"),
+                        current_user=caller,
+                        db=db,
+                    )
+                assert exc.value.status_code == 403
+
+            # Row 12: PUT only Custom API's is_active -- Custom API has no
+            # personal-field carve-out the way MCP's PUT does (row 6):
+            # the can_edit gate fires before the is_active-only check is
+            # ever reached, so this is 403 for population B too, not 200.
+            if population == "owner":
+                api_row12_response = await update_custom_api(
+                    api_id,
+                    CustomApiUpdate(is_active=False),
+                    current_user=caller,
+                    db=db,
+                )
+                assert api_row12_response.is_active is False
+            else:
+                with pytest.raises(HTTPException) as exc:
+                    await update_custom_api(
+                        api_id,
+                        CustomApiUpdate(is_active=False),
+                        current_user=caller,
+                        db=db,
+                    )
+                assert exc.value.status_code == 403
+
+            # Row 8: DELETE /servers/{id} -- last, since it consumes the
+            # row. Gated on is_owner OR can_delete; population B has
+            # neither.
+            if population == "owner":
+                await delete_mcp_server(server_id, current_user=caller, db=db)
+            else:
+                with pytest.raises(HTTPException) as exc:
+                    await delete_mcp_server(server_id, current_user=caller, db=db)
+                assert exc.value.status_code == 403
+
+            # Row 13: DELETE /custom-apis/{id} -- last, same reasoning.
+            if population == "owner":
+                await delete_custom_api(api_id, current_user=caller, db=db)
+            else:
+                with pytest.raises(HTTPException) as exc:
+                    await delete_custom_api(api_id, current_user=caller, db=db)
+                assert exc.value.status_code == 403
+
+    async def test_a_complete_stranger_still_gets_404_everywhere_with_no_hook(self, db):
+        """A caller with neither a personal row nor any team link is not one
+        of the matrix's two constructible populations (design-v1.md's J
+        column: standalone can only construct A and B), but the pre-change
+        404 behavior for this case is worth keeping pinned too -- it is
+        what the matrix's population footnote is drawing the line against."""
+        owner = _make_user(db, 702)
+        stranger = _make_user(db, 703)
+        server = _make_owned_server(db, owner.id, name="parity-stranger-mcp")
+        server_id = server.id
+        api = _make_owned_api(db, owner.id, name="parity-stranger-api")
+        api_id = api.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks()
 
             with pytest.raises(HTTPException) as exc:
                 get_mcp_server(server_id, current_user=stranger, db=db)
             assert exc.value.status_code == 404
-
-            put_response = update_mcp_server(
-                server_id,
-                MCPServerUpdate(description="parity"),
-                current_user=owner,
-                db=db,
-            )
-            assert put_response.can_edit_global is True
 
             with pytest.raises(HTTPException) as exc:
                 update_mcp_server(
@@ -782,35 +994,9 @@ class TestStandaloneParityWithNoHookInstalled:
                 )
             assert exc.value.status_code == 404
 
-            toggle_response = await toggle_mcp_server(
-                server_id, current_user=owner, db=db
-            )
-            assert toggle_response.can_edit_global is True
-
-            list_entries = get_mcp_servers(current_user=owner, db=db)
-            mcp_entry = next(r for r in list_entries if r.id == server_id)
-            assert mcp_entry.can_edit_global is True
-            custom_api_entry = next(
-                r
-                for r in list_entries
-                if r.id == api_id and r.transport == "custom_api"
-            )
-            assert custom_api_entry.can_edit_global is True
-
-            api_get_response = await get_custom_api(api_id, current_user=owner, db=db)
-            assert api_get_response.id == api_id
-
             with pytest.raises(HTTPException) as exc:
                 await get_custom_api(api_id, current_user=stranger, db=db)
             assert exc.value.status_code == 404
-
-            api_put_response = await update_custom_api(
-                api_id,
-                CustomApiUpdate(description="parity"),
-                current_user=owner,
-                db=db,
-            )
-            assert api_put_response.id == api_id
 
             with pytest.raises(HTTPException) as exc:
                 await update_custom_api(
@@ -820,6 +1006,70 @@ class TestStandaloneParityWithNoHookInstalled:
                     db=db,
                 )
             assert exc.value.status_code == 404
+
+    @pytest.mark.parametrize(
+        "population", ["owner", "personal_non_owner"], ids=["A=owner", "B=personal"]
+    )
+    async def test_the_apps_listing_can_configure_matches_pre_change_behavior(
+        self, db, population
+    ):
+        """Outside the thirteen-row matrix but touched by this same work:
+        ``/api/mcp/apps``'s ``can_configure`` reads only whether a personal
+        association row exists (or, absent one, a team verdict) -- both
+        constructible populations have a personal row, so both see True,
+        with no hook installed."""
+        owner = _make_user(db, 704)
+        member = _make_user(db, 705)
+        caller = owner if population == "owner" else member
+
+        server = _make_owned_server(db, owner.id, name=f"parity-apps-mcp-{population}")
+        server_id = server.id
+
+        if population == "personal_non_owner":
+            db.add(
+                UserMCPServer(
+                    user_id=member.id,
+                    mcpserver_id=server_id,
+                    is_owner=False,
+                    is_active=True,
+                )
+            )
+            db.commit()
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks()
+            entries = list_mcp_apps(location="local", current_user=caller, db=db)
+
+        entry = next(e for e in entries if e["server_id"] == server_id)
+        assert entry["can_configure"] is True
+
+    @pytest.mark.parametrize(
+        "population", ["owner", "personal_non_owner"], ids=["A=owner", "B=personal"]
+    )
+    async def test_connecting_an_app_can_edit_global_matches_pre_change_behavior(
+        self, db, population
+    ):
+        """Outside the thirteen-row matrix but touched by this same work:
+        connecting to a catalog app always creates a fresh, non-owning
+        association (``is_owner=False``), so ``can_edit_global`` is False
+        regardless of which population is doing the connecting -- pinned
+        for both, with no hook installed, so a future change that makes
+        this population-dependent would be caught."""
+        owner = _make_user(db, 706)
+        member = _make_user(db, 707)
+        caller = owner if population == "owner" else member
+        _seed_catalog_app(db, f"parity-connect-app-{population}")
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks()
+            response = connect_mcp_app(
+                f"parity-connect-app-{population}",
+                MCPAppConnectRequest(),
+                current_user=caller,
+                db=db,
+            )
+
+        assert response.can_edit_global is False
 
 
 class TestListMcpAppsPerRowDegradation:
