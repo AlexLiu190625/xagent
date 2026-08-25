@@ -1257,7 +1257,13 @@ async def test_openrouter_vision_relaxes_tool_choice_after_wrapped_resend_failur
     this repository, so this recovery is reachable in production. A failed
     resend arrives here wrapped as ``RuntimeError`` by the base client; the
     compat loop's catch tuple keeps the bare SDK exception as defense in
-    depth.
+    depth. The value asserted below reaches the caller from the THIRD
+    upstream call, which succeeds on its first attempt after the compat loop
+    relaxed ``tool_choice`` -- it does not come through a successful resend.
+    So this pins that ``vision_chat``'s processed result survives the
+    OpenRouter compat loop; the successful-resend return itself is pinned
+    directly by ``test_vision_chat_response_format_retry_success_returns_result``
+    in ``tests/core/model/chat/basic/test_openai.py``.
     """
     mock_client = mocker.AsyncMock()
     mock_client.chat.completions.create.side_effect = [
@@ -1277,13 +1283,15 @@ async def test_openrouter_vision_relaxes_tool_choice_after_wrapped_resend_failur
         abilities=["chat", "tool_calling", "vision"],
     )
 
-    await llm.vision_chat(
+    result = await llm.vision_chat(
         [{"role": "user", "content": "score?"}],
         tools=_two_tool_schema(),
         tool_choice="required",
         response_format={"type": "json_object"},
     )
 
+    assert result["type"] == "text"
+    assert result["content"] == "Hello World"
     assert mock_client.chat.completions.create.await_count == 3
     final_call = mock_client.chat.completions.create.call_args_list[2].kwargs
     assert final_call["tool_choice"] == "auto"

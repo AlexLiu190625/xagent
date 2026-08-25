@@ -53,6 +53,13 @@ def _response_format_bad_request(message: str) -> openai.BadRequestError:
     )
 
 
+def _api_timeout_error() -> openai.APITimeoutError:
+    """The SDK's timeout error, as raised by a request that never answered."""
+    return openai.APITimeoutError(
+        request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    )
+
+
 class TestOpenAILLM:
     """Test cases for OpenAI LLM implementation."""
 
@@ -1299,16 +1306,18 @@ class TestOpenAILLM:
     ):
         """A second BadRequestError from the response_format resend must be
         wrapped into RuntimeError, not escape as a bare SDK exception, just
-        like every other ``chat()`` failure path."""
+        like every other ``chat()`` failure path. This pins WHICH of the two
+        errors becomes ``__cause__``: it must be the resend's own failure,
+        not the first attempt's, and the wrapped message must carry the
+        resend's text."""
+        first_error = _response_format_bad_request(
+            "the model does not support response_format on the first attempt"
+        )
+        second_error = _response_format_bad_request(
+            "the model still rejects response_format on the resend"
+        )
         mock_client = mocker.AsyncMock()
-        mock_client.chat.completions.create.side_effect = [
-            _response_format_bad_request(
-                "the model does not support response_format for this request"
-            ),
-            _response_format_bad_request(
-                "the model does not support response_format for this request"
-            ),
-        ]
+        mock_client.chat.completions.create.side_effect = [first_error, second_error]
         mocker.patch(
             "xagent.core.model.chat.basic.openai.AsyncOpenAI",
             return_value=mock_client,
@@ -1321,7 +1330,8 @@ class TestOpenAILLM:
                 response_format={"type": "json_object"},
             )
 
-        assert isinstance(exc_info.value.__cause__, openai.BadRequestError)
+        assert exc_info.value.__cause__ is second_error
+        assert "on the resend" in str(exc_info.value)
         assert mock_client.chat.completions.create.await_count == 2
 
     @pytest.mark.asyncio
@@ -1359,16 +1369,18 @@ class TestOpenAILLM:
         self, openai_llm_config, mocker
     ):
         """Same guarantee as ``chat()``: the vision path must not leak a bare
-        BadRequestError when the response_format resend also fails."""
+        BadRequestError when the response_format resend also fails. This
+        pins WHICH of the two errors becomes ``__cause__``: it must be the
+        resend's own failure, not the first attempt's, and the wrapped
+        message must carry the resend's text."""
+        first_error = _response_format_bad_request(
+            "the model does not support response_format on the first attempt"
+        )
+        second_error = _response_format_bad_request(
+            "the model still rejects response_format on the resend"
+        )
         mock_client = mocker.AsyncMock()
-        mock_client.chat.completions.create.side_effect = [
-            _response_format_bad_request(
-                "the model does not support response_format for this request"
-            ),
-            _response_format_bad_request(
-                "the model does not support response_format for this request"
-            ),
-        ]
+        mock_client.chat.completions.create.side_effect = [first_error, second_error]
         mocker.patch(
             "xagent.core.model.chat.basic.openai.AsyncOpenAI",
             return_value=mock_client,
@@ -1381,7 +1393,8 @@ class TestOpenAILLM:
                 response_format={"type": "json_object"},
             )
 
-        assert isinstance(exc_info.value.__cause__, openai.BadRequestError)
+        assert exc_info.value.__cause__ is second_error
+        assert "on the resend" in str(exc_info.value)
         assert mock_client.chat.completions.create.await_count == 2
 
     @pytest.mark.asyncio
@@ -1411,6 +1424,163 @@ class TestOpenAILLM:
         assert result is not None
         assert result.get("type") == "text"
         assert result.get("content") == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_chat_response_format_resend_timeout_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """Before this PR the response_format resend lived directly inside
+        the ``except openai.BadRequestError`` clause, so a non-BadRequestError
+        failure from that resend escaped unwrapped. The nested-try
+        restructuring routes it to ``chat()``'s own
+        ``except openai.APITimeoutError`` handler instead; this path is
+        newly correct and was previously untested."""
+        timeout_error = _api_timeout_error()
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            timeout_error,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.chat(
+                [{"role": "user", "content": "hi"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert "OpenAI API timeout" in str(exc_info.value)
+        assert exc_info.value.__cause__ is timeout_error
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_format_resend_timeout_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """Before this PR the response_format resend lived directly inside
+        the ``except openai.BadRequestError`` clause, so a non-BadRequestError
+        failure from that resend escaped unwrapped. The nested-try
+        restructuring routes it to ``vision_chat()``'s own
+        ``except openai.APITimeoutError`` handler instead; this path is
+        newly correct and was previously untested."""
+        timeout_error = _api_timeout_error()
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            timeout_error,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.vision_chat(
+                [{"role": "user", "content": "describe this"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert "OpenAI API timeout" in str(exc_info.value)
+        assert exc_info.value.__cause__ is timeout_error
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_response_format_resend_timeout_is_retryable(
+        self, openai_llm_config, mocker
+    ):
+        """``stream_chat`` already had this nested-try shape before this PR;
+        its diff is untouched here. This test pins the sibling contract that
+        ``test_chat_...`` and ``test_vision_chat_...`` above were aligned
+        to: ``stream_chat`` classifies the same response_format-resend
+        timeout as ``LLMRetryableError`` rather than ``RuntimeError``."""
+        timeout_error = _api_timeout_error()
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            timeout_error,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(LLMRetryableError) as exc_info:
+            _ = [
+                chunk
+                async for chunk in llm.stream_chat(
+                    [{"role": "user", "content": "hi"}],
+                    response_format={"type": "json_object"},
+                )
+            ]
+
+        assert "OpenAI API timeout" in str(exc_info.value)
+        assert exc_info.value.__cause__ is timeout_error
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_empty_content_after_resend_raises_empty_content_error(
+        self, openai_llm_config, mocker
+    ):
+        """Pins ``vision_chat()``'s empty-content contract, which had zero
+        tests of its own (``chat()`` has ``test_empty_content_response``;
+        ``vision_chat()`` had nothing). The response_format resend is the
+        carrier here because falling through to the normal processing path
+        is what makes this outcome reachable on the resend at all: before
+        this PR, a successful resend short-circuited to ``None`` instead of
+        running that processing path."""
+        mock_choice = MagicMock()
+        mock_choice.finish_reason = "stop"
+        mock_message = MagicMock()
+        mock_message.content = ""
+        mock_message.tool_calls = None
+        mock_message.reasoning_content = None
+        mock_choice.message = mock_message
+        empty_response = MagicMock()
+        empty_response.choices = [mock_choice]
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            empty_response,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        with pytest.raises(
+            LLMEmptyContentError,
+            match="LLM returned empty content and no tool calls",
+        ):
+            await llm.vision_chat(
+                [{"role": "user", "content": "describe this"}],
+                response_format={"type": "json_object"},
+            )
+
         assert mock_client.chat.completions.create.await_count == 2
         second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
         assert "response_format" not in second_call
