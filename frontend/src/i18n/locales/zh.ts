@@ -332,6 +332,8 @@ const zh = {
       confirmed: "已确认",
       sendFailed: "发送澄清回复失败",
       sendError: "发送回复失败",
+      sendNotSent: "你填写的内容已保留，可以重新提交。",
+      sendOutcomeUnknown: "回复可能已经提交，请刷新会话后再重新提交。",
       selectOption: "请选择一个选项",
       selectOptions: "请选择选项",
       acceptedFormats: "支持的格式",

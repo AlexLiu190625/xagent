@@ -332,6 +332,8 @@ const en = {
       confirmed: "Confirmed",
       sendFailed: "Failed to send clarification response",
       sendError: "Failed to send response",
+      sendNotSent: "Your answers were kept — you can submit again.",
+      sendOutcomeUnknown: "Your response may already have been submitted. Reload the conversation before submitting again.",
       selectOption: "Select an option",
       selectOptions: "Select options",
       acceptedFormats: "Accepted formats",

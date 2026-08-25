@@ -54,16 +54,26 @@ export type MessageDeliveryDisposition = "not_sent" | "rejected" | "outcome_unkn
 export class MessageDeliveryError extends Error {
   readonly disposition: MessageDeliveryDisposition
   readonly retryWithNewId: boolean
+  /**
+   * Whether `message` explains the failure in terms the sender can act on —
+   * the server's rejection text. The remaining messages describe connection
+   * plumbing ("the connection changed before delivery") and are diagnostics:
+   * callers show their own localized string for those rather than putting
+   * internal English in front of a visitor.
+   */
+  readonly userFacing: boolean
 
   constructor(
     message: string,
     disposition: MessageDeliveryDisposition,
     retryWithNewId = false,
+    userFacing = false,
   ) {
     super(message)
     this.name = "MessageDeliveryError"
     this.disposition = disposition
     this.retryWithNewId = retryWithNewId
+    this.userFacing = userFacing
   }
 }
 
@@ -71,7 +81,8 @@ const deliveryError = (
   message: string,
   disposition: MessageDeliveryDisposition,
   retryWithNewId = false,
-) => new MessageDeliveryError(message, disposition, retryWithNewId)
+  userFacing = false,
+) => new MessageDeliveryError(message, disposition, retryWithNewId, userFacing)
 
 export type WebSocketCredentialOwner =
   | {
@@ -887,6 +898,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                     ? "rejected"
                     : "outcome_unknown",
                   data.retry_with_new_id === true,
+                  typeof data.message === "string" && data.message.trim() !== "",
                 ))
               }
             }
