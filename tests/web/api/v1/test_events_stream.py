@@ -393,10 +393,37 @@ def test_events_not_owned_404():
 # ===== attach on an already-terminal task =====
 
 
-def test_events_terminal_task_immediate_close():
+@pytest.mark.parametrize(
+    ("status", "output", "error_message", "expected_completed_data"),
+    [
+        pytest.param(
+            TaskStatus.COMPLETED,
+            "the answer",
+            None,
+            {"status": "completed", "output": "the answer", "error": None},
+            id="completed",
+        ),
+        pytest.param(
+            TaskStatus.FAILED,
+            None,
+            "the tool call raised",
+            {"status": "failed", "output": None, "error": "the tool call raised"},
+            id="failed",
+        ),
+    ],
+)
+def test_events_terminal_task_immediate_close(
+    status, output, error_message, expected_completed_data
+):
+    """Both terminal statuses (``_TERMINAL_STATUSES``: completed and
+    failed) take this fast path and their own field -- ``output`` for a
+    completed task, ``error`` for a failed one -- has to actually reach
+    the ``task.completed`` frame; a test pinning only the completed leg
+    would miss a regression that dropped ``error`` from the frame while
+    leaving ``output`` alone."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id)
-    _set_task_status(task_id, TaskStatus.COMPLETED, output="the answer")
+    _set_task_status(task_id, status, output=output, error_message=error_message)
 
     resp = client.get(f"/v1/chat/tasks/{task_id}/events", headers=_bearer(full_key))
     assert resp.status_code == 200
@@ -407,12 +434,8 @@ def test_events_terminal_task_immediate_close():
     blocks = [b for b in body.split("\n\n") if b.strip()]
     status_data = json.loads(blocks[0].split("data: ", 1)[1])
     completed_data = json.loads(blocks[1].split("data: ", 1)[1])
-    assert status_data == {"status": "completed"}
-    assert completed_data == {
-        "status": "completed",
-        "output": "the answer",
-        "error": None,
-    }
+    assert status_data == {"status": status.value}
+    assert completed_data == expected_completed_data
     # No sink is registered for the terminal fast path -- nothing to close.
     assert es.count_task_sinks(task_id) == 0
 
@@ -2888,6 +2911,19 @@ async def test_fast_path_task_not_found_closes_with_task_deleted_not_resync_requ
     )
 
 
+def test_fast_path_snapshot_bounds_match_the_documented_endpoint_contract():
+    """Pins the two literal values the attach-time snapshot is bounded
+    by. These aren't free internal tuning: ``tasks.py``'s endpoint
+    docstring documents ``REPLAY_MAX_STEPS`` as the literal number 512
+    (not a symbolic reference to this module) for API consumers reading
+    the ``GET /v1/chat/tasks/{task_id}/events`` contract, so a change to
+    either constant here has to be paired with updating that docstring
+    -- this test exists so such a change doesn't slip through silently.
+    """
+    assert es.REPLAY_MAX_STEPS == 512
+    assert es.MAX_SNAPSHOT_WIRE_BYTES == 4 * 1024 * 1024
+
+
 @pytest.mark.parametrize(
     ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
     [
@@ -2972,6 +3008,197 @@ async def test_fast_path_step_snapshot_is_bounded_by_replay_max_steps(
     conclusion_data = json.loads(conclusion_block.split("data: ", 1)[1])
     assert conclusion_data["snapshot_truncated"] is True
     assert conclusion_data["snapshot_total_steps"] == total
+
+
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_step_snapshot_applies_the_replay_cap_before_the_byte_budget(
+    stream_fn, status, conclusion_event, extra_snapshot
+):
+    """The two admission bounds are applied in a fixed order --
+    ``REPLAY_MAX_STEPS`` first (keep the newest window), the byte
+    budget second (trim that window from its oldest end) -- not the
+    other way around. Pinned with a history where the two orders
+    produce entirely different output: 88 old steps each carrying ~48
+    KiB of ``data`` (enough on their own to exhaust the byte budget),
+    then 512 new, tiny ones. Applying ``REPLAY_MAX_STEPS`` first keeps
+    only the 512 tiny steps -- the byte budget never binds on them, so
+    all 512 go out untouched. Applying the byte budget first, over the
+    full 600-step history from its oldest end the way
+    ``_snapshot_steps_within_wire_budget`` walks, would instead spend
+    the whole budget on roughly the first 85 large steps and never even
+    reach the 512 tiny ones behind them -- a reversal this test would
+    catch by the wrong count and the wrong first step id below.
+    """
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    old_large = [
+        es.PublicStep(
+            id=f"tool_call:old-{i}",
+            type="tool_call",
+            status="completed",
+            started_at=base,
+            completed_at=base,
+            data={"name": "search", "result": "x" * (48 * 1024)},
+        )
+        for i in range(88)
+    ]
+    new_tiny = [
+        es.PublicStep(
+            id=f"tool_call:new-{i}",
+            type="tool_call",
+            status="completed",
+            started_at=base,
+            completed_at=base,
+            data={"name": "search", "result": "ok"},
+        )
+        for i in range(es.REPLAY_MAX_STEPS)
+    ]
+    steps = old_large + new_tiny
+    total = len(steps)
+
+    def _read_task_steps_response(task_id_, principal_):
+        return SimpleNamespace(steps=steps)
+
+    def _unchanged_read_task_snapshot(task_id_, principal_):
+        return SimpleNamespace(run_id="run-1", state_version=1)
+
+    snapshot = SimpleNamespace(
+        task_id=1,
+        agent_id=1,
+        status=status,
+        run_id="run-1",
+        state_version=1,
+        **extra_snapshot,
+    )
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=None,
+            read_task_steps_response=_read_task_steps_response,
+            read_task_snapshot=_unchanged_read_task_snapshot,
+        )
+    ]
+    body = "".join(frames)
+    assert body.count("event: step.completed") == es.REPLAY_MAX_STEPS
+    blocks = [b for b in body.split("\n\n") if b.strip()]
+    first_step_data = json.loads(blocks[1].split("data: ", 1)[1])
+    assert first_step_data["step"]["id"] == "tool_call:new-0"
+    assert body.count(f"event: {conclusion_event}") == 1
+    conclusion_block = next(
+        b for b in blocks if b.startswith(f"event: {conclusion_event}")
+    )
+    conclusion_data = json.loads(conclusion_block.split("data: ", 1)[1])
+    assert conclusion_data["snapshot_truncated"] is True
+    assert conclusion_data["snapshot_total_steps"] == total
+
+
+@pytest.mark.parametrize(
+    ("total", "expect_truncated"),
+    [
+        pytest.param(es.REPLAY_MAX_STEPS, False, id="exactly-at-cap"),
+        pytest.param(es.REPLAY_MAX_STEPS + 1, True, id="one-over-cap"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_step_snapshot_replay_max_steps_boundary(
+    stream_fn, status, conclusion_event, extra_snapshot, total, expect_truncated
+):
+    """``REPLAY_MAX_STEPS`` is a strict-over boundary, the same rule
+    every other size cap in this module uses (see ``_put_or_overflow``
+    and ``MAX_RAW_FRAME_TEXT_CHARS``'s own comments): a history of
+    exactly 512 steps fits whole and is not truncated, one more tips it
+    over. Expressed against ``es.REPLAY_MAX_STEPS`` rather than the
+    literal 512/513 so this test keeps pinning the boundary itself even
+    if the constant's value ever changes -- that value is pinned
+    separately, by
+    ``test_fast_path_snapshot_bounds_match_the_documented_endpoint_contract``.
+    """
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    steps = [
+        es.PublicStep(
+            id=f"tool_call:call-{i}",
+            type="tool_call",
+            status="completed",
+            started_at=base,
+            completed_at=base,
+            data={"name": "search", "result": "ok"},
+        )
+        for i in range(total)
+    ]
+
+    def _read_task_steps_response(task_id_, principal_):
+        return SimpleNamespace(steps=steps)
+
+    def _unchanged_read_task_snapshot(task_id_, principal_):
+        return SimpleNamespace(run_id="run-1", state_version=1)
+
+    snapshot = SimpleNamespace(
+        task_id=1,
+        agent_id=1,
+        status=status,
+        run_id="run-1",
+        state_version=1,
+        **extra_snapshot,
+    )
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=None,
+            read_task_steps_response=_read_task_steps_response,
+            read_task_snapshot=_unchanged_read_task_snapshot,
+        )
+    ]
+    body = "".join(frames)
+    assert body.count("event: step.completed") == min(total, es.REPLAY_MAX_STEPS)
+    assert body.count(f"event: {conclusion_event}") == 1
+    blocks = [b for b in body.split("\n\n") if b.strip()]
+    conclusion_block = next(
+        b for b in blocks if b.startswith(f"event: {conclusion_event}")
+    )
+    conclusion_data = json.loads(conclusion_block.split("data: ", 1)[1])
+    if expect_truncated:
+        assert conclusion_data["snapshot_truncated"] is True
+        assert conclusion_data["snapshot_total_steps"] == total
+    else:
+        assert "snapshot_truncated" not in conclusion_data
+        assert "snapshot_total_steps" not in conclusion_data
 
 
 @pytest.mark.parametrize(
@@ -3353,6 +3580,206 @@ async def test_fast_path_generation_change_withholds_steps_but_still_concludes(
     assert conclusion_marker in body
     assert steps_calls == [(snapshot.task_id, _FENCE_PRINCIPAL)]
     assert reread_calls == [(snapshot.task_id, _FENCE_PRINCIPAL)]
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        pytest.param("run_id", "run-new", id="run-id-moved"),
+        pytest.param("state_version", 2, id="state-version-moved"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_confirmed_generation_change_short_circuits_the_cursor_recheck(
+    stream_fn, status, conclusion_event, extra_snapshot, changed_field, changed_value
+):
+    """The fence's cursor recheck only runs ``if not changed`` (see the
+    call site in ``_fast_path_snapshot_stream``): ``changed`` is
+    assigned, not OR'd, from ``_fast_path_steps_cursor_changed``'s
+    return value, so that guard is a short circuit, not just an
+    optimization -- without it, a generation reread that already
+    confirmed a change would have its ``True`` overwritten by whatever
+    the cursor recheck itself returns. A generation change can leave
+    the steps cursor unmoved (a lease release, or a resume that hasn't
+    re-run any tool yet), which is exactly the case pinned here: the
+    cursor reader always reports the same ``max_event_id`` it gave the
+    baseline, so a cursor recheck that ran anyway would report
+    "unchanged" and silently flip the fence back open, sending steps
+    the generation reread had already ruled stale.
+
+    Pinned by recording every call the cursor reader receives: the
+    short circuit means it must be called exactly once (the baseline,
+    captured before the steps read), never a second time for the
+    recheck, once the generation reread alone has already confirmed a
+    change.
+    """
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    step = es.PublicStep(
+        id="tool_call:call-1",
+        type="tool_call",
+        status="completed",
+        started_at=base,
+        completed_at=base,
+        data={"name": "search", "result": "ok"},
+    )
+    original = {"run_id": "run-1", "state_version": 1}
+
+    def _read_task_steps_response(task_id_, principal_):
+        return SimpleNamespace(steps=[step])
+
+    def _reread_task_snapshot(task_id_, principal_):
+        return SimpleNamespace(**{**original, changed_field: changed_value})
+
+    version_calls: list[tuple[int, object]] = []
+
+    def _read_task_steps_version(task_id_, principal_):
+        # Constant across calls: a recheck that ran anyway would see the
+        # same cursor it saw at baseline and report "unchanged" -- the
+        # scenario that makes an un-short-circuited recheck dangerous.
+        version_calls.append((task_id_, principal_))
+        return SimpleNamespace(max_event_id=100)
+
+    snapshot = SimpleNamespace(
+        task_id=1, agent_id=1, status=status, **original, **extra_snapshot
+    )
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=_FENCE_PRINCIPAL,
+            read_task_steps_response=_read_task_steps_response,
+            read_task_snapshot=_reread_task_snapshot,
+            read_task_steps_version=_read_task_steps_version,
+        )
+    ]
+    body = "".join(frames)
+    # The short circuit's own contract: exactly the baseline call, never
+    # a recheck once the generation reread alone confirmed a change.
+    assert version_calls == [(snapshot.task_id, _FENCE_PRINCIPAL)]
+    assert body.count(f"event: {conclusion_event}") == 1
+    assert "event: step.completed" not in body
+    error_data = _parse_error_frame(body)
+    assert error_data["code"] == "resync_required"
+    assert "The task changed while this attach was reading" in error_data["message"]
+
+
+@pytest.mark.parametrize("failure_exit", ["steps_read_failure", "generation_changed"])
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"),
+    [
+        pytest.param(
+            "_terminal_snapshot_stream",
+            TaskStatus.COMPLETED,
+            "task.completed",
+            {"output": "done", "error": None},
+            id="terminal",
+        ),
+        pytest.param(
+            "_input_required_snapshot_stream",
+            TaskStatus.WAITING_FOR_USER,
+            "task.input_required",
+            {"pending_question": "what next?"},
+            id="waiting-for-user",
+        ),
+    ],
+)
+async def test_fast_path_failure_exits_never_carry_the_truncation_marker(
+    stream_fn, status, conclusion_event, extra_snapshot, failure_exit
+):
+    """Every failure/withhold exit on the fast paths calls
+    ``build_conclusion(None)`` (see ``_fast_path_snapshot_stream``'s own
+    docstring: "No snapshot was confirmed here, so the conclusion
+    carries no truncation marker"). This pins that even when the
+    underlying history is large enough that a *successful* read would
+    have truncated it -- 600 steps, over ``REPLAY_MAX_STEPS`` -- neither
+    failure exit's conclusion frame leaks ``snapshot_truncated`` /
+    ``snapshot_total_steps``.
+
+    The two exits differ in how far they get before failing:
+    ``steps_read_failure`` never learns the history's size at all (the
+    steps read itself raises), while ``generation_changed`` does read
+    all 600 steps -- ``_fast_path_step_snapshot`` internally admits the
+    most recent 512 and reports ``total_steps=600`` -- and only then
+    gets withheld by the fence, so it's the one exit that actually has a
+    computed truncation count in hand and still has to not send it.
+    """
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    total = es.REPLAY_MAX_STEPS + 88
+
+    if failure_exit == "steps_read_failure":
+
+        def _read_task_steps_response(task_id_, principal_):
+            raise RuntimeError("transient DB error reading cached steps")
+
+        def _read_task_snapshot(task_id_, principal_):
+            raise AssertionError(
+                "the generation reread must not run when the steps read itself failed"
+            )
+    else:
+
+        def _read_task_steps_response(task_id_, principal_):
+            return SimpleNamespace(
+                steps=[
+                    es.PublicStep(
+                        id=f"tool_call:call-{i}",
+                        type="tool_call",
+                        status="completed",
+                        started_at=base,
+                        completed_at=base,
+                        data={"name": "search", "result": "ok"},
+                    )
+                    for i in range(total)
+                ]
+            )
+
+        def _read_task_snapshot(task_id_, principal_):
+            return SimpleNamespace(run_id="run-new", state_version=1)
+
+    snapshot = SimpleNamespace(
+        task_id=1,
+        agent_id=1,
+        status=status,
+        run_id="run-1",
+        state_version=1,
+        **extra_snapshot,
+    )
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=None,
+            read_task_steps_response=_read_task_steps_response,
+            read_task_snapshot=_read_task_snapshot,
+        )
+    ]
+    body = "".join(frames)
+    assert body.count(f"event: {conclusion_event}") == 1
+    blocks = [b for b in body.split("\n\n") if b.strip()]
+    conclusion_block = next(
+        b for b in blocks if b.startswith(f"event: {conclusion_event}")
+    )
+    conclusion_data = json.loads(conclusion_block.split("data: ", 1)[1])
+    assert "snapshot_truncated" not in conclusion_data
+    assert "snapshot_total_steps" not in conclusion_data
+    assert body.count("event: stream.error") == 1
 
 
 @pytest.mark.parametrize(

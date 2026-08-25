@@ -1545,11 +1545,15 @@ async def _fast_path_step_snapshot(
     returned every step from this cached list in one shot, with no
     admission / deadline / heartbeat loop to pace it, unlike everything
     else this stream serves. The cached list is already in
-    ``started_at`` order (``map_trace_events_to_public_steps``'s own
-    docstring: "in the order their start events first appeared"), so
-    ``steps[-REPLAY_MAX_STEPS:]`` keeps the most recent steps and drops
-    the oldest; the byte budget is then applied to that window from its
-    oldest end (see ``_snapshot_steps_within_wire_budget`` for why a
+    ``started_at`` order -- the public contract ``GET .../steps``
+    documents (``schemas/v1.py``'s ``StepsResponse``: "Steps are
+    returned in monotonic started_at order") and
+    ``map_trace_events_to_public_steps`` enforces with an explicit final
+    sort (``_step_mapping.py:640-643``), not a property its projection's
+    own fold order already guarantees on its own -- that sort is exactly
+    why it's needed. ``steps[-REPLAY_MAX_STEPS:]`` keeps the most recent
+    steps and drops the oldest; the byte budget is then applied to that
+    window from its oldest end (see ``_snapshot_steps_within_wire_budget`` for why a
     prefix, not a suffix, is what it keeps). Returns the validated
     ``PublicStep`` objects themselves, not their serialized frame text
     -- serialization happens one frame at a time in each fast path's own
