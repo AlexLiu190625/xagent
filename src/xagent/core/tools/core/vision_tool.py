@@ -1079,83 +1079,104 @@ class VisionCore:
             )
 
             # Parse the result
+            normalized = _normalize_vision_response(raw_result)
+
+            if normalized.kind == "tool_call":
+                logger.warning(
+                    "Object detection received a tool-call response instead of a"
+                    " detection payload"
+                )
+                return DetectObjectsResult(
+                    success=False,
+                    error=(
+                        "Vision model returned a tool call instead of a"
+                        " detection payload"
+                    ),
+                    parsing_method="tool_call_response",
+                    raw_response=normalized.raw_display,
+                    confidence_threshold=confidence_threshold,
+                    prompt_sent=prompt,
+                )
+
+            if normalized.kind == "unknown":
+                logger.warning(
+                    "Object detection received an unsupported response shape"
+                )
+                return DetectObjectsResult(
+                    success=False,
+                    error="Vision model returned an unsupported response shape",
+                    parsing_method="unknown_type",
+                    raw_response=normalized.raw_display,
+                    confidence_threshold=confidence_threshold,
+                    prompt_sent=prompt,
+                )
+
+            # normalized.kind is "text" or "empty" here, so normalized.text is
+            # always a str -- both feed the same parser; an empty/whitespace
+            # response is handled by its existing fallback chain.
+            assert normalized.text is not None
+            raw_response = normalized.text
             detections = []
             parsing_method = "unknown"
             parsing_error = None
 
-            if isinstance(raw_result, str):
-                raw_response = raw_result
+            try:
+                detections = self._extract_detections_from_text(raw_response)
+                if detections:
+                    parsing_method = "regex"
+                else:
+                    try:
+                        import json
 
-                try:
-                    detections = self._extract_detections_from_text(raw_response)
-                    if detections:
-                        parsing_method = "regex"
-                    else:
-                        try:
-                            import json
+                        parsed_result = json.loads(raw_response)
+                        detections = parsed_result.get("detections", [])
+                        parsing_method = "json"
 
-                            parsed_result = json.loads(raw_result)
-                            detections = parsed_result.get("detections", [])
-                            parsing_method = "json"
+                        validated_detections = []
+                        for detection in detections:
+                            if isinstance(detection, dict):
+                                obj_class = detection.get("class", "unknown")
+                                bbox = detection.get("bbox", [0, 0, 1, 1])
+                                confidence = float(detection.get("confidence", 0.5))
 
-                            validated_detections = []
-                            for detection in detections:
-                                if isinstance(detection, dict):
-                                    obj_class = detection.get("class", "unknown")
-                                    bbox = detection.get("bbox", [0, 0, 1, 1])
-                                    confidence = float(detection.get("confidence", 0.5))
-
-                                    if (
-                                        isinstance(bbox, list)
-                                        and len(bbox) == 4
-                                        and all(
-                                            isinstance(coord, (int, float))
-                                            for coord in bbox
-                                        )
-                                        and 0 <= bbox[0] <= 1
-                                        and 0 <= bbox[1] <= 1
-                                        and 0 <= bbox[2] <= 1
-                                        and 0 <= bbox[3] <= 1
-                                        and bbox[0] < bbox[2]
-                                        and bbox[1] < bbox[3]
-                                    ):
-                                        validated_detections.append(
-                                            {
-                                                "class": obj_class,
-                                                "bbox": bbox,
-                                                "confidence": min(
-                                                    max(confidence, 0.0), 1.0
-                                                ),
-                                            }
-                                        )
-
-                            detections = validated_detections
-
-                        except json.JSONDecodeError as e:
-                            parsing_error = f"JSON parsing failed: {str(e)}"
-                            if not detections:
-                                detections = (
-                                    self._extract_detections_from_text_fallback(
-                                        raw_response
+                                if (
+                                    isinstance(bbox, list)
+                                    and len(bbox) == 4
+                                    and all(
+                                        isinstance(coord, (int, float))
+                                        for coord in bbox
                                     )
-                                )
-                                parsing_method = "regex_fallback"
+                                    and 0 <= bbox[0] <= 1
+                                    and 0 <= bbox[1] <= 1
+                                    and 0 <= bbox[2] <= 1
+                                    and 0 <= bbox[3] <= 1
+                                    and bbox[0] < bbox[2]
+                                    and bbox[1] < bbox[3]
+                                ):
+                                    validated_detections.append(
+                                        {
+                                            "class": obj_class,
+                                            "bbox": bbox,
+                                            "confidence": min(
+                                                max(confidence, 0.0), 1.0
+                                            ),
+                                        }
+                                    )
 
-                except Exception as e:
-                    parsing_error = f"General parsing error: {str(e)}"
-                    detections = self._extract_detections_from_text_fallback(
-                        raw_response
-                    )
-                    parsing_method = "simple_text"
+                        detections = validated_detections
 
-            elif isinstance(raw_result, dict):
-                raw_response = str(raw_result)
-                parsing_method = "dict_response"
-                detections = []
-            else:
-                raw_response = str(raw_result)
-                parsing_method = "unknown_type"
-                detections = []
+                    except json.JSONDecodeError as e:
+                        parsing_error = f"JSON parsing failed: {str(e)}"
+                        if not detections:
+                            detections = self._extract_detections_from_text_fallback(
+                                raw_response
+                            )
+                            parsing_method = "regex_fallback"
+
+            except Exception as e:
+                parsing_error = f"General parsing error: {str(e)}"
+                detections = self._extract_detections_from_text_fallback(raw_response)
+                parsing_method = "simple_text"
 
             # Base result
             result_data = {
@@ -1166,7 +1187,7 @@ class VisionCore:
                 "confidence_threshold": confidence_threshold,
                 "prompt_sent": prompt,
                 "box_color": box_color if mark_objects else None,
-                "raw_response": raw_response,
+                "raw_response": normalized.raw_display,
                 "parsing_method": parsing_method,
             }
 

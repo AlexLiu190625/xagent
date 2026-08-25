@@ -1422,6 +1422,86 @@ class TestVisionToolDetectObjects:
                 if os.path.exists(temp_image_path):
                     os.unlink(temp_image_path)
 
+    @pytest.mark.asyncio
+    async def test_detect_objects_parses_text_envelope_payload(self):
+        """OpenAI-family providers wrap the detection JSON in a text
+        envelope; the envelope's content must reach the same parser a bare
+        JSON string would."""
+        detection_json = (
+            '{"detections": [{"class": "person", "confidence": 0.95, '
+            '"bbox": [0.1, 0.1, 0.6, 0.8]}], "image_info": {"width": "640", '
+            '"height": "480"}}'
+        )
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(
+            return_value={
+                "type": "text",
+                "content": detection_json,
+                "raw": {"id": "resp-1"},
+            }
+        )
+        model.has_ability = Mock(return_value=True)
+
+        vision_tool = VisionTool(model)
+        result = await vision_tool.detect_objects(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+            task="Find all objects in the image",
+        )
+
+        assert result.success is True
+        assert result.total_detections == 1
+        assert result.detections[0]["class"] == "person"
+        assert result.parsing_method == "json"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "label,response",
+        [
+            (
+                "tool_call",
+                {
+                    "type": "tool_call",
+                    "tool_calls": [{"id": "c1", "type": "function"}],
+                },
+            ),
+            ("unknown_dict", {"type": "mystery", "payload": 1}),
+            ("non_str_content", {"type": "text", "content": 5}),
+            ("none", None),
+        ],
+    )
+    @pytest.mark.parametrize("mark_objects", [False, True])
+    async def test_detect_objects_flags_shapes_without_text_payload(
+        self, label, response, mark_objects
+    ):
+        """A response with no text payload must be reported as a failure
+        with a non-empty error, and must never reach the marking step that
+        writes a bounding-box image to disk."""
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(return_value=response)
+        model.has_ability = Mock(return_value=True)
+
+        vision_tool = VisionTool(model)
+        with patch.object(vision_tool.core, "_draw_bounding_boxes") as mock_draw:
+            result = await vision_tool.detect_objects(
+                "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+                task="Find all objects in the image",
+                mark_objects=mark_objects,
+            )
+            mock_draw.assert_not_called()
+
+        assert result.success is False
+        assert result.error
+        assert result.total_detections == 0
+        assert result.marked_image_path is None
+        # 4000 is the truncation limit; the suffix is the truncation marker.
+        # Exactly one of the two must hold for every raw_response.
+        # The cap is the only bound on provider-internal keys; no key-level
+        # redaction is performed.
+        assert result.raw_response is not None
+        assert len(result.raw_response) <= 4000 or result.raw_response.endswith(
+            " chars>"
+        )
+
 
 class TestVisionToolHelperMethods:
     """Test cases for helper methods"""
