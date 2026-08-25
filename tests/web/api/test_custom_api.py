@@ -296,6 +296,13 @@ async def test_update_custom_api():
     # Return user api on first query
     # Return None for existing name check
     db.query().filter().first.side_effect = [mock_user_api, None]
+    # The row lock's own fresh query is a separate mock chain
+    # (.populate_existing().with_for_update() sits between .filter() and
+    # .first()), so it needs its own return value rather than sharing the
+    # side_effect list above.
+    db.query().filter().populate_existing().with_for_update().first.return_value = (
+        mock_api
+    )
 
     api_data = CustomApiUpdate(
         name="new_name",
@@ -347,6 +354,11 @@ async def test_update_custom_api_env_replacement_deletes_only_the_omitted_secret
         custom_api=mock_api,
     )
     db.query().filter().first.return_value = mock_user_api
+    # The row lock's own fresh query is a separate mock chain -- see the
+    # comment in test_update_custom_api.
+    db.query().filter().populate_existing().with_for_update().first.return_value = (
+        mock_api
+    )
 
     with patch(
         "xagent.web.api.custom_api.encrypt_value", side_effect=lambda x: f"enc_{x}"
@@ -381,6 +393,11 @@ async def test_update_custom_api_rejects_renamed_masked_secret():
         custom_api=mock_api,
     )
     db.query().filter().first.return_value = mock_user_api
+    # The row lock's own fresh query is a separate mock chain -- see the
+    # comment in test_update_custom_api.
+    db.query().filter().populate_existing().with_for_update().first.return_value = (
+        mock_api
+    )
 
     with pytest.raises(HTTPException) as exc_info:
         await update_custom_api(
@@ -423,6 +440,11 @@ async def test_update_custom_api_explicit_null_clears_runtime_config():
         custom_api=mock_api,
     )
     db.query().filter().first.return_value = mock_user_api
+    # The row lock's own fresh query is a separate mock chain -- see the
+    # comment in test_update_custom_api.
+    db.query().filter().populate_existing().with_for_update().first.return_value = (
+        mock_api
+    )
 
     api_data = CustomApiUpdate(
         runtime_input_schema=None,

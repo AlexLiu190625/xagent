@@ -420,11 +420,36 @@ async def update_custom_api(
             detail="No personal connection exists to configure is_active for this API",
         )
 
-    old_name = str(api.name)
+    # A second, single-table lock on the definition row, taken before any
+    # field below reads or mutates it. The read above comes through the
+    # personal link row's relationship (or a bare lookup for a stand-in
+    # caller) and cannot itself lock just this table; this is a fresh
+    # statement, so a row deleted between the two still yields None here
+    # (handled as the same 404) rather than surfacing as an unrelated
+    # error out of the write path below.
+    locked_api = (
+        db.query(CustomApi)
+        .filter(CustomApi.id == api_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
+    if locked_api is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Custom API not found"
+        )
+    api = locked_api
     # The row's declared type from here on is loosened for mypy's sake: the
     # column-typed attributes below (name, description, env, ...) are all
     # mutated directly by this route, exactly as before this gate existed.
     mutable_api = cast(Any, api)
+    # Read only after the lock: rename_team_connector's "old" argument must
+    # be the name this transaction actually holds locked, not whatever the
+    # pre-lock read above saw -- a concurrent committed rename in between
+    # would otherwise make this stale, and the rewrite below would look for
+    # a name that no longer exists anywhere, leaving the previous renamer's
+    # selectors dangling with no error.
+    old_name = str(api.name)
 
     # Check name uniqueness if name is changed
     if api_data.name and api_data.name != api.name:
