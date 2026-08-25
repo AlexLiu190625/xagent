@@ -1231,7 +1231,22 @@ def create(
       NULL.
 
     A principal whose ``kind`` is neither ``"user"`` nor ``"guest"`` is
-    always unauthorized -- there is no third branch that defaults to allow.
+    always unauthorized -- there is no third branch that defaults to allow
+    -- and is rejected before the lookup is built, not by falling off the
+    end of the branch chain. Both orderings return the same outcome; only
+    the earlier one keeps such a principal off the id-only lookup path,
+    which would otherwise answer ``CreateUnavailable(reason="task_missing")``
+    and tell a caller this module cannot name whether a ``task_id`` exists.
+    This is the authorization-side half of the same judgment
+    ``InteractionPrincipal.identity_string`` makes on the audit side, where
+    an unrecognized ``kind`` raises ``ValueError`` rather than being
+    recorded as a user: neither side has a default that treats an unknown
+    kind as one of the two known ones. The two are not redundant. This gate
+    decides whether the caller may act at all and returns a typed outcome;
+    that one runs at the write point on a caller already authorized, and
+    raises, because a principal that got that far and still cannot be named
+    is a programming error rather than a rejection to report.
+
     A malformed principal that populates zero or more than one of the guest
     entity-binding fields makes the ownership predicate raise
     ``ValueError``; this function catches only that one exception type from
@@ -1303,6 +1318,18 @@ def create(
         # only because ``Task.user_id`` is NOT NULL today -- an explicit
         # rejection here says what is meant instead of borrowing a schema
         # detail to mean it.
+        return CreateUnauthorized(reason="not_task_principal")
+
+    if principal.kind not in ("user", "guest"):
+        # Rejected before the lookup, beside the missing-id guard above and
+        # for the same kind of reason. Such a principal is unauthorized
+        # either way -- the branch chain below has no third arm that
+        # authorizes -- but reaching that chain means the lookup ran first,
+        # and an unrecognized kind is not owner-scoped, so it would have run
+        # by id alone and answered CreateUnavailable(reason="task_missing")
+        # for a task that does not exist. That is the existence oracle the
+        # owner-scoped branches are written to withhold, handed to a
+        # principal this module cannot even name.
         return CreateUnauthorized(reason="not_task_principal")
 
     owner_scoped = principal.kind == "guest" or (

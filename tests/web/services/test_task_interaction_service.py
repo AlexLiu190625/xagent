@@ -1437,6 +1437,51 @@ def test_ca1_unknown_principal_kind_is_always_unauthorized(
     assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
 
 
+@pytest.mark.parametrize("task_exists", [True, False], ids=["present", "absent"])
+def test_ca1_unknown_principal_kind_is_rejected_before_the_task_lookup(
+    _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch, task_exists: bool
+) -> None:
+    """An unrecognized kind is not owner-scoped, so a lookup built for it
+    would run by id alone -- and the id-only branch reports
+    Unavailable(task_missing) for a task that does not exist. Rejecting
+    before the lookup is what keeps the two task ids below indistinguishable
+    to such a principal: the same Unauthorized(not_task_principal) for a task
+    that exists and for one that does not.
+
+    The outcome alone cannot show where the rejection happened, since the
+    end of the branch chain returns the same object for the existing task.
+    What separates them is whether the lookup was built at all, so that is
+    asserted too: with the guard in place db.query is never called; delete
+    it and the absent-task case turns Unavailable(task_missing) while the
+    present-task case starts querying."""
+
+    task_id = _seeded_task if task_exists else _seeded_task + 10_000
+    if not task_exists:
+        assert _db.query(Task).filter(Task.id == task_id).first() is None
+
+    queried: list[Any] = []
+    real_query = _db.query
+
+    def _recording_query(*args: Any, **kwargs: Any) -> Any:
+        queried.append(args)
+        return real_query(*args, **kwargs)
+
+    monkeypatch.setattr(_db, "query", _recording_query)
+
+    principal = svc.InteractionPrincipal(
+        kind="service",
+        user_id=1,
+        is_admin=False,
+        auth_mode=None,
+    )
+    outcome = svc.create(
+        _db, task_id=task_id, principal=principal, envelope=_valid_envelope()
+    )
+
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+    assert queried == []
+
+
 def test_ca1_entity_binding_with_non_int_convertible_config_value_is_rejected_not_raised(
     _db: Session, _session_factory
 ) -> None:
