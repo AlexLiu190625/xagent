@@ -336,6 +336,35 @@ def resolve_connector_access(
     return _validate_connector_access_answer(answer, requested)
 
 
+def _restore_session_after_hook_failure(db: Any) -> None:
+    """Roll back whatever a failed hook left on the shared session.
+
+    Hooks are handed the endpoint's own live session (see
+    ``delete_team_connector``'s contract note). A hook whose own statement
+    failed leaves that transaction unusable on PostgreSQL, and an ORM
+    ``flush`` failure leaves it unusable on every backend -- so every
+    later statement in the request, including the ones a degradation path
+    needs to build its response, would be refused. Rolling back here, at
+    the one door application code passes through, is what keeps the
+    degradation contract true; the roll back happens after the route's own
+    ``db.commit()`` on the post-commit decoration paths, so it never
+    discards durable work.
+
+    A rollback that itself fails is logged and swallowed: this runs on an
+    already-failing path, the original failure is re-raised by the caller
+    either way, and there is no further recovery available.
+    """
+    rollback = getattr(db, "rollback", None)
+    if rollback is None:
+        return
+    try:
+        rollback()
+    except Exception:
+        logger.warning(
+            "Rolling back after a failed connector hook failed", exc_info=True
+        )
+
+
 def resolve_team_connector_ids_or_raise(
     db: Any, *, team_id: int | None, log_subject: int | None
 ) -> dict[str, set[int]]:
@@ -361,12 +390,21 @@ def resolve_team_connector_ids_or_raise(
     no identity guard of its own; production only reaches it through its
     guarded public wrapper). It is only ever formatted into the log
     message, never interpreted.
+
+    Both failure arms roll back the shared session first (see
+    ``_restore_session_after_hook_failure``), including the arm that
+    passes a typed error straight through: a hook can leave a statement
+    failed on the session and *then* raise its own ``ConnectorRuntimeError``,
+    so restoring the session cannot be confined to the generic-exception
+    arm alone.
     """
     try:
         return team_connector_ids(db, team_id=team_id)
     except ConnectorRuntimeError:
+        _restore_session_after_hook_failure(db)
         raise
     except Exception as exc:
+        _restore_session_after_hook_failure(db)
         logger.warning(
             "Failed to resolve team connector scope for user %s",
             log_subject,
@@ -400,6 +438,13 @@ def resolve_connector_access_or_raise(
     sorted for a stable log line -- never an ORM attribute read off a row,
     which could itself fail if the session is left unusable by whatever
     just failed.
+
+    Both failure arms roll back the shared session first (see
+    ``_restore_session_after_hook_failure``), including the arm that
+    passes a typed error straight through: a hook can leave a statement
+    failed on the session and *then* raise its own ``ConnectorRuntimeError``,
+    so restoring the session cannot be confined to the generic-exception
+    arm alone.
     """
     requested = frozenset(
         (connector_type, int(connector_id)) for connector_type, connector_id in refs
@@ -407,8 +452,10 @@ def resolve_connector_access_or_raise(
     try:
         return resolve_connector_access(db, user_id, requested)
     except ConnectorRuntimeError:
+        _restore_session_after_hook_failure(db)
         raise
     except Exception as exc:
+        _restore_session_after_hook_failure(db)
         logger.warning(
             "Failed to resolve connector access for user %s across %s connectors: %s",
             user_id,

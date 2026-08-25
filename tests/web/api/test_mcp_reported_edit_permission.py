@@ -11,17 +11,22 @@ into suites that run after this one.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import sqlalchemy as sa
 from fastapi import HTTPException
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.web.api.custom_api import CustomApiUpdate, get_custom_api, update_custom_api
 from xagent.web.api.mcp import (
+    MCPAppConnectRequest,
     MCPOAuthConnectRequest,
     MCPOAuthDiscoverRequest,
     MCPServerUpdate,
+    connect_mcp_app,
     connect_mcp_oauth,
     delete_mcp_oauth_grant,
     discover_mcp_oauth,
@@ -36,6 +41,7 @@ from xagent.web.models.agent import Agent
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.services.connector_team_scope import (
     ConnectorAccess,
@@ -904,3 +910,204 @@ class TestListMcpAppsPerRowDegradation:
         )
         assert mcp_entry["can_configure"] is False
         assert api_entry["can_configure"] is False
+
+
+def poison_by_raw_statement(db, *, colliding_user_id=None):
+    """Poison the session with a raw statement that fails outright.
+
+    On PostgreSQL this aborts the surrounding transaction, so every later
+    statement on the same connection is refused until a rollback. On
+    SQLite, a failed Core-level statement like this one does not put the
+    ORM ``Session`` into a deactivated state the way a failed flush does
+    (see ``poison_by_orm_flush``) -- so this shape's recovery proof lives
+    in the PostgreSQL-only sibling suite
+    (test_connector_hook_session_fault_postgresql.py), not in the tests
+    that use this factory here. ``colliding_user_id`` is accepted and
+    ignored so both poison factories share one call signature.
+    """
+    del colliding_user_id
+    db.execute(sa.text("select * from no_such_table_at_all"))
+
+
+def poison_by_orm_flush(db, *, colliding_user_id):
+    """Poison the session by flushing a row that violates a real unique
+    constraint -- unlike ``poison_by_raw_statement``, this poisons the
+    ORM ``Session`` itself (not only the underlying DB transaction) on
+    every backend: SQLAlchemy marks the session's transaction inactive
+    after a failed flush, and any later operation on it raises
+    ``PendingRollbackError`` until a rollback runs.
+    """
+    db.add(User(id=colliding_user_id, username="flush-poison-dup", password_hash="x"))
+    db.flush()
+
+
+POISON_SHAPES = [poison_by_raw_statement, poison_by_orm_flush]
+POISON_SHAPE_IDS = ["raw-statement", "orm-flush"]
+
+
+def _seed_catalog_app(db, app_id: str = "session-fault-app") -> None:
+    db.add(
+        PublicMCPApp(
+            app_id=app_id,
+            name=app_id,
+            description="Session fault test app",
+            transport="stdio",
+            launch_config={"command": "npx", "args": ["-y", app_id]},
+        )
+    )
+    db.commit()
+
+
+class TestSessionRecoveryAfterHookFailure:
+    """A hook that leaves a failed statement on the shared session must not
+    turn a route that would otherwise succeed (or gracefully degrade) into
+    a 500 -- the seam's wrapper functions restore the session before
+    converting the failure into a typed error (see
+    ``_restore_session_after_hook_failure`` in connector_team_scope.py).
+
+    ``poison_by_raw_statement`` only actually poisons PostgreSQL (see its
+    docstring); it is still parametrized here so the SQLite half of this
+    file documents that shape's expected (correct, unaffected) behavior
+    too. The PostgreSQL-only proof that this shape needs the fix lives in
+    test_connector_hook_session_fault_postgresql.py.
+    """
+
+    @pytest.mark.parametrize("poison", POISON_SHAPES, ids=POISON_SHAPE_IDS)
+    def test_a_toggle_that_already_committed_still_returns_200_when_the_hook_poisons_the_session(
+        self, db, poison
+    ):
+        owner = _make_user(db, 90)
+        server = _make_owned_server(db, owner.id, name="toggle-poison-target")
+        server_id = server.id
+        owner_id = owner.id
+
+        def poisoning_access(_db, _user_id, _refs):
+            poison(_db, colliding_user_id=owner_id)
+            return {}
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=poisoning_access)
+            response = asyncio.run(
+                toggle_mcp_server(server_id, current_user=owner, db=db)
+            )
+
+        assert response.can_edit_global is True
+
+        db.rollback()
+        refreshed = (
+            db.query(UserMCPServer)
+            .filter(
+                UserMCPServer.user_id == owner_id,
+                UserMCPServer.mcpserver_id == server_id,
+            )
+            .one()
+        )
+        # The connector was created active; toggling it once must have
+        # flipped it to inactive, and that flip must have durably
+        # committed (it happens before the hook is ever consulted) even
+        # though the hook poisoned the session afterward.
+        assert refreshed.is_active is False
+
+    @pytest.mark.parametrize("poison", POISON_SHAPES, ids=POISON_SHAPE_IDS)
+    def test_connecting_an_app_still_returns_200_when_the_hook_poisons_the_session(
+        self, db, poison
+    ):
+        member = _make_user(db, 91)
+        member_id = member.id
+        _seed_catalog_app(db, "connect-poison-app")
+
+        def poisoning_access(_db, _user_id, _refs):
+            poison(_db, colliding_user_id=member_id)
+            return {}
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=poisoning_access)
+            response = connect_mcp_app(
+                "connect-poison-app",
+                MCPAppConnectRequest(),
+                current_user=member,
+                db=db,
+            )
+
+        # Connecting never grants ownership (a fresh association is always
+        # is_owner=False), so with the hook degraded to no verdict at all,
+        # can_edit_global is False here -- the same value this route
+        # always reported before any verdict existed.
+        assert response.can_edit_global is False
+
+        db.rollback()
+        assoc = (
+            db.query(UserMCPServer)
+            .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+            .filter(
+                UserMCPServer.user_id == member_id,
+                MCPServer.name == "connect-poison-app",
+            )
+            .one()
+        )
+        assert assoc is not None
+
+    # test_the_servers_listing_still_returns_every_row_when_the_hook_poisons_the_session
+    # is not here: /api/mcp/servers has no per-request degradation catch
+    # until the fix in group C lands (a bare batched-call failure there
+    # still fails the whole request today, matching this route's pre-PR
+    # behavior of zero degradation). That test is added alongside group
+    # C's catch, in test_a_failing_hook_does_not_blank_the_whole_servers_list's
+    # sibling class, so it never asserts a guarantee this revision does not
+    # yet provide.
+
+    def test_the_apps_listing_still_returns_every_row_when_the_hook_poisons_the_session(
+        self, db
+    ):
+        owner = _make_user(db, 94)
+        member = _make_user(db, 95)
+        member_id = member.id
+        server = _make_owned_server(db, owner.id, name="apps-list-poison-target")
+        server_id = server.id
+
+        def poisoning_access(_db, _user_id, _refs):
+            poison_by_orm_flush(_db, colliding_user_id=member_id)
+            return {}
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=poisoning_access,
+                visibility=lambda _db, _uid: {"mcp": {server_id}, "custom_api": set()},
+            )
+            entries = list_mcp_apps(location="local", current_user=member, db=db)
+
+        entry = next(e for e in entries if e["server_id"] == server_id)
+        assert entry["can_configure"] is False
+
+    def test_a_typed_error_raised_by_the_hook_itself_also_restores_the_session(
+        self, db
+    ):
+        """The ``except ConnectorRuntimeError: raise`` arm must restore the
+        session too -- a hook can poison the session and *then* raise its
+        own typed error, not only a bare exception."""
+        owner = _make_user(db, 96)
+        member = _make_user(db, 97)
+        member_id = member.id
+        server = _make_owned_server(db, owner.id, name="typed-error-poison-target")
+        server_id = server.id
+
+        def poisoning_typed_hook(_db, _user_id, _refs):
+            try:
+                poison_by_orm_flush(_db, colliding_user_id=member_id)
+            except Exception:
+                pass
+            raise ConnectorRuntimeError("planted", "planted failure", status_code=409)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=poisoning_typed_hook,
+                visibility=lambda _db, _uid: {"mcp": {server_id}, "custom_api": set()},
+            )
+            with pytest.raises(HTTPException) as exc:
+                get_mcp_server(server_id, current_user=member, db=db)
+            assert exc.value.status_code == 409
+
+            # The session must be usable again immediately afterward --
+            # not just after an explicit external rollback.
+            still_works = db.query(MCPServer).filter(MCPServer.id == server_id).first()
+        assert still_works is not None

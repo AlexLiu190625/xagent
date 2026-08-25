@@ -12,7 +12,7 @@ from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -925,5 +925,46 @@ def test_resolve_or_raise_passes_a_typed_error_through_unchanged():
             )
         assert excinfo.value is planted
         assert excinfo.value.details["reason"] == "planted_inner_reason"
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+# ---------------------------------------------------------------------------
+# The team-visibility wrapper restores the shared session after a failed
+# hook too -- the sister guarantee to resolve_connector_access_or_raise's,
+# on the sister wrapper.
+# ---------------------------------------------------------------------------
+
+
+def test_the_team_scope_wrapper_also_restores_the_session(db_session):
+    """A hook that poisons the shared session via a failed ORM flush, then
+    lets that failure propagate, must not leave the session unusable for
+    whatever runs next in the same request."""
+    poisoning_user_id = 900001
+    db_session.add(
+        User(id=poisoning_user_id, username="team-scope-poison", password_hash="x")
+    )
+    db_session.commit()
+
+    def poisoning_team_visibility(db, *, team_id):
+        # A duplicate primary key -- a real ORM flush failure, not a
+        # simulated one -- propagates out of this hook uncaught.
+        db.add(User(id=poisoning_user_id, username="dup", password_hash="x"))
+        db.flush()
+        return {"mcp": set(), "custom_api": set()}  # pragma: no cover - unreachable
+
+    connector_team_scope.set_connector_team_hooks(
+        team_visibility=poisoning_team_visibility
+    )
+    try:
+        with pytest.raises(ConnectorRuntimeError) as excinfo:
+            connector_team_scope.resolve_team_connector_ids_or_raise(
+                db_session, team_id=T1, log_subject=None
+            )
+        assert excinfo.value.status_code == 503
+
+        # The session must be usable again immediately afterward.
+        result = db_session.execute(select(1)).scalar()
+        assert result == 1
     finally:
         connector_team_scope.set_connector_team_hooks()
