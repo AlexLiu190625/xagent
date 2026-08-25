@@ -837,9 +837,13 @@ class ReActPattern(AgentPattern):
             can_lookup_output_files = (
                 WORKSPACE_OUTPUT_FILES_TOOL_NAME in active_tool_names
             )
+            clock_zone = context.clock_zone()
             current_date = (
-                context.created_at.astimezone(timezone.utc).date().isoformat()
+                context.created_at.astimezone(clock_zone or timezone.utc)
+                .date()
+                .isoformat()
             )
+            clock_zone_label = clock_zone.key if clock_zone is not None else "UTC"
             instruction = (
                 "Use available tools when the user asks you to generate, compute, run, "
                 "execute, inspect, read, write, or otherwise produce a concrete result "
@@ -863,7 +867,7 @@ class ReActPattern(AgentPattern):
                 "When writing any final user-facing response, including plain "
                 "assistant text: "
                 f"{final_deliverable_file_reference_instructions(can_lookup=can_lookup_output_files, include_heading=False)}\n\n"
-                f"Current date (UTC): {current_date}. "
+                f"Current date ({clock_zone_label}): {current_date}. "
                 "For recent, latest, current, or time-sensitive requests, use this "
                 "date when forming search queries and judging source relevance. Only call "
                 "tools that are present in the current tool schema for this LLM call; "

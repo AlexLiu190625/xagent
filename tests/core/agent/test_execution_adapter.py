@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -348,6 +351,87 @@ async def test_execution_adapter_routes_react_to_react() -> None:
     assert result["metadata"]["execution_type"] == "agent_react"
     assert result["agent_result"]["pattern"] == "ReActPattern"
     assert llm.calls[0]["tools"] is not None
+
+
+@pytest.mark.asyncio
+async def test_request_context_timezone_reaches_both_prompt_clocks() -> None:
+    """Covers the transport the renderer depends on: request context ->
+    metadata["request_context"] -> _apply_request_context -> metadata. The
+    renderer's own formatting is unit-tested in tests/core/agent/test_context.py.
+    """
+    llm = FakeLLM(["tz done"])
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="tz",
+            pattern="react",
+            llm=llm,
+            tools=[FakeTool()],
+            service_id="tz-service",
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    result = await adapter.execute(
+        task="how many shifts do we have on tomorrow?",
+        task_id="tz-exec",
+        context={"timezone": "Australia/Melbourne"},
+    )
+
+    assert result["success"] is True
+    system_prompt = next(
+        message["content"]
+        for message in llm.calls[0]["messages"]
+        if message["role"] == "system"
+    )
+
+    # created_at is a dataclass default_factory, so it cannot be monkeypatched
+    # from here. Reading the UTC stamp back out of the prompt pins the pair
+    # without a wall-clock race.
+    stamped_utc = re.search(
+        r"which is (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC\.", system_prompt
+    )
+    assert stamped_utc is not None, system_prompt
+    expected_local = (
+        datetime.strptime(stamped_utc.group(1), "%Y-%m-%d %H:%M:%S")
+        .replace(tzinfo=timezone.utc)
+        .astimezone(ZoneInfo("Australia/Melbourne"))
+    )
+
+    assert (
+        f"Current date and time: {expected_local.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"(Australia/Melbourne, UTC+" in system_prompt
+    )
+    assert (
+        f"Current date (Australia/Melbourne): {expected_local.date().isoformat()}. "
+        in system_prompt
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_context_without_timezone_keeps_utc_clocks() -> None:
+    llm = FakeLLM(["utc done"])
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="utc",
+            pattern="react",
+            llm=llm,
+            tools=[FakeTool()],
+            service_id="utc-service",
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    result = await adapter.execute(task="Say done", task_id="utc-exec", context={})
+
+    assert result["success"] is True
+    system_prompt = next(
+        message["content"]
+        for message in llm.calls[0]["messages"]
+        if message["role"] == "system"
+    )
+    assert "Current date (UTC): " in system_prompt
+    assert " UTC. Use this as the reference for relative dates" in system_prompt
+    assert "which is" not in system_prompt
 
 
 @pytest.mark.asyncio

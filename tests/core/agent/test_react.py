@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -20,6 +21,7 @@ from xagent.core.agent import (
     ToolCallInterrupted,
     ToolCallRecord,
 )
+from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
 from xagent.core.model.chat.basic.router import RouterLLM
@@ -6131,3 +6133,49 @@ async def test_blank_streaming_arguments_flow_from_adapter_into_react(mocker) ->
     assert result["success"] is True
     assert result["response"] == "gpt-4o"
     assert tool.calls == [{}]
+
+
+def _react_clock_prompt(timezone_name: str | None) -> str:
+    context = ExecutionContext(
+        created_at=datetime(2026, 8, 24, 22, 3, 37, tzinfo=timezone.utc)
+    )
+    if timezone_name is not None:
+        context.metadata[CLOCK_TIMEZONE_METADATA_KEY] = timezone_name
+    context.add_user_message("how many shifts do we have on tomorrow?")
+
+    messages = ReActPattern()._messages_for_llm(context, has_tools=True)
+    return messages[0]["content"]
+
+
+# Verbatim pre-PR sentence, so a change to any part of the fallback instruction
+# fails rather than only a change to its "Current date" prefix.
+UTC_DATE_INSTRUCTION = (
+    "Current date (UTC): 2026-08-24. "
+    "For recent, latest, current, or time-sensitive requests, use this "
+    "date when forming search queries and judging source relevance."
+)
+
+
+def _date_instruction(prompt: str) -> str:
+    start = prompt.index("Current date (")
+    end = prompt.index("source relevance.", start) + len("source relevance.")
+    return prompt[start:end]
+
+
+def test_tool_call_date_line_keeps_utc_wording_without_a_timezone() -> None:
+    assert _date_instruction(_react_clock_prompt(None)) == UTC_DATE_INSTRUCTION
+
+
+def test_tool_call_date_line_uses_the_caller_timezone() -> None:
+    prompt = _react_clock_prompt("Australia/Melbourne")
+
+    assert _date_instruction(prompt) == UTC_DATE_INSTRUCTION.replace(
+        "Current date (UTC): 2026-08-24. ",
+        "Current date (Australia/Melbourne): 2026-08-25. ",
+    )
+    # The UTC date is what produced the wrong "tomorrow" in production.
+    assert "Current date (UTC)" not in prompt
+
+
+def test_tool_call_date_line_degrades_to_utc_for_an_unusable_timezone() -> None:
+    assert _date_instruction(_react_clock_prompt("Not/AZone")) == UTC_DATE_INSTRUCTION
