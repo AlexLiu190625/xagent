@@ -86,9 +86,13 @@ def _format_openai_error(prefix: str, error: BaseException) -> str:
 def field_content(message: Any, field_name: str) -> tuple[bool, Any]:
     """Return whether a provider message/delta explicitly set ``field_name``.
 
-    Checks, in order, a plain dict, a pydantic model's declared fields, its
-    ``model_extra`` (unknown fields the SDK still preserves), and finally
-    ``__dict__`` as a last resort for other object shapes.
+    Checks, in order, a plain dict, a pydantic model's declared fields, and
+    its ``model_extra`` (unknown fields the SDK still preserves). ``__dict__``
+    is only consulted for objects that are neither of those two shapes: on a
+    pydantic model every declared field sits in ``__dict__`` carrying its
+    default whether or not the provider actually sent it, so it cannot
+    distinguish "the provider sent this" from "the class declares it" and
+    must not be used as a fallback there.
 
     Public (not ``_``-prefixed) because it is a general-purpose probe over
     any OpenAI-SDK-shaped message or delta object, not an implementation
@@ -102,7 +106,8 @@ def field_content(message: Any, field_name: str) -> tuple[bool, Any]:
         return value is not None, value
 
     model_fields_set = getattr(message, "model_fields_set", None)
-    if isinstance(model_fields_set, set) and field_name in model_fields_set:
+    is_pydantic_model = isinstance(model_fields_set, set)
+    if is_pydantic_model and field_name in model_fields_set:  # type: ignore[operator]
         value = getattr(message, field_name, None)
         return value is not None, value
 
@@ -110,6 +115,13 @@ def field_content(message: Any, field_name: str) -> tuple[bool, Any]:
     if isinstance(model_extra, dict) and field_name in model_extra:
         value = model_extra.get(field_name)
         return value is not None, value
+
+    if is_pydantic_model:
+        # On a pydantic model every declared field sits in ``__dict__``
+        # carrying its default, set or not, so ``__dict__`` cannot tell
+        # "the provider sent this" from "the class declares it". The two
+        # checks above are the only ones that can.
+        return False, None
 
     message_attrs = getattr(message, "__dict__", {})
     if not isinstance(message_attrs, dict) or field_name not in message_attrs:
@@ -128,10 +140,11 @@ def _delta_field_names(delta: Any) -> tuple[str, ...]:
     """Return every field name actually set on a streaming delta object.
 
     Checks the same shapes ``field_content`` does -- a plain dict, a
-    pydantic model's declared fields, its ``model_extra``, and finally
-    ``__dict__`` -- but returns key names rather than one field's value.
-    Used to log which reasoning-like field (if any) a delta carried without
-    ever logging its content.
+    pydantic model's declared fields, and its ``model_extra`` -- but
+    collects key names rather than one field's value, so it falls back to
+    ``__dict__`` whenever both of those come up empty, even on a pydantic
+    model. Used to log which reasoning-like field (if any) a delta carried
+    without ever logging its content.
     """
     if isinstance(delta, dict):
         return tuple(delta.keys())
