@@ -726,9 +726,9 @@ async def test_sandwiched_deepseek_prefix_sanitizes_messages_once(monkeypatch, m
 # caller's original configuration, not ``RouterLLM._abilities`` (which always
 # excludes vision/thinking_mode -- see ``_UNROUTED_ROUTER_ABILITIES`` -- since
 # a virtual router cannot claim a candidate's dynamic abilities before
-# routing picks one). See the design's V2-2/V3 attack: before this fix, a
-# user-declared ``thinking_mode``/``vision`` ability was silently dropped
-# from the actually-constructed downstream client on this branch.
+# routing picks one). Before this fix, a user-declared
+# ``thinking_mode``/``vision`` ability was silently dropped from the
+# actually-constructed downstream client on this branch.
 # ---------------------------------------------------------------------------
 
 
@@ -776,13 +776,15 @@ async def test_router_fallback_downstream_has_ability_vision_matches_configured_
 async def test_router_auto_fallback_vision_deepseek_round_trips_reasoning(
     monkeypatch, mocker
 ):
-    """I-20: auto routing's fallback branch, picking a deepseek model, on a
-    vision-input call -- the whole combination must still run end-to-end and
-    reasoning capture must still fire. This is the concrete scenario V2-1's
-    "vision inherits capture for free" and V2-2's "fallback abilities fix"
-    combine into: a user with an image in the conversation, no explicit
-    model chosen, routed by "auto" to a deepseek slug, on the code path with
-    no injected downstream_resolver.
+    """Auto routing to a deepseek model on a vision call still captures reasoning.
+
+    This is where two separate behaviors meet: ``vision_chat`` inheriting
+    reasoning capture, and the fallback branch building its downstream
+    client from the caller's configured abilities. The combination is a real
+    user situation -- an image in the conversation, no explicit model
+    chosen, routed by "auto" to a deepseek slug, on the code path with no
+    injected ``downstream_resolver`` -- so it must run end-to-end with
+    capture firing.
     """
     tool_call = SimpleNamespace(
         id="call_1",

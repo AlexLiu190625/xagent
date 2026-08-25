@@ -2023,14 +2023,15 @@ async def test_openrouter_deepseek_stream_no_op_thinking_default_propagates(mock
 
 
 # ---------------------------------------------------------------------------
-# DeepSeek reasoning-content replay on OpenRouter (issue #1537, PR-1).
+# DeepSeek reasoning-content replay on OpenRouter (issue #1537).
 #
 # These cover the shared capture/replay mechanism now wired into
-# OpenRouterLLM via ``deepseek_tool_protocol``'s shared functions. Naming
-# follows the design's invariant table (I-1 .. I-12, I-18, I-19); I-13/I-14
-# live in test_deepseek.py (unchanged direct-DeepSeek coverage), I-15 is the
-# existing test_openai.py negative test, and I-16/I-17 (PR-2, default
-# thinking) are out of scope here.
+# OpenRouterLLM via ``deepseek_tool_protocol``'s shared functions. The
+# direct-DeepSeek side of that same mechanism keeps its own coverage in
+# test_deepseek.py, and test_openai.py holds the negative case pinning that
+# a plain OpenAI-compatible client captures nothing. Whether thinking should
+# default to enabled for deepseek slugs is a separate question and is not
+# decided by any test here.
 # ---------------------------------------------------------------------------
 
 
@@ -2071,7 +2072,7 @@ def _openrouter_tool_call_response(
 
 @pytest.mark.asyncio
 async def test_openrouter_deepseek_captures_reasoning_provider_state(mocker):
-    """I-1: a deepseek-slug tool-call response captures reasoning_content."""
+    """A deepseek-slug tool-call response captures reasoning_content."""
     response = _openrouter_tool_call_response(
         reasoning_content="Use the search tool first"
     )
@@ -2096,7 +2097,11 @@ async def test_openrouter_deepseek_captures_reasoning_provider_state(mocker):
 
 @pytest.mark.asyncio
 async def test_openrouter_deepseek_captures_empty_reasoning_content(mocker):
-    """I-2: an explicit empty-string reasoning_content is still captured."""
+    """An explicit empty-string reasoning_content is still captured.
+
+    An empty string is a value the provider sent, not a missing field, so
+    it must round-trip like any other captured content.
+    """
     response = _openrouter_tool_call_response(reasoning_content="")
     mock_client = mocker.AsyncMock()
     mock_client.chat.completions.create.return_value = response
@@ -2117,12 +2122,13 @@ async def test_openrouter_deepseek_captures_empty_reasoning_content(mocker):
 
 @pytest.mark.asyncio
 async def test_openrouter_deepseek_captures_reasoning_alias_from_raw(mocker):
-    """I-3: the ``reasoning`` alias is captured from the raw response body
+    """The ``reasoning`` alias is captured from the raw response body
     when the SDK message object never surfaced ``reasoning_content`` at all.
 
-    This is the defensive-merge branch from the design's V4 decision (no
-    live OpenRouter response was available to confirm which spelling a
-    deepseek slug actually sends).
+    Capture checks both spellings on purpose: no live OpenRouter response
+    was available to confirm which one a deepseek slug actually sends, so
+    the raw body is consulted as a fallback for whichever spelling the
+    transport layer did not already normalize.
     """
     response = _openrouter_tool_call_response(
         reasoning_content="unset",
@@ -2155,7 +2161,7 @@ async def test_openrouter_deepseek_captures_reasoning_alias_from_raw(mocker):
 async def test_openrouter_deepseek_replays_reasoning_content(
     mocker, mock_chat_completion
 ):
-    """I-4: captured provider state is translated back to ``reasoning_content``
+    """Captured provider state is translated back to ``reasoning_content``
     on the next request, and the internal marker never reaches the wire.
     """
     mock_client = mocker.AsyncMock()
@@ -2193,7 +2199,7 @@ async def test_openrouter_deepseek_replays_reasoning_content(
 async def test_openrouter_deepseek_replays_empty_reasoning_fallback(
     mocker, mock_chat_completion
 ):
-    """I-5: an assistant tool-call message with no captured state gets the
+    """An assistant tool-call message with no captured state gets the
     empty-string fallback so the history stays structurally valid.
     """
     mock_client = mocker.AsyncMock()
@@ -2229,7 +2235,12 @@ async def test_openrouter_deepseek_replays_empty_reasoning_fallback(
 async def test_openrouter_deepseek_replays_when_thinking_disabled(
     mocker, mock_chat_completion
 ):
-    """I-6: replay happens regardless of this call's own thinking setting."""
+    """Replay happens regardless of this call's own thinking setting.
+
+    What the provider requires back is the reasoning content it produced
+    earlier in this tool chain, so whether thinking is requested again on
+    the current call cannot gate the replay.
+    """
     mock_client = mocker.AsyncMock()
     mock_client.chat.completions.create.return_value = mock_chat_completion
     mocker.patch(
@@ -2316,7 +2327,7 @@ def _tool_call_delta_chunk(
 
 @pytest.mark.asyncio
 async def test_openrouter_deepseek_stream_captures_reasoning_provider_state(mocker):
-    """I-7: streamed reasoning content accumulates onto the tool-call chunk's
+    """Streamed reasoning content accumulates onto the tool-call chunk's
     raw payload as captured provider state.
     """
 
@@ -2355,10 +2366,12 @@ async def test_openrouter_deepseek_stream_captures_reasoning_provider_state(mock
 
 @pytest.mark.asyncio
 async def test_openrouter_deepseek_stream_captures_reasoning_alias_delta(mocker):
-    """Streaming counterpart of I-3: a delta using the ``reasoning`` alias
-    (never ``reasoning_content``) must still be captured -- this is the
-    branch ``_delta_reasoning_content``'s override exists for; the base
-    class's own delta check only ever recognizes ``reasoning_content``.
+    """A streamed delta using the ``reasoning`` alias is captured too.
+
+    A delta that carries the alias and never ``reasoning_content`` must
+    still be recognized -- this is the branch ``_delta_reasoning_content``'s
+    override exists for, since the base class's own delta check only ever
+    recognizes ``reasoning_content``.
     """
 
     async def stream():
@@ -2398,11 +2411,13 @@ async def test_openrouter_deepseek_stream_captures_reasoning_alias_delta(mocker)
 async def test_openrouter_deepseek_stream_provider_state_survives_tool_truncation(
     mocker,
 ):
-    """I-8: when the protocol adapter withholds a partial-looking argument
-    tail (``_safe_streaming_tool_chunk``'s ``dataclasses.replace``), the
-    truncated chunk it immediately yields still carries the captured
-    provider state -- ``replace()`` only rewrites ``tool_calls``, never
-    ``raw``.
+    """Withholding a partial-looking argument tail preserves captured state.
+
+    When the protocol adapter holds back a tail that looks like the start of
+    a serialized tool-call marker (``_safe_streaming_tool_chunk``'s
+    ``dataclasses.replace``), the truncated chunk it yields in that moment
+    must still carry the captured provider state -- ``replace()`` only
+    rewrites ``tool_calls``, never ``raw``.
     """
 
     async def stream():
@@ -2444,13 +2459,13 @@ async def test_openrouter_deepseek_stream_provider_state_survives_tool_truncatio
 
 @pytest.mark.asyncio
 async def test_openrouter_deepseek_stream_replays_reasoning_content(mocker):
-    """Streaming counterpart of I-4 (``test_openrouter_deepseek_replays_
-    reasoning_content``): ``stream_chat`` runs through the same
-    ``_build_request_messages`` / ``_prepare_messages_for_request`` path as
-    ``chat``, so captured provider state on a prior assistant tool-call
-    message must be translated back to ``reasoning_content`` on the request
-    the stream entry point actually sends, not just on the non-streaming
-    entry point.
+    """``stream_chat``'s outbound request replays captured reasoning too.
+
+    ``stream_chat`` runs through the same ``_build_request_messages`` /
+    ``_prepare_messages_for_request`` path as ``chat``, so captured provider
+    state on a prior assistant tool-call message must be translated back to
+    ``reasoning_content`` on the request the streaming entry point actually
+    sends, not only on the non-streaming one.
     """
 
     async def stream():
@@ -2503,22 +2518,20 @@ async def test_openrouter_deepseek_stream_replays_reasoning_content(mocker):
 async def test_openrouter_deepseek_default_first_turn_request_is_byte_identical(
     mocker, mock_chat_completion
 ):
-    """PR-1 must not change anything about the request OpenRouter already
-    sends today for the untouched default (thinking left unset, i.e.
-    ``thinking=None``, which still renders disabled -- that is PR-2's
-    concern, not this one's).
+    """The default first-turn request is unchanged by reasoning replay.
 
-    A first turn with no prior assistant tool-call message is the case
-    where the new ``_prepare_messages_for_request`` override has nothing to
-    rewrite (``restore_deepseek_reasoning_content`` only touches assistant
-    messages that already have ``tool_calls``): every message here is
-    exactly what was sent before this PR, and ``extra_body`` renders the
-    same disabled payload ``_prepare_provider_reasoning_extra_body``
-    produced before (that function is untouched by PR-1). This is the
-    concrete request-level counterpart of A-5's no-op-comparison reasoning
-    in the design and of the existing
-    ``test_openrouter_deepseek_defaults_to_disabled_thinking`` extra_body
-    check.
+    With thinking left unset (``thinking=None``, which still renders
+    disabled) and no prior assistant tool-call message in the history, the
+    ``_prepare_messages_for_request`` override has nothing to rewrite --
+    ``restore_deepseek_reasoning_content`` only touches assistant messages
+    that already carry ``tool_calls``. So every message on the wire is
+    exactly what this client sent before replay existed, and ``extra_body``
+    renders the same disabled payload, because
+    ``_prepare_provider_reasoning_extra_body`` is not modified.
+
+    This is the request-level counterpart of the ``extra_body`` check in
+    ``test_openrouter_deepseek_defaults_to_disabled_thinking``: that one
+    pins the rendered reasoning payload, this one pins the whole request.
     """
     mock_client = mocker.AsyncMock()
     mock_client.chat.completions.create.return_value = mock_chat_completion
@@ -2540,12 +2553,14 @@ async def test_openrouter_deepseek_default_first_turn_request_is_byte_identical(
 
 @pytest.mark.asyncio
 async def test_openrouter_non_deepseek_does_not_capture_or_replay_reasoning(mocker):
-    """I-9: a non-deepseek slug is untouched by any of the three hooks --
-    no capture (checked here against a response that *does* carry
-    reasoning_content on a tool call, so the gate is actually exercised, not
-    vacuously true because the response has nothing to capture), no replay,
-    and an upstream-supplied internal marker is still stripped by the shared
-    base-class sanitization (not by anything new here).
+    """A non-deepseek slug is untouched by any of the three hooks.
+
+    No capture, no replay, and an upstream-supplied internal marker is still
+    stripped by the shared base-class sanitization rather than by anything
+    added here. The response used below deliberately *does* carry
+    reasoning_content on a tool call, so the model-name gate is actually
+    exercised instead of passing vacuously on a response with nothing to
+    capture.
     """
     response = _openrouter_tool_call_response(
         reasoning_content="should never be captured for this model"
@@ -2587,8 +2602,11 @@ async def test_openrouter_non_deepseek_does_not_capture_or_replay_reasoning(mock
 async def test_openrouter_deepseek_round_trips_reasoning_across_two_calls(
     mocker, mock_chat_completion
 ):
-    """I-10: a full two-call chain -- capture on the first response, replay
-    of that exact content on the assistant history sent in the second call.
+    """A full two-call chain captures then replays the same content.
+
+    Reasoning content is captured from the first response and replayed
+    verbatim on the assistant history sent in the second call -- the
+    end-to-end behavior the provider's 400 demands.
     """
     first_response = _openrouter_tool_call_response(
         reasoning_content="Search first, then answer."
@@ -2638,10 +2656,13 @@ async def test_openrouter_deepseek_round_trips_reasoning_across_two_calls(
 async def test_openrouter_deepseek_replays_reasoning_after_mandatory_reasoning_retry(
     mocker, mock_chat_completion
 ):
-    """I-11: after the enable-thinking compat retry recovers a mandatory-
-    reasoning 400, the captured content from that recovered call replays
-    correctly on a later request -- the #1621 "known boundary" this PR
-    closes.
+    """Reasoning captured by the enable-thinking retry replays later.
+
+    When the compat retry turns thinking on to recover a mandatory-reasoning
+    400, the content captured from that recovered call must replay correctly
+    on a later request. Recovering the first call was already possible; the
+    second call in the same tool chain used to fail anyway, and this pins
+    that it no longer does.
     """
     first_response = _openrouter_tool_call_response(
         reasoning_content="Reasoned after enabling thinking."
@@ -2704,9 +2725,11 @@ async def test_openrouter_deepseek_replays_reasoning_after_mandatory_reasoning_r
 async def test_openrouter_deepseek_prefix_retry_preserves_provider_state(
     mocker, mock_chat_completion
 ):
-    """I-12: the prefix-stripping retry's ``dict(message)`` shallow copy
-    (``_strip_assistant_tool_call_prefixes``) keeps the provider-state
-    marker, so the retried request still replays reasoning correctly.
+    """The prefix-stripping retry keeps the provider-state marker.
+
+    ``_strip_assistant_tool_call_prefixes`` rebuilds messages through a
+    ``dict(message)`` shallow copy, which must carry the provider-state
+    marker along so the retried request still replays reasoning correctly.
     """
     mock_client = mocker.AsyncMock()
     mock_client.chat.completions.create.side_effect = [
@@ -2746,9 +2769,10 @@ async def test_openrouter_deepseek_prefix_retry_preserves_provider_state(
 
 @pytest.mark.asyncio
 async def test_openrouter_deepseek_vision_captures_reasoning_provider_state(mocker):
-    """I-18: vision_chat inherits capture for free -- no deepseek-specific
-    override targets vision_chat, only the shared hooks the base class
-    already calls from both entrypoints.
+    """``vision_chat`` inherits reasoning capture with no vision-specific code.
+
+    Nothing here overrides ``vision_chat`` itself; capture works because the
+    base class calls the same shared hooks from both entrypoints.
     """
     response = _openrouter_tool_call_response(
         reasoning_content="Looking at the image first."
@@ -2779,8 +2803,10 @@ async def test_openrouter_deepseek_vision_captures_reasoning_provider_state(mock
 async def test_openrouter_deepseek_vision_replays_reasoning_content(
     mocker, mock_chat_completion
 ):
-    """I-19: vision_chat replays captured reasoning under the exact same
-    namespace/key as ``chat`` -- this is one shared mechanism, not two.
+    """``vision_chat`` replays captured reasoning exactly as ``chat`` does.
+
+    Both entrypoints read the same namespace and key, because this is one
+    shared mechanism rather than two parallel implementations.
     """
     mock_client = mocker.AsyncMock()
     mock_client.chat.completions.create.return_value = mock_chat_completion
@@ -2822,10 +2848,13 @@ async def test_openrouter_deepseek_vision_replays_reasoning_content(
 async def test_openrouter_deepseek_warns_when_capture_misses_all_known_spellings(
     mocker, caplog
 ):
-    """V2-6: the WARNING that fires when thinking was requested, the
-    response is a tool call, but neither known reasoning spelling was
-    captured -- must report the unrecognized key names it did observe
-    (its entire diagnostic value), never reasoning content.
+    """The capture-miss WARNING names the keys it saw, never their content.
+
+    It fires when thinking was requested and the response is a tool call but
+    neither known reasoning spelling was captured. Naming the unrecognized
+    keys it did observe is the warning's entire diagnostic value, since that
+    is what identifies a renamed provider field; the values behind those
+    keys must never reach a log line.
     """
     import logging
 
@@ -2868,11 +2897,12 @@ async def test_openrouter_deepseek_warns_when_capture_misses_all_known_spellings
 async def test_openrouter_deepseek_no_warning_when_thinking_not_requested(
     mocker, caplog
 ):
-    """The empty-capture WARNING must not fire on the ordinary path where
-    thinking was never requested (the current PR-1 default for every
-    deepseek slug): an empty capture there is expected, not a spelling-drift
-    signal, and this is also the highest-traffic path today -- misfiring
-    here would make the warning noise, not signal.
+    """The capture-miss WARNING stays silent when thinking was not requested.
+
+    Thinking is off by default for every deepseek slug, so this is the
+    highest-traffic path today. An empty capture there is the expected
+    outcome rather than a sign that the provider renamed its reasoning
+    field, and warning about it would turn the signal into noise.
     """
     import logging
 
@@ -2963,11 +2993,13 @@ async def test_openrouter_deepseek_stream_warns_when_capture_misses_all_known_sp
 async def test_openrouter_deepseek_stream_no_warning_when_thinking_not_requested(
     mocker, caplog
 ):
-    """Streaming counterpart of
+    """The streaming capture-miss WARNING is silent without thinking too.
+
+    Same rule as
     ``test_openrouter_deepseek_no_warning_when_thinking_not_requested``: an
-    empty capture is expected (not a spelling-drift signal) on the ordinary
-    path where thinking was never requested -- the current PR-1 default for
-    every deepseek slug, and the highest-traffic streaming path today.
+    empty capture is the expected outcome, not a sign of a renamed provider
+    field, on the path where thinking was never requested -- off by default
+    for every deepseek slug, and the highest-traffic streaming path today.
     """
     import logging
 
