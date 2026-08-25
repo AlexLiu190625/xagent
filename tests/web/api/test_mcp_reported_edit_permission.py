@@ -230,6 +230,92 @@ class TestListEndpointAccessHookCallBudget:
         assert len(queries) == 7, queries
 
 
+class TestAppsListEndpointAccessHookCallBudget:
+    """The sister endpoint's budget: ``/api/mcp/apps`` (``location=local``)
+    also asks the access hook at most once per request, covering both
+    connector kinds in the same call, independent of row count."""
+
+    @pytest.mark.parametrize("num_rows", [2, 6], ids=["R=2", "R=6"])
+    def test_the_apps_listing_asks_the_access_hook_exactly_once_no_matter_how_many_rows(
+        self, db, num_rows
+    ):
+        owner = _make_user(db, 300 + num_rows)
+        member = _make_user(db, 400 + num_rows)
+
+        # Personal rows the member owns outright -- a personal row already
+        # answers can_configure on its own, so these are never worth a
+        # hook call.
+        owned_mcp = [
+            _make_owned_server(db, member.id, name=f"apps-owned-mcp-{num_rows}-{i}")
+            for i in range(2)
+        ]
+        owned_api = [
+            _make_owned_api(db, member.id, name=f"apps-owned-api-{num_rows}-{i}")
+            for i in range(2)
+        ]
+
+        # Stand-in rows across both kinds -- every one of these needs a
+        # verdict.
+        stand_in_mcp = [
+            _make_owned_server(db, owner.id, name=f"apps-stand-in-mcp-{num_rows}-{i}")
+            for i in range(num_rows)
+        ]
+        stand_in_api = [
+            _make_owned_api(db, owner.id, name=f"apps-stand-in-api-{num_rows}-{i}")
+            for i in range(num_rows)
+        ]
+
+        _ = member.id
+        owned_mcp_ids = {s.id for s in owned_mcp}
+        owned_api_ids = {a.id for a in owned_api}
+        stand_in_mcp_ids = {s.id for s in stand_in_mcp}
+        stand_in_api_ids = {a.id for a in stand_in_api}
+
+        calls: list[object] = []
+
+        def counting_access_hook(hook_db, user_id, refs):
+            calls.append(refs)
+            for _ in range(3):
+                hook_db.execute(sa.select(sa.literal(1)))
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+            }
+
+        def visibility_hook(_db, _user_id):
+            return {"mcp": set(stand_in_mcp_ids), "custom_api": set(stand_in_api_ids)}
+
+        queries: list[str] = []
+
+        def record_query(conn, cursor, statement, parameters, context, executemany):
+            del conn, cursor, parameters, context, executemany
+            queries.append(statement)
+
+        engine = db.get_bind()
+        event.listen(engine, "before_cursor_execute", record_query)
+        try:
+            with snapshot_connector_team_hooks():
+                set_connector_team_hooks(
+                    access=counting_access_hook, visibility=visibility_hook
+                )
+                list_mcp_apps(location="local", current_user=member, db=db)
+        finally:
+            event.remove(engine, "before_cursor_execute", record_query)
+
+        assert len(calls) == 1
+        requested_refs = calls[0]
+        assert set(requested_refs) == {("mcp", sid) for sid in stand_in_mcp_ids} | {
+            ("custom_api", aid) for aid in stand_in_api_ids
+        }
+        called_mcp_ids = {rid for (kind, rid) in requested_refs if kind == "mcp"}
+        called_api_ids = {rid for (kind, rid) in requested_refs if kind == "custom_api"}
+        assert called_mcp_ids.isdisjoint(owned_mcp_ids)
+        assert called_api_ids.isdisjoint(owned_api_ids)
+
+        # Pinned as a constant for the same reason as the sibling test
+        # above: it must be identical for num_rows=2 and num_rows=6.
+        assert len(queries) == 10, queries
+
+
 class TestReportedEditPermissionConsistencyMcp:
     """The response's can_edit_global must agree across every surface that
     reports it, for the same (user, connector) -- for MCP connectors, across
