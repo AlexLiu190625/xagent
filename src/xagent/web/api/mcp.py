@@ -90,7 +90,7 @@ from ..services.user_oauth import (
 )
 
 if TYPE_CHECKING:
-    from ..services.connector_team_scope import ConnectorAccess
+    from ..services.connector_team_scope import ConnectorAccess, ConnectorRef
 
 logger = logging.getLogger(__name__)
 
@@ -1552,9 +1552,8 @@ def _resolve_mcp_server_for_request(
 
     access: "ConnectorAccess | None" = None
     if server is not None and not already_decided:
-        access = resolve_connector_access_or_raise(
-            db, int(user_id), "mcp", int(server.id)
-        )
+        ref: "ConnectorRef" = ("mcp", int(server.id))
+        access = resolve_connector_access_or_raise(db, int(user_id), [ref]).get(ref)
 
     if user_mcp is None and access is None:
         raise HTTPException(
@@ -2456,6 +2455,65 @@ def list_mcp_apps(
         # fixable from the Tools page, unreachable from the picker. A team-shared
         # catalog connector loses its only picker entry the same way, which is
         # pre-existing for most apps and tracked in #1387.
+        # Custom APIs: same overlay as the MCP half above, moved up (out of
+        # its original position after the MCP loop) so both halves' team-
+        # owned rows are known before the single batched access call below.
+        user_custom_apis = (
+            db.query(UserCustomApi, CustomApi)
+            .join(CustomApi, UserCustomApi.custom_api_id == CustomApi.id)
+            .filter(UserCustomApi.user_id == current_user.id)
+            .all()
+        )
+
+        # Same overlay as the MCP half above: a team-owned Custom API has no
+        # UserCustomApi row for the member, so it is carried as (api, None).
+        # The association is read for can_attach and can_configure below — a
+        # team-owned API is one the runtime overlays by id, exactly like the
+        # MCP half.
+        local_custom_apis: list[tuple[CustomApi, UserCustomApi | None]] = [
+            (api, user_api) for user_api, api in user_custom_apis
+        ]
+        own_api_ids = {cast(int, api.id) for api, _ in local_custom_apis}
+        missing_api = [aid for aid in team_ids["custom_api"] if aid not in own_api_ids]
+        if missing_api:
+            local_custom_apis.extend(
+                (api, None)
+                for api in db.query(CustomApi)
+                .filter(CustomApi.id.in_(missing_api))
+                .all()
+            )
+
+        # One batched call covering every stand-in row across both halves --
+        # a personal row (user_mcp/user_api is not None) already answers
+        # can_configure on its own and needs no verdict at all. A resolution
+        # failure here degrades every stand-in row's can_configure to False
+        # rather than failing the whole listing -- the same per-row
+        # degradation this route has always offered, now paid for with one
+        # hook call instead of one per row.
+        access_refs: "set[ConnectorRef]" = {
+            ("mcp", cast(int, server.id))
+            for server, user_mcp in local_mcps
+            if user_mcp is None
+        } | {
+            ("custom_api", cast(int, api.id))
+            for api, user_api in local_custom_apis
+            if user_api is None
+        }
+        verdicts: "dict[ConnectorRef, ConnectorAccess]" = {}
+        if access_refs:
+            try:
+                verdicts = resolve_connector_access_or_raise(
+                    db, cast(int, current_user.id), access_refs
+                )
+            except ConnectorRuntimeError:
+                logger.warning(
+                    "Connector access resolution failed while listing %s "
+                    "local connectors for user %s; reporting "
+                    "can_configure=False for those rows",
+                    len(access_refs),
+                    current_user.id,
+                )
+
         library_keys = {key for app in library_apps for key in _catalog_app_keys(app)}
         for server, user_mcp in local_mcps:
             if library_keys.intersection(_server_catalog_keys(server)):
@@ -2473,26 +2531,16 @@ def list_mcp_apps(
                 continue
 
             # A personal row already answers can_configure on its own; only
-            # a team-owned row with none (user_mcp is None) needs a verdict.
-            # A verdict resolution failure here must not blank the whole
-            # response list -- it only degrades this one row's
-            # can_configure to False, the same answer a caller with no
-            # verdict at all would get; every other row is built the same
-            # way and is unaffected.
-            local_team_access: "ConnectorAccess | None" = None
-            if user_mcp is None:
-                try:
-                    local_team_access = resolve_connector_access_or_raise(
-                        db, cast(int, current_user.id), "mcp", cast(int, server.id)
-                    )
-                except ConnectorRuntimeError:
-                    logger.warning(
-                        "Connector access resolution failed for MCP server "
-                        "%s while listing apps for user %s; reporting "
-                        "can_configure=False for this row",
-                        server.id,
-                        current_user.id,
-                    )
+            # a team-owned row with none (user_mcp is None) needs a verdict,
+            # looked up from the batch answer computed once above. A ref
+            # missing from that answer -- because the caller's team does not
+            # link it, or because the whole batch call failed and was
+            # degraded -- reports can_configure=False for this row alone.
+            local_team_access: "ConnectorAccess | None" = (
+                verdicts.get(("mcp", cast(int, server.id)))
+                if user_mcp is None
+                else None
+            )
 
             entry = {
                 "id": server.name,
@@ -2555,32 +2603,8 @@ def list_mcp_apps(
 
             results.append(entry)
 
-        # Append Custom APIs
-        user_custom_apis = (
-            db.query(UserCustomApi, CustomApi)
-            .join(CustomApi, UserCustomApi.custom_api_id == CustomApi.id)
-            .filter(UserCustomApi.user_id == current_user.id)
-            .all()
-        )
-
-        # Same overlay as the MCP half above: a team-owned Custom API has no
-        # UserCustomApi row for the member, so it is carried as (api, None).
-        # The association is read for can_attach and can_configure below — a
-        # team-owned API is one the runtime overlays by id, exactly like the
-        # MCP half.
-        local_custom_apis: list[tuple[CustomApi, UserCustomApi | None]] = [
-            (api, user_api) for user_api, api in user_custom_apis
-        ]
-        own_api_ids = {cast(int, api.id) for api, _ in local_custom_apis}
-        missing_api = [aid for aid in team_ids["custom_api"] if aid not in own_api_ids]
-        if missing_api:
-            local_custom_apis.extend(
-                (api, None)
-                for api in db.query(CustomApi)
-                .filter(CustomApi.id.in_(missing_api))
-                .all()
-            )
-
+        # Append Custom APIs (query and list assembled above, before the
+        # batched access call).
         for api, user_api in local_custom_apis:
             if search:
                 search_lower = search.lower()
@@ -2592,23 +2616,14 @@ def list_mcp_apps(
             if category and category != "All":
                 continue
 
-            # Same per-row degradation as the MCP loop above: a resolution
-            # failure only blanks this one row's can_configure, never the
-            # rest of the response list.
-            local_team_access = None
-            if user_api is None:
-                try:
-                    local_team_access = resolve_connector_access_or_raise(
-                        db, cast(int, current_user.id), "custom_api", cast(int, api.id)
-                    )
-                except ConnectorRuntimeError:
-                    logger.warning(
-                        "Connector access resolution failed for Custom API "
-                        "%s while listing apps for user %s; reporting "
-                        "can_configure=False for this row",
-                        api.id,
-                        current_user.id,
-                    )
+            # Same batch lookup as the MCP loop above: only a stand-in row
+            # (user_api is None) needs a verdict, and a ref missing from the
+            # batch answer degrades this row's can_configure to False.
+            local_team_access = (
+                verdicts.get(("custom_api", cast(int, api.id)))
+                if user_api is None
+                else None
+            )
 
             results.append(
                 {
@@ -2694,22 +2709,74 @@ def get_mcp_servers(
             visible_team_connector_ids,
         )
 
+        # Every query this route needs is run up front, before the single
+        # batched access call below, so every row needing a verdict is known
+        # in one place. Order here does not affect the response: the four
+        # append loops further down (personal MCP, personal Custom API,
+        # stand-in MCP, stand-in Custom API) preserve the exact row order
+        # this route has always produced.
+        user_custom_apis = (
+            db.query(UserCustomApi, CustomApi)
+            .join(CustomApi, UserCustomApi.custom_api_id == CustomApi.id)
+            .filter(UserCustomApi.user_id == effective_user_id)
+            .all()
+        )
+
+        # Team-owned connectors the user has no personal row for, so a team
+        # member sees the team's shared connectors in their own list.
+        team_ids = visible_team_connector_ids(db, effective_user_id)
+
+        own_mcp_ids = {int(server.id) for _um, server in user_mcps}
+        missing_mcp = [sid for sid in team_ids["mcp"] if sid not in own_mcp_ids]
+        stand_in_mcp_servers = (
+            db.query(MCPServer).filter(MCPServer.id.in_(missing_mcp)).all()
+            if missing_mcp
+            else []
+        )
+
+        own_api_ids = {int(api.id) for _ua, api in user_custom_apis}
+        missing_api = [aid for aid in team_ids["custom_api"] if aid not in own_api_ids]
+        stand_in_apis = (
+            db.query(CustomApi).filter(CustomApi.id.in_(missing_api)).all()
+            if missing_api
+            else []
+        )
+
+        # One batched call for every row this listing needs a verdict for.
+        # An owner's reported right cannot change with a verdict (the edit
+        # branch returns True on is_owner alone), so only a non-owner
+        # personal row is worth asking about; a stand-in row holds no
+        # personal row at all and is unconditionally worth asking about.
+        access_refs: "set[ConnectorRef]" = (
+            {
+                ("mcp", int(server.id))
+                for user_mcp, server in user_mcps
+                if not bool(getattr(user_mcp, "is_owner", False))
+            }
+            | {
+                ("custom_api", int(api.id))
+                for user_api, api in user_custom_apis
+                if not bool(getattr(user_api, "is_owner", False))
+            }
+            | {("mcp", int(server.id)) for server in stand_in_mcp_servers}
+            | {("custom_api", int(api.id)) for api in stand_in_apis}
+        )
+        verdicts: "dict[ConnectorRef, ConnectorAccess]" = (
+            resolve_connector_access_or_raise(db, effective_user_id, access_refs)
+            if access_refs
+            else {}
+        )
+
         is_admin = getattr(current_user, "is_admin", False)
         responses = []
         for user_mcp, server in user_mcps:
             app_id, provider, connected_account = _enrich_oauth_server_info(
                 db, server, oauth_emails
             )
-            # An owner's reported right cannot change with a verdict (the
-            # edit branch returns True on is_owner alone), so only a
-            # non-owner personal row is worth a hook call: zero calls for
-            # is_owner=True rows, one call for is_owner=False rows.
             team_access = (
                 None
                 if bool(getattr(user_mcp, "is_owner", False))
-                else resolve_connector_access_or_raise(
-                    db, effective_user_id, "mcp", int(server.id)
-                )
+                else verdicts.get(("mcp", int(server.id)))
             )
             responses.append(
                 _db_server_to_response(
@@ -2724,71 +2791,43 @@ def get_mcp_servers(
                 )
             )
 
-        # Append Custom APIs
-        user_custom_apis = (
-            db.query(UserCustomApi, CustomApi)
-            .join(CustomApi, UserCustomApi.custom_api_id == CustomApi.id)
-            .filter(UserCustomApi.user_id == effective_user_id)
-            .all()
-        )
-
         for user_api, api in user_custom_apis:
             team_access = (
                 None
                 if bool(getattr(user_api, "is_owner", False))
-                else resolve_connector_access_or_raise(
-                    db, effective_user_id, "custom_api", int(api.id)
-                )
+                else verdicts.get(("custom_api", int(api.id)))
             )
             responses.append(
                 _custom_api_to_mcp_response(api, user_api, team_access=team_access)
             )
 
-        # Append team-owned connectors the user has no personal row for, so a
-        # team member sees the team's shared connectors in their own list.
-        team_ids = visible_team_connector_ids(db, effective_user_id)
+        for server in stand_in_mcp_servers:
+            app_id, provider, connected_account = _enrich_oauth_server_info(
+                db, server, oauth_emails
+            )
+            team_access = verdicts.get(("mcp", int(server.id)))
+            responses.append(
+                _db_server_to_response(
+                    server,
+                    _TeamOwnedUserMCP(effective_user_id),
+                    manager,
+                    connected_account,
+                    app_id,
+                    provider,
+                    is_admin=is_admin,
+                    team_access=team_access,
+                )
+            )
 
-        own_mcp_ids = {int(server.id) for _um, server in user_mcps}
-        missing_mcp = [sid for sid in team_ids["mcp"] if sid not in own_mcp_ids]
-        if missing_mcp:
-            for server in (
-                db.query(MCPServer).filter(MCPServer.id.in_(missing_mcp)).all()
-            ):
-                app_id, provider, connected_account = _enrich_oauth_server_info(
-                    db, server, oauth_emails
+        for api in stand_in_apis:
+            team_access = verdicts.get(("custom_api", int(api.id)))
+            responses.append(
+                _custom_api_to_mcp_response(
+                    api,
+                    _TeamOwnedUserApi(effective_user_id),
+                    team_access=team_access,
                 )
-                # No personal row at all -- every stand-in row is worth a
-                # hook call, unconditionally.
-                team_access = resolve_connector_access_or_raise(
-                    db, effective_user_id, "mcp", int(server.id)
-                )
-                responses.append(
-                    _db_server_to_response(
-                        server,
-                        _TeamOwnedUserMCP(effective_user_id),
-                        manager,
-                        connected_account,
-                        app_id,
-                        provider,
-                        is_admin=is_admin,
-                        team_access=team_access,
-                    )
-                )
-
-        own_api_ids = {int(api.id) for _ua, api in user_custom_apis}
-        missing_api = [aid for aid in team_ids["custom_api"] if aid not in own_api_ids]
-        if missing_api:
-            for api in db.query(CustomApi).filter(CustomApi.id.in_(missing_api)).all():
-                team_access = resolve_connector_access_or_raise(
-                    db, effective_user_id, "custom_api", int(api.id)
-                )
-                responses.append(
-                    _custom_api_to_mcp_response(
-                        api,
-                        _TeamOwnedUserApi(effective_user_id),
-                        team_access=team_access,
-                    )
-                )
+            )
 
         return responses
 
@@ -3244,17 +3283,25 @@ def connect_mcp_app(
     # the verdict existed at all.
     from ..services.connector_team_scope import resolve_connector_access_or_raise
 
+    # Captured before the resolution call below: a failed hook can leave the
+    # shared session in a state where a lazy ORM attribute read triggers a
+    # query of its own, so the log line below reads plain ints gathered
+    # ahead of time rather than server.id/current_user.id off the row.
+    server_id_for_log = int(server.id)
+    user_id_for_log = int(current_user.id)
+
     team_access: "ConnectorAccess | None" = None
+    ref: "ConnectorRef" = ("mcp", server_id_for_log)
     try:
-        team_access = resolve_connector_access_or_raise(
-            db, int(current_user.id), "mcp", int(server.id)
+        team_access = resolve_connector_access_or_raise(db, user_id_for_log, [ref]).get(
+            ref
         )
     except ConnectorRuntimeError:
         logger.warning(
             "Connector access resolution failed for MCP server %s after "
             "connecting it for user %s; reporting can_edit_global=False",
-            server.id,
-            current_user.id,
+            server_id_for_log,
+            user_id_for_log,
         )
     return _db_server_to_response(
         server,
@@ -3946,17 +3993,26 @@ async def toggle_mcp_server(
         # reported before the verdict existed at all.
         from ..services.connector_team_scope import resolve_connector_access_or_raise
 
+        # Captured before the resolution call below: a failed hook can leave
+        # the shared session in a state where a lazy ORM attribute read
+        # triggers a query of its own, so the log line below reads plain
+        # ints gathered ahead of time rather than server.id/user_id off the
+        # row.
+        server_id_for_log = int(server.id)
+        user_id_for_log = int(user_id)
+
         team_access: "ConnectorAccess | None" = None
+        ref: "ConnectorRef" = ("mcp", server_id_for_log)
         try:
             team_access = resolve_connector_access_or_raise(
-                db, int(user_id), "mcp", int(server.id)
-            )
+                db, user_id_for_log, [ref]
+            ).get(ref)
         except ConnectorRuntimeError:
             logger.warning(
                 "Connector access resolution failed for MCP server %s after "
                 "toggling it for user %s; reporting can_edit_global=False",
-                server.id,
-                user_id,
+                server_id_for_log,
+                user_id_for_log,
             )
         return _db_server_to_response(
             server,

@@ -90,7 +90,7 @@ class TestGateHelperOnGetAndPut:
         api = _make_owned_api(db, owner.id)
 
         with snapshot_connector_team_hooks():
-            set_connector_team_hooks(access=lambda *_a, **_k: None)
+            set_connector_team_hooks(access=lambda db, user_id, refs: {})
             with pytest.raises(HTTPException) as exc:
                 await _get(api.id, stranger, db)
         assert exc.value.status_code == 404
@@ -105,7 +105,9 @@ class TestGateHelperOnGetAndPut:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(team_owned=True, can_edit=True)
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
             )
             response = await _get(api.id, member, db)
 
@@ -135,7 +137,9 @@ class TestPutWiringForATeamEditor:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(team_owned=True, can_edit=True)
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
             )
             response = await _put(
                 api_id,
@@ -168,9 +172,10 @@ class TestPutWiringForATeamEditor:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(
-                    team_owned=True, can_edit=False
-                )
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=False)
+                    for ref in refs
+                }
             )
             with pytest.raises(HTTPException) as exc:
                 await _put(
@@ -194,7 +199,9 @@ class TestIsActiveRejectionForAStandIn:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(team_owned=True, can_edit=True)
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
             )
             with pytest.raises(HTTPException) as exc:
                 await _put(

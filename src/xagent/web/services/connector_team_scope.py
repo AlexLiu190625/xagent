@@ -48,19 +48,28 @@ ConnectorDeletedHook = Callable[[Any, int, ConnectorType, int], ConnectorDeleteD
 class ConnectorAccess:
     """Whether the caller's team links a connector, and may edit it.
 
-    ``team_owned`` and ``can_edit`` are independent facts: a team can link
-    a connector without granting edit rights to it, which is a legal
-    answer on its own, not an intermediate or partial state. The only
-    shape this seam rejects between the two is ``can_edit`` set without
-    ``team_owned`` -- edit rights presuppose a link, so that combination
-    can never be a legitimate answer (see ``_validate_connector_access_answer``).
+    A verdict that reaches a caller always carries ``team_owned=True``:
+    the only way to say "the caller's team does not link this connector"
+    is to leave its ref out of the hook's answer map entirely, not to
+    return a verdict with ``team_owned=False``. ``can_edit`` is otherwise
+    independent -- a team can link a connector without granting edit
+    rights to it, which is a legal answer on its own, not an intermediate
+    or partial state. Both fields are validated as exact bools on the way
+    in (see ``_validate_connector_access_answer``); the dataclass defaults
+    below stay ``False``/``False`` on purpose so that constructing a bare
+    ``ConnectorAccess()`` remains the shape the validator rejects, rather
+    than quietly becoming a legitimate "not linked" answer.
     """
 
     team_owned: bool = False
     can_edit: bool = False
 
 
-ConnectorAccessHook = Callable[[Any, int, ConnectorType, int], "ConnectorAccess | None"]
+ConnectorRef = tuple[ConnectorType, int]
+
+ConnectorAccessHook = Callable[
+    [Any, int, "Collection[ConnectorRef]"], "dict[ConnectorRef, ConnectorAccess]"
+]
 
 ConnectorVisibilityHook = Callable[[Any, int], dict[str, set[int]]]
 
@@ -236,53 +245,95 @@ def team_connector_hook_installed() -> bool:
     return _team_connector_visibility_hook is not None
 
 
-def _validate_connector_access_answer(answer: Any) -> "ConnectorAccess | None":
-    """Validate the access hook's answer shape.
+def _validate_connector_access_answer(
+    answer: Any, requested: "frozenset[ConnectorRef]"
+) -> "dict[ConnectorRef, ConnectorAccess]":
+    """Validate the access hook's batch answer shape.
 
     An authorization input, not user-facing data: a malformed answer must
     fail loudly, never be normalized, coerced, or defaulted to empty. The
-    only two accepted shapes are ``None`` -- meaning the caller's team does
-    not link the connector at all, nothing else -- and a ``ConnectorAccess``
-    instance. A linked connector always answers a ``ConnectorAccess``, with
-    ``can_edit`` reflecting whatever predicate the application applied;
-    ``ConnectorAccess(team_owned=True, can_edit=False)`` is therefore a
-    legal answer on its own, not rejected. The one shape a ``ConnectorAccess``
-    instance can still fail on is ``can_edit`` set without ``team_owned``,
-    which is rejected because edit rights presuppose a link.
+    hook answers a ``dict`` keyed on the connectors it was asked about; a
+    connector the caller's team does not link is expressed by leaving its
+    ref out of the answer entirely, never by a verdict with
+    ``team_owned=False`` -- unlike the team-visibility hook's
+    ``_validate_team_connector_answer`` above, where extra keys beyond the
+    two required ones are silently accepted because nothing ever reads
+    them, here the keys of the answer *are* the question: a verdict for a
+    ref that was never asked about means the hook answered a different
+    question than the one it was asked, and silently dropping it would
+    hide that the hook and the caller have gone out of sync.
+
+    Each value must be a ``ConnectorAccess`` with ``team_owned`` exactly
+    ``True`` (an identity check, not a truthiness check, matching
+    ``knowledge_base_team_scope.py``'s ``element.team_owned is not True``)
+    and ``can_edit`` exactly ``True`` or ``False`` -- ``bool`` is a
+    subclass of ``int`` in Python, so a merely truthy value is never
+    accepted as a legitimate grant.
     """
-    if answer is None:
-        return None
-    if not isinstance(answer, ConnectorAccess):
+    if not isinstance(answer, dict):
         raise ValueError(
-            "connector access hook returned a malformed answer: expected "
-            f"ConnectorAccess or None, got {type(answer).__name__}"
+            "connector access hook returned a malformed answer: expected a "
+            f"dict, got {type(answer).__name__}"
         )
-    if answer.can_edit and not answer.team_owned:
-        raise ValueError(
-            "connector access hook returned a malformed answer: can_edit "
-            "is True but team_owned is not True"
-        )
-    return answer
+    validated: "dict[ConnectorRef, ConnectorAccess]" = {}
+    for key, verdict in answer.items():
+        if key not in requested:
+            raise ValueError(
+                "connector access hook returned a malformed answer: a "
+                f"verdict for {key!r}, which was not among the connectors "
+                "asked about"
+            )
+        if not isinstance(verdict, ConnectorAccess):
+            raise ValueError(
+                "connector access hook returned a malformed answer: "
+                f"expected ConnectorAccess values, got "
+                f"{type(verdict).__name__} for {key!r}"
+            )
+        if verdict.team_owned is not True:
+            raise ValueError(
+                "connector access hook returned a malformed answer for "
+                f"{key!r}: team_owned must be True -- a connector the "
+                "caller's team does not link is expressed by leaving it "
+                f"out of the answer, not by a verdict, got {verdict.team_owned!r}"
+            )
+        if verdict.can_edit is not True and verdict.can_edit is not False:
+            raise ValueError(
+                "connector access hook returned a malformed answer for "
+                f"{key!r}: can_edit must be exactly True or False (bool is "
+                "a subclass of int in Python, and a truthy value is never "
+                f"a legitimate grant), got {verdict.can_edit!r}"
+            )
+        validated[key] = verdict
+    return validated
 
 
 def resolve_connector_access(
-    db: Any, user_id: int, connector_type: ConnectorType, connector_id: int
-) -> "ConnectorAccess | None":
-    """Whether the caller's team links ``connector_id``, and may edit it.
+    db: Any, user_id: int, refs: "Collection[ConnectorRef]"
+) -> "dict[ConnectorRef, ConnectorAccess]":
+    """Whether the caller's team links each of ``refs``, and may edit it.
 
-    Returns ``None`` when no access hook is installed, and also when an
-    installed hook itself answers ``None`` -- both mean "the caller's team
-    does not link this connector," which is the only thing ``None`` ever
-    means here (a linked connector always answers a ``ConnectorAccess``).
-    The hook, when installed, is called positionally with
-    ``connector_type`` as a plain ``str`` matching the ``ConnectorType``
-    literal. The answer is shape-validated (see
-    ``_validate_connector_access_answer``) before it reaches any caller.
+    Asks the installed access hook, if any, at most once per call
+    regardless of how many refs are passed -- batching is the point of
+    this signature, not an incidental property, because the seam's whole
+    reason to exist is to answer "what is this caller's team's
+    relationship to these connectors" without paying one hook call per
+    connector. Returns ``{}`` immediately, without calling the hook at
+    all, when no hook is installed or when ``refs`` is empty: an empty
+    request is never worth a call, and a standalone deployment with no
+    hook installed sees zero queries and zero behavior change.
+
+    A ref missing from the returned map means "the caller's team does not
+    link this connector" -- the only way that fact is ever expressed (see
+    ``_validate_connector_access_answer``). The answer is shape-validated
+    before it reaches any caller.
     """
-    if _connector_access_hook is None:
-        return None
-    answer = _connector_access_hook(db, int(user_id), connector_type, int(connector_id))
-    return _validate_connector_access_answer(answer)
+    requested = frozenset(
+        (connector_type, int(connector_id)) for connector_type, connector_id in refs
+    )
+    if _connector_access_hook is None or not requested:
+        return {}
+    answer = _connector_access_hook(db, int(user_id), requested)
+    return _validate_connector_access_answer(answer, requested)
 
 
 def resolve_team_connector_ids_or_raise(
@@ -330,11 +381,10 @@ def resolve_team_connector_ids_or_raise(
 
 
 def resolve_connector_access_or_raise(
-    db: Any, user_id: int, connector_type: ConnectorType, connector_id: int
-) -> "ConnectorAccess | None":
-    """``resolve_connector_access(db, user_id, connector_type,
-    connector_id)``, with every non-typed failure converted into the
-    seam's one typed 503.
+    db: Any, user_id: int, refs: "Collection[ConnectorRef]"
+) -> "dict[ConnectorRef, ConnectorAccess]":
+    """``resolve_connector_access(db, user_id, refs)``, with every
+    non-typed failure converted into the seam's one typed 503.
 
     A ``ConnectorRuntimeError`` -- whether raised by the hook itself or by
     ``resolve_connector_access``'s own answer validation -- passes through
@@ -345,18 +395,25 @@ def resolve_connector_access_or_raise(
     "connector_access_resolution_failed"}, status_code=503)``. Unlike
     ``resolve_team_connector_ids_or_raise``, there is no separate
     ``log_subject`` parameter: ``user_id`` here already identifies the
-    caller directly, so it doubles as the value logged.
+    caller directly, so it doubles as the value logged. The logged refs
+    are the plain ``(connector_type, id)`` tuples the caller passed in,
+    sorted for a stable log line -- never an ORM attribute read off a row,
+    which could itself fail if the session is left unusable by whatever
+    just failed.
     """
+    requested = frozenset(
+        (connector_type, int(connector_id)) for connector_type, connector_id in refs
+    )
     try:
-        return resolve_connector_access(db, user_id, connector_type, connector_id)
+        return resolve_connector_access(db, user_id, requested)
     except ConnectorRuntimeError:
         raise
     except Exception as exc:
         logger.warning(
-            "Failed to resolve connector access for user %s, connector %s:%s",
+            "Failed to resolve connector access for user %s across %s connectors: %s",
             user_id,
-            connector_type,
-            connector_id,
+            len(requested),
+            sorted(requested),
             exc_info=True,
         )
         raise ConnectorRuntimeError(

@@ -12,6 +12,7 @@ into suites that run after this one.
 from __future__ import annotations
 
 import pytest
+import sqlalchemy as sa
 from fastapi import HTTPException
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
@@ -98,29 +99,52 @@ def _make_owned_api(db, owner_id: int, *, name: str = "shared-api") -> CustomApi
     return api
 
 
+def _fixed_answer_hook(access_answer):
+    """Build a batch access hook that answers every requested ref with the
+    same fixed verdict -- or, when ``access_answer`` is ``None``, answers
+    with an empty map, which is how "the caller's team does not link this"
+    is expressed under the batch contract."""
+
+    def _hook(db, user_id, refs):
+        if access_answer is None:
+            return {}
+        return {ref: access_answer for ref in refs}
+
+    return _hook
+
+
 class TestListEndpointAccessHookCallBudget:
-    """The list endpoint calls the access hook zero times for an
-    is_owner=True row, once for an is_owner=False row, and once for every
-    stand-in row -- pinned with a counting test double. Counting hook calls
-    alone would hide the query cost the gate helper and the per-row
-    definition lookups add, so a SQLAlchemy ``before_cursor_execute``
-    listener additionally pins the number of SQL statements the endpoint
-    issues for this exact population."""
+    """The list endpoint asks the access hook at most once per request, no
+    matter how many rows need a verdict -- pinned across two different
+    population sizes with a counting test double. Counting hook calls alone
+    would hide any SQL the endpoint's own queries issue on top of it, or
+    that the hook's own body issues, so a SQLAlchemy
+    ``before_cursor_execute`` listener additionally pins the *total* number
+    of SQL statements for two different row counts: if either grew with row
+    count, that would mean the endpoint reverted to a per-row hook call
+    after all."""
 
-    def test_hook_is_called_exactly_once_per_non_owner_row_and_never_for_owner_rows(
-        self, db
+    @pytest.mark.parametrize("num_rows", [2, 6], ids=["R=2", "R=6"])
+    def test_the_list_asks_the_access_hook_exactly_once_no_matter_how_many_rows(
+        self, db, num_rows
     ):
-        caller = _make_user(db, 1)
-        other_owner = _make_user(db, 2)
+        caller = _make_user(db, 100 + num_rows)
+        other_owner = _make_user(db, 200 + num_rows)
 
-        # P = 2 personal rows the caller owns outright.
-        owned = [_make_owned_server(db, caller.id, name=f"owned-{i}") for i in range(2)]
+        # P = 2 personal rows the caller owns outright -- never worth a
+        # hook call.
+        owned = [
+            _make_owned_server(db, caller.id, name=f"owned-{num_rows}-{i}")
+            for i in range(2)
+        ]
 
-        # Q = 3 personal rows the caller holds but does not own (a second
-        # link on a connector someone else owns).
+        # Q = num_rows personal rows the caller holds but does not own (a
+        # second link on a connector someone else owns).
         shared_personal = []
-        for i in range(3):
-            server = _make_owned_server(db, other_owner.id, name=f"shared-personal-{i}")
+        for i in range(num_rows):
+            server = _make_owned_server(
+                db, other_owner.id, name=f"shared-personal-{num_rows}-{i}"
+            )
             db.add(
                 UserMCPServer(
                     user_id=caller.id,
@@ -132,19 +156,19 @@ class TestListEndpointAccessHookCallBudget:
             db.commit()
             shared_personal.append(server)
 
-        # R = 2 rows the caller has no personal row for at all, made visible
-        # through the separate visibility hook (not the access hook under
-        # test here).
+        # R = num_rows rows the caller has no personal row for at all, made
+        # visible through the separate visibility hook (not the access hook
+        # under test here).
         stand_in = [
-            _make_owned_server(db, other_owner.id, name=f"stand-in-{i}")
-            for i in range(2)
+            _make_owned_server(db, other_owner.id, name=f"stand-in-{num_rows}-{i}")
+            for i in range(num_rows)
         ]
 
         # Read every id the hooks below will need before the query listener
         # attaches: the objects above were expired by their own setup
-        # commits (session default expire_on_commit=True), so reading
-        # .id for the first time inside the measured window would count as
-        # a query the *endpoint* issues, when it is really just this test's
+        # commits (session default expire_on_commit=True), so reading .id
+        # for the first time inside the measured window would count as a
+        # query the *endpoint* issues, when it is really just this test's
         # own setup catching up. caller.id specifically: get_mcp_servers
         # reads current_user.id as its very first act.
         _ = caller.id
@@ -152,11 +176,21 @@ class TestListEndpointAccessHookCallBudget:
         shared_personal_ids = {s.id for s in shared_personal}
         stand_in_ids = {s.id for s in stand_in}
 
-        calls: list[tuple[int, str, int]] = []
+        calls: list[object] = []
 
-        def counting_access_hook(_db, user_id, connector_type, connector_id):
-            calls.append((user_id, connector_type, connector_id))
-            return None
+        def counting_access_hook(hook_db, user_id, refs):
+            calls.append(refs)
+            # A realistic hook resolves its own team-membership rows to
+            # answer the batch -- simulated here as three throwaway
+            # statements run once per call, regardless of how many refs
+            # were asked about. If the endpoint ever regressed to one hook
+            # call per row, the total statement count below would grow
+            # with num_rows; it must not.
+            for _ in range(3):
+                hook_db.execute(sa.select(sa.literal(1)))
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+            }
 
         def visibility_hook(_db, _user_id):
             return {"mcp": set(stand_in_ids), "custom_api": set()}
@@ -178,23 +212,22 @@ class TestListEndpointAccessHookCallBudget:
         finally:
             event.remove(engine, "before_cursor_execute", record_query)
 
-        assert len(calls) == 3 + 2
-        # Sanity: never called for an owned row's id.
-        called_ids = {connector_id for _uid, _kind, connector_id in calls}
-        assert called_ids.isdisjoint(owned_ids)
-        assert called_ids == shared_personal_ids | stand_in_ids
+        assert len(calls) == 1
+        requested_refs = calls[0]
+        assert set(requested_refs) == {
+            ("mcp", sid) for sid in shared_personal_ids | stand_in_ids
+        }
+        assert {rid for (_kind, rid) in requested_refs}.isdisjoint(owned_ids)
 
-        # The hook-call count above cannot see the SQL the gate helper and
-        # the per-row definition lookups issue on top of it. Observed by
-        # running this exact population and reading the recorded
-        # statements, not derived from a formula: one query for the
-        # caller's own MCP rows (P + Q personal rows in one join), one for
-        # the OAuth-account lookup, one for the caller's own Custom API
-        # rows (none here), and one for the stand-in rows' MCPServer lookup
-        # (one statement, batched with an IN clause over both stand-in
-        # ids) -- 4 statements total for this population, none of them
-        # growing per row within P, Q or R.
-        assert len(queries) == 4, queries
+        # The hook-call count above cannot see the SQL the endpoint's own
+        # queries issue on top of it, or the hook's own three statements.
+        # Observed by running this exact population and reading the
+        # recorded statements, not derived from a formula -- but pinned as
+        # a constant on purpose: it must come out identical for num_rows=2
+        # and num_rows=6, since every row within P, Q or R is served by one
+        # batched IN-clause query (or the single hook call), never a query
+        # or a hook call per row.
+        assert len(queries) == 7, queries
 
 
 class TestReportedEditPermissionConsistencyMcp:
@@ -259,7 +292,7 @@ class TestReportedEditPermissionConsistencyMcp:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: access_answer,
+                access=_fixed_answer_hook(access_answer),
                 visibility=lambda _db, _uid: {"mcp": {server_id}, "custom_api": set()},
             )
 
@@ -344,7 +377,7 @@ class TestReportedEditPermissionConsistencyCustomApi:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: access_answer,
+                access=_fixed_answer_hook(access_answer),
                 visibility=lambda _db, _uid: {"mcp": set(), "custom_api": {api_id}},
             )
 
@@ -394,8 +427,8 @@ class TestLocalCanConfigureWidening:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(
-                    team_owned=True, can_edit=False
+                access=_fixed_answer_hook(
+                    ConnectorAccess(team_owned=True, can_edit=False)
                 ),
                 visibility=lambda _db, _uid: {"mcp": {server_id}, "custom_api": set()},
             )
@@ -418,8 +451,8 @@ class TestLocalCanConfigureWidening:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(
-                    team_owned=True, can_edit=False
+                access=_fixed_answer_hook(
+                    ConnectorAccess(team_owned=True, can_edit=False)
                 ),
                 visibility=lambda _db, _uid: {"mcp": set(), "custom_api": {api_id}},
             )
@@ -449,7 +482,9 @@ class TestOAuthRoutesKeepTheirOwnGate:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(team_owned=True, can_edit=True)
+                access=_fixed_answer_hook(
+                    ConnectorAccess(team_owned=True, can_edit=True)
+                )
             )
 
             with pytest.raises(HTTPException) as exc:
@@ -492,8 +527,8 @@ class TestDenyingVerdictIsFalseEverywhere:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(
-                    team_owned=True, can_edit=False
+                access=_fixed_answer_hook(
+                    ConnectorAccess(team_owned=True, can_edit=False)
                 ),
                 visibility=lambda _db, _uid: {"mcp": {server_id}, "custom_api": set()},
             )
@@ -535,8 +570,8 @@ class TestRenameStaysScopedToItsOwnConnector:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(
-                    team_owned=True, can_edit=True
+                access=_fixed_answer_hook(
+                    ConnectorAccess(team_owned=True, can_edit=True)
                 ),
                 renamed=spy_renamed_hook,
             )
@@ -597,8 +632,8 @@ class TestRenameStaysScopedToItsOwnConnector:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(
-                    team_owned=True, can_edit=True
+                access=_fixed_answer_hook(
+                    ConnectorAccess(team_owned=True, can_edit=True)
                 ),
             )
             update_mcp_server(
@@ -696,69 +731,90 @@ class TestStandaloneParityWithNoHookInstalled:
 
 
 class TestListMcpAppsPerRowDegradation:
-    """A raising hook inside ``list_mcp_apps``'s local-connector loop must
-    not blank the whole response list -- only the affected row's
-    ``can_configure`` degrades to False, and every other row keeps
-    reporting its correct value."""
+    """``/api/mcp/apps``'s local-connector loop now resolves every stand-in
+    row's verdict, across both connector kinds, with one batched call --
+    consolidated from the one-hook-call-per-row shape this route used to
+    have. A ref missing from an otherwise-successful answer still degrades
+    only that one row's ``can_configure`` to False, the same per-row
+    degradation this route has always offered -- now expressed by the
+    batch answer omitting a ref rather than a per-row hook call raising. A
+    hook that fails for the whole batch call degrades every row that
+    needed a verdict, but the response itself stays 200 with every row
+    present -- the failure never blanks the list."""
 
-    def test_a_raising_hook_for_one_mcp_connector_degrades_only_that_row(self, db):
+    def test_an_answer_that_omits_one_connector_degrades_only_that_row(self, db):
         owner = _make_user(db, 80)
         member = _make_user(db, 81)
-        broken = _make_owned_server(db, owner.id, name="broken-connector")
-        healthy = _make_owned_server(db, owner.id, name="healthy-connector")
-        broken_id, healthy_id = broken.id, healthy.id
+        healthy_mcp = _make_owned_server(db, owner.id, name="healthy-connector")
+        omitted_mcp = _make_owned_server(db, owner.id, name="omitted-connector")
+        healthy_api = _make_owned_api(db, owner.id, name="healthy-api")
+        omitted_api = _make_owned_api(db, owner.id, name="omitted-api")
+        healthy_mcp_id, omitted_mcp_id = healthy_mcp.id, omitted_mcp.id
+        healthy_api_id, omitted_api_id = healthy_api.id, omitted_api.id
 
-        def selective_access(_db, _user_id, _connector_type, connector_id):
-            if connector_id == broken_id:
-                raise ValueError("hook exploded")
-            return ConnectorAccess(team_owned=True, can_edit=True)
+        def partial_access(_db, _user_id, refs):
+            # A legitimate "not linked" answer for the two omitted refs,
+            # not a failure -- distinct from the whole-batch failure the
+            # next test exercises.
+            omitted = {("mcp", omitted_mcp_id), ("custom_api", omitted_api_id)}
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=True)
+                for ref in refs
+                if ref not in omitted
+            }
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=selective_access,
+                access=partial_access,
                 visibility=lambda _db, _uid: {
-                    "mcp": {broken_id, healthy_id},
-                    "custom_api": set(),
+                    "mcp": {healthy_mcp_id, omitted_mcp_id},
+                    "custom_api": {healthy_api_id, omitted_api_id},
                 },
             )
             entries = list_mcp_apps(location="local", current_user=member, db=db)
 
-        broken_entry = next(e for e in entries if e["server_id"] == broken_id)
-        healthy_entry = next(e for e in entries if e["server_id"] == healthy_id)
-        assert broken_entry["can_configure"] is False
-        assert healthy_entry["can_configure"] is True
+        healthy_mcp_entry = next(e for e in entries if e["server_id"] == healthy_mcp_id)
+        omitted_mcp_entry = next(e for e in entries if e["server_id"] == omitted_mcp_id)
+        healthy_api_entry = next(
+            e
+            for e in entries
+            if e["server_id"] == healthy_api_id and e["transport"] == "custom_api"
+        )
+        omitted_api_entry = next(
+            e
+            for e in entries
+            if e["server_id"] == omitted_api_id and e["transport"] == "custom_api"
+        )
+        assert healthy_mcp_entry["can_configure"] is True
+        assert omitted_mcp_entry["can_configure"] is False
+        assert healthy_api_entry["can_configure"] is True
+        assert omitted_api_entry["can_configure"] is False
 
-    def test_a_raising_hook_for_one_custom_api_degrades_only_that_row(self, db):
+    def test_a_failing_hook_does_not_blank_the_whole_apps_list(self, db):
         owner = _make_user(db, 82)
         member = _make_user(db, 83)
-        broken = _make_owned_api(db, owner.id, name="broken-api")
-        healthy = _make_owned_api(db, owner.id, name="healthy-api")
-        broken_id, healthy_id = broken.id, healthy.id
+        mcp_row = _make_owned_server(db, owner.id, name="stand-in-mcp")
+        api_row = _make_owned_api(db, owner.id, name="stand-in-api")
+        mcp_id, api_id = mcp_row.id, api_row.id
 
-        def selective_access(_db, _user_id, _connector_type, connector_id):
-            if connector_id == broken_id:
-                raise ValueError("hook exploded")
-            return ConnectorAccess(team_owned=True, can_edit=True)
+        def raising_access(_db, _user_id, _refs):
+            raise ValueError("hook exploded")
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=selective_access,
+                access=raising_access,
                 visibility=lambda _db, _uid: {
-                    "mcp": set(),
-                    "custom_api": {broken_id, healthy_id},
+                    "mcp": {mcp_id},
+                    "custom_api": {api_id},
                 },
             )
             entries = list_mcp_apps(location="local", current_user=member, db=db)
 
-        broken_entry = next(
+        mcp_entry = next(e for e in entries if e["server_id"] == mcp_id)
+        api_entry = next(
             e
             for e in entries
-            if e["server_id"] == broken_id and e["transport"] == "custom_api"
+            if e["server_id"] == api_id and e["transport"] == "custom_api"
         )
-        healthy_entry = next(
-            e
-            for e in entries
-            if e["server_id"] == healthy_id and e["transport"] == "custom_api"
-        )
-        assert broken_entry["can_configure"] is False
-        assert healthy_entry["can_configure"] is True
+        assert mcp_entry["can_configure"] is False
+        assert api_entry["can_configure"] is False

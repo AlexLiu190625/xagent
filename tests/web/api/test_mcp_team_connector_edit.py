@@ -150,7 +150,7 @@ class TestGateHelperOnGetAndPut:
         server = _make_owned_server(db, owner.id)
 
         with snapshot_connector_team_hooks():
-            set_connector_team_hooks(access=lambda *_a, **_k: None)
+            set_connector_team_hooks(access=lambda db, user_id, refs: {})
             with pytest.raises(HTTPException) as exc:
                 get_mcp_server(server.id, current_user=stranger, db=db)
         assert exc.value.status_code == 404
@@ -162,7 +162,9 @@ class TestGateHelperOnGetAndPut:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(team_owned=True, can_edit=True)
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
             )
             response = get_mcp_server(server.id, current_user=member, db=db)
 
@@ -190,7 +192,9 @@ class TestPutWiringForATeamEditor:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(team_owned=True, can_edit=True)
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
             )
             response = update_mcp_server(
                 server_id,
@@ -222,9 +226,10 @@ class TestPutWiringForATeamEditor:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(
-                    team_owned=True, can_edit=False
-                )
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=False)
+                    for ref in refs
+                }
             )
             with pytest.raises(HTTPException) as exc:
                 update_mcp_server(
@@ -250,9 +255,9 @@ class TestPutWiringForATeamEditor:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(
-                    team_owned=True, can_edit=True
-                ),
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                },
                 renamed=fake_renamed_hook,
             )
             update_mcp_server(
@@ -276,7 +281,9 @@ class TestUserEnvAndIsActiveRejectionForAStandIn:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(team_owned=True, can_edit=True)
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
             )
             with pytest.raises(HTTPException) as exc:
                 update_mcp_server(
@@ -307,7 +314,9 @@ class TestUserEnvAndIsActiveRejectionForAStandIn:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
-                access=lambda *_a, **_k: ConnectorAccess(team_owned=True, can_edit=True)
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
             )
             with pytest.raises(HTTPException) as exc:
                 update_mcp_server(

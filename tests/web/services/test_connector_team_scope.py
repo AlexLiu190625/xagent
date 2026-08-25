@@ -125,41 +125,65 @@ def test_connector_access_defaults_are_both_false():
     assert access.can_edit is False
 
 
-def test_resolve_connector_access_returns_none_without_hook_installed():
-    for connector_type, connector_id in [("mcp", 1), ("custom_api", 1), ("mcp", 999)]:
-        assert (
-            connector_team_scope.resolve_connector_access(
-                None, 7, connector_type, connector_id
-            )
-            is None
-        )
+def test_resolve_connector_access_returns_an_empty_map_without_a_hook_installed():
+    for refs in ([("mcp", 1), ("custom_api", 1), ("mcp", 999)], [("mcp", 1)]):
+        assert connector_team_scope.resolve_connector_access(None, 7, refs) == {}
 
 
-def test_resolve_connector_access_calls_hook_with_str_connector_type():
-    calls = []
+def test_resolve_connector_access_asks_no_hook_when_no_ref_needs_one():
+    """An installed hook is never called when there is nothing to ask about
+    -- an empty ``refs`` collection short-circuits before the hook, the
+    same way no hook installed does."""
+    calls: list[object] = []
 
-    def _hook(db, user_id, connector_type, connector_id):
-        calls.append((db, user_id, connector_type, connector_id))
-        assert isinstance(connector_type, str)
-        return connector_team_scope.ConnectorAccess(team_owned=True, can_edit=True)
+    def _hook(db, user_id, refs):
+        calls.append(refs)
+        return {}
 
     connector_team_scope.set_connector_team_hooks(access=_hook)
     try:
-        result = connector_team_scope.resolve_connector_access(None, 7, "mcp", 11)
-        assert result == connector_team_scope.ConnectorAccess(
-            team_owned=True, can_edit=True
-        )
-        assert calls == [(None, 7, "mcp", 11)]
+        assert connector_team_scope.resolve_connector_access(None, 7, []) == {}
+        assert calls == []
     finally:
         connector_team_scope.set_connector_team_hooks()
 
 
-def test_resolve_connector_access_passes_through_none_answer():
-    """None means the caller's team does not link this connector -- nothing
-    else -- and is a legal answer distinct from a rejected malformed one."""
-    connector_team_scope.set_connector_team_hooks(access=lambda *a: None)
+def test_resolve_connector_access_calls_the_hook_once_with_the_requested_refs():
+    calls = []
+
+    def _hook(db, user_id, refs):
+        calls.append((db, user_id, refs))
+        return {
+            ("mcp", 11): connector_team_scope.ConnectorAccess(
+                team_owned=True, can_edit=True
+            )
+        }
+
+    connector_team_scope.set_connector_team_hooks(access=_hook)
     try:
-        assert connector_team_scope.resolve_connector_access(None, 7, "mcp", 11) is None
+        result = connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+        assert result == {
+            ("mcp", 11): connector_team_scope.ConnectorAccess(
+                team_owned=True, can_edit=True
+            )
+        }
+        assert len(calls) == 1
+        called_db, called_user_id, called_refs = calls[0]
+        assert (called_db, called_user_id) == (None, 7)
+        assert called_refs == frozenset({("mcp", 11)})
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+def test_resolve_connector_access_a_ref_missing_from_the_answer_means_not_linked():
+    """Leaving a ref out of the answer is the only way to say "the caller's
+    team does not link this connector" -- distinct from a rejected
+    malformed verdict for that same ref."""
+    connector_team_scope.set_connector_team_hooks(access=lambda *a: {})
+    try:
+        assert (
+            connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)]) == {}
+        )
     finally:
         connector_team_scope.set_connector_team_hooks()
 
@@ -172,20 +196,21 @@ def test_resolve_connector_access_passes_through_none_answer():
 @pytest.mark.parametrize(
     "malformed_answer",
     [
-        "dict",
+        "dict-of-fields",
         "connector-delete-decision",
         "tuple",
         "truthy-object-with-right-attrs",
-        "can-edit-without-team-owned",
+        "none",
+        "list",
     ],
 )
-def test_resolve_connector_access_rejects_malformed_answer(malformed_answer):
+def test_resolve_connector_access_rejects_a_non_dict_answer(malformed_answer):
     # Built inside the test body, not the parametrize list: a couple of
     # these shapes are instances of types this module defines, and
     # constructing them at collection time would make the whole file
     # uncollectable while those types don't exist yet.
     answer = {
-        "dict": {"team_owned": True, "can_edit": True},
+        "dict-of-fields": {"team_owned": True, "can_edit": True},
         "connector-delete-decision": connector_team_scope.ConnectorDeleteDecision(
             team_owned=True, authorized=True
         ),
@@ -193,15 +218,96 @@ def test_resolve_connector_access_rejects_malformed_answer(malformed_answer):
         "truthy-object-with-right-attrs": SimpleNamespace(
             team_owned=True, can_edit=True
         ),
-        "can-edit-without-team-owned": connector_team_scope.ConnectorAccess(
-            team_owned=False, can_edit=True
-        ),
+        "none": None,
+        "list": [connector_team_scope.ConnectorAccess(team_owned=True, can_edit=True)],
     }[malformed_answer]
 
     connector_team_scope.set_connector_team_hooks(access=lambda *a: answer)
     try:
         with pytest.raises(ValueError):
-            connector_team_scope.resolve_connector_access(None, 7, "mcp", 11)
+            connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+def test_resolve_connector_access_rejects_a_verdict_for_a_connector_nobody_asked_about():
+    """A verdict keyed on a ref outside the requested set means the hook
+    answered a different question than the one it was asked -- silently
+    dropping it would hide that the hook and the caller have gone out of
+    sync, so this must fail loudly instead."""
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {
+            ("mcp", 999): connector_team_scope.ConnectorAccess(
+                team_owned=True, can_edit=True
+            )
+        }
+    )
+    try:
+        with pytest.raises(ValueError):
+            connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+@pytest.mark.parametrize(
+    "bad_team_owned",
+    [False, "yes", 1],
+    ids=["false", "truthy-string", "truthy-int"],
+)
+def test_resolve_connector_access_rejects_a_team_owned_that_is_not_true(
+    bad_team_owned,
+):
+    """``team_owned`` must be exactly ``True`` on every verdict that
+    reaches a caller -- "not linked" is expressed by leaving the ref out
+    of the answer, never by a verdict carrying a falsy or merely-truthy
+    ``team_owned``."""
+    verdict = connector_team_scope.ConnectorAccess(
+        team_owned=bad_team_owned, can_edit=True
+    )
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {("mcp", 11): verdict}
+    )
+    try:
+        with pytest.raises(ValueError):
+            connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+def test_resolve_connector_access_rejects_a_bare_connector_access_default():
+    """``ConnectorAccess()`` -- the dataclass's own all-``False`` default --
+    is rejected the same way: constructing a bare instance must never
+    become a legitimate "not linked" answer."""
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {("mcp", 11): connector_team_scope.ConnectorAccess()}
+    )
+    try:
+        with pytest.raises(ValueError):
+            connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+@pytest.mark.parametrize(
+    "bad_can_edit",
+    ["false", 1, 0],
+    ids=["string", "truthy-int", "falsy-int"],
+)
+def test_resolve_connector_access_rejects_a_can_edit_that_is_not_exactly_bool(
+    bad_can_edit,
+):
+    """``bool`` is a subclass of ``int`` in Python, so ``1``/``0`` would
+    pass a truthiness check -- this seam requires an exact ``True``/
+    ``False`` instead, since a truthy value is never a legitimate grant."""
+    verdict = connector_team_scope.ConnectorAccess(
+        team_owned=True, can_edit=bad_can_edit
+    )
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {("mcp", 11): verdict}
+    )
+    try:
+        with pytest.raises(ValueError):
+            connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
     finally:
         connector_team_scope.set_connector_team_hooks()
 
@@ -210,11 +316,13 @@ def test_resolve_connector_access_accepts_linked_but_not_editable():
     """A linked-but-not-editable answer is legal on its own -- the seam does
     not require can_edit to be True just because team_owned is."""
     answer = connector_team_scope.ConnectorAccess(team_owned=True, can_edit=False)
-    connector_team_scope.set_connector_team_hooks(access=lambda *a: answer)
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {("mcp", 11): answer}
+    )
     try:
-        assert (
-            connector_team_scope.resolve_connector_access(None, 7, "mcp", 11) == answer
-        )
+        assert connector_team_scope.resolve_connector_access(
+            None, 7, [("mcp", 11)]
+        ) == {("mcp", 11): answer}
     finally:
         connector_team_scope.set_connector_team_hooks()
 
@@ -225,13 +333,15 @@ def test_resolve_connector_access_accepts_linked_but_not_editable():
 
 
 def test_resolve_connector_access_or_raise_converts_value_error_to_503():
-    def _hook(db, user_id, connector_type, connector_id):
+    def _hook(db, user_id, refs):
         raise ValueError("hook returned garbage")
 
     connector_team_scope.set_connector_team_hooks(access=_hook)
     try:
         with pytest.raises(ConnectorRuntimeError) as excinfo:
-            connector_team_scope.resolve_connector_access_or_raise(None, 7, "mcp", 11)
+            connector_team_scope.resolve_connector_access_or_raise(
+                None, 7, [("mcp", 11)]
+            )
         assert excinfo.value.status_code == 503
     finally:
         connector_team_scope.set_connector_team_hooks()
@@ -242,13 +352,15 @@ def test_resolve_connector_access_or_raise_passes_through_planted_error():
         "planted_code", "planted", details={"reason": "planted_reason"}
     )
 
-    def _hook(db, user_id, connector_type, connector_id):
+    def _hook(db, user_id, refs):
         raise planted
 
     connector_team_scope.set_connector_team_hooks(access=_hook)
     try:
         with pytest.raises(ConnectorRuntimeError) as excinfo:
-            connector_team_scope.resolve_connector_access_or_raise(None, 7, "mcp", 11)
+            connector_team_scope.resolve_connector_access_or_raise(
+                None, 7, [("mcp", 11)]
+            )
         assert excinfo.value is planted
     finally:
         connector_team_scope.set_connector_team_hooks()
@@ -258,13 +370,17 @@ def test_resolve_connector_access_or_raise_converts_malformed_answer_too():
     """The validator's ValueError for a malformed answer goes through the
     same conversion as any other hook-side failure."""
     connector_team_scope.set_connector_team_hooks(
-        access=lambda *a: connector_team_scope.ConnectorAccess(
-            team_owned=False, can_edit=True
-        )
+        access=lambda *a: {
+            ("mcp", 11): connector_team_scope.ConnectorAccess(
+                team_owned=False, can_edit=True
+            )
+        }
     )
     try:
         with pytest.raises(ConnectorRuntimeError) as excinfo:
-            connector_team_scope.resolve_connector_access_or_raise(None, 7, "mcp", 11)
+            connector_team_scope.resolve_connector_access_or_raise(
+                None, 7, [("mcp", 11)]
+            )
         assert excinfo.value.status_code == 503
     finally:
         connector_team_scope.set_connector_team_hooks()

@@ -24,7 +24,7 @@ from ..models.database import get_db
 from ..models.user import User
 
 if TYPE_CHECKING:
-    from ..services.connector_team_scope import ConnectorAccess
+    from ..services.connector_team_scope import ConnectorAccess, ConnectorRef
     from .mcp import _TeamOwnedUserApi
 
 logger = logging.getLogger(__name__)
@@ -330,9 +330,8 @@ def _resolve_custom_api_for_request(
 
     access: "ConnectorAccess | None" = None
     if api is not None and not already_decided:
-        access = resolve_connector_access_or_raise(
-            db, int(user_id), "custom_api", int(api.id)
-        )
+        ref: "ConnectorRef" = ("custom_api", int(api.id))
+        access = resolve_connector_access_or_raise(db, int(user_id), [ref]).get(ref)
 
     if user_api is None and access is None:
         raise HTTPException(
