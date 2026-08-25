@@ -874,12 +874,33 @@ class VisionCore:
             )
 
             # Process the result
-            if isinstance(result, str):
-                answer = result
-            elif isinstance(result, dict) and result.get("type") == "tool_call":
-                answer = f"Model triggered tool call instead of answering: {result.get('tool_calls', [])}"
+            normalized = _normalize_vision_response(result)
+
+            if normalized.kind == "unknown":
+                logger.warning(
+                    "Media understanding received an unsupported response shape"
+                )
+                return UnderstandMediaResult(
+                    success=False,
+                    error="Vision model returned an unsupported response shape",
+                    warnings=warnings,
+                )
+
+            if normalized.kind == "empty":
+                logger.warning("Media understanding received an empty response")
+                return UnderstandMediaResult(
+                    success=False,
+                    error="Vision model returned an empty response",
+                    warnings=warnings,
+                )
+
+            if normalized.kind == "tool_call":
+                answer = (
+                    "Model triggered tool call instead of answering: "
+                    f"{normalized.tool_calls}"
+                )
             else:
-                answer = str(result)
+                answer = normalized.text
 
             return UnderstandMediaResult(
                 success=True,

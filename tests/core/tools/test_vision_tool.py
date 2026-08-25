@@ -13,7 +13,10 @@ import pytest
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.retry.wrapper import create_retry_wrapper
 from xagent.core.tools.adapters.vibe.vision_tool import VisionTool, get_vision_tool
-from xagent.core.tools.core.vision_tool import _normalize_vision_response
+from xagent.core.tools.core.vision_tool import (
+    UnderstandMediaResult,
+    _normalize_vision_response,
+)
 from xagent.web.services.model_service import get_default_vision_model
 
 
@@ -1183,6 +1186,155 @@ class TestVisionToolUnderstandMedia:
             )
         ]
         assert [call.args[0][4] for call in run.call_args_list] == ["2.000", "6.000"]
+
+
+class TestVisionToolUnderstandMediaEnvelope:
+    """Response-shape handling in understand_media. None of the module's
+    other fixtures produce an envelope response, so these configure the
+    mock model's return value directly per case."""
+
+    @pytest.mark.asyncio
+    async def test_understand_media_returns_envelope_content(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        """A text envelope's content must become the answer verbatim, and
+        the envelope itself must not leak into it."""
+        mock_vision_model.vision_chat.return_value = {
+            "type": "text",
+            "content": "The lake is Lake Louise.",
+            "raw": {"id": "resp-1"},
+        }
+
+        result = await vision_tool_without_workspace.understand_media(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", "Where is this?"
+        )
+
+        assert result.success is True
+        assert result.answer == "The lake is Lake Louise."
+        assert "'type'" not in result.answer
+        assert "'raw'" not in result.answer
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "label,response",
+        [
+            ("unknown_dict", {"type": "mystery", "payload": 1}),
+            ("non_str_content", {"type": "text", "content": 5}),
+            ("none", None),
+        ],
+    )
+    async def test_understand_media_rejects_shapes_without_text_payload(
+        self, vision_tool_without_workspace, mock_vision_model, label, response
+    ):
+        """A response with no text payload must not be turned into an
+        answer via str(response); it must fail explicitly instead."""
+        mock_vision_model.vision_chat.return_value = response
+
+        result = await vision_tool_without_workspace.understand_media(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", "Describe this."
+        )
+
+        assert result.success is False
+        assert result.answer is None
+        assert result.error
+
+    @pytest.mark.asyncio
+    async def test_understand_media_tool_call_message_unchanged(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        """The existing tool-call message text is not part of this fix and
+        must survive the rewrite unchanged."""
+        mock_vision_model.vision_chat.return_value = {
+            "type": "tool_call",
+            "tool_calls": [{"id": "c1", "type": "function"}],
+            "raw": {"id": "resp-1"},
+        }
+
+        result = await vision_tool_without_workspace.understand_media(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", "Describe this."
+        )
+
+        assert result.success is True
+        assert result.answer.startswith(
+            "Model triggered tool call instead of answering:"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "label,response",
+        [
+            ("bare_empty", ""),
+            ("bare_whitespace", "   "),
+            ("envelope_empty_content", {"type": "text", "content": ""}),
+            ("envelope_whitespace_content", {"type": "text", "content": "   "}),
+        ],
+    )
+    async def test_understand_media_rejects_empty_text_payload(
+        self, vision_tool_without_workspace, mock_vision_model, label, response
+    ):
+        """An empty or whitespace-only response, bare or wrapped in an
+        envelope, must not be reported as a successful empty answer."""
+        mock_vision_model.vision_chat.return_value = response
+
+        result = await vision_tool_without_workspace.understand_media(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", "Describe this."
+        )
+
+        assert result.success is False
+        assert result.answer is None
+        assert result.error
+
+    @pytest.mark.asyncio
+    async def test_raw_display_confined_to_detect_objects_diagnostics(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        """raw_display -- the classifier's length-capped diagnostic string
+        -- must never leak into a user-visible answer, UnderstandMediaResult
+        must not grow a field to carry it, and DetectObjectsResult must
+        keep populating its own raw_response diagnostic field."""
+        # UnderstandMediaResult gains no new field to carry raw_display.
+        assert set(UnderstandMediaResult.model_fields) == {
+            "success",
+            "answer",
+            "media_processed",
+            "images_processed",
+            "videos_processed",
+            "native_videos_processed",
+            "frames_extracted",
+            "model_used",
+            "warnings",
+            "error",
+        }
+
+        # A content payload longer than the truncation limit must reach
+        # `answer` in full. If `answer` were ever sourced from the
+        # length-capped raw_display instead of the classifier's `text`
+        # field, this would come back shorter than the original.
+        long_content = "x" * 5000
+        mock_vision_model.vision_chat.return_value = {
+            "type": "text",
+            "content": long_content,
+            "raw": {"id": "resp-1"},
+        }
+        result = await vision_tool_without_workspace.understand_media(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", "Describe this."
+        )
+        assert result.answer == long_content
+        assert len(result.answer) > 4000
+
+        # detect_objects still populates its own raw_response field.
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(
+            return_value=(
+                '{"detections": [{"class": "person", "confidence": 0.9, '
+                '"bbox": [0.1, 0.1, 0.6, 0.8]}]}'
+            )
+        )
+        model.has_ability = Mock(return_value=True)
+        detect_result = await VisionTool(model).detect_objects(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", task="Find objects"
+        )
+        assert detect_result.raw_response
 
 
 class TestVisionToolDescribeImages:
