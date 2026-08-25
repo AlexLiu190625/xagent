@@ -1039,6 +1039,14 @@ def _shrink_node(
     at each of its positions. ``slack`` is the budget held back for the
     omission markers.
     """
+    # Unreachable through the current call graph: the top-level call from
+    # _shrink_within_budget only runs when _render_event_data_for_log has
+    # already rejected max_bytes <= 0, so the root starts with
+    # remaining[0] > 0; and every recursive call from the dict/list
+    # branches below only fires after checking remaining[0] - cost > slack
+    # (slack >= 0) and then deducting cost, so remaining[0] is still > 0
+    # at the callee's entry. Kept as a guard for a future direct caller of
+    # _shrink_within_budget that passes a non-positive budget.
     if remaining[0] <= 0:
         return _LOG_BUDGET_SPENT
     if depth >= _MAX_TRACE_DEPTH:

@@ -13,6 +13,7 @@ follow-up PR.
 """
 
 import copy
+import re
 from typing import Any, Callable, Dict, List
 
 import pytest
@@ -762,6 +763,34 @@ def test_render_event_data_multibyte_small_payload_unchanged() -> None:
     assert _render_event_data_for_log(payload, max_bytes=50_000) == f"{payload}"
 
 
+def test_render_event_data_multibyte_dict_verbatim_at_budget_boundary() -> None:
+    """Pins byte-accurate accounting for a multi-byte payload sitting just
+    under the budget, where a char-count-based width estimate would wrongly
+    truncate it.
+
+    Each ``中`` char is 3 UTF-8 bytes. A dict holding 16,500 of them renders
+    to 49,515 bytes -- inside the 50,000 byte budget with the
+    ``_LOG_CONTAINER_SLACK`` reserve (256 bytes) still unspent (probed
+    boundary: this shape stays verbatim through 16,575 chars / 49,740
+    bytes and starts truncating at 16,576 chars / 49,743 bytes). This test
+    pins that a payload comfortably inside that boundary renders
+    byte-for-byte identical to plain interpolation.
+
+    This is a regression guard for charging a multi-byte leaf's width by
+    Python character count instead of UTF-8 byte count -- e.g. estimating
+    non-ASCII text at up to 4 bytes/char, which would count this payload
+    as needing far more than the budget and truncate it hard even though
+    it fits with room to spare. Verified by temporarily changing
+    ``_rendered_width`` to ``len(text) * 4``: this payload's rendered
+    output then shrinks from the true 49,515 bytes down to 37,204 bytes
+    and this assertion goes red.
+    """
+    from xagent.core.agent.trace import _render_event_data_for_log
+
+    payload = {"content": "中" * 16_500}
+    assert _render_event_data_for_log(payload, max_bytes=50_000) == f"{payload}"
+
+
 @pytest.mark.parametrize(
     "n_messages,chars_per_message",
     [
@@ -777,8 +806,18 @@ def test_render_event_data_bounds_multi_megabyte_checkpoint(
 
     Covers the shape ``truncate_for_trace`` alone cannot bound: it splits
     the budget per leaf, so a wide message list still renders megabytes.
+
+    Also pins the list-omission marker itself: the omitted count is not
+    just "some number" but exactly the messages dropped from the list,
+    i.e. the original length minus however many entries the shrink walk
+    kept before the budget ran out. Probed real values for the three
+    parametrizations above: (20, 200_000) omits 19, (2_000, 2_000) omits
+    1_974, (50_000, 100) omits 49_645.
     """
-    from xagent.core.agent.trace import _render_event_data_for_log
+    from xagent.core.agent.trace import (
+        _render_event_data_for_log,
+        _shrink_within_budget,
+    )
 
     payload = _checkpoint_payload(n_messages, chars_per_message)
     assert len(f"{payload}") > 500_000, "fixture should be far over the cap"
@@ -789,6 +828,25 @@ def test_render_event_data_bounds_multi_megabyte_checkpoint(
     out_bytes = len(out.encode("utf-8"))
     assert out_bytes <= 50_000 + 100, f"log render not bounded: {out_bytes}"
     assert out.startswith("{'checkpoint_type': 'step_complete'")
+
+    # The dropped messages are accounted for, not silently swallowed: the
+    # last list entry is the "...[N more items]" marker, and N must equal
+    # the original message count minus however many messages were kept
+    # ahead of it.
+    shrunk_messages = _shrink_within_budget(payload, 50_000)["snapshot"]["context"][
+        "messages"
+    ]
+    marker = shrunk_messages[-1]
+    assert isinstance(marker, str) and marker.startswith("...["), (
+        f"expected a list-omission marker as the last entry, got {marker!r}"
+    )
+    match = re.fullmatch(r"\.\.\.\[(\d+) more items\]", marker)
+    assert match, f"expected '...[N more items]' marker, got {marker!r}"
+    kept = len(shrunk_messages) - 1
+    assert int(match.group(1)) == n_messages - kept, (
+        f"omitted count {match.group(1)} should equal "
+        f"{n_messages} total - {kept} kept = {n_messages - kept}"
+    )
 
 
 def test_render_event_data_bounds_wide_dict() -> None:
@@ -803,13 +861,15 @@ def test_render_event_data_bounds_wide_dict() -> None:
     from xagent.core.agent.trace import (
         _render_event_data_for_log,
         _shrink_within_budget,
-        truncate_for_trace,
     )
 
     payload = {"snapshot": {f"k{i}": "v" * 200 for i in range(100_000)}}
 
-    assert len(f"{truncate_for_trace(payload, max_bytes=50_000)}") > 1_000_000
-
+    # truncate_for_trace's per-leaf budget gives every one of the 100k keys
+    # a floor of its own, so it renders this payload at well over 1 MB --
+    # this is the reason _shrink_within_budget (a shared, not per-leaf,
+    # budget) exists. Consolidating the two helpers is tracked in #623 and
+    # is out of scope here.
     out = _render_event_data_for_log(payload, max_bytes=50_000)
     out_bytes = len(out.encode("utf-8"))
     assert out_bytes <= 50_000 + 100, f"log render not bounded: {out_bytes}"
@@ -1210,14 +1270,22 @@ def test_render_event_data_small_budget_hard_cut() -> None:
     ``...[truncated N chars]`` marker, and the marker itself is what pushes
     the result over budget -- measured at 222 bytes for this fixture, 22
     bytes over the 200-byte budget.
+
+    The lower-bound assertion checks for the hard-cut marker itself, not
+    the overshoot amount: if the overshoot is ever fixed so the result
+    lands at or under 200 bytes, this test should not go red for no
+    longer overshooting -- only for the marker disappearing.
     """
     from xagent.core.agent.trace import _render_event_data_for_log
 
     payload = {"a": "x" * 1000, "b": "y" * 1000, "c": "z" * 1000}
     out = _render_event_data_for_log(payload, max_bytes=200)
     out_bytes = len(out.encode("utf-8"))
-    assert 200 < out_bytes <= 230, (
-        f"expected the hard-cut marker overshoot to land in (200, 230], got {out_bytes}"
+    assert out_bytes <= 230, (
+        f"expected the hard cut to stay near budget, got {out_bytes}"
+    )
+    assert re.search(r"\.\.\.\[truncated \d+ chars\]$", out), (
+        f"expected the hard-cut marker at the end of the output, got {out!r}"
     )
 
 
