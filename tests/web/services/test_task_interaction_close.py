@@ -452,6 +452,12 @@ def test_active_interaction_id_sync_returns_none_for_an_absent_task(
 # operation (no session factory yet, table not migrated yet -- no warning)
 # from the two that represent a genuine failure worth a log line (session
 # open failure, lookup failure).
+#
+# The last of the four is reached by two different schema states, and both
+# are covered: a lookup that raises because the shared predicate raises
+# (stubbed, below) and one that raises because the database really is
+# missing a column this function reads -- the pre-migration state built by
+# db_without_the_protocol_version_column further down.
 # --------------------------------------------------------------------------
 
 
@@ -507,17 +513,25 @@ def test_active_interaction_id_sync_returns_none_when_opening_a_session_fails(
     assert "could not open a session" in caplog.records[0].message
 
 
-def test_active_interaction_id_sync_returns_none_when_the_table_is_missing(
+def test_active_interaction_id_sync_returns_none_when_the_table_gate_reports_missing(
     db,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A deployment that has not yet run the migration creating
-    ``task_interaction_requests`` must not raise -- and, since this is a
-    known, temporary deployment window rather than a bug, must not log a
-    warning either. A real active row is seeded so that a caller which
-    removed this gate would find it -- proving the gate, not an empty table,
-    is what produces ``None`` here."""
+    """The table-existence gate, exercised against a database where the
+    table does exist: ``interaction_requests_table_exists`` is stubbed to
+    ``False`` while a real active row sits in a real table. What that
+    isolates is the gate itself -- a caller that removed it would find the
+    row and return its id, so ``None`` here can only have come from the
+    gate, never from an empty table.
+
+    The gate returning ``False`` for the reason it exists for -- a
+    deployment that has not yet run the migration creating
+    ``task_interaction_requests`` -- is covered without any stub by
+    test_active_interaction_id_sync_returns_none_without_the_interaction_table
+    above, which builds that schema shape for real. Both must resolve to
+    ``None`` without a warning: a known deployment window is not a
+    failure."""
 
     task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     seed_active_row(db, task_id=task_id, run_id="run-a")
@@ -555,6 +569,118 @@ def test_active_interaction_id_sync_returns_none_when_the_lookup_raises(
         "xagent.web.services.task_interaction_service._active_native_row_criteria",
         _broken_criteria,
     )
+
+    with caplog.at_level(logging.WARNING, logger=_CLOSE_MODULE_NAME):
+        result = active_interaction_id_sync(task_id)
+
+    assert result is None
+    assert len(caplog.records) == 1
+    assert "the active interaction row lookup failed" in caplog.records[0].message
+
+
+def _schema_without_the_protocol_version_column() -> sa.MetaData:
+    """This repo's full schema, minus ``tasks.interaction_protocol_version``.
+
+    The column and the CHECK constraint that names it
+    (``ck_tasks_interaction_protocol_version``) are both left out, which is
+    what the tasks table looked like before the 2026-08-10 migration added
+    the two together.
+
+    Built by cloning every table into a fresh MetaData and editing the
+    clone, rather than by creating the real schema and dropping the column
+    afterwards: SQLite refuses ``ALTER TABLE tasks DROP COLUMN
+    interaction_protocol_version`` outright while a CHECK constraint still
+    names that column (measured on SQLite 3.53.4: "error in table tasks
+    after drop column: no such column: interaction_protocol_version"), and
+    dropping a CHECK constraint is not something SQLite's ALTER TABLE can
+    do either. Every table is cloned, not just tasks, because a lone tasks
+    clone cannot resolve its own foreign keys to users and the other tables
+    it references.
+
+    ``Table.to_metadata`` has no column filter, so the removal below reaches
+    into the clone's private column collection. It is done to the clone and
+    never to ``Base.metadata``, so the real mapping is untouched.
+    """
+    metadata = sa.MetaData()
+    for table in Base.metadata.sorted_tables:
+        table.to_metadata(metadata)
+    tasks = metadata.tables[Task.__tablename__]
+    tasks._columns.remove(tasks.c.interaction_protocol_version)
+    for constraint in list(tasks.constraints):
+        if isinstance(
+            constraint, sa.CheckConstraint
+        ) and "interaction_protocol_version" in str(constraint.sqltext):
+            tasks.constraints.discard(constraint)
+    return metadata
+
+
+@pytest.fixture()
+def db_without_the_protocol_version_column(tmp_path):
+    """A deployment carrying task_interaction_requests but not the marker
+    column active_interaction_id_sync reads first.
+
+    Not a shape any single migration produces on its own -- the table and
+    the column arrive one migration apart -- but it is what a partially
+    migrated deployment can hold, and it is the one schema state that puts
+    a failing statement in front of this function rather than an empty
+    result set. Bound as the *global* engine and session factory for the
+    same reason db_without_interaction_table above is: the function under
+    test opens its own session through the process-global factory, so a
+    private engine here would leave it reading some other database.
+    """
+    previous_engine = database_module._engine
+    previous_session_local = database_module._SessionLocal
+    configure_db(db_url=f"sqlite:///{tmp_path / 'no_marker_column.db'}")
+    _schema_without_the_protocol_version_column().create_all(bind=get_engine())
+    session = get_session_local()()
+    try:
+        yield session
+    finally:
+        session.close()
+        database_module._engine = previous_engine
+        database_module._SessionLocal = previous_session_local
+
+
+def _seed_task_without_the_marker_column(db, *, run_id: str) -> int:
+    """Insert one task into a tasks table that has no marker column.
+
+    A Core INSERT naming its values explicitly, not the ORM helpers the
+    other fixtures use: those end in ``db.refresh(task)``, which SELECTs
+    every column the Task mapping declares -- including the one this
+    schema does not have -- and would fail in the fixture instead of in the
+    function under test. The INSERT below never names that column, so the
+    statement is legal against this schema even though it is compiled from
+    the full mapping.
+    """
+    user_id = make_user(db)
+    result = db.execute(
+        sa.insert(Task.__table__).values(
+            user_id=user_id, title="pre-migration schema fixture task", run_id=run_id
+        )
+    )
+    db.commit()
+    return int(result.inserted_primary_key[0])
+
+
+def test_active_interaction_id_sync_returns_none_when_the_marker_column_is_missing(
+    db_without_the_protocol_version_column,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The marker read is the first statement this function issues, and on
+    a deployment missing that column it does not come back empty -- it
+    raises OperationalError before any gate has run. The catch-all around
+    the lookup is what turns that into "assume no active row": the function
+    returns None, logs one warning, and lets the caller's close match
+    nothing, instead of failing a resume injection over a schema state the
+    next migration fixes.
+
+    A real active row is seeded to keep the None honest: the table is
+    present and populated here, so nothing but the failing marker read can
+    be producing it.
+    """
+    db = db_without_the_protocol_version_column
+    task_id = _seed_task_without_the_marker_column(db, run_id="run-a")
+    seed_active_row(db, task_id=task_id, run_id="run-a")
 
     with caplog.at_level(logging.WARNING, logger=_CLOSE_MODULE_NAME):
         result = active_interaction_id_sync(task_id)
