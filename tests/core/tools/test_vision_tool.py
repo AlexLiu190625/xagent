@@ -1665,6 +1665,32 @@ class TestVisionToolDetectObjects:
             " chars>"
         )
 
+    @pytest.mark.asyncio
+    async def test_detect_objects_truncates_large_raw_response(self):
+        """The no-text-payload rows above are all short, so the truncation
+        bound holds trivially whether or not truncation actually runs. This
+        forces an oversized payload (str(result) > 4000 chars) so the
+        truncation marker assertion has something to catch."""
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(
+            return_value={"type": "mystery", "payload": "x" * 5000}
+        )
+        model.has_ability = Mock(return_value=True)
+
+        vision_tool = VisionTool(model)
+        result = await vision_tool.detect_objects(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+            task="Find all objects in the image",
+        )
+
+        assert result.success is False
+        assert result.raw_response is not None
+        # The truncated string is the 4000-char prefix plus a "...<truncated
+        # N chars>" marker, so its length is *not* <= 4000 -- it must carry
+        # the marker instead.
+        assert result.raw_response.endswith(" chars>")
+        assert len(result.raw_response) > 4000
+
 
 class TestVisionToolHelperMethods:
     """Test cases for helper methods"""
