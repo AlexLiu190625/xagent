@@ -267,6 +267,24 @@ def _long_intervals(**overrides: float) -> dict[str, float]:
     }
 
 
+def _parse_error_frame(body: str) -> dict:
+    """Extract and parse the one ``stream.error`` frame's JSON payload out
+    of a full SSE response body.
+
+    Asserts there is exactly one -- a caller relying on the returned
+    ``code``/``message`` needs the frame that actually closed the
+    stream, not whichever one a substring search happened to match, and
+    a body with zero or more than one ``stream.error`` frame is itself a
+    sign the test's premise is wrong.
+    """
+    blocks = [b for b in body.split("\n\n") if b.strip()]
+    error_blocks = [b for b in blocks if b.startswith("event: stream.error")]
+    assert len(error_blocks) == 1, (
+        f"expected exactly one stream.error frame, got {len(error_blocks)}: {body!r}"
+    )
+    return json.loads(error_blocks[0].split("data: ", 1)[1])
+
+
 # ===== error_frame code validation =====
 
 
@@ -2727,7 +2745,14 @@ async def test_fast_path_step_read_failure_closes_with_resync_required_not_a_bar
     ``stream.error``, conclusion first -- a step-read failure only costs
     the client the step content, never the fact that the task already
     reached this state. This test's ``principal`` is ``None`` -- it's
-    only testing the steps-read failure, not authorization."""
+    only testing the steps-read failure, not authorization.
+
+    The message is pinned exactly, not by substring: it has to be true
+    of a failure preparing the snapshot in general, not name the steps
+    read specifically -- the cursor baseline read shares this same
+    ``except`` (see ``_fast_path_steps_read_error_frame``) and a wording
+    that only fits one of the two would misdescribe the other whenever
+    it's the one that actually failed."""
 
     def _broken_read_task_steps_response(task_id_, principal_):
         raise RuntimeError("transient DB error reading cached steps")
@@ -2752,8 +2777,12 @@ async def test_fast_path_step_read_failure_closes_with_resync_required_not_a_bar
     terminal_body = "".join(terminal_frames)
     assert terminal_body.count("event: task.status") == 1
     assert terminal_body.count("event: task.completed") == 1
-    assert terminal_body.count("event: stream.error") == 1
-    assert "resync_required" in terminal_body
+    terminal_error = _parse_error_frame(terminal_body)
+    assert terminal_error["code"] == "resync_required"
+    assert terminal_error["message"] == (
+        "Preparing the task's step snapshot failed; call steps() to "
+        "resync, then re-attach."
+    )
     # Order matters: the conclusion frame is the authoritative one and
     # must reach the client even if the error frame that follows it is
     # somehow lost -- not the other way around.
@@ -2779,8 +2808,12 @@ async def test_fast_path_step_read_failure_closes_with_resync_required_not_a_bar
     waiting_body = "".join(waiting_frames)
     assert waiting_body.count("event: task.status") == 1
     assert waiting_body.count("event: task.input_required") == 1
-    assert waiting_body.count("event: stream.error") == 1
-    assert "resync_required" in waiting_body
+    waiting_error = _parse_error_frame(waiting_body)
+    assert waiting_error["code"] == "resync_required"
+    assert waiting_error["message"] == (
+        "Preparing the task's step snapshot failed; call steps() to "
+        "resync, then re-attach."
+    )
     assert waiting_body.index("event: task.input_required") < waiting_body.index(
         "event: stream.error"
     )
@@ -2826,9 +2859,7 @@ async def test_fast_path_task_not_found_closes_with_task_deleted_not_resync_requ
         )
     ]
     terminal_body = "".join(terminal_frames)
-    assert terminal_body.count("event: stream.error") == 1
-    assert "task_deleted" in terminal_body
-    assert "resync_required" not in terminal_body
+    assert _parse_error_frame(terminal_body)["code"] == "task_deleted"
     assert terminal_body.count("event: task.completed") == 1
     assert terminal_body.index("event: task.completed") < terminal_body.index(
         "event: stream.error"
@@ -2850,9 +2881,7 @@ async def test_fast_path_task_not_found_closes_with_task_deleted_not_resync_requ
         )
     ]
     waiting_body = "".join(waiting_frames)
-    assert waiting_body.count("event: stream.error") == 1
-    assert "task_deleted" in waiting_body
-    assert "resync_required" not in waiting_body
+    assert _parse_error_frame(waiting_body)["code"] == "task_deleted"
     assert waiting_body.count("event: task.input_required") == 1
     assert waiting_body.index("event: task.input_required") < waiting_body.index(
         "event: stream.error"

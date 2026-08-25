@@ -1579,22 +1579,27 @@ async def _fast_path_step_snapshot(
 def _fast_path_steps_read_error_frame(
     exc: BaseException, task_id: int, path_name: str
 ) -> str:
-    """Close frame for a failed ``_fast_path_step_snapshot`` call,
-    shared by both attach-time fast paths' ``except`` blocks below.
+    """Close frame for a failure preparing the fast path's step snapshot
+    -- either the cursor baseline read (``read_task_steps_version``, when
+    supplied) or the steps read itself (``_fast_path_step_snapshot``).
+    Both run inside the same ``try`` in ``_fast_path_snapshot_stream``,
+    shared by both attach-time fast paths' ``except`` blocks below, so
+    this is called whichever of the two actually raised and the wording
+    below has to be true of either -- not just the steps read.
 
-    ``read_task_steps_response`` re-resolves the task (see
-    ``TaskStepsResponseReader``) after ``build_event_stream_response``
+    Both readers re-resolve the task (``TaskStepsResponseReader``,
+    ``TaskStepsVersionReader``) after ``build_event_stream_response``
     already resolved it once to pick this fast path -- a task deleted in
-    that gap surfaces here as ``V1ApiError(TASK_NOT_FOUND)``, same as it
-    does to the watchdog (which already emits ``task_deleted`` for it,
-    not ``resync_required``): the task is gone, not merely unreadable,
-    so ``steps()`` + reattach would just 404 instead of resyncing
-    anything. Only that specific shape gets ``task_deleted``; every
-    other failure (a transient DB error, a bug in projection) keeps the
-    existing ``resync_required`` handling and is logged --
-    ``task_deleted`` isn't logged here for the same reason the watchdog
-    path doesn't log it: a deleted task racing the attach isn't a bug
-    in this stream.
+    that gap surfaces here as ``V1ApiError(TASK_NOT_FOUND)`` from
+    whichever one ran, same as it does to the watchdog (which already
+    emits ``task_deleted`` for it, not ``resync_required``): the task is
+    gone, not merely unreadable, so ``steps()`` + reattach would just
+    404 instead of resyncing anything. Only that specific shape gets
+    ``task_deleted``; every other failure (a transient DB error, a bug
+    in projection) keeps the existing ``resync_required`` handling and
+    is logged -- ``task_deleted`` isn't logged here for the same reason
+    the watchdog path doesn't log it: a deleted task racing the attach
+    isn't a bug in this stream.
 
     Must be called from inside the ``except`` block it serves -- the
     ``logger.exception`` call below relies on the caller's still-active
@@ -1603,15 +1608,18 @@ def _fast_path_steps_read_error_frame(
     if isinstance(exc, V1ApiError) and exc.code is V1ErrorCode.TASK_NOT_FOUND:
         return error_frame("task_deleted")
     logger.exception(
-        "v1 SSE %s fast-path steps read failed for task %s; closing for "
-        "resync instead of leaving the client with a bare disconnect and "
-        "no close frame",
+        "v1 SSE %s fast-path step snapshot preparation failed for task "
+        "%s; closing for resync instead of leaving the client with a "
+        "bare disconnect and no close frame",
         path_name,
         task_id,
     )
     return error_frame(
         "resync_required",
-        message="Reading the task's steps failed; call steps() to resync, then re-attach.",
+        message=(
+            "Preparing the task's step snapshot failed; call steps() to "
+            "resync, then re-attach."
+        ),
     )
 
 
@@ -1940,9 +1948,10 @@ async def _fast_path_snapshot_stream(
         )
     except Exception as exc:
         # The conclusion goes out first -- see the docstring above -- so
-        # a step-read failure never also swallows the outcome the
-        # conclusion frame carries. No snapshot was confirmed here, so
-        # the conclusion carries no truncation marker.
+        # a failure reading the cursor baseline or the steps themselves
+        # never also swallows the outcome the conclusion frame carries.
+        # No snapshot was confirmed here, so the conclusion carries no
+        # truncation marker.
         yield build_conclusion(None)
         yield _fast_path_steps_read_error_frame(exc, task_id, path_name)
         return
