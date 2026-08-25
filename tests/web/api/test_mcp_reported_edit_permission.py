@@ -1048,13 +1048,11 @@ class TestSessionRecoveryAfterHookFailure:
         assert assoc is not None
 
     # test_the_servers_listing_still_returns_every_row_when_the_hook_poisons_the_session
-    # is not here: /api/mcp/servers has no per-request degradation catch
-    # until the fix in group C lands (a bare batched-call failure there
-    # still fails the whole request today, matching this route's pre-PR
-    # behavior of zero degradation). That test is added alongside group
-    # C's catch, in test_a_failing_hook_does_not_blank_the_whole_servers_list's
-    # sibling class, so it never asserts a guarantee this revision does not
-    # yet provide.
+    # is not here: it lives in TestListMcpServersPerRowDegradation below,
+    # next to /api/mcp/servers's own per-request degradation catch --
+    # that catch did not exist yet at the point this class was written,
+    # so the poison test could not have asserted a guarantee this route
+    # did not yet provide.
 
     def test_the_apps_listing_still_returns_every_row_when_the_hook_poisons_the_session(
         self, db
@@ -1111,3 +1109,226 @@ class TestSessionRecoveryAfterHookFailure:
             # not just after an explicit external rollback.
             still_works = db.query(MCPServer).filter(MCPServer.id == server_id).first()
         assert still_works is not None
+
+
+class TestListMcpServersPerRowDegradation:
+    """``/api/mcp/servers``'s response loops resolve every row that still
+    needs a verdict -- a non-owner personal row, or a stand-in row with no
+    personal row at all -- with one batched call (see the shape built in
+    get_mcp_servers). A ref missing from an otherwise-successful answer
+    degrades only that one row's ``can_edit_global`` to False, the same
+    per-row degradation this route has always offered. A hook that fails
+    for the whole batch call degrades every row that needed a verdict, but
+    the response itself stays 200 with every row present -- the failure
+    never blanks the list. Mirrors ``TestListMcpAppsPerRowDegradation``
+    above for the sister listing endpoint."""
+
+    def test_an_answer_that_omits_one_connector_degrades_only_that_row(self, db):
+        owner = _make_user(db, 84)
+        member = _make_user(db, 85)
+        healthy = _make_owned_server(db, owner.id, name="servers-healthy")
+        omitted = _make_owned_server(db, owner.id, name="servers-omitted")
+        healthy_id, omitted_id = healthy.id, omitted.id
+
+        def partial_access(_db, _user_id, refs):
+            # A legitimate "not linked" answer for the omitted ref, not a
+            # failure -- distinct from the whole-batch failure the next
+            # test exercises.
+            skip = {("mcp", omitted_id)}
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=True)
+                for ref in refs
+                if ref not in skip
+            }
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=partial_access,
+                visibility=lambda _db, _uid: {
+                    "mcp": {healthy_id, omitted_id},
+                    "custom_api": set(),
+                },
+            )
+            entries = get_mcp_servers(current_user=member, db=db)
+
+        healthy_entry = next(e for e in entries if e.id == healthy_id)
+        omitted_entry = next(e for e in entries if e.id == omitted_id)
+        assert healthy_entry.can_edit_global is True
+        assert omitted_entry.can_edit_global is False
+
+    def test_a_failing_hook_does_not_blank_the_whole_servers_list(self, db):
+        owner = _make_user(db, 86)
+        member = _make_user(db, 87)
+        owned_by_member = _make_owned_server(db, member.id, name="servers-member-owned")
+        personal_non_owner = _make_owned_server(
+            db, owner.id, name="servers-personal-non-owner"
+        )
+        db.add(
+            UserMCPServer(
+                user_id=member.id,
+                mcpserver_id=personal_non_owner.id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        stand_in = _make_owned_server(db, owner.id, name="servers-stand-in")
+
+        def raising_access(_db, _user_id, _refs):
+            raise ValueError("hook exploded")
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=raising_access,
+                visibility=lambda _db, _uid: {
+                    "mcp": {stand_in.id},
+                    "custom_api": set(),
+                },
+            )
+            entries = get_mcp_servers(current_user=member, db=db)
+
+        assert {e.id for e in entries} == {
+            owned_by_member.id,
+            personal_non_owner.id,
+            stand_in.id,
+        }
+        owned_entry = next(e for e in entries if e.id == owned_by_member.id)
+        personal_entry = next(e for e in entries if e.id == personal_non_owner.id)
+        stand_in_entry = next(e for e in entries if e.id == stand_in.id)
+        # The owner's own row never needed a verdict at all -- the edit
+        # branch returns True on is_owner alone, so a failed batch call
+        # cannot touch it.
+        assert owned_entry.can_edit_global is True
+        assert personal_entry.can_edit_global is False
+        assert stand_in_entry.can_edit_global is False
+
+    def test_the_servers_listing_still_returns_every_row_when_the_hook_poisons_the_session(
+        self, db
+    ):
+        """Sibling to the SQLite-side poison tests in
+        ``TestSessionRecoveryAfterHookFailure`` above -- deferred to this
+        class specifically because ``/api/mcp/servers`` had no per-request
+        degradation catch of its own until this same revision added one;
+        before that, a poisoned session on this route would have failed
+        the whole request regardless of any session-recovery fix."""
+        owner = _make_user(db, 88)
+        member = _make_user(db, 89)
+        member_id = member.id
+        server = _make_owned_server(db, owner.id, name="servers-list-poison-target")
+        server_id = server.id
+
+        def poisoning_access(_db, _user_id, _refs):
+            poison_by_orm_flush(_db, colliding_user_id=member_id)
+            return {}
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=poisoning_access,
+                visibility=lambda _db, _uid: {
+                    "mcp": {server_id},
+                    "custom_api": set(),
+                },
+            )
+            entries = get_mcp_servers(current_user=member, db=db)
+
+        entry = next(e for e in entries if e.id == server_id)
+        assert entry.can_edit_global is False
+
+
+class TestSingleServerAccessResolutionFailure:
+    """A single MCP server's verdict plays two different roles depending on
+    the route: ``GET`` uses it as decoration on a row the caller can
+    already read (a personal row, or a team gate that already passed), so
+    a resolution failure there degrades ``can_edit_global`` to False and
+    the read still succeeds. ``PUT`` uses the same verdict as the gate
+    itself for a non-owner caller, so a resolution failure there must
+    still fail closed with a typed 503 -- never a silent 200 or a 404 that
+    would misreport "does not exist" for a connector the caller merely
+    could not be asked about."""
+
+    def test_reading_one_server_survives_a_failing_hook_when_a_personal_row_exists(
+        self, db
+    ):
+        owner = _make_user(db, 102)
+        member = _make_user(db, 103)
+        server = _make_owned_server(db, owner.id, name="read-degrade-target")
+        db.add(
+            UserMCPServer(
+                user_id=member.id,
+                mcpserver_id=server.id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        server_id = server.id
+
+        def raising_access(_db, _user_id, _refs):
+            raise ValueError("hook exploded")
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=raising_access)
+            response = get_mcp_server(server_id, current_user=member, db=db)
+
+        assert response.can_edit_global is False
+
+    def test_reading_one_server_still_fails_closed_without_a_personal_row(self, db):
+        owner = _make_user(db, 104)
+        member = _make_user(db, 105)
+        server = _make_owned_server(db, owner.id, name="read-gate-target")
+        server_id = server.id
+
+        def raising_access(_db, _user_id, _refs):
+            raise ValueError("hook exploded")
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=raising_access,
+                visibility=lambda _db, _uid: {
+                    "mcp": {server_id},
+                    "custom_api": set(),
+                },
+            )
+            with pytest.raises(HTTPException) as exc:
+                get_mcp_server(server_id, current_user=member, db=db)
+
+        # Must be 503 (typed, fail-closed) -- specifically not 404
+        # (which would misreport "does not exist" for a connector the
+        # team's own visibility hook just said this caller can see) and
+        # not 200 (which would be the door itself failing open).
+        assert exc.value.status_code == 503
+
+    def test_updating_one_server_still_fails_closed_on_a_personal_only_payload(
+        self, db
+    ):
+        owner = _make_user(db, 106)
+        member = _make_user(db, 107)
+        server = _make_owned_server(db, owner.id, name="write-gate-target")
+        db.add(
+            UserMCPServer(
+                user_id=member.id,
+                mcpserver_id=server.id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        server_id = server.id
+
+        def raising_access(_db, _user_id, _refs):
+            raise ValueError("hook exploded")
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=raising_access)
+            with pytest.raises(HTTPException) as exc:
+                update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(is_active=False),
+                    current_user=member,
+                    db=db,
+                )
+
+        # PUT never degrades, even for a payload that only touches the
+        # caller's own personal fields: the verdict is the gate that
+        # decides whether this caller may write at all.
+        assert exc.value.status_code == 503

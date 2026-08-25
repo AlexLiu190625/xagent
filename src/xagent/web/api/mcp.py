@@ -1502,7 +1502,11 @@ class _TeamOwnedUserApi:
 
 
 def _resolve_mcp_server_for_request(
-    db: Session, user_id: int, server_id: int
+    db: Session,
+    user_id: int,
+    server_id: int,
+    *,
+    on_resolution_failure: Literal["raise", "degrade"] = "raise",
 ) -> "tuple[UserMCPServer | _TeamOwnedUserMCP, MCPServer, ConnectorAccess | None]":
     """Resolve the caller's association, the definition row, and the
     caller's team access verdict, for ``GET``/``PUT /api/mcp/servers/{id}``.
@@ -1528,8 +1532,20 @@ def _resolve_mcp_server_for_request(
     only add an unnecessary hook call; this skips the call entirely for an
     owner's row and returns ``access=None``.
 
-    Raises ``ConnectorRuntimeError`` when access resolution itself fails;
-    callers translate that into an ``HTTPException``.
+    ``on_resolution_failure`` decides what a hook failure means for this
+    call, and only the caller can know which: ``"raise"`` (the default)
+    lets ``ConnectorRuntimeError`` propagate to the caller's own
+    HTTPException translation, appropriate whenever this verdict is a
+    gate (``PUT`` -- the verdict decides whether the request is even
+    authorized). ``"degrade"`` reports ``can_edit_global=False`` instead
+    and lets the request succeed, appropriate only when this verdict is
+    pure decoration on a field the caller can already read regardless
+    (``GET`` -- the caller already has a personal row or their team
+    already cleared the gate above). Degrading without a personal row
+    would answer "does not exist" for a connector this call merely failed
+    to ask about, which is why the degrade branch below still raises when
+    ``user_mcp is None``: the verdict *is* the gate in that case, not a
+    decoration on top of one.
     """
     from ..services.connector_team_scope import resolve_connector_access_or_raise
 
@@ -1553,7 +1569,23 @@ def _resolve_mcp_server_for_request(
     access: "ConnectorAccess | None" = None
     if server is not None and not already_decided:
         ref: "ConnectorRef" = ("mcp", int(server.id))
-        access = resolve_connector_access_or_raise(db, int(user_id), [ref]).get(ref)
+        try:
+            access = resolve_connector_access_or_raise(db, int(user_id), [ref]).get(ref)
+        except ConnectorRuntimeError:
+            # Degrade only when the caller's own personal row already got
+            # them past the gate. With no personal row the verdict *is*
+            # the gate, and degrading it to None would answer "does not
+            # exist" for a connector we merely failed to ask about.
+            if user_mcp is None or on_resolution_failure == "raise":
+                raise
+            logger.warning(
+                "Connector access resolution failed for MCP server %s "
+                "while reading it for user %s; reporting "
+                "can_edit_global=False",
+                int(server_id),
+                int(user_id),
+            )
+            access = None
 
     if user_mcp is None and access is None:
         raise HTTPException(
@@ -2761,11 +2793,28 @@ def get_mcp_servers(
             | {("mcp", int(server.id)) for server in stand_in_mcp_servers}
             | {("custom_api", int(api.id)) for api in stand_in_apis}
         )
-        verdicts: "dict[ConnectorRef, ConnectorAccess]" = (
-            resolve_connector_access_or_raise(db, effective_user_id, access_refs)
-            if access_refs
-            else {}
-        )
+        # A resolution failure here degrades every row that still needed a
+        # verdict to can_edit_global=False rather than failing the whole
+        # list: this call is a single batch, so it either succeeds for
+        # every row asked about or fails for all of them together -- there
+        # is no partial-failure mode to preserve at this granularity. A
+        # per-connector granularity still exists and is preserved: a
+        # verdict genuinely missing from a *successful* answer degrades
+        # only that one row, the same as before batching.
+        verdicts: "dict[ConnectorRef, ConnectorAccess]" = {}
+        if access_refs:
+            try:
+                verdicts = resolve_connector_access_or_raise(
+                    db, effective_user_id, access_refs
+                )
+            except ConnectorRuntimeError:
+                logger.warning(
+                    "Connector access resolution failed while listing %s "
+                    "connectors for user %s; reporting can_edit_global=False "
+                    "for those rows",
+                    len(access_refs),
+                    effective_user_id,
+                )
 
         is_admin = getattr(current_user, "is_admin", False)
         responses = []
@@ -2857,9 +2906,12 @@ def get_mcp_server(
         user_id = current_user.id
 
         # Check user has access to this server: a personal row, or a team
-        # access verdict for a connector the caller has none for.
+        # access verdict for a connector the caller has none for. The
+        # verdict is pure decoration on this read path -- degrade it to
+        # can_edit_global=False on a resolution failure rather than
+        # failing the whole read.
         user_mcp, server, team_access = _resolve_mcp_server_for_request(
-            db, int(user_id), server_id
+            db, int(user_id), server_id, on_resolution_failure="degrade"
         )
 
         # Actor credentials are not personal server connections.
