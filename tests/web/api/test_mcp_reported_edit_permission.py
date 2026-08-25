@@ -1620,25 +1620,62 @@ class TestAdminInspectingAnotherUsersListReportsPerKindSubject:
         )
         api = _make_owned_api(db, target.id, name="admin-subject-api")
         api_id = api.id
+        # A second Custom API the target can see but genuinely cannot
+        # edit -- a non-owning personal row, with the hook denying the
+        # target's own verdict on it too. Distinct from `api` above:
+        # `api`'s True could in principle come from an admin bypass this
+        # module does not have rather than from the target's own
+        # can_edit, and the two would be indistinguishable there (True or
+        # True is still True). This row is the one that actually proves
+        # the subject is the target and not the admin -- if a bypass on
+        # is_admin were ever added to Custom API's response builder, the
+        # admin's own True would leak into this row and flip it.
+        other_owner_api = _make_owned_api(
+            db, other_owner.id, name="admin-subject-denied-api"
+        )
+        denied_api_id = other_owner_api.id
+        db.add(
+            UserCustomApi(
+                user_id=target.id,
+                custom_api_id=denied_api_id,
+                is_owner=False,
+                can_edit=False,
+                is_active=True,
+            )
+        )
         db.commit()
 
-        # Answers only for the target -- never for the admin's own id, so
-        # any row whose value tracks the admin instead of the target would
-        # be exposed by getting an empty (not-linked) answer instead.
-        def denying_access_for_target_only(_db, user_id, refs):
-            if user_id != target.id:
-                return {}
+        # Denies the target's own verdict on every ref -- but, deliberately,
+        # *grants* anyone else's, including the admin's own id. A correct
+        # list implementation always asks about the target being
+        # inspected, regardless of who is doing the viewing, so this
+        # granting branch should never be reached for this list call. A
+        # mutation that asked about the *viewer's* id instead of the
+        # target's would reach it and leak a wrong grant into a
+        # target-subject row -- this is what makes that class of bug
+        # visible rather than merely restating "the target is denied".
+        def access_hook_keyed_on_who_is_asked_about(_db, user_id, refs):
+            if user_id == target.id:
+                return {
+                    ref: ConnectorAccess(team_owned=True, can_edit=False)
+                    for ref in refs
+                }
             return {
-                ref: ConnectorAccess(team_owned=True, can_edit=False) for ref in refs
+                ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
             }
 
         with snapshot_connector_team_hooks():
-            set_connector_team_hooks(access=denying_access_for_target_only)
+            set_connector_team_hooks(access=access_hook_keyed_on_who_is_asked_about)
             list_entries = get_mcp_servers(user_id=target.id, current_user=admin, db=db)
 
         mcp_entry = next(r for r in list_entries if r.id == server_id)
         api_entry = next(
             r for r in list_entries if r.id == api_id and r.transport == "custom_api"
+        )
+        denied_api_entry = next(
+            r
+            for r in list_entries
+            if r.id == denied_api_id and r.transport == "custom_api"
         )
 
         # The MCP row's subject is the acting admin: True here, even
@@ -1654,13 +1691,25 @@ class TestAdminInspectingAnotherUsersListReportsPerKindSubject:
         # here too, this would need to be False (the verdict denies it).
         assert api_entry.can_edit_global is True
 
+        # This row is the one that actually distinguishes "target" from
+        # "admin" as the subject: the target's own verdict on it is
+        # denied and they do not own it, so it must be False despite the
+        # acting caller being an admin. An admin bypass leaking into
+        # Custom API's response builder would flip this to True.
+        assert denied_api_entry.can_edit_global is False
+
         # The list said the Custom API row is editable, but that value
         # describes the target, not the caller -- acting as themselves,
-        # the admin has no personal row and no team link to this API
-        # (the hook above answers nothing for the admin's own id), so a
-        # real write attempt 404s despite what the list just reported.
+        # the admin has no personal row and no team link to this API at
+        # all, so a real write attempt 404s despite what the list just
+        # reported. A plain deny-everyone hook here (not the
+        # asker-dependent one above): this block is about the admin's own
+        # resolution outcome, not about which id a call asks about.
+        def access_hook_denies_everyone(_db, _user_id, _refs):
+            return {}
+
         with snapshot_connector_team_hooks():
-            set_connector_team_hooks(access=denying_access_for_target_only)
+            set_connector_team_hooks(access=access_hook_denies_everyone)
             with pytest.raises(HTTPException) as exc:
                 await update_custom_api(
                     api_id,
