@@ -328,6 +328,137 @@ class TestAppsListEndpointAccessHookCallBudget:
         assert len(queries) == 10, queries
 
 
+class TestDegradedListingQueryCostGrowsWithRowCount:
+    """The healthy half of this class's own name is already covered above
+    (the call budget classes pin a constant statement count for a healthy
+    hook). This class covers the other half: when the access hook fails,
+    ``_restore_session_after_hook_failure`` (connector_team_scope.py) calls
+    ``db.rollback()`` to recover the session the failed hook may have left
+    mid-statement. On SQLAlchemy 2.0.48, that rollback expires every
+    already-loaded object's every mapped field, including primary keys --
+    so the two listing loops below, each iterating a stand-in row per
+    connector, re-``SELECT`` that row one at a time on next access. Repo
+    issue #1711 independently confirmed this rollback behavior. This test
+    exists to pin that cost as a number CI will notice moving, not to
+    remove it: the recovery itself is required (a failed hook can leave a
+    statement failed on the shared session, and the next request on that
+    session needs it usable again), and there is no cheaper way to get
+    there available to this seam.
+
+    Counts only ``SELECT`` statements (``q.lstrip().upper().startswith
+    ("SELECT")``) -- a different count than the two call-budget classes
+    above, which count every statement including the hook's own. The two
+    numbers are not meant to line up; this class exists to see the
+    per-row re-select specifically, and INSERT/UPDATE noise from a
+    healthy hook's own bookkeeping would only blur that.
+
+    Population: ``num_rows`` stand-in MCP servers and ``num_rows``
+    stand-in Custom APIs (owner-owned, visible to the caller only through
+    the visibility hook), with the caller holding zero personal
+    association rows of its own -- every row in both listings therefore
+    needs a verdict, so the degradation this class measures actually
+    fires for the whole listing, not just part of it.
+    """
+
+    # Measured directly against this PR's own code (2026-08-26, SQLite,
+    # SQLAlchemy 2.0.48): constant while healthy, BASE + 2*num_rows while
+    # failing. The "+2*num_rows" is one re-SELECT for the MCPServer/
+    # CustomApi row and one for the UserMCPServer/UserCustomApi row per
+    # stand-in connector (both listings build one stand-in per row across
+    # both kinds; num_rows stand-ins per kind here, so 2*num_rows total
+    # re-selects). The extra "+1" on ``servers`` alone reflects that
+    # endpoint's own extra per-owner-lookup query the apps endpoint does
+    # not have; it does not grow with num_rows.
+    HEALTHY = {"apps": 7, "servers": 5}
+    BASE = {"apps": 7, "servers": 5}
+    EXTRA = {"apps": 0, "servers": 1}
+
+    def _run(self, db, *, endpoint, num_rows, failing):
+        owner = _make_user(db, 900 + num_rows * 10 + (1 if failing else 0))
+        member = _make_user(db, 950 + num_rows * 10 + (1 if failing else 0))
+
+        stand_in_mcp = [
+            _make_owned_server(
+                db, owner.id, name=f"cost-mcp-{endpoint}-{num_rows}-{failing}-{i}"
+            )
+            for i in range(num_rows)
+        ]
+        stand_in_api = [
+            _make_owned_api(
+                db, owner.id, name=f"cost-api-{endpoint}-{num_rows}-{failing}-{i}"
+            )
+            for i in range(num_rows)
+        ]
+        # Warms member's attributes before the listener below is attached:
+        # every _make_user/_make_owned_* call above commits, which expires
+        # every already-loaded object under this session's default
+        # expire_on_commit. Without this access, the route's own first
+        # touch of current_user.id would trigger member's refresh SELECT
+        # after the listener is attached, inflating the count by one for a
+        # reason that has nothing to do with the degradation this class
+        # measures.
+        _ = member.id
+        mcp_ids = {s.id for s in stand_in_mcp}
+        api_ids = {a.id for a in stand_in_api}
+
+        def failing_hook(hook_db, user_id, refs):
+            raise ValueError("hook exploded")
+
+        def ok_hook(hook_db, user_id, refs):
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+            }
+
+        def visibility_hook(_db, _user_id):
+            return {"mcp": set(mcp_ids), "custom_api": set(api_ids)}
+
+        queries: list[str] = []
+
+        def record_query(conn, cursor, statement, parameters, context, executemany):
+            del conn, cursor, parameters, context, executemany
+            queries.append(statement)
+
+        engine = db.get_bind()
+        event.listen(engine, "before_cursor_execute", record_query)
+        try:
+            with snapshot_connector_team_hooks():
+                set_connector_team_hooks(
+                    access=failing_hook if failing else ok_hook,
+                    visibility=visibility_hook,
+                )
+                if endpoint == "apps":
+                    rows = list_mcp_apps(location="local", current_user=member, db=db)
+                else:
+                    rows = get_mcp_servers(current_user=member, db=db)
+        finally:
+            event.remove(engine, "before_cursor_execute", record_query)
+
+        assert len(rows) == 2 * num_rows
+        n_select = sum(1 for q in queries if q.lstrip().upper().startswith("SELECT"))
+        return n_select
+
+    @pytest.mark.parametrize("failing", [False, True], ids=["healthy", "failing"])
+    @pytest.mark.parametrize("endpoint", ["apps", "servers"])
+    @pytest.mark.parametrize("num_rows", [2, 6], ids=["R=2", "R=6"])
+    def test_select_count(self, db, endpoint, num_rows, failing):
+        n_select = self._run(db, endpoint=endpoint, num_rows=num_rows, failing=failing)
+        if failing:
+            expected = self.BASE[endpoint] + 2 * num_rows + self.EXTRA[endpoint]
+            assert n_select == expected, (
+                f"expected {expected} SELECTs for a failing hook with "
+                f"num_rows={num_rows} on {endpoint} (base "
+                f"{self.BASE[endpoint]} + 2*{num_rows} row re-selects + "
+                f"{self.EXTRA[endpoint]} endpoint-specific extra), got "
+                f"{n_select}"
+            )
+        else:
+            assert n_select == self.HEALTHY[endpoint], (
+                f"expected a constant {self.HEALTHY[endpoint]} SELECTs for "
+                f"a healthy hook on {endpoint} regardless of num_rows, got "
+                f"{n_select}"
+            )
+
+
 class TestReportedEditPermissionConsistencyMcp:
     """The response's can_edit_global must agree across every surface that
     reports it, for the same (user, connector) -- for MCP connectors, across
