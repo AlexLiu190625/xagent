@@ -3992,6 +3992,10 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     )
     assert "tool names mentioned in memory" in system_prompt
     assert "call the final_answer tool exactly once" in system_prompt
+    assert (
+        "Never put final_answer in the same response as any other tool call"
+        in system_prompt
+    )
     final_answer_schema = next(
         schema
         for schema in llm.calls[0]["tools"]
@@ -4000,6 +4004,10 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     assert (
         "same natural language as the current user request"
         in final_answer_schema["description"]
+    )
+    assert (
+        "Call this tool alone: never place it in the same response as any "
+        "other tool call" in final_answer_schema["description"]
     )
     assert "response_language" in final_answer_schema["parameters"]["required"]
     assert "outcome" in final_answer_schema["parameters"]["required"]
