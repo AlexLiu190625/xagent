@@ -3,8 +3,10 @@
 the connector access hook instead of 404ing outright, ``can_edit`` falls
 back to that verdict for a caller with no personal row, an ``is_active``
 payload from such a caller rejects outright instead of writing a shadow
-attribute the response then reads back, and a raising hook surfaces as its
-declared status rather than a 500.
+attribute the response then reads back, a raising hook surfaces as its
+declared status rather than a 500, and the verdict is re-resolved once
+more after the definition row's lock is taken, refusing the write if it
+no longer grants what the pre-lock answer granted.
 
 Every test installs the access hook through ``snapshot_connector_team_hooks``
 so no hook state leaks between tests or into suites that run after this one.

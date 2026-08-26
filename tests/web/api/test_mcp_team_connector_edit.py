@@ -2,8 +2,12 @@
 /api/mcp/servers/{server_id}`` resolve a caller with no personal row
 through the connector access hook instead of 404ing outright, the edit
 branch of ``_check_mcp_permission`` falls back to that verdict, the two
-per-user fields reject outright for a caller with no row to hold them, and
-a raising hook surfaces as its declared status rather than a 500.
+per-user fields reject outright for a caller with no row to hold them, a
+raising hook surfaces as its declared status rather than a 500, a
+stand-in whose verdict denies edit is refused outright rather than
+reported as an empty success, and the verdict is re-resolved once more
+after the definition row's lock is taken, refusing the write if it no
+longer grants what the pre-lock answer granted.
 
 Every test installs the access hook through
 ``snapshot_connector_team_hooks`` so no hook state leaks between tests or
