@@ -8,11 +8,19 @@ record of what actually failed. ``ManagedFileRef`` wraps provider faults into
 log line without ``exc_info`` leaves an operator unable to tell a throttle from
 a timeout from rejected credentials. That is the gap that blocked an incident
 investigation in #1467.
+
+The same helper also renders the *classified* provider fault as ``key=value``
+fields, so a burst of these logs can be aggregated by cause rather than grepped
+as text. Classification itself is unit-tested in
+``tests/core/test_storage_provider_faults.py``; what is pinned here is that the
+fields reach the request paths' log lines, and that ``retryable=False`` in them
+does not change the 503 the client receives.
 """
 
 from __future__ import annotations
 
 import ast
+import errno
 import io
 import logging
 from pathlib import Path
@@ -86,6 +94,7 @@ def _stage_under(root: Path, user_id: int):
     return get_upload_path
 
 
+_EIO = errno.EIO
 _FILENAME = "quarterly-report.txt"
 _STORAGE_KEY = f"users/7/uploads/8ac1f2/{_FILENAME}"
 _PROVIDER_MESSAGE = "SlowDown: Please reduce your request rate (status 503)"
@@ -113,6 +122,32 @@ def _wrapped_fault() -> DurableStorageOperationError:
         "Failed to write durable object", storage_key=_STORAGE_KEY
     )
     fault.__cause__ = _ProviderThrottled(_PROVIDER_MESSAGE)
+    return fault
+
+
+def _s3_throttle_fault() -> DurableStorageOperationError:
+    """The incident's real chain: wrap -> s3fs OSError -> botocore ClientError.
+
+    s3fs maps unrecognized codes onto ``OSError(EIO, ...)`` and hangs the
+    original ``ClientError`` off ``__cause__``, so the provider code sits two
+    links below the wrap. Built by hand rather than with botocore so the test
+    does not depend on an optional dependency being importable.
+    """
+
+    class ClientError(Exception):
+        def __init__(self) -> None:
+            super().__init__("An error occurred (SlowDown)")
+            self.response = {
+                "Error": {"Code": "SlowDown", "Message": _PROVIDER_MESSAGE},
+                "ResponseMetadata": {"HTTPStatusCode": 503},
+            }
+
+    translated = OSError(_EIO, _PROVIDER_MESSAGE)
+    translated.__cause__ = ClientError()
+    fault = DurableStorageOperationError(
+        "Failed to write durable object", storage_key=_STORAGE_KEY
+    )
+    fault.__cause__ = translated
     return fault
 
 
@@ -944,6 +979,16 @@ _DIRECT_HELPER_SITES = frozenset(
     {
         ("web/api/files.py", "upload compensation", ("user_id", "task_id")),
         (
+            "web/services/startup_file_storage_sync.py",
+            "startup durable adoption",
+            ("file_id", "storage_key"),
+        ),
+        (
+            "web/services/startup_file_storage_sync.py",
+            "startup durable sync",
+            ("file_id", "storage_key"),
+        ),
+        (
             "web/api/v1/tasks.py",
             "turn attachment resolution",
             ("task_id", "owner_user_id", "file_ids"),
@@ -1289,8 +1334,11 @@ def test_a_field_value_cannot_forge_a_second_field_on_the_same_line(
     # The consumer: split on whitespace, then on the first ``=``. This is what
     # awk, a kv filter, and a grep pipeline all do.
     fields = dict(token.split("=", 1) for token in message_line.split() if "=" in token)
-    assert set(fields) == {"file_ids", "storage_key"}, fields
-    assert "user_id" not in fields and "file_id" not in fields
+    # Not an exact set: the classifier appends its own fields to every line
+    # (``provider_class``, ``retryable``, ...). What must hold is that the
+    # client's value minted none of them.
+    assert "user_id" not in fields and "file_id" not in fields, fields
+    assert "file_ids" in fields and "storage_key" in fields, fields
     # The value survives whole in the one field it belongs to, escaped.
     assert fields["file_ids"].replace("\\x20", " ") == forged
     # Fields the helper renders itself stay untouched and greppable.
@@ -1360,3 +1408,95 @@ def test_an_overlong_field_value_is_truncated(
     # green if it were raised to a value that defeats that. A ceiling rather
     # than an equality, so the number stays tunable within its purpose.
     assert _MAX_LOG_VALUE_LENGTH <= 512
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_test_db")
+async def test_upload_log_carries_the_classified_provider_fault(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    isolated_upload_storage: Path,
+) -> None:
+    """The fields an operator aggregates on must reach the upload log line.
+
+    This is the burst from #1467: intermittent 503s whose cause could not be
+    named. With the chain classified, one query groups them by
+    ``provider_code`` instead of eyeballing tracebacks.
+    """
+    upload_root = isolated_upload_storage
+    # Side effect only: lays down the admin row the upload is attributed to.
+    _setup_admin()
+    db = _direct_db_session()
+    try:
+        user_id = int(db.query(User.id).filter(User.username == "admin").scalar())
+    finally:
+        db.close()
+    monkeypatch.setattr(
+        files_api, "get_upload_path", _stage_under(upload_root, user_id)
+    )
+
+    def fail_sync(_self: ManagedFileRef, *_args: Any, **_kwargs: Any) -> None:
+        raise _s3_throttle_fault()
+
+    monkeypatch.setattr(ManagedFileRef, "sync_to_durable", fail_sync)
+    upload = UploadFile(
+        filename=_FILENAME,
+        file=io.BytesIO(b"payload"),
+        headers={"content-type": "text/plain"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        with pytest.raises(HTTPException) as raised:
+            await files_api.store_uploaded_files(
+                upload_items=[upload],
+                task_type="general",
+                task_id=None,
+                folder=None,
+                user_id=user_id,
+                single_file_mode=True,
+            )
+
+    assert raised.value.status_code == 503
+    rendered = _warning_matching(
+        caplog, files_api.logger.name, "Durable storage unavailable during upload"
+    )
+    assert "provider_code=SlowDown" in rendered
+    assert "provider_http_status=503" in rendered
+    assert "retryable=True" in rendered
+    # The traceback still accompanies the fields; they add to it, not replace it.
+    assert _PROVIDER_MESSAGE in rendered
+    assert _STORAGE_KEY in rendered
+
+
+def test_a_permanent_fault_is_labelled_but_still_answered_503(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Classification is diagnostic only -- it must not reroute the status.
+
+    Mapping permanent causes onto a non-retryable status is a deliberate
+    follow-up: it would change the SDK retry contract and the widget error path,
+    so this change stops at naming the cause.
+    """
+
+    class ClientError(Exception):
+        def __init__(self) -> None:
+            super().__init__("An error occurred (InvalidAccessKeyId)")
+            self.response = {
+                "Error": {"Code": "InvalidAccessKeyId"},
+                "ResponseMetadata": {"HTTPStatusCode": 403},
+            }
+
+    fault = DurableStorageOperationError(
+        "Failed to write durable object", storage_key=_STORAGE_KEY
+    )
+    fault.__cause__ = ClientError()
+
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        with pytest.raises(HTTPException) as raised:
+            files_api._raise_durable_storage_unavailable(fault, "upload")
+
+    assert raised.value.status_code == 503
+    assert raised.value.detail == _UNAVAILABLE_DETAIL
+    rendered = _sole_warning(caplog, files_api.logger.name)
+    assert "provider_code=InvalidAccessKeyId" in rendered
+    assert "retryable=False" in rendered
