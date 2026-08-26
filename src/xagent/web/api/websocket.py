@@ -361,6 +361,11 @@ class ClientVisibleError(Exception):
     redacted, so forgetting the marker fails closed.
     """
 
+    def __init__(self, *args: object) -> None:
+        if type(self) is ClientVisibleError:
+            raise TypeError("ClientVisibleError must be subclassed")
+        super().__init__(*args)
+
 
 class ClientVisibleValidationError(ClientVisibleError, ValueError):
     """A validation failure whose text is safe to show the sender."""
@@ -398,11 +403,11 @@ def client_safe_error_message(error: BaseException) -> str:
     Read a passing sweep as "the recognized shapes are clean", never as
     "nothing reaches a client raw".
     """
-    return (
-        str(error)
-        if isinstance(error, ClientVisibleError)
-        else CLIENT_SAFE_VALIDATION_ERROR
-    )
+    if isinstance(error, ClientVisibleError):
+        message = str(error)
+        if message.strip():
+            return message
+    return CLIENT_SAFE_VALIDATION_ERROR
 
 
 def client_safe_task_command_failure(
@@ -444,10 +449,41 @@ def log_client_facing_failure(error: Exception, template: str, *args: object) ->
     ``template`` ends in the ``%s`` that receives ``error``; ``args`` fill the
     placeholders before it.
     """
+    rendered_message: str | None = None
+    try:
+        if str.endswith(template, "%s"):
+            rendered_message = str.__str__(template % (*args, error))
+    except Exception:
+        pass
+    if rendered_message is None:
+        safe_template = _safe_log_argument(template)
+        safe_args = tuple(_safe_log_argument(arg) for arg in args)
+        safe_error = _safe_log_argument(error)
+        logger.log(
+            logging.WARNING if isinstance(error, ClientVisibleError) else logging.ERROR,
+            "Malformed client-facing log template %r with args=%r; original error: %s",
+            safe_template,
+            safe_args,
+            safe_error,
+            exc_info=None if isinstance(error, ClientVisibleError) else True,
+        )
+        return
     if isinstance(error, ClientVisibleError):
-        logger.warning(template, *args, error)
+        logger.warning(rendered_message)
     else:
-        logger.error(template, *args, error, exc_info=True)
+        logger.error(rendered_message, exc_info=True)
+
+
+def _safe_log_argument(value: object) -> object:
+    """Snapshot malformed-log values without trusting hostile string methods."""
+    # Exact types preserve builtin logging representations without admitting subclasses.
+    if type(value) in (str, int, float, bytes):
+        return value
+    try:
+        # The unbound call strips any surviving ``str``-subclass overrides.
+        return str.__str__(str(value))
+    except Exception as rendering_error:
+        return f"<unprintable {type(value).__name__}: {type(rendering_error).__name__}>"
 
 
 async def send_message_delivery(
