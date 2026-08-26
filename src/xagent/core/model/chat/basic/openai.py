@@ -434,8 +434,18 @@ class OpenAICompatibleLLM(BaseLLM):
                 return await self._client.chat.completions.create(**completion_params)
 
         # Helper function to process response
-        def _process_response(resp: Any) -> Dict[str, Any]:
-            """Process the API response and return the result"""
+        def _process_response(
+            resp: Any, *, request_thinking: Optional[Dict[str, Any]]
+        ) -> Dict[str, Any]:
+            """Process the API response and return the result.
+
+            ``request_thinking`` is the thinking configuration that the
+            attempt producing ``resp`` actually sent. It is a parameter
+            rather than a closure read because this call can retry once
+            with thinking disabled (see the structured-output degrade
+            branch below): a closure read would judge the second response
+            by the first attempt's configuration.
+            """
             # Validate response
             if not hasattr(resp, "choices") or not resp.choices:
                 raise RuntimeError(
@@ -492,7 +502,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     result["reasoning_content"] = reasoning_content
                     result["reasoning"] = reasoning_content
                 provider_state = self._response_provider_state(
-                    result, thinking=thinking
+                    result, thinking=request_thinking
                 )
                 if provider_state:
                     result[PROVIDER_STATE_METADATA_KEY] = provider_state
@@ -582,7 +592,7 @@ class OpenAICompatibleLLM(BaseLLM):
                 else:
                     raise
 
-            result = _process_response(response)
+            result = _process_response(response, request_thinking=thinking)
 
             # Provider reasoning can corrupt structured JSON on some compatible
             # endpoints. Subclasses can disable provider reasoning for a retry.
@@ -607,16 +617,25 @@ class OpenAICompatibleLLM(BaseLLM):
                             "Model returned non-JSON content with response_format while thinking was enabled. "
                             "Retrying with thinking disabled."
                         )
+                        # One variable for both halves: what this retry
+                        # sends, and what the response hook is told it
+                        # sent. Two literals here would drift apart.
+                        retry_thinking: Dict[str, Any] = {
+                            "type": "disabled",
+                            "enable": False,
+                        }
                         extra_body = self._prepare_provider_reasoning_extra_body(
                             extra_body=extra_body,
-                            thinking={"type": "disabled", "enable": False},
+                            thinking=retry_thinking,
                             tools=tools,
                             response_format=response_format,
                             output_config=output_config,
                             is_streaming=False,
                         )
                         response = await _make_api_call()
-                        result = _process_response(response)
+                        result = _process_response(
+                            response, request_thinking=retry_thinking
+                        )
 
             return result
 
