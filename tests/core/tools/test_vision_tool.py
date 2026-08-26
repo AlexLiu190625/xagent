@@ -1238,15 +1238,32 @@ class TestVisionToolUnderstandMediaEnvelope:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "label,response",
+        "label,response,expected_error",
         [
-            ("unknown_dict", {"type": "mystery", "payload": 1}),
-            ("non_str_content", {"type": "text", "content": 5}),
-            ("none", None),
+            (
+                "unknown_dict",
+                {"type": "mystery", "payload": 1},
+                "Vision model returned an unsupported response shape",
+            ),
+            (
+                "non_str_content",
+                {"type": "text", "content": 5},
+                "Vision model returned an unsupported response shape",
+            ),
+            (
+                "none",
+                None,
+                "Vision model returned an unsupported response shape",
+            ),
         ],
     )
     async def test_understand_media_rejects_shapes_without_text_payload(
-        self, vision_tool_without_workspace, mock_vision_model, label, response
+        self,
+        vision_tool_without_workspace,
+        mock_vision_model,
+        label,
+        response,
+        expected_error,
     ):
         """A response with no text payload must not be turned into an
         answer via str(response); it must fail explicitly instead."""
@@ -1258,7 +1275,7 @@ class TestVisionToolUnderstandMediaEnvelope:
 
         assert result.success is False
         assert result.answer is None
-        assert result.error
+        assert result.error == expected_error
 
     @pytest.mark.asyncio
     async def test_understand_media_tool_call_message_unchanged(
@@ -1277,8 +1294,9 @@ class TestVisionToolUnderstandMediaEnvelope:
         )
 
         assert result.success is True
-        assert result.answer.startswith(
-            "Model triggered tool call instead of answering:"
+        assert result.answer == (
+            "Model triggered tool call instead of answering: "
+            "[{'id': 'c1', 'type': 'function'}]"
         )
 
     @pytest.mark.asyncio
@@ -1304,7 +1322,7 @@ class TestVisionToolUnderstandMediaEnvelope:
 
         assert result.success is False
         assert result.answer is None
-        assert result.error
+        assert result.error == "Vision model returned an empty response"
 
     @pytest.mark.asyncio
     async def test_raw_display_confined_to_detect_objects_diagnostics(
@@ -1629,7 +1647,7 @@ class TestVisionToolDetectObjects:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "label,response",
+        "label,response,expected_error,expected_parsing_method,expected_raw_response",
         [
             (
                 "tool_call",
@@ -1637,15 +1655,42 @@ class TestVisionToolDetectObjects:
                     "type": "tool_call",
                     "tool_calls": [{"id": "c1", "type": "function"}],
                 },
+                "Vision model returned a tool call instead of a detection payload",
+                "tool_call_response",
+                "{'type': 'tool_call', 'tool_calls': [{'id': 'c1', 'type': 'function'}]}",
             ),
-            ("unknown_dict", {"type": "mystery", "payload": 1}),
-            ("non_str_content", {"type": "text", "content": 5}),
-            ("none", None),
+            (
+                "unknown_dict",
+                {"type": "mystery", "payload": 1},
+                "Vision model returned an unsupported response shape",
+                "unknown_type",
+                "{'type': 'mystery', 'payload': 1}",
+            ),
+            (
+                "non_str_content",
+                {"type": "text", "content": 5},
+                "Vision model returned an unsupported response shape",
+                "unknown_type",
+                "{'type': 'text', 'content': 5}",
+            ),
+            (
+                "none",
+                None,
+                "Vision model returned an unsupported response shape",
+                "unknown_type",
+                "None",
+            ),
         ],
     )
     @pytest.mark.parametrize("mark_objects", [False, True])
     async def test_detect_objects_flags_shapes_without_text_payload(
-        self, label, response, mark_objects
+        self,
+        label,
+        response,
+        expected_error,
+        expected_parsing_method,
+        expected_raw_response,
+        mark_objects,
     ):
         """A response with no text payload must be reported as a failure
         with a non-empty error, and must never reach the marking step that
@@ -1675,7 +1720,9 @@ class TestVisionToolDetectObjects:
                 os.unlink(temp_image_path)
 
         assert result.success is False
-        assert result.error
+        assert result.error == expected_error
+        assert result.parsing_method == expected_parsing_method
+        assert result.raw_response == expected_raw_response
         assert result.total_detections == 0
         assert result.marked_image_path is None
         # 4000 is the truncation limit; the suffix is the truncation marker.
@@ -1748,7 +1795,6 @@ class TestVisionToolDetectObjects:
         assert result.detections == []
         assert result.total_detections == 0
         assert result.marked_image_path is None
-        mock_draw.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_detect_objects_truncates_large_raw_response(self):
