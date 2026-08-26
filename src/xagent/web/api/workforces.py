@@ -834,7 +834,7 @@ async def archive_or_delete_workforce(
 
         def _load_and_delete_permanently() -> tuple[
             list[WorkforceRunPauseTarget],
-            list[tuple[AgentTrigger, str, dict[str, Any]]],
+            list[tuple[AgentTrigger, str, dict[str, Any], str | None]],
         ]:
             # Offloaded as one unit (load + the cascade-heavy delete
             # itself), not just the delete: a workforce with a large
