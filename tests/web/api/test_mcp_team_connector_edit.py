@@ -78,6 +78,31 @@ def _make_owned_server(db, owner_id: int, *, name: str = "shared-server") -> MCP
     return server
 
 
+def _sequenced_access_hook(*answers):
+    """An access hook that answers differently on successive calls, so a
+    test can make the second (post-lock) resolution disagree with the
+    first. ``None`` in the sequence means an empty answer -- the batch
+    contract's way of saying "the caller's team does not link this". An
+    entry that is an exception instance is raised instead of returned, so a
+    test can make the second resolution fail outright. The last entry
+    repeats for any further call. Records every call's ``refs`` on
+    ``.calls`` so a test can pin how many round trips the route pays."""
+    calls: list[object] = []
+
+    def hook(db, user_id, refs):
+        calls.append(refs)
+        index = min(len(calls) - 1, len(answers) - 1)
+        answer = answers[index]
+        if isinstance(answer, BaseException):
+            raise answer
+        if answer is None:
+            return {}
+        return {ref: answer for ref in refs}
+
+    hook.calls = calls
+    return hook
+
+
 class TestCheckMcpPermissionTeamAccessFallback:
     """New assertions only -- ``test_check_mcp_permission`` in
     test_mcp_api.py is left untouched by design."""
@@ -635,3 +660,189 @@ class TestADenyingStandInIsRefusedRatherThanReportedSuccessful:
         server.description = "the connector's current description"
         db.commit()
         run(MCPServerUpdate(description=server.description))
+
+
+class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
+    """The verdict that granted a stand-in edit access is resolved before
+    this route's own row lock exists. The installing application can
+    revoke the team's link to this connector at any moment in between --
+    it writes its own tables, which this lock does not cover -- so the
+    route re-resolves the verdict once more after taking the lock, and
+    refuses (with zero side effects) if the answer no longer grants edit.
+    This narrows the window between resolving the verdict and committing
+    the write; it does not close it, since the caller's own definition-row
+    lock has nothing to say about a revoke the installing application makes
+    through its own tables.
+    """
+
+    def _run(self, db, *, hook):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_owned_server(db, owner.id, name="revalidated-under-lock")
+        server_id = server.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            result = {}
+            try:
+                result["response"] = update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(description="edited-while-in-flight"),
+                    current_user=member,
+                    db=db,
+                )
+            except HTTPException as exc:
+                result["error"] = exc
+            return server, server_id, result
+
+    def test_revoked_between_resolution_and_lock_is_refused(self, db):
+        hook = _sequenced_access_hook(
+            ConnectorAccess(team_owned=True, can_edit=True), None
+        )
+        server, server_id, result = self._run(db, hook=hook)
+
+        assert result["error"].status_code == 403
+        db.rollback()
+        refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert refreshed.description == server.description
+        assert refreshed.name == server.name
+        assert db.query(UserMCPServer).filter(UserMCPServer.user_id == 2).count() == 0
+
+    def test_downgraded_to_not_editable_between_resolution_and_lock_is_refused(
+        self, db
+    ):
+        hook = _sequenced_access_hook(
+            ConnectorAccess(team_owned=True, can_edit=True),
+            ConnectorAccess(team_owned=True, can_edit=False),
+        )
+        server, server_id, result = self._run(db, hook=hook)
+
+        assert result["error"].status_code == 403
+        db.rollback()
+        refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert refreshed.description == server.description
+        assert refreshed.name == server.name
+        assert db.query(UserMCPServer).filter(UserMCPServer.user_id == 2).count() == 0
+
+    def test_still_granted_on_recheck_commits_durably(self, db):
+        hook = _sequenced_access_hook(
+            ConnectorAccess(team_owned=True, can_edit=True),
+            ConnectorAccess(team_owned=True, can_edit=True),
+        )
+        server, server_id, result = self._run(db, hook=hook)
+
+        assert "error" not in result
+        assert result["response"].description == "edited-while-in-flight"
+
+        # I5: durability, not staging.
+        db.rollback()
+        refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert refreshed.description == "edited-while-in-flight"
+
+    def test_recheck_that_raises_surfaces_the_hooks_own_status_with_zero_side_effects(
+        self, db
+    ):
+        hook = _sequenced_access_hook(
+            ConnectorAccess(team_owned=True, can_edit=True),
+            ValueError("hook exploded during recheck"),
+        )
+        server, server_id, result = self._run(db, hook=hook)
+
+        assert result["error"].status_code == 503
+        db.rollback()
+        refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert refreshed.description == server.description
+        assert refreshed.name == server.name
+        assert db.query(UserMCPServer).filter(UserMCPServer.user_id == 2).count() == 0
+
+
+class TestTheRecheckCostsExactlyOneExtraHookCall:
+    """Which populations pay the recheck's extra hook round trip, and which
+    do not, spelled out as call counts. This is the executable form of the
+    trigger-condition table in the design: the recheck only runs when the
+    verdict is the caller's authority for a payload that actually needs it.
+    """
+
+    def test_a_granting_stand_in_editing_the_shared_config_pays_two_calls(self, db):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_owned_server(db, owner.id, name="cost-stand-in-shared")
+        server_id = server.id
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="shared-edit"),
+                current_user=member,
+                db=db,
+            )
+
+        assert len(hook.calls) == 2
+
+    def test_a_granting_stand_in_with_a_personal_only_payload_pays_one_call(self, db):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_owned_server(db, owner.id, name="cost-stand-in-personal-only")
+        server_id = server.id
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            with pytest.raises(HTTPException):
+                # A stand-in has no personal row, so is_active still 400s --
+                # what matters here is that this payload shape never
+                # triggers the recheck, not that it succeeds.
+                update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(is_active=False),
+                    current_user=member,
+                    db=db,
+                )
+
+        assert len(hook.calls) == 1
+
+    def test_an_owner_pays_zero_calls(self, db):
+        owner = _make_user(db, 1)
+        server = _make_owned_server(db, owner.id, name="cost-owner")
+        server_id = server.id
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="owner-edit"),
+                current_user=owner,
+                db=db,
+            )
+
+        assert len(hook.calls) == 0
+
+    def test_a_denying_verdict_on_a_personal_row_pays_one_call(self, db):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_owned_server(db, owner.id, name="cost-personal-denied")
+        server_id = server.id
+        db.add(
+            UserMCPServer(
+                user_id=member.id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=False))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            update_mcp_server(
+                server_id,
+                MCPServerUpdate(is_active=False),
+                current_user=member,
+                db=db,
+            )
+
+        assert len(hook.calls) == 1

@@ -80,6 +80,31 @@ async def _put(api_id, payload, current_user, db):
     return update_custom_api(api_id, payload, current_user=current_user, db=db)
 
 
+def _sequenced_access_hook(*answers):
+    """An access hook that answers differently on successive calls, so a
+    test can make the second (post-lock) resolution disagree with the
+    first. ``None`` in the sequence means an empty answer -- the batch
+    contract's way of saying "the caller's team does not link this". An
+    entry that is an exception instance is raised instead of returned, so a
+    test can make the second resolution fail outright. The last entry
+    repeats for any further call. Records every call's ``refs`` on
+    ``.calls`` so a test can pin how many round trips the route pays."""
+    calls: list[object] = []
+
+    def hook(db, user_id, refs):
+        calls.append(refs)
+        index = min(len(calls) - 1, len(answers) - 1)
+        answer = answers[index]
+        if isinstance(answer, BaseException):
+            raise answer
+        if answer is None:
+            return {}
+        return {ref: answer for ref in refs}
+
+    hook.calls = calls
+    return hook
+
+
 class TestGateHelperOnGetAndPut:
     @pytest.mark.asyncio
     async def test_get_404s_for_an_unrelated_user_with_no_link_and_no_team_access(
@@ -376,3 +401,134 @@ class TestOwnerIsImmuneToAHookFailure:
 
         assert get_response.id == api_id
         assert put_response.description == "edited by the owner"
+
+
+class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
+    """The same re-check as the MCP side's PUT (see
+    TestTheVerdictIsRevalidatedUnderTheDefinitionLock in
+    test_mcp_team_connector_edit.py), for the same reason: the verdict
+    granting a stand-in edit access was resolved before this route's own
+    row lock existed, and the installing application can revoke the link
+    at any moment through its own tables, which this lock does not cover.
+    No personal-field exemption here: this route's gate requires can_edit
+    for every payload, including an is_active-only one, so the verdict is
+    the authority for everything this route admits.
+    """
+
+    async def _run(self, db, *, hook):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id, name="revalidated-under-lock")
+        api_id = api.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            result = {}
+            try:
+                result["response"] = await _put(
+                    api_id,
+                    CustomApiUpdate(description="edited-while-in-flight"),
+                    member,
+                    db,
+                )
+            except HTTPException as exc:
+                result["error"] = exc
+            return api, api_id, result
+
+    @pytest.mark.asyncio
+    async def test_revoked_between_resolution_and_lock_is_refused(self, db):
+        hook = _sequenced_access_hook(
+            ConnectorAccess(team_owned=True, can_edit=True), None
+        )
+        api, api_id, result = await self._run(db, hook=hook)
+
+        assert result["error"].status_code == 403
+        db.rollback()
+        refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert refreshed.description == api.description
+        assert refreshed.name == api.name
+        assert db.query(UserCustomApi).filter(UserCustomApi.user_id == 2).count() == 0
+
+    @pytest.mark.asyncio
+    async def test_downgraded_to_not_editable_between_resolution_and_lock_is_refused(
+        self, db
+    ):
+        hook = _sequenced_access_hook(
+            ConnectorAccess(team_owned=True, can_edit=True),
+            ConnectorAccess(team_owned=True, can_edit=False),
+        )
+        api, api_id, result = await self._run(db, hook=hook)
+
+        assert result["error"].status_code == 403
+        db.rollback()
+        refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert refreshed.description == api.description
+        assert refreshed.name == api.name
+        assert db.query(UserCustomApi).filter(UserCustomApi.user_id == 2).count() == 0
+
+    @pytest.mark.asyncio
+    async def test_still_granted_on_recheck_commits_durably(self, db):
+        hook = _sequenced_access_hook(
+            ConnectorAccess(team_owned=True, can_edit=True),
+            ConnectorAccess(team_owned=True, can_edit=True),
+        )
+        api, api_id, result = await self._run(db, hook=hook)
+
+        assert "error" not in result
+        assert result["response"].description == "edited-while-in-flight"
+
+        db.rollback()
+        refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert refreshed.description == "edited-while-in-flight"
+
+    @pytest.mark.asyncio
+    async def test_recheck_that_raises_surfaces_the_hooks_own_status_with_zero_side_effects(
+        self, db
+    ):
+        hook = _sequenced_access_hook(
+            ConnectorAccess(team_owned=True, can_edit=True),
+            ValueError("hook exploded during recheck"),
+        )
+        api, api_id, result = await self._run(db, hook=hook)
+
+        assert result["error"].status_code == 503
+        db.rollback()
+        refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert refreshed.description == api.description
+        assert refreshed.name == api.name
+        assert db.query(UserCustomApi).filter(UserCustomApi.user_id == 2).count() == 0
+
+
+class TestTheRecheckCostsExactlyOneExtraHookCall:
+    """The Custom API halves of cells i and j in the design's call-count
+    table -- MCP's own halves (cells e-h) live in
+    test_mcp_team_connector_edit.py."""
+
+    @pytest.mark.asyncio
+    async def test_a_granting_stand_in_editing_the_shared_config_pays_two_calls(
+        self, db
+    ):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id, name="cost-stand-in-shared")
+        api_id = api.id
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            await _put(api_id, CustomApiUpdate(description="shared-edit"), member, db)
+
+        assert len(hook.calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_an_owner_pays_zero_calls(self, db):
+        owner = _make_user(db, 1)
+        api = _make_owned_api(db, owner.id, name="cost-owner")
+        api_id = api.id
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            await _put(api_id, CustomApiUpdate(description="owner-edit"), owner, db)
+
+        assert len(hook.calls) == 0

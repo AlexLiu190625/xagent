@@ -264,6 +264,15 @@ async def create_custom_api(
     return _db_api_to_response(new_api, user_api)
 
 
+def _http_from_connector_runtime(exc: ConnectorRuntimeError) -> HTTPException:
+    """One place that maps the connector seam's typed error onto this
+    module's HTTP answer. Three call sites need it (``get_custom_api``, and
+    ``update_custom_api`` twice -- once for the pre-lock resolution and once
+    for the post-lock re-check), and this route has no function-wide
+    ``try`` the way ``update_mcp_server`` does."""
+    return HTTPException(status_code=exc.status_code, detail=exc.safe_message)
+
+
 def _resolve_custom_api_for_request(
     db: Session,
     user_id: int,
@@ -366,9 +375,7 @@ async def get_custom_api(
             skip_resolution_when=lambda _user_api: True,
         )
     except ConnectorRuntimeError as exc:
-        raise HTTPException(
-            status_code=exc.status_code, detail=exc.safe_message
-        ) from exc
+        raise _http_from_connector_runtime(exc) from exc
 
     return _db_api_to_response(api, user_api)
 
@@ -395,9 +402,7 @@ def update_custom_api(
             skip_resolution_when=lambda ua: bool(ua.can_edit),
         )
     except ConnectorRuntimeError as exc:
-        raise HTTPException(
-            status_code=exc.status_code, detail=exc.safe_message
-        ) from exc
+        raise _http_from_connector_runtime(exc) from exc
 
     is_stand_in = not isinstance(user_api, UserCustomApi)
     can_edit = bool(user_api.can_edit) or bool(
@@ -440,6 +445,36 @@ def update_custom_api(
             status_code=status.HTTP_404_NOT_FOUND, detail="Custom API not found"
         )
     api = locked_api
+
+    # Same re-check as the MCP side's PUT, for the same reason: the verdict
+    # was resolved before this lock existed and the application that
+    # answers it can revoke the link at any moment. No personal-field
+    # exemption here, unlike MCP: this route's gate above refuses *every*
+    # payload without can_edit, including an is_active-only one, so the
+    # verdict is the authority for every write it admits. No platform-admin
+    # exemption either -- this route's gate has no admin bypass at all.
+    if team_access is not None and team_access.can_edit:
+        from ..services.connector_team_scope import (
+            resolve_one_connector_access_or_raise,
+        )
+
+        try:
+            rechecked = resolve_one_connector_access_or_raise(
+                db, int(current_user.id), ("custom_api", int(api_id))
+            )
+        except ConnectorRuntimeError as exc:
+            db.rollback()
+            raise _http_from_connector_runtime(exc) from exc
+        if rechecked is None or not rechecked.can_edit:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Your team's access to this Custom API changed while "
+                    "this edit was in flight"
+                ),
+            )
+
     # The row's declared type from here on is loosened for mypy's sake: the
     # column-typed attributes below (name, description, env, ...) are all
     # mutated directly by this route, exactly as before this gate existed.

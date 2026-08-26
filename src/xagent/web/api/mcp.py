@@ -3641,6 +3641,53 @@ def update_mcp_server(
                 status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
             )
         server = locked_server
+
+        # The verdict above was resolved before this lock existed, and the
+        # application that answers it can revoke the team's link at any
+        # moment -- it writes its own tables, which this lock does not
+        # cover. Re-resolve it here, while this transaction holds the
+        # definition row, and refuse if the answer no longer grants what
+        # the pre-lock answer granted. This narrows the window; it is not
+        # a fence, and cannot be one from inside this repository: the
+        # revoke path lives in the application that installs the hook, and
+        # a real fence needs both sides to take the same lock.
+        #
+        # Skipped for a payload that only touches this caller's own
+        # association row, and for a platform admin: neither writes on the
+        # verdict's authority (see _check_mcp_permission, which answers
+        # True on is_admin before it ever reads the verdict).
+        #
+        # Placed before any field below is read or mutated and before
+        # rename_team_connector runs, so a refusal here has nothing to
+        # undo -- zero side effects is structural, not something the
+        # rollback has to achieve.
+        payload_is_personal_only = set(server_data.model_fields_set) <= {
+            "user_env",
+            "is_active",
+        }
+        if (
+            team_access is not None
+            and team_access.can_edit
+            and not getattr(current_user, "is_admin", False)
+            and not payload_is_personal_only
+        ):
+            from ..services.connector_team_scope import (
+                resolve_one_connector_access_or_raise,
+            )
+
+            rechecked = resolve_one_connector_access_or_raise(
+                db, int(user_id), ("mcp", int(server_id))
+            )
+            if rechecked is None or not rechecked.can_edit:
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        "Your team's access to this MCP server changed while "
+                        "this edit was in flight"
+                    ),
+                )
+
         # Read only after the lock: rename_team_connector's "old" argument
         # must be the name this transaction actually holds locked, not
         # whatever was there at the pre-lock read above -- a concurrent
