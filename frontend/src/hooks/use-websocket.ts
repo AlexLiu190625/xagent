@@ -77,7 +77,13 @@ export class MessageDeliveryError extends Error {
   }
 }
 
-const resolveBrowserTimezone = (): string | undefined => {
+const resolveReportedTimezone = (): string | undefined => {
+  if (typeof window !== "undefined") {
+    // widget.js copies data-timezone onto the iframe URL; an embedder that knows
+    // its user's business zone outranks the machine zone.
+    const declared = new URLSearchParams(window.location.search).get("timezone")?.trim()
+    if (declared) return declared
+  }
   try {
     // Defensive: neither a throwing Intl nor an empty resolved zone may block
     // the send. The caller's truthiness check drops "".
@@ -924,6 +930,21 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                   typeof data.message === "string" && data.message.trim() !== "",
                 ))
               }
+            } else if (
+              typeof clientMessageId === 'string'
+              && !pending
+              && !preparationsRef.current.has(clientMessageId)
+              && (
+                data.type === 'message_accepted'
+                || data.rejection_outcome === "not_accepted"
+              )
+            ) {
+              // Terminal ack that arrived after the 30s timeout already dropped
+              // the pending entry. isCurrentOwner (top of onmessage) fences stale
+              // sockets, and no same-id retry is in flight, so the binding can
+              // never be reused; release it. outcome_unknown is excluded so a
+              // still-allowed same-id retry keeps its first attempt's zone.
+              attemptTimezonesRef.current.delete(clientMessageId)
             }
             return
           }
@@ -1200,14 +1221,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
     try {
       if (!attemptTimezonesRef.current.has(clientMessageId)) {
-        attemptTimezonesRef.current.set(clientMessageId, resolveBrowserTimezone())
+        attemptTimezonesRef.current.set(clientMessageId, resolveReportedTimezone())
       }
-      const browserTimezone = attemptTimezonesRef.current.get(clientMessageId)
+      const reportedTimezone = attemptTimezonesRef.current.get(clientMessageId)
       const messageData: Record<string, unknown> = {
         type: 'chat',
         message,
         client_message_id: clientMessageId,
-        ...(browserTimezone ? { context: { timezone: browserTimezone } } : {}),
+        ...(reportedTimezone ? { context: { timezone: reportedTimezone } } : {}),
         ...(connection.chatTaskIdMode === "required" ? { task_id: currentTaskId } : {}),
       }
 
@@ -1323,6 +1344,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         ) {
           clearTimeout(pending.timeout)
           pendingDeliveriesRef.current.delete(clientMessageId)
+          // Nothing reached the server, so a same-id retry may re-resolve the
+          // zone freely; drop the binding rather than leak it.
+          attemptTimezonesRef.current.delete(clientMessageId)
           pending.reject(deliveryError(
             error instanceof Error ? error.message : String(error),
             "not_sent",
@@ -1353,6 +1377,15 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
       return delivery
     } catch (error) {
+      // Pre-send failures never reached the server; free the attempt binding so
+      // abandoned drafts do not accumulate. An outcome-unknown send cannot land
+      // here (it settles through the delivery promise), so retryable bindings
+      // are untouched.
+      const disposition =
+        error instanceof MessageDeliveryError ? error.disposition : "not_sent"
+      if (disposition !== "outcome_unknown") {
+        attemptTimezonesRef.current.delete(clientMessageId)
+      }
       if (error instanceof MessageDeliveryError) throw error
       throw deliveryError(
         error instanceof Error ? error.message : String(error),
