@@ -732,6 +732,10 @@ class ReActPattern(AgentPattern):
             assistant_content = normalized.get("content")
             tool_calls = normalized.get("tool_calls", [])
             if assistant_content is not None or normalized.get("tool_calls"):
+                # A tool-protocol error response never carries tool_calls (see
+                # tool_protocol_error_response), so this guard never mistakes
+                # a protocol violation for a real tool-call turn worth saving
+                # provider state for.
                 metadata = (
                     self._provider_state_for_context(normalized) if tool_calls else {}
                 )

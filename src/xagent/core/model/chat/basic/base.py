@@ -130,6 +130,28 @@ class BaseLLM(ABC):
         """
         return ability in self.abilities
 
+    def _strip_internal_message_keys(
+        self, messages: List[dict[str, Any]]
+    ) -> List[dict[str, Any]]:
+        """Remove Xagent-only message metadata before sending provider calls.
+
+        Every provider that forwards a message dict's keys through to its SDK
+        call largely unchanged (as opposed to rebuilding a provider-shaped
+        message field-by-field) must call this before the request leaves the
+        process, or an internal marker like ``_xagent_provider_state`` leaks
+        onto the wire.
+        """
+        sanitized: List[dict[str, Any]] = []
+        for message in messages:
+            sanitized.append(
+                {
+                    key: value
+                    for key, value in message.items()
+                    if not key.startswith("_xagent_")
+                }
+            )
+        return sanitized
+
     def _sanitize_unicode_content(self, content: Any) -> Any:
         """
         Sanitize content by removing or replacing invalid Unicode characters.

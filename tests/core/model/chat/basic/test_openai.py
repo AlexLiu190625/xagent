@@ -8,12 +8,15 @@ from unittest.mock import MagicMock
 import httpx
 import openai
 import pytest
+from openai.types.chat.chat_completion_chunk import ChoiceDelta
+from pydantic import BaseModel, ConfigDict
 
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.openai import (
     PROVIDER_STATE_METADATA_KEY,
     OpenAILLM,
     _format_openai_error,
+    field_content,
 )
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMEmptyContentError, LLMRetryableError
@@ -1584,3 +1587,31 @@ class TestOpenAILLM:
         assert mock_client.chat.completions.create.await_count == 2
         second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
         assert "response_format" not in second_call
+
+
+class TestFieldContent:
+    """``field_content`` must not mistake a pydantic model's declared default
+    for a value the provider actually sent."""
+
+    class _MessageWithDeclaredDefault(BaseModel):
+        model_config = ConfigDict(extra="allow")
+
+        reasoning_content: str = "sdk-default-not-from-provider"
+
+    def test_field_content_ignores_a_declared_default_on_a_pydantic_model(self):
+        message = self._MessageWithDeclaredDefault()
+
+        assert field_content(message, "reasoning_content") == (False, None)
+
+    def test_field_content_reads_a_value_passed_through_model_extra(self):
+        """The real-world path: the OpenAI SDK builds response and delta
+        objects through ``construct()``, which -- unlike a normal pydantic
+        ``__init__`` -- only adds explicitly-declared fields to
+        ``model_fields_set`` and routes every unrecognized field straight to
+        ``model_extra``. ``ChoiceDelta`` doesn't declare ``reasoning_content``,
+        so this is exactly how a provider's reasoning field actually arrives
+        on a streaming delta."""
+        delta = ChoiceDelta.construct(role="assistant", reasoning_content="step 1")
+
+        assert "reasoning_content" not in delta.model_fields_set
+        assert field_content(delta, "reasoning_content") == (True, "step 1")
