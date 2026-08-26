@@ -293,6 +293,7 @@ class OpenAICompatibleLLM(BaseLLM):
         self,
         *,
         thinking: Optional[Dict[str, Any]],
+        response_format: Optional[Dict[str, Any]],
         has_tool_calls: bool,
         has_reasoning_content: bool,
         observed_field_names: tuple[str, ...],
@@ -303,11 +304,18 @@ class OpenAICompatibleLLM(BaseLLM):
         the streaming path: called with the whole stream's outcome (whether
         any delta ever carried a recognized reasoning field, whether the
         response ended with tool calls, and every field name -- never a
-        value -- seen on any delta), so a subclass can warn when thinking
-        was requested but nothing recognized was ever captured. Default is a
+        value -- seen on any delta), so a subclass can decide whether this
+        request could have produced reasoning at all. ``response_format`` is
+        the value this request's extra_body was built from. Default is a
         no-op; only ``OpenRouterLLM`` currently overrides it.
         """
-        _ = thinking, has_tool_calls, has_reasoning_content, observed_field_names
+        _ = (
+            thinking,
+            response_format,
+            has_tool_calls,
+            has_reasoning_content,
+            observed_field_names,
+        )
 
     def _build_request_messages(
         self,
@@ -1134,8 +1142,14 @@ class OpenAICompatibleLLM(BaseLLM):
             # capture failure (thinking requested, tool calls in the
             # response, but no recognized reasoning field ever captured).
             # See ``_check_stream_reasoning_capture``'s docstring.
+            # ``response_format`` is passed as the value this request's
+            # extra_body was built from: the response_format pop-and-retry
+            # above drops it from completion_params only and reuses the
+            # already-built extra_body, so the local variable still
+            # describes what actually went on the wire.
             self._check_stream_reasoning_capture(
                 thinking=thinking,
+                response_format=response_format,
                 has_tool_calls=bool(accumulated_tool_calls),
                 has_reasoning_content=has_reasoning_content,
                 observed_field_names=tuple(sorted(observed_reasoning_field_names)),

@@ -370,20 +370,27 @@ class OpenRouterLLM(OpenAILLM):
         if (
             not provider_state
             and result.get("tool_calls")
-            and _thinking_requested(thinking)
+            and not self._provider_reasoning_intent(
+                thinking, response_format=None, is_streaming=False
+            )[0]
         ):
-            # Thinking was requested and the response is a tool call, but
-            # neither known reasoning field spelling was captured. This is
-            # the one silent-failure mode of the whole mechanism (see
-            # OPENROUTER_REASONING_FIELDS): the next request in this tool
-            # chain will 400 with no clue pointing back here, so log which
-            # reasoning-like keys (if any) actually showed up -- key names
-            # only, never their content.
+            # This request did not go out with an explicit disable payload,
+            # so the endpoint was free to produce reasoning content and its
+            # absence from a tool-call response is a real capture miss:
+            # the next request in this chain will 400 with no clue pointing
+            # back here. Log which reasoning-like keys (if any) showed up --
+            # key names only, never their content.
+            #
+            # Both call sites of this hook are non-streaming request paths,
+            # and the only intent branch that reads ``response_format`` also
+            # requires streaming, so ``response_format=None`` here is exact
+            # rather than an approximation. A future streaming caller of
+            # this hook must pass that path's real ``response_format``.
             logger.warning(
-                "OpenRouter deepseek model %s returned a tool call with "
-                "thinking requested, but no reasoning content was captured "
-                "under any known field spelling %s; observed reasoning-like "
-                "keys: %s",
+                "OpenRouter deepseek model %s returned a tool call "
+                "without thinking disabled, but no reasoning content was "
+                "captured under any known field spelling %s; observed "
+                "reasoning-like keys: %s",
                 self._model_name,
                 OPENROUTER_REASONING_FIELDS,
                 reasoning_field_names(result),
@@ -431,29 +438,33 @@ class OpenRouterLLM(OpenAILLM):
         self,
         *,
         thinking: Optional[Dict[str, Any]],
+        response_format: Optional[Dict[str, Any]],
         has_tool_calls: bool,
         has_reasoning_content: bool,
         observed_field_names: tuple[str, ...],
     ) -> None:
         """Streaming counterpart of the WARNING in ``_response_provider_state``.
 
-        Same silent-failure mode, same gate (deepseek slugs only, thinking
-        requested, response ended with tool calls), just checked over the
-        whole stream's outcome instead of one non-streaming response body:
-        if no delta ever carried a recognized reasoning field, the next
-        request in this tool chain will 400 with nothing pointing back here.
+        Same silent-failure mode, same gate (deepseek slugs only, this
+        request did not go out with thinking disabled, response ended with
+        tool calls), just checked over the whole stream's outcome instead of
+        one non-streaming response body: if no delta ever carried a
+        recognized reasoning field, the next request in this tool chain will
+        400 with nothing pointing back here.
         """
         if (
             self._uses_deepseek_tool_protocol
             and has_tool_calls
-            and _thinking_requested(thinking)
             and not has_reasoning_content
+            and not self._provider_reasoning_intent(
+                thinking, response_format=response_format, is_streaming=True
+            )[0]
         ):
             logger.warning(
-                "OpenRouter deepseek model %s streamed a tool call with "
-                "thinking requested, but no reasoning content was captured "
-                "under any known field spelling %s across the stream; "
-                "observed reasoning-like keys: %s",
+                "OpenRouter deepseek model %s streamed a tool call "
+                "without thinking disabled, but no reasoning content was "
+                "captured under any known field spelling %s across the "
+                "stream; observed reasoning-like keys: %s",
                 self._model_name,
                 OPENROUTER_REASONING_FIELDS,
                 observed_field_names,
@@ -1048,9 +1059,11 @@ class OpenRouterLLM(OpenAILLM):
             return bool(should_disable), bool(should_enable)
 
         if is_streaming and response_format:
-            # Provider reasoning can corrupt structured JSON on this
-            # transport, so a structured stream is disabled unconditionally
-            # -- the declared ability does not reach this branch.
+            # The caller said nothing about reasoning and this is a
+            # structured stream, where provider reasoning can corrupt the
+            # JSON. Disable it: the declared ability does not reach this
+            # branch. A caller that asked for reasoning explicitly is
+            # answered above and is not overridden here.
             return (
                 self.supports_thinking_mode or self._uses_deepseek_tool_protocol,
                 False,
