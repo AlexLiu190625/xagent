@@ -833,6 +833,30 @@ class TestTheRecheckCostsExactlyOneExtraHookCall:
 
         assert len(hook.calls) == 1
 
+    def test_a_granting_stand_in_who_is_a_platform_admin_pays_one_call(self, db):
+        """A platform admin's write authority never comes from the verdict
+        in the first place: ``_check_mcp_permission`` answers True on
+        ``is_admin`` before it ever reads one. The recheck condition's
+        ``and not getattr(current_user, "is_admin", False)`` exists to skip
+        the recheck for exactly this population -- deleting that clause
+        from the condition must turn this red (2 calls instead of 1)."""
+        owner = _make_user(db, 1)
+        admin = _make_user(db, 2, is_admin=True)
+        server = _make_owned_server(db, owner.id, name="cost-stand-in-admin")
+        server_id = server.id
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="admin-edit"),
+                current_user=admin,
+                db=db,
+            )
+
+        assert len(hook.calls) == 1
+
     def test_an_owner_pays_zero_calls(self, db):
         owner = _make_user(db, 1)
         server = _make_owned_server(db, owner.id, name="cost-owner")
