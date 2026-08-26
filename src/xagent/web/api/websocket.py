@@ -8622,6 +8622,7 @@ async def handle_builder_chat(
     from ...core.memory.in_memory import InMemoryMemoryStore
     from ...skills.utils import create_skill_manager
     from ..services.builder_chat_runtime import load_builder_chat_runtime_inputs
+    from .agents import apply_user_voice, voice_from_runtime_user
 
     user_id = int(user.id)
     is_admin = bool(user.is_admin)
@@ -8705,7 +8706,9 @@ async def handle_builder_chat(
 
         # Build system prompt with runtime state only. The behavioral workflow comes
         # from the forced agent-builder skill context below.
-        system_prompt = f"""You are the runtime wrapper for the Xagent builder chat.
+        system_prompt: Optional[
+            str
+        ] = f"""You are the runtime wrapper for the Xagent builder chat.
 Follow the selected `agent-builder` skill as the authoritative workflow.
 
 Current Agent Configuration:
@@ -8724,6 +8727,10 @@ Builder chat tools available in this runtime:
 Use native `ask_user_question` for structured user input. Do not ask required
 clarification questions as plain assistant text.
 """
+        # apply_user_voice's own scoping caveat covers create_agent/
+        # update_agent's persisted name/description/instructions here -
+        # see apply_output_voice's docstring.
+        system_prompt = apply_user_voice(system_prompt, voice_from_runtime_user(user))
 
         async def send_builder_outbound_message(payload: Dict[str, Any]) -> None:
             """Bridge agent agent-to-user messages to the builder chat socket."""
