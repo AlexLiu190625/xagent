@@ -9,6 +9,7 @@ surrounding tests in this file only exercise MCP.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -245,6 +246,87 @@ def test_resolve_connector_access_rejects_a_verdict_for_a_connector_nobody_asked
     try:
         with pytest.raises(ValueError):
             connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+@pytest.mark.parametrize(
+    "connector_type,requested_id,alias_id",
+    [
+        ("mcp", 1, True),
+        ("mcp", 1, 1.0),
+        ("mcp", 1, Decimal("1")),
+        ("custom_api", 2, 2.0),
+        ("custom_api", 1, True),
+    ],
+    ids=["mcp-bool", "mcp-float", "mcp-decimal", "custom-api-float", "custom-api-bool"],
+)
+def test_resolve_connector_access_rejects_a_key_whose_id_is_only_equal_to_an_int(
+    connector_type, requested_id, alias_id
+):
+    """``True == 1``, ``1.0 == 1`` and ``Decimal("1") == 1`` in Python, so a
+    key carrying any of those in place of the requested connector id would
+    pass an ``in``-based membership check against ``requested`` -- and be
+    stored as a grant for the connector it merely aliases, not the one it
+    actually is. The exact-type check must reject it before membership is
+    ever checked."""
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {
+            (connector_type, alias_id): connector_team_scope.ConnectorAccess(
+                team_owned=True, can_edit=True
+            )
+        }
+    )
+    try:
+        with pytest.raises(ValueError, match="not an int"):
+            connector_team_scope.resolve_connector_access(
+                None, 7, [(connector_type, requested_id)]
+            )
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+def test_resolve_connector_access_rejects_a_key_that_is_not_a_tuple():
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {
+            "mcp": connector_team_scope.ConnectorAccess(team_owned=True, can_edit=True)
+        }
+    )
+    try:
+        with pytest.raises(
+            ValueError, match=r"not a \(connector_type, connector_id\) pair"
+        ):
+            connector_team_scope.resolve_connector_access(None, 7, [("mcp", 1)])
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+def test_resolve_connector_access_rejects_a_key_of_the_wrong_length():
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {
+            ("mcp", 1, "x"): connector_team_scope.ConnectorAccess(
+                team_owned=True, can_edit=True
+            )
+        }
+    )
+    try:
+        with pytest.raises(
+            ValueError, match=r"not a \(connector_type, connector_id\) pair"
+        ):
+            connector_team_scope.resolve_connector_access(None, 7, [("mcp", 1)])
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+def test_resolve_connector_access_rejects_a_key_whose_connector_type_is_not_a_str():
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {
+            (1, 1): connector_team_scope.ConnectorAccess(team_owned=True, can_edit=True)
+        }
+    )
+    try:
+        with pytest.raises(ValueError, match="connector type that is not a str"):
+            connector_team_scope.resolve_connector_access(None, 7, [(1, 1)])
     finally:
         connector_team_scope.set_connector_team_hooks()
 

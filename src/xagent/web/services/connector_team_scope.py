@@ -269,6 +269,17 @@ def _validate_connector_access_answer(
     and ``can_edit`` exactly ``True`` or ``False`` -- ``bool`` is a
     subclass of ``int`` in Python, so a merely truthy value is never
     accepted as a legitimate grant.
+
+    Each key must be an exact ``(str, int)`` pair before it is even checked
+    for membership: ``bool``, ``float`` and ``Decimal`` all compare equal
+    to the ``int`` they alias (``True == 1``, ``1.0 == 1``,
+    ``Decimal("1") == 1``), and Python's ordinary tuple equality carries
+    that through to a key like ``("mcp", True)`` -- which would compare
+    equal to, and pass the membership check for, ``("mcp", 1)``. The keys
+    of this answer *are* the question (see above), so a key that only
+    resembles one of the refs asked about is not a legitimate answer to
+    the question, and must fail loudly here rather than being accepted as
+    the connector it merely aliases.
     """
     if not isinstance(answer, dict):
         raise ValueError(
@@ -277,6 +288,25 @@ def _validate_connector_access_answer(
         )
     validated: "dict[ConnectorRef, ConnectorAccess]" = {}
     for key, verdict in answer.items():
+        if not isinstance(key, tuple) or len(key) != 2:
+            raise ValueError(
+                "connector access hook returned a malformed answer: key "
+                f"{key!r} is not a (connector_type, connector_id) pair"
+            )
+        connector_type, connector_id = key
+        if not isinstance(connector_type, str):
+            raise ValueError(
+                "connector access hook returned a malformed answer: key "
+                f"{key!r} has a connector type that is not a str, got "
+                f"{type(connector_type).__name__}"
+            )
+        if isinstance(connector_id, bool) or not isinstance(connector_id, int):
+            raise ValueError(
+                "connector access hook returned a malformed answer: key "
+                f"{key!r} has a connector id that is not an int (bool is a "
+                "subclass of int in Python and is never a legitimate "
+                f"connector id), got {connector_id!r}"
+            )
         if key not in requested:
             raise ValueError(
                 "connector access hook returned a malformed answer: a "
