@@ -278,7 +278,7 @@ class OpenAICompatibleLLM(BaseLLM):
         thinking: Optional[Dict[str, Any]] = None,
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
-    ) -> Any:
+    ) -> Dict[str, Any]:
         """
         Perform a chat completion or trigger tool call.
 
@@ -598,7 +598,7 @@ class OpenAICompatibleLLM(BaseLLM):
         thinking: Optional[Dict[str, Any]] = None,
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
-    ) -> Any:
+    ) -> Dict[str, Any]:
         """
         Perform a vision-aware chat completion for OpenAI models that support vision.
         This method handles multimodal messages with image content.
