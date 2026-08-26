@@ -1140,9 +1140,19 @@ class VisionCore:
                     prompt_sent=prompt,
                 )
 
-            # normalized.kind is "text" or "empty" here, so normalized.text is
-            # always a str -- both feed the same parser; an empty/whitespace
-            # response is handled by its existing fallback chain.
+            if normalized.kind == "empty":
+                logger.warning("Object detection received an empty response")
+                return DetectObjectsResult(
+                    success=False,
+                    error="Vision model returned an empty response",
+                    parsing_method="empty_response",
+                    raw_response=normalized.raw_display,
+                    confidence_threshold=confidence_threshold,
+                    prompt_sent=prompt,
+                )
+
+            # Every non-text kind has returned above, so normalized.kind is
+            # "text" here and normalized.text is a non-blank str.
             assert normalized.text is not None
             raw_response = normalized.text
             detections = []

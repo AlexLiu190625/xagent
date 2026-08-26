@@ -1688,6 +1688,69 @@ class TestVisionToolDetectObjects:
         )
 
     @pytest.mark.asyncio
+    # bare_empty / bare_whitespace: zhipu.py's vision entry point (lines
+    # 1027/1033) returns a bare "" or a bare unstripped `content` when there
+    # are no tool calls; its vision path has no whitespace guard, unlike its
+    # chat path's `.strip()` check at zhipu.py:369.
+    # envelope_whitespace_content: xinference.py:347 gates its text exit on
+    # bare truthiness, so whitespace-only content passes through unrejected.
+    # envelope_empty_content: no confirmed production source; exercised
+    # defensively as a normalization boundary.
+    @pytest.mark.parametrize(
+        "label,response,expected_raw_response",
+        [
+            ("bare_empty", "", ""),
+            ("bare_whitespace", "   \n\t ", "   \n\t "),
+            ("envelope_empty_content", {"type": "text", "content": ""}, ""),
+            (
+                "envelope_whitespace_content",
+                {"type": "text", "content": "   "},
+                "   ",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("mark_objects", [False, True])
+    async def test_detect_objects_rejects_empty_text_payload(
+        self, label, response, expected_raw_response, mark_objects
+    ):
+        """An empty or whitespace-only text payload -- bare or wrapped in a
+        text envelope -- must be reported as a failure rather than an
+        empty-but-successful detection, and must never reach the marking
+        step. Uses a real local file (rather than a data: URL) so the
+        mark_objects=True rows exercise the actual marking code path
+        instead of being rejected earlier by the local-file-only guard for
+        URL/data images."""
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(return_value=response)
+        model.has_ability = Mock(return_value=True)
+
+        vision_tool = VisionTool(model)
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
+            temp_image_path = temp_file.name
+            temp_file.write(b"fake_image_data")
+
+        try:
+            with patch.object(vision_tool.core, "_draw_bounding_boxes") as mock_draw:
+                result = await vision_tool.detect_objects(
+                    temp_image_path,
+                    task="Find all objects in the image",
+                    mark_objects=mark_objects,
+                )
+                mock_draw.assert_not_called()
+        finally:
+            if os.path.exists(temp_image_path):
+                os.unlink(temp_image_path)
+
+        assert result.success is False
+        assert result.error == "Vision model returned an empty response"
+        assert result.parsing_method == "empty_response"
+        assert result.raw_response == expected_raw_response
+        assert result.detections == []
+        assert result.total_detections == 0
+        assert result.marked_image_path is None
+        mock_draw.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_detect_objects_truncates_large_raw_response(self):
         """The no-text-payload rows above are all short, so the truncation
         bound holds trivially whether or not truncation actually runs. This
