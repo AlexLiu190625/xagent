@@ -223,6 +223,23 @@ class TestPutWiringForATeamEditor:
         owner = _make_user(db, 1)
         member = _make_user(db, 2)
         server = _make_owned_server(db, owner.id)
+        server_id = server.id
+        # A personal, non-owner association row (population D), not a
+        # stand-in: a stand-in whose verdict denies edit is now refused
+        # outright before this route ever reaches the shared-config tamper
+        # check this test is pinning (see
+        # TestADenyingStandInIsRefusedRatherThanReportedSuccessful). D still
+        # has no can_edit of its own and no granting verdict, so it hits
+        # the same tamper-check 403 this test always meant to cover.
+        db.add(
+            UserMCPServer(
+                user_id=member.id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
@@ -233,12 +250,13 @@ class TestPutWiringForATeamEditor:
             )
             with pytest.raises(HTTPException) as exc:
                 update_mcp_server(
-                    server.id,
+                    server_id,
                     MCPServerUpdate(description="should not land"),
                     current_user=member,
                     db=db,
                 )
         assert exc.value.status_code == 403
+        assert "shared configuration" in exc.value.detail
 
     def test_rename_propagates_to_team_agent_selectors(self, db, monkeypatch):
         """I10, and the mutation check the design requires for it: deleting
@@ -551,3 +569,69 @@ class TestDecorationDegradesAfterTheWriteCommits:
             .one()
         )
         assert assoc.is_owner is False
+
+
+class TestADenyingStandInIsRefusedRatherThanReportedSuccessful:
+    """A stand-in (no personal association row) whose verdict denies edit
+    has an empty writable field set on this route: the personal-field
+    guard refuses user_env/is_active (there is no personal row to hold
+    them), the tamper check refuses every shared field it can compare, and
+    the fields it cannot compare (secrets) are silently emptied out of the
+    payload rather than written. Every payload such a caller can send was
+    therefore already a no-op before this guard existed -- a 200 for it
+    reported success for a write that never happened. All three payload
+    shapes below are the ones that used to slip past the tamper check
+    specifically (an unset payload, a secret-only payload the tamper check
+    deliberately does not compare, and a payload that resubmits the
+    connector's current value) and confirm none of them can still commit
+    anything even with the new guard in place.
+    """
+
+    def _stand_in(self, db):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_owned_server(db, owner.id, name="denying-stand-in-target")
+        server_id = server.id
+
+        def _run(payload):
+            with snapshot_connector_team_hooks():
+                set_connector_team_hooks(
+                    access=lambda db, user_id, refs: {
+                        ref: ConnectorAccess(team_owned=True, can_edit=False)
+                        for ref in refs
+                    }
+                )
+                with pytest.raises(HTTPException) as exc:
+                    update_mcp_server(server_id, payload, current_user=member, db=db)
+            assert exc.value.status_code == 403
+
+            db.rollback()
+            refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+            assert refreshed.description == server.description
+            assert refreshed.name == server.name
+            assert (
+                db.query(UserMCPServer)
+                .filter(UserMCPServer.user_id == member.id)
+                .count()
+                == 0
+            )
+            return server, refreshed
+
+        return server_id, _run
+
+    def test_an_empty_payload_is_refused(self, db):
+        _server_id, run = self._stand_in(db)
+        run(MCPServerUpdate())
+
+    def test_a_secrets_only_payload_the_tamper_check_never_compares_is_refused(
+        self, db
+    ):
+        _server_id, run = self._stand_in(db)
+        run(MCPServerUpdate(config={"env": {"K": "v"}}))
+
+    def test_resubmitting_the_current_value_is_refused(self, db):
+        server_id, run = self._stand_in(db)
+        server = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        server.description = "the connector's current description"
+        db.commit()
+        run(MCPServerUpdate(description=server.description))

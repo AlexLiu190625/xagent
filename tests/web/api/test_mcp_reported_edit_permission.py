@@ -331,7 +331,14 @@ class TestAppsListEndpointAccessHookCallBudget:
 class TestReportedEditPermissionConsistencyMcp:
     """The response's can_edit_global must agree across every surface that
     reports it, for the same (user, connector) -- for MCP connectors, across
-    the list, GET, PUT's response and toggle's response."""
+    the list, GET, PUT's response and toggle's response.
+
+    One population is the exception: a stand-in whose verdict denies edit
+    no longer gets a PUT response to compare at all -- that payload's
+    writable field set is empty, so the route refuses it outright (see
+    TestADenyingStandInIsRefusedRatherThanReportedSuccessful in
+    test_mcp_team_connector_edit.py) rather than reporting a decorative
+    can_edit_global on a write that could never have landed."""
 
     @pytest.mark.parametrize(
         "population,access_answer,has_personal_row",
@@ -398,9 +405,25 @@ class TestReportedEditPermissionConsistencyMcp:
             list_entry = next(r for r in list_entries if r.id == server_id)
 
             get_response = get_mcp_server(server_id, current_user=caller, db=db)
-            put_response = update_mcp_server(
-                server_id, MCPServerUpdate(), current_user=caller, db=db
-            )
+
+            # A denying stand-in's PUT no longer reaches a can_edit_global
+            # value to agree with: it is refused outright before this route
+            # builds a response at all (empty writable field set -- see
+            # TestADenyingStandInIsRefusedRatherThanReportedSuccessful in
+            # test_mcp_team_connector_edit.py). The other three surfaces
+            # below are unaffected by that guard and still agree on
+            # ``expected``.
+            put_response = None
+            if population == "stand_in_denying_edit":
+                with pytest.raises(HTTPException) as exc:
+                    update_mcp_server(
+                        server_id, MCPServerUpdate(), current_user=caller, db=db
+                    )
+                assert exc.value.status_code == 403
+            else:
+                put_response = update_mcp_server(
+                    server_id, MCPServerUpdate(), current_user=caller, db=db
+                )
 
             toggle_response = None
             if has_personal_row:
@@ -410,7 +433,8 @@ class TestReportedEditPermissionConsistencyMcp:
 
         assert list_entry.can_edit_global == expected
         assert get_response.can_edit_global == expected
-        assert put_response.can_edit_global == expected
+        if put_response is not None:
+            assert put_response.can_edit_global == expected
         if toggle_response is not None:
             assert toggle_response.can_edit_global == expected
 
@@ -613,7 +637,19 @@ class TestOAuthRoutesKeepTheirOwnGate:
 class TestDenyingVerdictIsFalseEverywhere:
     """A connector whose verdict denies edit reports can_edit_global False
     in the list, in the response from GET, and in the response from PUT
-    alike."""
+    alike.
+
+    ``member`` holds a personal, non-owner association row here (population
+    D: personal row + team link + denying verdict), not a stand-in: a
+    stand-in whose verdict denies edit is now refused outright by PUT (see
+    TestADenyingStandInIsRefusedRatherThanReportedSuccessful in
+    test_mcp_team_connector_edit.py), so it can no longer reach a
+    successful PUT response to assert can_edit_global on. Population D
+    still can -- can_edit_global is False by the same route (no personal
+    can_edit, no granting verdict) on all three surfaces, and its PUT
+    succeeds because it is writing its own association row, not the
+    verdict-gated shared config.
+    """
 
     async def test_a_denying_verdict_yields_false_in_the_list_get_and_put_response(
         self, db
@@ -622,6 +658,15 @@ class TestDenyingVerdictIsFalseEverywhere:
         member = _make_user(db, 51)
         server = _make_owned_server(db, owner.id, name="denied-everywhere")
         server_id = server.id
+        db.add(
+            UserMCPServer(
+                user_id=member.id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(

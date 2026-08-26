@@ -3605,6 +3605,24 @@ def update_mcp_server(
                 ),
             )
 
+        # A stand-in whose verdict denies edit has an empty writable field
+        # set: the guard above refuses the personal fields (there is no
+        # personal row to hold them), the tamper check below refuses every
+        # shared field it can compare, and the ones it deliberately cannot
+        # compare (secrets) are emptied out of the payload. Every payload
+        # this caller can send therefore either fails already or commits
+        # nothing -- and a 200 for a write that provably cannot change
+        # anything reports success for a request that had none. Ordered
+        # after the personal-field guard on purpose: "there is no personal
+        # connection to configure this on" is the more precise answer for
+        # that payload, and design matrix 43.1's `PUT personal only` cell
+        # for this population stays 400.
+        if is_stand_in and not can_edit_global:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to edit this MCP server",
+            )
+
         # A second, single-table lock on the definition row, taken before any
         # tamper check or config build below reads or mutates it. The read
         # above is a two-table join and cannot itself lock just this table;

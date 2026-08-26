@@ -187,6 +187,42 @@ class TestPutWiringForATeamEditor:
         assert exc.value.status_code == 403
 
 
+@pytest.mark.asyncio
+async def test_a_denying_verdict_stand_in_is_403_on_an_empty_payload_too(db):
+    """The MCP side needed a new guard for this (see
+    TestADenyingStandInIsRefusedRatherThanReportedSuccessful in
+    test_mcp_team_connector_edit.py) because its personal-field guard and
+    tamper check only fire for specific payload shapes. This route's own
+    gate (custom_api.py's ``can_edit`` check) has no such carve-out: it
+    requires the edit right for every payload, including an empty one, so
+    a stand-in whose verdict denies edit is already 403 here without any
+    new code. This test exists to pin that so it cannot be changed out
+    from under this route's contract unnoticed.
+    """
+    owner = _make_user(db, 1)
+    member = _make_user(db, 2)
+    api = _make_owned_api(db, owner.id, name="denying-stand-in-target")
+    api_id = api.id
+
+    with snapshot_connector_team_hooks():
+        set_connector_team_hooks(
+            access=lambda db, user_id, refs: {
+                ref: ConnectorAccess(team_owned=True, can_edit=False) for ref in refs
+            }
+        )
+        with pytest.raises(HTTPException) as exc:
+            await _put(api_id, CustomApiUpdate(), member, db)
+    assert exc.value.status_code == 403
+
+    db.rollback()
+    refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
+    assert refreshed.description == api.description
+    assert refreshed.name == api.name
+    assert (
+        db.query(UserCustomApi).filter(UserCustomApi.user_id == member.id).count() == 0
+    )
+
+
 class TestIsActiveRejectionForAStandIn:
     @pytest.mark.asyncio
     async def test_is_active_from_a_caller_with_no_personal_row_is_400_not_a_silent_drop(
