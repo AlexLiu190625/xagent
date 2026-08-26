@@ -1021,6 +1021,56 @@ class OpenRouterLLM(OpenAILLM):
             },
         }
 
+    def _provider_reasoning_intent(
+        self,
+        thinking: Optional[Dict[str, Any]],
+        *,
+        response_format: Optional[Dict[str, Any]],
+        is_streaming: bool,
+    ) -> tuple[bool, bool]:
+        """Return ``(should_disable, should_enable)`` for one request.
+
+        Single source of truth for what this client asks the endpoint to do
+        about reasoning. The request builder below turns the pair into
+        extra_body keys; the two capture sentinels ask the same method
+        whether this request actually went out with thinking disabled.
+        Recomputing the branch separately in a sentinel would let the two
+        answers drift apart, and a sentinel that disagrees with the payload
+        is worse than no sentinel.
+        """
+        if thinking is not None:
+            should_enable = thinking.get("type") == "enabled" or thinking.get(
+                "enable", False
+            )
+            should_disable = not should_enable and (
+                thinking.get("type") == "disabled" or not thinking.get("enable", False)
+            )
+            return bool(should_disable), bool(should_enable)
+
+        if is_streaming and response_format:
+            # Provider reasoning can corrupt structured JSON on this
+            # transport, so a structured stream is disabled unconditionally
+            # -- the declared ability does not reach this branch.
+            return (
+                self.supports_thinking_mode or self._uses_deepseek_tool_protocol,
+                False,
+            )
+
+        # DeepSeek-served endpoints can default to thinking mode, and once a
+        # response carries reasoning_content they require it to be replayed
+        # verbatim on the next request of a tool-call chain. That replay is
+        # implemented (_prepare_messages_for_request, _response_provider_
+        # state, _attach_reasoning_content_to_raw below), so this is no
+        # longer the reason thinking stays off by default. It stays off
+        # here anyway, matching DeepSeekLLM's own default: turning
+        # thinking on changes token cost and response shape for every
+        # DeepSeek-authored slug on this client, which is a separate call
+        # from closing the replay gap and is left for a change that makes
+        # that call explicitly (#1537). This deliberately ignores
+        # supports_thinking_mode: a declared thinking_mode ability does
+        # not flip this default on its own.
+        return self._uses_deepseek_tool_protocol, False
+
     def _prepare_provider_reasoning_extra_body(
         self,
         *,
@@ -1033,35 +1083,9 @@ class OpenRouterLLM(OpenAILLM):
     ) -> Dict[str, Any]:
         _ = tools, output_config
         updated_extra_body = dict(extra_body)
-
-        if thinking is not None:
-            should_enable = thinking.get("type") == "enabled" or thinking.get(
-                "enable", False
-            )
-            should_disable = not should_enable and (
-                thinking.get("type") == "disabled" or not thinking.get("enable", False)
-            )
-        elif is_streaming and response_format:
-            should_disable = (
-                self.supports_thinking_mode or self._uses_deepseek_tool_protocol
-            )
-            should_enable = False
-        else:
-            # DeepSeek-served endpoints can default to thinking mode, and once a
-            # response carries reasoning_content they require it to be replayed
-            # verbatim on the next request of a tool-call chain. That replay is
-            # implemented (_prepare_messages_for_request, _response_provider_
-            # state, _attach_reasoning_content_to_raw below), so this is no
-            # longer the reason thinking stays off by default. It stays off
-            # here anyway, matching DeepSeekLLM's own default: turning
-            # thinking on changes token cost and response shape for every
-            # DeepSeek-authored slug on this client, which is a separate call
-            # from closing the replay gap and is left for a change that makes
-            # that call explicitly (#1537). This deliberately ignores
-            # supports_thinking_mode: a declared thinking_mode ability does
-            # not flip this default on its own.
-            should_disable = self._uses_deepseek_tool_protocol
-            should_enable = False
+        should_disable, should_enable = self._provider_reasoning_intent(
+            thinking, response_format=response_format, is_streaming=is_streaming
+        )
 
         if should_disable:
             updated_extra_body["reasoning"] = {"enabled": False}
