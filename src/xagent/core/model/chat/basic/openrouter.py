@@ -1061,9 +1061,10 @@ class OpenRouterLLM(OpenAILLM):
         if is_streaming and response_format:
             # The caller said nothing about reasoning and this is a
             # structured stream, where provider reasoning can corrupt the
-            # JSON. Disable it: the declared ability does not reach this
-            # branch. A caller that asked for reasoning explicitly is
-            # answered above and is not overridden here.
+            # JSON. Disable it regardless of the declared ability, which
+            # does not open the default here. A caller that asked for
+            # reasoning explicitly is answered above and is not overridden
+            # here.
             return (
                 self.supports_thinking_mode or self._uses_deepseek_tool_protocol,
                 False,

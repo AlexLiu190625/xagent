@@ -275,8 +275,9 @@ class OpenAICompatibleLLM(BaseLLM):
         """Return opaque provider-owned message state for future LLM requests.
 
         ``thinking`` is the request's thinking configuration, made available
-        so a subclass can tell whether reasoning content was actually asked
-        for (e.g. to decide whether an empty capture is worth a warning).
+        so a subclass can decide whether this request could have produced
+        reasoning at all (e.g. to decide whether an empty capture is worth a
+        warning).
         """
         _ = result, thinking
         return {}
@@ -1139,9 +1140,10 @@ class OpenAICompatibleLLM(BaseLLM):
                     yield chunk
 
             # One-time hook for a subclass to detect a silent streaming
-            # capture failure (thinking requested, tool calls in the
-            # response, but no recognized reasoning field ever captured).
-            # See ``_check_stream_reasoning_capture``'s docstring.
+            # capture failure (the request did not go out with reasoning
+            # disabled, tool calls in the response, but no recognized
+            # reasoning field ever captured). See
+            # ``_check_stream_reasoning_capture``'s docstring.
             # ``response_format`` is passed as the value this request's
             # extra_body was built from: the response_format pop-and-retry
             # above drops it from completion_params only and reuses the
