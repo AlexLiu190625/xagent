@@ -77,7 +77,7 @@ async def _get(api_id, current_user, db):
 
 
 async def _put(api_id, payload, current_user, db):
-    return await update_custom_api(api_id, payload, current_user=current_user, db=db)
+    return update_custom_api(api_id, payload, current_user=current_user, db=db)
 
 
 class TestGateHelperOnGetAndPut:

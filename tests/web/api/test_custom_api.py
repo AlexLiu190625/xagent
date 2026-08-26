@@ -318,7 +318,7 @@ async def test_update_custom_api():
     with patch(
         "xagent.web.api.custom_api.encrypt_value", side_effect=lambda x: f"enc_{x}"
     ):
-        await update_custom_api(10, api_data, current_user=user, db=db)
+        update_custom_api(10, api_data, current_user=user, db=db)
 
         assert mock_api.name == "new_name"
         assert mock_api.env == {"k1": "enc_old1", "k2": "enc_v2"}
@@ -363,7 +363,7 @@ async def test_update_custom_api_env_replacement_deletes_only_the_omitted_secret
     with patch(
         "xagent.web.api.custom_api.encrypt_value", side_effect=lambda x: f"enc_{x}"
     ):
-        await update_custom_api(
+        update_custom_api(
             10,
             CustomApiUpdate(env={"TENANT": "********"}),
             current_user=user,
@@ -400,7 +400,7 @@ async def test_update_custom_api_rejects_renamed_masked_secret():
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await update_custom_api(
+        update_custom_api(
             10,
             CustomApiUpdate(env={"RENAMED_TOKEN": "********"}),
             current_user=user,
@@ -452,7 +452,7 @@ async def test_update_custom_api_explicit_null_clears_runtime_config():
         allow_delegated_authorization=False,
     )
 
-    await update_custom_api(10, api_data, current_user=user, db=db)
+    update_custom_api(10, api_data, current_user=user, db=db)
 
     assert mock_api.runtime_input_schema is None
     assert mock_api.runtime_bindings is None
@@ -472,7 +472,7 @@ async def test_delete_custom_api():
 
     db.query().filter().first.return_value = mock_user_api
 
-    await delete_custom_api(10, current_user=user, db=db)
+    delete_custom_api(10, current_user=user, db=db)
 
     db.delete.assert_called_once_with(mock_api)
     db.commit.assert_called()
@@ -497,9 +497,24 @@ async def test_delete_team_custom_api_flushes_only_current_user_link():
         "xagent.web.services.connector_team_scope.delete_team_connector",
         return_value=decision,
     ):
-        await delete_custom_api(10, current_user=user, db=db)
+        delete_custom_api(10, current_user=user, db=db)
 
     db.flush.assert_called_once_with([mock_user_api])
     assert db.no_autoflush.__enter__.called
     assert db.delete.call_args_list == [call(mock_user_api), call(mock_api)]
     db.commit.assert_called_once()
+
+
+def test_the_locking_routes_are_sync_defs_so_a_lock_wait_never_holds_the_event_loop():
+    """Both routes below run a ``SELECT ... FOR UPDATE`` that can wait
+    indefinitely on a concurrent writer. FastAPI runs a coroutine route on
+    the event loop thread itself, so such a wait inside an ``async def``
+    route stalls every other request the process is serving. Declaring them
+    as plain ``def`` puts them in the threadpool instead, which is what the
+    MCP side's own PUT already does."""
+    import inspect
+
+    from xagent.web.api import custom_api as custom_api_api
+
+    assert not inspect.iscoroutinefunction(custom_api_api.update_custom_api)
+    assert not inspect.iscoroutinefunction(custom_api_api.delete_custom_api)

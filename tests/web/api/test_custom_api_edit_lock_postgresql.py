@@ -19,7 +19,6 @@ opening a hand-rolled connection. That helper reads
 
 from __future__ import annotations
 
-import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -124,23 +123,19 @@ def test_a_second_editor_blocks_until_the_first_editors_transaction_finishes(
     try:
 
         def run_first():
-            return asyncio.run(
-                custom_api_api.update_custom_api(
-                    api_id,
-                    CustomApiUpdate(name="renamed-by-first-editor"),
-                    current_user=current_user,
-                    db=session_a,
-                )
+            return custom_api_api.update_custom_api(
+                api_id,
+                CustomApiUpdate(name="renamed-by-first-editor"),
+                current_user=current_user,
+                db=session_a,
             )
 
         def run_second():
-            result = asyncio.run(
-                custom_api_api.update_custom_api(
-                    api_id,
-                    CustomApiUpdate(description="edited-by-second-editor"),
-                    current_user=current_user,
-                    db=session_b,
-                )
+            result = custom_api_api.update_custom_api(
+                api_id,
+                CustomApiUpdate(description="edited-by-second-editor"),
+                current_user=current_user,
+                db=session_b,
             )
             second_finished.set()
             return result
@@ -227,23 +222,19 @@ def test_the_second_editors_rename_reports_the_first_editors_committed_name_as_o
             set_connector_team_hooks(renamed=spy_renamed_hook)
 
             def run_first():
-                return asyncio.run(
-                    custom_api_api.update_custom_api(
-                        api_id,
-                        CustomApiUpdate(name="renamed-by-first-editor"),
-                        current_user=current_user,
-                        db=session_a,
-                    )
+                return custom_api_api.update_custom_api(
+                    api_id,
+                    CustomApiUpdate(name="renamed-by-first-editor"),
+                    current_user=current_user,
+                    db=session_a,
                 )
 
             def run_second():
-                result = asyncio.run(
-                    custom_api_api.update_custom_api(
-                        api_id,
-                        CustomApiUpdate(name="renamed-by-second-editor"),
-                        current_user=current_user,
-                        db=session_b,
-                    )
+                result = custom_api_api.update_custom_api(
+                    api_id,
+                    CustomApiUpdate(name="renamed-by-second-editor"),
+                    current_user=current_user,
+                    db=session_b,
                 )
                 second_finished.set()
                 return result
@@ -307,13 +298,11 @@ def test_a_row_that_vanishes_after_the_gate_but_before_the_lock_is_a_404_not_a_5
     db = session_factory()
     try:
         with pytest.raises(HTTPException) as exc:
-            asyncio.run(
-                custom_api_api.update_custom_api(
-                    api_id,
-                    CustomApiUpdate(name="renamed-after-vanish"),
-                    current_user=current_user,
-                    db=db,
-                )
+            custom_api_api.update_custom_api(
+                api_id,
+                CustomApiUpdate(name="renamed-after-vanish"),
+                current_user=current_user,
+                db=db,
             )
         assert exc.value.status_code == 404
     finally:

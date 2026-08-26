@@ -374,7 +374,7 @@ async def get_custom_api(
 
 
 @custom_api_router.put("/{api_id}", response_model=CustomApiResponse)
-async def update_custom_api(
+def update_custom_api(
     api_id: int,
     api_data: CustomApiUpdate,
     current_user: User = Depends(get_current_user),
@@ -546,7 +546,7 @@ async def update_custom_api(
 
 
 @custom_api_router.delete("/{api_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_custom_api(
+def delete_custom_api(
     api_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

@@ -487,7 +487,7 @@ class TestReportedEditPermissionConsistencyCustomApi:
             )
 
             try:
-                await update_custom_api(
+                update_custom_api(
                     api_id,
                     CustomApiUpdate(description="edited by the consistency test"),
                     current_user=caller,
@@ -908,7 +908,7 @@ class TestStandaloneParityWithNoHookInstalled:
             # user_api.can_edit OR the team verdict; with no hook and no
             # can_edit on a non-owner's row, this is 403 for population B.
             if population == "owner":
-                api_put_response = await update_custom_api(
+                api_put_response = update_custom_api(
                     api_id,
                     CustomApiUpdate(description="row11-changed"),
                     current_user=caller,
@@ -917,7 +917,7 @@ class TestStandaloneParityWithNoHookInstalled:
                 assert api_put_response.id == api_id
             else:
                 with pytest.raises(HTTPException) as exc:
-                    await update_custom_api(
+                    update_custom_api(
                         api_id,
                         CustomApiUpdate(description="row11-attempted"),
                         current_user=caller,
@@ -930,7 +930,7 @@ class TestStandaloneParityWithNoHookInstalled:
             # the can_edit gate fires before the is_active-only check is
             # ever reached, so this is 403 for population B too, not 200.
             if population == "owner":
-                api_row12_response = await update_custom_api(
+                api_row12_response = update_custom_api(
                     api_id,
                     CustomApiUpdate(is_active=False),
                     current_user=caller,
@@ -939,7 +939,7 @@ class TestStandaloneParityWithNoHookInstalled:
                 assert api_row12_response.is_active is False
             else:
                 with pytest.raises(HTTPException) as exc:
-                    await update_custom_api(
+                    update_custom_api(
                         api_id,
                         CustomApiUpdate(is_active=False),
                         current_user=caller,
@@ -959,10 +959,10 @@ class TestStandaloneParityWithNoHookInstalled:
 
             # Row 13: DELETE /custom-apis/{id} -- last, same reasoning.
             if population == "owner":
-                await delete_custom_api(api_id, current_user=caller, db=db)
+                delete_custom_api(api_id, current_user=caller, db=db)
             else:
                 with pytest.raises(HTTPException) as exc:
-                    await delete_custom_api(api_id, current_user=caller, db=db)
+                    delete_custom_api(api_id, current_user=caller, db=db)
                 assert exc.value.status_code == 403
 
     async def test_a_complete_stranger_still_gets_404_everywhere_with_no_hook(self, db):
@@ -999,7 +999,7 @@ class TestStandaloneParityWithNoHookInstalled:
             assert exc.value.status_code == 404
 
             with pytest.raises(HTTPException) as exc:
-                await update_custom_api(
+                update_custom_api(
                     api_id,
                     CustomApiUpdate(description="x"),
                     current_user=stranger,
@@ -1711,7 +1711,7 @@ class TestAdminInspectingAnotherUsersListReportsPerKindSubject:
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=access_hook_denies_everyone)
             with pytest.raises(HTTPException) as exc:
-                await update_custom_api(
+                update_custom_api(
                     api_id,
                     CustomApiUpdate(description="admin-attempted-edit"),
                     current_user=admin,
