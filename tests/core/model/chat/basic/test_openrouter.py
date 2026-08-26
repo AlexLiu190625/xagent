@@ -2791,6 +2791,7 @@ async def test_openrouter_deepseek_vision_captures_reasoning_provider_state(mock
 
     result = await llm.vision_chat(
         [{"role": "user", "content": [{"type": "text", "text": "what is this?"}]}],
+        tools=_single_tool_schema("search"),
         thinking={"type": "enabled"},
     )
 
@@ -2927,6 +2928,76 @@ async def test_openrouter_deepseek_no_warning_when_thinking_not_requested(
         "no reasoning content was captured" in record.message
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_no_capture_warning_after_thinking_disabled_retry(
+    mocker, caplog
+):
+    """The capture-miss WARNING judges each attempt by that attempt's own
+    thinking configuration.
+
+    ``chat`` retries once with thinking disabled when a structured-output
+    request came back as non-JSON while thinking was on. That retry really
+    does ask for no thinking, so an empty reasoning capture on its response
+    is the expected outcome -- not the silent-failure mode this warning
+    exists to report. Judging the retry by the first attempt's "thinking
+    enabled" would print a warning that sends a reader looking for a
+    renamed provider field that is not there.
+    """
+    import logging
+
+    non_json_message = SimpleNamespace(
+        content="Here is the answer, but it is not JSON.",
+        tool_calls=None,
+        reasoning_content="Thinking about the schema first.",
+    )
+    thinking_on_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=non_json_message)],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-deepseek-non-json"},
+    )
+    thinking_off_response = _openrouter_tool_call_response(reasoning_content="unset")
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        thinking_on_response,
+        thinking_off_response,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.model.chat.basic.openrouter"
+    ):
+        result = await llm.chat(
+            [{"role": "user", "content": "Search xagent"}],
+            tools=_single_tool_schema("search"),
+            response_format={"type": "json_object"},
+            thinking={"type": "enabled"},
+        )
+
+    # The retry really did go out with thinking off -- otherwise this test
+    # would be asserting silence on a request that never changed.
+    assert mock_client.chat.completions.create.await_count == 2
+    retry_extra_body = mock_client.chat.completions.create.call_args.kwargs[
+        "extra_body"
+    ]
+    assert retry_extra_body["thinking"] == {"type": "disabled"}
+    assert retry_extra_body["reasoning"] == {"enabled": False}
+    assert result["type"] == "tool_call"
+
+    assert not [
+        record.message
+        for record in caplog.records
+        if "no reasoning content was captured" in record.message
+    ]
 
 
 @pytest.mark.asyncio

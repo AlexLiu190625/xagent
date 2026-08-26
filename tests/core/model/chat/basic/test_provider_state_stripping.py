@@ -109,6 +109,55 @@ async def test_zhipu_chat_strips_internal_keys_before_the_sdk_call(mocker):
 
 
 @pytest.mark.asyncio
+async def test_zhipu_vision_chat_strips_internal_keys_before_the_sdk_call(mocker):
+    """Zhipu: ``vision_chat`` assembles its own request instead of delegating
+    to ``chat``, so it carries its own strip call and needs its own check.
+    Registering the class once is not the same as exercising each entrypoint.
+    """
+    mock_response = mocker.MagicMock()
+    mock_response.choices = [mocker.MagicMock()]
+    mock_response.choices[0].message.tool_calls = None
+    mock_response.choices[0].message.content = "done"
+    mock_response.usage = None
+    mock_client = mocker.MagicMock()
+    mock_client.chat.completions.create.return_value = mock_response
+    mocker.patch(
+        "xagent.core.model.chat.basic.zhipu.ZhipuAiClient",
+        return_value=mock_client,
+    )
+    llm = ZhipuLLM(
+        model_name="glm-4.5v",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "vision"],
+    )
+
+    await llm.vision_chat(_MARKED_HISTORY)
+
+    sent_messages = mock_client.chat.completions.create.call_args.kwargs["messages"]
+    _assert_no_internal_keys(sent_messages)
+
+
+@pytest.mark.asyncio
+async def test_zhipu_stream_chat_strips_internal_keys_before_the_sdk_call(mocker):
+    """Zhipu: ``stream_chat`` is the third entrypoint that builds its own
+    request, on a separate producer-thread code path from ``chat``.
+    """
+    mock_client = mocker.MagicMock()
+    mock_client.chat.completions.create.return_value = []
+    mocker.patch(
+        "xagent.core.model.chat.basic.zhipu.ZhipuAiClient",
+        return_value=mock_client,
+    )
+    llm = ZhipuLLM(api_key="test-key")
+
+    async for _chunk in llm.stream_chat(_MARKED_HISTORY):
+        pass
+
+    sent_messages = mock_client.chat.completions.create.call_args.kwargs["messages"]
+    _assert_no_internal_keys(sent_messages)
+
+
+@pytest.mark.asyncio
 async def test_xinference_chat_strips_internal_keys_before_the_sdk_call(mocker):
     """Xinference: same wholesale-forwarding shape as Zhipu, same fix."""
 
@@ -125,6 +174,37 @@ async def test_xinference_chat_strips_internal_keys_before_the_sdk_call(mocker):
     llm._model_handle = handle
 
     await llm.chat(_MARKED_HISTORY)
+
+    _assert_no_internal_keys(handle.received_messages)
+
+
+@pytest.mark.asyncio
+async def test_xinference_stream_chat_strips_internal_keys_before_the_sdk_call(mocker):
+    """Xinference: ``stream_chat`` is a second wholesale-forwarding path with
+    its own strip call. ``vision_chat`` needs no separate check here -- it
+    delegates straight to ``chat`` (see xinference.py) rather than building
+    a request of its own.
+    """
+
+    class _EmptyStream:
+        def __aiter__(self) -> "_EmptyStream":
+            return self
+
+        async def __anext__(self) -> Any:
+            raise StopAsyncIteration
+
+    class _StreamHandle:
+        async def chat(self, **kwargs: Any) -> _EmptyStream:
+            self.received_messages = kwargs["messages"]
+            return _EmptyStream()
+
+    llm = XinferenceLLM(model_name="qwen3.8")
+    handle = _StreamHandle()
+    llm._client = mocker.MagicMock()
+    llm._model_handle = handle
+
+    async for _chunk in llm.stream_chat(_MARKED_HISTORY):
+        pass
 
     _assert_no_internal_keys(handle.received_messages)
 

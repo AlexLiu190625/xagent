@@ -840,7 +840,11 @@ async def test_router_auto_fallback_vision_deepseek_round_trips_reasoning(
     # combined scenario to actually reach vision_chat successfully).
     assert prepared.has_ability("vision") is True
 
-    result = await prepared.vision_chat(messages, thinking={"type": "enabled"})
+    result = await prepared.vision_chat(
+        messages,
+        tools=[_tool_schema()],
+        thinking={"type": "enabled"},
+    )
 
     assert result[PROVIDER_STATE_METADATA_KEY] == {
         "deepseek": {"reasoning_content": "Looking at the picture first."}
