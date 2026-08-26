@@ -77,6 +77,16 @@ export class MessageDeliveryError extends Error {
   }
 }
 
+const resolveBrowserTimezone = (): string | undefined => {
+  try {
+    // Defensive: neither a throwing Intl nor an empty resolved zone may block
+    // the send. The caller's truthiness check drops "".
+    return Intl.DateTimeFormat().resolvedOptions().timeZone
+  } catch {
+    return undefined
+  }
+}
+
 const deliveryError = (
   message: string,
   disposition: MessageDeliveryDisposition,
@@ -330,6 +340,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const tokenRef = useRef(token !== undefined ? token : authToken)
   const pendingDeliveriesRef = useRef(new Map<string, PendingDelivery>())
   const preparationsRef = useRef(new Map<string, MessagePreparationClaim>())
+  // Keyed by the logical client_message_id, not by physical send. The durable
+  // transport compares the whole payload, so a same-id retry that re-resolved
+  // the zone would be rejected as different content while the first command may
+  // still be executing. Cleared on either terminal ack below.
+  const attemptTimezonesRef = useRef(new Map<string, string | undefined>())
   const recentMessagesRef = useRef<RecentMessage[]>([])
   const callbacksRef = useRef<WebSocketCallbacks>({
     onConnectionClose,
@@ -886,6 +901,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             ) {
               clearTimeout(pending.timeout)
               pendingDeliveriesRef.current.delete(clientMessageId)
+              if (
+                data.type === 'message_accepted'
+                || data.rejection_outcome === "not_accepted"
+              ) {
+                // Terminal for this id: accepted, or rejected without a
+                // same-id retry. An unknown outcome keeps the binding.
+                attemptTimezonesRef.current.delete(clientMessageId)
+              }
               if (data.type === 'message_accepted') {
                 pending.resolve({
                   client_message_id: clientMessageId,
@@ -1176,10 +1199,15 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     preparationsRef.current.set(clientMessageId, claim)
 
     try {
+      if (!attemptTimezonesRef.current.has(clientMessageId)) {
+        attemptTimezonesRef.current.set(clientMessageId, resolveBrowserTimezone())
+      }
+      const browserTimezone = attemptTimezonesRef.current.get(clientMessageId)
       const messageData: Record<string, unknown> = {
         type: 'chat',
         message,
         client_message_id: clientMessageId,
+        ...(browserTimezone ? { context: { timezone: browserTimezone } } : {}),
         ...(connection.chatTaskIdMode === "required" ? { task_id: currentTaskId } : {}),
       }
 
