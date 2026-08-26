@@ -169,7 +169,25 @@ def set_connector_team_hooks(
 
 
 def visible_team_connector_ids(db: Any, user_id: int) -> dict[str, set[int]]:
-    """Team-shared connector ids visible to user; empty when no hook/standalone."""
+    """Team-shared connector ids visible to user; empty when no hook/standalone.
+
+    Answers list membership only. Direct-id reachability and edit
+    authority come from a different hook -- ``resolve_connector_access``
+    -- and xagent enforces no relationship between the two answers:
+    they are separate module-level slots, installed separately, and
+    nothing cross-checks them. An installing application must derive
+    both from one and the same link query, because it is the only side
+    that can see its own link table; xagent cannot verify that and does
+    not try.
+
+    When the two answers disagree, xagent answers each question from the
+    hook that owns it and does not reconcile them: a connector this hook
+    returns but the access hook omits appears in the listing and 404s on
+    direct id; a connector the access hook grants but this hook omits is
+    absent from the listing and still reachable and editable by id.
+    Neither is a defect in xagent -- both are what the installed answers
+    said.
+    """
     if _connector_visibility_hook is None:
         return {"mcp": set(), "custom_api": set()}
     return _connector_visibility_hook(db, int(user_id))
@@ -356,6 +374,22 @@ def resolve_connector_access(
     link this connector" -- the only way that fact is ever expressed (see
     ``_validate_connector_access_answer``). The answer is shape-validated
     before it reaches any caller.
+
+    Answers direct-id reachability and edit authority only. List
+    membership comes from a different hook -- ``visible_team_connector_ids``
+    -- and xagent enforces no relationship between the two answers: they
+    are separate module-level slots, installed separately, and nothing
+    cross-checks them. An installing application must derive both from one
+    and the same link query, because it is the only side that can see its
+    own link table; xagent cannot verify that and does not try.
+
+    When the two answers disagree, xagent answers each question from the
+    hook that owns it and does not reconcile them: a connector this hook
+    grants but the visibility hook omits is absent from the listing and
+    still reachable and editable by id; a connector the visibility hook
+    returns but this hook omits appears in the listing and 404s on direct
+    id. Neither is a defect in xagent -- both are what the installed
+    answers said.
     """
     requested = frozenset(
         (connector_type, int(connector_id)) for connector_type, connector_id in refs
