@@ -310,6 +310,26 @@ class TestNormalizeVisionResponse:
         else:
             assert result.text is None
 
+    @pytest.mark.parametrize(
+        "label,response",
+        [
+            ("bare_whitespace", " " * 9000),
+            ("envelope_whitespace_content", {"type": "text", "content": " " * 9000}),
+        ],
+    )
+    def test_empty_raw_display_is_truncated(self, label, response):
+        """The shape matrix rows are all short, so the cap holds trivially
+        there. A whitespace-only payload long enough to exceed the limit
+        forces the empty branches to route through the truncator like every
+        other branch does."""
+        result = _normalize_vision_response(response)
+
+        assert result.kind == "empty"
+        # The 4000-char prefix plus the marker: the marker is appended
+        # *after* the cap, so the returned string is 4025 chars, not 4000.
+        assert result.raw_display == " " * 4000 + "...<truncated 5000 chars>"
+        assert len(result.raw_display) == 4025
+
 
 class TestVisionToolInitialization:
     """Test cases for VisionTool initialization"""

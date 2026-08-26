@@ -90,7 +90,10 @@ def _normalize_vision_response(result: Any) -> _NormalizedVisionResponse:
     if isinstance(result, str):
         if not result.strip():
             return _NormalizedVisionResponse(
-                kind="empty", text=result, tool_calls=[], raw_display=result
+                kind="empty",
+                text=result,
+                tool_calls=[],
+                raw_display=_truncate_vision_raw_display(result),
             )
         return _NormalizedVisionResponse(
             kind="text",
@@ -118,7 +121,7 @@ def _normalize_vision_response(result: Any) -> _NormalizedVisionResponse:
                         kind="empty",
                         text=content,
                         tool_calls=[],
-                        raw_display=content,
+                        raw_display=_truncate_vision_raw_display(content),
                     )
                 return _NormalizedVisionResponse(
                     kind="text",
