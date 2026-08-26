@@ -100,8 +100,8 @@ from ..services.db_runtime import (
 )
 from ..services.external_task_cancel import (
     EXTERNAL_COMMAND_SCOPE,
-    EXTERNAL_TURN_INTERRUPTED_MESSAGE,
     cancel_external_task_unserialized,
+    external_cancel_exhausted_message,
 )
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
@@ -405,7 +405,11 @@ def client_safe_error_message(error: BaseException) -> str:
 
 
 def client_safe_task_command_failure(
-    kind: TaskCommandKind, error: BaseException, *, scope: str | None = None
+    kind: TaskCommandKind,
+    error: BaseException,
+    *,
+    scope: str | None = None,
+    task_status: TaskStatus | None = None,
 ) -> str:
     """Terminal command failure: server-owned kind prefix + redacted detail.
 
@@ -415,12 +419,15 @@ def client_safe_task_command_failure(
 
     An external-scope cancel is the one command a task's audience issues
     without any account behind it, and its whole meaning is "stop this
-    response". Whatever exhausted the command's budget, the audience gets the
-    same sentence the terminal event carries, with no command identity or
-    exception detail attached.
+    response". That audience gets neither the command identity nor the
+    exception detail - and it gets a sentence about the turn rather than
+    about the command, which is why the caller reads the task and hands the
+    status in. Saying the response was interrupted when the task is still
+    running would be false, and the visitor would keep waiting on a turn
+    nobody stopped.
     """
     if kind == TaskCommandKind.CANCEL and scope == EXTERNAL_COMMAND_SCOPE:
-        return EXTERNAL_TURN_INTERRUPTED_MESSAGE
+        return external_cancel_exhausted_message(task_status)
     return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
 
 
@@ -8482,15 +8489,37 @@ async def _execute_durable_task_command(
                     )
                 # The A2A execution core loads its target as an A2A task, so
                 # a cancel for any other task source needs its own core. The
-                # scope names which one; a payload without it is an A2A
-                # cancel, the only shape this command had before.
+                # scope names which one, and the absence of the key is itself
+                # a value: it is the only shape this command had before the
+                # external core existed, so it stays on the A2A path. Any
+                # other value names a core that does not exist here, and
+                # silently running the A2A one against it would cancel
+                # nothing while reporting success.
+                if "scope" not in message_data:
+                    scope_value = EXTERNAL_COMMAND_SCOPE_ABSENT
+                else:
+                    scope_value = message_data["scope"]
+                # Identity and equality checks rather than set membership:
+                # an unhashable payload value (a dict or list) must land in
+                # the same terminal rejection, not raise ``TypeError`` into
+                # the retry path.
+                if (
+                    scope_value is not EXTERNAL_COMMAND_SCOPE_ABSENT
+                    and scope_value != EXTERNAL_COMMAND_SCOPE
+                ):
+                    raise TaskCommandRejected(
+                        f"Cancel command {command.command_id} names task scope "
+                        f"{scope_value!r}, which has no execution core",
+                        reason="unsupported_scope",
+                    )
                 async with task_execution_controller.command(command.task_id):
-                    if message_data.get("scope") == EXTERNAL_COMMAND_SCOPE:
+                    if scope_value == EXTERNAL_COMMAND_SCOPE:
                         await cancel_external_task_unserialized(
                             task_id=command.task_id,
                             agent_id=agent_id,
                             expected_run_id=command.target_run_id,
                             expected_state_version=target_state_version,
+                            turn_id=_command_turn_id(command.task_id, message_data),
                         )
                     else:
                         from .a2a import _cancel_task_unserialized
@@ -8515,6 +8544,12 @@ async def _execute_durable_task_command(
     }
 
 
+# "no scope key at all" needs a value the scope check can compare against
+# and no payload can ever carry. A JSON payload cannot hold this object, so
+# a producer cannot forge the pre-external shape by writing a string.
+EXTERNAL_COMMAND_SCOPE_ABSENT = object()
+
+
 def _command_scope(command: ClaimedTaskCommand) -> str | None:
     """The scope a command payload names, or ``None`` when it names none."""
 
@@ -8522,23 +8557,79 @@ def _command_scope(command: ClaimedTaskCommand) -> str | None:
     return scope if isinstance(scope, str) else None
 
 
+def _command_turn_id(task_id: int, message_data: dict[str, Any]) -> str | None:
+    """The turn a command names, or ``None`` when it names none usably.
+
+    The value only picks which delivery row a cancel closes. A producer that
+    writes something other than a non-empty string is a bug, but refusing
+    the stop over it would leave the visitor's turn running, so the target
+    falls back to the running turn and the bug is logged rather than raised.
+    """
+
+    if "turn_id" not in message_data:
+        return None
+    raw = message_data["turn_id"]
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    logger.warning(
+        "task %s cancel command carries an unusable turn_id of type %s; "
+        "falling back to the running turn's delivery row",
+        task_id,
+        type(raw).__name__,
+    )
+    return None
+
+
+def _is_external_cancel(command: ClaimedTaskCommand) -> bool:
+    """Whether this command is a stop issued by a task's external audience."""
+
+    return (
+        command.kind == TaskCommandKind.CANCEL
+        and _command_scope(command) == EXTERNAL_COMMAND_SCOPE
+    )
+
+
 async def _broadcast_terminal_command_error(
     command: ClaimedTaskCommand,
     error: BaseException,
 ) -> None:
+    scope = _command_scope(command)
+    # Two things separate an external-scope cancel from every other command
+    # that exhausts its budget, and both come from who reads the frame. The
+    # wording has to be true about the turn, which takes reading the task.
+    # And ``command_kind``/``command_id`` are operator handles: an anonymous
+    # visitor cannot act on them and should not be shown the durable command
+    # identity of a task they do not own. Two payload literals rather than
+    # one built and trimmed: the client-safe guard only inspects dict
+    # literals passed straight to the sink, and a payload assembled in a
+    # variable would drop this site out of its view entirely.
+    if _is_external_cancel(command):
+        task_status = await _load_terminal_command_task_status(command.task_id)
+        await manager.broadcast_to_task(
+            {
+                "type": "agent_error",
+                "message": client_safe_task_command_failure(
+                    command.kind,
+                    error,
+                    scope=scope,
+                    task_status=task_status,
+                ),
+                "task_id": command.task_id,
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+            },
+            command.task_id,
+        )
+        return
     await manager.broadcast_to_task(
         {
             "type": "agent_error",
             # A blessed constructor rather than an f-string at the call
             # site: the guard cannot see inside an interpolation. The kind
             # also travels as a structured field for consumers that want it.
-            # The scope goes with it because the audience of an
-            # external-scope command is not the audience the default
-            # wording was written for.
             "message": client_safe_task_command_failure(
                 command.kind,
                 error,
-                scope=_command_scope(command),
+                scope=scope,
             ),
             "command_kind": command.kind.value,
             "task_id": command.task_id,
@@ -8604,6 +8695,36 @@ def _load_command_task_run_id(task_id: int) -> str | None:
         if task is None:
             raise ValueError(f"Task {task_id} no longer exists")
         return str(task.run_id) if task.run_id is not None else None
+
+
+async def _load_terminal_command_task_status(task_id: int) -> TaskStatus | None:
+    """The task's status right now, or ``None`` when it cannot be read.
+
+    This read only chooses wording for a notification that is already the
+    last act of a terminal command, and it runs inside the ``except`` bodies
+    of ``execute_durable_task_command``. An exception raised here would
+    replace the failure that dispatcher is handling, turning "the command
+    failed" into "the database failed", so an unreadable row - deleted, pool
+    exhausted, database down - is answered as ``None`` and logged.
+    ``CancelledError`` is deliberately not caught: a cancelled dispatcher
+    still has to unwind.
+    """
+
+    def _read() -> TaskStatus | None:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            task = db.query(Task).filter(Task.id == task_id).first()
+            return task.status if task is not None else None
+
+    try:
+        return await run_db_io_cancellation_safe(_read)
+    except Exception:
+        logger.warning(
+            "could not read task %s status while wording a terminal command broadcast",
+            task_id,
+            exc_info=True,
+        )
+        return None
 
 
 @ws_router.websocket("/ws/build/chat")
