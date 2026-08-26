@@ -3142,6 +3142,78 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     assert "get_workspace_output_files" not in answer_schema["description"]
 
 
+def test_interaction_type_list_has_one_source() -> None:
+    from xagent.core.tools.adapters.vibe.ask_user_tool import InteractionArg
+    from xagent.core.tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+    from xagent.web.services.task_interaction_service import _V1_INTERACTION_TYPES
+
+    assert INTERACTION_TYPES == (
+        "select_one",
+        "select_multiple",
+        "text_input",
+        "file_upload",
+        "confirm",
+        "number_input",
+        "action_cards",
+    )
+    assert InteractionArg.model_fields["type"].description == (
+        "Type of interaction: select_one, select_multiple, text_input, "
+        "file_upload, confirm, number_input, action_cards"
+    )
+    assert frozenset(INTERACTION_TYPES) == _V1_INTERACTION_TYPES
+
+
+async def test_react_pattern_ask_user_question_schema_derives_its_type_enum_from_one_source() -> (
+    None
+):
+    """The ask_user_question tool's ``interactions[].type`` enum is built
+    from ``interaction_types.INTERACTION_TYPES`` rather than a copy written
+    out in this schema; a name added or reordered there must show up here
+    unchanged."""
+
+    from xagent.core.tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+
+    llm = FakeLLM(responses=[{"content": "No tools needed."}])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext()
+    context.add_user_message("Say hi")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeAskUserTool()],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    ask_user_schema = next(
+        schema
+        for schema in llm.calls[0]["tools"]
+        if schema["function"]["name"] == "ask_user_question"
+    )["function"]
+    type_enum = ask_user_schema["parameters"]["properties"]["interactions"]["items"][
+        "properties"
+    ]["type"]["enum"]
+    assert type_enum == list(INTERACTION_TYPES)
+
+
+def test_react_module_pulls_in_no_web_modules() -> None:
+    """react.py must not depend on xagent.web. The interaction type list it
+    reads lives in an import-free module for exactly this reason -- putting
+    it beside InteractionArg in ask_user_tool pulls the tool-registration
+    chain and 61 xagent.web modules into every import of this pattern."""
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys; import xagent.core.agent.pattern.react.react; "
+        "print(len([m for m in sys.modules if m.startswith('xagent.web')]))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    assert out.stdout.strip() == "0"
+
+
 def test_react_final_answer_lookup_instruction_tracks_active_workspace_tool() -> None:
     pattern = ReActPattern()
 

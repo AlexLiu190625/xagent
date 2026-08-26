@@ -48,6 +48,7 @@ from ....file_ref import (
 )
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
+from ....tools.adapters.vibe.interaction_types import INTERACTION_TYPES
 from ....tools.user_interaction import (
     tool_result_waits_for_user,
     user_interaction_resume_callable,
@@ -1812,15 +1813,7 @@ class ReActPattern(AgentPattern):
                                     "properties": {
                                         "type": {
                                             "type": "string",
-                                            "enum": [
-                                                "select_one",
-                                                "select_multiple",
-                                                "text_input",
-                                                "file_upload",
-                                                "confirm",
-                                                "number_input",
-                                                "action_cards",
-                                            ],
+                                            "enum": list(INTERACTION_TYPES),
                                         },
                                         "field": {"type": "string"},
                                         "label": {"type": "string"},
