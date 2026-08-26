@@ -249,9 +249,12 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
     -- so this stays consistent with the frontend regardless of which one
     changes first.
 
-    This function does not deduplicate field names within a single call; a
-    batch with colliding normalized fields is returned unchanged, and a
-    warning is logged. The single-tool call site (``ask_user_question`` in
+    This function does not deduplicate field names within a single call: it
+    keeps every colliding entry as its own interaction rather than dropping
+    or renaming one. Each one still goes through every other step above --
+    its field is trimmed, its options are filtered, ``actions`` is stripped
+    -- only the name collision itself is left as-is, and a warning is
+    logged. The single-tool call site (``ask_user_question`` in
     ``_handle_control_tool``) sends the result on as-is. The multi-tool call
     site (``_pause_for_tool_results``) runs its own deduplication across all
     tools' interactions after calling this function once per tool.
@@ -262,9 +265,9 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
 
     The output never carries an ``actions`` key: ``actions`` is a model
     alias for ``options`` (consumed above whenever ``options`` itself is
-    missing or not a list), and leaving the raw, unfiltered alias in the
-    output would give the persisted row a second, never-filtered carrier of
-    the same option list.
+    missing or not a list, and ``actions`` is itself a list), and leaving
+    the raw, unfiltered alias in the output would give the persisted row a
+    second, never-filtered carrier of the same option list.
     """
 
     if not isinstance(interactions, list):
