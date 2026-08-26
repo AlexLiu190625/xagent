@@ -2906,7 +2906,14 @@ class AgentServiceManager:
                     await self._load_persisted_execution_context(task_id, db)
 
             except Exception as e:
-                logger.error(f"Failed to create AgentService for task {task_id}: {e}")
+                # ``exc_info`` because this arm absorbs any wrapped fault --
+                # a durable-storage one from attachment restore included --
+                # whose provider cause lives only in ``__cause__`` (#1467).
+                # It re-raises, so nothing but the log line changes.
+                logger.error(
+                    f"Failed to create AgentService for task {task_id}: {e}",
+                    exc_info=True,
+                )
                 # Re-raise the exception - no fallback logic allowed
                 raise
 
