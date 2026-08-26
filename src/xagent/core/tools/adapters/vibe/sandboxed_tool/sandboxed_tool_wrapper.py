@@ -718,7 +718,11 @@ async def create_workspace_in_sandbox(
     sandbox: Sandbox,
     workspace: TaskWorkspace,
 ) -> None:
-    """Create workspace directories inside the sandbox.
+    """Create workspace directories inside an independently-backed sandbox.
+
+    This is the fallback for raw/standalone sandbox integrations. Web sandbox
+    lease providers expose their host-mount coverage to ``ToolFactory`` and
+    skip this exec when the host-created workspace is already visible.
 
     Args:
         sandbox: Sandbox instance

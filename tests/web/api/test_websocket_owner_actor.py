@@ -1644,6 +1644,78 @@ async def test_live_marker_failure_after_registered_handoff_is_still_accepted(
 
 
 @pytest.mark.asyncio
+async def test_live_resume_reads_the_interaction_row_before_injecting(
+    db_session,
+) -> None:
+    """The close is keyed on the row observed *before* the injection, and
+    only the ordering makes that true -- see task_interaction_close's
+    module docstring. The read also sits before the ``posted`` fork, so the
+    deferred branch carries the same observation instead of taking one of
+    its own even later."""
+
+    owner = _user(db_session, "close-order-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "close-order-runner"
+    task.run_id = "close-order-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+
+    order: list[str] = []
+
+    def record_read(_task_id: int) -> int:
+        order.append("read")
+        return 4321
+
+    async def record_injection(*_args: object, **_kwargs: object) -> bool:
+        order.append("inject")
+        return True
+
+    agent.post_user_message = AsyncMock(side_effect=record_injection)
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch(
+            "xagent.web.api.websocket.active_interaction_id_sync",
+            side_effect=record_read,
+        ),
+        patch(
+            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            return_value=1,
+        ) as close_mock,
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Apply this once",
+                "client_message_id": "close-order-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    assert order == ["read", "inject"]
+    close_mock.assert_called_once_with(
+        task_id=int(task.id), run_id="close-order-run", interaction_id=4321
+    )
+
+
+@pytest.mark.asyncio
 async def test_live_close_failure_after_registered_handoff_is_still_accepted(
     db_session,
 ) -> None:
@@ -1691,7 +1763,9 @@ async def test_live_close_failure_after_registered_handoff_is_still_accepted(
         )
 
     bg_mgr.register_reserved_resume.assert_called_once()
-    close_mock.assert_called_once_with(int(task.id), "close-failure-run")
+    close_mock.assert_called_once_with(
+        task_id=int(task.id), run_id="close-failure-run", interaction_id=None
+    )
     accepted = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
@@ -1751,7 +1825,9 @@ async def test_live_close_cancellation_does_not_abort_registered_handoff(
         )
 
     bg_mgr.register_reserved_resume.assert_called_once()
-    close_mock.assert_called_once_with(int(task.id), "close-cancel-run")
+    close_mock.assert_called_once_with(
+        task_id=int(task.id), run_id="close-cancel-run", interaction_id=None
+    )
     accepted = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
@@ -3553,7 +3629,7 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
     # after the `with` block, outside that handler's reach.
     observed_close_calls: list[tuple[int, str, str | None]] = []
 
-    def fail_close(task_id_arg: int, run_id_arg: str) -> int:
+    def fail_close(*, task_id: int, run_id: str, interaction_id: int | None) -> int:
         # A fresh session, not db_session: this runs inside the worker
         # thread run_db_io_cancellation_safe schedules it on, while the
         # test's own db_session sits unused on the main thread -- sharing
@@ -3561,10 +3637,10 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
         # elsewhere.
         probe = next(get_db())
         try:
-            live_run_id = probe.query(Task).filter(Task.id == task_id_arg).one().run_id
+            live_run_id = probe.query(Task).filter(Task.id == task_id).one().run_id
         finally:
             probe.close()
-        observed_close_calls.append((task_id_arg, run_id_arg, live_run_id))
+        observed_close_calls.append((task_id, run_id, live_run_id))
         raise RuntimeError("interaction close unavailable")
 
     with (
@@ -3602,6 +3678,84 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
         if call.args[0].get("type") == "message_accepted"
     ]
     assert len(accepted) == 1
+
+
+@pytest.mark.asyncio
+async def test_deferred_injection_closes_the_row_the_online_handler_observed(
+    db_session,
+) -> None:
+    """The deferred path takes no observation of its own. Its injection is
+    later still than the online one, so a read taken here would be even
+    further past the point where the answered row is identifiable. The
+    online handler's pre-injection observation travels in
+    pending_user_message and is what the close is keyed on."""
+
+    owner = _user(db_session, "deferred-carry-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Deferred guidance",
+            message_type="user_message",
+            turn_id="deferred-carry-turn",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={"turn_id": "deferred-carry-turn"})
+        ]
+    )
+    agent = MagicMock(
+        post_user_message=AsyncMock(return_value=True),
+        resume_execution_by_id=AsyncMock(
+            return_value={
+                "status": "completed",
+                "success": True,
+                "output": "Applied",
+                "agent_result": {"context": context},
+            }
+        ),
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
+        patch(
+            "xagent.web.api.websocket.active_interaction_id_sync",
+            side_effect=AssertionError("the deferred path must not read its own"),
+        ),
+        patch(
+            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            return_value=1,
+        ) as close_mock,
+    ):
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            pending_user_message={
+                "execution_message": "Deferred guidance",
+                "display_message": "Deferred guidance",
+                "files": [],
+                "turn_id": "deferred-carry-turn",
+                "interaction_id": 9876,
+            },
+            delivery_turn_id="deferred-carry-turn",
+            delivery_websocket=MagicMock(),
+            delivery_client_message_id="deferred-carry-turn",
+        )
+
+    close_mock.assert_called_once()
+    assert close_mock.call_args.kwargs["task_id"] == int(task.id)
+    assert close_mock.call_args.kwargs["interaction_id"] == 9876
 
 
 @pytest.mark.asyncio
@@ -3652,13 +3806,15 @@ async def test_deferred_injection_close_cancellation_does_not_abort_resume(
     # ``except Exception:`` the same way it swallows an ordinary failure.
     observed_close_calls: list[tuple[int, str, str | None]] = []
 
-    def raise_cancelled(task_id_arg: int, run_id_arg: str) -> int:
+    def raise_cancelled(
+        *, task_id: int, run_id: str, interaction_id: int | None
+    ) -> int:
         probe = next(get_db())
         try:
-            live_run_id = probe.query(Task).filter(Task.id == task_id_arg).one().run_id
+            live_run_id = probe.query(Task).filter(Task.id == task_id).one().run_id
         finally:
             probe.close()
-        observed_close_calls.append((task_id_arg, run_id_arg, live_run_id))
+        observed_close_calls.append((task_id, run_id, live_run_id))
         raise asyncio.CancelledError
 
     with (
@@ -3778,3 +3934,270 @@ async def test_resume_non_owner_non_admin_is_refused(db_session) -> None:
     # Authorized away before any runtime is built; an error is sent back.
     assert "task_owner_user_id" not in captured
     ws_manager.send_personal_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_durable_attachment_failure_keeps_the_storage_key_off_the_socket(
+    db_session,
+    caplog,
+) -> None:
+    """A stored-file fault must not send the storage key to the client.
+
+    Attachment preparation runs in the handler's *outer* scope, so this fault
+    surfaces before the inner agent-execution arms and was answered with
+    ``str(exc)``, which then read
+    ``Failed to restore durable object: users/<id>/uploads/...`` and embedded the
+    owning user's id. Same defect as the model-facing leak in #1467, one
+    transport over.
+
+    The key has since moved off the message onto ``storage_key``, so ``str(exc)``
+    no longer carries it and this arm is no longer the only thing standing
+    between the fault and the client. Both still matter: this pins the arm's
+    fixed message, and ``test_the_wrap_keeps_the_storage_key_out_of_its_own_message``
+    pins the exception. Neither alone would have caught both rounds of this.
+
+    What this proves is the *rejection frame*: it asserts one was sent, so the
+    negative assertions below cannot pass over an empty list. The broadcast
+    assertion is defence in depth -- this path does not broadcast, so it holds
+    vacuously and exists to fail if a future edit starts. The persisted
+    rejection is not reached: ``finish_delivery_failure`` only writes when
+    ``delivery_claimed`` is set, and that comes from
+    ``preparation.delivery_claimed``, which never gets assigned when preparation
+    is what raised. Do not read this test as covering all three egresses.
+    """
+    import logging
+
+    from xagent.web.services.managed_file_ref import DurableStorageOperationError
+
+    owner = _user(db_session, "durable-leak-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    owner_id = int(owner.id)
+    task_id = int(task.id)
+    db_session.close()
+
+    storage_key = f"users/{owner_id}/uploads/8ac1f2/quarterly-report.xlsx"
+
+    class _ProviderThrottled(RuntimeError):
+        pass
+
+    def failing_prepare(**_kwargs):
+        wrap = DurableStorageOperationError(
+            "Failed to restore durable object", storage_key=storage_key
+        )
+        wrap.__cause__ = _ProviderThrottled("SlowDown: reduce your request rate")
+        raise wrap
+
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    logger_name = "xagent.web.api.websocket"
+
+    with (
+        patch(
+            "xagent.web.api.websocket._prepare_websocket_turn_sync",
+            side_effect=failing_prepare,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        caplog.at_level(logging.WARNING, logger=logger_name),
+    ):
+        with pytest.raises(DurableStorageOperationError):
+            await _handle_chat_message_unserialized(
+                MagicMock(),
+                task_id,
+                {
+                    "message": "with an attachment",
+                    "client_message_id": "durable-leak-probe",
+                    "user": SimpleNamespace(id=owner_id, is_admin=False),
+                    "files": ["8ac1f2"],
+                },
+            )
+
+    # The rejection frame must actually have gone out, or every negative
+    # assertion below would hold over nothing and this test would pass while
+    # answering the client with anything at all.
+    frames = [str(call) for call in ws_manager.send_personal_message.await_args_list]
+    assert any("message_rejected" in frame for frame in frames), frames
+
+    # Every outbound egress: nothing may carry the key or the provider text.
+    outbound = frames + [
+        str(call) for call in ws_manager.broadcast_to_task.await_args_list
+    ]
+    for payload in outbound:
+        assert storage_key not in payload
+        assert f"users/{owner_id}" not in payload
+        assert "Failed to restore durable object" not in payload
+        assert "SlowDown" not in payload
+
+    # The server-side record keeps the whole chain, exactly once.
+    fault_lines = [
+        logging.Formatter("%(message)s").format(entry)
+        for entry in caplog.records
+        if entry.name == logger_name
+        and "Durable storage unavailable" in entry.getMessage()
+    ]
+    assert len(fault_lines) == 1, fault_lines
+    assert "during websocket chat turn preparation" in fault_lines[0]
+    assert storage_key in fault_lines[0]
+    assert "_ProviderThrottled" in fault_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_fault_is_labelled_with_the_message_that_failed(
+    db_session,
+    caplog,
+) -> None:
+    """The endpoint arm must name the message it was applying, not "chat turn".
+
+    That arm guards the whole receive-loop dispatch, so it sees faults from
+    every message type whose handler lets one through. It logged a fixed
+    ``"websocket chat turn"``, mislabelling all of them in the single line meant
+    to be authoritative about what failed.
+
+    ``resume_task`` rather than ``execute_task``, and the difference matters:
+    ``handle_execute_task`` ends in ``except RuntimeError`` with no re-raise, so
+    a durable fault there never reaches this arm at all. An earlier version of
+    this test mocked that handler and asserted a label for a path production
+    cannot take -- green, and describing nothing.
+    ``handle_resume_task`` propagates, so mocking it to raise stands in for a
+    real fault, and
+    ``test_a_type_is_unlabelled_only_because_its_handler_swallows`` is what keeps
+    that distinction true rather than remembered.
+
+    Driven through the real endpoint, because neither the label map nor its
+    agreement with the cascade would notice this arm going back to a constant.
+    """
+    import json
+    import logging
+
+    from fastapi import WebSocketDisconnect
+
+    from xagent.web.services.managed_file_ref import DurableStorageOperationError
+
+    owner = _user(db_session, "dispatch-label-owner")
+    task = _task(db_session, owner.id)
+    owner_id = int(owner.id)
+    task_id = int(task.id)
+    db_session.close()
+
+    websocket = MagicMock()
+    websocket.receive_text = AsyncMock(
+        side_effect=[json.dumps({"type": "resume_task"}), WebSocketDisconnect()]
+    )
+    ws_manager = MagicMock(
+        connect=AsyncMock(),
+        disconnect=MagicMock(),
+        send_personal_message=AsyncMock(),
+        broadcast_to_task=AsyncMock(),
+    )
+    logger_name = "xagent.web.api.websocket"
+
+    with (
+        patch.object(websocket_api, "manager", ws_manager),
+        patch.object(
+            websocket_api,
+            "get_authenticated_user",
+            AsyncMock(return_value=SimpleNamespace(id=owner_id, is_admin=False)),
+        ),
+        patch.object(websocket_api, "handle_status_request", AsyncMock()),
+        patch.object(
+            websocket_api,
+            "handle_resume_task",
+            AsyncMock(
+                side_effect=DurableStorageOperationError(
+                    "Failed to restore durable object",
+                    storage_key=f"users/{owner_id}/uploads/a/b.txt",
+                )
+            ),
+        ),
+        caplog.at_level(logging.WARNING, logger=logger_name),
+    ):
+        await websocket_api.websocket_chat_endpoint(websocket, task_id, None)
+
+    fault_lines = [
+        entry.getMessage()
+        for entry in caplog.records
+        if entry.name == logger_name
+        and "Durable storage unavailable" in entry.getMessage()
+    ]
+    assert len(fault_lines) == 1, fault_lines
+    assert "during websocket resume_task" in fault_lines[0]
+    assert "chat turn" not in fault_lines[0]
+    # The key still reaches the log, from the attribute rather than the message.
+    assert f"storage_key=users/{owner_id}/uploads/a/b.txt" in fault_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_a_durable_integrity_fault_is_answered_as_corruption_not_an_outage(
+    db_session,
+    caplog,
+) -> None:
+    """The integrity subclass through the real cascade, not just the parent.
+
+    ``test_durable_attachment_failure_keeps_the_storage_key_off_the_socket``
+    injects only ``DurableStorageOperationError``, so it would pass with these
+    two arms swapped -- the parent would catch the subclass and tell the client
+    to retry something retrying cannot fix, while emitting a transient-outage
+    warning over the permanent-corruption ERROR already logged upstream.
+
+    Ordering is checked across all twelve pairs by
+    ``test_the_integrity_arm_precedes_its_parent_at_every_site``; this is what
+    proves this pair's arms also produce the right answers.
+    """
+    import logging
+
+    from xagent.web.services.managed_file_ref import (
+        FILE_INTEGRITY_REUPLOAD_MESSAGE,
+        DurableObjectIntegrityError,
+    )
+
+    owner = _user(db_session, "integrity-answer-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    owner_id = int(owner.id)
+    task_id = int(task.id)
+    db_session.close()
+
+    def failing_prepare(**_kwargs):
+        raise DurableObjectIntegrityError(
+            FILE_INTEGRITY_REUPLOAD_MESSAGE,
+            storage_key="users/7/uploads/8ac1f2/corrupt.txt",
+        )
+
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    logger_name = "xagent.web.api.websocket"
+
+    with (
+        patch(
+            "xagent.web.api.websocket._prepare_websocket_turn_sync",
+            side_effect=failing_prepare,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        caplog.at_level(logging.WARNING, logger=logger_name),
+    ):
+        with pytest.raises(DurableObjectIntegrityError):
+            await _handle_chat_message_unserialized(
+                MagicMock(),
+                task_id,
+                {
+                    "message": "with a corrupted attachment",
+                    "client_message_id": "integrity-probe",
+                    "user": SimpleNamespace(id=owner_id, is_admin=False),
+                    "files": ["8ac1f2"],
+                },
+            )
+
+    frames = [str(call) for call in ws_manager.send_personal_message.await_args_list]
+    assert any("message_rejected" in frame for frame in frames), frames
+    # Told to re-upload, not to retry: retrying cannot repair corruption.
+    assert any("integrity check" in frame for frame in frames), frames
+    assert not any("temporarily unavailable" in frame for frame in frames), frames
+
+    assert not [
+        entry
+        for entry in caplog.records
+        if entry.name == logger_name
+        and "Durable storage unavailable" in entry.getMessage()
+    ], "an integrity fault emitted an outage warning -- the arms are misordered"

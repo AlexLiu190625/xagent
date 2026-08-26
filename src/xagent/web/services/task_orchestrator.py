@@ -56,6 +56,7 @@ from uuid import uuid4
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from ...core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from ...core.execution_scope import resolve_execution_scope
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from ..models.task import Task, TaskStatus
@@ -70,6 +71,10 @@ from .db_runtime import (
     drain_async_task_cancellation_safe,
     is_database_pool_timeout,
     run_db_io_cancellation_safe,
+)
+from .external_task_cancel import (
+    EXTERNAL_TASK_SOURCE,
+    EXTERNAL_TURN_INTERRUPTED_MESSAGE,
 )
 from .file_turn import bind_turn_files_no_commit
 from .hot_path_cache import invalidate_task_cache
@@ -110,6 +115,18 @@ _APPENDABLE_STATUSES = (
     TaskStatus.FAILED,
     TaskStatus.PAUSED,
 )
+
+
+def timezone_schedule_context(timezone: str | None) -> dict[str, Any] | None:
+    """Build the schedule ``context`` carrying the caller's clock timezone.
+
+    Shared by every create-first entry point (workforce widget/share, the
+    workforce SDK, and ``/v1/chat/tasks``) so blank normalization and the
+    metadata key stay identical across them. Whitespace-only degrades to
+    ``None`` so the renderer keeps UTC.
+    """
+    normalized = (timezone or "").strip()
+    return {CLOCK_TIMEZONE_METADATA_KEY: normalized} if normalized else None
 
 
 @dataclass(frozen=True)
@@ -1788,7 +1805,17 @@ def _schedule_bg(
                     task_id,
                 )
             except asyncio.CancelledError:
-                settlement_error = "task execution cancelled"
+                # Settlement text lands in ``task.error_message`` and, for a
+                # task with an owner, in the transcript as an assistant
+                # message. An external task's transcript is read by the
+                # visitor who asked the question, so that audience gets a
+                # sentence written for it instead of the operator wording
+                # every other source keeps.
+                settlement_error = (
+                    EXTERNAL_TURN_INTERRUPTED_MESSAGE
+                    if task_source == EXTERNAL_TASK_SOURCE
+                    else "task execution cancelled"
+                )
                 raise
             except Exception as setup_or_run_err:
                 if is_database_pool_timeout(setup_or_run_err):
