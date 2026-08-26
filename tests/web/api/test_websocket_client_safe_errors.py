@@ -890,7 +890,10 @@ async def test_terminal_command_failure_keeps_context_and_redacts_detail() -> No
     connection_manager = MagicMock()
     connection_manager.broadcast_to_task = AsyncMock()
     command = SimpleNamespace(
-        kind=websocket_api.TaskCommandKind.PAUSE, task_id=7, command_id="cmd-7"
+        kind=websocket_api.TaskCommandKind.PAUSE,
+        task_id=7,
+        command_id="cmd-7",
+        payload={},
     )
     with patch.object(websocket_api, "manager", connection_manager):
         await websocket_api._broadcast_terminal_command_error(
