@@ -660,3 +660,87 @@ describe("ClarificationForm delivery failures", () => {
     expect(screen.queryByRole("alert")).toBeNull()
   })
 })
+
+describe("ClarificationForm blank option filtering", () => {
+  afterEach(() => {
+    cleanup()
+  })
+
+  // The option label is rendered into a <span> on both branches this suite
+  // covers: select_one's dropdown option (ui/select.tsx, "font-medium
+  // truncate") and action_cards' card (clarification-form.tsx, "font-medium
+  // text-sm text-foreground"). action_cards renders each card as a <div
+  // onClick>, not a <button> -- getAllByRole("button") returns an empty
+  // array for it regardless of whether the blank-option filter is
+  // trim-aware, so it cannot be used to detect a blank card here. No other
+  // <span> in this component's default render (no files staged, no
+  // description set on any option) is ever blank, so a <span> with blank
+  // text content can only be a surviving blank option.
+  const blankOptionSpans = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll("span")).filter(
+      (el) => el.textContent !== "" && el.textContent?.trim() === "",
+    )
+
+  it("F-1: a select_one interaction whose only option is blank shows no options", () => {
+    const interactions = [
+      {
+        type: "select_one" as const,
+        field: "choice",
+        label: "Choice",
+        options: [{ label: "   ", value: "   " }],
+      },
+    ]
+    render(<ClarificationForm interactions={interactions} onSend={vi.fn()} />)
+
+    fireEvent.click(screen.getByText("chatPage.clarification.selectOption"))
+
+    expect(screen.getByText("common.noOptions")).toBeInTheDocument()
+  })
+
+  it("F-2: a select_one interaction keeps a good option and drops a blank one", () => {
+    const interactions = [
+      {
+        type: "select_one" as const,
+        field: "choice",
+        label: "Choice",
+        options: [
+          { label: "Import", value: "import" },
+          { label: "   ", value: "   " },
+        ],
+      },
+    ]
+    const { container } = render(
+      <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.selectOption"))
+
+    expect(screen.getByText("Import")).toBeInTheDocument()
+    expect(blankOptionSpans(container)).toHaveLength(0)
+  })
+
+  it("F-3: an action_cards interaction keeps a good option and drops a blank one", () => {
+    // Mirrors the shape the agent-builder skill instructs the model to use
+    // for this interaction type: a mix of a real choice and, in the failure
+    // case this fix targets, a blank one.
+    const interactions = [
+      {
+        type: "action_cards" as const,
+        field: "source",
+        label: "Source",
+        options: [
+          { label: "Import", value: "import" },
+          { label: "   ", value: "   " },
+        ],
+      },
+    ]
+    const { container } = render(
+      <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
+    )
+
+    // No dropdown to open: action_cards renders its cards directly inside
+    // CollapsibleContent, which is open by default (active defaults to true).
+    expect(screen.getByText("Import")).toBeInTheDocument()
+    expect(blankOptionSpans(container)).toHaveLength(0)
+  })
+})
