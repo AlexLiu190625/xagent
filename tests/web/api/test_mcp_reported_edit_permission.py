@@ -862,10 +862,26 @@ class TestStandaloneParityWithNoHookInstalled:
         with snapshot_connector_team_hooks():
             set_connector_team_hooks()  # explicit reset: no hooks installed
 
-            # Rows 1-2: GET /servers list -- presence and can_edit_global.
+            # Rows 1-2: GET /servers list -- presence and can_edit_global,
+            # for BOTH connector kinds. The aggregate listing projects
+            # Custom API rows through _custom_api_to_mcp_response, which
+            # this work also changed; asserting only the MCP row would
+            # leave that projection unpinned. Both rows are selected by
+            # (id, transport): the two kinds live in separate tables and
+            # their ids collide freely.
             list_entries = get_mcp_servers(current_user=caller, db=db)
-            mcp_entry = next(r for r in list_entries if r.id == server_id)
+            mcp_entry = next(
+                r
+                for r in list_entries
+                if r.id == server_id and r.transport != "custom_api"
+            )
             assert mcp_entry.can_edit_global is can_edit_global_config
+            api_list_entry = next(
+                r
+                for r in list_entries
+                if r.id == api_id and r.transport == "custom_api"
+            )
+            assert api_list_entry.can_edit_global is can_edit_global_config
 
             # Row 3: GET /servers/{id}.
             get_response = get_mcp_server(server_id, current_user=caller, db=db)
@@ -1062,13 +1078,15 @@ class TestStandaloneParityWithNoHookInstalled:
         ``/api/mcp/apps``'s ``can_configure`` reads only whether a personal
         association row exists (or, absent one, a team verdict) -- both
         constructible populations have a personal row, so both see True,
-        with no hook installed."""
+        with no hook installed, for both connector kinds."""
         owner = _make_user(db, 704)
         member = _make_user(db, 705)
         caller = owner if population == "owner" else member
 
         server = _make_owned_server(db, owner.id, name=f"parity-apps-mcp-{population}")
         server_id = server.id
+        api = _make_owned_api(db, owner.id, name=f"parity-apps-api-{population}")
+        api_id = api.id
 
         if population == "personal_non_owner":
             db.add(
@@ -1079,14 +1097,33 @@ class TestStandaloneParityWithNoHookInstalled:
                     is_active=True,
                 )
             )
+            db.add(
+                UserCustomApi(
+                    user_id=member.id,
+                    custom_api_id=api_id,
+                    is_owner=False,
+                    can_edit=False,
+                    is_active=True,
+                )
+            )
             db.commit()
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks()
             entries = list_mcp_apps(location="local", current_user=caller, db=db)
 
-        entry = next(e for e in entries if e["server_id"] == server_id)
-        assert entry["can_configure"] is True
+        mcp_entry = next(
+            e
+            for e in entries
+            if e["server_id"] == server_id and e["transport"] != "custom_api"
+        )
+        assert mcp_entry["can_configure"] is True
+        api_entry = next(
+            e
+            for e in entries
+            if e["server_id"] == api_id and e["transport"] == "custom_api"
+        )
+        assert api_entry["can_configure"] is True
 
     @pytest.mark.parametrize(
         "population", ["owner", "personal_non_owner"], ids=["A=owner", "B=personal"]
