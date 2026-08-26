@@ -281,6 +281,8 @@ class TestNormalizeVisionResponse:
         kinds = {row[2] for row in _VISION_RESPONSE_SHAPE_MATRIX}
         assert kinds == {"text", "empty", "tool_call", "unknown"}
 
+    # Covers the shape matrix plus a handful of other plain-data inputs --
+    # not a claim that the classifier never raises for any input whatsoever.
     @pytest.mark.parametrize(
         "response",
         [row[1] for row in _VISION_RESPONSE_SHAPE_MATRIX]

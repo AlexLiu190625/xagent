@@ -80,12 +80,17 @@ def _normalize_vision_response(result: Any) -> _NormalizedVisionResponse:
     ``vision_chat`` is typed ``str | dict[str, Any]``: OpenAI-family
     providers wrap a reply in an envelope (``{"type": "text", "content":
     ..., "raw": ...}`` or a tool-call envelope), while other providers
-    return a bare string. This function is a pure classifier: it never
-    raises, and it never decides whether a shape counts as a failure --
-    callers own that decision because only they know what they need from
-    the response. An exception raised by ``vision_chat`` itself never
-    reaches this function; it is handled by the caller's own exception
-    handling before a return value exists to classify.
+    return a bare string. This function is a pure classifier: it does not
+    raise for the shapes providers actually return -- bare strings, ``None``,
+    and dicts of plain JSON data -- and it never decides whether a shape
+    counts as a failure; callers own that decision because only they know
+    what they need from the response. Diagnostic rendering for any other
+    input goes through ``str(result)``, so an object with a raising
+    ``__str__`` (or a raising ``__repr__`` on a value nested inside a dict)
+    propagates that exception to the caller's own exception handling.
+    An exception raised by ``vision_chat`` itself never reaches this
+    function; it is handled by the caller's own exception handling
+    before a return value exists to classify.
     """
     if isinstance(result, str):
         if not result.strip():
