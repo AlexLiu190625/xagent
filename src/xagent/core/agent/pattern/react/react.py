@@ -256,9 +256,9 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
     site (``_pause_for_tool_results``) runs its own deduplication across all
     tools' interactions after calling this function once per tool.
 
-    As of commit 95fada70f, those two call sites are the only callers in the
-    repository; there is no mechanical guard against a third call site being
-    added without also being covered by this contract.
+    Today those two call sites are the only callers in the repository; there
+    is no mechanical guard against a third call site being added without
+    also being covered by this contract.
 
     The output never carries an ``actions`` key: ``actions`` is a model
     alias for ``options`` (consumed above whenever ``options`` itself is
@@ -314,11 +314,13 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
             if options and not filtered_options:
                 # All options for this interaction were blank. The
                 # interaction is still emitted (the question still goes
-                # out), so this is the only signal that it happened. Bounded
-                # to integer counts, never the model-controlled field name:
-                # this module's logging never carries untrusted-input text
-                # (see STRIP_LOG_MAX_TOOL_NAMES above for the same rule
-                # applied to tool names).
+                # out), so this is the only signal that it happened. This
+                # warning's payload is bounded to integer counts, never the
+                # model-controlled field name -- the same discipline
+                # STRIP_LOG_MAX_TOOL_NAMES above applies to tool names, but
+                # that is this warning's own choice, not a blanket rule for
+                # every log call in this module (several elsewhere put raw
+                # tool names or argument keys straight into the message).
                 logger.warning(
                     "ask_user_question dropped all %d option(s) for interaction %d",
                     len(options),
@@ -334,22 +336,26 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
             # options is present but neither a list nor rescued by the
             # actions alias above -- a malformed shape this function has
             # always left untouched, but silently: nothing signaled that
-            # it happened. Same untrusted-input logging rule as the other
-            # two warnings in this function: bounded, integer-only.
+            # it happened. Same payload discipline as the other two
+            # warnings in this function: bounded, integer-only.
             logger.warning(
                 "ask_user_question interaction %d has a non-list options value",
                 index,
                 extra={"interaction_index": index},
             )
 
-        # Leave only one carrier of the option list in the output. The
-        # alias branch above has already consumed actions into options
-        # wherever it had anything useful to contribute; what is left is
-        # either a duplicate of options (already-filtered content) or,
-        # when options was itself a list, content actions never fed into
-        # the filter at all. Either way, actions in the output is a second,
-        # unfiltered copy of the same data that gets persisted verbatim
-        # into task_chat_messages.interactions and replayed unchanged.
+        # Leave only one carrier of the option list in the output. Whether
+        # or not the alias branch above used actions to seed options,
+        # item["actions"] itself is never touched by the filter step above
+        # (that step reassigns item["options"] to a new, filtered list and
+        # leaves the actions key exactly as the model gave it) -- so
+        # whatever is left under item["actions"] is always the original,
+        # unfiltered list: either the same content options was seeded
+        # from, pre-filter, or, when options was itself already a list, a
+        # completely unrelated list the filter never saw. Either way,
+        # leaving it in the output gives the persisted row a second,
+        # unfiltered carrier of option data that gets stored verbatim into
+        # task_chat_messages.interactions and replayed unchanged.
         # Unconditional so this holds regardless of whether options ended
         # up a list -- must run after the alias branch above, not before:
         # popping actions first would delete the only place a malformed
@@ -364,8 +370,8 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
         field_counts[item["field"]] = field_counts.get(item["field"], 0) + 1
     colliding_field_count = sum(1 for count in field_counts.values() if count > 1)
     if colliding_field_count:
-        # Same untrusted-input logging rule as above: integer counts only,
-        # never the colliding field name itself.
+        # Same payload discipline as the other warnings in this function:
+        # integer counts only, never the colliding field name itself.
         logger.warning(
             "ask_user_question interactions have %d colliding field name(s) out of %d",
             colliding_field_count,

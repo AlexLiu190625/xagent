@@ -681,7 +681,7 @@ describe("ClarificationForm blank option filtering", () => {
       (el) => el.textContent !== "" && el.textContent?.trim() === "",
     )
 
-  it("F-1: a select_one interaction whose only option is blank shows no options", () => {
+  it("a select_one interaction whose only option is blank shows no options", () => {
     const interactions = [
       {
         type: "select_one" as const,
@@ -697,7 +697,7 @@ describe("ClarificationForm blank option filtering", () => {
     expect(screen.getByText("common.noOptions")).toBeInTheDocument()
   })
 
-  it("F-2: a select_one interaction keeps a good option and drops a blank one", () => {
+  it("a select_one interaction keeps a good option and drops a blank one", () => {
     const interactions = [
       {
         type: "select_one" as const,
@@ -719,7 +719,7 @@ describe("ClarificationForm blank option filtering", () => {
     expect(blankOptionSpans(container)).toHaveLength(0)
   })
 
-  it("F-3: an action_cards interaction keeps a good option and drops a blank one", () => {
+  it("an action_cards interaction keeps a good option and drops a blank one", () => {
     // Mirrors the shape the agent-builder skill instructs the model to use
     // for this interaction type: a mix of a real choice and, in the failure
     // case this fix targets, a blank one.

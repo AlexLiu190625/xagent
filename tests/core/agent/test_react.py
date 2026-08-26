@@ -4512,7 +4512,7 @@ def _js_trim_equivalent(value: str) -> str:
 
 
 def test_trim_table_covers_every_javascript_trimmed_code_point() -> None:
-    """I-5 coverage, superset half: _INTERACTION_TRIM_CHARS must contain
+    """Coverage check, superset half: _INTERACTION_TRIM_CHARS must contain
     every code point JavaScript's trim() removes, or writing the normalized
     field back into item["field"] and relying on the frontend's own trim()
     being a no-op on it stops holding."""
@@ -4524,7 +4524,7 @@ def test_trim_table_covers_every_javascript_trimmed_code_point() -> None:
 
 
 def test_trim_table_python_only_difference_is_exactly_five_code_points() -> None:
-    """I-5 coverage, differential half: pins the five Python-only code
+    """Coverage check, differential half: pins the five Python-only code
     points exactly. The superset check above alone would still pass if one
     of these five were mistyped (e.g. U+001C typoed into U+001B), since a
     typo like that only shrinks the Python-only difference by one member and
@@ -4543,7 +4543,7 @@ def test_trim_table_python_only_difference_is_exactly_five_code_points() -> None
 
 
 def test_normalize_keeps_well_formed_options_and_fields() -> None:
-    """I-1: a normal option and a normal field pass through unchanged."""
+    """A normal option and a normal field pass through unchanged."""
     normalized = _normalize_ask_user_interactions(
         [
             {
@@ -4554,6 +4554,35 @@ def test_normalize_keeps_well_formed_options_and_fields() -> None:
         ]
     )
     assert normalized[0]["options"] == [{"label": "A", "value": "a"}]
+    assert normalized[0]["field"] == "choice"
+
+
+def test_normalize_returns_empty_list_for_non_list_interactions() -> None:
+    """A top-level interactions value that is not a list -- the model
+    sending a dict or a string instead of an array, say -- is rejected
+    outright rather than partially processed."""
+    assert _normalize_ask_user_interactions("not-a-list") == []
+    assert _normalize_ask_user_interactions({"field": "choice"}) == []
+    assert _normalize_ask_user_interactions(None) == []
+
+
+def test_normalize_skips_non_dict_elements_within_the_list() -> None:
+    """A non-dict element inside an otherwise well-formed interactions list
+    is dropped, and the well-formed interactions around it are still
+    normalized -- one malformed element does not fail the whole batch."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            "not-a-dict",
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [{"label": "A", "value": "a"}],
+            },
+            42,
+            None,
+        ]
+    )
+    assert len(normalized) == 1
     assert normalized[0]["field"] == "choice"
 
 
@@ -4570,10 +4599,11 @@ _BLANK_TEXT_CASES = [
 
 @pytest.mark.parametrize("case_id,value", _BLANK_TEXT_CASES)
 def test_normalize_drops_blank_options(case_id: str, value: str) -> None:
-    """I-3: an option whose label or value is blank under
+    """An option whose label or value is blank under
     _INTERACTION_TRIM_CHARS is dropped -- the same treatment the existing
-    empty-string-label case already gets (I-2's regression test above),
-    widened from "the empty string" to "blank under the trim table"."""
+    empty-string-label case already gets (see the regression test above
+    for missing/empty label or value), widened from "the empty string" to
+    "blank under the trim table"."""
     normalized = _normalize_ask_user_interactions(
         [
             {
@@ -4592,12 +4622,26 @@ def test_normalize_drops_blank_options(case_id: str, value: str) -> None:
 
 @pytest.mark.parametrize("case_id,value", _BLANK_TEXT_CASES)
 def test_normalize_substitutes_blank_field(case_id: str, value: str) -> None:
-    """I-4: a field name blank under _INTERACTION_TRIM_CHARS falls back to
+    """A field name blank under _INTERACTION_TRIM_CHARS falls back to
     response_{index}."""
     normalized = _normalize_ask_user_interactions(
         [{"type": "select_one", "field": value, "label": "Choice"}]
     )
     assert normalized[0]["field"] == "response_0"
+
+
+def test_normalize_substitutes_blank_field_using_its_own_index() -> None:
+    """The fallback is f"response_{index}" for the interaction's own
+    position, not a fixed "response_0" -- a well-formed interaction ahead
+    of the blank one must not shift what the blank one falls back to."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {"type": "select_one", "field": "choice", "label": "Choice"},
+            {"type": "select_one", "field": "   ", "label": "Other"},
+        ]
+    )
+    assert normalized[0]["field"] == "choice"
+    assert normalized[1]["field"] == "response_1"
 
 
 @pytest.mark.parametrize(
@@ -4610,7 +4654,7 @@ def test_normalize_substitutes_blank_field(case_id: str, value: str) -> None:
 def test_normalize_field_bom_normalizes_to_frontend_equivalent(
     case_id: str, value: str, expected: str
 ) -> None:
-    """I-4/I-5: a field wrapped in a BOM (with or without interior spacing)
+    """A field wrapped in a BOM (with or without interior spacing)
     normalizes to the same string the frontend's own trim() produces. The
     same normalization applies when the value arrives through the field/id/
     name alias chain rather than "field" directly."""
@@ -4642,7 +4686,7 @@ def test_normalize_field_bom_normalizes_to_frontend_equivalent(
 def test_normalized_field_is_stable_under_javascript_trim(
     case_id: str, value: str
 ) -> None:
-    """I-5: whatever field the normalizer produces must already be a fixed
+    """Whatever field the normalizer produces must already be a fixed
     point of the frontend's own trim(). If it were not, writing the result
     back into item["field"] and trusting the frontend to leave it alone
     would silently stop being true for that input."""
@@ -4656,7 +4700,7 @@ def test_normalized_field_is_stable_under_javascript_trim(
 def test_normalize_logs_when_all_options_are_dropped(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """I-6/I-9: an interaction whose options are all blank keeps the
+    """An interaction whose options are all blank keeps the
     interaction (the question still goes out) and logs exactly one warning.
     The warning's extra keys are exactly {dropped, total, interaction_index},
     all ints, and its message format args are also all ints -- no
@@ -4704,7 +4748,7 @@ def test_normalize_logs_when_all_options_are_dropped(
 
 
 def test_normalize_keeps_surviving_option_text_verbatim() -> None:
-    """I-10: an option that survives the blank filter keeps its label and
+    """An option that survives the blank filter keeps its label and
     value exactly as given -- normalization only judges blankness, it never
     rewrites content. A BOM-wrapped value is the only kind of input that can
     tell "judge blank" apart from "judge blank and also rewrite": a purely
@@ -4720,7 +4764,7 @@ def test_normalize_keeps_surviving_option_text_verbatim() -> None:
 def test_normalize_keeps_colliding_fields_at_single_tool_callsite(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """I-11: within one ask_user_question call, a BOM-wrapped field name and
+    """Within one ask_user_question call, a BOM-wrapped field name and
     its plain counterpart now normalize to the same field. This function
     does not deduplicate -- both interactions are kept unchanged, and the
     single-tool call site sends the result on as-is (the multi-tool call
@@ -4763,7 +4807,7 @@ def test_normalize_keeps_colliding_fields_at_single_tool_callsite(
 
 
 def test_normalize_blank_alias_does_not_fall_through_to_next_key() -> None:
-    """S-4 (decided): the field/id/name alias chain keeps its raw truthiness
+    """The field/id/name alias chain keeps its raw truthiness
     check on purpose. A BOM-only field is truthy before normalization, so it
     wins the alias chain and is only normalized away to blank afterward --
     id="ok" is never reached. Widening the blankness judgment to include BOM
@@ -4822,7 +4866,7 @@ def test_normalize_blank_alias_does_not_fall_through_to_next_key() -> None:
     ],
 )
 def test_normalize_strips_actions_alias_from_output(case_id: str, raw: dict) -> None:
-    """I-12: the output never carries an actions key, unconditionally --
+    """The output never carries an actions key, unconditionally --
     whether options was missing, a well-formed list, or a malformed
     non-list value, and whether actions itself was a list or not. Case 1
     additionally asserts the alias survived into options: without that
@@ -4838,15 +4882,16 @@ def test_normalize_strips_actions_alias_from_output(case_id: str, raw: dict) -> 
 
 
 def test_normalize_aliases_actions_when_options_is_not_a_list() -> None:
-    """I-13: when options is present but not a list, the alias branch --
+    """When options is present but not a list, the alias branch --
     widened from "options" not in item to "options is not a list" -- still
     rescues actions into options, and the usual blank-option filter still
     runs on what it rescued. This is the test that would catch the pop
     running before the alias branch: with the pop moved earlier, actions
     would already be gone by the time the alias branch runs, options would
-    stay "auto", and this assertion would fail even though every I-12 case
-    would still pass (I-12 only checks that actions is gone, not that its
-    data went anywhere)."""
+    stay "auto", and this assertion would fail even though every case in
+    test_normalize_strips_actions_alias_from_output would still pass (that
+    test only checks that actions is gone, not that its data went
+    anywhere)."""
     normalized = _normalize_ask_user_interactions(
         [
             {
@@ -4871,8 +4916,9 @@ def test_normalize_logs_when_options_is_not_a_list(
     is a malformed shape the model produced; today it silently renders as
     no available options (the renderer falls back to interaction.options ||
     []), and this warning is the only signal that it happened. Same
-    integer-only payload discipline as the I-6 and I-11 warnings in this
-    same function."""
+    integer-only payload discipline as the other two warnings in this
+    same function (the all-options-blank warning and the colliding-field-
+    name warning)."""
     with caplog.at_level(
         logging.WARNING, logger="xagent.core.agent.pattern.react.react"
     ):
@@ -4904,7 +4950,7 @@ def test_normalize_logs_when_options_is_not_a_list(
 
 @pytest.mark.asyncio
 async def test_pause_for_tool_results_deduplicates_normalized_fields() -> None:
-    """I-8: _pause_for_tool_results runs its own field-name dedup after
+    """_pause_for_tool_results runs its own field-name dedup after
     calling the normalizer for each tool. Two tools whose fields now
     normalize (via the BOM fix) to the same string still end up with
     distinct field names in the published interactions -- narrowing the

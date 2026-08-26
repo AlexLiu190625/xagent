@@ -1079,14 +1079,19 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
             raise ValueError(f"{where} is a {interaction.type} carrying options")
         # Either half blank, not both: an option the user can see but not
         # submit, and one they can submit but not see, are both unusable.
-        # The renderer's own filter (clarification-form.tsx) and the
-        # model-facing producer (``_normalize_ask_user_interactions``,
-        # react.py) both keep an option only when value and label are
-        # still non-blank after trimming against a table covering every
-        # code point either Python's ``str.strip()`` or JavaScript's
-        # ``trim()`` treats as whitespace, so an option that survives
-        # either of them has already cleared that bar. This check does
-        # not rely on that, though: it is falsy, not trim-aware, and
+        # The renderer's own filter (clarification-form.tsx) keeps an
+        # option only when value and label are non-blank under
+        # JavaScript's own ``trim()``. The model-facing producer
+        # (``_normalize_ask_user_interactions``, react.py) keeps an option
+        # only when both are non-blank under a wider table -- every code
+        # point either Python's ``str.strip()`` or JavaScript's ``trim()``
+        # treats as whitespace, a strict superset of what the renderer
+        # checks. The two are not equivalent: a value like a single
+        # ``"\x1c"`` (a control code point Python treats as whitespace but
+        # JavaScript's ``trim()`` does not) survives the renderer's filter
+        # but is dropped by the producer, so the producer is the stricter
+        # of the two, not the looser one. This check here does not rely on
+        # either of them: it is falsy, not trim-aware, and
         # ``InteractionOption.label``/``value`` (ask_user_tool.py) are
         # required ``str`` with no ``min_length`` or whitespace
         # constraint, so a whitespace-only label or value -- not just the
