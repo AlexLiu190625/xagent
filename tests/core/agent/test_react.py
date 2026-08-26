@@ -4781,6 +4781,127 @@ def test_normalize_blank_alias_does_not_fall_through_to_next_key() -> None:
     assert normalized_whitespace[0]["field"] == "response_0"
 
 
+@pytest.mark.parametrize(
+    "case_id,raw",
+    [
+        (
+            "case1_alias_only",
+            {
+                "type": "select_one",
+                "field": "f",
+                "actions": [{"label": "A", "value": "a"}],
+            },
+        ),
+        (
+            "case2_options_and_unrelated_actions",
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": [{"label": "A", "value": "a"}],
+                "actions": [{"label": "X", "value": "x"}],
+            },
+        ),
+        (
+            "case3_options_not_a_list",
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": "auto",
+                "actions": [{"label": "B", "value": "b"}],
+            },
+        ),
+        (
+            "case4_actions_not_a_list",
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": "auto",
+                "actions": "bad",
+            },
+        ),
+    ],
+)
+def test_normalize_strips_actions_alias_from_output(case_id: str, raw: dict) -> None:
+    """I-12: the output never carries an actions key, unconditionally --
+    whether options was missing, a well-formed list, or a malformed
+    non-list value, and whether actions itself was a list or not. Case 1
+    additionally asserts the alias survived into options: without that
+    second assertion, moving the pop above the alias branch would still
+    pass this case (actions is gone either way, just for the wrong reason)
+    while silently losing the alias's only copy of the data -- a gap only
+    test_normalize_aliases_actions_when_options_is_not_a_list below would
+    otherwise catch alone."""
+    normalized = _normalize_ask_user_interactions([raw])
+    assert "actions" not in normalized[0]
+    if case_id == "case1_alias_only":
+        assert normalized[0]["options"] == [{"label": "A", "value": "a"}]
+
+
+def test_normalize_aliases_actions_when_options_is_not_a_list() -> None:
+    """I-13: when options is present but not a list, the alias branch --
+    widened from "options" not in item to "options is not a list" -- still
+    rescues actions into options, and the usual blank-option filter still
+    runs on what it rescued. This is the test that would catch the pop
+    running before the alias branch: with the pop moved earlier, actions
+    would already be gone by the time the alias branch runs, options would
+    stay "auto", and this assertion would fail even though every I-12 case
+    would still pass (I-12 only checks that actions is gone, not that its
+    data went anywhere)."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": "auto",
+                "actions": [
+                    {"label": "   ", "value": "   "},
+                    {"label": "B", "value": "b"},
+                ],
+            }
+        ]
+    )
+    assert normalized[0]["options"] == [{"label": "B", "value": "b"}]
+    assert "actions" not in normalized[0]
+
+
+def test_normalize_logs_when_options_is_not_a_list(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """options present but neither a list nor rescued by an actions alias
+    is a malformed shape the model produced; today it silently renders as
+    no available options (the renderer falls back to interaction.options ||
+    []), and this warning is the only signal that it happened. Same
+    integer-only payload discipline as the I-6 and I-11 warnings in this
+    same function."""
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        normalized = _normalize_ask_user_interactions(
+            [{"type": "select_one", "field": "choice", "options": "auto"}]
+        )
+
+    assert normalized[0]["options"] == "auto"
+    assert "actions" not in normalized[0]
+
+    records = [r for r in caplog.records if "non-list options" in r.getMessage()]
+    assert len(records) == 1
+    record = records[0]
+
+    baseline_attrs = set(
+        logging.LogRecord("n", logging.WARNING, "p", 1, "m", None, None).__dict__
+    )
+    # Same three attributes excluded for the same reasons as the other two
+    # warning tests in this module: "taskName" (3.12+ LogRecord attribute),
+    # "message" and "asctime" (added by a Formatter.format() pass, not by
+    # this call's own extra= payload).
+    extra_keys = (
+        set(record.__dict__) - baseline_attrs - {"taskName", "message", "asctime"}
+    )
+    assert extra_keys == {"interaction_index"}
+    assert all(isinstance(record.__dict__[k], int) for k in extra_keys)
+    assert record.args is None or all(isinstance(a, int) for a in record.args)
+
+
 @pytest.mark.asyncio
 async def test_pause_for_tool_results_deduplicates_normalized_fields() -> None:
     """I-8: _pause_for_tool_results runs its own field-name dedup after

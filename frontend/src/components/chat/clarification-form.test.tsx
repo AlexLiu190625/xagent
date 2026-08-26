@@ -743,4 +743,31 @@ describe("ClarificationForm blank option filtering", () => {
     expect(screen.getByText("Import")).toBeInTheDocument()
     expect(blankOptionSpans(container)).toHaveLength(0)
   })
+
+  it("renders options from a legacy message that still carries actions", () => {
+    // The backend normalizer now strips a well-formed interaction down to
+    // one options carrier and never emits actions, but that only applies to
+    // new payloads. Rows persisted before that change, and anything from
+    // Agent Builder's self-parsed chat response (which never reaches the
+    // backend normalizer at all), can still carry only actions with no
+    // options key -- this component's own fallback (rawOptions above) is
+    // the sole thing still rendering those.
+    const interactions = [
+      {
+        type: "action_cards" as const,
+        field: "source",
+        label: "Source",
+        actions: [
+          { label: "Import", value: "import" },
+          { label: "   ", value: "   " },
+        ],
+      },
+    ]
+    const { container } = render(
+      <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
+    )
+
+    expect(screen.getByText("Import")).toBeInTheDocument()
+    expect(blankOptionSpans(container)).toHaveLength(0)
+  })
 })

@@ -259,6 +259,12 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
     As of commit 95fada70f, those two call sites are the only callers in the
     repository; there is no mechanical guard against a third call site being
     added without also being covered by this contract.
+
+    The output never carries an ``actions`` key: ``actions`` is a model
+    alias for ``options`` (consumed above whenever ``options`` itself is
+    missing or not a list), and leaving the raw, unfiltered alias in the
+    output would give the persisted row a second, never-filtered carrier of
+    the same option list.
     """
 
     if not isinstance(interactions, list):
@@ -275,7 +281,16 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
             field = f"response_{index}"
         item["field"] = _normalize_interaction_text(field)
 
-        if "options" not in item and isinstance(item.get("actions"), list):
+        # Widened from "options" not in item: an interaction can carry both
+        # a malformed options (present but not a list) and a well-formed
+        # actions alias, and the alias is the only place the real data
+        # lives in that shape -- narrower than "not in item" would leave
+        # the alias unconsumed and drop every option for that interaction
+        # (verified: the malformed-options-plus-actions case loses all its
+        # options under the narrower condition).
+        if not isinstance(item.get("options"), list) and isinstance(
+            item.get("actions"), list
+        ):
             item["options"] = item["actions"]
 
         options = item.get("options")
@@ -315,6 +330,32 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
                     },
                 )
             item["options"] = filtered_options
+        elif "options" in item:
+            # options is present but neither a list nor rescued by the
+            # actions alias above -- a malformed shape this function has
+            # always left untouched, but silently: nothing signaled that
+            # it happened. Same untrusted-input logging rule as the other
+            # two warnings in this function: bounded, integer-only.
+            logger.warning(
+                "ask_user_question interaction %d has a non-list options value",
+                index,
+                extra={"interaction_index": index},
+            )
+
+        # Leave only one carrier of the option list in the output. The
+        # alias branch above has already consumed actions into options
+        # wherever it had anything useful to contribute; what is left is
+        # either a duplicate of options (already-filtered content) or,
+        # when options was itself a list, content actions never fed into
+        # the filter at all. Either way, actions in the output is a second,
+        # unfiltered copy of the same data that gets persisted verbatim
+        # into task_chat_messages.interactions and replayed unchanged.
+        # Unconditional so this holds regardless of whether options ended
+        # up a list -- must run after the alias branch above, not before:
+        # popping actions first would delete the only place a malformed
+        # options's real data lives before the alias branch can consume it,
+        # dropping every option for that interaction.
+        item.pop("actions", None)
 
         normalized.append(item)
 
