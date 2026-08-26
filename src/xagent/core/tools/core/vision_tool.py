@@ -43,7 +43,14 @@ _VISION_RAW_DISPLAY_TRUNCATION_LIMIT = 4000
 def _truncate_vision_raw_display(
     value: str, limit: int = _VISION_RAW_DISPLAY_TRUNCATION_LIMIT
 ) -> str:
-    """Cap a diagnostic string so a provider payload cannot balloon a tool result.
+    """Bound a diagnostic string so a provider payload cannot balloon a tool result.
+
+    ``limit`` is a prefix limit, not a total-length limit. An oversized value
+    keeps its first ``limit`` characters and then carries the marker
+    ``...<truncated N chars>``, so the returned string is
+    ``limit + 21 + len(str(N))`` characters long -- 4025 for a 9000-character
+    value at the default limit of 4000. A caller that needs a hard total
+    budget has to add that marker allowance itself.
 
     Mirrors the truncation shape already used for chat error bodies
     (``openai.py``'s ``_truncate_error_detail``) so vision diagnostics look
@@ -64,8 +71,10 @@ class _NormalizedVisionResponse(NamedTuple):
     ``text`` is a ``str`` when ``kind`` is ``"text"`` or ``"empty"``, and
     ``None`` for ``"tool_call"``/``"unknown"``. ``tool_calls`` is populated
     only for ``"tool_call"`` and is otherwise an empty list. ``raw_display``
-    is always a length-capped string meant for logging and diagnostic
-    fields; it must never be surfaced as a user-visible answer.
+    is a length-bounded string meant for logging and diagnostic fields: an
+    oversized value keeps a fixed-length prefix and carries a truncation
+    marker past it, so it is bounded rather than capped at an exact total.
+    It must never be surfaced as a user-visible answer.
     """
 
     kind: str
