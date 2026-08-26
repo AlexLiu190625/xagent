@@ -669,14 +669,40 @@ class OpenAICompatibleLLM(BaseLLM):
 
         try:
             # Make the API call with extra_body if needed
-            if extra_body:
-                response = await self._client.chat.completions.create(
-                    extra_body=extra_body, **completion_params
-                )
-            else:
-                response = await self._client.chat.completions.create(
-                    **completion_params
-                )
+            try:
+                if extra_body:
+                    response = await self._client.chat.completions.create(
+                        extra_body=extra_body, **completion_params
+                    )
+                else:
+                    response = await self._client.chat.completions.create(
+                        **completion_params
+                    )
+            except openai.BadRequestError as e:
+                # Check if error is related to response_format
+                error_msg = _format_openai_error("OpenAI bad request", e)
+                if (
+                    "response_format" in error_msg.lower()
+                    and "response_format" in completion_params
+                ):
+                    # Remove response_format and retry, then fall through to
+                    # the shared response handling below so the retried reply
+                    # is returned instead of being discarded.
+                    logger.warning(
+                        f"API doesn't support response_format, retrying without it. Error: {error_msg}"
+                    )
+                    completion_params.pop("response_format")
+
+                    if extra_body:
+                        response = await self._client.chat.completions.create(
+                            extra_body=extra_body, **completion_params
+                        )
+                    else:
+                        response = await self._client.chat.completions.create(
+                            **completion_params
+                        )
+                else:
+                    raise
 
             # Validate response
             if not hasattr(response, "choices") or not response.choices:
@@ -800,31 +826,9 @@ class OpenAICompatibleLLM(BaseLLM):
             raise RuntimeError(f"OpenAI authentication failed: {e.message}") from e
 
         except openai.BadRequestError as e:
-            # Handle bad request errors
-            error_msg = _format_openai_error("OpenAI bad request", e)
-
-            # Check if error is related to response_format
-            if (
-                "response_format" in error_msg.lower()
-                and "response_format" in completion_params
-            ):
-                # Remove response_format and retry
-                logger.warning(
-                    f"API doesn't support response_format, retrying without it. Error: {error_msg}"
-                )
-                completion_params.pop("response_format")
-
-                # Retry the API call without response_format
-                if extra_body:
-                    response = await self._client.chat.completions.create(
-                        extra_body=extra_body, **completion_params
-                    )
-                else:
-                    response = await self._client.chat.completions.create(
-                        **completion_params
-                    )
-            else:
-                raise RuntimeError(error_msg) from e
+            # Handle bad request errors. The response_format retry is handled
+            # at the call site above; anything reaching here is terminal.
+            raise RuntimeError(_format_openai_error("OpenAI bad request", e)) from e
 
         except openai.APIError as e:
             # Handle OpenAI API errors
