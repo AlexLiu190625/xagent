@@ -781,7 +781,15 @@ class TestTheRecheckCostsExactlyOneExtraHookCall:
 
         assert len(hook.calls) == 2
 
-    def test_a_granting_stand_in_with_a_personal_only_payload_pays_one_call(self, db):
+    def test_a_granting_stand_in_with_an_empty_payload_pays_one_call(self, db):
+        """An empty payload's ``model_fields_set`` is the empty set, which
+        is a subset of ``{"user_env", "is_active"}`` -- the personal-only
+        exemption, not the earlier personal-field 400 guard (that guard
+        only fires when ``user_env``/``is_active`` is actually present).
+        This is the payload shape that actually reaches the recheck's own
+        condition and exercises the exemption, unlike an is_active-only
+        payload, which never gets there at all for a stand-in (it 400s
+        first)."""
         owner = _make_user(db, 1)
         member = _make_user(db, 2)
         server = _make_owned_server(db, owner.id, name="cost-stand-in-personal-only")
@@ -790,16 +798,7 @@ class TestTheRecheckCostsExactlyOneExtraHookCall:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=hook)
-            with pytest.raises(HTTPException):
-                # A stand-in has no personal row, so is_active still 400s --
-                # what matters here is that this payload shape never
-                # triggers the recheck, not that it succeeds.
-                update_mcp_server(
-                    server_id,
-                    MCPServerUpdate(is_active=False),
-                    current_user=member,
-                    db=db,
-                )
+            update_mcp_server(server_id, MCPServerUpdate(), current_user=member, db=db)
 
         assert len(hook.calls) == 1
 
