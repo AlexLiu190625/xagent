@@ -591,6 +591,32 @@ def delete_custom_api(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only a team admin can delete a team Custom API",
         )
+
+    # One global lock order over this pair of tables. ``update_custom_api``
+    # locks the ``CustomApi`` definition row first and writes the
+    # ``UserCustomApi`` link row afterwards; both branches below delete the
+    # link row first and the definition row second, inside one transaction.
+    # Without this statement the two routes take the same two rows in
+    # opposite orders and a concurrent edit/delete pair can deadlock
+    # (PostgreSQL 40P01). Taken after every refusal above, so a request that
+    # is going to be refused never acquires the lock. ``populate_existing``
+    # matches the PUT's own lock: the row this transaction holds is the one
+    # the deletion below acts on, not whatever the relationship read above
+    # happened to see.
+    locked_api = (
+        db.query(CustomApi)
+        .filter(CustomApi.id == api_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
+    if locked_api is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Custom API not found",
+        )
+    api = locked_api
+
     if team_delete.team_owned:
         db.delete(user_api)
         db.flush([user_api])

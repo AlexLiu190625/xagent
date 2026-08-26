@@ -1,14 +1,17 @@
-"""Real-PostgreSQL coverage for the row lock ``update_custom_api`` takes on
-the ``CustomApi`` definition row before propagating a rename.
+"""Real-PostgreSQL coverage for the row lock ``update_custom_api`` and
+``delete_custom_api`` take on the ``CustomApi`` definition row before
+propagating a rename or removing the link row, respectively.
 
 ``FOR UPDATE`` is a no-op on SQLite -- every other suite in this repo runs
 against SQLite, so nothing there can tell a genuine second-writer block
 from a lock statement that silently does nothing. This file is the one
 place that runs the real statement against a real server and proves it
-actually blocks a second writer, plus the companion path where the row
-vanishes between the route's first read and this lock. Mirrors
-test_mcp_server_edit_lock_postgresql.py's structure for the MCP side of
-the same lock.
+actually blocks a second writer: two concurrent edits, an edit and a
+concurrent delete both taking the same lock in the same order, and the
+companion path where the row vanishes between the route's first read and
+this lock. Mirrors test_mcp_server_edit_lock_postgresql.py's structure for
+the MCP side of the edit lock; the MCP side's delete path takes no such
+lock (see custom_api.py's own delete route for why the two kinds differ).
 
 Obtains its database through ``tests/shared/postgres_disposable.py``
 (``disposable_database_factory``), the same disposable-CREATE-DATABASE
@@ -308,3 +311,85 @@ def test_a_row_that_vanishes_after_the_gate_but_before_the_lock_is_a_404_not_a_5
     finally:
         custom_api_api._resolve_custom_api_for_request = real_resolve
         db.close()
+
+
+def test_a_delete_blocks_until_a_concurrent_edits_transaction_finishes(
+    session_factory, seeded
+) -> None:
+    """``delete_custom_api`` takes the same definition-row lock
+    ``update_custom_api`` does, in the same order (``CustomApi`` first),
+    precisely so that a concurrent edit/delete pair cannot deadlock
+    (PostgreSQL 40P01): the edit's transaction below must finish -- commit
+    or roll back -- before the delete's own lock statement can proceed,
+    the same block ``test_a_second_editor_blocks_until_the_first_editors_
+    transaction_finishes`` above demonstrates between two edits. Before
+    delete_custom_api took this lock, its own child-row-first deletion
+    order (see custom_api.py) and the PUT's parent-row-first order let the
+    two routes take these same two rows in opposite orders.
+    """
+    import xagent.web.api.custom_api as custom_api_api
+    from xagent.web.api.custom_api import CustomApiUpdate
+
+    owner_id, api_id = seeded
+    current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+    second_finished = threading.Event()
+
+    real_validate = custom_api_api.validate_runtime_config_declaration
+
+    def paced_validate(**kwargs):
+        # The editor's own lock statement runs earlier in the route, before
+        # this patched call -- by the time this pauses, the editor already
+        # holds the definition row lock in an uncommitted transaction.
+        lock_acquired.set()
+        assert release_lock.wait(timeout=10), "the editor was never released"
+        return real_validate(**kwargs)
+
+    custom_api_api.validate_runtime_config_declaration = paced_validate
+    session_a = session_factory()
+    session_b = session_factory()
+    try:
+
+        def run_edit():
+            return custom_api_api.update_custom_api(
+                api_id,
+                CustomApiUpdate(is_active=False),
+                current_user=current_user,
+                db=session_a,
+            )
+
+        def run_delete():
+            result = custom_api_api.delete_custom_api(
+                api_id,
+                current_user=current_user,
+                db=session_b,
+            )
+            second_finished.set()
+            return result
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            editor = executor.submit(run_edit)
+            assert lock_acquired.wait(timeout=5), "the editor never reached the lock"
+
+            deleter = executor.submit(run_delete)
+            # The delete's own lock statement should still be blocked on
+            # the database at this point. If the two routes took this pair
+            # of rows in opposite orders (or if either lock were a no-op,
+            # as on SQLite), the delete would sail through almost
+            # immediately and this would flip to True.
+            assert not second_finished.wait(timeout=1.0), (
+                "the delete finished before the concurrent editor released "
+                "the row -- the lock did not actually block it"
+            )
+
+            release_lock.set()
+            editor.result(timeout=10)
+            deleter.result(timeout=10)
+
+        assert second_finished.is_set()
+    finally:
+        custom_api_api.validate_runtime_config_declaration = real_validate
+        session_a.close()
+        session_b.close()

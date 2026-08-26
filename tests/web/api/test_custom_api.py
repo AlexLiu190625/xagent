@@ -1,10 +1,12 @@
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.web.api.custom_api import (
     CustomApiCreate,
@@ -18,8 +20,13 @@ from xagent.web.api.custom_api import (
     update_custom_api,
 )
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
+from xagent.web.models.database import Base
 from xagent.web.models.user import User
-from xagent.web.services.connector_team_scope import ConnectorDeleteDecision
+from xagent.web.services.connector_team_scope import (
+    ConnectorDeleteDecision,
+    set_connector_team_hooks,
+    snapshot_connector_team_hooks,
+)
 
 
 def test_custom_api_models_env_validation():
@@ -471,6 +478,9 @@ async def test_delete_custom_api():
     )
 
     db.query().filter().first.return_value = mock_user_api
+    db.query().filter().populate_existing().with_for_update().first.return_value = (
+        mock_api
+    )
 
     delete_custom_api(10, current_user=user, db=db)
 
@@ -487,6 +497,9 @@ async def test_delete_team_custom_api_flushes_only_current_user_link():
         user_id=1, custom_api_id=10, can_delete=True, custom_api=mock_api
     )
     db.query().filter().first.side_effect = [mock_user_api, None]
+    db.query().filter().populate_existing().with_for_update().first.return_value = (
+        mock_api
+    )
 
     decision = ConnectorDeleteDecision(
         team_owned=True,
@@ -518,3 +531,121 @@ def test_the_locking_routes_are_sync_defs_so_a_lock_wait_never_holds_the_event_l
 
     assert not inspect.iscoroutinefunction(custom_api_api.update_custom_api)
     assert not inspect.iscoroutinefunction(custom_api_api.delete_custom_api)
+
+
+def _lock_order_session_factory():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    return sessionmaker(autocommit=False, autoflush=False, bind=engine), engine
+
+
+def _seed_owned_api_for_lock_order(session_factory, *, name: str) -> tuple[int, int]:
+    db = session_factory()
+    owner = User(username=f"user-{name}", password_hash="x", is_admin=False)
+    db.add(owner)
+    db.flush()
+    api = CustomApi(name=name, url="https://example.test/api", method="GET")
+    db.add(api)
+    db.flush()
+    db.add(
+        UserCustomApi(
+            user_id=owner.id,
+            custom_api_id=api.id,
+            is_owner=True,
+            can_edit=True,
+            can_delete=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+    owner_id, api_id = int(owner.id), int(api.id)
+    db.close()
+    return owner_id, api_id
+
+
+def _count_custom_apis_selects_before_first_delete(statements: list[str]) -> int:
+    """How many ``SELECT``s against ``custom_apis`` land before the first
+    ``DELETE`` of either table.
+
+    The route's own not-found guard (``not user_api or not
+    user_api.custom_api``) always lazy-loads the ``custom_api`` relationship,
+    which is one such ``SELECT`` on its own -- with or without the lock
+    statement this test exists to pin. So *presence* of a ``custom_apis``
+    ``SELECT`` before the delete is true either way and proves nothing; the
+    *count* is what distinguishes them -- one without the lock statement,
+    two with it, because ``populate_existing()`` forces the lock's query to
+    hit the database again rather than reuse the already-loaded row.
+    """
+    count = 0
+    for statement in statements:
+        upper = statement.strip().upper()
+        if upper.startswith("DELETE"):
+            break
+        if upper.startswith("SELECT") and "FROM CUSTOM_APIS" in upper:
+            count += 1
+    return count
+
+
+class TestDeleteLockOrderMatchesThePutsLockOrder:
+    """``update_custom_api`` locks the ``CustomApi`` definition row first and
+    writes the ``UserCustomApi`` link row afterwards. For the two routes to
+    share one global lock order, ``delete_custom_api`` must take the same
+    definition-row lock before it deletes the link row, in both of its
+    branches.
+
+    SQLite silently drops ``FOR UPDATE`` (it is a no-op on this dialect), so
+    nothing here demonstrates that the lock actually blocks a second writer
+    -- that proof lives in test_custom_api_edit_lock_postgresql.py, against
+    a real server. What this proves instead is statement *order*, which is
+    dialect-independent and exercisable without one.
+    """
+
+    def _run(self, *, team_owned: bool) -> list[str]:
+        session_factory, engine = _lock_order_session_factory()
+        owner_id, api_id = _seed_owned_api_for_lock_order(
+            session_factory,
+            name="lock-order-team" if team_owned else "lock-order-cascade",
+        )
+        db = session_factory()
+        current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+        statements: list[str] = []
+
+        def record_query(conn, cursor, statement, parameters, context, executemany):
+            del conn, cursor, parameters, context, executemany
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", record_query)
+        try:
+            if team_owned:
+
+                def deleted_hook(_db, _user_id, _connector_type, _connector_id):
+                    return ConnectorDeleteDecision(
+                        team_owned=True, authorized=True, delete_definition=True
+                    )
+
+                with snapshot_connector_team_hooks():
+                    set_connector_team_hooks(deleted=deleted_hook)
+                    delete_custom_api(api_id, current_user=current_user, db=db)
+            else:
+                delete_custom_api(api_id, current_user=current_user, db=db)
+        finally:
+            event.remove(engine, "before_cursor_execute", record_query)
+            db.close()
+        return statements
+
+    def test_lock_order_team_owned_branch(self):
+        statements = self._run(team_owned=True)
+        assert _count_custom_apis_selects_before_first_delete(statements) == 2, (
+            "expected the not-found guard's relationship load AND the new "
+            "lock statement's own SELECT against custom_apis, both before "
+            "the first DELETE"
+        )
+
+    def test_lock_order_cascade_branch(self):
+        statements = self._run(team_owned=False)
+        assert _count_custom_apis_selects_before_first_delete(statements) == 2, (
+            "expected the not-found guard's relationship load AND the new "
+            "lock statement's own SELECT against custom_apis, both before "
+            "the first DELETE"
+        )
