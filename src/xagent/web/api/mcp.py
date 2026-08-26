@@ -2222,14 +2222,18 @@ def _local_mcp_can_configure(
       verdict that links the connector but denies edit still resolves the
       route -- the form opens, and a save attempt is refused owner-side, not
       here. Existence of either source is what the four routes' first gate
-      reads, and it is what this answers. Custom API's ``PUT`` has a second,
-      owner-side gate on ``can_edit``/the verdict (403), so this field's
-      accuracy there rests on a convention rather than an identity: the one
-      production write point sets ``can_edit=True`` (custom_api.py), and no
-      other code path creates the row. A future writer that leaves the
-      column at its ``False`` default would make this field claim an
-      editable entry whose save is refused -- add that gate here if that
-      ever happens.
+      reads, and it is what this answers. Both kinds' ``PUT`` now carry that
+      owner-side refusal (403): MCP's route refuses a stand-in whose verdict
+      denies edit outright, before the shared-config tamper check ever runs;
+      Custom API's route reads ``can_edit``/the verdict as its own gate. For
+      MCP, that refusal is a structural check against the same verdict this
+      function reads, so it never drifts from what this field reports. For
+      Custom API, this field's accuracy rests on a convention rather than an
+      identity: the one production write point sets ``can_edit=True``
+      (custom_api.py), and no other code path creates the row. A future
+      writer that leaves the column at its ``False`` default would make this
+      field claim an editable entry whose save is refused -- add that gate
+      here if that ever happens.
 
     This is a UI hint, never a permission. Editing the shared configuration is
     additionally gated owner-side (``_check_mcp_permission(require="edit")``
@@ -3661,6 +3665,12 @@ def update_mcp_server(
         # rename_team_connector runs, so a refusal here has nothing to
         # undo -- zero side effects is structural, not something the
         # rollback has to achieve.
+        #
+        # This set must stay in sync with every field this route writes
+        # onto the caller's personal association row (currently user_env
+        # and is_active, below): adding a third such field without adding
+        # it here would silently start subjecting a personal-only payload
+        # to the recheck too.
         payload_is_personal_only = set(server_data.model_fields_set) <= {
             "user_env",
             "is_active",
