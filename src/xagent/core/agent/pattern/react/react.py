@@ -168,8 +168,98 @@ class ToolCallRecord:
         )
 
 
+# Every code point that Python's str.strip() or JavaScript's
+# String.prototype.trim() treats as trimmable: ECMA-262 WhiteSpace (TAB VT FF
+# ZWNBSP + Unicode Zs) and LineTerminator (LF CR LS PS), unioned with the five
+# extra code points CPython's str.strip() treats as whitespace (U+001C-U+001F,
+# U+0085).
+#
+# The table is frozen as a literal instead of derived from CPython's
+# whitespace table for two reasons: (1) this invariant runs in the direction
+# "whatever JavaScript trims, we must also trim", and CPython's whitespace
+# table shifts with the Unicode version bundled in each interpreter release;
+# (2) the normalized value is written back into item["field"], and the
+# frontend's own trim() must be a no-op on the result -- that only holds
+# while this table is a superset of the JavaScript table, which the coverage
+# test in tests/core/agent/test_react.py pins down.
+#
+# Every code point is written as an escape, never a literal: several of them
+# (U+2028/U+2029 in particular) are silently rewritten by some editors and
+# transports when they appear as literal bytes.
+_INTERACTION_TRIM_CHARS = (
+    "\t\n\v\f\r\x1c\x1d\x1e\x1f\x20\x85\xa0"
+    "\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000\ufeff"
+)  # 30 code points
+
+
+def _normalize_interaction_text(value: str) -> str:
+    """Strip every code point either Python or JavaScript treats as trimmable.
+
+    One pass over one union table, deliberately -- not ``value.strip()``
+    followed by a second pass over the JavaScript-only characters.
+
+    One pass is a fixed point by construction: ``str.strip(chars)`` deletes
+    from both ends up to the first character not in ``chars``, so the
+    returned value's first and last characters are, by definition, not in
+    ``chars``; stripping the same ``chars`` again is the identity. That is
+    what lets the caller write the result back into ``item["field"]`` and
+    rely on the frontend's own ``trim()`` being a no-op on it.
+
+    Two passes over two different tables would not be a fixed point: each
+    pass stops at a character its own table does not contain, and that
+    stopping point says nothing about the other table -- e.g. a value
+    starting with U+FEFF then U+001C would have the first pass halt
+    immediately on U+FEFF (Python does not treat it as space), then a second
+    pass over the JavaScript-only characters would remove U+FEFF and halt on
+    U+001C (JavaScript does not trim it), leaving U+001C behind. Do not
+    "optimize" this back into two passes.
+    """
+    return value.strip(_INTERACTION_TRIM_CHARS)
+
+
+def _is_non_blank_str(value: Any) -> bool:
+    """True when value is a string that stays non-empty after
+    _normalize_interaction_text -- the blankness judgment shared by option
+    label/value filtering and field-name fallback. Takes Any (not str) so
+    the isinstance check and the trim happen together, on the same value:
+    calling _normalize_interaction_text directly on a fresh dict.get(...)
+    expression defeats type-narrowing across the two calls.
+    """
+    return isinstance(value, str) and bool(_normalize_interaction_text(value))
+
+
 def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
-    """Normalize common model variants into the frontend interaction contract."""
+    """Normalize common model variants into the frontend interaction contract.
+
+    A label or value that is blank after ``_normalize_interaction_text`` is
+    treated the same as missing: the option is dropped. A field name that is
+    blank after normalization falls back to ``response_{index}``; a
+    well-formed field name is normalized and written back so the frontend's
+    own ``trim()`` is a no-op on it. Survivors are otherwise kept verbatim --
+    only blankness is judged here, not content.
+
+    The alias chain ``field or id or name`` intentionally keeps its raw
+    truthiness check; it is not normalization-aware. The frontend's own
+    alias chains (clarification-form.tsx, app-context-chat.tsx) make the
+    same raw-truthiness choice, and because this function always writes its
+    result back into ``item["field"]``, the frontend never evaluates its own
+    ``id``/``name`` fallback for a field this function has already resolved
+    -- so this stays consistent with the frontend regardless of which one
+    changes first.
+
+    This function does not deduplicate field names within a single call; a
+    batch with colliding normalized fields is returned unchanged, and a
+    warning is logged. The single-tool call site (``ask_user_question`` in
+    ``_handle_control_tool``) sends the result on as-is. The multi-tool call
+    site (``_pause_for_tool_results``) runs its own deduplication across all
+    tools' interactions after calling this function once per tool.
+
+    As of commit 95fada70f, those two call sites are the only callers in the
+    repository; there is no mechanical guard against a third call site being
+    added without also being covered by this contract.
+    """
 
     if not isinstance(interactions, list):
         return []
@@ -181,16 +271,16 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
 
         item = dict(interaction)
         field = item.get("field") or item.get("id") or item.get("name")
-        if not isinstance(field, str) or not field.strip():
+        if not isinstance(field, str) or not _normalize_interaction_text(field):
             field = f"response_{index}"
-        item["field"] = field.strip()
+        item["field"] = _normalize_interaction_text(field)
 
         if "options" not in item and isinstance(item.get("actions"), list):
             item["options"] = item["actions"]
 
         options = item.get("options")
         if isinstance(options, list):
-            item["options"] = [
+            filtered_options = [
                 {
                     key: value
                     for key, value in {
@@ -203,13 +293,47 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
                 }
                 for option in options
                 if isinstance(option, dict)
-                and isinstance(option.get("label"), str)
-                and option.get("label")
-                and isinstance(option.get("value"), str)
-                and option.get("value")
+                and _is_non_blank_str(option.get("label"))
+                and _is_non_blank_str(option.get("value"))
             ]
+            if options and not filtered_options:
+                # All options for this interaction were blank. The
+                # interaction is still emitted (the question still goes
+                # out), so this is the only signal that it happened. Bounded
+                # to integer counts, never the model-controlled field name:
+                # this module's logging never carries untrusted-input text
+                # (see STRIP_LOG_MAX_TOOL_NAMES above for the same rule
+                # applied to tool names).
+                logger.warning(
+                    "ask_user_question dropped all %d option(s) for interaction %d",
+                    len(options),
+                    index,
+                    extra={
+                        "dropped": len(options),
+                        "total": len(options),
+                        "interaction_index": index,
+                    },
+                )
+            item["options"] = filtered_options
 
         normalized.append(item)
+
+    field_counts: dict[str, int] = {}
+    for item in normalized:
+        field_counts[item["field"]] = field_counts.get(item["field"], 0) + 1
+    colliding_field_count = sum(1 for count in field_counts.values() if count > 1)
+    if colliding_field_count:
+        # Same untrusted-input logging rule as above: integer counts only,
+        # never the colliding field name itself.
+        logger.warning(
+            "ask_user_question interactions have %d colliding field name(s) out of %d",
+            colliding_field_count,
+            len(normalized),
+            extra={
+                "colliding_field_count": colliding_field_count,
+                "total": len(normalized),
+            },
+        )
 
     return normalized
 

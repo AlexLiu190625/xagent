@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import re
+import unicodedata
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +23,10 @@ from xagent.core.agent import (
     ToolCallRecord,
 )
 from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
+from xagent.core.agent.pattern.react.react import (
+    _INTERACTION_TRIM_CHARS,
+    _normalize_ask_user_interactions,
+)
 from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
 from xagent.core.model.chat.basic.router import RouterLLM
@@ -4491,6 +4496,328 @@ async def test_react_pattern_ask_user_question_drops_invalid_options() -> None:
     assert result["interactions"][0]["options"] == [
         {"label": "A", "value": "a"},
         {"label": "B", "value": "b", "description": "Bee"},
+    ]
+
+
+def _js_trim_equivalent(value: str) -> str:
+    """Reference JavaScript String.prototype.trim() semantics, derived from
+    unicodedata rather than the production _INTERACTION_TRIM_CHARS constant
+    -- reusing that constant here would make every assertion below
+    self-proving instead of an independent check."""
+    js_trim_chars = {
+        chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) == "Zs"
+    }
+    js_trim_chars |= {"\t", "\n", "\v", "\f", "\r", "\ufeff", "\u2028", "\u2029"}
+    return value.strip("".join(js_trim_chars))
+
+
+def test_trim_table_covers_every_javascript_trimmed_code_point() -> None:
+    """I-5 coverage, superset half: _INTERACTION_TRIM_CHARS must contain
+    every code point JavaScript's trim() removes, or writing the normalized
+    field back into item["field"] and relying on the frontend's own trim()
+    being a no-op on it stops holding."""
+    js_trimmed = {
+        chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) == "Zs"
+    }
+    js_trimmed |= {"\t", "\n", "\v", "\f", "\r", "\ufeff", "\u2028", "\u2029"}
+    assert js_trimmed <= set(_INTERACTION_TRIM_CHARS)
+
+
+def test_trim_table_python_only_difference_is_exactly_five_code_points() -> None:
+    """I-5 coverage, differential half: pins the five Python-only code
+    points exactly. The superset check above alone would still pass if one
+    of these five were mistyped (e.g. U+001C typoed into U+001B), since a
+    typo like that only shrinks the Python-only difference by one member and
+    stays within a superset of the JavaScript table."""
+    js_trimmed = {
+        chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) == "Zs"
+    }
+    js_trimmed |= {"\t", "\n", "\v", "\f", "\r", "\ufeff", "\u2028", "\u2029"}
+    assert set(_INTERACTION_TRIM_CHARS) - js_trimmed == {
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x1f",
+        "\x85",
+    }
+
+
+def test_normalize_keeps_well_formed_options_and_fields() -> None:
+    """I-1: a normal option and a normal field pass through unchanged."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [{"label": "A", "value": "a"}],
+            }
+        ]
+    )
+    assert normalized[0]["options"] == [{"label": "A", "value": "a"}]
+    assert normalized[0]["field"] == "choice"
+
+
+_BLANK_TEXT_CASES = [
+    ("v1_empty", ""),
+    ("v2_ascii_spaces", "   "),
+    ("v3_mixed_whitespace", "\t\n "),
+    ("v4_fullwidth_space", "\u3000"),
+    ("v5_bom_only", "\ufeff"),
+    ("v8_python_only_control", "\x1c"),
+    ("v9_js_line_separator", "\u2028"),
+]
+
+
+@pytest.mark.parametrize("case_id,value", _BLANK_TEXT_CASES)
+def test_normalize_drops_blank_options(case_id: str, value: str) -> None:
+    """I-3: an option whose label or value is blank under
+    _INTERACTION_TRIM_CHARS is dropped -- the same treatment the existing
+    empty-string-label case already gets (I-2's regression test above),
+    widened from "the empty string" to "blank under the trim table"."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [
+                    {"label": value, "value": "kept-value"},
+                    {"label": "kept-label", "value": value},
+                    {"label": "A", "value": "a"},
+                ],
+            }
+        ]
+    )
+    assert normalized[0]["options"] == [{"label": "A", "value": "a"}]
+
+
+@pytest.mark.parametrize("case_id,value", _BLANK_TEXT_CASES)
+def test_normalize_substitutes_blank_field(case_id: str, value: str) -> None:
+    """I-4: a field name blank under _INTERACTION_TRIM_CHARS falls back to
+    response_{index}."""
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": value, "label": "Choice"}]
+    )
+    assert normalized[0]["field"] == "response_0"
+
+
+@pytest.mark.parametrize(
+    "case_id,value,expected",
+    [
+        ("v6_bom_prefix", "\ufeffabc", "abc"),
+        ("v7_bom_and_space_both_ends", "\ufeff abc\ufeff", "abc"),
+    ],
+)
+def test_normalize_field_bom_normalizes_to_frontend_equivalent(
+    case_id: str, value: str, expected: str
+) -> None:
+    """I-4/I-5: a field wrapped in a BOM (with or without interior spacing)
+    normalizes to the same string the frontend's own trim() produces. The
+    same normalization applies when the value arrives through the field/id/
+    name alias chain rather than "field" directly."""
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": value, "label": "Choice"}]
+    )
+    assert normalized[0]["field"] == expected
+
+    normalized_via_alias = _normalize_ask_user_interactions(
+        [{"type": "select_one", "id": value, "label": "Choice"}]
+    )
+    assert normalized_via_alias[0]["field"] == expected
+
+
+@pytest.mark.parametrize(
+    "case_id,value",
+    [
+        ("v1_empty", ""),
+        ("v2_ascii_spaces", "   "),
+        ("v3_mixed_whitespace", "\t\n "),
+        ("v4_fullwidth_space", "\u3000"),
+        ("v5_bom_only", "\ufeff"),
+        ("v6_bom_prefix", "\ufeffabc"),
+        ("v7_bom_and_space_both_ends", "\ufeff abc\ufeff"),
+        ("v8_python_only_control", "\x1c"),
+        ("v9_js_line_separator", "\u2028"),
+    ],
+)
+def test_normalized_field_is_stable_under_javascript_trim(
+    case_id: str, value: str
+) -> None:
+    """I-5: whatever field the normalizer produces must already be a fixed
+    point of the frontend's own trim(). If it were not, writing the result
+    back into item["field"] and trusting the frontend to leave it alone
+    would silently stop being true for that input."""
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": value, "label": "Choice"}]
+    )
+    field = normalized[0]["field"]
+    assert _js_trim_equivalent(field) == field
+
+
+def test_normalize_logs_when_all_options_are_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-6/I-9: an interaction whose options are all blank keeps the
+    interaction (the question still goes out) and logs exactly one warning.
+    The warning's extra keys are exactly {dropped, total, interaction_index},
+    all ints, and its message format args are also all ints -- no
+    model-controlled string (the field name, a label, a value) is allowed
+    into either half of this log line."""
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        normalized = _normalize_ask_user_interactions(
+            [
+                {
+                    "type": "select_one",
+                    "field": "choice",
+                    "options": [
+                        {"label": "   ", "value": "   "},
+                        {"label": "\ufeff", "value": "\ufeff"},
+                    ],
+                }
+            ]
+        )
+
+    assert len(normalized) == 1
+    assert normalized[0]["options"] == []
+
+    dropped_records = [r for r in caplog.records if "dropped all" in r.getMessage()]
+    assert len(dropped_records) == 1
+    record = dropped_records[0]
+
+    baseline_attrs = set(
+        logging.LogRecord("n", logging.WARNING, "p", 1, "m", None, None).__dict__
+    )
+    # "taskName" is a LogRecord attribute added in 3.12. "message" and
+    # (when some other test module's logging setup is still attached to the
+    # root logger) "asctime" are added by a Formatter.format() pass -- set
+    # record.message / record.asctime as a side effect of formatting, not by
+    # this log call's own extra= payload. All three are excluded so this
+    # comparison is stable regardless of Python version, test runner, or
+    # which other test modules ran earlier in the same process.
+    extra_keys = (
+        set(record.__dict__) - baseline_attrs - {"taskName", "message", "asctime"}
+    )
+    assert extra_keys == {"dropped", "total", "interaction_index"}
+    assert all(isinstance(record.__dict__[k], int) for k in extra_keys)
+    assert record.args is None or all(isinstance(a, int) for a in record.args)
+
+
+def test_normalize_keeps_surviving_option_text_verbatim() -> None:
+    """I-10: an option that survives the blank filter keeps its label and
+    value exactly as given -- normalization only judges blankness, it never
+    rewrites content. A BOM-wrapped value is the only kind of input that can
+    tell "judge blank" apart from "judge blank and also rewrite": a purely
+    blank value would be dropped under either implementation, so it would
+    not catch a rewrite regression."""
+    raw = {"label": "\ufeffImport", "value": "\ufeffimport"}
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": "choice", "options": [raw]}]
+    )
+    assert normalized[0]["options"] == [raw]
+
+
+def test_normalize_keeps_colliding_fields_at_single_tool_callsite(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-11: within one ask_user_question call, a BOM-wrapped field name and
+    its plain counterpart now normalize to the same field. This function
+    does not deduplicate -- both interactions are kept unchanged, and the
+    single-tool call site sends the result on as-is (the multi-tool call
+    site has its own dedup, covered separately below). One warning is
+    logged, with an integer-only extra/message-args payload."""
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        normalized = _normalize_ask_user_interactions(
+            [
+                {"type": "select_one", "field": "\ufeffchoice"},
+                {"type": "select_one", "field": "choice"},
+            ]
+        )
+
+    assert [item["field"] for item in normalized] == ["choice", "choice"]
+
+    collision_records = [
+        r for r in caplog.records if "colliding field name" in r.getMessage()
+    ]
+    assert len(collision_records) == 1
+    record = collision_records[0]
+
+    baseline_attrs = set(
+        logging.LogRecord("n", logging.WARNING, "p", 1, "m", None, None).__dict__
+    )
+    # "taskName" is a LogRecord attribute added in 3.12. "message" and
+    # (when some other test module's logging setup is still attached to the
+    # root logger) "asctime" are added by a Formatter.format() pass -- set
+    # record.message / record.asctime as a side effect of formatting, not by
+    # this log call's own extra= payload. All three are excluded so this
+    # comparison is stable regardless of Python version, test runner, or
+    # which other test modules ran earlier in the same process.
+    extra_keys = (
+        set(record.__dict__) - baseline_attrs - {"taskName", "message", "asctime"}
+    )
+    assert extra_keys == {"colliding_field_count", "total"}
+    assert all(isinstance(record.__dict__[k], int) for k in extra_keys)
+    assert record.args is None or all(isinstance(a, int) for a in record.args)
+
+
+def test_normalize_blank_alias_does_not_fall_through_to_next_key() -> None:
+    """S-4 (decided): the field/id/name alias chain keeps its raw truthiness
+    check on purpose. A BOM-only field is truthy before normalization, so it
+    wins the alias chain and is only normalized away to blank afterward --
+    id="ok" is never reached. Widening the blankness judgment to include BOM
+    does not create a new alias-chain outcome, it only adds a new way to
+    reach the one a plain whitespace field already produced (the second
+    case below, pinned as a regression)."""
+    normalized_bom = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": "\ufeff", "id": "ok"}]
+    )
+    assert normalized_bom[0]["field"] == "response_0"
+
+    normalized_whitespace = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": "   ", "id": "ok"}]
+    )
+    assert normalized_whitespace[0]["field"] == "response_0"
+
+
+@pytest.mark.asyncio
+async def test_pause_for_tool_results_deduplicates_normalized_fields() -> None:
+    """I-8: _pause_for_tool_results runs its own field-name dedup after
+    calling the normalizer for each tool. Two tools whose fields now
+    normalize (via the BOM fix) to the same string still end up with
+    distinct field names in the published interactions -- narrowing the
+    normalizer's output domain does not break the existing dedup loop."""
+    pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime(execution_id="exec-1")
+    context = ExecutionContext()
+    context.add_user_message("Ask")
+
+    tool_call_a = {"id": "call_a", "name": "tool_a"}
+    tool_call_b = {"id": "call_b", "name": "tool_b"}
+    result_a = {
+        "status": "waiting_for_user",
+        "message": "Pick one",
+        "message_type": "question",
+        "interactions": [{"type": "select_one", "field": "\ufeffchoice"}],
+    }
+    result_b = {
+        "status": "waiting_for_user",
+        "message": "Pick another",
+        "message_type": "question",
+        "interactions": [{"type": "select_one", "field": "choice"}],
+    }
+
+    outcome = await pattern._pause_for_tool_results(
+        waiting_pairs=[(tool_call_a, result_a), (tool_call_b, result_b)],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert outcome["status"] == "waiting_for_user"
+    assert [item["field"] for item in outcome["interactions"]] == [
+        "choice",
+        "choice_2",
     ]
 
 
