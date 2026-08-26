@@ -230,6 +230,12 @@ async def test_a_denying_verdict_stand_in_is_403_on_an_empty_payload_too(db):
     member = _make_user(db, 2)
     api = _make_owned_api(db, owner.id, name="denying-stand-in-target")
     api_id = api.id
+    # Captured as plain values, not read off ``api`` after the call: ``api``
+    # and the ``refreshed`` row below share the same identity-mapped Python
+    # object in this session, so comparing one against the other after the
+    # call would be comparing the object with itself and could never fail.
+    original_name = str(api.name)
+    original_description = str(api.description) if api.description is not None else None
 
     with snapshot_connector_team_hooks():
         set_connector_team_hooks(
@@ -243,8 +249,8 @@ async def test_a_denying_verdict_stand_in_is_403_on_an_empty_payload_too(db):
 
     db.rollback()
     refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
-    assert refreshed.description == api.description
-    assert refreshed.name == api.name
+    assert refreshed.name == original_name
+    assert refreshed.description == original_description
     assert (
         db.query(UserCustomApi).filter(UserCustomApi.user_id == member.id).count() == 0
     )
@@ -422,6 +428,15 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
         member = _make_user(db, 2)
         api = _make_owned_api(db, owner.id, name="revalidated-under-lock")
         api_id = api.id
+        # Captured as plain values before the call, not read off ``api``
+        # afterwards: ``api`` and the requery below share the same
+        # identity-mapped Python object in this session, so comparing one
+        # against the other after the call would be comparing the object
+        # with itself and could never fail.
+        original_name = str(api.name)
+        original_description = (
+            str(api.description) if api.description is not None else None
+        )
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=hook)
@@ -435,20 +450,22 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
                 )
             except HTTPException as exc:
                 result["error"] = exc
-            return api, api_id, result
+            return api, api_id, result, original_name, original_description
 
     @pytest.mark.asyncio
     async def test_revoked_between_resolution_and_lock_is_refused(self, db):
         hook = _sequenced_access_hook(
             ConnectorAccess(team_owned=True, can_edit=True), None
         )
-        api, api_id, result = await self._run(db, hook=hook)
+        _api, api_id, result, original_name, original_description = await self._run(
+            db, hook=hook
+        )
 
         assert result["error"].status_code == 403
         db.rollback()
         refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
-        assert refreshed.description == api.description
-        assert refreshed.name == api.name
+        assert refreshed.name == original_name
+        assert refreshed.description == original_description
         assert db.query(UserCustomApi).filter(UserCustomApi.user_id == 2).count() == 0
 
     @pytest.mark.asyncio
@@ -459,13 +476,15 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
             ConnectorAccess(team_owned=True, can_edit=True),
             ConnectorAccess(team_owned=True, can_edit=False),
         )
-        api, api_id, result = await self._run(db, hook=hook)
+        _api, api_id, result, original_name, original_description = await self._run(
+            db, hook=hook
+        )
 
         assert result["error"].status_code == 403
         db.rollback()
         refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
-        assert refreshed.description == api.description
-        assert refreshed.name == api.name
+        assert refreshed.name == original_name
+        assert refreshed.description == original_description
         assert db.query(UserCustomApi).filter(UserCustomApi.user_id == 2).count() == 0
 
     @pytest.mark.asyncio
@@ -474,7 +493,13 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
             ConnectorAccess(team_owned=True, can_edit=True),
             ConnectorAccess(team_owned=True, can_edit=True),
         )
-        api, api_id, result = await self._run(db, hook=hook)
+        (
+            _api,
+            api_id,
+            result,
+            _original_name,
+            _original_description,
+        ) = await self._run(db, hook=hook)
 
         assert "error" not in result
         assert result["response"].description == "edited-while-in-flight"
@@ -491,13 +516,15 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
             ConnectorAccess(team_owned=True, can_edit=True),
             ValueError("hook exploded during recheck"),
         )
-        api, api_id, result = await self._run(db, hook=hook)
+        _api, api_id, result, original_name, original_description = await self._run(
+            db, hook=hook
+        )
 
         assert result["error"].status_code == 503
         db.rollback()
         refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
-        assert refreshed.description == api.description
-        assert refreshed.name == api.name
+        assert refreshed.name == original_name
+        assert refreshed.description == original_description
         assert db.query(UserCustomApi).filter(UserCustomApi.user_id == 2).count() == 0
 
 

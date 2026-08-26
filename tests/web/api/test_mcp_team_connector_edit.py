@@ -623,6 +623,16 @@ class TestADenyingStandInIsRefusedRatherThanReportedSuccessful:
         server_id = server.id
 
         def _run(payload):
+            # Captured as plain values, not read off ``server`` after the
+            # call: ``server`` and the ``refreshed`` row below share the
+            # same identity-mapped Python object in this session, so
+            # comparing one against the other after the call is comparing
+            # the object with itself and can never fail.
+            original_name = str(server.name)
+            original_description = (
+                str(server.description) if server.description is not None else None
+            )
+
             with snapshot_connector_team_hooks():
                 set_connector_team_hooks(
                     access=lambda db, user_id, refs: {
@@ -636,8 +646,8 @@ class TestADenyingStandInIsRefusedRatherThanReportedSuccessful:
 
             db.rollback()
             refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
-            assert refreshed.description == server.description
-            assert refreshed.name == server.name
+            assert refreshed.name == original_name
+            assert refreshed.description == original_description
             assert (
                 db.query(UserMCPServer)
                 .filter(UserMCPServer.user_id == member.id)
@@ -684,6 +694,15 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
         member = _make_user(db, 2)
         server = _make_owned_server(db, owner.id, name="revalidated-under-lock")
         server_id = server.id
+        # Captured as plain values before the call, not read off ``server``
+        # afterwards: ``server`` and the requery below share the same
+        # identity-mapped Python object in this session, so comparing one
+        # against the other after the call would be comparing the object
+        # with itself and could never fail.
+        original_name = str(server.name)
+        original_description = (
+            str(server.description) if server.description is not None else None
+        )
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=hook)
@@ -697,19 +716,21 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
                 )
             except HTTPException as exc:
                 result["error"] = exc
-            return server, server_id, result
+            return server, server_id, result, original_name, original_description
 
     def test_revoked_between_resolution_and_lock_is_refused(self, db):
         hook = _sequenced_access_hook(
             ConnectorAccess(team_owned=True, can_edit=True), None
         )
-        server, server_id, result = self._run(db, hook=hook)
+        _server, server_id, result, original_name, original_description = self._run(
+            db, hook=hook
+        )
 
         assert result["error"].status_code == 403
         db.rollback()
         refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
-        assert refreshed.description == server.description
-        assert refreshed.name == server.name
+        assert refreshed.name == original_name
+        assert refreshed.description == original_description
         assert db.query(UserMCPServer).filter(UserMCPServer.user_id == 2).count() == 0
 
     def test_downgraded_to_not_editable_between_resolution_and_lock_is_refused(
@@ -719,13 +740,15 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
             ConnectorAccess(team_owned=True, can_edit=True),
             ConnectorAccess(team_owned=True, can_edit=False),
         )
-        server, server_id, result = self._run(db, hook=hook)
+        _server, server_id, result, original_name, original_description = self._run(
+            db, hook=hook
+        )
 
         assert result["error"].status_code == 403
         db.rollback()
         refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
-        assert refreshed.description == server.description
-        assert refreshed.name == server.name
+        assert refreshed.name == original_name
+        assert refreshed.description == original_description
         assert db.query(UserMCPServer).filter(UserMCPServer.user_id == 2).count() == 0
 
     def test_still_granted_on_recheck_commits_durably(self, db):
@@ -733,7 +756,9 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
             ConnectorAccess(team_owned=True, can_edit=True),
             ConnectorAccess(team_owned=True, can_edit=True),
         )
-        server, server_id, result = self._run(db, hook=hook)
+        _server, server_id, result, _original_name, _original_description = self._run(
+            db, hook=hook
+        )
 
         assert "error" not in result
         assert result["response"].description == "edited-while-in-flight"
@@ -750,13 +775,15 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
             ConnectorAccess(team_owned=True, can_edit=True),
             ValueError("hook exploded during recheck"),
         )
-        server, server_id, result = self._run(db, hook=hook)
+        _server, server_id, result, original_name, original_description = self._run(
+            db, hook=hook
+        )
 
         assert result["error"].status_code == 503
         db.rollback()
         refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
-        assert refreshed.description == server.description
-        assert refreshed.name == server.name
+        assert refreshed.name == original_name
+        assert refreshed.description == original_description
         assert db.query(UserMCPServer).filter(UserMCPServer.user_id == 2).count() == 0
 
 
