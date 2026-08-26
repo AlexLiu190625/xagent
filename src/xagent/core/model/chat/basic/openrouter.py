@@ -1069,20 +1069,36 @@ class OpenRouterLLM(OpenAILLM):
                 False,
             )
 
-        # DeepSeek-served endpoints can default to thinking mode, and once a
-        # response carries reasoning_content they require it to be replayed
-        # verbatim on the next request of a tool-call chain. That replay is
-        # implemented (_prepare_messages_for_request, _response_provider_
-        # state, _attach_reasoning_content_to_raw below), so this is no
-        # longer the reason thinking stays off by default. It stays off
-        # here anyway, matching DeepSeekLLM's own default: turning
-        # thinking on changes token cost and response shape for every
-        # DeepSeek-authored slug on this client, which is a separate call
-        # from closing the replay gap and is left for a change that makes
-        # that call explicitly (#1537). This deliberately ignores
-        # supports_thinking_mode: a declared thinking_mode ability does
-        # not flip this default on its own.
-        return self._uses_deepseek_tool_protocol, False
+        # No caller-supplied thinking configuration. DeepSeek-served
+        # endpoints turn reasoning on by themselves, so the only question
+        # here is whether this client overrides that with an explicit
+        # disable payload. It does, unless the model record declares the
+        # ``thinking_mode`` ability.
+        #
+        # The ability is operator-set configuration read from the model
+        # record, while ``_uses_deepseek_tool_protocol`` is inferred from
+        # the model name. Gating on the explicit configuration keeps the
+        # decision with whoever configured the model: a record that asks
+        # for thinking gets the endpoint's reasoning, and a record that
+        # never asked for it keeps the cheaper non-reasoning shape it has
+        # always had. Reasoning produced this way is captured and replayed
+        # on the next request of a tool-call chain
+        # (``_prepare_messages_for_request``, ``_response_provider_state``,
+        # ``_attach_reasoning_content_to_raw``), which is what makes
+        # leaving it on safe.
+        #
+        # This is deliberately different from ``DeepSeekLLM``, which
+        # disables reasoning for every request that does not ask for it and
+        # never consults abilities. That client talks to one endpoint whose
+        # default it knows; this one routes the same author's models
+        # through endpoints whose defaults it does not control, so the
+        # declared ability is the only signal available about what the
+        # operator wants. Aligning the direct client is a separate decision
+        # about a different endpoint and is not made here.
+        return (
+            self._uses_deepseek_tool_protocol and not self.supports_thinking_mode,
+            False,
+        )
 
     def _prepare_provider_reasoning_extra_body(
         self,
