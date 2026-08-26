@@ -2082,6 +2082,7 @@ def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) 
         execution_mode: str | None = None,
         is_preview: bool = False,
         is_visible: bool = True,
+        timezone: str | None = None,
     ) -> Any:
         captured.update(
             {
@@ -2092,6 +2093,7 @@ def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) 
                 "execution_mode": execution_mode,
                 "is_preview": is_preview,
                 "is_visible": is_visible,
+                "timezone": timezone,
             }
         )
         return SimpleNamespace(
@@ -2108,7 +2110,12 @@ def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) 
     response = client.post(
         f"/api/workforces/{workforce['id']}/runs",
         headers=headers,
-        json={"message": "go", "files": ["file-1"], "execution_mode": "think"},
+        json={
+            "message": "go",
+            "files": ["file-1"],
+            "execution_mode": "think",
+            "timezone": "Australia/Melbourne",
+        },
     )
     assert response.status_code == 200, response.text
     assert response.json() == {
@@ -2125,6 +2132,7 @@ def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) 
         "execution_mode": "think",
         "is_preview": False,
         "is_visible": True,
+        "timezone": "Australia/Melbourne",
     }
 
 
@@ -2152,6 +2160,7 @@ def test_preview_run_endpoint_delegates_to_run_service(
         message: str,
         selected_file_ids: list[str] | None = None,
         execution_mode: str | None = None,
+        timezone: str | None = None,
     ) -> Any:
         captured.update(
             {
@@ -2163,6 +2172,7 @@ def test_preview_run_endpoint_delegates_to_run_service(
                 "message": message,
                 "selected_file_ids": selected_file_ids,
                 "execution_mode": execution_mode,
+                "timezone": timezone,
             }
         )
         return SimpleNamespace(
@@ -2190,6 +2200,7 @@ def test_preview_run_endpoint_delegates_to_run_service(
             ],
             "message": "go",
             "files": ["file-1"],
+            "timezone": "Australia/Melbourne",
         },
     )
     assert response.status_code == 200, response.text
@@ -2218,6 +2229,7 @@ def test_preview_run_endpoint_delegates_to_run_service(
         "message": "go",
         "selected_file_ids": ["file-1"],
         "execution_mode": None,
+        "timezone": "Australia/Melbourne",
     }
 
 

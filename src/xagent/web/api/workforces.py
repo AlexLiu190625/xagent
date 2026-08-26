@@ -128,6 +128,10 @@ class WorkforceRunRequest(BaseModel):
     execution_mode: str | None = None
     is_preview: bool = False
     is_visible: bool = True
+    # Opening turn starts inside this request, so the zone rides here or the
+    # first answer renders against UTC. Unresolvable names degrade to UTC at
+    # the render site rather than 422 here.
+    timezone: str | None = Field(default=None, max_length=64)
 
 
 class WorkforcePreviewRunRequest(BaseModel):
@@ -138,6 +142,7 @@ class WorkforcePreviewRunRequest(BaseModel):
     message: str = Field(..., min_length=1)
     files: list[str] = Field(default_factory=list)
     execution_mode: str | None = None
+    timezone: str | None = Field(default=None, max_length=64)
 
 
 def _field_supplied(model: BaseModel, field_name: str) -> bool:
@@ -663,6 +668,7 @@ async def create_workforce_preview_run(
         message=request.message,
         selected_file_ids=request.files,
         execution_mode=request.execution_mode,
+        timezone=request.timezone,
     )
     return {
         "workforce_run_id": result.workforce_run.id,
@@ -1420,6 +1426,7 @@ async def create_workforce_run(
         execution_mode=request.execution_mode,
         is_preview=request.is_preview,
         is_visible=request.is_visible,
+        timezone=request.timezone,
     )
     return {
         "workforce_run_id": result.workforce_run.id,
