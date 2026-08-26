@@ -1332,7 +1332,12 @@ class TestVisionToolUnderstandMediaEnvelope:
         -- must never leak into a user-visible answer, UnderstandMediaResult
         must not grow a field to carry it, and DetectObjectsResult must
         keep populating its own raw_response diagnostic field."""
-        # UnderstandMediaResult gains no new field to carry raw_display.
+        # Frozen field set. Equality rather than a `"raw_display" not in`
+        # check is deliberate: it also pins the absence of `parsing_method`
+        # and `raw_response`, which the detect_objects result carries and
+        # this one must not. Adding a field to this public result object is
+        # a deliberate contract change, so update this line in the same
+        # commit that adds it.
         assert set(UnderstandMediaResult.model_fields) == {
             "success",
             "answer",
