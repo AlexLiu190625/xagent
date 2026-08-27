@@ -1469,7 +1469,11 @@ class TestSessionRecoveryAfterHookFailure:
 
         assert response.can_edit_global is True
 
-        db.rollback()
+        # No rollback here on purpose: the query below is the statement
+        # that proves the seam's hook door restored this session, not just
+        # an incidental fresh read (see the same note in
+        # test_connector_hook_session_fault_postgresql.py, where the
+        # orm-flush shape poisons on every backend the same way).
         refreshed = (
             db.query(UserMCPServer)
             .filter(
@@ -1511,7 +1515,8 @@ class TestSessionRecoveryAfterHookFailure:
         # always reported before any verdict existed.
         assert response.can_edit_global is False
 
-        db.rollback()
+        # No rollback here on purpose -- see the same note in the toggle
+        # test above.
         assoc = (
             db.query(UserMCPServer)
             .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)

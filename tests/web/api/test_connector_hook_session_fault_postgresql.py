@@ -20,19 +20,33 @@ shape needs its own PostgreSQL-only proof.
 The four route-level tests below (toggle, connect, the apps listing, the
 servers listing) are also run here for completeness -- they pin the
 *correct* end-to-end behavior (2xx, durable writes) under this exact
-failure shape on a real server. They are not independently
-mutation-sensitive for this specific shape on these specific routes,
-though: each response builder happens to read the connector row's
-attributes once *before* the hook ever runs (e.g. toggle_mcp_server's own
-log line touches ``server.name``), which loads those attributes into the
-ORM instance. Since ``poison_by_raw_statement`` aborts the underlying
+failure shape on a real server. Whether each route *call itself* needs the
+session restored is a separate question from whether its test does, and
+the two no longer agree for all four:
+
+The route calls themselves are never independently mutation-sensitive for
+this specific shape: each response builder happens to read the connector
+row's attributes once *before* the hook ever runs (e.g. toggle_mcp_server's
+own log line touches ``server.name``), which loads those attributes into
+the ORM instance. Since ``poison_by_raw_statement`` aborts the underlying
 transaction without SQLAlchemy's ORM-level "expire everything" cleanup
 (unlike a failed flush -- see poison_by_orm_flush's docstring and
 TestSessionRecoveryAfterHookFailure in the SQLite suite, which *is*
 mutation-sensitive on both backends), no attribute on that already-loaded
-row needs reloading afterward, so these four routes never actually issue a
-new statement on the poisoned connection either way. The seam-level test
-above is what actually exercises the poisoned connection.
+row needs reloading afterward, so none of the four routes ever issues a
+new statement on the poisoned connection while building its own response.
+
+The toggle and connect tests are independently mutation-sensitive anyway,
+because each queries the database again *after* the route call returns, to
+verify what actually landed (``refreshed``/``assoc`` below) -- and that
+query runs directly on the same session the hook just poisoned, with no
+rollback of the test's own in between. Removing the production restore
+turns that query into the first statement that reaches the aborted
+transaction, which PostgreSQL refuses. The apps-listing and servers-listing
+tests stay non-sensitive: neither issues any further statement after the
+route call, so there is nothing left in either test that could reach the
+poisoned connection. The seam-level test above is what directly exercises
+the poisoned connection regardless of any particular route's shape.
 
 ``/api/mcp/servers`` (the sister listing to the apps listing above) now
 has its own per-request degradation catch, added in this same revision, so
@@ -143,7 +157,11 @@ def test_a_toggle_that_already_committed_still_returns_200_when_the_hook_poisons
             )
         assert response.can_edit_global is True
 
-        db.rollback()
+        # No rollback here on purpose: the seam's hook door already
+        # restored this session, and the query below is the statement that
+        # proves it -- on PostgreSQL a poisoned transaction refuses every
+        # later statement. Rolling back first would make this test pass
+        # with the production restore removed.
         refreshed = (
             db.query(UserMCPServer)
             .filter(
@@ -188,7 +206,9 @@ def test_connecting_an_app_still_returns_200_when_the_hook_poisons_the_session(
         # always reported before any verdict existed.
         assert response.can_edit_global is False
 
-        db.rollback()
+        # No rollback here on purpose -- see the same note in the toggle
+        # test above: the query below is the proof the seam's hook door
+        # restored the session, not just an incidental fresh read.
         assoc = (
             db.query(UserMCPServer)
             .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
@@ -198,7 +218,11 @@ def test_connecting_an_app_still_returns_200_when_the_hook_poisons_the_session(
             )
             .one()
         )
-        assert assoc is not None
+        # ``.one()`` raises when the row is missing, so its own success is
+        # the existence assertion. What this line adds is the route's own
+        # decision: connecting never grants ownership (mcp.py:3339-3341),
+        # and that decision survived the poisoned hook.
+        assert assoc.is_owner is False
     finally:
         db.close()
 
