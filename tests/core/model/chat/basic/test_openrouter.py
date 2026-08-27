@@ -2827,6 +2827,94 @@ async def test_openrouter_deepseek_stream_replays_reasoning_content(mocker):
 
 
 @pytest.mark.asyncio
+async def test_openrouter_deepseek_declared_thinking_stream_captures_and_replays_without_request_thinking(
+    mocker,
+):
+    """Streaming counterpart of the non-streaming capture-then-replay test.
+
+    Each half of this round trip is already pinned on its own -- streamed
+    capture, streamed replay, and the declared-ability default. What is only
+    covered here is the composition: one streamed tool-call turn captures
+    reasoning, and the next streamed turn sends it back, with neither call
+    passing ``thinking`` at all.
+    """
+
+    async def first_stream():
+        yield _reasoning_delta_chunk(reasoning_content="Use the search tool first")
+        yield _tool_call_delta_chunk(
+            call_id="call_1",
+            index=0,
+            name="search",
+            arguments='{"query":"xagent"}',
+            finish_reason="tool_calls",
+        )
+
+    async def second_stream():
+        yield _tool_call_delta_chunk(
+            call_id="call_2",
+            index=0,
+            name="search",
+            arguments='{"query":"xagent"}',
+            finish_reason="tool_calls",
+        )
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        first_stream(),
+        second_stream(),
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    round1 = [
+        chunk
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "Search xagent"}],
+            tools=_single_tool_schema("search"),
+        )
+    ]
+    assert (
+        "extra_body" not in mock_client.chat.completions.create.call_args_list[0].kwargs
+    )
+    tool_chunks = [chunk for chunk in round1 if chunk.is_tool_call()]
+    assert tool_chunks, "expected at least one tool-call chunk"
+    captured = tool_chunks[-1].raw[PROVIDER_STATE_METADATA_KEY]
+    assert captured == _deepseek_provider_state("Use the search tool first")
+
+    messages = [
+        {"role": "user", "content": "Search xagent"},
+        {
+            "role": "assistant",
+            "content": "",
+            PROVIDER_STATE_METADATA_KEY: captured,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+    ]
+    async for _chunk in llm.stream_chat(messages, tools=_single_tool_schema("search")):
+        pass
+
+    second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+    assert "extra_body" not in second_call
+    sent = second_call["messages"]
+    assert sent[1]["reasoning_content"] == "Use the search tool first"
+    assert PROVIDER_STATE_METADATA_KEY not in sent[1]
+
+
+@pytest.mark.asyncio
 async def test_openrouter_deepseek_default_first_turn_request_is_byte_identical(
     mocker, mock_chat_completion
 ):
