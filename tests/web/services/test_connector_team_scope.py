@@ -334,6 +334,37 @@ def test_resolve_connector_access_rejects_a_key_whose_connector_type_is_not_a_st
 
 
 @pytest.mark.parametrize(
+    "wrong_value",
+    ["dict", "duck-typed", "delete-decision", "none", "true"],
+)
+def test_resolve_connector_access_rejects_a_verdict_value_that_is_not_a_connector_access(
+    wrong_value,
+):
+    """The key was asked about and the key's shape is fine -- what is
+    wrong is the value. A duck-typed object carrying ``team_owned=True``
+    and ``can_edit=True`` would satisfy every attribute check below it, so
+    the type check is the only thing that stops a hook from answering with
+    something that merely resembles a verdict. Built in the body, not the
+    parametrize list, because two of these are instances of types this
+    module defines."""
+    value = {
+        "dict": {"team_owned": True, "can_edit": True},
+        "duck-typed": SimpleNamespace(team_owned=True, can_edit=True),
+        "delete-decision": connector_team_scope.ConnectorDeleteDecision(
+            team_owned=True, authorized=True
+        ),
+        "none": None,
+        "true": True,
+    }[wrong_value]
+
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *_a: {("mcp", 11): value}
+    )
+    with pytest.raises(ValueError, match="expected ConnectorAccess values"):
+        connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+
+
+@pytest.mark.parametrize(
     "bad_team_owned",
     [False, "yes", 1],
     ids=["false", "truthy-string", "truthy-int"],
