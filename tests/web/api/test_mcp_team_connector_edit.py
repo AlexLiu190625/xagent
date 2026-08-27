@@ -248,6 +248,56 @@ class TestPutWiringForATeamEditor:
             is None
         )
 
+    def test_a_member_with_a_personal_row_edits_the_shared_config_durably(self, db):
+        """Design invariants I5 and I6 for the population they were
+        written for and never got: a caller whose own personal row does
+        not grant edit, widened by a granting team verdict. The existing
+        coverage for both invariants uses the stand-in population, which
+        has no personal row at all."""
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_owned_server(db, owner.id, name="both-rows-mcp")
+        server_id = server.id
+        db.add(
+            UserMCPServer(
+                user_id=member.id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=_sequenced_access_hook(
+                    ConnectorAccess(team_owned=True, can_edit=True)
+                )
+            )
+            response = update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="widened-by-the-team"),
+                current_user=member,
+                db=db,
+            )
+
+        assert response.can_edit_global is True
+
+        # I5: durability, not staging.
+        db.rollback()
+        refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert refreshed.description == "widened-by-the-team"
+        # I6: the caller's one personal row, not a second one.
+        assert (
+            db.query(UserMCPServer)
+            .filter(
+                UserMCPServer.user_id == member.id,
+                UserMCPServer.mcpserver_id == server_id,
+            )
+            .count()
+            == 1
+        )
+
     def test_view_only_team_member_cannot_tamper_the_shared_config(self, db):
         owner = _make_user(db, 1)
         member = _make_user(db, 2)
@@ -925,3 +975,50 @@ class TestTheRecheckCostsExactlyOneExtraHookCall:
             )
 
         assert len(hook.calls) == 1
+
+    def test_a_member_with_a_personal_row_pays_one_call_on_a_real_personal_field(
+        self, db
+    ):
+        """The personal-only exemption, exercised by a payload that
+        actually carries a personal field and by a caller the payload can
+        land on. The existing coverage is degenerate in two different
+        ways: the empty-payload case (above) never carries a field at all,
+        and the denying-verdict case (above) short-circuits one clause
+        earlier, on ``team_access.can_edit``, so neither reaches the
+        exemption with a real value."""
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_owned_server(db, owner.id, name="both-rows-personal-only")
+        server_id = server.id
+        db.add(
+            UserMCPServer(
+                user_id=member.id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            update_mcp_server(
+                server_id,
+                MCPServerUpdate(is_active=False),
+                current_user=member,
+                db=db,
+            )
+
+        assert len(hook.calls) == 1
+        # The personal write the exemption exists to let through actually landed.
+        db.rollback()
+        refreshed = (
+            db.query(UserMCPServer)
+            .filter(
+                UserMCPServer.user_id == member.id,
+                UserMCPServer.mcpserver_id == server_id,
+            )
+            .one()
+        )
+        assert refreshed.is_active is False

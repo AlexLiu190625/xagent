@@ -192,6 +192,59 @@ class TestPutWiringForATeamEditor:
         )
 
     @pytest.mark.asyncio
+    async def test_a_member_with_a_personal_row_edits_the_shared_config_durably(
+        self, db
+    ):
+        """The MCP twin of this test: a caller whose own personal row does
+        not grant edit, widened by a granting team verdict. ``can_edit=False``
+        on the personal row is the point -- it is what keeps
+        ``_resolve_custom_api_for_request``'s ``skip_resolution_when=lambda
+        ua: bool(ua.can_edit)`` from short-circuiting before the verdict is
+        even resolved."""
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id, name="both-rows-custom-api")
+        api_id = api.id
+        db.add(
+            UserCustomApi(
+                user_id=member.id,
+                custom_api_id=api_id,
+                is_owner=False,
+                can_edit=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
+            )
+            response = await _put(
+                api_id,
+                CustomApiUpdate(description="widened-by-the-team"),
+                member,
+                db,
+            )
+
+        assert response.description == "widened-by-the-team"
+
+        db.rollback()
+        refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert refreshed.description == "widened-by-the-team"
+        assert (
+            db.query(UserCustomApi)
+            .filter(
+                UserCustomApi.user_id == member.id,
+                UserCustomApi.custom_api_id == api_id,
+            )
+            .count()
+            == 1
+        )
+
+    @pytest.mark.asyncio
     async def test_view_only_team_member_cannot_tamper_the_shared_config(self, db):
         owner = _make_user(db, 1)
         member = _make_user(db, 2)

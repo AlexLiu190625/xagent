@@ -475,6 +475,15 @@ class TestReportedEditPermissionConsistencyMcp:
             ("owner", None, True),
             ("personal_non_owner_no_team_link", None, True),
             (
+                # The PR's own central capability: a caller who already has
+                # a personal row that does not grant edit, widened by a
+                # granting team verdict. Every other population here either
+                # has no personal row (the stand-ins) or no verdict.
+                "personal_row_and_granting_verdict",
+                ConnectorAccess(team_owned=True, can_edit=True),
+                True,
+            ),
+            (
                 "stand_in_granting_edit",
                 ConnectorAccess(team_owned=True, can_edit=True),
                 False,
@@ -509,7 +518,10 @@ class TestReportedEditPermissionConsistencyMcp:
         server = _make_owned_server(db, owner.id, name=f"consistency-mcp-{population}")
         server_id = server.id
 
-        if population == "personal_non_owner_no_team_link":
+        if population in (
+            "personal_non_owner_no_team_link",
+            "personal_row_and_granting_verdict",
+        ):
             db.add(
                 UserMCPServer(
                     user_id=caller.id,
@@ -583,6 +595,10 @@ class TestReportedEditPermissionConsistencyCustomApi:
             ("owner", None),
             ("personal_non_owner_no_team_link", None),
             (
+                "personal_row_and_granting_verdict",
+                ConnectorAccess(team_owned=True, can_edit=True),
+            ),
+            (
                 "stand_in_granting_edit",
                 ConnectorAccess(team_owned=True, can_edit=True),
             ),
@@ -614,7 +630,10 @@ class TestReportedEditPermissionConsistencyCustomApi:
         api = _make_owned_api(db, owner.id, name=f"consistency-api-{population}")
         api_id = api.id
 
-        if population == "personal_non_owner_no_team_link":
+        if population in (
+            "personal_non_owner_no_team_link",
+            "personal_row_and_granting_verdict",
+        ):
             db.add(
                 UserCustomApi(
                     user_id=caller.id,
