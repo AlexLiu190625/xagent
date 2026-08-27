@@ -1923,6 +1923,12 @@ async def test_openrouter_deepseek_declared_thinking_makes_disable_retry_a_real_
     disabled, so the "disable thinking" rule (2) is a real change against
     this same combined error and gets to fire instead of being skipped as a
     no-op.
+
+    The endpoint modelled here is the one the error text describes: it
+    refuses every request that does not ask for reasoning explicitly. So the
+    disable attempt this fallthrough now spends is rejected in turn, and
+    recovery costs three upstream requests -- the unspecified first attempt,
+    the disable attempt, and the enable attempt that finally succeeds.
     """
     monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
     combined_error = (
@@ -1943,6 +1949,7 @@ async def test_openrouter_deepseek_declared_thinking_makes_disable_retry_a_real_
     mock_client = mocker.AsyncMock()
     mock_client.chat.completions.create.side_effect = [
         RuntimeError(combined_error),
+        RuntimeError(combined_error),
         success_response,
     ]
     mocker.patch(
@@ -1962,13 +1969,17 @@ async def test_openrouter_deepseek_declared_thinking_makes_disable_retry_a_real_
     )
 
     assert result["content"] == "ok"
-    assert mock_client.chat.completions.create.await_count == 2
-    assert (
-        "extra_body" not in mock_client.chat.completions.create.call_args_list[0].kwargs
-    )
-    second = mock_client.chat.completions.create.call_args_list[1].kwargs["extra_body"]
-    assert second["thinking"] == {"type": "disabled"}
-    assert second["reasoning"] == {"enabled": False}
+    calls = mock_client.chat.completions.create.call_args_list
+    assert mock_client.chat.completions.create.await_count == 3
+    assert "extra_body" not in calls[0].kwargs
+    assert calls[1].kwargs["extra_body"] == {
+        "reasoning": {"enabled": False},
+        "thinking": {"type": "disabled"},
+    }
+    assert calls[2].kwargs["extra_body"] == {
+        "reasoning": {"enabled": True},
+        "thinking": {"type": "enabled"},
+    }
 
 
 # ==========================================================================
