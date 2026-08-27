@@ -80,6 +80,14 @@ from ...core.file_storage.keys import (
     build_task_output_storage_key,
     build_upload_storage_key,
 )
+from ..services.assistant_history_safety import (
+    ASSISTANT_RESPONSE_MESSAGE_TYPE,
+    TASK_FAILURE_MESSAGE_TYPE,
+    assistant_history_has_safe_ancillary_payload,
+    assistant_history_values_for_persistence,
+    client_safe_assistant_history_content,
+    safe_str,
+)
 from ..services.chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
@@ -90,6 +98,7 @@ from ..services.chat_history_service import (
     inspect_user_message_delivery,
     mark_user_message_delivery_sync,
 )
+from ..services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from ..services.db_runtime import (
     await_task_settlement,
     cancel_and_drain_async_task,
@@ -351,10 +360,6 @@ def _client_message_id(value: Any) -> str | None:
 # the exception text. Still #1479: whether the sender copy should also be
 # narrowed when the initiator is an anonymous public connection.
 CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
-
-# Broadcast audiences did not send anything, so the validation wording above
-# would be misdirected; task-level failure broadcasts use this instead.
-CLIENT_SAFE_TASK_FAILURE = "Task execution failed."
 
 
 class ClientVisibleError(Exception):
@@ -623,8 +628,8 @@ def _terminal_task_error_payload(
                         db,
                         task_id=task_id,
                         user_id=int(task_user_id),
-                        content=message,
-                        message_type="chat_response",
+                        content=CLIENT_SAFE_TASK_FAILURE,
+                        message_type=TASK_FAILURE_MESSAGE_TYPE,
                     )
                 except Exception:
                     logger.warning(
@@ -2498,6 +2503,15 @@ def _finalize_task_execution_result_isolated(
                     status=final_status,
                     expected_run_id=expected_run_id,
                 )
+                if final_status == TaskStatus.FAILED:
+                    diagnostic_error = safe_str(result.get("error")).strip()
+                    setattr(
+                        task_updated,
+                        "error_message",
+                        diagnostic_error
+                        or safe_str(ai_response).strip()
+                        or CLIENT_SAFE_TASK_FAILURE,
+                    )
                 sync_workforce_run_status(
                     finalize_db,
                     task_updated,
@@ -2514,17 +2528,25 @@ def _finalize_task_execution_result_isolated(
                         f"Task {task_id}: cannot persist assistant message "
                         "without a resolved user_id"
                     )
+                history_content, history_message_type = (
+                    assistant_history_values_for_persistence(
+                        content=safe_str(ai_response),
+                        message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
+                        is_failure=task_updated.status == TaskStatus.FAILED,
+                    )
+                )
                 persist_assistant_message_no_commit(
                     finalize_db,
                     task_id=task_id,
                     user_id=task_user_id,
-                    content=str(ai_response),
-                    message_type="chat_response"
-                    if isinstance(chat_response, dict)
-                    else "final_answer",
-                    interactions=chat_response.get("interactions")
-                    if isinstance(chat_response, dict)
-                    else None,
+                    content=history_content,
+                    message_type=history_message_type,
+                    interactions=(
+                        chat_response.get("interactions")
+                        if isinstance(chat_response, dict)
+                        and task_updated.status != TaskStatus.FAILED
+                        else None
+                    ),
                     content_is_reconciled=True,
                 )
                 finalize_db.commit()
@@ -3138,7 +3160,7 @@ def _finalize_resumed_task(
                 task_id=task_id,
                 user_id=task_owner_user_id,
                 content=output,
-                message_type="final_answer",
+                message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
                 turn_id=_latest_result_user_turn_id(result),
                 content_is_reconciled=True,
             )
@@ -3146,9 +3168,23 @@ def _finalize_resumed_task(
             orm_task.output = output
             orm_task.error_message = None
         elif final_task_status == TaskStatus.FAILED:
+            if task_owner_user_id is not None:
+                persist_assistant_message_no_commit(
+                    db,
+                    task_id=task_id,
+                    user_id=task_owner_user_id,
+                    content=CLIENT_SAFE_TASK_FAILURE,
+                    message_type=TASK_FAILURE_MESSAGE_TYPE,
+                    turn_id=_latest_result_user_turn_id(result),
+                    content_is_reconciled=True,
+                )
             orm_task = cast(Any, task)
             orm_task.output = None
-            orm_task.error_message = output or "Task execution failed."
+            orm_task.error_message = (
+                str(result.get("error") or "").strip()
+                or output
+                or CLIENT_SAFE_TASK_FAILURE
+            )
 
         sync_workforce_run_status(db, task, final_task_status)
         lease_released = release_task_lease_no_commit(
@@ -7479,6 +7515,10 @@ def _load_historical_stream_snapshot_sync(
                 role = str(chat_message.role)
                 content = str(chat_message.content or "").strip()
                 if role == "assistant":
+                    content = client_safe_assistant_history_content(
+                        content=content,
+                        message_type=str(chat_message.message_type),
+                    )
                     content = reconcile_assistant_file_references(
                         db,
                         task_id=int(task_id),
@@ -7489,7 +7529,14 @@ def _load_historical_stream_snapshot_sync(
                 # Read attachments off the row so file-only turns (empty
                 # content + non-empty attachments) survive replay and so the
                 # chip metadata reaches the synthesized user_message event.
-                _attachments_raw = chat_message.attachments
+                assistant_ancillary_is_safe = role != "assistant" or (
+                    assistant_history_has_safe_ancillary_payload(
+                        str(chat_message.message_type)
+                    )
+                )
+                _attachments_raw = (
+                    chat_message.attachments if assistant_ancillary_is_safe else None
+                )
                 row_attachments: Optional[list] = (
                     _attachments_raw
                     if isinstance(_attachments_raw, list) and _attachments_raw
@@ -7536,7 +7583,11 @@ def _load_historical_stream_snapshot_sync(
                         in trace_message_keys
                     ):
                         continue
-                    interactions = chat_message.interactions
+                    interactions = (
+                        chat_message.interactions
+                        if assistant_ancillary_is_safe
+                        else None
+                    )
                     data = {
                         "message": content,
                         "content": content,
