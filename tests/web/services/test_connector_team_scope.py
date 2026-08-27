@@ -665,10 +665,13 @@ def _swallowing_poisoning_hook_answering(colliding_user_id: int, answer: object)
 def test_a_hook_that_swallows_its_failure_and_answers_malformed_restores_too(
     db_session, slot, answer, invoke
 ):
-    """The two slots whose answers this seam validates are the two where a
-    hook can poison the shared session without ever raising: it runs a
-    statement that fails, catches that itself, and returns an answer the
-    validator then rejects. The rejection is the seam's own exception, not
+    """The two slots whose answers this seam validates are the two where
+    it can notice a hook that poisoned the shared session without ever
+    raising: the hook runs a statement that fails, catches that itself,
+    and returns an answer the validator then rejects. A hook can do the
+    same on the other three slots, where nothing checks the answer and so
+    nothing raises -- see the door's docstring on the shape that stays
+    uncovered. The rejection is the seam's own exception, not
     the hook's, so the restore has to sit where it sees both -- inside the
     door, around the validation as well as around the call."""
     existing = _create_user(db_session, "already-here")

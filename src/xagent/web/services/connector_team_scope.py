@@ -479,6 +479,14 @@ def _call_connector_hook_gate(
     this function decides nothing about how the failure is classified or
     translated. That stays with the ``*_or_raise`` wrappers below, which
     own the seam's typed-error contract.
+
+    One shape stays uncovered, deliberately: a hook that poisons the
+    session, swallows its own failure, and still returns a well-formed
+    answer produces no exception at all -- neither here nor in a
+    validator -- so nothing triggers a restore. That was equally true
+    before this restore moved here; closing it would mean probing the
+    session's health after every hook call, which is a different design
+    than a failure path.
     """
     try:
         answer = hook(*args, **kwargs)

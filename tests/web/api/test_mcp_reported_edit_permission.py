@@ -335,8 +335,8 @@ class TestDegradedListingQueryCostGrowsWithRowCount:
     mid-statement. The same rollback, and so the same cost, applies when
     the hook returns normally but its answer is rejected by the seam's
     validator: the door restores the session for both. On SQLAlchemy
-    2.0.48, that rollback expires every
-    already-loaded object's every mapped field, including primary keys --
+    2.0.48, that rollback expires every already-loaded object's every
+    mapped field, including primary keys --
     so the two listing loops below, each iterating a stand-in row per
     connector, re-``SELECT`` that row one at a time on next access. Repo
     issue #1711 independently confirmed this rollback behavior. This test
