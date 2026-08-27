@@ -357,7 +357,7 @@ class OpenAICompatibleLLM(BaseLLM):
         thinking: Optional[Dict[str, Any]] = None,
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
-    ) -> Any:
+    ) -> Dict[str, Any]:
         """
         Perform a chat completion or trigger tool call.
 
@@ -373,7 +373,7 @@ class OpenAICompatibleLLM(BaseLLM):
             **kwargs: Additional parameters to pass to the OpenAI API
 
         Returns:
-            - If normal text reply: return string
+            - If normal text reply: return dict with type "text" and content
             - If tool call triggered: return dict with type "tool_call" and tool_calls list
 
         Raises:
@@ -709,7 +709,7 @@ class OpenAICompatibleLLM(BaseLLM):
         thinking: Optional[Dict[str, Any]] = None,
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
-    ) -> Any:
+    ) -> Dict[str, Any]:
         """
         Perform a vision-aware chat completion for OpenAI models that support vision.
         This method handles multimodal messages with image content.
@@ -726,7 +726,7 @@ class OpenAICompatibleLLM(BaseLLM):
             **kwargs: Additional parameters to pass to the OpenAI API
 
         Returns:
-            - If normal text reply: return string
+            - If normal text reply: return dict with type "text" and content
             - If tool call triggered: return dict with type "tool_call" and tool_calls list
 
         Raises:

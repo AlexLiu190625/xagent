@@ -224,14 +224,25 @@ class BaseLLM(ABC):
             **kwargs: Additional parameters specific to the underlying model (e.g. top_p, user, stop).
 
         Returns:
-            If the model returns a natural language response:
-                -> string (the assistant reply content)
-
-            If the model triggers a tool call:
-                -> dict with fields:
-                    - "type": "tool_call"
-                    - "tool_calls": list of tool call objects
-                    - "raw": the full response JSON
+            The return type is a union; the concrete shape depends on the
+            implementation:
+                -> str: some implementations (e.g. Zhipu, Claude, Gemini)
+                   return the assistant reply content as a bare string.
+                -> dict: other implementations (e.g. the OpenAI family --
+                   OpenAI, OpenRouter, DashScope -- and Xinference) wrap
+                   the reply in an envelope instead:
+                     - {"type": "text", "content": <str>, ...} for a
+                       natural language response
+                     - {"type": "tool_call", "tool_calls": [...], ...} for a
+                       tool call
+                   A "raw" key carrying the provider's full response is
+                   present on some implementations' envelopes and absent on
+                   others, so callers must not require it. Neither list is
+                   exhaustive, and an implementation listed above as
+                   returning a bare string for ordinary replies can still
+                   return a tool-call envelope -- Gemini does exactly that.
+                   Callers that must accept more than one implementation need
+                   to branch on the shape rather than assume a bare string.
 
         Raises:
             RuntimeError if the model call fails or returns an unexpected format.
@@ -268,14 +279,25 @@ class BaseLLM(ABC):
             **kwargs: Additional parameters specific to the underlying model.
 
         Returns:
-            If the model returns a natural language response:
-                -> string (the assistant reply content)
-
-            If the model triggers a tool call:
-                -> dict with fields:
-                    - "type": "tool_call"
-                    - "tool_calls": list of tool call objects
-                    - "raw": the full response JSON
+            The return type is a union; the concrete shape depends on the
+            implementation:
+                -> str: some implementations (e.g. Zhipu, Claude, Gemini)
+                   return the assistant reply content as a bare string.
+                -> dict: other implementations (e.g. the OpenAI family --
+                   OpenAI, OpenRouter, DashScope -- and Xinference) wrap
+                   the reply in an envelope instead:
+                     - {"type": "text", "content": <str>, ...} for a
+                       natural language response
+                     - {"type": "tool_call", "tool_calls": [...], ...} for a
+                       tool call
+                   A "raw" key carrying the provider's full response is
+                   present on some implementations' envelopes and absent on
+                   others, so callers must not require it. Neither list is
+                   exhaustive, and an implementation listed above as
+                   returning a bare string for ordinary replies can still
+                   return a tool-call envelope -- Gemini does exactly that.
+                   Callers that must accept more than one implementation need
+                   to branch on the shape rather than assume a bare string.
 
         Raises:
             RuntimeError if the model doesn't support vision or the call fails.

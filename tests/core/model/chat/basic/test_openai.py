@@ -56,6 +56,18 @@ def _response_format_bad_request(message: str) -> openai.BadRequestError:
     )
 
 
+def _unrelated_bad_request() -> openai.BadRequestError:
+    """A 400 that has nothing to do with response_format."""
+    return openai.BadRequestError(
+        "Error code: 400 - {'error': {'message': 'Unsupported image format'}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        ),
+        body={"error": {"message": "Unsupported image format", "code": 400}},
+    )
+
+
 def _api_timeout_error() -> openai.APITimeoutError:
     """The SDK's timeout error, as raised by a request that never answered."""
     return openai.APITimeoutError(
@@ -624,6 +636,96 @@ class TestOpenAILLM:
         call_args = mock_client.chat.completions.create.call_args
         assert call_args.kwargs["temperature"] == 0.0
         assert "max_tokens" not in call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_returns_the_response_format_retry_result(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Dropping response_format must not also drop the answer.
+
+        The retry succeeds, so vision_chat has to return that reply's
+        envelope. Returning ``None`` instead reaches the vision tool as an
+        unsupported response shape, turning a successful answer into a
+        detection failure.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "response_format is not supported by this model"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        response = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image."}],
+            response_format={"type": "json_object"},
+        )
+
+        assert response == {
+            "type": "text",
+            "content": "Hello World",
+            "raw": mock_chat_completion.model_dump(),
+        }
+        assert mock_client.chat.completions.create.await_count == 2
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_unrelated_bad_request_is_terminal(
+        self, openai_llm_config, mocker
+    ):
+        """A 400 unrelated to response_format keeps failing with its own message."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = _unrelated_bad_request()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        with pytest.raises(RuntimeError, match="OpenAI bad request"):
+            await llm.vision_chat(
+                [{"role": "user", "content": "Describe this image."}],
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_reports_a_failed_retry_as_a_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """A retry that is rejected too surfaces as the documented RuntimeError.
+
+        The method documents ``Raises: RuntimeError``; a raw provider
+        exception escaping from the retry would break that, and would differ
+        from how ``stream_chat`` reports the same double rejection.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "response_format is not supported by this model"
+            ),
+            _unrelated_bad_request(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        with pytest.raises(RuntimeError, match="OpenAI bad request"):
+            await llm.vision_chat(
+                [{"role": "user", "content": "Describe this image."}],
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 2
 
     @pytest.mark.asyncio
     async def test_cleanup(self, openai_llm_config, mock_chat_completion, mocker):
