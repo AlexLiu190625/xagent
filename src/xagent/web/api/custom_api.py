@@ -266,10 +266,10 @@ async def create_custom_api(
 
 def _http_from_connector_runtime(exc: ConnectorRuntimeError) -> HTTPException:
     """One place that maps the connector seam's typed error onto this
-    module's HTTP answer. Three call sites need it (``get_custom_api``, and
-    ``update_custom_api`` twice -- once for the pre-lock resolution and once
-    for the post-lock re-check), and this route has no function-wide
-    ``try`` the way ``update_mcp_server`` does."""
+    module's HTTP answer. Four call sites need it (``get_custom_api``;
+    ``update_custom_api`` for the pre-lock resolution, the post-lock
+    re-check, and the rename hook), and this route has no function-wide
+    ``try`` the way ``update_mcp_server`` does, so each arm is local."""
     return HTTPException(status_code=exc.status_code, detail=exc.safe_message)
 
 
@@ -561,14 +561,25 @@ def update_custom_api(
 
     from ..services.connector_team_scope import rename_team_connector
 
-    rename_team_connector(
-        db,
-        int(current_user.id),
-        "custom_api",
-        int(api_id),
-        old_name,
-        str(api.name),
-    )
+    # The same translation ``update_mcp_server`` gives this call
+    # (mcp.py:3853-3857): the seam raises its own typed error, and this
+    # route answers with the status that error declares rather than
+    # letting it reach the generic handler as a 500. This route has no
+    # function-wide ``try`` the way the MCP one does, so the arm is local;
+    # the mapping itself stays in ``_http_from_connector_runtime``, which
+    # is the module's one place that turns a seam error into an HTTP one.
+    try:
+        rename_team_connector(
+            db,
+            int(current_user.id),
+            "custom_api",
+            int(api_id),
+            old_name,
+            str(api.name),
+        )
+    except ConnectorRuntimeError as exc:
+        db.rollback()
+        raise _http_from_connector_runtime(exc) from exc
 
     # Update UserCustomApi link
     if api_data.is_active is not None:

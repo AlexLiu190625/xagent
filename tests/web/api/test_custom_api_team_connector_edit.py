@@ -377,6 +377,43 @@ class TestTypedErrorArm:
         assert exc.value.status_code == 409
         assert exc.value.detail == "planted failure"
 
+    @pytest.mark.asyncio
+    async def test_a_raising_rename_hook_surfaces_its_declared_status_not_a_500(
+        self, db
+    ):
+        """The MCP side's PUT already translates this (mcp.py:3853-3857);
+        without the same arm here the seam's 503 reaches the client as a
+        generic 500, and the two connector kinds answer the same failure
+        differently."""
+        owner = _make_user(db, 1)
+        api = _make_owned_api(db, owner.id, name="rename-hook-raises")
+        api_id = api.id
+        original_name = str(api.name)
+
+        def boom(*_a, **_k):
+            raise ConnectorRuntimeError(
+                "connector_runtime_unavailable",
+                "Connector team scope is unavailable.",
+                status_code=503,
+            )
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(renamed=boom)
+            with pytest.raises(HTTPException) as exc:
+                update_custom_api(
+                    api_id,
+                    CustomApiUpdate(name="renamed-by-the-test"),
+                    current_user=owner,
+                    db=db,
+                )
+
+        assert exc.value.status_code == 503
+        # Zero side effects: the rename that triggered the hook is rolled
+        # back with everything else this request had staged.
+        db.rollback()
+        refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert refreshed.name == original_name
+
 
 class TestOwnerIsImmuneToAHookFailure:
     """An owner's row already decides both routes' answers on its own --
