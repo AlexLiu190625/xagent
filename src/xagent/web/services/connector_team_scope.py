@@ -11,7 +11,7 @@ import logging
 from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar
 
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -190,7 +190,7 @@ def visible_team_connector_ids(db: Any, user_id: int) -> dict[str, set[int]]:
     """
     if _connector_visibility_hook is None:
         return {"mcp": set(), "custom_api": set()}
-    return _connector_visibility_hook(db, int(user_id))
+    return _call_connector_hook_gate(db, _connector_visibility_hook, db, int(user_id))
 
 
 def _validate_team_connector_answer(answer: Any) -> dict[str, set[int]]:
@@ -250,7 +250,9 @@ def team_connector_ids(db: Any, *, team_id: int | None) -> dict[str, set[int]]:
     """
     if team_id is None or _team_connector_visibility_hook is None:
         return {"mcp": set(), "custom_api": set()}
-    answer = _team_connector_visibility_hook(db, team_id=int(team_id))
+    answer = _call_connector_hook_gate(
+        db, _team_connector_visibility_hook, db, team_id=int(team_id)
+    )
     return _validate_team_connector_answer(answer)
 
 
@@ -396,7 +398,9 @@ def resolve_connector_access(
     )
     if _connector_access_hook is None or not requested:
         return {}
-    answer = _connector_access_hook(db, int(user_id), requested)
+    answer = _call_connector_hook_gate(
+        db, _connector_access_hook, db, int(user_id), requested
+    )
     return _validate_connector_access_answer(answer, requested)
 
 
@@ -429,6 +433,36 @@ def _restore_session_after_hook_failure(db: Any) -> None:
         )
 
 
+_HookResult = TypeVar("_HookResult")
+
+
+def _call_connector_hook_gate(
+    db: Any, hook: "Callable[..., _HookResult]", *args: Any, **kwargs: Any
+) -> _HookResult:
+    """The one door every installed connector hook is called through.
+
+    Hooks run on the endpoint's own live session (see
+    ``delete_team_connector``'s contract note). A hook whose own statement
+    failed leaves that transaction unusable on PostgreSQL, and a failed
+    ORM ``flush`` leaves it unusable on every backend -- so restoring the
+    session belongs to the invocation itself, not to whichever caller
+    happens to wrap it. Placing it here is what makes the property hold
+    for a hook slot added to this module later, without that slot's author
+    having to know about it: five slots exist today and only two of the
+    call paths used to be covered.
+
+    The exception is re-raised unchanged; this function decides nothing
+    about how the failure is classified or translated. That stays with the
+    ``*_or_raise`` wrappers below, which own the seam's typed-error
+    contract.
+    """
+    try:
+        return hook(*args, **kwargs)
+    except Exception:
+        _restore_session_after_hook_failure(db)
+        raise
+
+
 def resolve_team_connector_ids_or_raise(
     db: Any, *, team_id: int | None, log_subject: int | None
 ) -> dict[str, set[int]]:
@@ -455,20 +489,19 @@ def resolve_team_connector_ids_or_raise(
     guarded public wrapper). It is only ever formatted into the log
     message, never interpreted.
 
-    Both failure arms roll back the shared session first (see
-    ``_restore_session_after_hook_failure``), including the arm that
-    passes a typed error straight through: a hook can leave a statement
-    failed on the session and *then* raise its own ``ConnectorRuntimeError``,
-    so restoring the session cannot be confined to the generic-exception
-    arm alone.
+    The session restore that used to live on both failure arms here now
+    lives on ``_call_connector_hook_gate``, the single door every installed
+    hook is invoked through: a hook can leave a statement failed on the
+    session and *then* raise its own ``ConnectorRuntimeError``, so
+    restoring the session was never something the generic-exception arm
+    alone could own, and it now happens before either arm below even
+    sees the exception.
     """
     try:
         return team_connector_ids(db, team_id=team_id)
     except ConnectorRuntimeError:
-        _restore_session_after_hook_failure(db)
         raise
     except Exception as exc:
-        _restore_session_after_hook_failure(db)
         logger.warning(
             "Failed to resolve team connector scope for user %s",
             log_subject,
@@ -503,12 +536,13 @@ def resolve_connector_access_or_raise(
     which could itself fail if the session is left unusable by whatever
     just failed.
 
-    Both failure arms roll back the shared session first (see
-    ``_restore_session_after_hook_failure``), including the arm that
-    passes a typed error straight through: a hook can leave a statement
-    failed on the session and *then* raise its own ``ConnectorRuntimeError``,
-    so restoring the session cannot be confined to the generic-exception
-    arm alone.
+    The session restore that used to live on both failure arms here now
+    lives on ``_call_connector_hook_gate``, the single door every installed
+    hook is invoked through: a hook can leave a statement failed on the
+    session and *then* raise its own ``ConnectorRuntimeError``, so
+    restoring the session was never something the generic-exception arm
+    alone could own, and it now happens before either arm below even
+    sees the exception.
     """
     requested = frozenset(
         (connector_type, int(connector_id)) for connector_type, connector_id in refs
@@ -516,10 +550,8 @@ def resolve_connector_access_or_raise(
     try:
         return resolve_connector_access(db, user_id, requested)
     except ConnectorRuntimeError:
-        _restore_session_after_hook_failure(db)
         raise
     except Exception as exc:
-        _restore_session_after_hook_failure(db)
         logger.warning(
             "Failed to resolve connector access for user %s across %s connectors: %s",
             user_id,
@@ -695,7 +727,9 @@ def delete_team_connector(
 
     if _connector_deleted_hook is None:
         return ConnectorDeleteDecision()
-    return _connector_deleted_hook(db, user_id, connector_type, connector_id)
+    return _call_connector_hook_gate(
+        db, _connector_deleted_hook, db, user_id, connector_type, connector_id
+    )
 
 
 def rename_team_connector(
@@ -709,6 +743,13 @@ def rename_team_connector(
     """Keep application-owned connector selectors aligned after a rename."""
 
     if _connector_renamed_hook is not None and old_name != new_name:
-        _connector_renamed_hook(
-            db, user_id, connector_type, connector_id, old_name, new_name
+        _call_connector_hook_gate(
+            db,
+            _connector_renamed_hook,
+            db,
+            user_id,
+            connector_type,
+            connector_id,
+            old_name,
+            new_name,
         )

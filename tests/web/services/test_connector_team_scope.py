@@ -547,6 +547,64 @@ def _create_user(db: Session, username: str) -> User:
     return user
 
 
+def _poisoning_hook_by_orm_flush(colliding_user_id: int):
+    """A hook that leaves a failed ORM flush on the shared session and then
+    raises. A failed flush marks the session's transaction inactive on
+    every backend, so any later statement raises ``PendingRollbackError``
+    until something rolls back -- which is exactly what the seam's hook
+    door must do before the exception leaves the module."""
+
+    def hook(db, *_args, **_kwargs):
+        db.add(
+            User(id=colliding_user_id, username="flush-poison-dup", password_hash="x")
+        )
+        db.flush()
+
+    return hook
+
+
+@pytest.mark.parametrize(
+    "slot,invoke",
+    [
+        (
+            "visibility",
+            lambda db: connector_team_scope.visible_team_connector_ids(db, 1),
+        ),
+        (
+            "deleted",
+            lambda db: connector_team_scope.delete_team_connector(db, 1, "mcp", 1),
+        ),
+        (
+            "renamed",
+            lambda db: connector_team_scope.rename_team_connector(
+                db, 1, "mcp", 1, "old", "new"
+            ),
+        ),
+    ],
+    ids=["visibility-hook", "deleted-hook", "renamed-hook"],
+)
+def test_every_hook_door_restores_the_session_when_the_hook_fails(
+    db_session, slot, invoke
+):
+    """These three doors had no session restore before: only the two
+    ``*_or_raise`` wrappers had one, which covered the access hook and the
+    team-visibility hook and nothing else. The restore now lives on the
+    single invocation door, so every slot has it -- including a slot added
+    to this module later."""
+    existing = _create_user(db_session, "already-here")
+    db_session.commit()
+
+    with connector_team_scope.snapshot_connector_team_hooks():
+        connector_team_scope.set_connector_team_hooks(
+            **{slot: _poisoning_hook_by_orm_flush(int(existing.id))}
+        )
+        with pytest.raises(Exception):
+            invoke(db_session)
+
+    # Without the restore this raises PendingRollbackError instead.
+    assert db_session.query(User).count() == 1
+
+
 def _create_mcp(db: Session, name: str, *, owner: User | None = None) -> MCPServer:
     server = MCPServer(
         name=name,

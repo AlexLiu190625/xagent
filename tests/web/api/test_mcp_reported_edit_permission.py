@@ -1420,9 +1420,9 @@ def _seed_catalog_app(db, app_id: str = "session-fault-app") -> None:
 class TestSessionRecoveryAfterHookFailure:
     """A hook that leaves a failed statement on the shared session must not
     turn a route that would otherwise succeed (or gracefully degrade) into
-    a 500 -- the seam's wrapper functions restore the session before
-    converting the failure into a typed error (see
-    ``_restore_session_after_hook_failure`` in connector_team_scope.py).
+    a 500 -- the seam's single hook-invocation door restores the session
+    before the failure ever reaches a caller to convert into a typed error
+    (see ``_call_connector_hook_gate`` in connector_team_scope.py).
 
     ``poison_by_raw_statement`` only actually poisons PostgreSQL (see its
     docstring); it is still parametrized here so the SQLite half of this
