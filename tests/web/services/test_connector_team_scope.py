@@ -596,7 +596,9 @@ def test_every_hook_door_restores_the_session_when_the_hook_fails(
     ``*_or_raise`` wrappers had one, which covered the access hook and the
     team-visibility hook and nothing else. The restore now lives on the
     single invocation door, so every slot has it -- including a slot added
-    to this module later."""
+    to this module later. The two slots this parametrization leaves out are
+    the two whose answers this seam validates; they are covered by the
+    sister test below, where the hook does not raise at all."""
     existing = _create_user(db_session, "already-here")
     db_session.commit()
 
@@ -608,6 +610,81 @@ def test_every_hook_door_restores_the_session_when_the_hook_fails(
             invoke(db_session)
 
     # Without the restore this raises PendingRollbackError instead.
+    assert db_session.query(User).count() == 1
+
+
+def _swallowing_poisoning_hook_answering(colliding_user_id: int, answer: object):
+    """A hook that leaves a failed ORM flush on the shared session,
+    swallows that failure itself, and then answers with a shape the seam's
+    own validator rejects.
+
+    The sister of ``_poisoning_hook_by_orm_flush`` above: there the hook
+    lets its failure propagate, so the door's ``except`` fires on the hook
+    call. Here nothing propagates out of the hook at all -- the door's
+    ``except`` fires on the validator's rejection instead, which is the
+    other half the restore has to cover.
+    """
+
+    def hook(db, *_args, **_kwargs):
+        try:
+            db.add(
+                User(
+                    id=colliding_user_id,
+                    username="swallowed-poison-dup",
+                    password_hash="x",
+                )
+            )
+            db.flush()
+        except Exception:
+            pass
+        return answer
+
+    return hook
+
+
+@pytest.mark.parametrize(
+    "slot,answer,invoke",
+    [
+        (
+            "team_visibility",
+            {"mcp": "not-a-set", "custom_api": set()},
+            lambda db: connector_team_scope.resolve_team_connector_ids_or_raise(
+                db, team_id=T1, log_subject=None
+            ),
+        ),
+        (
+            "access",
+            {"not-a-ref": object()},
+            lambda db: connector_team_scope.resolve_connector_access_or_raise(
+                db, 1, [("mcp", 11)]
+            ),
+        ),
+    ],
+    ids=["team-visibility-hook", "access-hook"],
+)
+def test_a_hook_that_swallows_its_failure_and_answers_malformed_restores_too(
+    db_session, slot, answer, invoke
+):
+    """The two slots whose answers this seam validates are the two where a
+    hook can poison the shared session without ever raising: it runs a
+    statement that fails, catches that itself, and returns an answer the
+    validator then rejects. The rejection is the seam's own exception, not
+    the hook's, so the restore has to sit where it sees both -- inside the
+    door, around the validation as well as around the call."""
+    existing = _create_user(db_session, "already-here")
+    db_session.commit()
+
+    with connector_team_scope.snapshot_connector_team_hooks():
+        connector_team_scope.set_connector_team_hooks(
+            **{slot: _swallowing_poisoning_hook_answering(int(existing.id), answer)}
+        )
+        with pytest.raises(ConnectorRuntimeError) as excinfo:
+            invoke(db_session)
+        assert excinfo.value.status_code == 503
+
+    # No rollback of our own before this line: the query is the statement
+    # that proves the door restored the session, and its count proves the
+    # poisoning insert never landed.
     assert db_session.query(User).count() == 1
 
 

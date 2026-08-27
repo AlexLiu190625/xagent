@@ -250,10 +250,13 @@ def team_connector_ids(db: Any, *, team_id: int | None) -> dict[str, set[int]]:
     """
     if team_id is None or _team_connector_visibility_hook is None:
         return {"mcp": set(), "custom_api": set()}
-    answer = _call_connector_hook_gate(
-        db, _team_connector_visibility_hook, db, team_id=int(team_id)
+    return _call_connector_hook_gate(
+        db,
+        _team_connector_visibility_hook,
+        db,
+        team_id=int(team_id),
+        validate=_validate_team_connector_answer,
     )
-    return _validate_team_connector_answer(answer)
 
 
 def team_connector_hook_installed() -> bool:
@@ -398,14 +401,20 @@ def resolve_connector_access(
     )
     if _connector_access_hook is None or not requested:
         return {}
-    answer = _call_connector_hook_gate(
-        db, _connector_access_hook, db, int(user_id), requested
+    return _call_connector_hook_gate(
+        db,
+        _connector_access_hook,
+        db,
+        int(user_id),
+        requested,
+        validate=lambda answer: _validate_connector_access_answer(answer, requested),
     )
-    return _validate_connector_access_answer(answer, requested)
 
 
 def _restore_session_after_hook_failure(db: Any) -> None:
-    """Roll back whatever a failed hook left on the shared session.
+    """Roll back whatever a hook left on the shared session before its call
+    failed -- whether the hook raised, or answered with a shape this seam
+    rejected.
 
     Hooks are handed the endpoint's own live session (see
     ``delete_team_connector``'s contract note). A hook whose own statement
@@ -413,10 +422,10 @@ def _restore_session_after_hook_failure(db: Any) -> None:
     ``flush`` failure leaves it unusable on every backend -- so every
     later statement in the request, including the ones a degradation path
     needs to build its response, would be refused. Rolling back here, at
-    the one door application code passes through, is what keeps the
-    degradation contract true; the roll back happens after the route's own
-    ``db.commit()`` on the post-commit decoration paths, so it never
-    discards durable work.
+    the one door every hook call and every answer check passes through, is
+    what keeps the degradation contract true; the roll back happens after
+    the route's own ``db.commit()`` on the post-commit decoration paths, so
+    it never discards durable work.
 
     A rollback that itself fails is logged and swallowed: this runs on an
     already-failing path, the original failure is re-raised by the caller
@@ -437,9 +446,14 @@ _HookResult = TypeVar("_HookResult")
 
 
 def _call_connector_hook_gate(
-    db: Any, hook: "Callable[..., _HookResult]", *args: Any, **kwargs: Any
+    db: Any,
+    hook: "Callable[..., _HookResult]",
+    *args: Any,
+    validate: "Callable[[Any], _HookResult] | None" = None,
+    **kwargs: Any,
 ) -> _HookResult:
-    """The one door every installed connector hook is called through.
+    """The one door every installed connector hook is called through, and
+    the one place its answer is checked.
 
     Hooks run on the endpoint's own live session (see
     ``delete_team_connector``'s contract note). A hook whose own statement
@@ -451,13 +465,26 @@ def _call_connector_hook_gate(
     having to know about it: five slots exist today and only two of the
     call paths used to be covered.
 
-    The exception is re-raised unchanged; this function decides nothing
-    about how the failure is classified or translated. That stays with the
-    ``*_or_raise`` wrappers below, which own the seam's typed-error
-    contract.
+    ``validate``, when given, runs inside the same ``try`` because a hook
+    can poison the session *without* raising: run a statement that fails,
+    catch that itself, and answer with a shape this seam then rejects. The
+    rejection is this module's own exception rather than the hook's, so a
+    restore placed around the call alone would not fire for it -- the
+    session would stay unusable for everything the request does next. Two
+    of the five slots have an answer this seam validates; the other three
+    pass nothing, which says at the call site that this seam checks
+    nothing about those answers, rather than leaving that silent.
+
+    The exception is re-raised unchanged, whichever of the two raised it;
+    this function decides nothing about how the failure is classified or
+    translated. That stays with the ``*_or_raise`` wrappers below, which
+    own the seam's typed-error contract.
     """
     try:
-        return hook(*args, **kwargs)
+        answer = hook(*args, **kwargs)
+        if validate is None:
+            return answer
+        return validate(answer)
     except Exception:
         _restore_session_after_hook_failure(db)
         raise
@@ -491,11 +518,12 @@ def resolve_team_connector_ids_or_raise(
 
     The session restore that used to live on both failure arms here now
     lives on ``_call_connector_hook_gate``, the single door every installed
-    hook is invoked through: a hook can leave a statement failed on the
-    session and *then* raise its own ``ConnectorRuntimeError``, so
-    restoring the session was never something the generic-exception arm
-    alone could own, and it now happens before either arm below even
-    sees the exception.
+    hook is invoked through, and it covers both ways that call can fail: a
+    hook can leave a statement failed on the session and *then* raise its
+    own ``ConnectorRuntimeError``, and a hook can leave one failed, swallow
+    that itself, and answer with a shape this seam's own validator then
+    rejects. Neither is something the generic-exception arm below could
+    own, and both are restored before either arm sees the exception.
     """
     try:
         return team_connector_ids(db, team_id=team_id)
@@ -538,11 +566,12 @@ def resolve_connector_access_or_raise(
 
     The session restore that used to live on both failure arms here now
     lives on ``_call_connector_hook_gate``, the single door every installed
-    hook is invoked through: a hook can leave a statement failed on the
-    session and *then* raise its own ``ConnectorRuntimeError``, so
-    restoring the session was never something the generic-exception arm
-    alone could own, and it now happens before either arm below even
-    sees the exception.
+    hook is invoked through, and it covers both ways that call can fail: a
+    hook can leave a statement failed on the session and *then* raise its
+    own ``ConnectorRuntimeError``, and a hook can leave one failed, swallow
+    that itself, and answer with a shape this seam's own validator then
+    rejects. Neither is something the generic-exception arm below could
+    own, and both are restored before either arm sees the exception.
     """
     requested = frozenset(
         (connector_type, int(connector_id)) for connector_type, connector_id in refs
