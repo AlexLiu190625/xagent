@@ -46,6 +46,7 @@ from xagent.web.api.websocket import (
 )
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from xagent.web.services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -735,7 +736,9 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resume_background_fails_closed_on_scope_authority_mismatch() -> None:
+async def test_resume_background_fails_closed_on_scope_authority_mismatch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """The scheduled turn's own re-resolution is fail-closed, not downgraded.
 
     ``execute_resume_background`` is the consumer that selects a namespace
@@ -780,7 +783,11 @@ async def test_resume_background_fails_closed_on_scope_authority_mismatch() -> N
     event, broadcast_task_id = broadcast_args
     assert broadcast_task_id == 42
     assert event["type"] == "task_error"
-    assert "execution scope authority mismatch" in event["message"]
+    assert event["task"]["status"] == TaskStatus.FAILED.value
+    assert event["message"] == CLIENT_SAFE_TASK_FAILURE
+    assert event["error"] == CLIENT_SAFE_TASK_FAILURE
+    assert "execution scope authority mismatch" not in repr(event).lower()
+    assert "execution scope authority mismatch" in caplog.text.lower()
 
 
 def test_resume_acquire_checkout_timeout_before_claim_does_not_try_cleanup() -> None:

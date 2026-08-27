@@ -1086,6 +1086,39 @@ def test_error_settlement_releases_terminal_lease_without_reporting_failure(
     assert persisted.lease_expires_at is None
 
 
+def test_error_settlement_persists_client_safe_history(db_session) -> None:
+    secret = "orchestrator-provider-secret"
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    task_id = int(task.id)
+    lease = acquire_task_lease_isolated(task_id)
+    assert lease is not None
+
+    assert (
+        settle_task_lease_isolated(
+            lease,
+            error_message=f"setup/run failed: {secret}",
+        )
+        is True
+    )
+
+    db_session.expire_all()
+    persisted = db_session.get(Task, task_id)
+    assert persisted is not None
+    assert persisted.error_message == f"setup/run failed: {secret}"
+    messages = (
+        db_session.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == task_id,
+            TaskChatMessage.role == "assistant",
+        )
+        .all()
+    )
+    assert len(messages) == 1
+    assert messages[0].content == "Task execution failed."
+    assert secret not in messages[0].content
+
+
 @pytest.mark.asyncio
 async def test_begin_turn_dispatch_timeout_does_not_reject_scheduled_turn(
     db_session,
@@ -2749,6 +2782,7 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
     transaction pushes the exact run to ``FAILED`` while releasing it.
     """
     from xagent.web.api.websocket import background_task_manager
+    from xagent.web.api.websocket import manager as ws_manager
     from xagent.web.services.task_lease_service import TaskLease
 
     user = _create_user(db_session)
@@ -2781,6 +2815,7 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
             new=AsyncMock(),
         ) as mock_exec,
         patch.object(background_task_manager, "register_task"),
+        patch.object(ws_manager, "broadcast_to_task", new=AsyncMock()) as broadcast,
         patch(
             "xagent.web.services.task_orchestrator._get_agent_manager",
             return_value=MagicMock(),
@@ -2811,6 +2846,15 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
     assert task.runner_id is None
     assert task.error_message is not None
     assert "simulated snapshot load failure" in str(task.error_message)
+    task_errors = [
+        call.args[0]
+        for call in broadcast.call_args_list
+        if call.args[0].get("type") == "task_error"
+    ]
+    assert len(task_errors) == 1
+    assert task_errors[0]["message"] == "Task execution failed."
+    assert task_errors[0]["error"] == "Task execution failed."
+    assert "simulated snapshot load failure" not in repr(task_errors[0])
     assert get_ephemeral_runtime_values(payload.turn_id) is None
     assert pop_ephemeral_runtime_values(payload.turn_id) is None
 

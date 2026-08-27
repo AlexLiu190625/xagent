@@ -263,16 +263,18 @@ def test_websocket_output_persistence_sends_error_and_rolls_back_when_minio_writ
         assert execution_started["type"] == "execution_started"
         error_message = _receive_until_execution_error(websocket)
 
-    error_text = str(
-        error_message.get("error") or error_message.get("message") or ""
-    ).lower()
-    assert error_text == CLIENT_SAFE_TASK_FAILURE.lower()
-    assert "simulated minio output write outage" not in error_text
+    assert error_message["message"] == CLIENT_SAFE_TASK_FAILURE
+    assert error_message["error"] == CLIENT_SAFE_TASK_FAILURE
+    assert "simulated MinIO output write outage" not in repr(error_message)
     assert failed_output_keys
     assert all(f"/tasks/{task_id}/outputs/" in f"/{key}" for key in failed_output_keys)
 
     db = session_factory()
     try:
+        task = db.get(Task, task_id)
+        assert task is not None
+        assert task.status == TaskStatus.FAILED
+        assert "durable object" in str(task.error_message).lower()
         assert (
             db.query(UploadedFile)
             .filter(

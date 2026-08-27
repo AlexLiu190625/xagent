@@ -3083,6 +3083,14 @@ async def test_execute_resume_background_rejects_owner_mismatch(db_session) -> N
         if isinstance(msg, dict)
     }
     assert "task_error" in error_types
+    task_errors = [
+        call.args[0]
+        for call in ws_manager.broadcast_to_task.call_args_list
+        if call.args[0].get("type") == "task_error"
+    ]
+    assert task_errors[0]["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
+    assert task_errors[0]["error"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
+    assert str(int(owner.id) + 999) not in repr(task_errors[0])
 
 
 @pytest.mark.asyncio
@@ -3311,12 +3319,16 @@ async def test_resume_failure_broadcasts_only_after_exact_settlement(
     settled: bool,
     expected_error_broadcasts: int,
 ) -> None:
+    secret = "resume-provider-secret"
     owner = _user(db_session, "resume-settlement-owner")
     task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
     agent = MagicMock(
-        resume_execution_by_id=AsyncMock(side_effect=RuntimeError("resume failed")),
+        resume_execution_by_id=AsyncMock(
+            side_effect=RuntimeError(f"resume failed: {secret}")
+        ),
     )
     events: list[str] = []
+    error_payloads: list[dict] = []
 
     def settle(*_args, **_kwargs) -> bool:
         events.append("settle")
@@ -3325,6 +3337,7 @@ async def test_resume_failure_broadcasts_only_after_exact_settlement(
     async def broadcast(payload, *_args, **_kwargs) -> None:
         if payload.get("type") == "task_error":
             events.append("broadcast")
+            error_payloads.append(payload)
 
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(side_effect=broadcast),
@@ -3345,6 +3358,58 @@ async def test_resume_failure_broadcasts_only_after_exact_settlement(
         )
 
     assert events == ["settle"] + (["broadcast"] * expected_error_broadcasts)
+    if settled:
+        assert error_payloads[0]["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
+        assert error_payloads[0]["error"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
+        assert secret not in repr(error_payloads[0])
+
+
+@pytest.mark.asyncio
+async def test_resume_failure_rejection_redacts_exception_text(db_session) -> None:
+    secret = "resume-rejection-secret"
+    owner = _user(db_session, "resume-rejection-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Deferred guidance",
+            message_type="user_message",
+            turn_id="resume-rejection-turn",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+    agent = MagicMock(
+        resume_execution_by_id=AsyncMock(
+            side_effect=RuntimeError(f"resume failed: {secret}")
+        ),
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        _register_current_resume(int(task.id))
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            delivery_turn_id="resume-rejection-turn",
+            delivery_websocket=MagicMock(),
+            delivery_client_message_id="resume-rejection-turn",
+        )
+
+    rejected = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert secret not in repr(rejected[0])
 
 
 @pytest.mark.asyncio

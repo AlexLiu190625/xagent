@@ -155,19 +155,15 @@ async def test_execute_task_keeps_a_message_written_for_the_sender(
 def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     """Exception text may not reach a client through the *recognized* shapes.
 
-    Scope, stated honestly: this walks direct calls to the producers in
-    ``PRODUCERS`` and dict *literals* whose ``type`` is one of
-    ``ERROR_PAYLOAD_TYPES``, passed to one of ``ERROR_PAYLOAD_SINKS``.
+    Scope, stated honestly: this walks the direct producers and error-payload
+    sinks used by this module. It understands the task-error and stream-event
+    helpers, explicit overrides on dict-spread payloads, and the listed
+    deferred-delivery wrapper.
 
-    It does NOT follow dict-spread payloads, payloads built by a helper and
-    passed as a call, wrapper functions that forward a raw argument into a
-    producer (all #1497), or payloads whose ``type`` is a variable rather than
-    a string literal (#1547). ``agent_error`` was added only after review
-    found ``_broadcast_terminal_command_error`` escaping on that dimension
-    alone - the type set is a maintained list, not a derived invariant.
-
-    Those shapes leak today. Do not read a passing run as "nothing can reach a
-    client raw"; the xfail tests below pin the ones we know about.
+    It is not general interprocedural data-flow analysis. Dynamic payload types
+    fail closed unless they come from the listed module helpers, and the type
+    set is maintained rather than derived. Do not read a passing run as proof
+    that arbitrary Python data flow cannot reach a client.
     """
     # Explicit encoding: this module carries non-ASCII prose, and the
     # platform default would decode it as cp1252/GBK on a Windows runner.
@@ -181,12 +177,12 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
 
     # These are deliberate exact baselines. If a producer is added or removed,
     # inspect the changed site and bump the corresponding count in this test.
-    assert result.producers == 26, (
-        f"expected exactly 26 producers, matched {result.producers}; "
+    assert result.producers == 30, (
+        f"expected exactly 30 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
-    assert result.error_payloads == 35, (
-        f"expected exactly 35 error payloads, matched {result.error_payloads}; "
+    assert result.error_payloads == 53, (
+        f"expected exactly 53 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
@@ -496,6 +492,18 @@ def test_client_visible_message_preserves_non_ascii_text() -> None:
     )
 
 
+def test_incidental_exception_uses_the_requested_safe_fallback() -> None:
+    fallback = "The requested operation could not be completed."
+
+    rendered = websocket_api.client_safe_error_message(
+        RuntimeError(SECRET),
+        fallback=fallback,
+    )
+
+    assert rendered == fallback
+    assert SECRET not in rendered
+
+
 def test_empty_client_visible_outer_error_does_not_expose_its_cause() -> None:
     cause = RuntimeError(SECRET)
     error = websocket_api.ClientVisibleValidationError("")
@@ -606,18 +614,19 @@ async def test_permission_wording_survives_redaction_in_every_handler(
     ), payloads
 
 
-# Each entry is a bypass shape this module admits it does not cover: a source
-# snippet the guard reports clean even though raw exception text reaches a
-# client. Each mirrors a real site rather than a minimal repro, so the xfail
-# cannot flip on a shape nothing actually uses - dict-spread copies
+# Each entry mirrors a real leak shape fixed by #1696 rather than a minimal
+# synthetic repro: dict-spread copies
 # ``execute_task_background`` (text under ``error``, type inherited from the
 # spread), helper-built copies ``send_historical_data_as_stream``, and
-# wrapper-forwarded copies ``notify_deferred_delivery``. They are pinned as strict xfails so the day the guard learns a shape,
-# its test flips to a failure and says so, instead of the hole quietly
-# outliving the issue that tracks it.
+# wrapper-forwarded copies ``notify_deferred_delivery``. These cases must stay
+# visible to the production sweep so the three mechanisms cannot regress.
 BYPASS_SHAPES = [
     pytest.param(
         """
+def _terminal_task_error_payload(task_id, message):
+    return {"type": "agent_error", "message": message}
+
+
 async def leak(websocket, task_id):
     try:
         pass
@@ -638,19 +647,24 @@ async def leak(websocket, task_id):
     ),
     pytest.param(
         """
+def create_stream_event(event_type, task_id, data):
+    return {"type": event_type, "task_id": task_id, **data}
+
+
 async def leak(websocket, task_id):
     try:
         pass
     except Exception as e:
-        await manager.broadcast_to_task(
-            create_stream_event("error", task_id, {"message": str(e)}), task_id
+        error_event = create_stream_event(
+            "error", task_id, {"message": str(e)}
         )
+        await manager.send_personal_message(error_event, websocket)
 """,
-        id="helper-built",
+        id="helper-built-then-passed-by-name",
     ),
     pytest.param(
         """
-async def forward(websocket, raw):
+async def notify_deferred_delivery(accepted, raw):
     await send_message_delivery(
         websocket,
         client_message_id="c",
@@ -665,9 +679,33 @@ async def leak(websocket):
     try:
         pass
     except Exception as e:
-        await forward(websocket, str(e))
+        await notify_deferred_delivery(False, str(e))
 """,
         id="wrapper-forwarded",
+    ),
+    pytest.param(
+        """
+async def leak(task_id):
+    try:
+        pass
+    except Exception as e:
+        await manager.broadcast_to_task(
+            {"type": "task_error", "message": str(e)}, task_id
+        )
+""",
+        id="task-error-message",
+    ),
+    pytest.param(
+        """
+async def leak(task_id):
+    try:
+        pass
+    except Exception as e:
+        await manager.broadcast_to_task(
+            {"type": "task_error", "error": str(e)}, task_id
+        )
+""",
+        id="task-error-error-field",
     ),
 ]
 
@@ -686,22 +724,11 @@ async def leak(websocket):
 # dependency is written down rather than left implicit.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known guard blind spots, all tracked in #1497. When one is closed "
-    "this flips to a failure - fix the issue, then delete its param.",
-)
 @pytest.mark.parametrize("source", BYPASS_SHAPES)
-def test_known_bypass_shapes_are_still_invisible_to_the_guard(source: str) -> None:
-    """A passing sweep does not mean no raw text can reach a client.
-
-    Every snippet here puts ``str(e)`` in front of a client and the guard says
-    nothing. Asserting that out loud is the difference between a documented
-    gap and a forgotten one.
-    """
+def test_known_bypass_shapes_are_rejected_by_the_guard(source: str) -> None:
+    """The guard rejects every producer shape fixed for #1696."""
     assert _guard_offenders(source), (
-        "the guard now sees this shape - remove it from BYPASS_SHAPES and "
-        "close the tracking issue"
+        "the guard missed a client-facing raw exception shape fixed for #1696"
     )
 
 
@@ -1598,6 +1625,56 @@ async def leak(error):
     assert _guard_offenders(source)
 
 
+@pytest.mark.parametrize(
+    ("fallback", "imported_constant", "accepted"),
+    [
+        ('f"raw: {error}"', "", False),
+        ("raw_fallback", "", False),
+        ('"fixed safe text"', "", True),
+        (
+            "CLIENT_SAFE_TASK_FAILURE",
+            "from ..services.client_error_messages import CLIENT_SAFE_TASK_FAILURE\n",
+            True,
+        ),
+    ],
+    ids=["formatted-exception", "unresolved-name", "literal", "trusted-constant"],
+)
+def test_guard_checks_an_explicit_client_safe_fallback(
+    fallback: str, imported_constant: str, accepted: bool
+) -> None:
+    source = f"""{imported_constant}
+def client_safe_error_message(error, *, fallback="safe"):
+    return fallback
+async def safe(websocket, error):
+    await manager.send_personal_message(
+        {{
+            "type": "error",
+            "message": client_safe_error_message(error, fallback={fallback}),
+        }},
+        websocket,
+    )
+"""
+
+    assert bool(_guard_offenders(source)) is not accepted
+
+
+def test_guard_rejects_a_stream_builder_rebound_through_global() -> None:
+    source = """
+def create_stream_event(event_type, task_id, data):
+    return {"type": event_type, "task_id": task_id, **data}
+def configure(raw_builder):
+    global create_stream_event
+    create_stream_event = raw_builder
+async def send(websocket, task_id):
+    await manager.send_personal_message(
+        create_stream_event("error", task_id, {"message": "fixed text"}),
+        websocket,
+    )
+"""
+
+    assert _guard_offenders(source)
+
+
 def test_guard_rejects_a_safe_builder_rebound_in_a_decorator() -> None:
     source = """
 def client_safe_error_message(error):
@@ -1821,9 +1898,9 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
     """The inner chat validation branch answers on two sinks; assert both.
 
     The rejection ack goes to the sender and the task broadcast goes to every
-    subscriber through a dict-spread payload the AST guard cannot follow, so
-    this is runtime-only coverage: reverting the branch to ``str(e)`` must
-    fail here even though the sweep stays green.
+    subscriber through a dict-spread payload. The AST guard now recognizes
+    that shape; this runtime test additionally pins the actual audience and
+    serialized values on both sinks.
     """
     db = _direct_db_session()
     try:
