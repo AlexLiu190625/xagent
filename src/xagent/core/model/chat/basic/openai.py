@@ -271,15 +271,18 @@ class OpenAICompatibleLLM(BaseLLM):
         result: Dict[str, Any],
         *,
         thinking: Optional[Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Return opaque provider-owned message state for future LLM requests.
 
-        ``thinking`` is the request's thinking configuration, made available
-        so a subclass can decide whether this request could have produced
-        reasoning at all (e.g. to decide whether an empty capture is worth a
-        warning).
+        ``thinking`` and ``response_format`` are this request's own thinking
+        configuration and response format, made available so a subclass can
+        decide whether this request could have produced reasoning at all
+        (e.g. to decide whether an empty capture is worth a warning).
+        Mirrors ``_check_stream_reasoning_capture``'s parameters, for the
+        non-streaming path.
         """
-        _ = result, thinking
+        _ = result, thinking, response_format
         return {}
 
     def _delta_reasoning_content(self, delta: Any) -> tuple[bool, Any]:
@@ -511,7 +514,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     result["reasoning_content"] = reasoning_content
                     result["reasoning"] = reasoning_content
                 provider_state = self._response_provider_state(
-                    result, thinking=request_thinking
+                    result, thinking=request_thinking, response_format=response_format
                 )
                 if provider_state:
                     result[PROVIDER_STATE_METADATA_KEY] = provider_state
@@ -876,7 +879,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     result["reasoning_content"] = reasoning_content
                     result["reasoning"] = reasoning_content
                 provider_state = self._response_provider_state(
-                    result, thinking=thinking
+                    result, thinking=thinking, response_format=response_format
                 )
                 if provider_state:
                     result[PROVIDER_STATE_METADATA_KEY] = provider_state

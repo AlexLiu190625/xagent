@@ -361,6 +361,7 @@ class OpenRouterLLM(OpenAILLM):
         result: Dict[str, Any],
         *,
         thinking: Optional[Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if not self._uses_deepseek_tool_protocol:
             return {}
@@ -371,7 +372,7 @@ class OpenRouterLLM(OpenAILLM):
             not provider_state
             and result.get("tool_calls")
             and not self._provider_reasoning_intent(
-                thinking=thinking, response_format=None, is_streaming=False
+                thinking=thinking, response_format=response_format, is_streaming=False
             )[0]
         ):
             # This request did not go out with an explicit disable payload,
@@ -381,11 +382,12 @@ class OpenRouterLLM(OpenAILLM):
             # back here. Log which reasoning-like keys (if any) showed up --
             # key names only, never their content.
             #
-            # Both call sites of this hook are non-streaming request paths,
-            # and the only intent branch that reads ``response_format`` also
-            # requires streaming, so ``response_format=None`` here is exact
-            # rather than an approximation. A future streaming caller of
-            # this hook must pass that path's real ``response_format``.
+            # ``response_format`` is this call's own value, handed down by
+            # the caller that built the request: structured requests
+            # disable reasoning on this path too, so a sentinel that
+            # assumed ``None`` would report a miss against a response it
+            # had itself made impossible. ``is_streaming`` stays a literal
+            # because both call sites of this hook are non-streaming.
             logger.warning(
                 "OpenRouter deepseek model %s returned a tool call "
                 "without thinking disabled, but no reasoning content was "
