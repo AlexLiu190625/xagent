@@ -425,6 +425,13 @@ class OpenAICompatibleLLM(BaseLLM):
 
         self._apply_output_config(completion_params, output_config)
 
+        # The response_format degrade branch below (retry without
+        # response_format after a 400) resets the ``response_format``
+        # local to None so the structured-output degrade check further
+        # down still gates correctly. The capture sentinel further below
+        # needs to know what this particular request was actually built
+        # with, which can differ from that local on that narrow path, so
+        # it is tracked separately here.
         extra_body = self._prepare_provider_reasoning_extra_body(
             extra_body=extra_body,
             thinking=thinking,
@@ -433,6 +440,7 @@ class OpenAICompatibleLLM(BaseLLM):
             output_config=output_config,
             is_streaming=False,
         )
+        built_response_format = response_format
 
         # Helper function to process response
         async def _make_api_call() -> Any:
@@ -514,7 +522,9 @@ class OpenAICompatibleLLM(BaseLLM):
                     result["reasoning_content"] = reasoning_content
                     result["reasoning"] = reasoning_content
                 provider_state = self._response_provider_state(
-                    result, thinking=request_thinking, response_format=response_format
+                    result,
+                    thinking=request_thinking,
+                    response_format=built_response_format,
                 )
                 if provider_state:
                     result[PROVIDER_STATE_METADATA_KEY] = provider_state
@@ -644,6 +654,7 @@ class OpenAICompatibleLLM(BaseLLM):
                             output_config=output_config,
                             is_streaming=False,
                         )
+                        built_response_format = response_format
                         response = await _make_api_call()
                         result = _process_response(
                             response, request_thinking=retry_thinking

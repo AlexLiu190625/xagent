@@ -382,12 +382,14 @@ class OpenRouterLLM(OpenAILLM):
             # back here. Log which reasoning-like keys (if any) showed up --
             # key names only, never their content.
             #
-            # ``response_format`` is this call's own value, handed down by
-            # the caller that built the request: structured requests
-            # disable reasoning on this path too, so a sentinel that
-            # assumed ``None`` would report a miss against a response it
-            # had itself made impossible. ``is_streaming`` stays a literal
-            # because both call sites of this hook are non-streaming.
+            # ``response_format`` is the value the caller building this
+            # particular request used to construct its extra_body, not
+            # necessarily whatever ``response_format`` was originally
+            # passed in: structured requests disable reasoning on this
+            # path too, so a sentinel that assumed ``None`` would report a
+            # miss against a response it had itself made impossible.
+            # ``is_streaming`` stays a literal because both call sites of
+            # this hook are non-streaming.
             logger.warning(
                 "OpenRouter deepseek model %s returned a tool call "
                 "without thinking disabled, but no reasoning content was "

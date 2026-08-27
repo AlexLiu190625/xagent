@@ -3786,3 +3786,64 @@ async def test_openrouter_deepseek_structured_stream_stays_disabled_and_silent(
         for record in caplog.records
         if "no reasoning content was captured" in record.message
     ]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_response_format_resend_stays_silent(mocker, caplog):
+    """The capture sentinel must judge the resent request, not the caller's.
+
+    When the endpoint rejects ``response_format`` with a 400, ``OpenAILLM.chat``
+    drops it and resends -- but reuses the extra_body it already built while
+    ``response_format`` was still set, so the resend still goes out with
+    thinking disabled. The sentinel must recognize that: if it instead looked
+    at the now-cleared ``response_format`` local, it would conclude the resend
+    left thinking open and wrongly warn about a missing capture on this
+    tool-call response.
+    """
+    import logging
+
+    response = _openrouter_tool_call_response(
+        reasoning_content="unset",
+        raw_message_extra={
+            "reasoning_details": [{"type": "reasoning.text", "text": "SECRET-THOUGHT"}]
+        },
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        _bad_request_error(
+            "the model does not support response_format for this request"
+        ),
+        response,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.model.chat.basic.openrouter"
+    ):
+        await llm.chat(
+            [{"role": "user", "content": "Search xagent"}],
+            tools=_single_tool_schema("search"),
+            response_format={"type": "json_object"},
+        )
+
+    assert mock_client.chat.completions.create.await_count == 2
+    for call in mock_client.chat.completions.create.call_args_list:
+        assert call.kwargs["extra_body"] == {
+            "reasoning": {"enabled": False},
+            "thinking": {"type": "disabled"},
+        }
+    assert not [
+        record.message
+        for record in caplog.records
+        if "no reasoning content was captured" in record.message
+    ]
+    for record in caplog.records:
+        assert "SECRET-THOUGHT" not in record.getMessage()
