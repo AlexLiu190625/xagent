@@ -662,6 +662,14 @@ describe("ClarificationForm delivery failures", () => {
 })
 
 describe("ClarificationForm blank option filtering", () => {
+  beforeEach(() => {
+    appContextMock.dispatch.mockReset()
+    appContextMock.filesDisabled = false
+    appContextMock.providerAvailable = true
+    appContextMock.sendMessage.mockReset()
+    toastErrorMock.mockReset()
+  })
+
   afterEach(() => {
     cleanup()
   })
@@ -697,7 +705,13 @@ describe("ClarificationForm blank option filtering", () => {
     expect(screen.getByText("common.noOptions")).toBeInTheDocument()
   })
 
-  it("a select_one interaction keeps a good option and drops a blank one", () => {
+  it("a select_one interaction drops an option whose label alone is blank", () => {
+    // label and value are independent halves of the same filter
+    // (opt.value.trim() !== "" && opt.label.trim() !== ""); a blank value
+    // makes this option non-blank in isolation, so a regression that only
+    // reverted the label half back to a truthiness check would let this
+    // option survive even though a case that leaves both halves blank at
+    // once would still be dropped by the (unregressed) value half alone.
     const interactions = [
       {
         type: "select_one" as const,
@@ -705,7 +719,7 @@ describe("ClarificationForm blank option filtering", () => {
         label: "Choice",
         options: [
           { label: "Import", value: "import" },
-          { label: "   ", value: "   " },
+          { label: "   ", value: "blank-label-only" },
         ],
       },
     ]
@@ -717,6 +731,32 @@ describe("ClarificationForm blank option filtering", () => {
 
     expect(screen.getByText("Import")).toBeInTheDocument()
     expect(blankOptionSpans(container)).toHaveLength(0)
+  })
+
+  it("a select_one interaction drops an option whose value alone is blank", () => {
+    // Mirrors the case above for the other half of the same filter: a
+    // non-blank label makes this option non-blank in isolation, so a
+    // regression that only reverted the value half back to a truthiness
+    // check would let this option survive.
+    const interactions = [
+      {
+        type: "select_one" as const,
+        field: "choice",
+        label: "Choice",
+        options: [
+          { label: "Import", value: "import" },
+          { label: "Blank value only", value: "   " },
+        ],
+      },
+    ]
+    const { container } = render(
+      <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.selectOption"))
+
+    expect(screen.getByText("Import")).toBeInTheDocument()
+    expect(screen.queryByText("Blank value only")).not.toBeInTheDocument()
   })
 
   it("an action_cards interaction keeps a good option and drops a blank one", () => {

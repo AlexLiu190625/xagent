@@ -4499,16 +4499,19 @@ async def test_react_pattern_ask_user_question_drops_invalid_options() -> None:
     ]
 
 
+# Independent reference for JavaScript's String.prototype.trim() semantics,
+# derived from unicodedata rather than the production _INTERACTION_TRIM_CHARS
+# constant -- reusing that constant here would make every assertion below
+# self-proving instead of an independent check. Built once at module scope
+# and reused, instead of being rebuilt inline in each function that needs it.
+_JS_TRIM = {chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) == "Zs"}
+_JS_TRIM |= {"\t", "\n", "\v", "\f", "\r", "\ufeff", "\u2028", "\u2029"}
+
+
 def _js_trim_equivalent(value: str) -> str:
-    """Reference JavaScript String.prototype.trim() semantics, derived from
-    unicodedata rather than the production _INTERACTION_TRIM_CHARS constant
-    -- reusing that constant here would make every assertion below
-    self-proving instead of an independent check."""
-    js_trim_chars = {
-        chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) == "Zs"
-    }
-    js_trim_chars |= {"\t", "\n", "\v", "\f", "\r", "\ufeff", "\u2028", "\u2029"}
-    return value.strip("".join(js_trim_chars))
+    """Reference JavaScript String.prototype.trim(), via the independent
+    _JS_TRIM set above."""
+    return value.strip("".join(_JS_TRIM))
 
 
 def test_trim_table_covers_every_javascript_trimmed_code_point() -> None:
@@ -4516,11 +4519,7 @@ def test_trim_table_covers_every_javascript_trimmed_code_point() -> None:
     every code point JavaScript's trim() removes, or writing the normalized
     field back into item["field"] and relying on the frontend's own trim()
     being a no-op on it stops holding."""
-    js_trimmed = {
-        chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) == "Zs"
-    }
-    js_trimmed |= {"\t", "\n", "\v", "\f", "\r", "\ufeff", "\u2028", "\u2029"}
-    assert js_trimmed <= set(_INTERACTION_TRIM_CHARS)
+    assert _JS_TRIM <= set(_INTERACTION_TRIM_CHARS)
 
 
 def test_trim_table_python_only_difference_is_exactly_five_code_points() -> None:
@@ -4529,17 +4528,26 @@ def test_trim_table_python_only_difference_is_exactly_five_code_points() -> None
     of these five were mistyped (e.g. U+001C typoed into U+001B), since a
     typo like that only shrinks the Python-only difference by one member and
     stays within a superset of the JavaScript table."""
-    js_trimmed = {
-        chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) == "Zs"
-    }
-    js_trimmed |= {"\t", "\n", "\v", "\f", "\r", "\ufeff", "\u2028", "\u2029"}
-    assert set(_INTERACTION_TRIM_CHARS) - js_trimmed == {
+    assert set(_INTERACTION_TRIM_CHARS) - _JS_TRIM == {
         "\x1c",
         "\x1d",
         "\x1e",
         "\x1f",
         "\x85",
     }
+
+
+def test_python_whitespace_set_is_a_subset_of_the_frozen_trim_table() -> None:
+    """task_interaction_service.py's write-side field/option checks use
+    plain str.strip() rather than importing _INTERACTION_TRIM_CHARS -- that
+    is only safe to reason about at all if every code point Python's own
+    str.isspace() treats as whitespace is already inside the frozen table.
+    Computed independently (via isspace(), not by re-deriving from
+    _INTERACTION_TRIM_CHARS or from _JS_TRIM), so a typo that dropped one of
+    the five Python-only code points from the frozen table would be caught
+    here even if it happened to still pass the two JS-side checks above."""
+    python_whitespace = {chr(c) for c in range(0x110000) if chr(c).isspace()}
+    assert python_whitespace <= set(_INTERACTION_TRIM_CHARS)
 
 
 def test_normalize_keeps_well_formed_options_and_fields() -> None:
@@ -4594,6 +4602,7 @@ _BLANK_TEXT_CASES = [
     ("v5_bom_only", "\ufeff"),
     ("v8_python_only_control", "\x1c"),
     ("v9_js_line_separator", "\u2028"),
+    ("v10_nbsp", "\xa0"),
 ]
 
 
@@ -4745,6 +4754,11 @@ def test_normalize_logs_when_all_options_are_dropped(
     assert extra_keys == {"dropped", "total", "interaction_index"}
     assert all(isinstance(record.__dict__[k], int) for k in extra_keys)
     assert record.args is None or all(isinstance(a, int) for a in record.args)
+    # Both options in this interaction were blank, so dropped == total == 2,
+    # not just "some int" -- pins the actual count, not merely its type.
+    assert record.__dict__["dropped"] == 2
+    assert record.__dict__["total"] == 2
+    assert record.__dict__["interaction_index"] == 0
 
 
 def test_normalize_keeps_surviving_option_text_verbatim() -> None:

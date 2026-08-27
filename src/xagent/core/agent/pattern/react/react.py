@@ -259,10 +259,6 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
     site (``_pause_for_tool_results``) runs its own deduplication across all
     tools' interactions after calling this function once per tool.
 
-    Today those two call sites are the only callers in the repository; there
-    is no mechanical guard against a third call site being added without
-    also being covered by this contract.
-
     The output never carries an ``actions`` key: ``actions`` is a model
     alias for ``options`` (consumed above whenever ``options`` itself is
     missing or not a list, and ``actions`` is itself a list), and leaving
@@ -280,9 +276,10 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
 
         item = dict(interaction)
         field = item.get("field") or item.get("id") or item.get("name")
-        if not isinstance(field, str) or not _normalize_interaction_text(field):
-            field = f"response_{index}"
-        item["field"] = _normalize_interaction_text(field)
+        normalized_field = (
+            _normalize_interaction_text(field) if isinstance(field, str) else ""
+        )
+        item["field"] = normalized_field or f"response_{index}"
 
         # Widened from "options" not in item: an interaction can carry both
         # a malformed options (present but not a list) and a well-formed
