@@ -768,6 +768,31 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
         refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
         assert refreshed.description == "edited-while-in-flight"
 
+    def test_a_verdict_that_changed_under_the_lock_is_the_one_reported(self, db):
+        """The pre-lock answer granted edit; the post-lock answer still
+        grants it but is a different object. The 200's can_edit_global
+        must come from the answer the write was authorized on, not from
+        the one resolved before the lock existed.
+
+        This test alone cannot distinguish "reports the recheck" from
+        "reports the pre-lock answer": both objects grant edit, so either
+        one reported here yields the same True. What it pins is that the
+        recheck running does not accidentally break the response -- for
+        example by reassigning team_access in the refusal branch, or by
+        setting it to None. The mutation record for this test is kept in
+        the delivery report rather than asserted here, because the
+        distinguishing mutation (deleting the reassignment outright)
+        leaves this test green.
+        """
+        hook = _sequenced_access_hook(
+            ConnectorAccess(team_owned=True, can_edit=True),
+            ConnectorAccess(team_owned=True, can_edit=True),
+        )
+        _server, _server_id, result, _name, _description = self._run(db, hook=hook)
+
+        assert "error" not in result
+        assert result["response"].can_edit_global is True
+
     def test_recheck_that_raises_surfaces_the_hooks_own_status_with_zero_side_effects(
         self, db
     ):

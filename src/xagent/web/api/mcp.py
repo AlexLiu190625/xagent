@@ -3697,6 +3697,13 @@ def update_mcp_server(
                         "this edit was in flight"
                     ),
                 )
+            # The response below reports the verdict this write was
+            # actually authorized on, not the one resolved before the lock
+            # existed. Only rebound where the recheck ran: where it was
+            # skipped there is no fresher answer to report, and asking for
+            # one would cost a hook call on exactly the paths §59.2 of the
+            # design removed it from.
+            team_access = rechecked
 
         # Read only after the lock: rename_team_connector's "old" argument
         # must be the name this transaction actually holds locked, not
