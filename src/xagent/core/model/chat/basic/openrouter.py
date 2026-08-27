@@ -371,7 +371,7 @@ class OpenRouterLLM(OpenAILLM):
             not provider_state
             and result.get("tool_calls")
             and not self._provider_reasoning_intent(
-                thinking, response_format=None, is_streaming=False
+                thinking=thinking, response_format=None, is_streaming=False
             )[0]
         ):
             # This request did not go out with an explicit disable payload,
@@ -457,7 +457,7 @@ class OpenRouterLLM(OpenAILLM):
             and has_tool_calls
             and not has_reasoning_content
             and not self._provider_reasoning_intent(
-                thinking, response_format=response_format, is_streaming=True
+                thinking=thinking, response_format=response_format, is_streaming=True
             )[0]
         ):
             logger.warning(
@@ -1034,8 +1034,8 @@ class OpenRouterLLM(OpenAILLM):
 
     def _provider_reasoning_intent(
         self,
-        thinking: Optional[Dict[str, Any]],
         *,
+        thinking: Optional[Dict[str, Any]],
         response_format: Optional[Dict[str, Any]],
         is_streaming: bool,
     ) -> tuple[bool, bool]:
@@ -1114,7 +1114,9 @@ class OpenRouterLLM(OpenAILLM):
         _ = tools, output_config
         updated_extra_body = dict(extra_body)
         should_disable, should_enable = self._provider_reasoning_intent(
-            thinking, response_format=response_format, is_streaming=is_streaming
+            thinking=thinking,
+            response_format=response_format,
+            is_streaming=is_streaming,
         )
 
         if should_disable:
