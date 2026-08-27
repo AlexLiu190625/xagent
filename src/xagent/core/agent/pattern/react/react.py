@@ -2287,7 +2287,7 @@ class ReActPattern(AgentPattern):
             expect_response = bool(args.get("expect_response", False))
             message_type = str(args.get("message_type", "info"))
             visible = bool(args.get("visible", True))
-            await runtime.send_message(
+            outbound_message = await runtime.send_message(
                 message=message,
                 message_type=message_type,
                 expect_response=expect_response,
@@ -2314,6 +2314,7 @@ class ReActPattern(AgentPattern):
                     tool_call_id=tool_call.get("id"),
                 )
                 self.waiting_for_user_request = {
+                    "event_id": outbound_message["event_id"],
                     "tool_call_id": tool_call.get("id"),
                     "tool_name": name,
                     "message": message,
@@ -2351,7 +2352,7 @@ class ReActPattern(AgentPattern):
             interactions = _normalize_ask_user_interactions(
                 args.get("interactions", [])
             )
-            await runtime.send_message(
+            outbound_message = await runtime.send_message(
                 message=message,
                 message_type="question",
                 expect_response=True,
@@ -2379,6 +2380,7 @@ class ReActPattern(AgentPattern):
                 tool_call_id=tool_call.get("id"),
             )
             self.waiting_for_user_request = {
+                "event_id": outbound_message["event_id"],
                 "tool_call_id": tool_call.get("id"),
                 "tool_name": name,
                 "message": message,
@@ -2671,7 +2673,7 @@ class ReActPattern(AgentPattern):
             )
             message_type = "question"
 
-        await runtime.send_message(
+        outbound_message = await runtime.send_message(
             message=message,
             message_type=message_type,
             expect_response=True,
@@ -2680,6 +2682,7 @@ class ReActPattern(AgentPattern):
         )
         self.status = "waiting_for_user"
         self.waiting_for_user_request = {
+            "event_id": outbound_message["event_id"],
             "kind": "tool_waiting_for_user",
             "requests": requests,
             "message": message,

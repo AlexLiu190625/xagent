@@ -890,11 +890,16 @@ def create_stream_event(
     task_id: Union[int, str],
     data: Dict[str, Any],
     timestamp: Optional[Any] = None,
+    *,
+    event_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Create unified stream event format"""
+    """Create a stream event, preserving a producer-supplied event identity."""
+    resolved_event_id = (
+        event_id if isinstance(event_id, str) and event_id else str(uuid.uuid4())
+    )
     return {
         "type": "trace_event",
-        "event_id": str(uuid.uuid4()),
+        "event_id": resolved_event_id,
         "event_type": event_type,
         "task_id": task_id,
         "timestamp": _stream_timestamp(timestamp),
@@ -1077,6 +1082,7 @@ def make_agent_outbound_handler(task_id: int) -> Any:
                 "visible": bool(payload.get("visible", True)),
                 "metadata": payload.get("metadata") or {},
             },
+            event_id=payload.get("event_id"),
         )
         await asyncio.to_thread(_persist_agent_outbound_event, task_id, event)
         await manager.broadcast_to_task(event, task_id)
@@ -9218,6 +9224,7 @@ clarification questions as plain assistant text.
                             "visible": bool(payload.get("visible", True)),
                             "metadata": payload.get("metadata") or {},
                         },
+                        event_id=payload.get("event_id"),
                     )
                 )
             )
