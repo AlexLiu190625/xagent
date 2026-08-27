@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -34,6 +35,7 @@ from xagent.core.execution_scope import (
 )
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
+    ResumeReservationOutcome,
     _claim_user_message_delivery_isolated,
     _execute_durable_task_command,
     _handle_chat_message_unserialized,
@@ -57,6 +59,7 @@ from xagent.web.models.user import User
 from xagent.web.services import task_orchestrator
 from xagent.web.services.chat_history_service import DELIVERY_FAILED, DELIVERY_PENDING
 from xagent.web.services.task_command_transport import (
+    COMMAND_COMPLETED,
     ClaimedTaskCommand,
     TaskCommandKind,
     TaskCommandRejected,
@@ -65,6 +68,7 @@ from xagent.web.services.task_execution_controller import StaleTaskRunError
 from xagent.web.services.task_lease_service import (
     TaskLease,
     current_task_lease,
+    get_runner_id,
 )
 
 
@@ -1975,6 +1979,101 @@ def test_live_claim_unique_loser_returns_conflicting_winner_with_files(
 
 
 @pytest.mark.asyncio
+async def test_message_handoff_registers_the_minted_run_not_the_stale_one(
+    db_session,
+) -> None:
+    """A legacy NULL-run_id row gets a fresh run at the transition.
+
+    ``apply_task_control_transition`` mints a run id when the row has none,
+    so the value read from the routing snapshot before that call is ``None``
+    while the task now runs under a uuid. Registering the coordinator under
+    the stale value makes a later RESUME asking about the real run read a
+    live resume as ``RESERVATION_HELD``, defer sixty times, and terminally
+    fail a resume that was already succeeding.
+    """
+
+    owner = _user(db_session, "minted-run-owner")
+    # WAITING_FOR_USER, because that is what routes a chat message into the
+    # live-control resume handoff (``_task_status_uses_live_control``).
+    task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
+    task.run_id = None
+    task.control_state = "waiting_for_user"
+    db_session.commit()
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    # No exact live lease, so the handoff defers the message to the resume
+    # owner instead of injecting it -- the path that reaches the transition.
+    agent.post_user_message = AsyncMock(return_value=False)
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+    registered_run_ids: list[str | None] = []
+    registered_handles: list[asyncio.Task] = []
+
+    def register_resume(
+        _task_id: int,
+        task_handle: asyncio.Task,
+        *,
+        run_id: str | None = None,
+    ) -> None:
+        registered_run_ids.append(run_id)
+        registered_handles.append(task_handle)
+
+    async def resume_forever(*_args, **_kwargs) -> None:
+        await asyncio.Event().wait()
+
+    bg_mgr.register_reserved_resume.side_effect = register_resume
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.api.websocket.execute_resume_background",
+            side_effect=resume_forever,
+        ) as resume_bg,
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "resume a legacy row",
+                "client_message_id": "minted-run-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+        # The coroutine is recorded at construction, before the loop runs it.
+        resume_expected_run_id = resume_bg.call_args.kwargs["expected_run_id"]
+        for handle in registered_handles:
+            handle.cancel()
+        await asyncio.gather(*registered_handles, return_exceptions=True)
+
+    db_session.expire_all()
+    stored = db_session.get(Task, int(task.id))
+    assert stored is not None
+    minted = stored.run_id
+    assert minted is not None, "the transition should have minted a run id"
+
+    assert registered_run_ids == [minted], (
+        "the coordinator must be registered under the run the task is "
+        "actually executing, not the NULL the snapshot carried"
+    )
+    # And the execution has to agree: a None here would reach
+    # acquire_task_lease_no_commit and mint a *second* run, putting the row,
+    # the registration and the lease on three different answers.
+    assert resume_expected_run_id == minted
+
+
+@pytest.mark.asyncio
 async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
     db_session,
 ) -> None:
@@ -2010,7 +2109,13 @@ async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
             background_cancelled.set()
             raise
 
-    def register_resume(_task_id: int, task_handle: asyncio.Task) -> None:
+    def register_resume(
+        _task_id: int,
+        task_handle: asyncio.Task,
+        *,
+        run_id: str | None = None,
+    ) -> None:
+        assert run_id == "marker-cancellation-run"
         registered_tasks.append(task_handle)
 
     bg_mgr.register_reserved_resume.side_effect = register_resume
@@ -2658,7 +2763,8 @@ async def test_durable_resume_propagates_stale_run_error(db_session) -> None:
     _captured, agent, mgr, ws_manager = _patched_manager_and_agent()
     agent.supports_live_control.return_value = True
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.resume_admission_state.return_value = None
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
 
     with (
         patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
@@ -2878,7 +2984,7 @@ async def test_pause_non_owner_non_admin_is_refused(db_session) -> None:
 async def test_resume_admin_on_other_users_task_runs_as_owner(db_session) -> None:
     owner = _user(db_session, "owner")
     admin = _user(db_session, "admin", is_admin=True)
-    task = _task(db_session, owner.id)
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
     captured, agent, mgr, ws_manager = _patched_manager_and_agent()
 
     with (
@@ -2911,12 +3017,16 @@ async def test_resume_admin_on_other_users_task_runs_as_owner(db_session) -> Non
 
 
 @pytest.mark.asyncio
-async def test_resume_rejection_embeds_known_control_state(db_session) -> None:
+async def test_running_resume_completes_as_explicit_idempotent_success(
+    db_session,
+) -> None:
     owner = _user(db_session, "owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
     task.run_id = "run-current"
     task.state_version = 7
     task.control_state = "running"
+    task.runner_id = get_runner_id()
+    task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
     db_session.commit()
     _captured, agent, mgr, ws_manager = _patched_manager_and_agent()
     agent.supports_live_control = MagicMock(return_value=True)
@@ -2927,28 +3037,49 @@ async def test_resume_rejection_embeds_known_control_state(db_session) -> None:
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": owner})
 
-        # The rejection is sent from a dispatched command that
-        # ``dispatch_task_command_promptly`` may detach after its 50ms
-        # deadline, so the "task" payload can land after this call returns.
-        payload = None
+        command = None
         for _ in range(100):
-            for call in ws_manager.send_personal_message.await_args_list:
-                if call.args and "task" in call.args[0]:
-                    payload = call.args[0]
-                    break
-            if payload is not None:
+            db_session.expire_all()
+            command = (
+                db_session.query(TaskExecutionCommand)
+                .filter(
+                    TaskExecutionCommand.task_id == int(task.id),
+                    TaskExecutionCommand.kind == TaskCommandKind.RESUME.value,
+                )
+                .one_or_none()
+            )
+            if command is not None and command.status == COMMAND_COMPLETED:
                 break
             await asyncio.sleep(0.01)
         else:
-            raise AssertionError("resume rejection payload did not arrive in time")
+            raise AssertionError("idempotent resume did not complete in time")
 
-    assert payload["task"] == {
-        "id": int(task.id),
-        "run_id": "run-current",
-        "state_version": 7,
-        "control_state": "running",
-        "status": "running",
-    }
+    assert command is not None
+    assert command.result["resume_outcome"] == "already_in_progress"
+
+    # The durable row records an idempotent success, but the client that
+    # asked still gets the task's state tuple: the resume control only
+    # renders while the client believes the task is paused, so a silent
+    # completion would leave a stale client clicking resume forever. This is
+    # the payload shape a resume correction has always carried.
+    payload = None
+    for _ in range(100):
+        for call in ws_manager.send_personal_message.await_args_list:
+            if call.args and "task" in call.args[0]:
+                payload = call.args[0]
+                break
+        if payload is not None:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("idempotent resume correction did not arrive in time")
+
+    # The handler deliberately supplies no state tuple: its own setup
+    # snapshot can be stale by the time this branch fires, and
+    # ``send_personal_message`` attaches the live row precisely when the
+    # producer supplied none. The attachment is pinned by
+    # ``test_idempotent_resume_frame_is_enriched_with_the_live_row``.
+    assert payload["task"] == {"id": int(task.id)}
 
 
 @pytest.mark.asyncio
@@ -2971,6 +3102,8 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
     )
     bg_mgr = MagicMock()
     bg_mgr.running_tasks.get = MagicMock(return_value=None)
+    bg_mgr.resume_admission_state.return_value = None
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
 
     with (
         patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
@@ -3010,7 +3143,10 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
     resume_bg.assert_called_once()
     assert resume_bg.call_args.kwargs["task_owner_user_id"] == int(owner.id)
     assert resume_bg.call_args.kwargs["expected_run_id"] == "run-from-resume-transition"
-    bg_mgr.reserve_resume.assert_called_once_with(int(task.id))
+    bg_mgr.try_reserve_resume.assert_called_once_with(
+        int(task.id),
+        expected_run_id=None,
+    )
     bg_mgr.register_reserved_resume.assert_called_once()
 
 
@@ -3021,7 +3157,8 @@ async def test_resume_registration_failure_cancels_coordinator(db_session) -> No
     captured, agent, mgr, ws_manager = _patched_manager_and_agent()
     agent.supports_live_control = MagicMock(return_value=True)
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.resume_admission_state.return_value = None
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     bg_mgr.register_reserved_resume.side_effect = RuntimeError("reservation lost")
     bg_handle = MagicMock()

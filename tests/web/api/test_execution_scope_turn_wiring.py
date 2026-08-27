@@ -39,6 +39,7 @@ from xagent.core.execution_scope import (
     set_execution_scope_snapshot_loader,
 )
 from xagent.web.api.websocket import (
+    ResumeReservationOutcome,
     _acquire_resume_task_lease,
     _handle_resume_task_unserialized,
     execute_resume_background,
@@ -596,7 +597,10 @@ async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() ->
 
     background_manager = MagicMock()
     background_manager.running_tasks = {}
-    background_manager.reserve_resume.return_value = True
+    background_manager.resume_admission_state.return_value = None
+    background_manager.try_reserve_resume.return_value = (
+        ResumeReservationOutcome.RESERVED
+    )
     transition = AsyncMock(
         return_value=SimpleNamespace(run_id="run-a", status=TaskStatus.PAUSED)
     )
@@ -615,6 +619,13 @@ async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() ->
             patch(
                 "xagent.web.api.websocket.background_task_manager",
                 background_manager,
+            ),
+            # The handler asks the DB whether another process still holds a
+            # live lease before scheduling; this suite drives it without a
+            # task row, so answer "no foreign owner" explicitly.
+            patch(
+                "xagent.web.api.websocket.task_has_live_foreign_runner",
+                return_value=False,
             ),
             patch(
                 "xagent.web.api.websocket.execute_resume_background",
@@ -687,7 +698,10 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
 
     background_manager = MagicMock()
     background_manager.running_tasks = {}
-    background_manager.reserve_resume.return_value = True
+    background_manager.resume_admission_state.return_value = None
+    background_manager.try_reserve_resume.return_value = (
+        ResumeReservationOutcome.RESERVED
+    )
 
     with _Patches(
         [
@@ -707,6 +721,13 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
             patch(
                 "xagent.web.api.websocket.background_task_manager",
                 background_manager,
+            ),
+            # The handler asks the DB whether another process still holds a
+            # live lease before scheduling; this suite drives it without a
+            # task row, so answer "no foreign owner" explicitly.
+            patch(
+                "xagent.web.api.websocket.task_has_live_foreign_runner",
+                return_value=False,
             ),
             patch(
                 "xagent.web.api.websocket.execute_resume_background",

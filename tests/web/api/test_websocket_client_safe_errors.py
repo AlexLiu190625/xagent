@@ -181,8 +181,16 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
         f"expected exactly 30 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
-    assert result.error_payloads == 53, (
-        f"expected exactly 53 error payloads, matched {result.error_payloads}; "
+    # 53 -> 52 in #1658: ``_resync_client_to_running_task`` used to correct a
+    # stale client with an ``error`` frame even though the command had
+    # succeeded, which the chat client renders as a failed bubble. It now
+    # sends ``task_resumed``, the control-only shape, so one site leaves this
+    # census. A reduction is the safe direction for what this guard protects
+    # -- one fewer site on which raw text can reach a chat client -- and the
+    # producer count above is unchanged, so the census moved by exactly the
+    # one site this PR changed.
+    assert result.error_payloads == 52, (
+        f"expected exactly 52 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
