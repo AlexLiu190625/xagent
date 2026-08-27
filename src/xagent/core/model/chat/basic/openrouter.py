@@ -1060,15 +1060,20 @@ class OpenRouterLLM(OpenAILLM):
             )
             return bool(should_disable), bool(should_enable)
 
-        if is_streaming and response_format:
-            # The caller said nothing about reasoning and this is a
-            # structured stream, where provider reasoning can corrupt the
-            # JSON. Disable it regardless of the declared ability, which
-            # does not open the default here. A caller that asked for
+        if response_format:
+            # The caller said nothing about reasoning and this request asks
+            # for structured output, where provider reasoning can corrupt
+            # the JSON. Disable it for every DeepSeek-served model, declared
+            # ability or not: the ability says the operator wants reasoning,
+            # it does not say they want it mixed into a JSON body. Models
+            # from other authors keep the streaming-only rule this client
+            # has always had -- widening that one would change requests for
+            # models this change is not about. A caller that asked for
             # reasoning explicitly is answered above and is not overridden
             # here.
             return (
-                self.supports_thinking_mode or self._uses_deepseek_tool_protocol,
+                self._uses_deepseek_tool_protocol
+                or (is_streaming and self.supports_thinking_mode),
                 False,
             )
 

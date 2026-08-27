@@ -1038,7 +1038,11 @@ def test_openrouter_deepseek_defaults_to_disabled_thinking(
     ("is_streaming", "response_format", "expected_extra"),
     [
         (False, None, {}),
-        (False, {"type": "json_object"}, {}),
+        (
+            False,
+            {"type": "json_object"},
+            {"reasoning": {"enabled": False}, "thinking": {"type": "disabled"}},
+        ),
         (True, None, {}),
         (
             True,
@@ -1060,10 +1064,11 @@ def test_openrouter_deepseek_declared_thinking_ability_leaves_default_open(
     """The declared-ability half of a declared/undeclared contrast pair.
 
     A model record that declares ``thinking_mode`` gets nothing sent for an
-    unspecified request, except on the structured-streaming shape, which
-    stays disabled unconditionally: that branch is only reached when the
-    caller specified no thinking configuration at all, and the declared
-    ability does not change that. See
+    unspecified request, except when the request asks for structured
+    output -- streaming or not -- which stays disabled: that branch is only
+    reached when the caller specified no thinking configuration at all, and
+    the declared ability says the operator wants reasoning, not that they
+    want it mixed into a JSON body. See
     ``test_openrouter_deepseek_defaults_to_disabled_thinking`` for the same
     shapes without the ability declared.
     """
@@ -1219,11 +1224,13 @@ async def test_openrouter_deepseek_default_thinking_triggers_structured_degrade_
     mocker, monkeypatch
 ):
     """The structured-output degrade resend above is triggered by the
-    response's own reasoning_content and the declared ability, not by what
-    this call requested -- so it also fires when the caller passes no
-    ``thinking`` at all. What matters for PR-2 is what the *first* request
-    sent: with the ability declared and no thinking requested, it must
-    carry nothing, not a disable payload.
+    response's own reasoning_content, not by what this call requested -- so
+    it also fires when the caller passes no ``thinking`` at all. The
+    mandatory reasoning-disable for structured output does not depend on
+    whether this call's model record declares the thinking ability either,
+    so the first request already carries the disable payload; the degrade
+    resend exists because this endpoint reasoned anyway, ignoring that
+    payload, and it repeats the same disable ask on the resend.
     """
     monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
 
@@ -1268,15 +1275,21 @@ async def test_openrouter_deepseek_default_thinking_triggers_structured_degrade_
 
     assert result["content"] == '{"status": "ok"}'
     assert mock_client.chat.completions.create.await_count == 2
-    assert (
-        "extra_body" not in mock_client.chat.completions.create.call_args_list[0].kwargs
-    )
-    assert mock_client.chat.completions.create.call_args_list[1].kwargs[
-        "extra_body"
-    ] == {
+    disabled = {
         "reasoning": {"enabled": False},
         "thinking": {"type": "disabled"},
     }
+    # The structured-output rule already asked for no reasoning on the way
+    # out; this endpoint reasoned anyway. The degrade resend is the second
+    # line of defence for exactly that, and it repeats the same ask.
+    assert (
+        mock_client.chat.completions.create.call_args_list[0].kwargs["extra_body"]
+        == disabled
+    )
+    assert (
+        mock_client.chat.completions.create.call_args_list[1].kwargs["extra_body"]
+        == disabled
+    )
 
 
 # ==========================================================================
@@ -3551,6 +3564,63 @@ async def test_openrouter_non_deepseek_stream_no_capture_warning(mocker, caplog)
         "no reasoning content was captured" in record.message
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_structured_non_stream_stays_disabled_and_silent(
+    mocker, caplog
+):
+    """Non-streaming half of the structured-output rule, and of the sentinel
+    agreement the streaming test below pins.
+
+    A structured request disables thinking whatever the transport, and the
+    non-streaming capture sentinel must agree, staying silent about a
+    capture it knows this request could not have produced. The model record
+    declares the ability specifically so this test can tell apart the two
+    things the sentinel could be looking at: if it ignored this call's own
+    ``response_format`` and reused the declared-ability default-open
+    answer, it would treat the missing capture as a real miss and warn.
+    """
+    import logging
+
+    response = _openrouter_tool_call_response(
+        reasoning_content="unset",
+        raw_message_extra={
+            "reasoning_details": [{"type": "reasoning.text", "text": "SECRET-THOUGHT"}]
+        },
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = response
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.model.chat.basic.openrouter"
+    ):
+        await llm.chat(
+            [{"role": "user", "content": "Search xagent"}],
+            tools=_single_tool_schema("search"),
+            response_format={"type": "json_object"},
+        )
+
+    assert mock_client.chat.completions.create.call_args.kwargs["extra_body"] == {
+        "reasoning": {"enabled": False},
+        "thinking": {"type": "disabled"},
+    }
+    assert not [
+        record.message
+        for record in caplog.records
+        if "no reasoning content was captured" in record.message
+    ]
+    for record in caplog.records:
+        assert "SECRET-THOUGHT" not in record.getMessage()
 
 
 @pytest.mark.asyncio
