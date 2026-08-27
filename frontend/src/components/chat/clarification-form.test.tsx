@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -355,6 +356,28 @@ describe("ClarificationForm connect_apps interaction", () => {
     })
   })
 
+  it("binds a connect_apps skip to the rendered interaction request", async () => {
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        requestId="inputreq_0011223344556677889900aabbccddee"
+      />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"))
+
+    await waitFor(() => {
+      expect(appContextMock.sendMessage).toHaveBeenCalledWith(
+        "chatPage.clarification.connectApps.skip",
+        {
+          force: true,
+          metadata: { request_id: "inputreq_0011223344556677889900aabbccddee" },
+        },
+        [],
+      )
+    })
+  })
+
   it("renders the real connect_apps widget instead of an 'unsupported type' error when mixed into a list with another interaction type", () => {
     // Not producible by any seeder today (see LIVE_WIDGET_TYPES's comment in
     // clarification-form.tsx), but nothing rules it out - isConnectAppsOnly
@@ -658,6 +681,68 @@ describe("ClarificationForm delivery failures", () => {
     rerender(<ClarificationForm interactions={interactions} active />)
 
     expect(screen.queryByRole("alert")).toBeNull()
+  })
+})
+
+describe("ClarificationForm interaction identity", () => {
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("resets the reused form and ignores completion from the previous request", async () => {
+    let resolveR1!: () => void
+    const onSend = vi.fn(() => new Promise<void>((resolve) => { resolveR1 = resolve }))
+    const form = (requestId: string, messageId?: string) => (
+      <ClarificationForm
+        interactions={[{ type: "text_input", field: "city", label: "City" }]}
+        requestId={requestId}
+        messageId={messageId}
+        onSend={onSend}
+      />
+    )
+    const { container, rerender } = render(form("inputreq_r1"))
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Sydney" } })
+    expect(screen.getByRole("textbox")).toHaveValue("Sydney")
+
+    rerender(form("inputreq_r1", "unrelated-rerender"))
+    expect(screen.getByRole("textbox")).toHaveValue("Sydney")
+    fireEvent.click(screen.getByRole("button", { name: "chatPage.clarification.submit" }))
+
+    rerender(form("inputreq_r2"))
+
+    expect(screen.getByRole("textbox")).toHaveValue("")
+    expect(screen.getByRole("button", { name: "chatPage.clarification.submit" })).toBeEnabled()
+    expect(container.querySelector('[aria-expanded="true"]')).not.toBeNull()
+    expect(screen.queryByRole("alert")).toBeNull()
+
+    await act(async () => resolveR1())
+
+    expect(screen.getByRole("textbox")).toHaveValue("")
+    expect(screen.getByRole("button", { name: "chatPage.clarification.submit" })).toBeEnabled()
+    expect(screen.queryByRole("alert")).toBeNull()
+  })
+
+  it("submits the request id bound to this rendered form", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    render(
+      <ClarificationForm
+        interactions={[{ type: "text_input", field: "city", label: "City" }]}
+        requestId="inputreq_0011223344556677889900aabbccddee"
+        onSend={onSend}
+      />,
+    )
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Sydney" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith(
+      "City: Sydney",
+      [],
+      { request_id: "inputreq_0011223344556677889900aabbccddee" },
+    ))
   })
 })
 
