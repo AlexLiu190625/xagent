@@ -49,7 +49,6 @@ helper the other ``*_postgresql.py`` suites in this repo use.
 
 from __future__ import annotations
 
-import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -139,8 +138,8 @@ def test_a_toggle_that_already_committed_still_returns_200_when_the_hook_poisons
     try:
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=poisoning_access)
-            response = asyncio.run(
-                mcp_api.toggle_mcp_server(server_id, current_user=current_user, db=db)
+            response = mcp_api.toggle_mcp_server(
+                server_id, current_user=current_user, db=db
             )
         assert response.can_edit_global is True
 

@@ -356,7 +356,7 @@ def _resolve_custom_api_for_request(
 
 
 @custom_api_router.get("/{api_id}", response_model=CustomApiResponse)
-async def get_custom_api(
+def get_custom_api(
     api_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

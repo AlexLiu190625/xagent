@@ -1,3 +1,6 @@
+import ast
+import importlib
+import inspect
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -261,7 +264,7 @@ async def test_get_custom_api():
 
     db.query().filter().first.return_value = mock_user_api
 
-    res = await get_custom_api(10, current_user=user, db=db)
+    res = get_custom_api(10, current_user=user, db=db)
     assert res.id == 10
     assert res.name == "test_api"
 
@@ -273,7 +276,7 @@ async def test_get_custom_api_not_found():
     db.query().filter().first.return_value = None
 
     with pytest.raises(HTTPException) as exc_info:
-        await get_custom_api(99, current_user=user, db=db)
+        get_custom_api(99, current_user=user, db=db)
     assert exc_info.value.status_code == 404
 
 
@@ -531,6 +534,121 @@ def test_the_locking_routes_are_sync_defs_so_a_lock_wait_never_holds_the_event_l
 
     assert not inspect.iscoroutinefunction(custom_api_api.update_custom_api)
     assert not inspect.iscoroutinefunction(custom_api_api.delete_custom_api)
+
+
+_SEAM_MODULES = ("xagent.web.api.custom_api", "xagent.web.api.mcp")
+
+# The one function that reaches the connector team seam and is still a
+# coroutine, with the fact that makes it impossible to convert. Its own
+# ``await`` is asserted below, so this entry cannot be claimed by a route
+# that does not actually need it.
+_COROUTINE_EXEMPTIONS = {("xagent.web.api.mcp", "delete_mcp_server")}
+
+_SEAM_REACHING_FUNCTIONS = {
+    ("xagent.web.api.custom_api", "_resolve_custom_api_for_request"),
+    ("xagent.web.api.custom_api", "get_custom_api"),
+    ("xagent.web.api.custom_api", "update_custom_api"),
+    ("xagent.web.api.custom_api", "delete_custom_api"),
+    ("xagent.web.api.mcp", "_resolve_mcp_server_for_request"),
+    ("xagent.web.api.mcp", "_local_mcp_can_attach"),
+    ("xagent.web.api.mcp", "list_mcp_apps"),
+    ("xagent.web.api.mcp", "get_mcp_servers"),
+    ("xagent.web.api.mcp", "get_mcp_server"),
+    ("xagent.web.api.mcp", "connect_mcp_app"),
+    ("xagent.web.api.mcp", "update_mcp_server"),
+    ("xagent.web.api.mcp", "delete_mcp_server"),
+    ("xagent.web.api.mcp", "toggle_mcp_server"),
+}
+
+
+def _functions_reaching_the_connector_seam(module_name: str) -> dict[str, ast.AST]:
+    """Every top-level function in ``module_name`` that can reach an
+    installed connector team hook.
+
+    Seeded on the functions that import ``connector_team_scope`` in their
+    own body -- which is how every call site in these two modules reaches
+    the seam -- then closed transitively over plain-name calls, because
+    two of the routes reach it only through a helper (``get_custom_api``
+    through ``_resolve_custom_api_for_request``, ``get_mcp_server``
+    through ``_resolve_mcp_server_for_request``). A seed-only check would
+    miss exactly the route this test exists for.
+    """
+    module = importlib.import_module(module_name)
+    tree = ast.parse(inspect.getsource(module))
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    reaching = {
+        name
+        for name, node in functions.items()
+        if any(
+            isinstance(child, ast.ImportFrom)
+            and child.module is not None
+            and child.module.endswith("connector_team_scope")
+            for child in ast.walk(node)
+        )
+    }
+    changed = True
+    while changed:
+        changed = False
+        for name, node in functions.items():
+            if name in reaching:
+                continue
+            called = {
+                child.func.id
+                for child in ast.walk(node)
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+            }
+            if called & reaching:
+                reaching.add(name)
+                changed = True
+    return {name: functions[name] for name in reaching}
+
+
+def test_the_discovery_of_seam_reaching_functions_is_not_vacuous():
+    """Pins the enumeration itself, so the assertion below cannot pass by
+    finding nothing."""
+    found = {
+        (module_name, name)
+        for module_name in _SEAM_MODULES
+        for name in _functions_reaching_the_connector_seam(module_name)
+    }
+    assert found == _SEAM_REACHING_FUNCTIONS
+
+
+def test_no_function_that_reaches_the_connector_seam_is_a_coroutine():
+    """An installed connector team hook may be slow -- this repo's own
+    design assumes it does database-backed work. FastAPI runs a coroutine
+    route on the event loop thread itself, so a slow hook call inside an
+    ``async def`` stalls every other request the process is serving, not
+    just this one; a plain ``def`` goes to the threadpool instead, where a
+    slow call occupies one worker.
+
+    Enumerated by reachability rather than by a hand-written list of
+    routes: the earlier fix for this same risk class swept siblings along
+    the "takes a row lock" axis and therefore missed two routes that call
+    a hook without taking one.
+    """
+    offenders = []
+    for module_name in _SEAM_MODULES:
+        for name, node in _functions_reaching_the_connector_seam(module_name).items():
+            if not isinstance(node, ast.AsyncFunctionDef):
+                continue
+            if (module_name, name) in _COROUTINE_EXEMPTIONS:
+                # An exemption is only legitimate for a function that
+                # genuinely cannot be converted, so it must carry an await.
+                assert any(isinstance(child, ast.Await) for child in ast.walk(node)), (
+                    f"{module_name}.{name} is exempted from this invariant but has "
+                    "no await, so nothing stops it from being a plain def"
+                )
+                continue
+            offenders.append(f"{module_name}.{name}")
+    assert offenders == [], (
+        "these functions can reach an installed connector team hook while "
+        f"running on the event loop thread: {offenders}"
+    )
 
 
 def _lock_order_session_factory():

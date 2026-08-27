@@ -11,8 +11,6 @@ into suites that run after this one.
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 import sqlalchemy as sa
 from fastapi import HTTPException
@@ -558,7 +556,7 @@ class TestReportedEditPermissionConsistencyMcp:
 
             toggle_response = None
             if has_personal_row:
-                toggle_response = await toggle_mcp_server(
+                toggle_response = toggle_mcp_server(
                     server_id, current_user=caller, db=db
                 )
 
@@ -717,7 +715,7 @@ class TestLocalCanConfigureWidening:
             )
             assert entry["can_configure"] is True
 
-            response = await get_custom_api(api_id, current_user=member, db=db)
+            response = get_custom_api(api_id, current_user=member, db=db)
         assert response.id == api_id
 
 
@@ -1085,15 +1083,13 @@ class TestStandaloneParityWithNoHookInstalled:
 
             # Row 9: POST .../toggle -- gated on a personal row's mere
             # existence, not on edit rights; both populations have one.
-            toggle_response = await toggle_mcp_server(
-                server_id, current_user=caller, db=db
-            )
+            toggle_response = toggle_mcp_server(server_id, current_user=caller, db=db)
             assert toggle_response.can_edit_global is can_edit_global_config
 
             # Row 10: GET /custom-apis/{id} -- never reads a verdict for a
             # caller who already has a working personal row, of either
             # population, so this always succeeds.
-            api_get_response = await get_custom_api(api_id, current_user=caller, db=db)
+            api_get_response = get_custom_api(api_id, current_user=caller, db=db)
             assert api_get_response.id == api_id
 
             # Row 11: PUT any editable Custom API field -- gated on
@@ -1187,7 +1183,7 @@ class TestStandaloneParityWithNoHookInstalled:
             assert exc.value.status_code == 404
 
             with pytest.raises(HTTPException) as exc:
-                await get_custom_api(api_id, current_user=stranger, db=db)
+                get_custom_api(api_id, current_user=stranger, db=db)
             assert exc.value.status_code == 404
 
             with pytest.raises(HTTPException) as exc:
@@ -1450,9 +1446,7 @@ class TestSessionRecoveryAfterHookFailure:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=poisoning_access)
-            response = asyncio.run(
-                toggle_mcp_server(server_id, current_user=owner, db=db)
-            )
+            response = toggle_mcp_server(server_id, current_user=owner, db=db)
 
         assert response.can_edit_global is True
 

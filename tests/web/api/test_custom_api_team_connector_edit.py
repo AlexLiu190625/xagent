@@ -75,7 +75,7 @@ def _make_owned_api(db, owner_id: int, *, name: str = "shared-api") -> CustomApi
 
 
 async def _get(api_id, current_user, db):
-    return await get_custom_api(api_id, current_user=current_user, db=db)
+    return get_custom_api(api_id, current_user=current_user, db=db)
 
 
 async def _put(api_id, payload, current_user, db):

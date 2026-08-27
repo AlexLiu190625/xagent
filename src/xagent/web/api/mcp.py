@@ -4083,7 +4083,7 @@ async def delete_mcp_server(
 
 
 @mcp_router.post("/servers/{server_id}/toggle", response_model=MCPServerResponse)
-async def toggle_mcp_server(
+def toggle_mcp_server(
     server_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

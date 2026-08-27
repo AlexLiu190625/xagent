@@ -547,7 +547,7 @@ class TestDecorationDegradesAfterTheWriteCommits:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=boom)
-            response = await toggle_mcp_server(server_id, current_user=editor, db=db)
+            response = toggle_mcp_server(server_id, current_user=editor, db=db)
 
         assert response.can_edit_global is False
         fake_logger.warning.assert_called_once()
