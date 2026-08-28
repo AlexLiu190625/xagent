@@ -1230,6 +1230,52 @@ describe("useWebSocket normalized connections", () => {
     })
   })
 
+  it("offers an explicit unbound Session binding on the initial physical connection", async () => {
+    renderHook(() => useWebSocket({
+      connection: sessionConnection({
+        taskBindingMode: "session-subprotocol",
+      }),
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    expect(MockWebSocket.instances[0].protocols).toEqual([
+      "xagent-session-v1",
+      "xagent-session-token.st_secret",
+      "xagent-session-binding-v1",
+      "xagent-session-task.unbound",
+    ])
+  })
+
+  it("offers the current bound task when establishing a replacement physical connection", async () => {
+    const connection = sessionConnection({
+      taskBindingMode: "session-subprotocol",
+    })
+    const hook = renderHook(
+      ({ taskId }: { taskId: number | undefined }) => useWebSocket({
+        connection,
+        taskId,
+      }),
+      { initialProps: { taskId: undefined as number | undefined } },
+    )
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    expect(MockWebSocket.instances[0].protocols).toContain(
+      "xagent-session-task.unbound",
+    )
+
+    hook.rerender({ taskId: 42 })
+    expect(MockWebSocket.instances).toHaveLength(1)
+    act(() => hook.result.current.disconnect())
+    act(() => hook.result.current.connect())
+
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(MockWebSocket.instances[1].protocols).toEqual([
+      "xagent-session-v1",
+      "xagent-session-token.st_secret",
+      "xagent-session-binding-v1",
+      "xagent-session-task.42",
+    ])
+  })
+
   it.each([4001, 4003, 1011])(
     "runs the Session close delegate first and suppresses legacy handling for %s",
     async (code) => {

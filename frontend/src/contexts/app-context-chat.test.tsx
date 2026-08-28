@@ -4553,6 +4553,129 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("requires reload before replacing a rebound Session task the server cannot replay", async () => {
+    const { rerender } = render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("unreplayable-old"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(102))
+      webSocketOptions.current?.onMessage?.(assistantMessage("Preserved transcript", 102))
+    })
+
+    rerender(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("unreplayable-new"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "conversation_reload_required",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 102,
+        data: {},
+      })
+    })
+
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+    expect(screen.getByTestId("task-id").textContent).toBe("102")
+    expect(screen.getByTestId("messages").textContent).toContain("Preserved transcript")
+    await expect(getSessionControls().sendMessage("Replacement")).rejects.toThrow(/reload required/i)
+    await expect(getSessionControls().startNewConversation()).rejects.toThrow(/reload required/i)
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+    expect(sendRawMessageMock).not.toHaveBeenCalled()
+  })
+
+  it("requires reload when a stale sibling reset is fenced before acknowledgement", async () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("stale-reset"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(102)))
+
+    let reset!: Promise<void>
+    act(() => {
+      reset = getSessionControls().startNewConversation()
+    })
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "conversation_reload_required",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 102,
+        data: {},
+      })
+    })
+
+    await expect(reset).rejects.toThrow(/reload required/i)
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+    expect(screen.getByTestId("task-id").textContent).toBe("102")
+    await expect(getSessionControls().sendMessage("Must not send")).rejects.toThrow(/reload required/i)
+    await expect(getSessionControls().startNewConversation()).rejects.toThrow(/reload required/i)
+  })
+
+  it("ignores a stale, invalid, or mismatched server reload requirement", () => {
+    const { rerender } = render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("unreplayable-old"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(102)))
+    const staleOnMessage = webSocketOptions.current?.onMessage
+
+    rerender(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("unreplayable-current"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    act(() => staleOnMessage?.({
+      type: "conversation_reload_required",
+      timestamp: "2026-05-27T05:00:03Z",
+      task_id: 102,
+      data: {},
+    }))
+
+    for (const taskId of [undefined, true, 0, 103]) {
+      act(() => {
+        webSocketOptions.current?.onMessage?.({
+          type: "conversation_reload_required",
+          timestamp: "2026-05-27T05:00:03Z",
+          ...(taskId === undefined ? {} : { task_id: taskId as unknown as number }),
+          data: {},
+        })
+      })
+    }
+
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("bound")
+    expect(screen.getByTestId("task-id").textContent).toBe("102")
+  })
+
+  it("ignores a server reload requirement before the Session adopts a task", () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    act(() => webSocketOptions.current?.onMessage?.({
+      type: "conversation_reload_required",
+      timestamp: "2026-05-27T05:00:03Z",
+      task_id: 102,
+      data: {},
+    }))
+
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("unbound")
+    expect(screen.getByTestId("task-id").textContent).toBe("")
+  })
+
   it("rejects an outstanding reset when AppProvider unmounts", async () => {
     const { unmount } = render(
       <AppProvider token="token" transport={makeSessionTransport()}>

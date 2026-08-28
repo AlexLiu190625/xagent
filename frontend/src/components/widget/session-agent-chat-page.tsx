@@ -252,6 +252,7 @@ export function SessionAgentChatPage() {
       ],
       expectedProtocol: SESSION_PROTOCOL,
       chatTaskIdMode: "omit",
+      taskBindingMode: "session-subprotocol",
       credentialOwner: { kind: "external" },
     }
   }, [bridge.session, bridge.status])

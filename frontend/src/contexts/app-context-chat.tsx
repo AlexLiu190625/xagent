@@ -5678,6 +5678,28 @@ export function AppProvider({
       return
     }
 
+    if (message.type === "conversation_reload_required") {
+      const binding = extractSessionTaskBinding(message)
+      const lifecycle = sessionConversationRef.current
+      if (
+        !binding.present
+        || !binding.valid
+        || (
+          lifecycle.phase !== "bound"
+          && lifecycle.phase !== "reset_requested"
+        )
+        || lifecycle.connectionIdentity !== owner.connectionIdentity
+        || lifecycle.taskId !== binding.taskId
+        || sessionTaskIdRef.current !== binding.taskId
+      ) {
+        return
+      }
+      requireSessionReload(
+        new Error("The current conversation cannot be restored; reload required.")
+      )
+      return
+    }
+
     if (message.type === "conversation_reset") {
       const resetFlight = sessionResetFlightRef.current
       if (

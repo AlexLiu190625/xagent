@@ -21,6 +21,8 @@ interface RecentMessage {
 const MESSAGE_DUPLICATE_THRESHOLD = 2000 // Same message within 2 seconds is considered duplicate
 const HANDSHAKE_TIMEOUT_MS = 10_000
 const MAX_AUTH_REFRESH_RETRIES = 3
+const SESSION_BINDING_PROTOCOL = "xagent-session-binding-v1"
+const SESSION_TASK_PROTOCOL_PREFIX = "xagent-session-task."
 
 // Connection values may carry credentials. Lifecycle fencing keeps the
 // normalized connection object opaque; it is never serialized or hashed.
@@ -125,7 +127,30 @@ export interface WebSocketConnection {
   expectedProtocol?: string
   taskId?: number
   chatTaskIdMode: "required" | "omit"
+  taskBindingMode?: "session-subprotocol"
   credentialOwner: WebSocketCredentialOwner
+}
+
+const getConnectionProtocols = (
+  connection: WebSocketConnection,
+  currentTaskId: number | undefined,
+): string[] | undefined => {
+  if (connection.taskBindingMode !== "session-subprotocol") {
+    return connection.protocols
+  }
+
+  const baseProtocols = (connection.protocols ?? []).filter(protocol => (
+    protocol !== SESSION_BINDING_PROTOCOL
+    && !protocol.startsWith(SESSION_TASK_PROTOCOL_PREFIX)
+  ))
+  const taskBinding = Number.isInteger(currentTaskId) && Number(currentTaskId) > 0
+    ? String(currentTaskId)
+    : "unbound"
+  return [
+    ...baseProtocols,
+    SESSION_BINDING_PROTOCOL,
+    `${SESSION_TASK_PROTOCOL_PREFIX}${taskBinding}`,
+  ]
 }
 
 export type WebSocketSendResult = "sent" | "not_sent"
@@ -333,6 +358,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const socketRef = useRef<WebSocket | null>(null)
   const socketOwnerRef = useRef<SocketOwner | null>(null)
   const connectionRef = useRef<WebSocketConnection | null>(normalizedConnection)
+  const taskIdRef = useRef(taskId)
   const descriptorKeyRef = useRef<ConnectionDescriptorIdentity | null>(connectionDescriptorIdentity)
   const retryTimersRef = useRef(new Map<ReturnType<typeof setTimeout>, ScheduledRetry>())
   const reconnectAttemptsRef = useRef(0)
@@ -628,6 +654,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
     descriptorKeyRef.current = connectionDescriptorIdentity
     connectionRef.current = normalizedConnection
+    taskIdRef.current = taskId
     deliveryIdentityRef.current = nextIdentity
     deliveryGenerationRef.current = deliveryGeneration
     callbacksRef.current = {
@@ -688,8 +715,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }
 
       const attemptEpoch = ++attemptEpochRef.current
-      const socket = connection.protocols
-        ? new WebSocket(connection.url, connection.protocols)
+      const protocols = getConnectionProtocols(connection, taskIdRef.current)
+      const socket = protocols
+        ? new WebSocket(connection.url, protocols)
         : new WebSocket(connection.url)
       const owner: SocketOwner = {
         callbacks: callbacksRef.current,

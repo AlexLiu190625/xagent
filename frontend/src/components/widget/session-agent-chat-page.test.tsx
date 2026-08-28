@@ -230,6 +230,7 @@ describe("SessionAgentChatPage", () => {
       ],
       expectedProtocol: "xagent-session-v1",
       chatTaskIdMode: "omit",
+      taskBindingMode: "session-subprotocol",
       credentialOwner: { kind: "external" },
     })
     expect(app.provider?.transport?.session?.onConnectionFailure).toBe(
