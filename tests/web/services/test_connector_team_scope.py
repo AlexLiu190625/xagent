@@ -9,10 +9,12 @@ surrounding tests in this file only exercise MCP.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import contextmanager
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -33,11 +35,47 @@ T2 = 102
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def _reset_hooks_scope() -> Iterator[None]:
+    # Snapshot-and-restore, not clear-everything: this module's own
+    # ``set_connector_team_hooks`` docstring says it clears every slot it
+    # is not given, so calling it bare to "reset" would drop whatever the
+    # process had installed before this file ran. ``snapshot_connector_team_hooks``
+    # is what the newer suites in this repo use, and this file is the last
+    # one that did not. Pulled out of the fixture below so a test can
+    # exercise this scope directly (see
+    # ``test_the_reset_scope_restores_a_pre_installed_hook_rather_than_clearing_it``),
+    # since the fixture itself wraps the whole test body and cannot be
+    # asserted on from inside one.
+    with connector_team_scope.snapshot_connector_team_hooks():
+        yield
+    agent_team_scope.set_agent_team_scope_hook(None)
+
+
 @pytest.fixture(autouse=True)
 def _reset_hooks() -> Iterator[None]:
-    yield
-    connector_team_scope.set_connector_team_hooks()
-    agent_team_scope.set_agent_team_scope_hook(None)
+    with _reset_hooks_scope():
+        yield
+
+
+def test_the_reset_scope_restores_a_pre_installed_hook_rather_than_clearing_it():
+    """This file's autouse reset must restore what the process had, not
+    clear everything: a bare ``set_connector_team_hooks()`` drops any hook
+    installed before this file ran (its own docstring says so), which is
+    what the newer suites in this repo use ``snapshot_connector_team_hooks``
+    to avoid. Asserted directly against the extracted scope rather than
+    from inside a fixture-wrapped test, since the fixture wraps the whole
+    test body and so cannot observe its own effect on itself."""
+    # No manual cleanup needed here: this whole test body already runs
+    # inside the autouse fixture's own ``_reset_hooks_scope()``, which
+    # restores whatever was installed before this test to whatever it was
+    # before, once this test returns -- a bare ``set_connector_team_hooks()``
+    # here would be exactly the clear-everything pattern this fix removes.
+    sentinel = lambda *_a, **_k: {}  # noqa: E731
+    connector_team_scope.set_connector_team_hooks(access=sentinel)
+    with _reset_hooks_scope():
+        connector_team_scope.set_connector_team_hooks(access=lambda *_a, **_k: {})
+    assert connector_team_scope._connector_access_hook is sentinel
 
 
 def test_team_connector_ids_empty_without_hook_installed():
@@ -52,10 +90,13 @@ def test_team_connector_hook_installed_reflects_presence():
     connector_team_scope.set_connector_team_hooks(
         team_visibility=lambda db, *, team_id: {"mcp": set(), "custom_api": set()}
     )
-    try:
-        assert connector_team_scope.team_connector_hook_installed() is True
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    assert connector_team_scope.team_connector_hook_installed() is True
+    # Load-bearing, not teardown: this line is what the assertion below is
+    # actually exercising -- that clearing the hook flips the reported
+    # presence back to False. The autouse fixture's own snapshot restore
+    # still runs after this test regardless, so nothing here is relied on
+    # for cleanup.
+    connector_team_scope.set_connector_team_hooks()
     assert connector_team_scope.team_connector_hook_installed() is False
 
 
@@ -67,14 +108,11 @@ def test_team_connector_ids_resolves_none_team_without_calling_hook():
         return {"mcp": {1}, "custom_api": set()}
 
     connector_team_scope.set_connector_team_hooks(team_visibility=_hook)
-    try:
-        assert connector_team_scope.team_connector_ids(None, team_id=None) == {
-            "mcp": set(),
-            "custom_api": set(),
-        }
-        assert calls == []
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    assert connector_team_scope.team_connector_ids(None, team_id=None) == {
+        "mcp": set(),
+        "custom_api": set(),
+    }
+    assert calls == []
 
 
 def test_team_hook_invocation_contract():
@@ -86,16 +124,13 @@ def test_team_hook_invocation_contract():
         return {"mcp": set(), "custom_api": set()}
 
     connector_team_scope.set_connector_team_hooks(team_visibility=_record)
-    try:
-        assert connector_team_scope.team_connector_ids(None, team_id=None) == {
-            "mcp": set(),
-            "custom_api": set(),
-        }
-        assert calls == []
-        connector_team_scope.team_connector_ids(None, team_id=T1)
-        assert calls == [("kw", T1)]
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    assert connector_team_scope.team_connector_ids(None, team_id=None) == {
+        "mcp": set(),
+        "custom_api": set(),
+    }
+    assert calls == []
+    connector_team_scope.team_connector_ids(None, team_id=T1)
+    assert calls == [("kw", T1)]
 
 
 def test_team_hook_positional_only_callable_raises():
@@ -107,11 +142,385 @@ def test_team_hook_positional_only_callable_raises():
         return {"mcp": set(), "custom_api": set()}
 
     connector_team_scope.set_connector_team_hooks(team_visibility=_positional_only)
-    try:
-        with pytest.raises(TypeError):
-            connector_team_scope.team_connector_ids(None, team_id=T1)
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    with pytest.raises(TypeError):
+        connector_team_scope.team_connector_ids(None, team_id=T1)
+
+
+# ---------------------------------------------------------------------------
+# ConnectorAccess and the access hook slot.
+# ---------------------------------------------------------------------------
+
+
+def test_connector_access_defaults_are_both_false():
+    access = connector_team_scope.ConnectorAccess()
+    assert access.team_owned is False
+    assert access.can_edit is False
+
+
+def test_resolve_connector_access_returns_an_empty_map_without_a_hook_installed():
+    for refs in ([("mcp", 1), ("custom_api", 1), ("mcp", 999)], [("mcp", 1)]):
+        assert connector_team_scope.resolve_connector_access(None, 7, refs) == {}
+
+
+def test_resolve_connector_access_asks_no_hook_when_no_ref_needs_one():
+    """An installed hook is never called when there is nothing to ask about
+    -- an empty ``refs`` collection short-circuits before the hook, the
+    same way no hook installed does."""
+    calls: list[object] = []
+
+    def _hook(db, user_id, refs):
+        calls.append(refs)
+        return {}
+
+    connector_team_scope.set_connector_team_hooks(access=_hook)
+    assert connector_team_scope.resolve_connector_access(None, 7, []) == {}
+    assert calls == []
+
+
+def test_resolve_connector_access_calls_the_hook_once_with_the_requested_refs():
+    calls = []
+
+    def _hook(db, user_id, refs):
+        calls.append((db, user_id, refs))
+        return {
+            ("mcp", 11): connector_team_scope.ConnectorAccess(
+                team_owned=True, can_edit=True
+            )
+        }
+
+    connector_team_scope.set_connector_team_hooks(access=_hook)
+    result = connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+    assert result == {
+        ("mcp", 11): connector_team_scope.ConnectorAccess(
+            team_owned=True, can_edit=True
+        )
+    }
+    assert len(calls) == 1
+    called_db, called_user_id, called_refs = calls[0]
+    assert (called_db, called_user_id) == (None, 7)
+    assert called_refs == frozenset({("mcp", 11)})
+
+
+def test_resolve_connector_access_a_ref_missing_from_the_answer_means_not_linked():
+    """Leaving a ref out of the answer is the only way to say "the caller's
+    team does not link this connector" -- distinct from a rejected
+    malformed verdict for that same ref."""
+    connector_team_scope.set_connector_team_hooks(access=lambda *a: {})
+    assert connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)]) == {}
+
+
+# ---------------------------------------------------------------------------
+# Validation of the access hook's answer shape at the boundary.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "malformed_answer",
+    [
+        "dict-of-fields",
+        "connector-delete-decision",
+        "tuple",
+        "truthy-object-with-right-attrs",
+        "none",
+        "list",
+    ],
+)
+def test_resolve_connector_access_rejects_a_non_dict_answer(malformed_answer):
+    # Built inside the test body, not the parametrize list: a couple of
+    # these shapes are instances of types this module defines, and
+    # constructing them at collection time would make the whole file
+    # uncollectable while those types don't exist yet.
+    answer = {
+        "dict-of-fields": {"team_owned": True, "can_edit": True},
+        "connector-delete-decision": connector_team_scope.ConnectorDeleteDecision(
+            team_owned=True, authorized=True
+        ),
+        "tuple": (True, True),
+        "truthy-object-with-right-attrs": SimpleNamespace(
+            team_owned=True, can_edit=True
+        ),
+        "none": None,
+        "list": [connector_team_scope.ConnectorAccess(team_owned=True, can_edit=True)],
+    }[malformed_answer]
+
+    connector_team_scope.set_connector_team_hooks(access=lambda *a: answer)
+    with pytest.raises(ValueError):
+        connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+
+
+def test_resolve_connector_access_rejects_a_verdict_for_a_connector_nobody_asked_about():
+    """A verdict keyed on a ref outside the requested set means the hook
+    answered a different question than the one it was asked -- silently
+    dropping it would hide that the hook and the caller have gone out of
+    sync, so this must fail loudly instead."""
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {
+            ("mcp", 999): connector_team_scope.ConnectorAccess(
+                team_owned=True, can_edit=True
+            )
+        }
+    )
+    with pytest.raises(ValueError):
+        connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+
+
+@pytest.mark.parametrize(
+    "connector_type,requested_id,alias_id",
+    [
+        ("mcp", 1, True),
+        ("mcp", 1, 1.0),
+        ("mcp", 1, Decimal("1")),
+        ("custom_api", 2, 2.0),
+        ("custom_api", 1, True),
+    ],
+    ids=["mcp-bool", "mcp-float", "mcp-decimal", "custom-api-float", "custom-api-bool"],
+)
+def test_resolve_connector_access_rejects_a_key_whose_id_is_only_equal_to_an_int(
+    connector_type, requested_id, alias_id
+):
+    """``True == 1``, ``1.0 == 1`` and ``Decimal("1") == 1`` in Python, so a
+    key carrying any of those in place of the requested connector id would
+    pass an ``in``-based membership check against ``requested`` -- and be
+    stored as a grant for the connector it merely aliases, not the one it
+    actually is. The exact-type check must reject it before membership is
+    ever checked."""
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {
+            (connector_type, alias_id): connector_team_scope.ConnectorAccess(
+                team_owned=True, can_edit=True
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="not an int"):
+        connector_team_scope.resolve_connector_access(
+            None, 7, [(connector_type, requested_id)]
+        )
+
+
+def test_resolve_connector_access_rejects_a_key_that_is_not_a_tuple():
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {
+            "mcp": connector_team_scope.ConnectorAccess(team_owned=True, can_edit=True)
+        }
+    )
+    with pytest.raises(
+        ValueError, match=r"not a \(connector_type, connector_id\) pair"
+    ):
+        connector_team_scope.resolve_connector_access(None, 7, [("mcp", 1)])
+
+
+def test_resolve_connector_access_rejects_a_key_of_the_wrong_length():
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {
+            ("mcp", 1, "x"): connector_team_scope.ConnectorAccess(
+                team_owned=True, can_edit=True
+            )
+        }
+    )
+    with pytest.raises(
+        ValueError, match=r"not a \(connector_type, connector_id\) pair"
+    ):
+        connector_team_scope.resolve_connector_access(None, 7, [("mcp", 1)])
+
+
+def test_resolve_connector_access_rejects_a_key_whose_connector_type_is_not_a_str():
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {
+            (1, 1): connector_team_scope.ConnectorAccess(team_owned=True, can_edit=True)
+        }
+    )
+    with pytest.raises(ValueError, match="connector type that is not a str"):
+        connector_team_scope.resolve_connector_access(None, 7, [(1, 1)])
+
+
+@pytest.mark.parametrize(
+    "wrong_value",
+    ["dict", "duck-typed", "delete-decision", "none", "true"],
+)
+def test_resolve_connector_access_rejects_a_verdict_value_that_is_not_a_connector_access(
+    wrong_value,
+):
+    """The key was asked about and the key's shape is fine -- what is
+    wrong is the value. A duck-typed object carrying ``team_owned=True``
+    and ``can_edit=True`` would satisfy every attribute check below it, so
+    the type check is the only thing that stops a hook from answering with
+    something that merely resembles a verdict. Built in the body, not the
+    parametrize list, because two of these are instances of types this
+    module defines."""
+    value = {
+        "dict": {"team_owned": True, "can_edit": True},
+        "duck-typed": SimpleNamespace(team_owned=True, can_edit=True),
+        "delete-decision": connector_team_scope.ConnectorDeleteDecision(
+            team_owned=True, authorized=True
+        ),
+        "none": None,
+        "true": True,
+    }[wrong_value]
+
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *_a: {("mcp", 11): value}
+    )
+    with pytest.raises(ValueError, match="expected ConnectorAccess values"):
+        connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+
+
+@pytest.mark.parametrize(
+    "bad_team_owned",
+    [False, "yes", 1],
+    ids=["false", "truthy-string", "truthy-int"],
+)
+def test_resolve_connector_access_rejects_a_team_owned_that_is_not_true(
+    bad_team_owned,
+):
+    """``team_owned`` must be exactly ``True`` on every verdict that
+    reaches a caller -- "not linked" is expressed by leaving the ref out
+    of the answer, never by a verdict carrying a falsy or merely-truthy
+    ``team_owned``."""
+    verdict = connector_team_scope.ConnectorAccess(
+        team_owned=bad_team_owned, can_edit=True
+    )
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {("mcp", 11): verdict}
+    )
+    with pytest.raises(ValueError):
+        connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+
+
+def test_resolve_connector_access_rejects_a_bare_connector_access_default():
+    """``ConnectorAccess()`` -- the dataclass's own all-``False`` default --
+    is rejected the same way: constructing a bare instance must never
+    become a legitimate "not linked" answer."""
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {("mcp", 11): connector_team_scope.ConnectorAccess()}
+    )
+    with pytest.raises(ValueError):
+        connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+
+
+@pytest.mark.parametrize(
+    "bad_can_edit",
+    ["false", 1, 0],
+    ids=["string", "truthy-int", "falsy-int"],
+)
+def test_resolve_connector_access_rejects_a_can_edit_that_is_not_exactly_bool(
+    bad_can_edit,
+):
+    """``bool`` is a subclass of ``int`` in Python, so ``1``/``0`` would
+    pass a truthiness check -- this seam requires an exact ``True``/
+    ``False`` instead, since a truthy value is never a legitimate grant."""
+    verdict = connector_team_scope.ConnectorAccess(
+        team_owned=True, can_edit=bad_can_edit
+    )
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {("mcp", 11): verdict}
+    )
+    with pytest.raises(ValueError):
+        connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)])
+
+
+def test_resolve_connector_access_accepts_linked_but_not_editable():
+    """A linked-but-not-editable answer is legal on its own -- the seam does
+    not require can_edit to be True just because team_owned is."""
+    answer = connector_team_scope.ConnectorAccess(team_owned=True, can_edit=False)
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {("mcp", 11): answer}
+    )
+    assert connector_team_scope.resolve_connector_access(None, 7, [("mcp", 11)]) == {
+        ("mcp", 11): answer
+    }
+
+
+# ---------------------------------------------------------------------------
+# The typed-failure wrapper.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_connector_access_or_raise_converts_value_error_to_503():
+    def _hook(db, user_id, refs):
+        raise ValueError("hook returned garbage")
+
+    connector_team_scope.set_connector_team_hooks(access=_hook)
+    with pytest.raises(ConnectorRuntimeError) as excinfo:
+        connector_team_scope.resolve_connector_access_or_raise(None, 7, [("mcp", 11)])
+    assert excinfo.value.status_code == 503
+
+
+def test_resolve_connector_access_or_raise_passes_through_planted_error():
+    planted = ConnectorRuntimeError(
+        "planted_code", "planted", details={"reason": "planted_reason"}
+    )
+
+    def _hook(db, user_id, refs):
+        raise planted
+
+    connector_team_scope.set_connector_team_hooks(access=_hook)
+    with pytest.raises(ConnectorRuntimeError) as excinfo:
+        connector_team_scope.resolve_connector_access_or_raise(None, 7, [("mcp", 11)])
+    assert excinfo.value is planted
+
+
+def test_resolve_connector_access_or_raise_converts_malformed_answer_too():
+    """The validator's ValueError for a malformed answer goes through the
+    same conversion as any other hook-side failure."""
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda *a: {
+            ("mcp", 11): connector_team_scope.ConnectorAccess(
+                team_owned=False, can_edit=True
+            )
+        }
+    )
+    with pytest.raises(ConnectorRuntimeError) as excinfo:
+        connector_team_scope.resolve_connector_access_or_raise(None, 7, [("mcp", 11)])
+    assert excinfo.value.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# snapshot_connector_team_hooks and its discovery-based coverage test.
+# ---------------------------------------------------------------------------
+
+
+def _connector_hook_slot_names() -> list[str]:
+    return [name for name in vars(connector_team_scope) if name.endswith("_hook")]
+
+
+def test_connector_hook_slot_names_are_discoverable():
+    # Sanity check the enumeration itself finds all five known slots, so
+    # the coverage test below is not vacuously true.
+    names = _connector_hook_slot_names()
+    assert names.count("_connector_deleted_hook") == 1
+    assert names.count("_connector_renamed_hook") == 1
+    assert names.count("_connector_visibility_hook") == 1
+    assert names.count("_team_connector_visibility_hook") == 1
+    assert names.count("_connector_access_hook") == 1
+    assert len(names) == 5
+
+
+def test_snapshot_connector_team_hooks_restores_every_slot_by_identity():
+    names = _connector_hook_slot_names()
+    originals = {name: getattr(connector_team_scope, name) for name in names}
+
+    with connector_team_scope.snapshot_connector_team_hooks():
+        for name in names:
+            setattr(connector_team_scope, name, lambda *a, **k: None)
+        for name in names:
+            assert getattr(connector_team_scope, name) is not originals[name]
+
+    for name in names:
+        assert getattr(connector_team_scope, name) is originals[name]
+
+
+def test_snapshot_connector_team_hooks_restores_on_exception():
+    names = _connector_hook_slot_names()
+    originals = {name: getattr(connector_team_scope, name) for name in names}
+
+    with pytest.raises(RuntimeError):
+        with connector_team_scope.snapshot_connector_team_hooks():
+            for name in names:
+                setattr(connector_team_scope, name, lambda *a, **k: None)
+            raise RuntimeError("boom inside the block")
+
+    for name in names:
+        assert getattr(connector_team_scope, name) is originals[name]
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +551,144 @@ def _create_user(db: Session, username: str) -> User:
     db.add(user)
     db.flush()
     return user
+
+
+def _poisoning_hook_by_orm_flush(colliding_user_id: int):
+    """A hook that leaves a failed ORM flush on the shared session and then
+    raises. A failed flush marks the session's transaction inactive on
+    every backend, so any later statement raises ``PendingRollbackError``
+    until something rolls back -- which is exactly what the seam's hook
+    door must do before the exception leaves the module."""
+
+    def hook(db, *_args, **_kwargs):
+        db.add(
+            User(id=colliding_user_id, username="flush-poison-dup", password_hash="x")
+        )
+        db.flush()
+
+    return hook
+
+
+@pytest.mark.parametrize(
+    "slot,invoke",
+    [
+        (
+            "visibility",
+            lambda db: connector_team_scope.visible_team_connector_ids(db, 1),
+        ),
+        (
+            "deleted",
+            lambda db: connector_team_scope.delete_team_connector(db, 1, "mcp", 1),
+        ),
+        (
+            "renamed",
+            lambda db: connector_team_scope.rename_team_connector(
+                db, 1, "mcp", 1, "old", "new"
+            ),
+        ),
+    ],
+    ids=["visibility-hook", "deleted-hook", "renamed-hook"],
+)
+def test_every_hook_door_restores_the_session_when_the_hook_fails(
+    db_session, slot, invoke
+):
+    """The session restore lives on the single invocation door rather than
+    on the ``*_or_raise`` wrappers, so every slot has it -- including a
+    slot added to this module later. These three are the slots whose
+    answers this seam does not validate. The two this parametrization
+    leaves out are the two whose answers it does validate; they are
+    covered by the sister test below, where the hook does not raise at
+    all."""
+    existing = _create_user(db_session, "already-here")
+    db_session.commit()
+
+    with connector_team_scope.snapshot_connector_team_hooks():
+        connector_team_scope.set_connector_team_hooks(
+            **{slot: _poisoning_hook_by_orm_flush(int(existing.id))}
+        )
+        with pytest.raises(Exception):
+            invoke(db_session)
+
+    # Without the restore this raises PendingRollbackError instead.
+    assert db_session.query(User).count() == 1
+
+
+def _swallowing_poisoning_hook_answering(colliding_user_id: int, answer: object):
+    """A hook that leaves a failed ORM flush on the shared session,
+    swallows that failure itself, and then answers with a shape the seam's
+    own validator rejects.
+
+    The sister of ``_poisoning_hook_by_orm_flush`` above: there the hook
+    lets its failure propagate, so the door's ``except`` fires on the hook
+    call. Here nothing propagates out of the hook at all -- the door's
+    ``except`` fires on the validator's rejection instead, which is the
+    other half the restore has to cover.
+    """
+
+    def hook(db, *_args, **_kwargs):
+        try:
+            db.add(
+                User(
+                    id=colliding_user_id,
+                    username="swallowed-poison-dup",
+                    password_hash="x",
+                )
+            )
+            db.flush()
+        except Exception:
+            pass
+        return answer
+
+    return hook
+
+
+@pytest.mark.parametrize(
+    "slot,answer,invoke",
+    [
+        (
+            "team_visibility",
+            {"mcp": "not-a-set", "custom_api": set()},
+            lambda db: connector_team_scope.resolve_team_connector_ids_or_raise(
+                db, team_id=T1, log_subject=None
+            ),
+        ),
+        (
+            "access",
+            {"not-a-ref": object()},
+            lambda db: connector_team_scope.resolve_connector_access_or_raise(
+                db, 1, [("mcp", 11)]
+            ),
+        ),
+    ],
+    ids=["team-visibility-hook", "access-hook"],
+)
+def test_a_hook_that_swallows_its_failure_and_answers_malformed_restores_too(
+    db_session, slot, answer, invoke
+):
+    """The two slots whose answers this seam validates are the two where
+    it can notice a hook that poisoned the shared session without ever
+    raising: the hook runs a statement that fails, catches that itself,
+    and returns an answer the validator then rejects. A hook can do the
+    same on the other three slots, where nothing checks the answer and so
+    nothing raises -- see the door's docstring on the shape that stays
+    uncovered. The rejection is the seam's own exception, not
+    the hook's, so the restore has to sit where it sees both -- inside the
+    door, around the validation as well as around the call."""
+    existing = _create_user(db_session, "already-here")
+    db_session.commit()
+
+    with connector_team_scope.snapshot_connector_team_hooks():
+        connector_team_scope.set_connector_team_hooks(
+            **{slot: _swallowing_poisoning_hook_answering(int(existing.id), answer)}
+        )
+        with pytest.raises(ConnectorRuntimeError) as excinfo:
+            invoke(db_session)
+        assert excinfo.value.status_code == 503
+
+    # No rollback of our own before this line: the query is the statement
+    # that proves the door restored the session, and its count proves the
+    # poisoning insert never landed.
+    assert db_session.query(User).count() == 1
 
 
 def _create_mcp(db: Session, name: str, *, owner: User | None = None) -> MCPServer:
@@ -263,22 +810,18 @@ async def test_scope_keys_on_agent_team_not_runner(db_session, seed, owner_team)
                 team_id=_team, is_team_admin=False
             )
         )
-    try:
-        cfg = WebToolConfig(
-            db=db_session,
-            request=None,
-            user_id=int(seed.c.id),
-            connector_team_id=T1,
-            include_mcp_tools=True,
-        )
-        configs = await cfg._load_mcp_server_configs()
-        assert {c["name"] for c in configs} == {
-            seed.active_own.name,
-            seed.team_s.name,
-        }
-    finally:
-        connector_team_scope.set_connector_team_hooks()
-        agent_team_scope.set_agent_team_scope_hook(None)
+    cfg = WebToolConfig(
+        db=db_session,
+        request=None,
+        user_id=int(seed.c.id),
+        connector_team_id=T1,
+        include_mcp_tools=True,
+    )
+    configs = await cfg._load_mcp_server_configs()
+    assert {c["name"] for c in configs} == {
+        seed.active_own.name,
+        seed.team_s.name,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -303,31 +846,28 @@ async def test_legacy_visibility_hook_alone_is_unchanged(db_session, seed):
             else {"mcp": set(), "custom_api": set()}
         )
     )
-    try:
-        assert connector_team_scope.team_connector_hook_installed() is False
+    assert connector_team_scope.team_connector_hook_installed() is False
 
-        # The tool loader consults no hook today and must not widen.
-        cfg = WebToolConfig(
-            db=db_session,
-            request=None,
-            user_id=int(seed.c.id),
-            connector_team_id=T1,
-            include_mcp_tools=True,
-        )
-        configs = await cfg._load_mcp_server_configs()
-        assert {c["name"] for c in configs} == {seed.active_own.name}
+    # The tool loader consults no hook today and must not widen.
+    cfg = WebToolConfig(
+        db=db_session,
+        request=None,
+        user_id=int(seed.c.id),
+        connector_team_id=T1,
+        include_mcp_tools=True,
+    )
+    configs = await cfg._load_mcp_server_configs()
+    assert {c["name"] for c in configs} == {seed.active_own.name}
 
-        # The runtime-connector loader keeps exactly today's answer via the
-        # fallback, for both connector kinds.
-        visible = _load_visible_runtime_connectors(
-            db_session, user_id=int(seed.c.id), agent_team_id=T1
-        )
-        mcp_ids = {r.connector_id for r in visible if r.connector_type == "mcp"}
-        capi_ids = {r.connector_id for r in visible if r.connector_type == "custom_api"}
-        assert mcp_ids == {int(seed.active_own.id), int(seed.team_s.id)}
-        assert capi_ids == {int(seed.capi_own.id), int(seed.a_capi.id)}
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    # The runtime-connector loader keeps exactly today's answer via the
+    # fallback, for both connector kinds.
+    visible = _load_visible_runtime_connectors(
+        db_session, user_id=int(seed.c.id), agent_team_id=T1
+    )
+    mcp_ids = {r.connector_id for r in visible if r.connector_type == "mcp"}
+    capi_ids = {r.connector_id for r in visible if r.connector_type == "custom_api"}
+    assert mcp_ids == {int(seed.active_own.id), int(seed.team_s.id)}
+    assert capi_ids == {int(seed.capi_own.id), int(seed.a_capi.id)}
 
 
 # ---------------------------------------------------------------------------
@@ -338,14 +878,11 @@ async def test_legacy_visibility_hook_alone_is_unchanged(db_session, seed):
 
 def test_personal_agent_gets_no_team_custom_api(db_session, seed):
     connector_team_scope.set_connector_team_hooks(team_visibility=_team_hook(seed))
-    try:
-        visible = _load_visible_runtime_connectors(
-            db_session, user_id=int(seed.c.id), agent_team_id=None
-        )
-        capi_ids = {r.connector_id for r in visible if r.connector_type == "custom_api"}
-        assert capi_ids == {int(seed.capi_own.id)}
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    visible = _load_visible_runtime_connectors(
+        db_session, user_id=int(seed.c.id), agent_team_id=None
+    )
+    capi_ids = {r.connector_id for r in visible if r.connector_type == "custom_api"}
+    assert capi_ids == {int(seed.capi_own.id)}
 
 
 # ---------------------------------------------------------------------------
@@ -364,16 +901,13 @@ def test_installed_hook_returning_empty_does_not_fall_back(db_session, seed):
         ),
         team_visibility=lambda db, *, team_id: {"mcp": set(), "custom_api": set()},
     )
-    try:
-        visible = _load_visible_runtime_connectors(
-            db_session, user_id=int(seed.c.id), agent_team_id=T1
-        )
-        mcp_ids = {r.connector_id for r in visible if r.connector_type == "mcp"}
-        capi_ids = {r.connector_id for r in visible if r.connector_type == "custom_api"}
-        assert mcp_ids == {int(seed.active_own.id)}
-        assert capi_ids == {int(seed.capi_own.id)}
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    visible = _load_visible_runtime_connectors(
+        db_session, user_id=int(seed.c.id), agent_team_id=T1
+    )
+    mcp_ids = {r.connector_id for r in visible if r.connector_type == "mcp"}
+    capi_ids = {r.connector_id for r in visible if r.connector_type == "custom_api"}
+    assert mcp_ids == {int(seed.active_own.id)}
+    assert capi_ids == {int(seed.capi_own.id)}
 
 
 # ---------------------------------------------------------------------------
@@ -401,19 +935,16 @@ def test_installed_hook_with_no_governing_agent_supersedes_legacy_overlay(
         ),
         team_visibility=_team_hook(seed),
     )
-    try:
-        visible = _load_visible_runtime_connectors(
-            db_session, user_id=int(seed.c.id), agent_team_id=None
-        )
-        mcp_ids = {r.connector_id for r in visible if r.connector_type == "mcp"}
-        capi_ids = {r.connector_id for r in visible if r.connector_type == "custom_api"}
-        # Personal-only on both connector kinds: seed.team_s / seed.a_capi
-        # (the legacy hook's answer) do NOT appear, even though the legacy
-        # hook alone would have granted them.
-        assert mcp_ids == {int(seed.active_own.id)}
-        assert capi_ids == {int(seed.capi_own.id)}
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    visible = _load_visible_runtime_connectors(
+        db_session, user_id=int(seed.c.id), agent_team_id=None
+    )
+    mcp_ids = {r.connector_id for r in visible if r.connector_type == "mcp"}
+    capi_ids = {r.connector_id for r in visible if r.connector_type == "custom_api"}
+    # Personal-only on both connector kinds: seed.team_s / seed.a_capi
+    # (the legacy hook's answer) do NOT appear, even though the legacy
+    # hook alone would have granted them.
+    assert mcp_ids == {int(seed.active_own.id)}
+    assert capi_ids == {int(seed.capi_own.id)}
 
 
 # ---------------------------------------------------------------------------
@@ -432,18 +963,15 @@ def test_installed_hook_with_no_governing_agent_supersedes_legacy_overlay(
 
 def test_new_hook_branch_unions_team_custom_api_too(db_session, seed):
     connector_team_scope.set_connector_team_hooks(team_visibility=_team_hook(seed))
-    try:
-        visible = _load_visible_runtime_connectors(
-            db_session, user_id=int(seed.c.id), agent_team_id=T1
-        )
-        mcp_ids = {r.connector_id for r in visible if r.connector_type == "mcp"}
-        capi_ids = {r.connector_id for r in visible if r.connector_type == "custom_api"}
-        # T1's hook (see _team_hook above) grants both seed.team_s (mcp) and
-        # seed.a_capi (custom_api). Both grants union in now.
-        assert mcp_ids == {int(seed.active_own.id), int(seed.team_s.id)}
-        assert capi_ids == {int(seed.capi_own.id), int(seed.a_capi.id)}
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    visible = _load_visible_runtime_connectors(
+        db_session, user_id=int(seed.c.id), agent_team_id=T1
+    )
+    mcp_ids = {r.connector_id for r in visible if r.connector_type == "mcp"}
+    capi_ids = {r.connector_id for r in visible if r.connector_type == "custom_api"}
+    # T1's hook (see _team_hook above) grants both seed.team_s (mcp) and
+    # seed.a_capi (custom_api). Both grants union in now.
+    assert mcp_ids == {int(seed.active_own.id), int(seed.team_s.id)}
+    assert capi_ids == {int(seed.capi_own.id), int(seed.a_capi.id)}
 
 
 # ---------------------------------------------------------------------------
@@ -498,11 +1026,8 @@ def test_team_connector_ids_raises_on_malformed_hook_answer(malformed_answer):
     connector_team_scope.set_connector_team_hooks(
         team_visibility=lambda db, *, team_id: malformed_answer
     )
-    try:
-        with pytest.raises(ValueError):
-            connector_team_scope.team_connector_ids(None, team_id=T1)
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    with pytest.raises(ValueError):
+        connector_team_scope.team_connector_ids(None, team_id=T1)
 
 
 def test_team_connector_ids_accepts_and_ignores_extra_keys():
@@ -516,12 +1041,9 @@ def test_team_connector_ids_accepts_and_ignores_extra_keys():
             "unexpected_extra_key": object(),
         }
     )
-    try:
-        result = connector_team_scope.team_connector_ids(None, team_id=T1)
-        assert result["mcp"] == {1, 2}
-        assert result["custom_api"] == {3}
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    result = connector_team_scope.team_connector_ids(None, team_id=T1)
+    assert result["mcp"] == {1, 2}
+    assert result["custom_api"] == {3}
 
 
 @pytest.mark.asyncio
@@ -533,21 +1055,18 @@ async def test_mcp_loader_seam_retypes_malformed_hook_answer(db_session, seed):
     connector_team_scope.set_connector_team_hooks(
         team_visibility=lambda db, *, team_id: {"mcp": "12", "custom_api": set()}
     )
-    try:
-        cfg = WebToolConfig(
-            db=db_session,
-            request=None,
-            user_id=int(seed.c.id),
-            connector_team_id=T1,
-            include_mcp_tools=True,
-        )
-        with pytest.raises(ConnectorRuntimeError) as excinfo:
-            await cfg._load_mcp_server_configs()
-        assert excinfo.value.status_code == 503
-        assert excinfo.value.details["reason"] == "team_scope_resolution_failed"
-        assert isinstance(excinfo.value.__cause__, ValueError)
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    cfg = WebToolConfig(
+        db=db_session,
+        request=None,
+        user_id=int(seed.c.id),
+        connector_team_id=T1,
+        include_mcp_tools=True,
+    )
+    with pytest.raises(ConnectorRuntimeError) as excinfo:
+        await cfg._load_mcp_server_configs()
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.details["reason"] == "team_scope_resolution_failed"
+    assert isinstance(excinfo.value.__cause__, ValueError)
 
 
 def test_runtime_view_seam_retypes_malformed_hook_answer(db_session, seed):
@@ -566,19 +1085,16 @@ def test_runtime_view_seam_retypes_malformed_hook_answer(db_session, seed):
     connector_team_scope.set_connector_team_hooks(
         team_visibility=lambda db, *, team_id: {"mcp": "12", "custom_api": set()}
     )
-    try:
-        with pytest.raises(ConnectorRuntimeError) as excinfo:
-            _load_custom_api_runtime_view_sync(
-                db_session,
-                task_id=str(task.id),
-                connector_runtime_turn_id=None,
-                user_id=int(seed.c.id),
-                agent_team_id=T1,
-            )
-        assert excinfo.value.status_code == 503
-        assert isinstance(excinfo.value.__cause__, ValueError)
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    with pytest.raises(ConnectorRuntimeError) as excinfo:
+        _load_custom_api_runtime_view_sync(
+            db_session,
+            task_id=str(task.id),
+            connector_runtime_turn_id=None,
+            user_id=int(seed.c.id),
+            agent_team_id=T1,
+        )
+    assert excinfo.value.status_code == 503
+    assert isinstance(excinfo.value.__cause__, ValueError)
 
 
 def test_resolve_or_raise_passes_a_typed_error_through_unchanged():
@@ -597,12 +1113,47 @@ def test_resolve_or_raise_passes_a_typed_error_through_unchanged():
         raise planted
 
     connector_team_scope.set_connector_team_hooks(team_visibility=_raising_hook)
-    try:
-        with pytest.raises(ConnectorRuntimeError) as excinfo:
-            connector_team_scope.resolve_team_connector_ids_or_raise(
-                None, team_id=T1, log_subject="passthrough-probe"
-            )
-        assert excinfo.value is planted
-        assert excinfo.value.details["reason"] == "planted_inner_reason"
-    finally:
-        connector_team_scope.set_connector_team_hooks()
+    with pytest.raises(ConnectorRuntimeError) as excinfo:
+        connector_team_scope.resolve_team_connector_ids_or_raise(
+            None, team_id=T1, log_subject="passthrough-probe"
+        )
+    assert excinfo.value is planted
+    assert excinfo.value.details["reason"] == "planted_inner_reason"
+
+
+# ---------------------------------------------------------------------------
+# The team-visibility wrapper restores the shared session after a failed
+# hook too -- the sister guarantee to resolve_connector_access_or_raise's,
+# on the sister wrapper.
+# ---------------------------------------------------------------------------
+
+
+def test_the_team_scope_wrapper_also_restores_the_session(db_session):
+    """A hook that poisons the shared session via a failed ORM flush, then
+    lets that failure propagate, must not leave the session unusable for
+    whatever runs next in the same request."""
+    poisoning_user_id = 900001
+    db_session.add(
+        User(id=poisoning_user_id, username="team-scope-poison", password_hash="x")
+    )
+    db_session.commit()
+
+    def poisoning_team_visibility(db, *, team_id):
+        # A duplicate primary key -- a real ORM flush failure, not a
+        # simulated one -- propagates out of this hook uncaught.
+        db.add(User(id=poisoning_user_id, username="dup", password_hash="x"))
+        db.flush()
+        return {"mcp": set(), "custom_api": set()}  # pragma: no cover - unreachable
+
+    connector_team_scope.set_connector_team_hooks(
+        team_visibility=poisoning_team_visibility
+    )
+    with pytest.raises(ConnectorRuntimeError) as excinfo:
+        connector_team_scope.resolve_team_connector_ids_or_raise(
+            db_session, team_id=T1, log_subject=None
+        )
+    assert excinfo.value.status_code == 503
+
+    # The session must be usable again immediately afterward.
+    result = db_session.execute(select(1)).scalar()
+    assert result == 1

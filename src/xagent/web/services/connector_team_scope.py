@@ -8,9 +8,10 @@ the application's team tables.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar
 
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -41,6 +42,34 @@ class ConnectorDeleteDecision:
 
 
 ConnectorDeletedHook = Callable[[Any, int, ConnectorType, int], ConnectorDeleteDecision]
+
+
+@dataclass(frozen=True)
+class ConnectorAccess:
+    """Whether the caller's team links a connector, and may edit it.
+
+    A verdict that reaches a caller always carries ``team_owned=True``:
+    the only way to say "the caller's team does not link this connector"
+    is to leave its ref out of the hook's answer map entirely, not to
+    return a verdict with ``team_owned=False``. ``can_edit`` is otherwise
+    independent -- a team can link a connector without granting edit
+    rights to it, which is a legal answer on its own, not an intermediate
+    or partial state. Both fields are validated as exact bools on the way
+    in (see ``_validate_connector_access_answer``); the dataclass defaults
+    below stay ``False``/``False`` on purpose so that constructing a bare
+    ``ConnectorAccess()`` remains the shape the validator rejects, rather
+    than quietly becoming a legitimate "not linked" answer.
+    """
+
+    team_owned: bool = False
+    can_edit: bool = False
+
+
+ConnectorRef = tuple[ConnectorType, int]
+
+ConnectorAccessHook = Callable[
+    [Any, int, "Collection[ConnectorRef]"], "dict[ConnectorRef, ConnectorAccess]"
+]
 
 ConnectorVisibilityHook = Callable[[Any, int], dict[str, set[int]]]
 
@@ -110,6 +139,7 @@ _connector_deleted_hook: ConnectorDeletedHook | None = None
 _connector_renamed_hook: ConnectorRenamedHook | None = None
 _connector_visibility_hook: ConnectorVisibilityHook | None = None
 _team_connector_visibility_hook: TeamConnectorVisibilityHook | None = None
+_connector_access_hook: ConnectorAccessHook | None = None
 
 
 def set_connector_team_hooks(
@@ -118,6 +148,7 @@ def set_connector_team_hooks(
     renamed: ConnectorRenamedHook | None = None,
     visibility: ConnectorVisibilityHook | None = None,
     team_visibility: TeamConnectorVisibilityHook | None = None,
+    access: ConnectorAccessHook | None = None,
 ) -> None:
     """Install application-owned connector lifecycle hooks.
 
@@ -129,17 +160,35 @@ def set_connector_team_hooks(
 
     global _connector_deleted_hook, _connector_renamed_hook
     global _connector_visibility_hook, _team_connector_visibility_hook
+    global _connector_access_hook
     _connector_deleted_hook = deleted
     _connector_renamed_hook = renamed
     _connector_visibility_hook = visibility
     _team_connector_visibility_hook = team_visibility
+    _connector_access_hook = access
 
 
 def visible_team_connector_ids(db: Any, user_id: int) -> dict[str, set[int]]:
-    """Team-shared connector ids visible to user; empty when no hook/standalone."""
+    """Team-shared connector ids visible to user; empty when no hook/standalone.
+
+    Answers list membership only. Direct-id reachability and edit
+    authority come from a different hook -- ``resolve_connector_access``
+    -- and xagent enforces no relationship between the two answers:
+    they are separate module-level slots, installed separately, and
+    nothing cross-checks them. An installing application must derive
+    both from one and the same link query, because it is the only side
+    that can see its own link table; xagent cannot verify that and does
+    not try.
+
+    When the two answers disagree, xagent does not reconcile them: each
+    question is answered from the hook that owns it, and whatever that
+    hook said is what the caller gets. A connector one hook reports and
+    the other omits is not a defect in xagent -- it is what the installed
+    answers said.
+    """
     if _connector_visibility_hook is None:
         return {"mcp": set(), "custom_api": set()}
-    return _connector_visibility_hook(db, int(user_id))
+    return _call_connector_hook_gate(db, _connector_visibility_hook, db, int(user_id))
 
 
 def _validate_team_connector_answer(answer: Any) -> dict[str, set[int]]:
@@ -199,8 +248,13 @@ def team_connector_ids(db: Any, *, team_id: int | None) -> dict[str, set[int]]:
     """
     if team_id is None or _team_connector_visibility_hook is None:
         return {"mcp": set(), "custom_api": set()}
-    answer = _team_connector_visibility_hook(db, team_id=int(team_id))
-    return _validate_team_connector_answer(answer)
+    return _call_connector_hook_gate(
+        db,
+        _team_connector_visibility_hook,
+        db,
+        team_id=int(team_id),
+        validate=_validate_team_connector_answer,
+    )
 
 
 def team_connector_hook_installed() -> bool:
@@ -210,6 +264,233 @@ def team_connector_hook_installed() -> bool:
     hook legitimately answers with empty sets for a team that owns nothing.
     """
     return _team_connector_visibility_hook is not None
+
+
+def _validate_connector_access_answer(
+    answer: Any, requested: "frozenset[ConnectorRef]"
+) -> "dict[ConnectorRef, ConnectorAccess]":
+    """Validate the access hook's batch answer shape.
+
+    An authorization input, not user-facing data: a malformed answer must
+    fail loudly, never be normalized, coerced, or defaulted to empty. The
+    hook answers a ``dict`` keyed on the connectors it was asked about; a
+    connector the caller's team does not link is expressed by leaving its
+    ref out of the answer entirely, never by a verdict with
+    ``team_owned=False`` -- unlike the team-visibility hook's
+    ``_validate_team_connector_answer`` above, where extra keys beyond the
+    two required ones are silently accepted because nothing ever reads
+    them, here the keys of the answer *are* the question: a verdict for a
+    ref that was never asked about means the hook answered a different
+    question than the one it was asked, and silently dropping it would
+    hide that the hook and the caller have gone out of sync.
+
+    Each value must be a ``ConnectorAccess`` with ``team_owned`` exactly
+    ``True`` (an identity check, not a truthiness check, matching
+    ``knowledge_base_team_scope.py``'s ``element.team_owned is not True``)
+    and ``can_edit`` exactly ``True`` or ``False`` -- ``bool`` is a
+    subclass of ``int`` in Python, so a merely truthy value is never
+    accepted as a legitimate grant.
+
+    Each key must be an exact ``(str, int)`` pair before it is even checked
+    for membership: ``bool``, ``float`` and ``Decimal`` all compare equal
+    to the ``int`` they alias (``True == 1``, ``1.0 == 1``,
+    ``Decimal("1") == 1``), and Python's ordinary tuple equality carries
+    that through to a key like ``("mcp", True)`` -- which would compare
+    equal to, and pass the membership check for, ``("mcp", 1)``. The keys
+    of this answer *are* the question (see above), so a key that only
+    resembles one of the refs asked about is not a legitimate answer to
+    the question, and must fail loudly here rather than being accepted as
+    the connector it merely aliases.
+    """
+    if not isinstance(answer, dict):
+        raise ValueError(
+            "connector access hook returned a malformed answer: expected a "
+            f"dict, got {type(answer).__name__}"
+        )
+    validated: "dict[ConnectorRef, ConnectorAccess]" = {}
+    for key, verdict in answer.items():
+        if not isinstance(key, tuple) or len(key) != 2:
+            raise ValueError(
+                "connector access hook returned a malformed answer: key "
+                f"{key!r} is not a (connector_type, connector_id) pair"
+            )
+        connector_type, connector_id = key
+        if not isinstance(connector_type, str):
+            raise ValueError(
+                "connector access hook returned a malformed answer: key "
+                f"{key!r} has a connector type that is not a str, got "
+                f"{type(connector_type).__name__}"
+            )
+        if isinstance(connector_id, bool) or not isinstance(connector_id, int):
+            raise ValueError(
+                "connector access hook returned a malformed answer: key "
+                f"{key!r} has a connector id that is not an int (bool is a "
+                "subclass of int in Python and is never a legitimate "
+                f"connector id), got {connector_id!r}"
+            )
+        if key not in requested:
+            raise ValueError(
+                "connector access hook returned a malformed answer: a "
+                f"verdict for {key!r}, which was not among the connectors "
+                "asked about"
+            )
+        if not isinstance(verdict, ConnectorAccess):
+            raise ValueError(
+                "connector access hook returned a malformed answer: "
+                f"expected ConnectorAccess values, got "
+                f"{type(verdict).__name__} for {key!r}"
+            )
+        if verdict.team_owned is not True:
+            raise ValueError(
+                "connector access hook returned a malformed answer for "
+                f"{key!r}: team_owned must be True -- a connector the "
+                "caller's team does not link is expressed by leaving it "
+                f"out of the answer, not by a verdict, got {verdict.team_owned!r}"
+            )
+        if verdict.can_edit is not True and verdict.can_edit is not False:
+            raise ValueError(
+                "connector access hook returned a malformed answer for "
+                f"{key!r}: can_edit must be exactly True or False (bool is "
+                "a subclass of int in Python, and a truthy value is never "
+                f"a legitimate grant), got {verdict.can_edit!r}"
+            )
+        validated[key] = verdict
+    return validated
+
+
+def resolve_connector_access(
+    db: Any, user_id: int, refs: "Collection[ConnectorRef]"
+) -> "dict[ConnectorRef, ConnectorAccess]":
+    """Whether the caller's team links each of ``refs``, and may edit it.
+
+    Asks the installed access hook, if any, at most once per call
+    regardless of how many refs are passed -- batching is the point of
+    this signature, not an incidental property, because the seam's whole
+    reason to exist is to answer "what is this caller's team's
+    relationship to these connectors" without paying one hook call per
+    connector. Returns ``{}`` immediately, without calling the hook at
+    all, when no hook is installed or when ``refs`` is empty: an empty
+    request is never worth a call, and a standalone deployment with no
+    hook installed sees zero queries and zero behavior change.
+
+    A ref missing from the returned map means "the caller's team does not
+    link this connector" -- the only way that fact is ever expressed (see
+    ``_validate_connector_access_answer``). The answer is shape-validated
+    before it reaches any caller.
+
+    Answers direct-id reachability and edit authority only. List
+    membership comes from a different hook -- ``visible_team_connector_ids``
+    -- and xagent enforces no relationship between the two answers: they
+    are separate module-level slots, installed separately, and nothing
+    cross-checks them. An installing application must derive both from one
+    and the same link query, because it is the only side that can see its
+    own link table; xagent cannot verify that and does not try.
+
+    When the two answers disagree, xagent does not reconcile them: each
+    question is answered from the hook that owns it, and whatever that
+    hook said is what the caller gets. A connector one hook reports and
+    the other omits is not a defect in xagent -- it is what the installed
+    answers said.
+    """
+    requested = frozenset(
+        (connector_type, int(connector_id)) for connector_type, connector_id in refs
+    )
+    if _connector_access_hook is None or not requested:
+        return {}
+    return _call_connector_hook_gate(
+        db,
+        _connector_access_hook,
+        db,
+        int(user_id),
+        requested,
+        validate=lambda answer: _validate_connector_access_answer(answer, requested),
+    )
+
+
+def _restore_session_after_hook_failure(db: Any) -> None:
+    """Roll back whatever a hook left on the shared session before its call
+    failed -- whether the hook raised, or answered with a shape this seam
+    rejected.
+
+    Hooks are handed the endpoint's own live session (see
+    ``delete_team_connector``'s contract note). A hook whose own statement
+    failed leaves that transaction unusable on PostgreSQL, and an ORM
+    ``flush`` failure leaves it unusable on every backend -- so every
+    later statement in the request, including the ones a degradation path
+    needs to build its response, would be refused. Rolling back here, at
+    the one door every hook call and every answer check passes through, is
+    what keeps the degradation contract true; the roll back happens after
+    the route's own ``db.commit()`` on the post-commit decoration paths, so
+    it never discards durable work.
+
+    A rollback that itself fails is logged and swallowed: this runs on an
+    already-failing path, the original failure is re-raised by the caller
+    either way, and there is no further recovery available.
+    """
+    rollback = getattr(db, "rollback", None)
+    if rollback is None:
+        return
+    try:
+        rollback()
+    except Exception:
+        logger.warning(
+            "Rolling back after a failed connector hook failed", exc_info=True
+        )
+
+
+_HookResult = TypeVar("_HookResult")
+
+
+def _call_connector_hook_gate(
+    db: Any,
+    hook: "Callable[..., _HookResult]",
+    *args: Any,
+    validate: "Callable[[Any], _HookResult] | None" = None,
+    **kwargs: Any,
+) -> _HookResult:
+    """The one door every installed connector hook is called through, and
+    the one place its answer is checked.
+
+    Hooks run on the endpoint's own live session (see
+    ``delete_team_connector``'s contract note). A hook whose own statement
+    failed leaves that transaction unusable on PostgreSQL, and a failed
+    ORM ``flush`` leaves it unusable on every backend -- so restoring the
+    session belongs to the invocation itself, not to whichever caller
+    happens to wrap it. Placing it here is what makes the property hold
+    for a hook slot added to this module later, without that slot's author
+    having to know about it: every one of the five slots this module
+    defines is invoked through this one function.
+
+    ``validate``, when given, runs inside the same ``try`` because a hook
+    can poison the session *without* raising: run a statement that fails,
+    catch that itself, and answer with a shape this seam then rejects. The
+    rejection is this module's own exception rather than the hook's, so a
+    restore placed around the call alone would not fire for it -- the
+    session would stay unusable for everything the request does next. Two
+    of the five slots have an answer this seam validates; the other three
+    pass nothing, which says at the call site that this seam checks
+    nothing about those answers, rather than leaving that silent.
+
+    The exception is re-raised unchanged, whichever of the two raised it;
+    this function decides nothing about how the failure is classified or
+    translated. That stays with the ``*_or_raise`` wrappers below, which
+    own the seam's typed-error contract.
+
+    One shape stays uncovered, deliberately: a hook that poisons the
+    session, swallows its own failure, and still returns a well-formed
+    answer produces no exception at all -- neither here nor in a
+    validator -- so nothing triggers a restore. Closing it would mean
+    probing the session's health after every hook call, which is a
+    different design than a failure path.
+    """
+    try:
+        answer = hook(*args, **kwargs)
+        if validate is None:
+            return answer
+        return validate(answer)
+    except Exception:
+        _restore_session_after_hook_failure(db)
+        raise
 
 
 def resolve_team_connector_ids_or_raise(
@@ -237,6 +518,15 @@ def resolve_team_connector_ids_or_raise(
     no identity guard of its own; production only reaches it through its
     guarded public wrapper). It is only ever formatted into the log
     message, never interpreted.
+
+    The session restore lives on ``_call_connector_hook_gate``, the single
+    door every installed hook is invoked through, rather than on either
+    failure arm below, and it covers both ways that call can fail: a
+    hook can leave a statement failed on the session and *then* raise its
+    own ``ConnectorRuntimeError``, and a hook can leave one failed, swallow
+    that itself, and answer with a shape this seam's own validator then
+    rejects. Neither is something the generic-exception arm below could
+    own, and both are restored before either arm sees the exception.
     """
     try:
         return team_connector_ids(db, team_id=team_id)
@@ -254,6 +544,114 @@ def resolve_team_connector_ids_or_raise(
             details={"reason": "team_scope_resolution_failed"},
             status_code=503,
         ) from exc
+
+
+def resolve_connector_access_or_raise(
+    db: Any, user_id: int, refs: "Collection[ConnectorRef]"
+) -> "dict[ConnectorRef, ConnectorAccess]":
+    """``resolve_connector_access(db, user_id, refs)``, with every
+    non-typed failure converted into the seam's one typed 503.
+
+    A ``ConnectorRuntimeError`` -- whether raised by the hook itself or by
+    ``resolve_connector_access``'s own answer validation -- passes through
+    unchanged (same object, not re-wrapped). Any other exception is logged
+    at ``WARNING`` and converted into
+    ``ConnectorRuntimeError(ERROR_CONNECTOR_RUNTIME_UNAVAILABLE, "Connector
+    access is unavailable.", details={"reason":
+    "connector_access_resolution_failed"}, status_code=503)``. Unlike
+    ``resolve_team_connector_ids_or_raise``, there is no separate
+    ``log_subject`` parameter: ``user_id`` here already identifies the
+    caller directly, so it doubles as the value logged. The logged refs
+    are the plain ``(connector_type, id)`` tuples the caller passed in,
+    sorted for a stable log line -- never an ORM attribute read off a row,
+    which could itself fail if the session is left unusable by whatever
+    just failed.
+
+    The session restore lives on ``_call_connector_hook_gate``, the single
+    door every installed hook is invoked through, rather than on either
+    failure arm below, and it covers both ways that call can fail: a
+    hook can leave a statement failed on the session and *then* raise its
+    own ``ConnectorRuntimeError``, and a hook can leave one failed, swallow
+    that itself, and answer with a shape this seam's own validator then
+    rejects. Neither is something the generic-exception arm below could
+    own, and both are restored before either arm sees the exception.
+    """
+    requested = frozenset(
+        (connector_type, int(connector_id)) for connector_type, connector_id in refs
+    )
+    try:
+        return resolve_connector_access(db, user_id, requested)
+    except ConnectorRuntimeError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Failed to resolve connector access for user %s across %s connectors: %s",
+            user_id,
+            len(requested),
+            sorted(requested),
+            exc_info=True,
+        )
+        raise ConnectorRuntimeError(
+            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+            "Connector access is unavailable.",
+            details={"reason": "connector_access_resolution_failed"},
+            status_code=503,
+        ) from exc
+
+
+def resolve_one_connector_access_or_raise(
+    db: Any, user_id: int, ref: "ConnectorRef"
+) -> "ConnectorAccess | None":
+    """Single-``ref`` convenience wrapper around
+    ``resolve_connector_access_or_raise``: wraps ``ref`` in a one-element
+    collection, calls the batch resolver, and unwraps the answer for that
+    ref. ``None`` means the same thing it means for any ref missing from a
+    batch answer -- not linked, or a legitimate answer the hook chose to
+    omit -- never a failure, which still raises ``ConnectorRuntimeError``
+    same as the batch form. Exists so a caller resolving a single
+    connector does not repeat the wrap-then-``.get(ref)`` shape by hand.
+    """
+    return resolve_connector_access_or_raise(db, user_id, [ref]).get(ref)
+
+
+@contextmanager
+def snapshot_connector_team_hooks() -> Iterator[None]:
+    """Save every module-level hook slot, restore it on exit.
+
+    Intended for tests: entering the block, replacing any slot (through
+    ``set_connector_team_hooks`` or a direct module-attribute monkeypatch),
+    and leaving restores every slot to the exact object it held before the
+    block, including a slot the block never touched. A slot added to this
+    module later must be added here too, or a snapshot taken before that
+    slot exists will silently fail to restore it -- covered by the
+    discovery-based coverage test in
+    tests/web/services/test_connector_team_scope.py, which enumerates every
+    module global ending in ``_hook`` and asserts this snapshot restores
+    each one by identity. Saving and restoring lives on the module because
+    the state being saved lives on the module: a test-side helper would
+    have to name and reach these globals from outside, and would go stale
+    the moment a slot is added here.
+    """
+    global _connector_deleted_hook, _connector_renamed_hook
+    global _connector_visibility_hook, _team_connector_visibility_hook
+    global _connector_access_hook
+    saved = (
+        _connector_deleted_hook,
+        _connector_renamed_hook,
+        _connector_visibility_hook,
+        _team_connector_visibility_hook,
+        _connector_access_hook,
+    )
+    try:
+        yield
+    finally:
+        (
+            _connector_deleted_hook,
+            _connector_renamed_hook,
+            _connector_visibility_hook,
+            _team_connector_visibility_hook,
+            _connector_access_hook,
+        ) = saved
 
 
 def connector_visible_to_user(
@@ -361,7 +759,9 @@ def delete_team_connector(
 
     if _connector_deleted_hook is None:
         return ConnectorDeleteDecision()
-    return _connector_deleted_hook(db, user_id, connector_type, connector_id)
+    return _call_connector_hook_gate(
+        db, _connector_deleted_hook, db, user_id, connector_type, connector_id
+    )
 
 
 def rename_team_connector(
@@ -375,6 +775,13 @@ def rename_team_connector(
     """Keep application-owned connector selectors aligned after a rename."""
 
     if _connector_renamed_hook is not None and old_name != new_name:
-        _connector_renamed_hook(
-            db, user_id, connector_type, connector_id, old_name, new_name
+        _call_connector_hook_gate(
+            db,
+            _connector_renamed_hook,
+            db,
+            user_id,
+            connector_type,
+            connector_id,
+            old_name,
+            new_name,
         )
