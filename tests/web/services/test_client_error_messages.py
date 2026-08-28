@@ -106,10 +106,11 @@ def test_public_error_details_normalizes_reason(reason: object) -> None:
 LEGAL_REASONS = [
     "not_provided",
     "store_lost",
-    "payload_too_large",
-    "encryption_unavailable",
+    "connector_not_selected",
+    "undeclared_context_key",
     "team_env_resolution_failed",
     "team_scope_resolution_failed",
+    "runtime_view_resolution_failed",
     "custom_api_config_load_failed",
     "missing_context.auth_token",
     "type_mismatch.context.tenant_id",
@@ -255,17 +256,6 @@ def test_public_error_details_is_constructed_in_one_module_only() -> None:
 # I-31: the whitelist and the real raise sites stay in step
 # --------------------------------------------------------------------------
 
-
-# Reasons that are listed but have no literal raise site in this repository
-# today. Both belong to the runtime value-fill endpoint, which is added by a
-# later PR in this series; they are listed now because the whitelist is the
-# contract that endpoint is written against.
-REASONS_WITHOUT_A_LITERAL_RAISE_SITE = frozenset(
-    {
-        "payload_too_large",
-        "encryption_unavailable",
-    }
-)
 
 # Literal reasons that the derivation below finds and that are deliberately
 # kept off the wire. The first two state the task's ownership and the outcome
@@ -421,7 +411,14 @@ def test_public_reason_whitelist_covers_every_raise_site() -> None:
 
 
 def test_public_reason_whitelist_has_no_member_without_a_raise_site() -> None:
-    """The whitelist must not grow entries nothing can actually produce."""
+    """Every listed reason is produced somewhere, with no exemptions.
+
+    Zero exemptions is the point of this assertion. A listed reason nothing
+    raises is a standing allowance with no expiry, and by the time the code
+    raising it arrives nobody remembers which audience it was judged against.
+    A reason therefore enters the whitelist in the same change as the site
+    that raises it.
+    """
 
     literals, patterns = _derive_reasons()
     compiled = [re.compile(pattern) for pattern in patterns]
@@ -430,7 +427,6 @@ def test_public_reason_whitelist_has_no_member_without_a_raise_site() -> None:
         reason
         for reason in CONNECTOR_RUNTIME_PUBLIC_REASONS
         if reason not in literals
-        and reason not in REASONS_WITHOUT_A_LITERAL_RAISE_SITE
         and not any(expression.match(reason) for expression in compiled)
     }
     assert not ungrounded, (

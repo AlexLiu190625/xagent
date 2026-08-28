@@ -1,11 +1,13 @@
 """Fixed client-visible fallbacks for incidental server failures."""
 
-import re
 from dataclasses import dataclass
 from enum import StrEnum
 
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
-from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
+from ...core.tools.adapters.vibe.connector_runtime import (
+    RUNTIME_SOURCE_KEY_RE,
+    ConnectorRuntimeError,
+)
 
 CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
 
@@ -146,9 +148,6 @@ CONNECTOR_RUNTIME_PUBLIC_REASONS = frozenset(
         "undeclared_context_key",
         "undeclared_secrets_key",
         "undeclared_auth_selector_key",
-        # Raised by the runtime value-fill boundary.
-        "payload_too_large",
-        "encryption_unavailable",
         # Fixed 503 strings built by direct ConnectorRuntimeError construction
         # in three other modules. Each one states that a server-side component
         # is unavailable; none of them states who owns the task, or how an
@@ -161,6 +160,11 @@ CONNECTOR_RUNTIME_PUBLIC_REASONS = frozenset(
         "custom_api_config_load_failed",
     }
 )
+# Every member above is raised somewhere in this repository today, and a test
+# asserts that in both directions. Add a reason here in the same change that
+# adds the site raising it, never ahead of it: a listed reason nothing produces
+# is an allowance with no expiry date, and by the time the raising code arrives
+# nobody remembers which audience the reason was judged against.
 CONNECTOR_RUNTIME_PUBLIC_REASON_PREFIXES = frozenset(
     {
         "missing_context",
@@ -172,13 +176,14 @@ CONNECTOR_RUNTIME_PUBLIC_REASON_PREFIXES = frozenset(
         "conflict.auth_selector",
     }
 )
-# The declared runtime key grammar, reused verbatim from
-# core/tools/adapters/vibe/connector_runtime.py:141-144.
-_RUNTIME_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _is_public_reason(reason: object) -> bool:
-    """True when this reason may reach a client. Used by PublicErrorDetails."""
+    """True when this reason may reach a client. Used by PublicErrorDetails.
+
+    The key half of a prefixed reason is matched against the declared runtime
+    key grammar itself, not a copy of it, so the two cannot drift apart.
+    """
 
     if not isinstance(reason, str):
         return False
@@ -189,7 +194,7 @@ def _is_public_reason(reason: object) -> bool:
         return False
     if prefix not in CONNECTOR_RUNTIME_PUBLIC_REASON_PREFIXES:
         return False
-    return _RUNTIME_KEY_RE.fullmatch(key) is not None
+    return RUNTIME_SOURCE_KEY_RE.fullmatch(key) is not None
 
 
 @dataclass(frozen=True)
