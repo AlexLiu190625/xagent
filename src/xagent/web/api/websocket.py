@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -321,6 +322,20 @@ def _task_error_payload(
     return payload
 
 
+@lru_cache(maxsize=1)
+def _client_visible_error_codes() -> frozenset[str]:
+    """The closed set of client-visible error codes, reused not recopied.
+
+    Imported inside the function on purpose: the ``v1`` package's ``__init__``
+    pulls in routers that import this module, so a module-level import would
+    close a cycle. The set is built once and cached.
+    """
+
+    from .v1.errors import V1ErrorCode
+
+    return frozenset(member.value for member in V1ErrorCode)
+
+
 def create_terminal_task_error_event(
     task_id: int,
     message: str,
@@ -330,11 +345,20 @@ def create_terminal_task_error_event(
 ) -> dict[str, Any]:
     """Shape an error event after the exact lease owner commits FAILED.
 
-    ``code`` and ``details`` are written only when both are supplied, so a
-    caller that passes neither still gets the same six-key frame. ``details``
-    is accepted as ``PublicErrorDetails`` itself and nothing else -- not a
-    subclass -- because that class's ``__post_init__`` is where the reason
-    whitelist lives.
+    ``code`` and ``details`` are written only when both survive validation, so
+    a caller that passes neither still gets the same six-key frame, and a
+    caller that passes something unusable gets that same frame rather than an
+    exception. This runs on the reporting path of an already-failed task, and
+    the one call site that passes these arguments evaluates them inside the
+    ``except Exception`` that only logs a failed broadcast -- so raising here
+    would cost the terminal frame outright and leave the user on the silent
+    failure this path exists to remove. A bad optional argument costs that
+    argument and nothing else. Both rejections are logged with their stack.
+
+    ``details`` is accepted as ``PublicErrorDetails`` itself and nothing else
+    -- not a subclass -- because that class's ``__post_init__`` is where the
+    reason whitelist lives. ``code`` must be a member of ``V1ErrorCode``, the
+    repository's closed set of client-visible error codes.
     """
 
     # Python annotations are not enforced at run time, so the mypy gate on the
@@ -348,7 +372,27 @@ def create_terminal_task_error_event(
     # both isinstance and mypy while bypassing the whitelist in __post_init__.
     # Only the class itself carries that guarantee.
     if details is not None and type(details) is not PublicErrorDetails:
-        raise TypeError("details must be a PublicErrorDetails")
+        logger.error(
+            "task_id=%s component=terminal-error-frame dropped=details "
+            "type=%s; the frame is still sent without it",
+            task_id,
+            type(details).__name__,
+            stack_info=True,
+        )
+        details = None
+
+    # ConnectorRuntimeError types its code as a bare str and stores it
+    # unvalidated, so "only the ten module constants reach here" is a fact
+    # about today's raise sites, not a property the code holds.
+    if code is not None and code not in _client_visible_error_codes():
+        logger.error(
+            "task_id=%s component=terminal-error-frame dropped=code "
+            "value=%r; the frame is still sent without it",
+            task_id,
+            code,
+            stack_info=True,
+        )
+        code = None
 
     event: dict[str, Any] = {
         "type": "task_error",

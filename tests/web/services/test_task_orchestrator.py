@@ -60,6 +60,7 @@ from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services import task_orchestrator as task_orchestrator_module
 from xagent.web.services.assistant_history_safety import (
     CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+    TASK_FAILURE_MESSAGE_TYPE,
 )
 from xagent.web.services.chat_history_service import (
     DELIVERY_COMPLETED,
@@ -3866,7 +3867,13 @@ CONNECTOR_RUNTIME_CODES = [
 
 @contextmanager
 def _captured_terminal_broadcast(setup_or_run_error: BaseException, db_session):
-    """Drive one owned run to failure and hand back the broadcast frames."""
+    """Drive one owned run to failure and hand back both halves it produced.
+
+    The branch under test writes two things: the broadcast frame the live
+    client renders, and the durable settlement the transcript replays after a
+    reload. Capturing only the frame would let the durable half be deleted
+    with every test still green, so the settlement kwargs come back too.
+    """
 
     from xagent.web.api.websocket import background_task_manager
 
@@ -3875,9 +3882,14 @@ def _captured_terminal_broadcast(setup_or_run_error: BaseException, db_session):
     task_id = int(task.id)
     lease = TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a")
     frames: list[dict] = []
+    settlements: list[dict] = []
 
     async def broadcast(event, *_args, **_kwargs) -> None:
         frames.append(event)
+
+    def settle(*_args, **kwargs) -> bool:
+        settlements.append(kwargs)
+        return True
 
     with (
         patch(
@@ -3904,7 +3916,7 @@ def _captured_terminal_broadcast(setup_or_run_error: BaseException, db_session):
         ),
         patch(
             "xagent.web.services.task_orchestrator.settle_task_lease_isolated",
-            return_value=True,
+            side_effect=settle,
         ),
         patch(
             "xagent.web.api.websocket.manager",
@@ -3916,7 +3928,7 @@ def _captured_terminal_broadcast(setup_or_run_error: BaseException, db_session):
             return_value=MagicMock(),
         ),
     ):
-        yield task_id, frames
+        yield task_id, frames, settlements
 
 
 async def _run_failing_turn(task_id: int, user_id: int, source) -> None:
@@ -3945,7 +3957,11 @@ async def test_connector_runtime_failure_broadcasts_its_safe_message(
         details={"reason": "missing_context.auth_token"},
     )
 
-    with _captured_terminal_broadcast(error, db_session) as (task_id, frames):
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
         task = db_session.query(Task).filter(Task.id == task_id).one()
         await _run_failing_turn(task_id, int(task.user_id), task.source)
 
@@ -3970,7 +3986,11 @@ async def test_incidental_failure_still_redacts(
 ) -> None:
     """Only the connector-runtime class earns the new branch."""
 
-    with _captured_terminal_broadcast(error, db_session) as (task_id, frames):
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
         task = db_session.query(Task).filter(Task.id == task_id).one()
         await _run_failing_turn(task_id, int(task.user_id), task.source)
 
@@ -3997,7 +4017,11 @@ async def test_connector_runtime_frame_details_shape(db_session) -> None:
         },
     )
 
-    with _captured_terminal_broadcast(error, db_session) as (task_id, frames):
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
         task = db_session.query(Task).filter(Task.id == task_id).one()
         await _run_failing_turn(task_id, int(task.user_id), task.source)
 
@@ -4024,7 +4048,11 @@ async def test_connector_runtime_frame_never_carries_connector_ref(
         details={"reason": "missing_context.auth_token"},
     )
 
-    with _captured_terminal_broadcast(error, db_session) as (task_id, frames):
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
         task = db_session.query(Task).filter(Task.id == task_id).one()
         await _run_failing_turn(task_id, int(task.user_id), task.source)
 
@@ -4057,7 +4085,11 @@ async def test_connector_runtime_frame_reason_matches_direct_construction(
         details={"reason": "missing_context.auth_token"},
     )
 
-    with _captured_terminal_broadcast(error, db_session) as (task_id, frames):
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
         task = db_session.query(Task).filter(Task.id == task_id).one()
         await _run_failing_turn(task_id, int(task.user_id), task.source)
 
@@ -4084,7 +4116,11 @@ async def test_connector_runtime_failure_logs_missing_key(
     )
 
     with caplog.at_level(logging.ERROR):
-        with _captured_terminal_broadcast(error, db_session) as (task_id, frames):
+        with _captured_terminal_broadcast(error, db_session) as (
+            task_id,
+            frames,
+            settlements,
+        ):
             task = db_session.query(Task).filter(Task.id == task_id).one()
             await _run_failing_turn(task_id, int(task.user_id), task.source)
 
@@ -4099,3 +4135,68 @@ async def test_connector_runtime_failure_logs_missing_key(
     assert "reason=missing_context.auth_token" in structured[0]
     assert "connector=" in structured[0]
     assert "'connector_id': 7" in structured[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", CONNECTOR_RUNTIME_CODES)
+async def test_connector_runtime_failure_persists_client_safe_history(
+    db_session,
+    code: str,
+) -> None:
+    """The durable half: what the transcript replays after a reload.
+
+    The new branch writes three things -- the frame, the settlement error and
+    the history message type. Without this test the whole
+    ``client_history_message_type`` line could be deleted and every other test
+    in this file would stay green, while a reloading user dropped back to the
+    generic failure text the frame no longer shows.
+    """
+
+    safe_message = f"Required connector runtime input is missing ({code})."
+    error = ConnectorRuntimeError(
+        code,
+        safe_message,
+        details={"reason": "missing_context.auth_token"},
+    )
+
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    assert len(settlements) == 1
+    settled = settlements[0]
+    assert settled["client_message_type"] == CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+    # The reloaded transcript says the same thing the live bubble said.
+    assert settled["client_error_message"] == safe_message
+    assert settled["client_error_message"] == frames[0]["message"]
+    # The durable error keeps the code prefix operators grep for, and never
+    # the "setup/run error: <ExceptionType>" shape the else branch produces.
+    assert settled["error_message"] == f"{code}: {safe_message}"
+    assert "setup/run error" not in settled["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_incidental_failure_persists_the_generic_history_type(
+    db_session,
+) -> None:
+    """The counterpart: an incidental failure keeps the untrusted settlement."""
+
+    error = RuntimeError("secret-token-xyz")
+
+    with _captured_terminal_broadcast(error, db_session) as (
+        task_id,
+        frames,
+        settlements,
+    ):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    assert len(settlements) == 1
+    settled = settlements[0]
+    assert settled["client_message_type"] == TASK_FAILURE_MESSAGE_TYPE
+    assert settled["client_error_message"] == CLIENT_SAFE_TASK_FAILURE
+    assert "secret-token-xyz" not in settled["client_error_message"]
