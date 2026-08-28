@@ -1858,8 +1858,13 @@ def _team_access_for_shared_row(
 
     Only ``can_edit`` is downgraded; ``team_owned`` is left as the application
     answered it, so the connector stays visible and readable to the team and
-    the caller's stand-in resolution is unaffected. Returning ``None`` instead
-    would 404 a connector the caller's team genuinely links.
+    the caller's stand-in resolution is unaffected. Dropping the verdict
+    entirely would not 404 such a row today -- the sole caller that can raise
+    a 404 applies this after that test, so the test sees the undowngraded
+    verdict either way. Keeping ``team_owned`` is what leaves the two
+    independent: neither this function's return shape nor that caller's
+    ordering has to hold for a connector the caller's team genuinely links to
+    stay reachable.
 
     The catalog test is ``_server_catalog_keys`` against the catalog's own
     keys -- the same predicate ``list_mcp_apps`` uses to decide that a stored
