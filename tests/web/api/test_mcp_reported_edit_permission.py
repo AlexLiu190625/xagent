@@ -1539,7 +1539,11 @@ class TestSessionRecoveryAfterHookFailure:
             )
             .one()
         )
-        assert assoc is not None
+        # ``.one()`` already raises when the row is absent, so asserting it is
+        # not None asserts nothing. What this test is actually about is that
+        # the association survived the poisoned session with the shape connect
+        # writes: a non-owning, active personal link.
+        assert (assoc.is_owner, assoc.is_active) == (False, True)
 
     # test_the_servers_listing_still_returns_every_row_when_the_hook_poisons_the_session
     # is not here: it lives in TestListMcpServersPerRowDegradation below,
