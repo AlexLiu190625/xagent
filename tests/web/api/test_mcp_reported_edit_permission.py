@@ -236,8 +236,12 @@ class TestListEndpointAccessHookCallBudget:
         # a constant on purpose: it must come out identical for num_rows=2
         # and num_rows=6, since every row within P, Q or R is served by one
         # batched IN-clause query (or the single hook call), never a query
-        # or a hook call per row.
-        assert len(queries) == 7, queries
+        # or a hook call per row. Includes one additional catalog-keys
+        # SELECT that fires once per request, not once per row: every
+        # granting verdict this hook returns has to be checked against the
+        # platform catalog before it can be trusted as an edit grant, and
+        # that catalog is read once and shared across every row's check.
+        assert len(queries) == 8, queries
 
 
 class TestAppsListEndpointAccessHookCallBudget:
@@ -370,7 +374,13 @@ class TestDegradedListingQueryCostGrowsWithRowCount:
     # re-selects). The extra "+1" on ``servers`` alone reflects that
     # endpoint's own extra per-owner-lookup query the apps endpoint does
     # not have; it does not grow with num_rows.
-    HEALTHY = {"apps": 7, "servers": 5}
+    #
+    # ``HEALTHY["servers"]`` carries one further "+1" that ``BASE["servers"]``
+    # does not: a healthy hook here always grants edit, so the servers
+    # listing's platform-catalog check reads the catalog once per request.
+    # The failing hook's verdicts map is empty, so that check never fires --
+    # BASE stays the pre-catalog-check number on purpose.
+    HEALTHY = {"apps": 7, "servers": 6}
     BASE = {"apps": 7, "servers": 5}
     EXTRA = {"apps": 0, "servers": 1}
 

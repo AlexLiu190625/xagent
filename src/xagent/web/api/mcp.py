@@ -13,7 +13,7 @@ import logging
 import secrets
 import shlex
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import (
     TYPE_CHECKING,
@@ -1392,6 +1392,11 @@ def _check_mcp_permission(
     owner's ``is_owner`` still wins the ``edit`` branch outright, with no
     verdict consulted at all, and the ``delete`` branch does not read it --
     ``can_delete`` is not part of the verdict this seam reports.
+
+    On the MCP routes the verdict reaching this parameter has already passed
+    through _team_access_for_shared_row, which withholds edit on a
+    platform-catalog row; this function itself applies no such test and
+    trusts what it is handed.
     """
     if is_admin:
         return True
@@ -1532,6 +1537,10 @@ def _resolve_mcp_server_for_request(
     only add an unnecessary hook call; this skips the call entirely for an
     owner's row and returns ``access=None``.
 
+    The verdict returned is the downgraded one -- see
+    _team_access_for_shared_row -- so both the gate and the reported field
+    below draw on the same object.
+
     ``on_resolution_failure`` decides what a hook failure means for this
     call, and only the caller can know which: ``"raise"`` (the default)
     lets ``ConnectorRuntimeError`` propagate to the caller's own
@@ -1595,6 +1604,11 @@ def _resolve_mcp_server_for_request(
 
     if user_mcp is None:
         user_mcp = _TeamOwnedUserMCP(int(user_id))
+
+    # Downgraded after the 404 above, not before it: a team member must still
+    # reach a catalog connector their team links, and read it. What they must
+    # not get is the edit right on it.
+    access = _team_access_for_shared_row(db, cast(MCPServer, server), access)
 
     return user_mcp, cast(MCPServer, server), access
 
@@ -1803,6 +1817,81 @@ def _is_reserved_catalog_name(db: Session, name: object) -> bool:
     if not key:
         return False
     return any(key in _catalog_app_keys(app) for app in get_all_mcp_apps(db))
+
+
+def _catalog_reserved_keys(db: Session) -> "set[str]":
+    """Every normalized key the platform's app catalog claims, in one query.
+
+    The same set ``list_mcp_apps`` builds inline as ``library_keys`` from the
+    ``library_apps`` list it already holds. Kept separate rather than shared
+    with that loop because that loop reuses a list it fetched for other
+    reasons, while the caller below needs the set on its own and only
+    sometimes.
+    """
+    return {key for app in get_all_mcp_apps(db) for key in _catalog_app_keys(app)}
+
+
+def _team_access_for_shared_row(
+    db: Session,
+    server: MCPServer,
+    access: "ConnectorAccess | None",
+    *,
+    reserved_keys: "set[str] | None" = None,
+) -> "ConnectorAccess | None":
+    """The team access verdict as this repo's MCP routes may act on it.
+
+    xagent provisions ONE shared ``MCPServer`` row per catalog app, and every
+    user who connects that app attaches to that same row; a key-based app's
+    row may additionally hold the administrator's platform fallback key in
+    ``env``. That row's configuration is the platform's, not any one team's,
+    so a verdict that grants edit on it is downgraded here rather than
+    trusted. Without this, an application answering ``can_edit=True`` for such
+    a ref would let one team rewrite ``command``/``args``/``url``/``env``/
+    ``auth`` for every user of that app, including users in no team at all.
+
+    Only ``can_edit`` is downgraded; ``team_owned`` is left as the application
+    answered it, so the connector stays visible and readable to the team and
+    the caller's stand-in resolution is unaffected. Returning ``None`` instead
+    would 404 a connector the caller's team genuinely links.
+
+    The catalog test is ``_server_catalog_keys`` against the catalog's own
+    keys -- the same predicate ``list_mcp_apps`` uses to decide that a stored
+    row is some catalog app's shared row, so this module holds one definition
+    of "catalog-managed", not two. Two nearby functions are deliberately NOT
+    used for it:
+
+    - ``_is_reserved_catalog_name`` answers a different question, "may a new
+      row take this name", and reads the name alone. A builtin-oauth catalog
+      row an administrator renamed still carries its ``app_id`` in ``auth``
+      and is still the platform's row; that function no longer recognizes it,
+      and builtin-oauth is 21 of the 28 built-in catalog apps.
+    - ``_catalog_server_has_platform_key`` answers "catalog row that ALSO
+      carries the platform key", so every keyless and mcp_oauth row, and every
+      key-based row whose key each user supplies themselves, reads False there
+      while still being platform-owned configuration.
+
+    DECLARED BOUNDARY -- a connector someone built themselves under a name a
+    catalog app later took. The catalog claims that name, so this function
+    treats such a row as catalog-managed and withholds the team edit. Its
+    creator keeps their own edit right in full: an owner's ``is_owner``
+    decides the edit branch in ``_check_mcp_permission`` before any verdict is
+    read. What is withheld is only a TEAMMATE editing that connector on the
+    owner's behalf. Telling such a row apart from a real catalog row needs a
+    stored "who created this definition" fact the schema does not carry today;
+    until it does, this is the side the ambiguity is resolved on, on purpose.
+
+    ``reserved_keys`` lets a caller resolving many rows in one request build
+    the key set once and pass it in. The test runs only for a verdict that
+    already grants edit -- the one case where it can change an answer -- so a
+    deployment with no access hook installed resolves ``None`` for every row
+    and issues no additional query at all.
+    """
+    if access is None or not access.can_edit:
+        return access
+    keys = _catalog_reserved_keys(db) if reserved_keys is None else reserved_keys
+    if not keys.intersection(_server_catalog_keys(server)):
+        return access
+    return replace(access, can_edit=False)
 
 
 def _oauth_account_can_connect(oauth_account: object) -> bool:
@@ -2827,16 +2916,32 @@ def get_mcp_servers(
                     effective_user_id,
                 )
 
+        # Built once per request, and only when some MCP verdict actually
+        # grants edit -- the downgrade below is its only reader. A listing
+        # with no granting verdict (every standalone deployment, and every
+        # team listing where nothing is editable) must cost exactly what it
+        # cost before this existed.
+        reserved_keys: "set[str] | None" = None
+        if any(
+            verdict.can_edit
+            for (kind, _connector_id), verdict in verdicts.items()
+            if kind == "mcp"
+        ):
+            reserved_keys = _catalog_reserved_keys(db)
+
         is_admin = getattr(current_user, "is_admin", False)
         responses = []
         for user_mcp, server in user_mcps:
             app_id, provider, connected_account = _enrich_oauth_server_info(
                 db, server, oauth_emails
             )
-            team_access = (
+            team_access = _team_access_for_shared_row(
+                db,
+                server,
                 None
                 if bool(getattr(user_mcp, "is_owner", False))
-                else verdicts.get(("mcp", int(server.id)))
+                else verdicts.get(("mcp", int(server.id))),
+                reserved_keys=reserved_keys,
             )
             responses.append(
                 _db_server_to_response(
@@ -2865,7 +2970,12 @@ def get_mcp_servers(
             app_id, provider, connected_account = _enrich_oauth_server_info(
                 db, server, oauth_emails
             )
-            team_access = verdicts.get(("mcp", int(server.id)))
+            team_access = _team_access_for_shared_row(
+                db,
+                server,
+                verdicts.get(("mcp", int(server.id))),
+                reserved_keys=reserved_keys,
+            )
             responses.append(
                 _db_server_to_response(
                     server,
@@ -3338,8 +3448,11 @@ def connect_mcp_app(
     logger.info(f"User {current_user.id} connected MCP app '{server_name}'")
     # assoc is a personal row this call just created or updated, always with
     # is_owner=False (connecting never grants ownership) -- resolved so the
-    # response's can_edit_global can reflect a granting team verdict rather
-    # than default to False for every connector this route ever returns.
+    # response's can_edit_global comes from the same object the PUT gate
+    # would read. Every row this route returns is a catalog app's shared
+    # row, so the downgrade below makes that False -- the point is that it
+    # is False for the same reason the gate would refuse, not that it
+    # defaults to False.
     # The association has already committed by this point, so a verdict
     # failure here must not fail the request -- it only degrades
     # can_edit_global to False, the value this route always reported before
@@ -3365,6 +3478,10 @@ def connect_mcp_app(
             server_id_for_log,
             user_id_for_log,
         )
+    # Every row this route returns is a catalog app's shared row, so this is
+    # what keeps its reported can_edit_global from advertising an edit the PUT
+    # gate would refuse.
+    team_access = _team_access_for_shared_row(db, server, team_access)
     return _db_server_to_response(
         server,
         assoc,
@@ -3654,7 +3771,9 @@ def update_mcp_server(
         # the pre-lock answer granted. This narrows the window; it is not
         # a fence, and cannot be one from inside this repository: the
         # revoke path lives in the application that installs the hook, and
-        # a real fence needs both sides to take the same lock.
+        # a real fence needs both sides to take the same lock. The downgrade
+        # is re-applied here too, against the locked row: the name and auth
+        # it reads are mutable through this very route.
         #
         # Skipped for a payload that only touches this caller's own
         # association row, and for a platform admin: neither writes on the
@@ -3685,8 +3804,15 @@ def update_mcp_server(
                 resolve_one_connector_access_or_raise,
             )
 
-            rechecked = resolve_one_connector_access_or_raise(
-                db, int(user_id), ("mcp", int(server_id))
+            # Re-derived from the row this transaction holds locked, not from
+            # the pre-lock read: the name and auth the catalog test reads are
+            # both mutable through this very route.
+            rechecked = _team_access_for_shared_row(
+                db,
+                server,
+                resolve_one_connector_access_or_raise(
+                    db, int(user_id), ("mcp", int(server_id))
+                ),
             )
             if rechecked is None or not rechecked.can_edit:
                 db.rollback()
@@ -4127,10 +4253,12 @@ def toggle_mcp_server(
 
         # The gate above is unchanged (still 404s without a personal row,
         # owner or not); only the reported field below draws on a team
-        # verdict. The toggle has already committed by the time this runs,
-        # so a verdict failure here must not fail the request -- it only
-        # degrades can_edit_global to False, the same answer this route
-        # reported before the verdict existed at all.
+        # verdict -- now the downgraded one, so a catalog row's reported
+        # field cannot advertise an edit the PUT gate refuses. The toggle
+        # has already committed by the time this runs, so a verdict failure
+        # here must not fail the request -- it only degrades
+        # can_edit_global to False, the same answer this route reported
+        # before the verdict existed at all.
         from ..services.connector_team_scope import (
             resolve_one_connector_access_or_raise,
         )
@@ -4155,6 +4283,7 @@ def toggle_mcp_server(
                 server_id_for_log,
                 user_id_for_log,
             )
+        team_access = _team_access_for_shared_row(db, server, team_access)
         return _db_server_to_response(
             server,
             user_mcp,

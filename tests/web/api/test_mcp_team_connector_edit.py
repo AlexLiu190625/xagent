@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
@@ -31,6 +31,7 @@ from xagent.web.api.mcp import (
     _check_mcp_permission,
     connect_mcp_app,
     get_mcp_server,
+    get_mcp_servers,
     toggle_mcp_server,
     update_mcp_server,
 )
@@ -553,6 +554,54 @@ def _make_catalog_app(db, app_id: str) -> None:
     db.commit()
 
 
+def _make_catalog_app_with_display_name(
+    db, app_id: str, display_name: str, *, transport: str = "stdio", launch_config=None
+) -> None:
+    """A catalog app written the way the real registry writes one: the
+    display name is NOT the app_id. A test that seeds name == app_id would
+    let a name-only implementation pass for the wrong reason.
+    """
+    db.add(
+        PublicMCPApp(
+            app_id=app_id,
+            name=display_name,
+            transport=transport,
+            launch_config=launch_config or {"command": "true", "args": []},
+        )
+    )
+    db.commit()
+
+
+def _make_catalog_server_row(
+    db,
+    *,
+    name: str,
+    transport: str = "stdio",
+    command: str | None = "true",
+    args: list | None = None,
+    url: str | None = None,
+    auth: dict | None = None,
+    env: dict | None = None,
+) -> MCPServer:
+    """A shared server row shaped the way a catalog provisioning helper
+    would write it, constructed directly rather than through connect/OAuth
+    so a test can pick exactly which catalog shape it needs (api_key,
+    mcp_oauth, or a renamed builtin_oauth row)."""
+    server = MCPServer(
+        name=name,
+        transport=transport,
+        managed="external",
+        command=command,
+        args=args if args is not None else [],
+        url=url,
+        auth=auth,
+        env=env,
+    )
+    db.add(server)
+    db.flush()
+    return server
+
+
 class TestDecorationDegradesAfterTheWriteCommits:
     """``toggle`` and ``connect`` both commit their write before resolving
     the verdict, purely to decorate the response's ``can_edit_global`` --
@@ -1022,3 +1071,525 @@ class TestTheRecheckCostsExactlyOneExtraHookCall:
             .one()
         )
         assert refreshed.is_active is False
+
+
+class TestCatalogRowsAreNeverTeamEditable:
+    """A team verdict that grants edit is downgraded to ``can_edit=False``
+    whenever the row it names is some platform catalog app's shared row --
+    across every kind of catalog row (api_key, mcp_oauth, a builtin_oauth
+    row an administrator renamed) and every route that produces or reports
+    a verdict (the GET/PUT gate, the list endpoint's two loops, connect,
+    and toggle). A self-built connector that happens to squat a catalog id
+    is deliberately NOT exempted from this: its creator keeps their own
+    edit right in full (``is_owner`` decides that outright), but a
+    teammate editing it on the owner's behalf is not.
+    """
+
+    def test_team_stand_in_cannot_rewrite_an_api_key_catalog_rows_command(self, db):
+        _make_catalog_app_with_display_name(db, "stripe", "Stripe")
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_catalog_server_row(
+            db,
+            name="stripe",
+            transport="stdio",
+            command="python",
+            args=["-m", "xagent.web.tools.mcp.stripe"],
+        )
+        db.add(
+            UserMCPServer(
+                user_id=owner.id, mcpserver_id=server.id, is_owner=True, is_active=True
+            )
+        )
+        db.commit()
+        server_id = server.id
+        original_command = server.command
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            with pytest.raises(HTTPException) as exc:
+                update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(config={"command": "evil", "args": []}),
+                    current_user=member,
+                    db=db,
+                )
+
+        assert exc.value.status_code == 403
+        assert "You do not have permission to edit this MCP server" in exc.value.detail
+        # Exactly one hook call: the refusal comes from the downgrade
+        # applied when the verdict is first resolved, before any personal
+        # row exists to hold an edit right -- not from the post-lock
+        # recheck catching it a step later (that would be two calls).
+        assert len(hook.calls) == 1
+
+        db.rollback()
+        refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert refreshed.command == original_command
+
+    def test_team_stand_in_cannot_rewrite_an_mcp_oauth_catalog_rows_url(self, db):
+        _make_catalog_app_with_display_name(
+            db,
+            "notion",
+            "Notion",
+            transport="streamable_http",
+            launch_config={
+                "url": "https://mcp.notion.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        )
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_catalog_server_row(
+            db,
+            name="notion",
+            transport="streamable_http",
+            command=None,
+            url="https://mcp.notion.com/mcp",
+            auth={"type": "mcp_oauth"},
+        )
+        db.add(
+            UserMCPServer(
+                user_id=owner.id, mcpserver_id=server.id, is_owner=True, is_active=True
+            )
+        )
+        db.commit()
+        server_id = server.id
+        original_url = server.url
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            with pytest.raises(HTTPException) as exc:
+                update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(config={"url": "https://evil.example/mcp"}),
+                    current_user=member,
+                    db=db,
+                )
+
+        assert exc.value.status_code == 403
+        assert "You do not have permission to edit this MCP server" in exc.value.detail
+        assert len(hook.calls) == 1
+
+        db.rollback()
+        refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert refreshed.url == original_url
+
+    def test_team_stand_in_cannot_rewrite_an_api_key_catalog_row_with_no_platform_key(
+        self, db
+    ):
+        """Same shape as the ``stripe`` case above, except this row carries
+        no platform fallback key in ``env`` at all -- the one distinction
+        that matters if the downgrade were (wrongly) gated on
+        ``_catalog_server_has_platform_key`` instead of catalog membership:
+        that function reads False here, but the row is still the
+        platform's, not this team's, to hand out edit rights on."""
+        _make_catalog_app_with_display_name(
+            db,
+            "acme-books",
+            "Acme Books",
+            transport="stdio",
+            launch_config={
+                "command": "python",
+                "args": ["-m", "acme_books"],
+                "required_env": ["ACME_BOOKS_API_KEY"],
+            },
+        )
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_catalog_server_row(
+            db,
+            name="acme-books",
+            transport="stdio",
+            command="python",
+            args=["-m", "acme_books"],
+            env=None,
+        )
+        db.add(
+            UserMCPServer(
+                user_id=owner.id, mcpserver_id=server.id, is_owner=True, is_active=True
+            )
+        )
+        db.commit()
+        server_id = server.id
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            with pytest.raises(HTTPException) as exc:
+                update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(config={"command": "evil", "args": []}),
+                    current_user=member,
+                    db=db,
+                )
+
+        assert exc.value.status_code == 403
+
+    def test_a_self_built_row_with_no_name_collision_is_still_team_editable(self, db):
+        _make_catalog_app_with_display_name(db, "stripe", "Stripe")
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_owned_server(db, owner.id, name="my-custom-tool")
+        server_id = server.id
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            response = update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="edited by the team"),
+                current_user=member,
+                db=db,
+            )
+
+        assert response.can_edit_global is True
+
+        db.rollback()
+        refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert refreshed.description == "edited by the team"
+
+    def test_the_catalog_rows_owner_can_still_edit_it_themselves(self, db):
+        """A builtin_oauth connect writes ``is_owner=True`` on the
+        connecting user's association -- unlike the key-based/mcp_oauth
+        paths, which never do. The owner's edit right must not move: no
+        verdict is even consulted for it, so the hook installed here must
+        never be called at all.
+
+        Uses the same stdio/api_key catalog shape as the tests above rather
+        than an actual oauth-transport row: ``update_mcp_server`` rebuilds
+        and revalidates the transport-specific config on every call
+        (including a description-only one), and ``MCPServerConfig`` does
+        not accept ``transport="oauth"`` at all -- a pre-existing
+        limitation of this route, unrelated to catalog membership. What
+        this test pins is the ownership bypass itself, which does not
+        depend on which catalog shape carries it.
+        """
+        _make_catalog_app_with_display_name(db, "stripe", "Stripe")
+        owner = _make_user(db, 1)
+        server = _make_catalog_server_row(
+            db,
+            name="stripe",
+            transport="stdio",
+            command="python",
+            args=["-m", "xagent.web.tools.mcp.stripe"],
+        )
+        db.add(
+            UserMCPServer(
+                user_id=owner.id, mcpserver_id=server.id, is_owner=True, is_active=True
+            )
+        )
+        db.commit()
+        server_id = server.id
+
+        def hook_must_not_be_called(*_a, **_k):
+            raise AssertionError("the access hook must not be called for an owner")
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook_must_not_be_called)
+            response = update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="edited by its owner"),
+                current_user=owner,
+                db=db,
+            )
+
+        assert response.can_edit_global is True
+
+    def test_get_on_a_catalog_row_still_reaches_it_but_reports_no_edit_right(self, db):
+        _make_catalog_app_with_display_name(db, "stripe", "Stripe")
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_catalog_server_row(
+            db, name="stripe", transport="stdio", command="python"
+        )
+        db.add(
+            UserMCPServer(
+                user_id=owner.id, mcpserver_id=server.id, is_owner=True, is_active=True
+            )
+        )
+        db.commit()
+        server_id = server.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
+            )
+            response = get_mcp_server(server_id, current_user=member, db=db)
+
+        # A downgrade, not an erasure -- the caller's team genuinely links
+        # this connector, so it must still be reachable and readable.
+        assert response.can_edit_global is False
+
+    def test_connecting_a_catalog_app_reports_no_edit_right_even_when_granted(self, db):
+        _make_catalog_app_with_display_name(db, "stripe", "Stripe")
+        user = _make_user(db, 1)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
+            )
+            response = connect_mcp_app(
+                "stripe",
+                MCPAppConnectRequest(),
+                current_user=user,
+                db=db,
+            )
+
+        assert response.can_edit_global is False
+
+    def test_the_list_endpoints_stand_in_row_reports_no_edit_right(self, db):
+        _make_catalog_app_with_display_name(
+            db,
+            "notion",
+            "Notion",
+            transport="streamable_http",
+            launch_config={
+                "url": "https://mcp.notion.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        )
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_catalog_server_row(
+            db,
+            name="notion",
+            transport="streamable_http",
+            command=None,
+            url="https://mcp.notion.com/mcp",
+            auth={"type": "mcp_oauth"},
+        )
+        db.add(
+            UserMCPServer(
+                user_id=owner.id, mcpserver_id=server.id, is_owner=True, is_active=True
+            )
+        )
+        db.commit()
+        server_id = server.id
+
+        def visibility_hook(_db, _user_id):
+            return {"mcp": {server_id}, "custom_api": set()}
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                },
+                visibility=visibility_hook,
+            )
+            responses = get_mcp_servers(current_user=member, db=db)
+
+        matches = [r for r in responses if r.id == server_id]
+        assert len(matches) == 1
+        assert matches[0].can_edit_global is False
+
+    def test_toggle_on_a_catalog_row_reports_no_edit_right(self, db):
+        _make_catalog_app_with_display_name(db, "stripe", "Stripe")
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_catalog_server_row(
+            db, name="stripe", transport="stdio", command="python"
+        )
+        db.add(
+            UserMCPServer(
+                user_id=owner.id, mcpserver_id=server.id, is_owner=True, is_active=True
+            )
+        )
+        db.add(
+            UserMCPServer(
+                user_id=member.id,
+                mcpserver_id=server.id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        server_id = server.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
+            )
+            response = toggle_mcp_server(server_id, current_user=member, db=db)
+
+        assert response.can_edit_global is False
+
+    def test_a_self_built_row_that_squats_a_catalog_id_is_not_team_editable_but_its_owner_still_edits_it(
+        self, db
+    ):
+        _make_catalog_app_with_display_name(db, "widget-sync", "Widget Sync")
+        creator = _make_user(db, 1)
+        teammate = _make_user(db, 2)
+        # Built directly, the way this test file builds every row -- not
+        # through connect/create, which would refuse this name outright
+        # (_is_reserved_catalog_name). This is the row create/rename block
+        # today, arriving here as if it predated the catalog app, or as if
+        # the reserved-name gate had a bug; the point of this test is what
+        # happens to a row in this shape once it exists, not how one could
+        # come to exist.
+        server = _make_catalog_server_row(
+            db,
+            name="widget-sync",
+            transport="stdio",
+            command="a-command-the-creator-chose",
+        )
+        db.add(
+            UserMCPServer(
+                user_id=creator.id,
+                mcpserver_id=server.id,
+                is_owner=True,
+                is_active=True,
+            )
+        )
+        db.commit()
+        server_id = server.id
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        # (a) A teammate editing it on the owner's behalf is refused --
+        # the catalog claims this name, and the row's own creation history
+        # is not something this schema records today.
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            with pytest.raises(HTTPException) as exc:
+                update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(description="edited by a teammate"),
+                    current_user=teammate,
+                    db=db,
+                )
+        assert exc.value.status_code == 403
+
+        # (b) Its own creator is unaffected -- is_owner decides the edit
+        # branch outright, before any verdict (downgraded or not) is read.
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            response = update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="edited by its creator"),
+                current_user=creator,
+                db=db,
+            )
+        assert response.can_edit_global is True
+
+    def test_team_stand_in_cannot_rewrite_a_renamed_builtin_oauth_catalog_row(self, db):
+        """A builtin_oauth row an administrator renamed away from the
+        catalog's display name still carries its ``app_id`` in ``auth`` --
+        the one shape ``_is_reserved_catalog_name`` (name-only) would miss,
+        which is why that function must not be the downgrade's predicate.
+        """
+        _make_catalog_app_with_display_name(db, "gmail", "Gmail")
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_catalog_server_row(
+            db,
+            name="team-mail-renamed",
+            transport="oauth",
+            command=None,
+            auth={"app_id": "gmail"},
+        )
+        db.add(
+            UserMCPServer(
+                user_id=owner.id, mcpserver_id=server.id, is_owner=True, is_active=True
+            )
+        )
+        db.commit()
+        server_id = server.id
+        hook = _sequenced_access_hook(ConnectorAccess(team_owned=True, can_edit=True))
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=hook)
+            with pytest.raises(HTTPException) as exc:
+                update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(description="edited by a teammate"),
+                    current_user=member,
+                    db=db,
+                )
+
+        assert exc.value.status_code == 403
+        assert "You do not have permission to edit this MCP server" in exc.value.detail
+        assert len(hook.calls) == 1
+
+
+class TestCatalogCheckQueryBudget:
+    """The per-request cost of the catalog downgrade: a deployment with no
+    granting verdict in a listing response pays nothing extra at all, and
+    one that does pays exactly one additional statement -- a single
+    catalog-keys SELECT shared across every row in the response -- not one
+    per row. Pinned across two population sizes, the same discipline
+    ``TestListEndpointAccessHookCallBudget`` in
+    test_mcp_reported_edit_permission.py already uses for the hook-call
+    count itself.
+    """
+
+    def _list_query_count(self, db, *, num_rows: int, grant_edit: bool) -> int:
+        suffix = f"{grant_edit}-{num_rows}"
+        owner = _make_user(db, 2000 + num_rows * 10 + (1 if grant_edit else 0))
+        caller = _make_user(db, 2050 + num_rows * 10 + (1 if grant_edit else 0))
+        stand_in = [
+            _make_owned_server(db, owner.id, name=f"budget-{suffix}-{i}")
+            for i in range(num_rows)
+        ]
+        # Read before the query listener attaches, matching the sibling
+        # class's own discipline: these ids were expired by their own
+        # setup commits, and reading them for the first time inside the
+        # measured window would count as a query this test's setup causes,
+        # not one the endpoint itself issues.
+        _ = caller.id
+        stand_in_ids = {s.id for s in stand_in}
+
+        def visibility_hook(_db, _user_id):
+            return {"mcp": set(stand_in_ids), "custom_api": set()}
+
+        def access_hook(hook_db, user_id, refs):
+            del hook_db, user_id
+            return {
+                ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+            }
+
+        queries: list[str] = []
+
+        def record_query(conn, cursor, statement, parameters, context, executemany):
+            del conn, cursor, parameters, context, executemany
+            queries.append(statement)
+
+        engine = db.get_bind()
+        event.listen(engine, "before_cursor_execute", record_query)
+        try:
+            with snapshot_connector_team_hooks():
+                set_connector_team_hooks(
+                    visibility=visibility_hook,
+                    access=access_hook if grant_edit else None,
+                )
+                get_mcp_servers(current_user=caller, db=db)
+        finally:
+            event.remove(engine, "before_cursor_execute", record_query)
+        return len(queries)
+
+    def test_a_deployment_with_no_access_hook_pays_nothing_regardless_of_row_count(
+        self, db
+    ):
+        counts = {
+            n: self._list_query_count(db, num_rows=n, grant_edit=False) for n in (2, 6)
+        }
+        assert counts[2] == counts[6], counts
+
+    def test_a_granting_access_hook_costs_exactly_one_more_query_regardless_of_row_count(
+        self, db
+    ):
+        without_hook = {
+            n: self._list_query_count(db, num_rows=n, grant_edit=False) for n in (2, 6)
+        }
+        with_hook = {
+            n: self._list_query_count(db, num_rows=n, grant_edit=True) for n in (2, 6)
+        }
+        assert with_hook[2] == with_hook[6], with_hook
+        assert with_hook[2] == without_hook[2] + 1, (with_hook, without_hook)
