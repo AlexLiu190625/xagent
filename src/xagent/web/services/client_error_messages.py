@@ -244,14 +244,28 @@ def connector_runtime_public_error(
     by passing an incidental exception. The reason filter itself lives in
     ``PublicErrorDetails``; this function only decides whether the exception
     is one we project at all.
+
+    This is not the only client-visible projection of this exception.
+    ``_raise_v1_connector_runtime_error`` (``web/api/v1/tasks.py``) projects it
+    for the SDK surface and ships ``to_public_error()["details"]`` whole,
+    ``connector_ref`` included. The two differ because their audiences do: that
+    one answers an API key held by a caller already authorized for the task,
+    while this one feeds ``broadcast_to_task``, which reaches every connection
+    under the task id including anonymous widget and share-link visitors.
+    Keep them as two projectors with one audience each; folding them into one
+    that takes the audience as an argument puts the width of the output behind
+    a caller-supplied flag, which fails open the first time it is passed wrong.
     """
 
     if not isinstance(error, ConnectorRuntimeError):
         return None
     details = error.details
     if not isinstance(details, dict):
-        # A details payload of the wrong shape means the exception instance
-        # itself is not trustworthy. Fall all the way back to the opaque
-        # failure rather than guessing which half of it is still readable.
+        # ``__init__`` normalizes details to a dict, but it is a plain public
+        # attribute anything can reassign afterwards. This is the last step
+        # before the wire, so verify rather than assume: a payload of the wrong
+        # shape means the instance is not trustworthy, and the safe answer is
+        # to fall all the way back to the opaque failure rather than guess
+        # which half of it is still readable.
         return None
     return error.code, PublicErrorDetails(reason=details.get("reason"))
