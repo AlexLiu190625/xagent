@@ -540,8 +540,9 @@ _SEAM_MODULES = ("xagent.web.api.custom_api", "xagent.web.api.mcp")
 
 # The one function that reaches the connector team seam and is still a
 # coroutine, with the fact that makes it impossible to convert. Its own
-# ``await`` is asserted below, so this entry cannot be claimed by a route
-# that does not actually need it.
+# await -- one that is not the seam call itself -- is asserted below, so
+# this entry cannot be claimed by a route whose coroutine is only the
+# seam's doing.
 _COROUTINE_EXEMPTIONS = {("xagent.web.api.mcp", "delete_mcp_server")}
 
 _SEAM_REACHING_FUNCTIONS = {
@@ -607,6 +608,23 @@ def _functions_reaching_the_connector_seam(module_name: str) -> dict[str, ast.AS
     return {name: functions[name] for name in reaching}
 
 
+def _seam_names_imported_by(node: ast.AST) -> set[str]:
+    """The names this function imports from ``connector_team_scope``.
+
+    Read off the function's own body because that is how every call site in
+    these two modules reaches the seam -- the same fact
+    ``_functions_reaching_the_connector_seam`` above is seeded on.
+    """
+    return {
+        alias.asname or alias.name
+        for child in ast.walk(node)
+        if isinstance(child, ast.ImportFrom)
+        and child.module is not None
+        and child.module.endswith("connector_team_scope")
+        for alias in child.names
+    }
+
+
 def test_the_discovery_of_seam_reaching_functions_is_not_vacuous():
     """Pins the enumeration itself, so the assertion below cannot pass by
     finding nothing."""
@@ -638,10 +656,27 @@ def test_no_function_that_reaches_the_connector_seam_is_a_coroutine():
                 continue
             if (module_name, name) in _COROUTINE_EXEMPTIONS:
                 # An exemption is only legitimate for a function that
-                # genuinely cannot be converted, so it must carry an await.
-                assert any(isinstance(child, ast.Await) for child in ast.walk(node)), (
-                    f"{module_name}.{name} is exempted from this invariant but has "
-                    "no await, so nothing stops it from being a plain def"
+                # genuinely cannot be converted, so it must carry an await
+                # that is NOT the seam call itself. A function whose only
+                # await IS the seam call is a coroutine of the seam's own
+                # making -- convertible by making that call synchronous --
+                # and "contains some await" would still wave it through.
+                seam_names = _seam_names_imported_by(node)
+                non_seam_awaits = [
+                    child
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Await)
+                    and not (
+                        isinstance(child.value, ast.Call)
+                        and isinstance(child.value.func, ast.Name)
+                        and child.value.func.id in seam_names
+                    )
+                ]
+                assert non_seam_awaits, (
+                    f"{module_name}.{name} is exempted from this invariant, but "
+                    "every await it has is a seam call -- the coroutine is the "
+                    "seam's own doing, so make that call synchronous instead of "
+                    "exempting the route"
                 )
                 continue
             offenders.append(f"{module_name}.{name}")
