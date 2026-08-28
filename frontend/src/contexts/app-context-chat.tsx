@@ -47,8 +47,9 @@ type TaskControlState =
 // The structured half of a terminal task_error frame. ``details`` holds at
 // most ``reason``: the server projects the exception through a whitelist
 // before broadcasting, because this frame reaches every connection on the
-// task, anonymous widget and share-link visitors included.
-type ConnectorRuntimeErrorState = {
+// task, anonymous widget and share-link visitors included. Nothing here is
+// connector-specific: the code is what decides whether a given frame is.
+type TaskErrorProjection = {
   code: string
   details: { reason?: string }
 }
@@ -103,7 +104,6 @@ const TASK_SCOPED_ACTION_TYPES = new Set<AppAction["type"]>([
   "UPSERT_STREAMING_FINAL_ANSWER",
   "ADD_TRACE_EVENT",
   "SET_CONTEXT_USAGE",
-  "SET_CONNECTOR_RUNTIME_ERROR",
   "SET_PLAN_MEMORY_INFO",
   "OPEN_FILE_PREVIEW",
 ])
@@ -939,13 +939,13 @@ const CONNECTOR_RUNTIME_MISSING_VALUE_CODES = new Set([
 ])
 
 // The frame deliberately carries no connector identity: its audience includes
-// anonymous widget and share-link visitors. The key name below is the only
-// connector-specific thing available here; anything more (which connector, the
-// declared type of each key) comes from the per-task requirements endpoint,
-// which is owner-only.
-const getConnectorRuntimeError = (
+// anonymous widget and share-link visitors. A missing key name parsed out of
+// the reason is the only connector-specific thing available here; anything
+// more (which connector, the declared type of each key) comes from the
+// per-task requirements endpoint, which is owner-only.
+const getTaskErrorProjection = (
   message: WebSocketMessage,
-): ConnectorRuntimeErrorState | null => {
+): TaskErrorProjection | null => {
   const root = message as unknown as Record<string, unknown>
   const data = isJsonRecord(message.data) ? message.data : null
   const code = getString(data?.code) || getString(root.code)
@@ -1124,11 +1124,6 @@ export interface AppState {
   isHistoryLoading: boolean
   // Current context-window usage from the latest LLM call, for the usage gauge.
   contextUsage: { tokens: number; threshold: number } | null
-  // The structured half of the last terminal connector-runtime failure on the
-  // viewed task. It holds only what the frame is allowed to carry; the
-  // connector identity and the declared key types come from the per-task
-  // requirements endpoint instead.
-  lastConnectorRuntimeError: ConnectorRuntimeErrorState | null
   sessionConversation: SessionConversationState
 }
 
@@ -1146,7 +1141,6 @@ type AppAction =
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "RESET_DAG_STATE" }
   | { type: "SET_CONTEXT_USAGE"; payload: { tokens: number; threshold: number } | null }
-  | { type: "SET_CONNECTOR_RUNTIME_ERROR"; payload: ConnectorRuntimeErrorState | null }
   | { type: "ADD_STEP"; payload: StepExecution }
   | { type: "UPDATE_STEP"; payload: { stepId: string; updates: Partial<StepExecution> } }
   | { type: "SET_STEPS"; payload: StepExecution[] }
@@ -1214,7 +1208,6 @@ const createInitialState = (): AppState => ({
   lastTaskUpdate: Date.now(),
   isHistoryLoading: false,
   contextUsage: null,
-  lastConnectorRuntimeError: null,
   sessionConversation: { ...initialSessionConversationState },
 })
 
@@ -1560,9 +1553,6 @@ function projectAppState(state: AppState, action: AppAction): AppState {
 
     case "SET_CONTEXT_USAGE":
       return { ...state, contextUsage: action.payload }
-
-    case "SET_CONNECTOR_RUNTIME_ERROR":
-      return { ...state, lastConnectorRuntimeError: action.payload }
 
     case "ADD_STEP":
       const newStep = action.payload
@@ -5723,7 +5713,7 @@ export function AppProvider({
           ? t(clientErrorTranslationKey(websocketErrorCode))
           : getWebSocketErrorMessage(message, trustLegacyErrorProse)
         const websocketTaskStatus = getWebSocketTaskStatus(message)
-        const connectorRuntimeError = getConnectorRuntimeError(message)
+        const taskErrorProjection = getTaskErrorProjection(message)
 
         if (websocketTaskStatus) {
           dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: websocketTaskStatus } })
@@ -5732,12 +5722,6 @@ export function AppProvider({
         if (shouldStopProcessingForTaskStatus(websocketTaskStatus)) {
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
-        if (connectorRuntimeError) {
-          dispatch({
-            type: "SET_CONNECTOR_RUNTIME_ERROR",
-            payload: connectorRuntimeError,
-          })
-        }
 
         // A missing runtime value is the one failure here the user can fix,
         // so name the key instead of relaying the server's sentence. The
@@ -5745,11 +5729,11 @@ export function AppProvider({
         // listed value, which is why the keyless wording has to exist.
         let connectorRuntimeBubble: string | null = null
         if (
-          connectorRuntimeError
-          && CONNECTOR_RUNTIME_MISSING_VALUE_CODES.has(connectorRuntimeError.code)
+          taskErrorProjection
+          && CONNECTOR_RUNTIME_MISSING_VALUE_CODES.has(taskErrorProjection.code)
         ) {
           const missingKey = missingRuntimeKeyFromReason(
-            connectorRuntimeError.details.reason
+            taskErrorProjection.details.reason
           )
           connectorRuntimeBubble = missingKey
             ? t('common.errors.connectorRuntimeMissingKey', { key: missingKey })
@@ -5758,9 +5742,21 @@ export function AppProvider({
         const errorBubbleContent = connectorRuntimeBubble
           ?? `${t('agent.logs.event.messages.errorPrefix')} ${websocketErrorMessage}`
 
-        // The dedup key stays the server's own message: it identifies the
-        // failure, and the rendered wording above is derived from it.
-        if (!isDuplicateMessageForViewedTask(websocketErrorMessage, "agent-error")) {
+        // The server sentence alone is too coarse to dedup on: one fixed
+        // string covers a whole error code, so two turns failing on two
+        // different missing keys share it while the bubbles above differ.
+        // Carry the code and reason as the occurrence identity so the second
+        // key still gets its own bubble.
+        const errorOccurrenceIdentity = taskErrorProjection
+          ? `${taskErrorProjection.code}:${taskErrorProjection.details.reason ?? ""}`
+          : undefined
+        if (
+          !isDuplicateMessageForViewedTask(
+            websocketErrorMessage,
+            "agent-error",
+            errorOccurrenceIdentity,
+          )
+        ) {
           dispatch({
             type: "ADD_MESSAGE",
             payload: {

@@ -5625,15 +5625,6 @@ describe("AppProvider websocket message routing", () => {
   })
 })
 
-function ConnectorRuntimeErrorProbe() {
-  const { state } = useApp()
-  return (
-    <div data-testid="connector-runtime-error">
-      {JSON.stringify(state.lastConnectorRuntimeError)}
-    </div>
-  )
-}
-
 describe("terminal error frames", () => {
   // Same reset as the routing suite above: the websocket harness ref and the
   // duplicate-message cache both outlive a single render, so without this the
@@ -5710,7 +5701,6 @@ describe("terminal error frames", () => {
       <AppProvider token="token">
         <SeedRunningTask />
         <StateProbe />
-        <ConnectorRuntimeErrorProbe />
       </AppProvider>
     )
 
@@ -5747,10 +5737,6 @@ describe("terminal error frames", () => {
     // No prefix: this wording replaces the server sentence rather than
     // decorating it.
     expect(bubble?.content).toBe("common.errors.connectorRuntimeMissingKey")
-    expect(JSON.parse(screen.getByTestId("connector-runtime-error").textContent || "null")).toEqual({
-      code: "missing_runtime_context",
-      details: { reason: "missing_context.auth_token" },
-    })
   })
 
   // A listed reason that is a bare enum value names no key, so the keyless
@@ -5760,7 +5746,6 @@ describe("terminal error frames", () => {
       <AppProvider token="token">
         <SeedRunningTask />
         <StateProbe />
-        <ConnectorRuntimeErrorProbe />
       </AppProvider>
     )
 
@@ -5798,7 +5783,6 @@ describe("terminal error frames", () => {
       <AppProvider token="token">
         <SeedRunningTask />
         <StateProbe />
-        <ConnectorRuntimeErrorProbe />
       </AppProvider>
     )
 
@@ -5827,10 +5811,6 @@ describe("terminal error frames", () => {
     expect(screen.getByTestId("messages").textContent).not.toContain(
       "common.errors.connectorRuntimeMissingKey"
     )
-    expect(JSON.parse(screen.getByTestId("connector-runtime-error").textContent || "null")).toEqual({
-      code: "missing_runtime_context",
-      details: {},
-    })
   })
 
   // connector_runtime_unavailable reports a server-side component being
@@ -5840,7 +5820,6 @@ describe("terminal error frames", () => {
       <AppProvider token="token">
         <SeedRunningTask />
         <StateProbe />
-        <ConnectorRuntimeErrorProbe />
       </AppProvider>
     )
 
@@ -5869,9 +5848,106 @@ describe("terminal error frames", () => {
     expect(screen.getByTestId("messages").textContent).not.toContain(
       "common.errors.connectorRuntimeMissing"
     )
-    expect(JSON.parse(screen.getByTestId("connector-runtime-error").textContent || "null")).toEqual({
-      code: "connector_runtime_unavailable",
-      details: { reason: "team_env_resolution_failed" },
+  })
+
+  // The server sends one fixed sentence per error code, so the message alone
+  // cannot tell two missing keys apart. Inside the 30-second dedup window the
+  // second bubble would vanish and the surviving one would name whichever key
+  // failed first -- one value standing for two facts, which is the shape this
+  // whole change exists to remove.
+  it("keeps both bubbles when two turns miss two different keys", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const frameForKey = (reason: string, timestamp: string) => ({
+      type: "task_error",
+      timestamp,
+      task_id: 1,
+      task: { id: 1, status: "failed" },
+      // Identical on both frames: _message_for_code returns one string per
+      // code and does not vary with the reason.
+      message: "Required connector runtime context is missing.",
+      error: "Required connector runtime context is missing.",
+      code: "missing_runtime_context",
+      details: { reason },
+    }) as TestWebSocketMessage
+
+    act(() => {
+      onMessage?.(frameForKey("missing_context.auth_token", "2026-05-27T05:00:02Z"))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "common.errors.connectorRuntimeMissingKey"
+      )
+    })
+
+    act(() => {
+      onMessage?.(frameForKey("missing_context.tenant_id", "2026-05-27T05:00:03Z"))
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      )
+      const bubbles = messages.filter((m: { content: string }) =>
+        m.content.includes("common.errors.connectorRuntimeMissingKey")
+      )
+      expect(bubbles).toHaveLength(2)
+    })
+  })
+
+  // The other half of the same contract: a genuine repeat of one failure is
+  // still collapsed, so the identity did not simply disable deduplication.
+  it("still collapses a repeat of the same missing key", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const frame = {
+      type: "task_error",
+      timestamp: "2026-05-27T05:00:02Z",
+      task_id: 1,
+      task: { id: 1, status: "failed" },
+      message: "Required connector runtime context is missing.",
+      error: "Required connector runtime context is missing.",
+      code: "missing_runtime_context",
+      details: { reason: "missing_context.auth_token" },
+    } as TestWebSocketMessage
+
+    act(() => {
+      onMessage?.(frame)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "common.errors.connectorRuntimeMissingKey"
+      )
+    })
+
+    act(() => {
+      onMessage?.({ ...frame, timestamp: "2026-05-27T05:00:03Z" })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      )
+      const bubbles = messages.filter((m: { content: string }) =>
+        m.content.includes("common.errors.connectorRuntimeMissingKey")
+      )
+      expect(bubbles).toHaveLength(1)
     })
   })
 })
