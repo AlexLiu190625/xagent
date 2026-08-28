@@ -1605,9 +1605,13 @@ def _resolve_mcp_server_for_request(
     if user_mcp is None:
         user_mcp = _TeamOwnedUserMCP(int(user_id))
 
-    # Downgraded after the 404 above, not before it: a team member must still
-    # reach a catalog connector their team links, and read it. What they must
-    # not get is the edit right on it.
+    # Placed after the 404 above rather than before it. Today that ordering
+    # is belt-and-braces: this helper never turns a verdict into None, it only
+    # clears can_edit, so the 404 test above sees a non-None verdict either
+    # way. The ordering becomes load-bearing the moment the helper starts
+    # returning None for a row -- ahead of the 404, a catalog connector the
+    # caller's team genuinely links would read as "not found" to that member
+    # instead of as read-only.
     access = _team_access_for_shared_row(db, cast(MCPServer, server), access)
 
     return user_mcp, cast(MCPServer, server), access
@@ -1770,7 +1774,8 @@ def _catalog_app_keys(app: dict) -> list[str]:
     after the display name (_ensure_user_mcp_server). Single-sourced so every
     caller asking "which row is this app's" — the connected-state and shared-row
     lookups, the names a custom server may not take, the rows the connector
-    listing must not re-emit, and the rows that carry a platform key — cannot
+    listing must not re-emit, the rows that carry a platform key, and the rows
+    a team verdict may not grant edit on — cannot
     drift apart; one such drift is exactly what #1346 was.
 
     Normalized keys only. The raw id/name strings stay in use where a value

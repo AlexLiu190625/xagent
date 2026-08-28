@@ -1321,8 +1321,10 @@ class TestCatalogRowsAreNeverTeamEditable:
             )
             response = get_mcp_server(server_id, current_user=member, db=db)
 
-        # A downgrade, not an erasure -- the caller's team genuinely links
-        # this connector, so it must still be reachable and readable.
+        # What this pins is "reachable and readable, with no edit right":
+        # reaching this assertion at all means no 404 was raised. It does not
+        # distinguish clearing can_edit from dropping the verdict entirely --
+        # past the 404 test above, those two are indistinguishable here.
         assert response.can_edit_global is False
 
     def test_connecting_a_catalog_app_reports_no_edit_right_even_when_granted(self, db):
