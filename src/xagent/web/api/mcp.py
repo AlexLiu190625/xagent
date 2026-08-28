@@ -1798,8 +1798,10 @@ def _server_catalog_keys(server: MCPServer) -> list[str]:
     against catalog *ids*, so one whose provider happens to equal some app's id
     is skipped even if it belongs to another app. Kept on purpose, because the
     catalog branch claims such a row by provider too (_is_oauth_server_for_app)
-    — a key this misses is a #1346 duplicate, while a key it over-matches only
-    moves a legacy row to the Remote tab, still editable via /api/mcp/servers.
+    — a key this misses is a #1346 duplicate, while a key it over-matches also
+    loses its team edit right through _team_access_for_shared_row; the row's
+    own owner is unaffected, since is_owner short-circuits that check in
+    _check_mcp_permission before any verdict is read.
     """
     if _normalize_app_key(server.transport) != "oauth":
         return _app_lookup_keys(server.name)
