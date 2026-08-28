@@ -104,6 +104,7 @@ from ..services.client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
     CLIENT_SAFE_VALIDATION_ERROR,
     ClientErrorCode,
+    PublicErrorDetails,
     client_error_message,
 )
 from ..services.db_runtime import (
@@ -323,10 +324,33 @@ def _task_error_payload(
 def create_terminal_task_error_event(
     task_id: int,
     message: str,
+    *,
+    code: str | None = None,
+    details: PublicErrorDetails | None = None,
 ) -> dict[str, Any]:
-    """Shape an error event after the exact lease owner commits FAILED."""
+    """Shape an error event after the exact lease owner commits FAILED.
 
-    return {
+    ``code`` and ``details`` are written only when both are supplied, so a
+    caller that passes neither still gets the same six-key frame. ``details``
+    is accepted as ``PublicErrorDetails`` itself and nothing else -- not a
+    subclass -- because that class's ``__post_init__`` is where the reason
+    whitelist lives.
+    """
+
+    # Python annotations are not enforced at run time, so the mypy gate on the
+    # signature above is not the whole door: a caller that routes through Any
+    # (a dict from JSON, a **kwargs splat) type-checks clean and would reach
+    # to_wire() as an AttributeError deep in this function. Name the contract
+    # here instead.
+    #
+    # `type(...) is`, not isinstance: a frozen dataclass can be subclassed, and
+    # a subclass that overrides to_wire() without reading self.reason passes
+    # both isinstance and mypy while bypassing the whitelist in __post_init__.
+    # Only the class itself carries that guarantee.
+    if details is not None and type(details) is not PublicErrorDetails:
+        raise TypeError("details must be a PublicErrorDetails")
+
+    event: dict[str, Any] = {
         "type": "task_error",
         "message": message,
         "task_id": task_id,
@@ -337,6 +361,10 @@ def create_terminal_task_error_event(
         "error": message,
         "timestamp": datetime.now(timezone.utc).timestamp(),
     }
+    if code is not None and details is not None:
+        event["code"] = code
+        event["details"] = details.to_wire()
+    return event
 
 
 def _client_message_id(value: Any) -> str | None:
