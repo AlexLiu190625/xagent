@@ -59,6 +59,7 @@ from sqlalchemy.orm import Session
 from ...core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from ...core.execution_scope import resolve_execution_scope
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
+from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..models.task import Task, TaskStatus
 from .assistant_history_safety import (
     CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
@@ -73,6 +74,9 @@ from .chat_history_service import (
 )
 from .client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
+    PublicErrorDetails,
+    connector_runtime_client_message,
+    connector_runtime_public_error,
     required_mcp_unavailable_client_message,
 )
 from .db_runtime import (
@@ -1793,6 +1797,8 @@ def _schedule_bg(
         client_history_error_message: str | None = None
         client_history_message_type = TASK_FAILURE_MESSAGE_TYPE
         broadcast_error_message: str | None = None
+        broadcast_error_code: str | None = None
+        broadcast_error_details: PublicErrorDetails | None = None
         defer_settlement_to_ttl_recovery = False
         skip_delivery_reconciliation = False
         # Positive evidence for finalize's delivery target: once
@@ -1961,6 +1967,33 @@ def _schedule_bg(
                                 fallback=CLIENT_SAFE_TASK_FAILURE,
                             )
                         )
+                    elif isinstance(setup_or_run_err, ConnectorRuntimeError):
+                        # This exception's message is a curated public-safe
+                        # sentence naming what the connector still needs, so
+                        # the client gets it instead of the opaque fallback.
+                        # ``code`` and the whitelisted ``reason`` ride along on
+                        # the frame; the projector decides what is wire-safe.
+                        settlement_error = str(setup_or_run_err)
+                        client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+                        broadcast_error_message = connector_runtime_client_message(
+                            setup_or_run_err
+                        )
+                        broadcast_error_code, broadcast_error_details = (
+                            connector_runtime_public_error(setup_or_run_err)
+                            or (None, None)
+                        )
+                        # Operators read the raw details, not the projection:
+                        # the connector identity is useful here and does not
+                        # leave the server, while the broadcast frame carries
+                        # neither it nor any reason that was filtered out.
+                        logger.error(
+                            "task_id=%s component=connector-runtime code=%s "
+                            "reason=%s connector=%s",
+                            task_id,
+                            setup_or_run_err.code,
+                            setup_or_run_err.details.get("reason"),
+                            setup_or_run_err.details.get("connector_ref"),
+                        )
                     else:
                         settlement_error = (
                             "setup/run error: "
@@ -2033,6 +2066,8 @@ def _schedule_bg(
                                     create_terminal_task_error_event(
                                         task_id,
                                         broadcast_error_message,
+                                        code=broadcast_error_code,
+                                        details=broadcast_error_details,
                                     ),
                                     task_id,
                                 )

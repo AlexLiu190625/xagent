@@ -15,6 +15,7 @@ require an actual agent runtime (``execute_task_background``).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
@@ -39,7 +40,10 @@ from tests.web.pool_contention_shared import (
 )
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
 from xagent.core.tools.adapters.vibe.config import RequiredMCPUnavailableError
-from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
+from xagent.core.tools.adapters.vibe.connector_runtime import (
+    ConnectorRef,
+    ConnectorRuntimeError,
+)
 from xagent.web.models import database as database_module
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
@@ -65,6 +69,10 @@ from xagent.web.services.chat_history_service import (
     claim_user_message_delivery,
     inspect_user_message_delivery,
     mark_user_message_delivery,
+)
+from xagent.web.services.client_error_messages import (
+    CLIENT_SAFE_TASK_FAILURE,
+    PublicErrorDetails,
 )
 from xagent.web.services.connector_runtime import (
     get_ephemeral_runtime_values,
@@ -3842,3 +3850,252 @@ def test_reconcile_finalized_delivery_noop_on_already_terminal_row(
     )
 
     assert _delivery_status(db_session, "turn-term") == seeded_status
+
+
+# ---------------------------------------------------------------------------
+# Connector-runtime failures reach the client as a structured, wire-safe frame
+# ---------------------------------------------------------------------------
+
+
+CONNECTOR_RUNTIME_CODES = [
+    "missing_runtime_context",
+    "runtime_secret_unavailable",
+    "scheduled_secret_unavailable",
+]
+
+
+@contextmanager
+def _captured_terminal_broadcast(setup_or_run_error: BaseException, db_session):
+    """Drive one owned run to failure and hand back the broadcast frames."""
+
+    from xagent.web.api.websocket import background_task_manager
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    task_id = int(task.id)
+    lease = TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a")
+    frames: list[dict] = []
+
+    async def broadcast(event, *_args, **_kwargs) -> None:
+        frames.append(event)
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            return_value=MagicMock(),
+        ),
+        patch.object(
+            task_orchestrator_module,
+            "resolve_execution_scope",
+            return_value=None,
+            create=True,
+        ),
+        patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=AsyncMock(side_effect=setup_or_run_error),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.settle_task_lease_isolated",
+            return_value=True,
+        ),
+        patch(
+            "xagent.web.api.websocket.manager",
+            MagicMock(broadcast_to_task=AsyncMock(side_effect=broadcast)),
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        yield task_id, frames
+
+
+async def _run_failing_turn(task_id: int, user_id: int, source) -> None:
+    await _schedule_bg(
+        task_id=task_id,
+        task_owner_user_id=user_id,
+        task_source=source,
+        payload=TaskTurnPayload("hello"),
+        force_fresh=False,
+        context=None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", CONNECTOR_RUNTIME_CODES)
+async def test_connector_runtime_failure_broadcasts_its_safe_message(
+    db_session,
+    code: str,
+) -> None:
+    """The curated sentence replaces the opaque task-failure fallback."""
+
+    safe_message = f"Required connector runtime input is missing ({code})."
+    error = ConnectorRuntimeError(
+        code,
+        safe_message,
+        details={"reason": "missing_context.auth_token"},
+    )
+
+    with _captured_terminal_broadcast(error, db_session) as (task_id, frames):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    assert [frame["message"] for frame in frames] == [safe_message]
+    assert frames[0]["error"] == safe_message
+    assert frames[0]["code"] == code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("secret-token-xyz"),
+        KeyError("secret-token-xyz"),
+        RuntimeError("secret-token-xyz"),
+    ],
+    ids=["value-error", "key-error", "runtime-error"],
+)
+async def test_incidental_failure_still_redacts(
+    db_session,
+    error: BaseException,
+) -> None:
+    """Only the connector-runtime class earns the new branch."""
+
+    with _captured_terminal_broadcast(error, db_session) as (task_id, frames):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    assert len(frames) == 1
+    assert frames[0]["message"] == CLIENT_SAFE_TASK_FAILURE
+    assert frames[0]["error"] == CLIENT_SAFE_TASK_FAILURE
+    assert "secret-token-xyz" not in json.dumps(frames[0])
+    assert "code" not in frames[0]
+    assert "details" not in frames[0]
+
+
+@pytest.mark.asyncio
+async def test_connector_runtime_frame_details_shape(db_session) -> None:
+    """Whatever the raise site attached, only ``reason`` can reach the wire."""
+
+    error = ConnectorRuntimeError(
+        "missing_runtime_context",
+        "Required connector runtime context is missing.",
+        details={
+            "reason": "missing_context.auth_token",
+            "internal_sql": "SELECT value FROM task_connector_runtime_contexts",
+            "raw_value": "tenant-secret",
+            "connector_ref": {"connector_type": "mcp", "connector_id": 7},
+        },
+    )
+
+    with _captured_terminal_broadcast(error, db_session) as (task_id, frames):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    assert set(frames[0]["details"]) <= {"reason"}
+    assert frames[0]["details"] == {"reason": "missing_context.auth_token"}
+
+
+@pytest.mark.asyncio
+async def test_connector_runtime_frame_never_carries_connector_ref(
+    db_session,
+) -> None:
+    """The frame's audience includes anonymous widget and share visitors.
+
+    The three assertions are structural on purpose. An earlier form of this
+    test also asserted the connector's numeric id was absent from the
+    serialized frame, which goes red on any fixture where that id collides
+    with the task id or a timestamp digit.
+    """
+
+    error = ConnectorRuntimeError(
+        "missing_runtime_context",
+        "Required connector runtime context is missing.",
+        connector_ref=ConnectorRef(connector_type="mcp", connector_id=7),
+        details={"reason": "missing_context.auth_token"},
+    )
+
+    with _captured_terminal_broadcast(error, db_session) as (task_id, frames):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    frame = frames[0]
+    assert set(frame) == {
+        "type",
+        "message",
+        "task_id",
+        "task",
+        "error",
+        "timestamp",
+        "code",
+        "details",
+    }
+    assert set(frame["details"]) <= {"reason"}
+    serialized = json.dumps(frame)
+    assert "connector_ref" not in serialized
+    assert "connector_id" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_connector_runtime_frame_reason_matches_direct_construction(
+    db_session,
+) -> None:
+    """End to end, the frame carries exactly what the type would produce."""
+
+    error = ConnectorRuntimeError(
+        "missing_runtime_context",
+        "Required connector runtime context is missing.",
+        details={"reason": "missing_context.auth_token"},
+    )
+
+    with _captured_terminal_broadcast(error, db_session) as (task_id, frames):
+        task = db_session.query(Task).filter(Task.id == task_id).one()
+        await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    assert (
+        frames[0]["details"]
+        == PublicErrorDetails(reason="missing_context.auth_token").to_wire()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", CONNECTOR_RUNTIME_CODES)
+async def test_connector_runtime_failure_logs_missing_key(
+    db_session,
+    caplog,
+    code: str,
+) -> None:
+    """Operators read the raw details, connector identity included."""
+
+    error = ConnectorRuntimeError(
+        code,
+        "Required connector runtime context is missing.",
+        connector_ref=ConnectorRef(connector_type="mcp", connector_id=7),
+        details={"reason": "missing_context.auth_token"},
+    )
+
+    with caplog.at_level(logging.ERROR):
+        with _captured_terminal_broadcast(error, db_session) as (task_id, frames):
+            task = db_session.query(Task).filter(Task.id == task_id).one()
+            await _run_failing_turn(task_id, int(task.user_id), task.source)
+
+    structured = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and "component=connector-runtime" in record.getMessage()
+    ]
+    assert len(structured) == 1
+    assert f"code={code}" in structured[0]
+    assert "reason=missing_context.auth_token" in structured[0]
+    assert "connector=" in structured[0]
+    assert "'connector_id': 7" in structured[0]
