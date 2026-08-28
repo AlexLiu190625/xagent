@@ -657,6 +657,17 @@ def delete_custom_api(
     # matches the PUT's own lock: the row this transaction holds is the one
     # the deletion below acts on, not whatever the relationship read above
     # happened to see.
+    #
+    # This statement orders THIS repository's two tables and nothing else. A
+    # connector team hook writes its own tables, which this lock does not
+    # cover, and the two routes reach it in opposite orders relative to this
+    # lock: the PUT takes the lock above and calls rename_team_connector
+    # afterwards, while this route calls delete_team_connector before taking
+    # the lock at all. So an installing application whose hooks lock a row of
+    # its own can still deadlock against a concurrent edit/delete pair on the
+    # same connector, and no ordering statement inside this repository can
+    # prevent that -- the hook side has to take its rows in an order
+    # compatible with this one, and only the application can arrange that.
     locked_api = (
         db.query(CustomApi)
         .filter(CustomApi.id == api_id)
