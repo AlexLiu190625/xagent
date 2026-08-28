@@ -66,6 +66,8 @@ const zh = {
     errors: {
       unknown: "未知错误",
       taskFailed: "出了点问题，请重试。",
+      connectorRuntimeMissingKey: "这个连接器还需要你提供 “{key}”。",
+      connectorRuntimeMissing: "这个连接器需要额外的运行时输入，请补充后重试。",
     },
   },
   voiceInput: {

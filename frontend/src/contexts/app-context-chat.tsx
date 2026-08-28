@@ -44,6 +44,15 @@ type TaskControlState =
   | "completed"
   | "failed"
 
+// The structured half of a terminal task_error frame. ``details`` holds at
+// most ``reason``: the server projects the exception through a whitelist
+// before broadcasting, because this frame reaches every connection on the
+// task, anonymous widget and share-link visitors included.
+type ConnectorRuntimeErrorState = {
+  code: string
+  details: { reason?: string }
+}
+
 type TaskControlEnvelope = {
   isStateEvent: boolean
   taskId?: number
@@ -94,6 +103,7 @@ const TASK_SCOPED_ACTION_TYPES = new Set<AppAction["type"]>([
   "UPSERT_STREAMING_FINAL_ANSWER",
   "ADD_TRACE_EVENT",
   "SET_CONTEXT_USAGE",
+  "SET_CONNECTOR_RUNTIME_ERROR",
   "SET_PLAN_MEMORY_INFO",
   "OPEN_FILE_PREVIEW",
 ])
@@ -918,6 +928,47 @@ const getWebSocketErrorCode = (message: WebSocketMessage) => {
   return errorCode.present ? readClientErrorCode(errorCode.value) : null
 }
 
+// The task_error codes that mean a connector is still missing a runtime value
+// the user can supply. The other connector-runtime code
+// (connector_runtime_unavailable) reports a server-side component being down,
+// which the user cannot act on, so it keeps the generic failure wording.
+const CONNECTOR_RUNTIME_MISSING_VALUE_CODES = new Set([
+  "missing_runtime_context",
+  "runtime_secret_unavailable",
+  "scheduled_secret_unavailable",
+])
+
+// The frame deliberately carries no connector identity: its audience includes
+// anonymous widget and share-link visitors. The key name below is the only
+// connector-specific thing available here; anything more (which connector, the
+// declared type of each key) comes from the per-task requirements endpoint,
+// which is owner-only.
+const getConnectorRuntimeError = (
+  message: WebSocketMessage,
+): ConnectorRuntimeErrorState | null => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  const code = getString(data?.code) || getString(root.code)
+  if (!code) return null
+  const details = isJsonRecord(data?.details)
+    ? data.details
+    : isJsonRecord(root.details)
+      ? root.details
+      : null
+  const reason = getString(details?.reason)
+  return { code, details: reason ? { reason } : {} }
+}
+
+// A reason is either a bare enum value or "<prefix>.<declared key name>". Only
+// the second form names a key the user has to fill in.
+const missingRuntimeKeyFromReason = (reason: string | undefined): string | null => {
+  if (!reason) return null
+  const separator = reason.lastIndexOf(".")
+  if (separator < 0) return null
+  const key = reason.slice(separator + 1)
+  return key || null
+}
+
 const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | null => {
   const root = message as unknown as Record<string, unknown>
   const data = isJsonRecord(message.data) ? message.data : null
@@ -1073,6 +1124,11 @@ export interface AppState {
   isHistoryLoading: boolean
   // Current context-window usage from the latest LLM call, for the usage gauge.
   contextUsage: { tokens: number; threshold: number } | null
+  // The structured half of the last terminal connector-runtime failure on the
+  // viewed task. It holds only what the frame is allowed to carry; the
+  // connector identity and the declared key types come from the per-task
+  // requirements endpoint instead.
+  lastConnectorRuntimeError: ConnectorRuntimeErrorState | null
   sessionConversation: SessionConversationState
 }
 
@@ -1090,6 +1146,7 @@ type AppAction =
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "RESET_DAG_STATE" }
   | { type: "SET_CONTEXT_USAGE"; payload: { tokens: number; threshold: number } | null }
+  | { type: "SET_CONNECTOR_RUNTIME_ERROR"; payload: ConnectorRuntimeErrorState | null }
   | { type: "ADD_STEP"; payload: StepExecution }
   | { type: "UPDATE_STEP"; payload: { stepId: string; updates: Partial<StepExecution> } }
   | { type: "SET_STEPS"; payload: StepExecution[] }
@@ -1157,6 +1214,7 @@ const createInitialState = (): AppState => ({
   lastTaskUpdate: Date.now(),
   isHistoryLoading: false,
   contextUsage: null,
+  lastConnectorRuntimeError: null,
   sessionConversation: { ...initialSessionConversationState },
 })
 
@@ -1502,6 +1560,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
 
     case "SET_CONTEXT_USAGE":
       return { ...state, contextUsage: action.payload }
+
+    case "SET_CONNECTOR_RUNTIME_ERROR":
+      return { ...state, lastConnectorRuntimeError: action.payload }
 
     case "ADD_STEP":
       const newStep = action.payload
@@ -5662,6 +5723,7 @@ export function AppProvider({
           ? t(clientErrorTranslationKey(websocketErrorCode))
           : getWebSocketErrorMessage(message, trustLegacyErrorProse)
         const websocketTaskStatus = getWebSocketTaskStatus(message)
+        const connectorRuntimeError = getConnectorRuntimeError(message)
 
         if (websocketTaskStatus) {
           dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: websocketTaskStatus } })
@@ -5670,16 +5732,48 @@ export function AppProvider({
         if (shouldStopProcessingForTaskStatus(websocketTaskStatus)) {
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
+        if (connectorRuntimeError) {
+          dispatch({
+            type: "SET_CONNECTOR_RUNTIME_ERROR",
+            payload: connectorRuntimeError,
+          })
+        }
 
+        // A missing runtime value is the one failure here the user can fix,
+        // so name the key instead of relaying the server's sentence. The
+        // reason is dropped by the server whitelist whenever it is not a
+        // listed value, which is why the keyless wording has to exist.
+        let connectorRuntimeBubble: string | null = null
+        if (
+          connectorRuntimeError
+          && CONNECTOR_RUNTIME_MISSING_VALUE_CODES.has(connectorRuntimeError.code)
+        ) {
+          const missingKey = missingRuntimeKeyFromReason(
+            connectorRuntimeError.details.reason
+          )
+          connectorRuntimeBubble = missingKey
+            ? t('common.errors.connectorRuntimeMissingKey', { key: missingKey })
+            : t('common.errors.connectorRuntimeMissing')
+        }
+        const errorBubbleContent = connectorRuntimeBubble
+          ?? `${t('agent.logs.event.messages.errorPrefix')} ${websocketErrorMessage}`
+
+        // The dedup key stays the server's own message: it identifies the
+        // failure, and the rendered wording above is derived from it.
         if (!isDuplicateMessageForViewedTask(websocketErrorMessage, "agent-error")) {
           dispatch({
             type: "ADD_MESSAGE",
             payload: {
               id: generateMessageId("msg-error"),
               role: "assistant",
-              content: `${t('agent.logs.event.messages.errorPrefix')} ${websocketErrorMessage}`,
+              content: errorBubbleContent,
               timestamp: message.timestamp,
               status: "failed",
+              // Terminal failure IS this turn's result. Without the flag the
+              // conversation panel (which only shows user / isResult /
+              // system-notice messages) filters the bubble out and falls back
+              // to a virtual "unknown error" placeholder until reload.
+              isResult: true,
             },
           })
         }

@@ -5624,3 +5624,254 @@ describe("AppProvider websocket message routing", () => {
     expect(defaultLink).not.toHaveAttribute("rel")
   })
 })
+
+function ConnectorRuntimeErrorProbe() {
+  const { state } = useApp()
+  return (
+    <div data-testid="connector-runtime-error">
+      {JSON.stringify(state.lastConnectorRuntimeError)}
+    </div>
+  )
+}
+
+describe("terminal error frames", () => {
+  // Same reset as the routing suite above: the websocket harness ref and the
+  // duplicate-message cache both outlive a single render, so without this the
+  // second test in this block would keep talking to the first one's provider.
+  beforeEach(() => {
+    webSocketOptions.current = null
+    webSocketOptions.all = []
+    sessionControls = null
+    wsHarness.isConnected = true
+    apiRequestMock.mockReset()
+    routerPushMock.mockReset()
+    sendRawMessageMock.mockReset()
+    sendRawMessageMock.mockReturnValue("sent")
+    sendChatMessageMock.mockReset()
+    sendChatMessageMock.mockResolvedValue({
+      client_message_id: "turn-optimistic",
+      turn_id: "turn-optimistic",
+    })
+    localStorage.clear()
+    ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+      .clearDuplicateMessageCache?.()
+  })
+
+  afterEach(() => {
+    cleanup()
+    localStorage.clear()
+  })
+
+  // The conversation panel renders only user / isResult / system-notice
+  // messages. Without the flag the bubble is filtered out and the UI falls
+  // back to a generic "unknown error" placeholder until the page reloads.
+  it.each(["error", "task_error"])(
+    "flags the %s bubble as the turn's result",
+    async (frameType) => {
+      render(
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <StateProbe />
+        </AppProvider>
+      )
+
+      const onMessage = webSocketOptions.current?.onMessage
+      expect(onMessage).toBeDefined()
+
+      act(() => {
+        onMessage?.({
+          type: frameType,
+          timestamp: "2026-05-27T05:00:02Z",
+          task_id: 1,
+          task: { id: 1, status: "failed" },
+          message: "Task execution failed.",
+          error: "Task execution failed.",
+        } as TestWebSocketMessage)
+      })
+
+      await waitFor(() => {
+        expect(screen.getByTestId("messages").textContent).toContain(
+          "Task execution failed."
+        )
+      })
+
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      )
+      const bubble = messages.find((m: { content: string }) =>
+        m.content.includes("Task execution failed.")
+      )
+      expect(bubble?.isResult).toBe(true)
+    }
+  )
+
+  it("names the missing connector key instead of relaying the server sentence", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+        <ConnectorRuntimeErrorProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Required connector runtime context is missing.",
+        error: "Required connector runtime context is missing.",
+        code: "missing_runtime_context",
+        details: { reason: "missing_context.auth_token" },
+      } as TestWebSocketMessage)
+    })
+
+    // The i18n mock in this file returns the key and drops the variables, so
+    // the assertion is on which wording was chosen, not on the rendered key
+    // name. The reason the key name is parsed from is asserted below.
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "common.errors.connectorRuntimeMissingKey"
+      )
+    })
+
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    const bubble = messages.find((m: { content: string }) =>
+      m.content.includes("common.errors.connectorRuntimeMissingKey")
+    )
+    expect(bubble?.isResult).toBe(true)
+    // No prefix: this wording replaces the server sentence rather than
+    // decorating it.
+    expect(bubble?.content).toBe("common.errors.connectorRuntimeMissingKey")
+    expect(JSON.parse(screen.getByTestId("connector-runtime-error").textContent || "null")).toEqual({
+      code: "missing_runtime_context",
+      details: { reason: "missing_context.auth_token" },
+    })
+  })
+
+  // A listed reason that is a bare enum value names no key, so the keyless
+  // wording is chosen even though the code is a missing-value one.
+  it("falls back to the generic wording when the reason names no key", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+        <ConnectorRuntimeErrorProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Connector secrets are unavailable.",
+        error: "Connector secrets are unavailable.",
+        code: "runtime_secret_unavailable",
+        details: { reason: "not_provided" },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "common.errors.connectorRuntimeMissing"
+      )
+    })
+
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "common.errors.connectorRuntimeMissingKey"
+    )
+  })
+
+  // The server drops a reason it cannot place on its whitelist, so the
+  // keyless wording has to exist and the frame still carries the code.
+  it("falls back to the generic wording when the reason was dropped", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+        <ConnectorRuntimeErrorProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Required connector runtime context is missing.",
+        error: "Required connector runtime context is missing.",
+        code: "missing_runtime_context",
+        details: {},
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "common.errors.connectorRuntimeMissing"
+      )
+    })
+
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "common.errors.connectorRuntimeMissingKey"
+    )
+    expect(JSON.parse(screen.getByTestId("connector-runtime-error").textContent || "null")).toEqual({
+      code: "missing_runtime_context",
+      details: {},
+    })
+  })
+
+  // connector_runtime_unavailable reports a server-side component being
+  // down, which the user cannot act on, so it keeps the generic prefix.
+  it("keeps the plain failure wording for a non-missing-value code", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+        <ConnectorRuntimeErrorProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Connector runtime is unavailable.",
+        error: "Connector runtime is unavailable.",
+        code: "connector_runtime_unavailable",
+        details: { reason: "team_env_resolution_failed" },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Connector runtime is unavailable."
+      )
+    })
+
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "common.errors.connectorRuntimeMissing"
+    )
+    expect(JSON.parse(screen.getByTestId("connector-runtime-error").textContent || "null")).toEqual({
+      code: "connector_runtime_unavailable",
+      details: { reason: "team_env_resolution_failed" },
+    })
+  })
+})
