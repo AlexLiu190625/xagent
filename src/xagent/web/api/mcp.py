@@ -3239,10 +3239,41 @@ def update_mcp_server(
             )
 
         user_mcp, server = result
-        old_name = str(server.name)
         can_edit_global = _check_mcp_permission(
             user_mcp, getattr(current_user, "is_admin", False), require="edit"
         )
+
+        # A second, single-table lock on the definition row, taken before any
+        # tamper check or config build below reads or mutates it. The read
+        # above is a two-table join and cannot itself lock just this table;
+        # this is a fresh statement, so a row deleted between the two still
+        # yields None here (handled as the same 404) rather than surfacing
+        # as an unrelated error out of the write path below.
+        # ``populate_existing()`` makes the locked row the one the rest of
+        # this route reads: without it the already-identity-mapped instance
+        # from the join above would be returned unrefreshed, and every field
+        # below would still be the pre-lock snapshot.
+        locked_server = (
+            db.query(MCPServer)
+            .filter(MCPServer.id == server_id)
+            .populate_existing()
+            .with_for_update()
+            .first()
+        )
+        if locked_server is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
+            )
+        server = locked_server
+
+        # Read only after the lock: rename_team_connector's "old" argument
+        # must be the name this transaction actually holds locked, not
+        # whatever was there at the pre-lock read above -- a concurrent
+        # committed rename in between would otherwise make this stale, and
+        # the rewrite below would then look for a name that no longer
+        # exists anywhere, leaving the previous renamer's selectors
+        # dangling with no error.
+        old_name = str(server.name)
 
         # Non-owners may not touch the shared global config (env, command, etc.);
         # they only get to set their own per-user env override below. Reject a

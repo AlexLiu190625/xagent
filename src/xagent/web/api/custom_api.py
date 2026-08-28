@@ -7,7 +7,7 @@ in the web application.
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -286,7 +286,7 @@ async def get_custom_api(
 
 
 @custom_api_router.put("/{api_id}", response_model=CustomApiResponse)
-async def update_custom_api(
+def update_custom_api(
     api_id: int,
     api_data: CustomApiUpdate,
     current_user: User = Depends(get_current_user),
@@ -315,8 +315,43 @@ async def update_custom_api(
             detail="You do not have permission to edit this Custom API",
         )
 
-    api = user_api.custom_api
+    # A second, single-table lock on the definition row, taken before any
+    # field below reads or mutates it. The read above comes through the
+    # personal link row's relationship and cannot itself lock just this
+    # table; this is a fresh statement, so a row deleted between the two
+    # still yields None here (handled as the same 404) rather than
+    # surfacing as an unrelated error out of the write path below.
+    # ``populate_existing()`` makes the locked row the one the rest of this
+    # route reads: without it the already-identity-mapped instance the
+    # relationship loaded would be returned unrefreshed, and every field
+    # below would still be the pre-lock snapshot.
+    locked_api = (
+        db.query(CustomApi)
+        .filter(CustomApi.id == api_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
+    if locked_api is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Custom API not found",
+        )
+    api = locked_api
+
+    # Read only after the lock: rename_team_connector's "old" argument must
+    # be the name this transaction actually holds locked, not whatever the
+    # pre-lock read above saw -- a concurrent committed rename in between
+    # would otherwise make this stale, and the rewrite below would look for
+    # a name that no longer exists anywhere, leaving the previous renamer's
+    # selectors dangling with no error.
     old_name = str(api.name)
+
+    # The row's declared type from here on is loosened for mypy's sake: the
+    # column-typed attributes below (name, description, env, ...) are all
+    # mutated directly by this route, exactly as they were when this local
+    # came off the relationship instead of off the locked query.
+    mutable_api = cast(Any, api)
 
     # Check name uniqueness if name is changed
     if api_data.name and api_data.name != api.name:
@@ -326,23 +361,25 @@ async def update_custom_api(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Custom API with name '{api_data.name}' already exists",
             )
-        api.name = api_data.name
+        mutable_api.name = api_data.name
 
     # Update fields
     if api_data.description is not None:
-        api.description = api_data.description
+        mutable_api.description = api_data.description
     if api_data.url is not None:
-        api.url = api_data.url
+        mutable_api.url = api_data.url
     if api_data.method is not None:
-        api.method = api_data.method
+        mutable_api.method = api_data.method
     if api_data.headers is not None:
-        api.headers = api_data.headers
+        mutable_api.headers = api_data.headers
     if api_data.body is not None:
-        api.body = api_data.body
+        mutable_api.body = api_data.body
 
     # Process env variables
     if api_data.env is not None:
-        existing_env = api.env if isinstance(api.env, dict) else {}
+        existing_env: Dict[str, str] = (
+            mutable_api.env if isinstance(api.env, dict) else {}
+        )
         try:
             processed_env = _process_env_vars(api_data.env, existing_env)
         except ValueError as exc:
@@ -350,7 +387,7 @@ async def update_custom_api(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid environment variables: {exc}",
             ) from exc
-        api.env = processed_env
+        mutable_api.env = processed_env
 
     fields_set = api_data.model_fields_set
     runtime_input_schema = (
@@ -374,7 +411,7 @@ async def update_custom_api(
             runtime_input_schema=runtime_input_schema,
             runtime_bindings=runtime_bindings,
             allow_delegated_authorization=allow_delegated_authorization,
-            static_headers=api.headers,
+            static_headers=mutable_api.headers,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -382,11 +419,11 @@ async def update_custom_api(
             detail=f"Invalid runtime configuration: {exc}",
         ) from exc
     if "runtime_input_schema" in fields_set:
-        api.runtime_input_schema = runtime_input_schema
+        mutable_api.runtime_input_schema = runtime_input_schema
     if "runtime_bindings" in fields_set:
-        api.runtime_bindings = runtime_bindings
+        mutable_api.runtime_bindings = runtime_bindings
     if "allow_delegated_authorization" in fields_set:
-        api.allow_delegated_authorization = allow_delegated_authorization
+        mutable_api.allow_delegated_authorization = allow_delegated_authorization
 
     from ..services.connector_team_scope import rename_team_connector
 
@@ -410,7 +447,7 @@ async def update_custom_api(
 
 
 @custom_api_router.delete("/{api_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_custom_api(
+def delete_custom_api(
     api_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -438,8 +475,6 @@ async def delete_custom_api(
             detail="You do not have permission to delete this Custom API",
         )
 
-    api = user_api.custom_api
-
     from ..services.connector_team_scope import delete_team_connector
 
     team_delete = delete_team_connector(
@@ -455,6 +490,43 @@ async def delete_custom_api(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only a team admin can delete a team Custom API",
         )
+
+    # One global lock order over this pair of tables. ``update_custom_api``
+    # locks the ``CustomApi`` definition row first and writes the
+    # ``UserCustomApi`` link row afterwards; both branches below delete the
+    # link row first and the definition row second, inside one transaction.
+    # Without this statement the two routes take the same two rows in
+    # opposite orders and a concurrent edit/delete pair can deadlock
+    # (PostgreSQL 40P01). Taken after every refusal above, so a request that
+    # is going to be refused never acquires the lock. ``populate_existing``
+    # matches the PUT's own lock: the row this transaction holds is the one
+    # the deletion below acts on, not whatever the relationship read above
+    # happened to see.
+    #
+    # This statement orders THIS repository's two tables and nothing else. A
+    # connector team hook writes its own tables, which this lock does not
+    # cover, and the two routes reach it in opposite orders relative to this
+    # lock: the PUT takes the lock above and calls rename_team_connector
+    # afterwards, while this route calls delete_team_connector before taking
+    # the lock at all. So an installing application whose hooks lock a row of
+    # its own can still deadlock against a concurrent edit/delete pair on the
+    # same connector, and no ordering statement inside this repository can
+    # prevent that -- the hook side has to take its rows in an order
+    # compatible with this one, and only the application can arrange that.
+    locked_api = (
+        db.query(CustomApi)
+        .filter(CustomApi.id == api_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
+    if locked_api is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Custom API not found",
+        )
+    api = locked_api
+
     if team_delete.team_owned:
         db.delete(user_api)
         db.flush([user_api])
