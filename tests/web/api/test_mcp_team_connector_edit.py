@@ -1389,6 +1389,49 @@ class TestCatalogRowsAreNeverTeamEditable:
         assert len(matches) == 1
         assert matches[0].can_edit_global is False
 
+    def test_the_list_endpoints_personal_row_on_a_catalog_server_reports_no_edit_right(
+        self, db
+    ):
+        """Same downgrade as the stand-in case above, but for the other of
+        the list endpoint's two append loops: a caller who has their own
+        (non-owner) personal row on a catalog server, rather than no
+        personal row at all. Both loops call ``_team_access_for_shared_row``
+        independently, so each needs its own test pinning it.
+        """
+        _make_catalog_app_with_display_name(db, "stripe", "Stripe")
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_catalog_server_row(
+            db, name="stripe", transport="stdio", command="python"
+        )
+        db.add(
+            UserMCPServer(
+                user_id=owner.id, mcpserver_id=server.id, is_owner=True, is_active=True
+            )
+        )
+        db.add(
+            UserMCPServer(
+                user_id=member.id,
+                mcpserver_id=server.id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        server_id = server.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
+            )
+            responses = get_mcp_servers(current_user=member, db=db)
+
+        matches = [r for r in responses if r.id == server_id]
+        assert len(matches) == 1
+        assert matches[0].can_edit_global is False
+
     def test_toggle_on_a_catalog_row_reports_no_edit_right(self, db):
         _make_catalog_app_with_display_name(db, "stripe", "Stripe")
         owner = _make_user(db, 1)
