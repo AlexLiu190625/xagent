@@ -5,7 +5,9 @@ import re
 import subprocess
 import tomllib
 from pathlib import Path
+from typing import Any, cast
 
+import yaml
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
@@ -448,3 +450,53 @@ def test_uv_export_locked_sandbox_group_contains_direct_distributions() -> None:
 
     for distribution in SANDBOX_DISTRIBUTION_IMPORTS:
         assert re.search(rf"^{re.escape(distribution)}==", result.stdout, re.MULTILINE)
+
+
+def sandbox_publish_step(name: str) -> dict[str, Any]:
+    workflow = yaml.safe_load(read_workflow("sandbox-publish.yml"))
+    for step in workflow["jobs"]["build-and-push"]["steps"]:
+        if step.get("name") == name:
+            return cast(dict[str, Any], step)
+    raise AssertionError(f"sandbox-publish.yml has no step named {name!r}")
+
+
+def test_sandbox_hub_description_step_is_sha_pinned_to_the_sandbox_repository() -> None:
+    step = sandbox_publish_step("Update Docker Hub repository description")
+
+    assert step["uses"] == (
+        "peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa"
+    )
+    assert step["with"]["repository"] == "${{ env.SANDBOX_IMAGE }}"
+    assert step["with"]["readme-filepath"] == "./docker/README.sandbox.md"
+    assert step["with"]["username"] == "${{ secrets.DOCKERHUB_USERNAME }}"
+    assert step["with"]["password"] == "${{ secrets.DOCKERHUB_PASSWORD }}"
+
+
+# WHY: the Hub description is repository-global, not tag-scoped, so a
+# push_to_dockerhub=false dry run must not reach it.
+def test_sandbox_hub_description_gate_equals_the_image_push_gate() -> None:
+    description = sandbox_publish_step("Update Docker Hub repository description")
+    build = sandbox_publish_step("Build and push sandbox image")
+
+    assert description["if"] == build["with"]["push"]
+    assert "push_to_dockerhub == 'true'" in description["if"]
+
+
+def test_sandbox_hub_description_failure_does_not_fail_the_release() -> None:
+    step = sandbox_publish_step("Update Docker Hub repository description")
+
+    assert step["continue-on-error"] is True
+
+
+# WHY: the action truncates an oversized readme or short description and only
+# warns, so drift past a Hub limit ships silently with the run still green.
+def test_sandbox_hub_description_inputs_fit_docker_hub_limits() -> None:
+    step = sandbox_publish_step("Update Docker Hub repository description")
+
+    readme = ROOT / step["with"]["readme-filepath"]
+    assert readme.is_file()
+    assert len(readme.read_bytes()) <= 25_000
+
+    short_description = step["with"]["short-description"]
+    assert short_description
+    assert len(short_description.encode("utf-8")) <= 100
