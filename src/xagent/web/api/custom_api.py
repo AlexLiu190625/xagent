@@ -446,6 +446,14 @@ def update_custom_api(
         )
     api = locked_api
 
+    # This re-check assumes READ COMMITTED, PostgreSQL's default, which this
+    # codebase sets no isolation_level on its engine to change: it needs a
+    # fresh snapshot to see a link the application revoked and committed
+    # after this request's pre-lock read. Under REPEATABLE READ or
+    # SERIALIZABLE the re-read reuses this transaction's original snapshot,
+    # sees the pre-lock answer again, and the recheck degrades to a
+    # no-op -- it would stop refusing, not start refusing wrongly.
+    #
     # Same re-check as the MCP side's PUT, for the same reason: the verdict
     # was resolved before this lock existed and the application that
     # answers it can revoke the link at any moment. No personal-field

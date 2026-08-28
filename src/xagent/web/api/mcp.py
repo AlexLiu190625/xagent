@@ -3763,6 +3763,14 @@ def update_mcp_server(
             )
         server = locked_server
 
+        # This re-resolve assumes READ COMMITTED, PostgreSQL's default, which
+        # this codebase sets no isolation_level on its engine to change: it
+        # needs a fresh snapshot to see a link the application revoked and
+        # committed after this request's pre-lock read. Under REPEATABLE READ
+        # or SERIALIZABLE the re-read reuses this transaction's original
+        # snapshot, sees the pre-lock answer again, and the recheck degrades
+        # to a no-op -- it would stop refusing, not start refusing wrongly.
+        #
         # The verdict above was resolved before this lock existed, and the
         # application that answers it can revoke the team's link at any
         # moment -- it writes its own tables, which this lock does not
