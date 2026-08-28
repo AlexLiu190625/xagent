@@ -47,9 +47,11 @@ def _reset_hooks_scope() -> Iterator[None]:
     # ``test_the_reset_scope_restores_a_pre_installed_hook_rather_than_clearing_it``),
     # since the fixture itself wraps the whole test body and cannot be
     # asserted on from inside one.
-    with connector_team_scope.snapshot_connector_team_hooks():
-        yield
-    agent_team_scope.set_agent_team_scope_hook(None)
+    try:
+        with connector_team_scope.snapshot_connector_team_hooks():
+            yield
+    finally:
+        agent_team_scope.set_agent_team_scope_hook(None)
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +78,19 @@ def test_the_reset_scope_restores_a_pre_installed_hook_rather_than_clearing_it()
     with _reset_hooks_scope():
         connector_team_scope.set_connector_team_hooks(access=lambda *_a, **_k: {})
     assert connector_team_scope._connector_access_hook is sentinel
+
+
+def test_the_reset_scope_releases_the_agent_team_hook_when_the_body_raises():
+    """The scope is also used as a plain ``with`` block, not only through
+    the autouse fixture, and on that path an exception inside the block
+    must not leave the agent-team hook installed for whatever runs next.
+    Written against the extracted scope directly, since that is the path
+    where the release is not otherwise guaranteed."""
+    agent_team_scope.set_agent_team_scope_hook(lambda db, user_id: None)
+    with pytest.raises(RuntimeError):
+        with _reset_hooks_scope():
+            raise RuntimeError("boom inside the block")
+    assert agent_team_scope._agent_team_scope_hook is None
 
 
 def test_team_connector_ids_empty_without_hook_installed():
@@ -160,6 +175,22 @@ def test_connector_access_defaults_are_both_false():
 def test_resolve_connector_access_returns_an_empty_map_without_a_hook_installed():
     for refs in ([("mcp", 1), ("custom_api", 1), ("mcp", 999)], [("mcp", 1)]):
         assert connector_team_scope.resolve_connector_access(None, 7, refs) == {}
+
+
+def test_resolve_connector_access_reads_no_ref_at_all_without_a_hook_installed():
+    """With no hook installed this seam does no work whatsoever -- it does
+    not even look at the refs. Deciding that before normalizing is what
+    keeps the "standalone xagent is byte-for-byte unchanged" property
+    true: a ref shape only the installing application would ever produce
+    must not be able to raise in a deployment that has no application
+    installed."""
+    assert connector_team_scope._connector_access_hook is None
+    assert (
+        connector_team_scope.resolve_connector_access(
+            None, 7, [("mcp", "not-an-int"), ("custom_api", None), ("mcp",)]
+        )
+        == {}
+    )
 
 
 def test_resolve_connector_access_asks_no_hook_when_no_ref_needs_one():
@@ -472,6 +503,75 @@ def test_resolve_connector_access_or_raise_converts_malformed_answer_too():
     with pytest.raises(ConnectorRuntimeError) as excinfo:
         connector_team_scope.resolve_connector_access_or_raise(None, 7, [("mcp", 11)])
     assert excinfo.value.status_code == 503
+
+
+MALFORMED_REFS = [
+    ("mcp", "abc"),
+    ("mcp", None),
+    ("mcp",),
+    ("mcp", 1, 2),
+]
+
+
+@pytest.mark.parametrize("malformed_ref", MALFORMED_REFS)
+def test_resolve_connector_access_or_raise_lets_a_malformed_ref_raise_raw(
+    malformed_ref,
+):
+    """A ref that is not a ``(str, int-coercible)`` pair is a defect in the
+    calling route, not an outage of the installing application, so it stays
+    the ``ValueError``/``TypeError`` it is instead of being converted into
+    the seam's retryable 503. A hook is installed here on purpose: without
+    one the seam returns ``{}`` before it ever reads a ref, so this check
+    would pass vacuously."""
+    calls: list[object] = []
+
+    def _hook(db, user_id, refs):
+        calls.append(refs)
+        return {}
+
+    connector_team_scope.set_connector_team_hooks(access=_hook)
+    with pytest.raises((ValueError, TypeError)) as excinfo:
+        connector_team_scope.resolve_connector_access_or_raise(None, 7, [malformed_ref])
+    assert not isinstance(excinfo.value, ConnectorRuntimeError)
+    assert calls == []
+
+
+@pytest.mark.parametrize("malformed_ref", MALFORMED_REFS)
+def test_resolve_one_connector_access_or_raise_lets_a_malformed_ref_raise_raw(
+    malformed_ref,
+):
+    """The single-ref wrapper inherits the batch resolver's boundary: it
+    wraps the ref and calls the batch form, so a malformed ref surfaces raw
+    there too rather than as the seam's 503."""
+    calls: list[object] = []
+
+    def _hook(db, user_id, refs):
+        calls.append(refs)
+        return {}
+
+    connector_team_scope.set_connector_team_hooks(access=_hook)
+    with pytest.raises((ValueError, TypeError)) as excinfo:
+        connector_team_scope.resolve_one_connector_access_or_raise(
+            None, 7, malformed_ref
+        )
+    assert not isinstance(excinfo.value, ConnectorRuntimeError)
+    assert calls == []
+
+
+def test_resolve_connector_access_or_raise_still_converts_with_well_formed_refs():
+    """The opposite direction of the two checks above, so that widening the
+    raw-error path cannot go unnoticed: with the refs well formed, a hook
+    that raises the very same ``ValueError`` still becomes the seam's one
+    typed 503, carrying its reason."""
+
+    def _hook(db, user_id, refs):
+        raise ValueError("hook blew up")
+
+    connector_team_scope.set_connector_team_hooks(access=_hook)
+    with pytest.raises(ConnectorRuntimeError) as excinfo:
+        connector_team_scope.resolve_connector_access_or_raise(None, 7, [("mcp", 11)])
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.details["reason"] == "connector_access_resolution_failed"
 
 
 # ---------------------------------------------------------------------------

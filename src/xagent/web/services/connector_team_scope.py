@@ -392,10 +392,12 @@ def resolve_connector_access(
     the other omits is not a defect in xagent -- it is what the installed
     answers said.
     """
+    if _connector_access_hook is None:
+        return {}
     requested = frozenset(
         (connector_type, int(connector_id)) for connector_type, connector_id in refs
     )
-    if _connector_access_hook is None or not requested:
+    if not requested:
         return {}
     return _call_connector_hook_gate(
         db,
@@ -549,8 +551,17 @@ def resolve_team_connector_ids_or_raise(
 def resolve_connector_access_or_raise(
     db: Any, user_id: int, refs: "Collection[ConnectorRef]"
 ) -> "dict[ConnectorRef, ConnectorAccess]":
-    """``resolve_connector_access(db, user_id, refs)``, with every
-    non-typed failure converted into the seam's one typed 503.
+    """``resolve_connector_access(db, user_id, refs)``, with every failure of the
+    hook call and of its answer validation converted into the seam's one typed 503.
+
+    Normalizing ``refs`` happens before that conversion and is deliberately
+    outside it. A ref that is not a ``(str, int-coercible)`` pair is a defect in
+    the calling route, not an outage of the installing application: every caller
+    builds its refs from FastAPI-validated ``int`` path parameters or from
+    non-nullable integer primary keys, so a malformed ref means xagent's own code
+    is wrong. It surfaces as the ``TypeError``/``ValueError`` it is, rather than
+    as a retryable "connector access is unavailable" that would send an operator
+    to look at the application instead of at the route.
 
     A ``ConnectorRuntimeError`` -- whether raised by the hook itself or by
     ``resolve_connector_access``'s own answer validation -- passes through
@@ -562,8 +573,9 @@ def resolve_connector_access_or_raise(
     ``resolve_team_connector_ids_or_raise``, there is no separate
     ``log_subject`` parameter: ``user_id`` here already identifies the
     caller directly, so it doubles as the value logged. The logged refs
-    are the plain ``(connector_type, id)`` tuples the caller passed in,
-    sorted for a stable log line -- never an ORM attribute read off a row,
+    are the normalized ``(connector_type, int(id))`` tuples this function
+    resolved with -- ``('mcp', '5')`` in, ``('mcp', 5)`` logged -- sorted
+    for a stable log line, and never an ORM attribute read off a row,
     which could itself fail if the session is left unusable by whatever
     just failed.
 
