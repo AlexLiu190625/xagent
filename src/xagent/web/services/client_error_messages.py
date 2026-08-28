@@ -1,4 +1,10 @@
-"""Fixed client-visible fallbacks for incidental server failures."""
+"""Client-visible projections of server-side failures.
+
+Holds the fixed fallback strings used when a failure has nothing safe to
+say, the per-exception adapters that pass a curated message through, and
+``PublicErrorDetails`` -- the only structured payload allowed onto a
+task_error frame, together with the reason allowlist that governs it.
+"""
 
 from dataclasses import dataclass
 from enum import StrEnum
