@@ -1,8 +1,11 @@
 """Fixed client-visible fallbacks for incidental server failures."""
 
+import re
+from dataclasses import dataclass
 from enum import StrEnum
 
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
+from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 
 CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
 
@@ -111,3 +114,133 @@ def required_mcp_unavailable_client_message(
     if message.strip():
         return message
     return fallback
+
+
+def connector_runtime_client_message(
+    error: BaseException,
+    *,
+    fallback: str = CLIENT_SAFE_TASK_FAILURE,
+) -> str:
+    """Adapt the curated connector-runtime failure without a generic escape.
+
+    The runtime check keeps this boundary fail-closed even if a future caller
+    passes an incidental exception despite the function's specific name.
+    """
+
+    if not isinstance(error, ConnectorRuntimeError):
+        return fallback
+    message = error.safe_message
+    if isinstance(message, str) and message.strip():
+        return message
+    return fallback
+
+
+CONNECTOR_RUNTIME_PUBLIC_REASONS = frozenset(
+    {
+        # Missing values and binding.
+        "not_provided",
+        "store_lost",
+        "connector_not_selected",
+        "auth_selector_not_supported",
+        "duplicate_ref",
+        "undeclared_context_key",
+        "undeclared_secrets_key",
+        "undeclared_auth_selector_key",
+        # Raised by the runtime value-fill boundary.
+        "payload_too_large",
+        "encryption_unavailable",
+        # Fixed 503 strings built by direct ConnectorRuntimeError construction
+        # in three other modules. Each one states that a server-side component
+        # is unavailable; none of them states who owns the task, or how an
+        # authorization check resolved. Two further strings of exactly this
+        # shape (runtime_task_identity_mismatch, runtime_owner_mismatch) are
+        # deliberately absent for that reason -- see the class docstring below.
+        "team_scope_resolution_failed",
+        "team_env_resolution_failed",
+        "runtime_view_resolution_failed",
+        "custom_api_config_load_failed",
+    }
+)
+CONNECTOR_RUNTIME_PUBLIC_REASON_PREFIXES = frozenset(
+    {
+        "missing_context",
+        "type_mismatch.context",
+        "type_mismatch.secrets",
+        "type_mismatch.auth_selector",
+        "conflict.context",
+        "conflict.secrets",
+        "conflict.auth_selector",
+    }
+)
+# The declared runtime key grammar, reused verbatim from
+# core/tools/adapters/vibe/connector_runtime.py:141-144.
+_RUNTIME_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _is_public_reason(reason: object) -> bool:
+    """True when this reason may reach a client. Used by PublicErrorDetails."""
+
+    if not isinstance(reason, str):
+        return False
+    if reason in CONNECTOR_RUNTIME_PUBLIC_REASONS:
+        return True
+    prefix, separator, key = reason.rpartition(".")
+    if not separator:
+        return False
+    if prefix not in CONNECTOR_RUNTIME_PUBLIC_REASON_PREFIXES:
+        return False
+    return _RUNTIME_KEY_RE.fullmatch(key) is not None
+
+
+@dataclass(frozen=True)
+class PublicErrorDetails:
+    """The only shape allowed into a task_error frame's ``details``.
+
+    ``reason`` is normalized on construction: a value that is not a listed
+    enum member, and not ``<listed prefix>.<declared key name>``, becomes
+    ``None``. Constructing this type and passing the reason whitelist are
+    therefore the same act -- there is no path that produces an instance
+    carrying free text, including a direct call from another module.
+
+    Nulling rather than raising is deliberate: every construction site is on
+    the reporting path of an already-failed task, and raising there would
+    turn a diagnosable failure into an undiagnosable crash.
+
+    The sink is ``broadcast_to_task``, whose audience includes anonymous
+    widget and share-link visitors, so every listed reason and every new
+    field must answer one question first: can a visitor who is not the task
+    owner read the task's ownership, or the outcome of an authorization
+    check, out of it? There is no ``connector_ref`` field because the answer
+    for it is yes; two runtime reasons are omitted for the same answer.
+    """
+
+    reason: str | None
+
+    def __post_init__(self) -> None:
+        if self.reason is not None and not _is_public_reason(self.reason):
+            object.__setattr__(self, "reason", None)
+
+    def to_wire(self) -> dict[str, str]:
+        return {"reason": self.reason} if self.reason is not None else {}
+
+
+def connector_runtime_public_error(
+    error: BaseException,
+) -> tuple[str, PublicErrorDetails] | None:
+    """Project a connector-runtime failure onto the wire-safe (code, details).
+
+    Returns ``None`` for anything else, so a caller cannot widen the surface
+    by passing an incidental exception. The reason filter itself lives in
+    ``PublicErrorDetails``; this function only decides whether the exception
+    is one we project at all.
+    """
+
+    if not isinstance(error, ConnectorRuntimeError):
+        return None
+    details = error.details
+    if not isinstance(details, dict):
+        # A details payload of the wrong shape means the exception instance
+        # itself is not trustworthy. Fall all the way back to the opaque
+        # failure rather than guessing which half of it is still readable.
+        return None
+    return error.code, PublicErrorDetails(reason=details.get("reason"))
