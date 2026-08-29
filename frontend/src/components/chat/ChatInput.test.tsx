@@ -1899,7 +1899,7 @@ describe("ChatInput", () => {
     ).toBeDisabled()
     unmount()
 
-    render(
+    const secondRender = render(
       <ChatInput
         compact
         hideConfig
@@ -1913,10 +1913,29 @@ describe("ChatInput", () => {
         taskStatus="running"
       />
     )
-    expect(
-      screen.getByRole("button", { name: "widgetSession.stopResponse" })
-    ).not.toBeDisabled()
+    const stopButton = screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    expect(stopButton).not.toBeDisabled()
+    expect(stopButton).toHaveAttribute("type", "button")
     expect(screen.getByText("widgetSession.stopTimedOut")).toBeInTheDocument()
+    fireEvent.click(stopButton)
+    expect(onStop).toHaveBeenCalledTimes(1)
+    secondRender.unmount()
+
+    render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue="draft"
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="timed_out"
+        taskStatus="running"
+      />
+    )
+    expect(screen.queryByText("widgetSession.stopTimedOut")).not.toBeInTheDocument()
   })
 
   it("swaps the compact submit control for a stop square", () => {
