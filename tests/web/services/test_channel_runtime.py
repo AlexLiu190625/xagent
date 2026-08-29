@@ -12,6 +12,7 @@ from sqlalchemy.pool import QueuePool
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.file_storage.storage import FsspecFileStorage
 from xagent.core.workspace import TaskWorkspace
+from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models import database as database_module
 from xagent.web.models.agent import Agent, AgentOrigin
 from xagent.web.models.database import Base
@@ -30,6 +31,9 @@ from xagent.web.services.channel_runtime import (
     register_channel_uploaded_files,
 )
 from xagent.web.services.task_lease_service import TaskLease
+from xagent.web.services.task_runtime import (
+    MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY,
+)
 from xagent.web.services.uploaded_file_store import UploadedFileStore
 
 
@@ -111,6 +115,103 @@ async def test_prepare_channel_task_binds_owned_agent(
         assert task.execution_mode == "balanced"
         assert task.connector_runtime_selected_refs == []
 
+    assert await prepared.managed_lease.finalize_result(status=TaskStatus.FAILED)
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_trusted_direct_channel_path_creates_fresh_hidden_marked_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    """The trusted caller persists the fence before either task executes."""
+    del mock_workspace_db
+    engine, SessionLocal, _user_id, channel_id = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    task_ids: list[int] = []
+    for message_text in ("first", "second"):
+        prepared = await prepare_channel_task(
+            channel_id=channel_id,
+            external_user_id="telegram-user",
+            active_task_id=None,
+            text=message_text,
+            channel_name="Trusted direct channel",
+            new_task_is_visible=False,
+            mcp_runtime_authorization_policy_required=True,
+        )
+        assert prepared is not None
+        task_ids.append(prepared.task_id)
+        with SessionLocal() as db:
+            task = db.query(Task).filter(Task.id == prepared.task_id).one()
+            assert task.is_visible is False
+            assert task.agent_config == {
+                MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY: True
+            }
+        assert await prepared.managed_lease.finalize_result(status=TaskStatus.FAILED)
+
+    assert task_ids[0] != task_ids[1]
+    with pytest.raises(RuntimeError, match="channel reuse is unsupported"):
+        await prepare_channel_task(
+            channel_id=channel_id,
+            external_user_id="telegram-user",
+            active_task_id=task_ids[0],
+            text="generic reuse",
+            channel_name="Telegram",
+        )
+
+    # A new manager has no warm marker cache. It must re-read the persisted
+    # marker and fail before attempting to construct a policyless runtime.
+    monkeypatch.setattr(
+        "xagent.web.services.task_setup_snapshot.get_session_local",
+        lambda: SessionLocal,
+    )
+    cold_manager = AgentServiceManager()
+    with pytest.raises(RuntimeError, match="requires an MCP runtime authorization"):
+        await cold_manager.get_agent_for_task(
+            task_ids[0],
+            task_owner_user_id=_user_id,
+            resolved_execution_scope=None,
+        )
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_actor_marker_forces_new_channel_task_hidden(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    del mock_workspace_db
+    engine, SessionLocal, _user_id, channel_id = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    prepared = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=None,
+        text="trusted actor message",
+        channel_name="Trusted direct channel",
+        mcp_runtime_authorization_policy_required=True,
+    )
+
+    assert prepared is not None
+    with SessionLocal() as db:
+        task = db.get(Task, prepared.task_id)
+        assert task is not None
+        assert task.is_visible is False
+        assert task.agent_config == {
+            MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY: True
+        }
     assert await prepared.managed_lease.finalize_result(status=TaskStatus.FAILED)
     engine.dispose()
 

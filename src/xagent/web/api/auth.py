@@ -1861,6 +1861,12 @@ def _actor_oauth_cookie_name(nonce: str) -> str:
     return f"{_ACTOR_OAUTH_COOKIE_PREFIX}{nonce[:24]}"
 
 
+def is_actor_oauth_cookie_header(value: str) -> bool:
+    """Accept only a Set-Cookie header for an actor OAuth flow."""
+    name, separator, _rest = value.partition("=")
+    return separator == "=" and name.strip().startswith(_ACTOR_OAUTH_COOKIE_PREFIX)
+
+
 def _actor_oauth_cookie_scope(provider: str, db_provider: Any) -> tuple[bool, str]:
     """Match the browser cookie to the configured callback URL."""
     from urllib.parse import urlparse
@@ -1954,7 +1960,7 @@ def start_builtin_oauth_for_resource_owner(
     db: Session,
     db_provider: Any,
 ) -> Any:
-    """Start OAuth for a trusted xagent user and exact actor owner namespace."""
+    """Start actor OAuth; the caller owns the surrounding transaction."""
     if not isinstance(app_id, str) or not app_id.strip():
         raise ValueError("actor builtin OAuth app_id must be a non-empty string")
     if user.id is None:
@@ -1973,7 +1979,6 @@ def start_builtin_oauth_for_resource_owner(
     browser_nonce = secrets.token_urlsafe(32)
     nonce_digest = hashlib.sha256(browser_nonce.encode()).hexdigest()
     expires_at = datetime.now(timezone.utc) + _ACTOR_OAUTH_FLOW_TTL
-    db.add(ActorOAuthFlowState(nonce=nonce_digest, expires_at=expires_at))
     response = _generic_oauth_login(
         provider,
         token=None,
@@ -1986,9 +1991,8 @@ def start_builtin_oauth_for_resource_owner(
         actor_flow_nonce=nonce_digest,
     )
     if not isinstance(response, RedirectResponse):
-        db.rollback()
         return response
-    db.commit()
+    db.add(ActorOAuthFlowState(nonce=nonce_digest, expires_at=expires_at))
     cookie_secure, cookie_path = _actor_oauth_cookie_scope(provider, db_provider)
     response.set_cookie(
         _actor_oauth_cookie_name(nonce_digest),
@@ -3115,7 +3119,7 @@ def generic_oauth_callback(
             from ..mcp_apps import get_all_mcp_apps
             from .mcp import _reject_hidden_catalog_app
 
-            if app_id:
+            if app_id and not is_actor_flow:
                 # Reuse target_app_info from the earlier hidden-app-gate
                 # check above rather than re-fetching by app_id: nothing
                 # mutates public_mcp_apps between there and here, so a second
@@ -3139,7 +3143,7 @@ def generic_oauth_callback(
                             ),
                             status_code=400,
                         )
-            else:
+            elif not app_id:
                 from ..mcp_apps import requires_app_scoped_oauth_grant
 
                 apps = [

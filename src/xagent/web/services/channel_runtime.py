@@ -37,7 +37,14 @@ from .managed_task_lease import (
     finalize_managed_task_lease_result,
     start_managed_task_lease,
 )
+from .mcp_runtime import MCPBuiltinOAuthActorPolicyRequiredError
 from .task_lease_service import TaskLease, acquire_task_lease_no_commit
+from .task_runtime import (
+    MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY,
+)
+from .task_runtime import (
+    mcp_runtime_authorization_policy_required as task_requires_mcp_actor_policy,
+)
 from .uploaded_file_store import (
     StagedUploadedFile,
     UploadedFileStore,
@@ -615,6 +622,8 @@ def _prepare_channel_task_sync(
     channel_name: str | None,
     expected_owner_user_id: int | None,
     agent_id: int | None = None,
+    new_task_is_visible: bool = True,
+    mcp_runtime_authorization_policy_required: bool = False,
 ) -> _ChannelTaskClaimSnapshot | None:
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -654,7 +663,24 @@ def _prepare_channel_task_sync(
                     db.flush()
 
             task = None
+            # Actor-owned channel turns are fresh-only. Ignoring an active id
+            # on the trusted marked path prevents it from becoming an
+            # accidental resume API while preserving ordinary channel reuse.
+            if mcp_runtime_authorization_policy_required is True:
+                active_task_id = None
             if active_task_id is not None and active_task_id != -1:
+                active_config = (
+                    db.query(Task.agent_config)
+                    .filter(
+                        Task.id == active_task_id,
+                        Task.user_id == owner_id,
+                    )
+                    .scalar()
+                )
+                if task_requires_mcp_actor_policy(active_config):
+                    raise MCPBuiltinOAuthActorPolicyRequiredError(
+                        f"Task {active_task_id} is actor-marked; channel reuse is unsupported"
+                    )
                 query = db.query(Task).filter(
                     Task.id == active_task_id,
                     Task.user_id == owner_id,
@@ -676,6 +702,12 @@ def _prepare_channel_task_sync(
                         Task.is_visible.is_(True),
                     )
                 task = query.first()
+                if task is not None and task_requires_mcp_actor_policy(
+                    task.agent_config
+                ):
+                    raise MCPBuiltinOAuthActorPolicyRequiredError(
+                        f"Task {int(task.id)} is actor-marked; channel reuse is unsupported"
+                    )
 
             # Revalidate the requested selection on every turn, not only for
             # new tasks. A conversation may only continue when its task binding
@@ -718,6 +750,16 @@ def _prepare_channel_task_sync(
                     channel_name=channel_name,
                     telegram_user_id=external_user_id if is_telegram else None,
                     agent_id=task_agent_id,
+                    is_visible=(
+                        False
+                        if mcp_runtime_authorization_policy_required is True
+                        else new_task_is_visible
+                    ),
+                    agent_config=(
+                        {MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY: True}
+                        if mcp_runtime_authorization_policy_required is True
+                        else None
+                    ),
                 )
                 selected_refs = prepare_connector_runtime_selection_snapshot(
                     db=db,
@@ -764,8 +806,15 @@ async def prepare_channel_task(
     channel_name: str | None,
     expected_owner_user_id: int | None = None,
     agent_id: int | None = None,
+    new_task_is_visible: bool = True,
+    mcp_runtime_authorization_policy_required: bool = False,
 ) -> ClaimedChannelTask | None:
-    """Authorize, resolve/create, and claim one exact channel run atomically."""
+    """Authorize, resolve or create, and claim one channel run atomically.
+
+    The trusted actor path sets both ``new_task_is_visible=False`` and
+    ``mcp_runtime_authorization_policy_required=True``. That marker is written
+    in the creation transaction before the returned lease can be executed.
+    """
 
     worker = asyncio.create_task(
         asyncio.to_thread(
@@ -777,6 +826,10 @@ async def prepare_channel_task(
             channel_name=channel_name,
             expected_owner_user_id=expected_owner_user_id,
             agent_id=agent_id,
+            new_task_is_visible=new_task_is_visible,
+            mcp_runtime_authorization_policy_required=(
+                mcp_runtime_authorization_policy_required
+            ),
         )
     )
     snapshot, cancellation = await await_task_settlement(worker)

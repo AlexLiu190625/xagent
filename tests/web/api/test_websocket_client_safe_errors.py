@@ -23,6 +23,9 @@ from tests.web.api.client_safe_ast_guard import guard_offenders as _guard_offend
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.mcp_runtime import (
+    MCPBuiltinOAuthActorPolicyRequiredError,
+)
 from xagent.web.services.task_orchestrator import TaskTurnOrchestrator
 
 from .conftest import _direct_db_session
@@ -68,8 +71,11 @@ def _sent_text_payloads(websocket: MagicMock) -> list[dict]:
         ValueError(f"invalid payload while reading {SECRET}"),
         KeyError(f"missing key near {SECRET}"),
         TypeError(f"bad type from {SECRET}"),
+        MCPBuiltinOAuthActorPolicyRequiredError(
+            f"actor task policy loaded from {SECRET}"
+        ),
     ],
-    ids=["value", "key", "type"],
+    ids=["value", "key", "type", "actor-policy"],
 )
 async def test_execute_task_redacts_an_incidental_validation_error(
     _test_db: None,
@@ -564,6 +570,84 @@ async def test_builder_chat_redacts_through_its_own_socket_sink(
     assert errors, "the handler must answer the builder client"
     assert SECRET not in repr(payloads)
     assert errors[-1]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+
+
+@pytest.mark.asyncio
+async def test_actor_policy_rejection_returns_chat_delivery_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    websocket = MagicMock()
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    send_delivery = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(websocket_api, "send_message_delivery", send_delivery)
+    monkeypatch.setattr(
+        websocket_api,
+        "_enqueue_websocket_task_command",
+        AsyncMock(
+            side_effect=MCPBuiltinOAuthActorPolicyRequiredError(
+                "actor-marked task does not support generic control"
+            )
+        ),
+    )
+
+    await websocket_api.handle_chat_message(
+        websocket,
+        42,
+        {"client_message_id": "command-1"},
+    )
+
+    send_delivery.assert_awaited_once_with(
+        websocket,
+        client_message_id="command-1",
+        turn_id="command-1",
+        accepted=False,
+        message=websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+        rejection_outcome="not_accepted",
+    )
+    connection_manager.send_personal_message.assert_awaited_once_with(
+        {
+            "type": "error",
+            "message": websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+        },
+        websocket,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler_name", ["handle_pause_task", "handle_resume_task"], ids=["pause", "resume"]
+)
+async def test_actor_policy_rejection_returns_websocket_error(
+    monkeypatch: pytest.MonkeyPatch,
+    handler_name: str,
+) -> None:
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "_enqueue_websocket_task_command",
+        AsyncMock(
+            side_effect=MCPBuiltinOAuthActorPolicyRequiredError(
+                "actor-marked task does not support generic control"
+            )
+        ),
+    )
+
+    await getattr(websocket_api, handler_name)(
+        MagicMock(),
+        42,
+        {"user": SimpleNamespace(id=7, is_admin=False)},
+    )
+
+    connection_manager.send_personal_message.assert_awaited_once()
+    payload = connection_manager.send_personal_message.await_args.args[0]
+    assert payload == {
+        "type": "error",
+        "message": websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+    }
 
 
 @pytest.mark.asyncio

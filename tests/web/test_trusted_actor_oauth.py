@@ -88,7 +88,9 @@ def _provider() -> SimpleNamespace:
     )
 
 
-def _catalog_link(db: Session, user: User) -> tuple[MCPServer, UserMCPServer]:
+def _catalog_link(
+    db: Session, user: User, *, server_name: str = "Google Calendar"
+) -> tuple[MCPServer, UserMCPServer]:
     app = PublicMCPApp(
         app_id="calendar",
         name="Google Calendar",
@@ -99,7 +101,7 @@ def _catalog_link(db: Session, user: User) -> tuple[MCPServer, UserMCPServer]:
         is_visible_in_connector=True,
     )
     server = MCPServer(
-        name="Google Calendar",
+        name=server_name,
         description="Calendar",
         managed="external",
         transport="oauth",
@@ -152,10 +154,12 @@ def _start(
     db: Session,
     user: User,
     owner: str = ACTOR_ALICE,
+    *,
     db_provider: SimpleNamespace | None = None,
+    commit: bool = True,
 ):
     start = getattr(auth_api, "start_builtin_oauth_for_resource_owner")
-    return start(
+    response = start(
         provider="custom",
         app_id="calendar",
         user=user,
@@ -164,6 +168,9 @@ def _start(
         db=db,
         db_provider=db_provider or _provider(),
     )
+    if commit:
+        db.commit()
+    return response
 
 
 def _mock_exchange(monkeypatch) -> Mock:
@@ -248,6 +255,52 @@ def test_actor_cookie_uses_callback_path(oauth_db) -> None:
     assert parsed[cookie_name]["path"] == "/proxy/api/auth/custom/callback"
 
 
+def test_actor_cookie_header_check() -> None:
+    actor_cookie = f"xagent_actor_oauth_{'a' * 24}=proof; HttpOnly; Secure"
+
+    assert auth_api.is_actor_oauth_cookie_header(actor_cookie)
+    assert not auth_api.is_actor_oauth_cookie_header("session=proof; HttpOnly; Secure")
+
+
+def test_actor_start_leaves_commit_to_caller(oauth_db) -> None:
+    db, user = oauth_db
+    _catalog_link(db, user)
+    pending = User(username="unrelated", password_hash="hash")
+    db.add(pending)
+
+    response = _start(db, user, commit=False)
+
+    assert response.status_code == 307
+    assert pending.id is None
+
+    db.commit()
+
+    assert pending.id is not None
+
+
+def test_actor_start_leaves_failed_flow_to_caller(oauth_db) -> None:
+    db, user = oauth_db
+    _catalog_link(db, user)
+    pending = User(username="unrelated", password_hash="hash")
+    db.add(pending)
+
+    response = auth_api.start_builtin_oauth_for_resource_owner(
+        provider="custom",
+        app_id="calendar",
+        user=user,
+        resource_owner_key=ACTOR_ALICE,
+        db=db,
+        db_provider=None,
+    )
+
+    assert response.status_code == 500
+    assert pending in db
+
+    db.commit()
+
+    assert pending.id is not None
+
+
 @pytest.mark.parametrize("active", [False, None])
 def test_actor_start_requires_exact_active_personal_link(oauth_db, active) -> None:
     db, user = oauth_db
@@ -260,6 +313,29 @@ def test_actor_start_requires_exact_active_personal_link(oauth_db, active) -> No
 
     with pytest.raises(ValueError, match="active personal"):
         _start(db, user)
+
+
+def test_builtin_snapshot_avoids_repeat_queries(oauth_db, monkeypatch) -> None:
+    db, user = oauth_db
+    server, _link = _catalog_link(db, user)
+
+    snapshot = mcp_apps.load_mcp_app_snapshot(db)
+    monkeypatch.setattr(
+        db,
+        "query",
+        lambda *_args, **_kwargs: pytest.fail(
+            "snapshot validation queried the database"
+        ),
+    )
+
+    resolved = mcp_apps.require_builtin_oauth_server_definition(
+        db,
+        app_id="calendar",
+        provider="custom",
+        snapshot=snapshot,
+    )
+
+    assert resolved is server
 
 
 def test_actor_start_rejects_provider_catalog_mismatch(oauth_db) -> None:
@@ -333,6 +409,58 @@ def test_actor_callback_claims_nonce_before_exchange_and_persists_exact_owner(
     }
     assert rows == {(None, "ordinary"), (ACTOR_BOB, "bob"), (ACTOR_ALICE, "new-access")}
     side_effects.assert_not_called()
+
+
+def test_actor_callback_keeps_canonical_nonowning_link(oauth_db, monkeypatch) -> None:
+    db, user = oauth_db
+    server, link = _catalog_link(db, user, server_name="calendar")
+    start = _start(db, user)
+    _mock_exchange(monkeypatch)
+
+    response = generic_oauth_callback(
+        "custom",
+        _request(_state(start), cookie=_flow_cookie(start)[:2]),
+        db,
+        _provider(),
+    )
+
+    assert response.status_code == 200
+    assert db.query(MCPServer).all() == [server]
+    assert db.query(UserMCPServer).all() == [link]
+    assert link.is_owner is False
+
+
+def test_actor_callback_locks_personal_link_before_persist(
+    oauth_db, monkeypatch
+) -> None:
+    db, user = oauth_db
+    _catalog_link(db, user)
+    start = _start(db, user)
+    _mock_exchange(monkeypatch)
+    require_link = auth_api._require_actor_oauth_personal_link
+    lock_link = auth_api._lock_actor_link
+    checks: list[str] = []
+
+    def record_require(*args, **kwargs) -> None:
+        checks.append("require")
+        require_link(*args, **kwargs)
+
+    def record_lock(*args, **kwargs) -> None:
+        checks.append("lock")
+        lock_link(*args, **kwargs)
+
+    monkeypatch.setattr(auth_api, "_require_actor_oauth_personal_link", record_require)
+    monkeypatch.setattr(auth_api, "_lock_actor_link", record_lock)
+
+    response = generic_oauth_callback(
+        "custom",
+        _request(_state(start), cookie=_flow_cookie(start)[:2]),
+        db,
+        _provider(),
+    )
+
+    assert response.status_code == 200
+    assert checks == ["require", "lock"]
 
 
 @pytest.mark.parametrize("cookie_mode", ["missing", "wrong"])

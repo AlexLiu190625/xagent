@@ -322,6 +322,26 @@ def test_visibility_rejects_normalized_reserved_alias(catalog_db) -> None:
         )
 
 
+def test_classification_ignores_missing_normalized_identity(catalog_db) -> None:
+    db, _user = catalog_db
+    app = PublicMCPApp(
+        app_id="blank-catalog",
+        name="",
+        transport="oauth",
+        provider_name="custom",
+        is_visible_in_connector=True,
+    )
+    server = MCPServer(
+        name="   ",
+        managed="external",
+        transport="stdio",
+    )
+    db.add_all([app, server])
+    db.commit()
+
+    assert mcp_apps.classify_actor_builtin_oauth_server(db, server) is None
+
+
 def test_visibility_rejects_normalized_reserved_auth_alias(catalog_db) -> None:
     db, user = catalog_db
     execution, _optional_scopes = get_builtin_execution_fields_and_optional_scopes(
