@@ -1877,4 +1877,95 @@ describe("ChatInput", () => {
     })
     expect(container.querySelector('button[type="submit"]')).toBeDisabled()
   })
+
+  it("disables the stop square while a stop is in flight", () => {
+    const onStop = vi.fn()
+    const { unmount } = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="stopping"
+        taskStatus="running"
+      />
+    )
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stoppingResponse" })
+    ).toBeDisabled()
+    unmount()
+
+    render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="timed_out"
+        taskStatus="running"
+      />
+    )
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    ).not.toBeDisabled()
+    expect(screen.getByText("widgetSession.stopTimedOut")).toBeInTheDocument()
+  })
+
+  it("swaps the compact submit control for a stop square", () => {
+    const cases: Array<[string, string]> = [
+      ["", "widgetSession.stopResponse"],
+      ["draft", "common.send"],
+    ]
+    expect(cases).toHaveLength(2)
+
+    for (const [inputValue, expectedName] of cases) {
+      const otherName = expectedName === "common.send"
+        ? "widgetSession.stopResponse"
+        : "common.send"
+      const { unmount } = render(
+        <ChatInput
+          compact
+          hideConfig
+          hideFileUpload
+          inputValue={inputValue}
+          isLoading
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+          onStop={vi.fn()}
+          stopState="idle"
+          taskStatus="running"
+        />
+      )
+      expect(screen.getByRole("button", { name: expectedName })).toBeInTheDocument()
+      expect(screen.queryByRole("button", { name: otherName })).not.toBeInTheDocument()
+      unmount()
+    }
+  })
+
+  it("renders no stop control without an onStop callback", () => {
+    render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        taskStatus="running"
+      />
+    )
+    expect(
+      screen.queryByRole("button", { name: "widgetSession.stopResponse" })
+    ).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "common.send" })).toBeInTheDocument()
+  })
 })
