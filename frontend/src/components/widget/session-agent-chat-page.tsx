@@ -258,6 +258,7 @@ export function SessionAgentChatPage() {
   }, [bridge.session, bridge.status])
 
   const transport = useMemo<AppProviderTransportConfig>(() => ({
+    legacyErrorProse: "untrusted",
     capabilities: {
       // This page only renders for the embedded widget's session-resume
       // route, so an in-tab navigation always abandons the visitor's iframe.

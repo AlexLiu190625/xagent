@@ -187,6 +187,7 @@ describe("SessionAgentChatPage", () => {
 
     expect(screen.getByText("widgetChat.status.initializing")).toBeInTheDocument()
     expect(app.provider?.token).toBeUndefined()
+    expect(app.provider?.transport?.legacyErrorProse).toBe("untrusted")
     expect(app.provider?.transport?.session).toEqual({
       connection: null,
       onConnectionClose: bridge.value.handleConnectionClose,

@@ -20,6 +20,7 @@ const app = vi.hoisted(() => ({
     transport?: AppProviderTransportConfig
   },
   startScreenProps: null as null | {
+    onSend?: (message: string, files: File[], config?: Record<string, string>) => Promise<void>
     voiceInputEnabled?: boolean
   },
 }))
@@ -167,6 +168,7 @@ async function expectWidgetAuthFailure(detail: string) {
 function expectPublicProviderToken() {
   expect(sessionStorage.getItem("xagent_public_access_token")).toBeNull()
   expect(app.provider).toMatchObject({ token: "public-access-token" })
+  expect(app.provider?.transport?.legacyErrorProse).toBe("untrusted")
   expect(app.provider?.transport?.capabilities).toEqual({
     agentCards: "disabled",
     voice: "disabled",
@@ -584,6 +586,29 @@ describe("PublicAgentChatPage", () => {
     })
   })
 
+  it("rejects duplicate workforce upload identifiers before task creation", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulWorkforceAuth))
+      .mockResolvedValueOnce(jsonResponse({ success: true, file_id: "file-1" }))
+      .mockResolvedValueOnce(jsonResponse({ success: true, file_id: " file-1 " }))
+
+    renderWidgetPage({ searchAgentId: null, widgetKey: "widget-secret" })
+
+    await screen.findByRole("button", { name: "start:Support Workforce" })
+    await expect(app.startScreenProps?.onSend?.(
+      "analyze attachments",
+      [
+        new File(["first"], "first.txt"),
+        new File(["second"], "second.txt"),
+      ],
+    )).rejects.toThrow("clientErrors.uploadFailed")
+
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock.mock.calls.some(([url]) => (
+      url === "https://api.example/api/widget/chat/task/create"
+    ))).toBe(false)
+  })
+
   it("authenticates a share link and persists the guest token for reuse", async () => {
     localStorage.clear()
     fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
@@ -607,6 +632,7 @@ describe("PublicAgentChatPage", () => {
       access_token: "public-access-token",
     })
     expect(app.provider).toMatchObject({ token: "public-access-token" })
+    expect(app.provider?.transport?.legacyErrorProse).toBe("untrusted")
     expect(app.provider?.transport?.buildWebSocketUrl?.({
       baseUrl: "wss://api.example",
       taskId: 42,
