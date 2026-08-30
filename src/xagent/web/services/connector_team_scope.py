@@ -266,6 +266,42 @@ def team_connector_hook_installed() -> bool:
     return _team_connector_visibility_hook is not None
 
 
+def _normalize_connector_refs(
+    refs: "Collection[ConnectorRef]",
+) -> "frozenset[ConnectorRef]":
+    """Canonicalize a batch of connector refs, coercing every id to ``int``.
+
+    Written once because the result is not merely an argument passed on to
+    the hook -- it is also the baseline the hook's answer is checked
+    against: ``_validate_connector_access_answer`` rejects every key that
+    is not a member of this set. Two separately written normalizations
+    could drift, and the question asked would then be measured against a
+    different notion of canonical shape than the one it was built from,
+    with nothing failing to say so.
+
+    An id that will not coerce to ``int`` is deliberately not tolerated,
+    skipped, or defaulted here. Callers are expected to build their refs
+    from FastAPI-validated ``int`` path parameters or from non-nullable
+    integer primary keys, so an un-coercible id means xagent's own code
+    built the list wrong; it surfaces as the ``TypeError``/``ValueError``
+    it is. Dropping such a ref instead would silently turn a caller's bug
+    into a connector the hook was never asked about, and the caller would
+    read the resulting gap as "the team does not link it".
+
+    Only the id half is checked at run time. The connector type is carried
+    by the ``ConnectorRef`` annotation, so a non-``str`` type is not
+    rejected here and reaches the hook as it was passed in: if the hook
+    answers with a verdict for it, the answer validator rejects the key,
+    and if the hook leaves it out, the caller reads that gap as "the team
+    does not link it". Whichever route first feeds this seam something a
+    type checker has not already constrained is the one that owes a
+    run-time check.
+    """
+    return frozenset(
+        (connector_type, int(connector_id)) for connector_type, connector_id in refs
+    )
+
+
 def _validate_connector_access_answer(
     answer: Any, requested: "frozenset[ConnectorRef]"
 ) -> "dict[ConnectorRef, ConnectorAccess]":
@@ -394,9 +430,7 @@ def resolve_connector_access(
     """
     if _connector_access_hook is None:
         return {}
-    requested = frozenset(
-        (connector_type, int(connector_id)) for connector_type, connector_id in refs
-    )
+    requested = _normalize_connector_refs(refs)
     if not requested:
         return {}
     return _call_connector_hook_gate(
@@ -588,9 +622,7 @@ def resolve_connector_access_or_raise(
     rejects. Neither is something the generic-exception arm below could
     own, and both are restored before either arm sees the exception.
     """
-    requested = frozenset(
-        (connector_type, int(connector_id)) for connector_type, connector_id in refs
-    )
+    requested = _normalize_connector_refs(refs)
     try:
         return resolve_connector_access(db, user_id, requested)
     except ConnectorRuntimeError:

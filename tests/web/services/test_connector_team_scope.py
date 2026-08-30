@@ -520,9 +520,9 @@ def test_resolve_connector_access_or_raise_lets_a_malformed_ref_raise_raw(
     """A ref that is not a ``(str, int-coercible)`` pair is a defect in the
     calling route, not an outage of the installing application, so it stays
     the ``ValueError``/``TypeError`` it is instead of being converted into
-    the seam's retryable 503. A hook is installed here on purpose: without
-    one the seam returns ``{}`` before it ever reads a ref, so this check
-    would pass vacuously."""
+    the seam's retryable 503. A hook is installed here on purpose: it is
+    what gives the trailing ``assert calls == []`` its meaning, by showing
+    the raise lands before the hook is ever reached."""
     calls: list[object] = []
 
     def _hook(db, user_id, refs):
