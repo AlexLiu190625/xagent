@@ -588,14 +588,30 @@ def resolve_connector_access_or_raise(
     """``resolve_connector_access(db, user_id, refs)``, with every failure of the
     hook call and of its answer validation converted into the seam's one typed 503.
 
-    Normalizing ``refs`` happens before that conversion and is deliberately
-    outside it. A ref that is not a ``(str, int-coercible)`` pair is a defect in
-    the calling route, not an outage of the installing application: every caller
-    builds its refs from FastAPI-validated ``int`` path parameters or from
-    non-nullable integer primary keys, so a malformed ref means xagent's own code
-    is wrong. It surfaces as the ``TypeError``/``ValueError`` it is, rather than
-    as a retryable "connector access is unavailable" that would send an operator
-    to look at the application instead of at the route.
+    Returns ``{}`` without reading ``refs`` at all when no hook is installed,
+    before any normalization -- the same first move ``resolve_connector_access``
+    makes, and for the same reason: a deployment with no application installed
+    must not be able to raise on a ref shape only an installing application
+    would ever produce. The rest of this docstring describes what happens once
+    one is installed.
+
+    Normalizing ``refs`` then happens before the 503 conversion and is
+    deliberately outside it. An id that will not coerce to ``int`` is a defect
+    in the calling route, not an outage of the installing application: every
+    caller builds its refs from FastAPI-validated ``int`` path parameters or
+    from non-nullable integer primary keys, so an un-coercible id means
+    xagent's own code is wrong. It surfaces as the ``TypeError``/``ValueError``
+    it is, raised before the hook is reached, rather than as a retryable
+    "connector access is unavailable" that would send an operator to look at
+    the application instead of at the route.
+
+    Only the id half is checked that way. The connector type is carried by the
+    ``ConnectorRef`` annotation and is not re-checked at run time, so a
+    non-``str`` type reaches the hook as it was passed in: if the hook answers
+    with a verdict for it, the answer validator rejects the key and the generic
+    arm below folds that into the same 503; if the hook leaves it out, the
+    caller reads the gap as "the team does not link it" and nothing raises at
+    all.
 
     A ``ConnectorRuntimeError`` -- whether raised by the hook itself or by
     ``resolve_connector_access``'s own answer validation -- passes through
@@ -622,6 +638,13 @@ def resolve_connector_access_or_raise(
     rejects. Neither is something the generic-exception arm below could
     own, and both are restored before either arm sees the exception.
     """
+    # Not redundant with the identical gate inside ``resolve_connector_access``:
+    # this one has to run before the normalization below, which is itself
+    # deliberately above the ``try``. Without it a standalone deployment raises
+    # on a malformed ref through this entry point while the other one returns
+    # ``{}`` for the very same input.
+    if _connector_access_hook is None:
+        return {}
     requested = _normalize_connector_refs(refs)
     try:
         return resolve_connector_access(db, user_id, requested)

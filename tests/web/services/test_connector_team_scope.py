@@ -575,6 +575,24 @@ def test_resolve_one_connector_access_or_raise_lets_a_malformed_ref_raise_raw(
     assert calls == []
 
 
+@pytest.mark.parametrize("malformed_ref", MALFORMED_REFS)
+def test_resolve_connector_access_or_raise_reads_no_ref_at_all_without_a_hook_installed(
+    malformed_ref,
+):
+    """The sibling of
+    ``test_resolve_connector_access_reads_no_ref_at_all_without_a_hook_installed``
+    for the raising entry point. The two checks above install a hook on
+    purpose, so they pin the malformed-ref boundary only for a deployment that
+    has an application installed; without this one, nothing pins the other
+    deployment, and this entry point raised there while
+    ``resolve_connector_access`` returned ``{}`` for the very same ref."""
+    assert connector_team_scope._connector_access_hook is None
+    assert (
+        connector_team_scope.resolve_connector_access_or_raise(None, 7, [malformed_ref])
+        == {}
+    )
+
+
 def test_resolve_connector_access_or_raise_still_converts_with_well_formed_refs():
     """The opposite direction of the two checks above, so that widening the
     raw-error path cannot go unnoticed: with the refs well formed, a hook
