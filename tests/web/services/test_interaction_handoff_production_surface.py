@@ -22,7 +22,7 @@ instead of the absence of every caller:
   three that need to (unchanged by this delivery -- see ``create()``'s own
   docstring on what it reuses).
 
-Window-not-lost note: static门1
+Window-not-lost note: the static create()/respond() production-caller gate
 (``test_task_interaction_service_create_gate.py``) still separately watches
 ``create()``/``respond()`` for a *production caller* -- neither name has one
 yet in this delivery. These three guards watch a narrower thing: given that
@@ -124,7 +124,7 @@ def test_handoff_is_entered_only_from_the_create_seam() -> None:
 # enters interaction_handoff; (b) behavioral -- a bad payload never reaches
 # the handoff and stages nothing.
 #
-# Hard rule (V3-B8): (a) alone is not enough. Line-number order does not
+# Hard rule: (a) alone is not enough. Line-number order does not
 # prove a statement always runs -- moving validation into an `if False:`
 # branch, or a `try` that is itself unreachable, would keep any purely
 # textual/line-number check green while skipping the check entirely. (a)
@@ -279,8 +279,8 @@ def test_create_validates_before_entering_the_handoff_behavioral(_db: Any) -> No
 
 # ---------------------------------------------------------------------------
 # Guard 3: the staging module's import surface is exactly the three modules
-# that need it, unchanged by this delivery (V3-B4/V3-L: the only new user,
-# task_interaction_service, was already in the set).
+# that need it, unchanged by this delivery -- the only new user,
+# task_interaction_service, was already in the set.
 # ---------------------------------------------------------------------------
 
 

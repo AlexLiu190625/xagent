@@ -5054,7 +5054,7 @@ def test_every_with_for_update_call_passes_key_share_true() -> None:
 def test_i_a_1_kind_and_user_id_domain_at_construction(
     kind: Any, user_id: Any, expect_constructs: bool
 ) -> None:
-    """I-a-1: any kind outside the closed enum, or a user_id outside its
+    """Any kind outside the closed enum, or a user_id outside its
     domain (None, or a positive non-bool int), can never be constructed."""
 
     kwargs = dict(kind=kind, user_id=user_id, is_admin=False, auth_mode=None)
@@ -5079,7 +5079,7 @@ def test_i_a_1_mutation_deleting_kind_check_lets_garbage_through() -> None:
 
 
 def test_i_a_2_identity_string_never_renders_a_nonexistent_person() -> None:
-    """I-a-2: responder_identity never renders as user:None / user:True /
+    """responder_identity never renders as user:None / user:True /
     guest: / an empty string, for any constructible principal -- including
     the system principal, whose rendering is a fixed, non-empty constant
     distinct from both namespaces."""
@@ -5102,7 +5102,7 @@ def test_i_a_2_identity_string_never_renders_a_nonexistent_person() -> None:
 def test_i_a_3_system_principal_never_gets_authorized_through_ownership(
     _db: Session, _seeded_task: int
 ) -> None:
-    """I-a-3: the system principal never reaches the write point by owning
+    """The system principal never reaches the write point by owning
     the task -- _assert_write_point_admissible is the only gate, and it
     checks kind alone, never user_id/ownership."""
 
@@ -5290,7 +5290,7 @@ def test_system_principal_creates_a_fresh_row(
 
 
 def test_i_a_5_system_path_issues_no_task_query() -> None:
-    """I-a-5, static half: on the system-principal path, create() must
+    """Static half: on the system-principal path, create() must
     never issue a Task query of its own. Walks the actual AST subtree of
     the `if principal.kind == InteractionPrincipalKind.SYSTEM:` branch's
     own body (its True side, never its `else`) and fails if any
@@ -5349,37 +5349,115 @@ def test_i_a_5_system_path_issues_no_task_query() -> None:
 
 
 def test_i_a_6_task_handed_to_handoff_is_the_caller_supplied_object(
-    _db: Session, _system_call_ctx: dict[str, Any]
+    _db: Session, _system_call_ctx: dict[str, Any], _session_factory
 ) -> None:
-    """I-a-6, behavioral: the exact object create() passes to
-    interaction_handoff is the caller's own task, never a re-derived one."""
+    """Behavioral: the exact object create() passes to
+    interaction_handoff is the caller's own task, never a re-derived one.
 
-    real_interaction_handoff = svc.interaction_handoff
-    seen: dict[str, Any] = {}
+    Loads ``task`` through a second, independent session (not ``_db``, the
+    one ``create()`` itself is given) before ever calling ``create()``.
+    This is load-bearing, not incidental: SQLAlchemy's identity map means
+    a same-session ``db.query(Task).filter(Task.id == task_id).first()``
+    returns the *identical* Python object already loaded on that session,
+    so an ``is`` comparison against a same-session task cannot tell "the
+    caller-supplied object was used" apart from "the object was silently
+    re-queried and happened to come back identical" -- a re-introduced
+    query would pass such a check by accident. A second session has no
+    such identity map to share, so only the genuinely caller-supplied
+    object can satisfy the ``is`` check below."""
 
-    def _spy(db: Any, lease: Any, *, task: Any, anchor: Any, now: Any) -> Any:
-        seen["task"] = task
-        return real_interaction_handoff(db, lease, task=task, anchor=anchor, now=now)
-
-    with mock.patch(
-        "xagent.web.services.task_interaction_service.interaction_handoff",
-        side_effect=_spy,
-    ):
-        _system_create(
-            _db, _system_call_ctx, request_idempotency_key="sys-key-identity"
+    ctx = _system_call_ctx
+    second_session = _session_factory()
+    try:
+        cross_session_task = (
+            second_session.query(Task).filter(Task.id == ctx["task"].id).first()
         )
+        assert cross_session_task is not ctx["task"]  # confirms the setup itself
 
-    assert seen["task"] is _system_call_ctx["task"]
+        real_interaction_handoff = svc.interaction_handoff
+        seen: dict[str, Any] = {}
+
+        def _spy(db: Any, lease: Any, *, task: Any, anchor: Any, now: Any) -> Any:
+            seen["task"] = task
+            return real_interaction_handoff(
+                db, lease, task=task, anchor=anchor, now=now
+            )
+
+        with mock.patch(
+            "xagent.web.services.task_interaction_service.interaction_handoff",
+            side_effect=_spy,
+        ):
+            svc.create(
+                _db,
+                task_id=int(ctx["task"].id),
+                principal=ctx["principal"],
+                envelope=_valid_envelope(request_idempotency_key="sys-key-identity"),
+                task=cross_session_task,
+                lease=ctx["lease"],
+                anchor=ctx["anchor"],
+                now=ctx["now"],
+                expires_at=ctx["expires_at"],
+            )
+    finally:
+        second_session.close()
+
+    assert seen["task"] is cross_session_task
+    assert seen["task"] is not ctx["task"]
+
+
+def test_i_a_6_uncommitted_in_memory_task_state_is_what_gets_staged(
+    _db: Session, _system_call_ctx: dict[str, Any], _session_factory
+) -> None:
+    """A second discriminator against the same mutation, independent of
+    object identity: mutates ``task.source`` in memory only, on a
+    second-session object, without ever committing it. Only the
+    caller-supplied object carries this uncommitted value -- a fresh
+    ``db.query(Task)`` on ``create()``'s own session would see the real,
+    unmutated, committed row instead. ``interaction_handoff``'s own
+    ``stage()`` derives the persisted row's ``origin`` from
+    ``task.source``, so the row this test reads back afterward proves
+    which object's data was actually used."""
+
+    ctx = _system_call_ctx
+    second_session = _session_factory()
+    try:
+        cross_session_task = (
+            second_session.query(Task).filter(Task.id == ctx["task"].id).first()
+        )
+        cross_session_task.source = "sdk"  # in-memory only, never committed
+        assert cross_session_task.source != ctx["task"].source
+
+        outcome = svc.create(
+            _db,
+            task_id=int(ctx["task"].id),
+            principal=ctx["principal"],
+            envelope=_valid_envelope(request_idempotency_key="sys-key-uncommitted"),
+            task=cross_session_task,
+            lease=ctx["lease"],
+            anchor=ctx["anchor"],
+            now=ctx["now"],
+            expires_at=ctx["expires_at"],
+        )
+    finally:
+        second_session.close()
+
+    assert isinstance(outcome, svc.CreateCreated)
+    row = (
+        _db.query(TaskInteractionRequest)
+        .filter(TaskInteractionRequest.id == outcome.receipt.interaction_id)
+        .first()
+    )
+    assert row.origin == "sdk"
 
 
 def test_anchor_corrupt_maps_to_validation_rejected_invalid_values(
     _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
-    """T2/修-2: InteractionAnchorCorrupt, pre-checked by create() itself
-    before ever entering interaction_handoff, maps to
-    CreateValidationRejected(invalid_values) with an anchor.<field>
-    position -- never anchor_dangling/checkpoint_unavailable, which name
-    the database-read half of anchor resolution this seam does not do."""
+    """InteractionAnchorCorrupt, swallowed by interaction_handoff and
+    recorded on handoff.degraded_as, maps to
+    CreateValidationRejected(invalid_values) -- never
+    anchor_dangling/checkpoint_unavailable, which name the database-read
+    half of anchor resolution this seam does not do."""
 
     ctx = _system_call_ctx
     corrupt_anchor = InteractionAnchor(
@@ -5421,9 +5499,10 @@ def test_anchor_corrupt_mutation_wrong_reason_word() -> None:
 def test_run_partition_mismatch_maps_to_stale_anchor_run_mismatch(
     _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
-    """T2, original ③-D mapping (unchanged across every revision round):
-    InteractionRunPartitionMismatch's write-side twin -- create()'s own
-    pre-check on lease.run_id vs anchor.resume_run_partition -- maps to
+    """InteractionRunPartitionMismatch, raised by
+    stage_interaction_request's own validation when lease.run_id does not
+    match anchor.resume_run_partition, swallowed by interaction_handoff and
+    recorded on handoff.degraded_as, maps to
     CreateStale(anchor_run_mismatch)."""
 
     ctx = _system_call_ctx
@@ -5451,10 +5530,14 @@ def test_run_partition_mismatch_maps_to_stale_anchor_run_mismatch(
 def test_closed_idempotency_key_maps_to_conflict_reused(
     _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
-    """T2/修-3 定案 A: a request_idempotency_key already naming a closed
+    """A request_idempotency_key already naming a closed
     (answered/terminated) row on this run maps to
-    CreateConflict(idempotency_key_reused) -- pre-checked by create()
-    itself, never reaching interaction_handoff for that call."""
+    CreateConflict(idempotency_key_reused). stage_interaction_request's own
+    step-3 pre-read raises InteractionRequestClosed inside the handoff;
+    interaction_handoff swallows it and records
+    handoff.degraded_as = InteractionRequestClosed, which create() reads
+    after the `with` block and maps to this outcome -- no separate
+    pre-check of its own runs ahead of the handoff."""
 
     ctx = _system_call_ctx
     first = _system_create(_db, ctx, request_idempotency_key="sys-key-closed")
@@ -5470,18 +5553,17 @@ def test_closed_idempotency_key_maps_to_conflict_reused(
     row.terminal_reason = "deadline_elapsed"
     _db.commit()
 
-    with mock.patch(
-        "xagent.web.services.task_interaction_service.interaction_handoff"
-    ) as mocked_handoff:
-        outcome = _system_create(_db, ctx, request_idempotency_key="sys-key-closed")
+    outcome = _system_create(_db, ctx, request_idempotency_key="sys-key-closed")
     assert outcome == svc.CreateConflict(reason="idempotency_key_reused")
-    mocked_handoff.assert_not_called()
+    # No second row: the closed key on this run refuses the write, it does
+    # not reclaim or replace the terminated row.
+    assert _db.query(TaskInteractionRequest).count() == 1
 
 
 def test_active_replay_returns_create_created_not_a_distinct_outcome(
     _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
-    """T2/修-3 定案 B: a replay hit whose row is still active is not
+    """A replay hit whose row is still active is not
     preempted -- stage_interaction_request's own step-3 pre-read returns
     it (created=False), and create() reports CreateCreated the same as a
     fresh insert, never a distinct outcome."""
@@ -5495,11 +5577,66 @@ def test_active_replay_returns_create_created_not_a_distinct_outcome(
     assert _db.query(TaskInteractionRequest).count() == 1
 
 
+def test_slot_taken_maps_to_conflict_slot_taken(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """InteractionSlotTaken, swallowed by interaction_handoff and recorded
+    on handoff.degraded_as, maps to CreateConflict(slot_taken). Forced
+    directly (a genuine INSERT race is not reproducible in a single-threaded
+    test) by making the staging primitive's own INSERT step raise it, the
+    same way it would after losing a real race against a concurrent
+    session's INSERT."""
+
+    from xagent.web.services import task_interaction_staging as staging_module
+
+    ctx = _system_call_ctx
+    real_stage = staging_module.stage_interaction_request
+
+    def _stage_and_raise_slot_taken(*args: Any, **kwargs: Any) -> Any:
+        raise staging_module.InteractionSlotTaken(
+            "forced for test_slot_taken_maps_to_conflict_slot_taken"
+        )
+
+    with mock.patch.object(
+        staging_module,
+        "stage_interaction_request",
+        side_effect=_stage_and_raise_slot_taken,
+    ):
+        outcome = _system_create(_db, ctx, request_idempotency_key="sys-key-slot-taken")
+    assert outcome == svc.CreateConflict(reason="slot_taken")
+    assert real_stage is staging_module.stage_interaction_request  # patch released
+    assert _db.query(TaskInteractionRequest).count() == 0
+
+
+def test_handoff_degraded_as_is_set_directly_on_a_slot_taken_swallow(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """Unlike the outcome-level test above, this checks
+    InteractionHandoff.degraded_as itself, at the staging primitive's own
+    layer -- discriminating power the outcome-level test lacks for this one
+    exception, since CreateConflict(slot_taken) is also this function's
+    fallback for an unset/unrecognized degraded_as, so an outcome-only
+    check cannot tell "correctly mapped" from "fell through to the
+    default". Deleting the `handoff.degraded_as = type(exc)` assignment in
+    interaction_handoff's except block turns this test red without
+    changing the outcome-level test's result at all."""
+
+    from xagent.web.services.task_interaction_staging import InteractionSlotTaken
+
+    ctx = _system_call_ctx
+    with svc.interaction_handoff(
+        _db, ctx["lease"], task=ctx["task"], anchor=ctx["anchor"], now=ctx["now"]
+    ) as handoff:
+        raise InteractionSlotTaken("forced for degraded_as inspection")
+    assert handoff.staged is None
+    assert handoff.degraded_as is InteractionSlotTaken
+
+
 def test_receipt_on_replay_reports_the_existing_rows_expires_at(
     _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
-    """R-1(ii), test cell 2 -- the collision-format's entire reason to
-    exist: on replay the receipt must report the EXISTING row's
+    """The receipt-widening format cell this test exists for: on replay the
+    receipt must report the EXISTING row's
     expires_at, not the value this call proposed. Forces the two apart by
     advancing `now`/`expires_at` between the two calls."""
 
@@ -5525,21 +5662,41 @@ def test_receipt_on_replay_reports_the_existing_rows_expires_at(
 def test_receipt_on_fresh_insert_carries_the_proposed_expires_at(
     _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
-    """R-1(ii), test cell 1 -- the mirror of the replay cell above."""
+    """The mirror of the replay cell above: a fresh insert's receipt
+    reports the value this call proposed."""
 
     ctx = _system_call_ctx
     outcome = _system_create(_db, ctx, request_idempotency_key="sys-key-fresh-expiry")
     assert outcome.receipt.expires_at == ctx["expires_at"]
 
 
-def test_statement_sequence_is_unchanged_by_the_receipt_widening(
-    _db: Session, _system_call_ctx: dict[str, Any]
-) -> None:
-    """R-1(ii)'s entire advantage over (i): widening an existing SELECT's
-    column list adds no new statement. Pinned by counting queries issued
-    during one create() call via SQLAlchemy's engine-level event hook."""
+def _leading_keyword(statement: str) -> str:
+    """The statement's own leading SQL keyword, uppercased -- a stable,
+    parameter-independent shape marker for the assertions below (bound
+    values and column lists change; the keyword and the statement's
+    position in the sequence do not)."""
 
-    ctx = _system_call_ctx
+    stripped = statement.strip()
+    first_word = stripped.split(None, 1)[0].upper()
+    if stripped.upper().startswith("RELEASE SAVEPOINT"):
+        return "RELEASE SAVEPOINT"
+    return first_word
+
+
+def _capture_statement_sequence(
+    db: Session, ctx: dict[str, Any], key: str
+) -> list[str]:
+    """Every statement create() issues (through interaction_handoff and
+    stage_interaction_request) for one call, as leading-keyword shapes, in
+    the order they actually ran. Touches every ctx["task"] attribute
+    create() itself reads before attaching the hook, so a lazy-reload
+    SQLAlchemy issues for an object this test's own fixture setup expired
+    (via an unrelated commit) is not mistaken for a statement create()
+    itself is responsible for."""
+
+    task = ctx["task"]
+    _ = (task.id, task.user_id, task.source, task.run_id, task.lease_attempt_id)
+
     statements: list[str] = []
 
     def _before_cursor_execute(
@@ -5547,28 +5704,66 @@ def test_statement_sequence_is_unchanged_by_the_receipt_widening(
     ):
         statements.append(statement)
 
-    engine = _db.get_bind()
+    engine = db.get_bind()
     sa.event.listen(engine, "before_cursor_execute", _before_cursor_execute)
     try:
-        _system_create(_db, ctx, request_idempotency_key="sys-key-stmt-count")
+        _system_create(db, ctx, request_idempotency_key=key)
     finally:
         sa.event.remove(engine, "before_cursor_execute", _before_cursor_execute)
+    return [_leading_keyword(s) for s in statements]
 
-    select_statements = [
-        s for s in statements if s.strip().upper().startswith("SELECT")
+
+def test_statement_sequence_is_unchanged_by_the_receipt_widening(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """Widening _identity_lookup_stmt's column list (this delivery's own
+    change) adds no new statement and reorders nothing: a fresh insert
+    still runs exactly this sequence -- the SQLite-only dummy UPDATE, the
+    outer savepoint interaction_handoff opens, the identity SELECT
+    stage_interaction_request's step 3 runs (now widened, same statement),
+    the reclaim UPDATE (step 4), the inner savepoint
+    stage_interaction_request opens for its own INSERT (step 5), the
+    INSERT itself, and the two savepoints releasing in reverse order.
+    Asserted by leading-keyword shape, in order -- not just a count --
+    against a real, captured sequence, not an estimate."""
+
+    sequence = _capture_statement_sequence(
+        _db, _system_call_ctx, "sys-key-stmt-sequence-fresh"
+    )
+    assert sequence == [
+        "UPDATE",  # SQLite-only dummy DML (interaction_handoff)
+        "SAVEPOINT",  # outer savepoint (interaction_handoff)
+        "SELECT",  # identity pre-read, step 3 (stage_interaction_request)
+        "UPDATE",  # reclaim stale/superseded slot, step 4
+        "SAVEPOINT",  # inner savepoint, step 5
+        "INSERT",  # the new row, step 5
+        "RELEASE SAVEPOINT",  # inner savepoint commits
+        "RELEASE SAVEPOINT",  # outer savepoint commits
     ]
-    # Exactly one identity SELECT from create()'s own pre-check, plus
-    # stage_interaction_request's own step-3 pre-read -- both use
-    # _identity_lookup_stmt, and neither is a new statement shape R-1(ii)
-    # introduced; the column widening changed what one existing SELECT
-    # returns, not how many SELECTs run.
-    assert len(select_statements) >= 1
+
+
+def test_statement_sequence_on_replay_is_unchanged_by_the_receipt_widening(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """The replay path's own sequence, shorter than the fresh-insert one
+    because it returns from the identity pre-read directly, without ever
+    opening the inner savepoint an INSERT would need."""
+
+    ctx = _system_call_ctx
+    _system_create(_db, ctx, request_idempotency_key="sys-key-stmt-sequence-replay")
+    sequence = _capture_statement_sequence(_db, ctx, "sys-key-stmt-sequence-replay")
+    assert sequence == [
+        "UPDATE",  # SQLite-only dummy DML (interaction_handoff)
+        "SAVEPOINT",  # outer savepoint (interaction_handoff)
+        "SELECT",  # identity pre-read, step 3 -- hits the active row
+        "RELEASE SAVEPOINT",  # outer savepoint commits; no insert attempted
+    ]
 
 
 def test_event_id_and_metadata_keys_are_not_rejected_as_unknown(
     _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
-    """T4/③-H: event_id, and the other keys build_clarification_payload
+    """event_id, and the other keys build_clarification_payload
     may add beyond message/interactions, must never be treated as unknown
     fields -- rejecting event_id specifically would refuse every
     legitimate payload, since every real caller carries it."""
@@ -5623,16 +5818,16 @@ def test_unrecognized_envelope_key_mutation_removing_the_check() -> None:
 @pytest.mark.parametrize(
     "field",
     [
-        pytest.param("﻿", id="bom_only"),
-        pytest.param("﻿env", id="bom_prefixed"),
-        pytest.param("env﻿", id="bom_suffixed"),
-        pytest.param(" \t﻿ ", id="mixed_ascii_and_bom"),
+        pytest.param("\ufeff", id="bom_only"),
+        pytest.param("\ufeffenv", id="bom_prefixed"),
+        pytest.param("env\ufeff", id="bom_suffixed"),
+        pytest.param(" \t\ufeff ", id="mixed_ascii_and_bom"),
     ],
 )
 def test_field_bom_forms_are_rejected_or_pinned_to_the_shared_table(
     field: str,
 ) -> None:
-    """义务43: field-name blankness/whitespace judgment must use the same
+    """field-name blankness/whitespace judgment must use the same
     30-code-point table react.py's producer uses, not bare str.strip()
     (which does not treat U+FEFF as whitespace). A BOM-only field is
     blank; a BOM-affixed non-blank field carries "surrounding whitespace"
@@ -5655,7 +5850,7 @@ def test_option_label_bom_only_is_rejected_strip_aware() -> None:
         [
             _interaction(
                 type="select_one",
-                options=[{"label": "﻿", "value": "a"}],
+                options=[{"label": "\ufeff", "value": "a"}],
             )
         ]
     )
@@ -5671,25 +5866,180 @@ def test_bom_mutation_reverting_to_str_strip_lets_bom_only_field_through() -> No
     _normalize_interaction_text to str.strip() would let this BOM-only
     field pass where the shared table refuses it."""
 
-    assert "﻿".strip() != ""  # str.strip() alone: NOT blank
+    assert "\ufeff".strip() != ""  # str.strip() alone: NOT blank
     from xagent.core.agent.pattern.react.react import _normalize_interaction_text
 
-    assert _normalize_interaction_text("﻿") == ""  # shared table: blank
+    assert _normalize_interaction_text("\ufeff") == ""  # shared table: blank
 
 
 def test_message_bom_only_is_blank() -> None:
     values = _values([_interaction()])
-    values["message"] = "﻿"
+    values["message"] = "\ufeff"
     parsed = svc.parse_v1_request_payload(values)
     with pytest.raises(svc.InteractionWritePayloadRejected) as excinfo:
         svc.validate_v1_write_payload(parsed)
     assert excinfo.value.refusal.rule == "message_blank"
 
 
+# ---------------------------------------------------------------------------
+# Input-space exhaustion for min/max/default_value/accept, crossed against
+# all seven interaction types and a set of bad shapes -- the deliverable
+# table itself, not just its passing tests. Every cell states its own
+# judgment (accept, or reject under a named rule) so a reader does not have
+# to re-derive it from the assertion alone.
+#
+# min/max are InteractionArg's own Optional[int] fields -- not strings, so
+# the string bad-shapes (empty/whitespace/BOM) that apply to field/label/
+# option values do not apply here at all; a caller cannot even construct a
+# BOM-shaped int. What varies instead is the numeric relationship between
+# the two: inverted (min > max), equal, and each set alone. Today's rule
+# (validate_v1_write_payload) rejects only an inverted pair, and only on
+# number_input -- the one type that reads the pair at all (see that
+# function's own docstring on the three deliberately-accepted shapes). On
+# every other type the pair is an unread hint; an inverted one there is
+# still accepted, because nothing renders it.
+#
+# default_value is Union[str, bool, int, float, None] -- the four string
+# bad-shapes apply when it is a string. No rule anywhere checks
+# default_value's content against anything (not its own type, not the
+# interaction's type, not blankness) -- it is a UI-only pre-fill hint the
+# renderer either uses or ignores, and the answer-side field schema (#1368)
+# is what would eventually validate a submitted answer, not this seam.
+# Every cell here is therefore an "accept" cell; the judgment is "no rule
+# exists to fire", stated once here rather than per cell.
+#
+# accept is Optional[list[str]], meaningful only to file_upload's renderer
+# (clarification-form.tsx passes it straight to the file input's own
+# `accept` attribute) -- the model does not restrict which type may carry
+# it, and neither does this validator. The four bad shapes apply to a list
+# element. No rule checks accept's element content either (an empty or
+# BOM-only extension string reaches the browser's own accept attribute
+# unfiltered, which is a rendering-quality question, not a write-integrity
+# one this seam is responsible for) -- every cell here is an "accept" cell
+# for the same reason default_value's are.
+# ---------------------------------------------------------------------------
+
+
+def _base_interaction_for_type(
+    interaction_type: str, **overrides: Any
+) -> dict[str, Any]:
+    item = _interaction(type=interaction_type, **overrides)
+    if (
+        interaction_type in svc._V1_TYPES_REQUIRING_OPTIONS
+        and "options" not in overrides
+    ):
+        item["options"] = [{"label": "Option A", "value": "a"}]
+    return item
+
+
+_ALL_SEVEN_TYPES = sorted(svc._V1_INTERACTION_TYPES)
+
+_MIN_MAX_CELLS = [
+    (interaction_type, min_value, max_value)
+    for interaction_type in _ALL_SEVEN_TYPES
+    for min_value, max_value in [
+        (5, 3),  # inverted
+        (5, 5),  # equal
+        (5, None),  # min alone
+        (None, 5),  # max alone
+    ]
+]
+
+
+@pytest.mark.parametrize(
+    ("interaction_type", "min_value", "max_value"),
+    _MIN_MAX_CELLS,
+    ids=[f"{t}-min={mn}-max={mx}" for t, mn, mx in _MIN_MAX_CELLS],
+)
+def test_min_max_matrix(
+    interaction_type: str, min_value: int | None, max_value: int | None
+) -> None:
+    values = _values(
+        [_base_interaction_for_type(interaction_type, min=min_value, max=max_value)]
+    )
+    parsed = svc.parse_v1_request_payload(values)
+    inverted = min_value is not None and max_value is not None and min_value > max_value
+    if interaction_type == "number_input" and inverted:
+        with pytest.raises(svc.InteractionWritePayloadRejected) as excinfo:
+            svc.validate_v1_write_payload(parsed)
+        assert excinfo.value.refusal.rule == "number_range_inverted"
+    else:
+        svc.validate_v1_write_payload(parsed)  # must not raise
+
+
+_BAD_STRING_SHAPES = [
+    ("empty", ""),
+    ("whitespace", "   "),
+    ("bom_only", "\ufeff"),
+    ("bom_wrapped", "\ufeffvalue\ufeff"),
+]
+
+_DEFAULT_VALUE_CELLS = [
+    (interaction_type, shape_id, shape_value)
+    for interaction_type in _ALL_SEVEN_TYPES
+    for shape_id, shape_value in _BAD_STRING_SHAPES
+]
+
+
+@pytest.mark.parametrize(
+    ("interaction_type", "shape_id", "shape_value"),
+    _DEFAULT_VALUE_CELLS,
+    ids=[f"{t}-{sid}" for t, sid, _ in _DEFAULT_VALUE_CELLS],
+)
+def test_default_value_matrix(
+    interaction_type: str, shape_id: str, shape_value: str
+) -> None:
+    values = _values(
+        [_base_interaction_for_type(interaction_type, default_value=shape_value)]
+    )
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)  # must not raise -- see module note above
+
+
+@pytest.mark.parametrize(
+    "default_value",
+    [True, False, 0, 1, 3.5, None],
+    ids=["bool_true", "bool_false", "int_zero", "int_one", "float", "none"],
+)
+def test_default_value_non_string_shapes_are_accepted(default_value: Any) -> None:
+    values = _values([_interaction(default_value=default_value)])
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)  # must not raise
+
+
+_ACCEPT_LIST_SHAPES = [
+    ("empty_list", []),
+    ("single_empty_element", [""]),
+    ("single_whitespace_element", ["   "]),
+    ("single_bom_only_element", ["\ufeff"]),
+    ("bom_wrapped_extension", ["\ufeff.csv"]),
+    ("mixed_good_and_bad", [".csv", ""]),
+]
+
+_ACCEPT_CELLS = [
+    (interaction_type, shape_id, shape_value)
+    for interaction_type in _ALL_SEVEN_TYPES
+    for shape_id, shape_value in _ACCEPT_LIST_SHAPES
+]
+
+
+@pytest.mark.parametrize(
+    ("interaction_type", "shape_id", "shape_value"),
+    _ACCEPT_CELLS,
+    ids=[f"{t}-{sid}" for t, sid, _ in _ACCEPT_CELLS],
+)
+def test_accept_matrix(
+    interaction_type: str, shape_id: str, shape_value: list[str]
+) -> None:
+    values = _values([_base_interaction_for_type(interaction_type, accept=shape_value)])
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)  # must not raise -- see module note above
+
+
 def test_receipt_idempotency_key_is_the_normalized_form_not_the_envelope_original(
     _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
-    """终判附带项: the receipt's request_idempotency_key must be
+    """The receipt's request_idempotency_key must be
     _normalize_command_id's return value, never the envelope's original
     string -- a key padded with surrounding whitespace must come back
     identical, byte for byte, to what is actually stored."""

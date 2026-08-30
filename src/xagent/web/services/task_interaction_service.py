@@ -20,22 +20,26 @@ on that same caller-owned session, never a savepoint of its own. Putting
 staging module's merge-reason docstring false. What this module reuses
 from the staging module instead of duplicating is narrow: the private
 kind vocabulary (``_KIND_VOCABULARY``), ``InteractionAnchor``,
-``interaction_handoff``, ``_identity_lookup_stmt``, and
-``_validate_anchor_fields``, all imported by name (the
-``StagedInteractionRequest`` values ``interaction_handoff`` produces flow
-through as ``handoff.staged``, never imported as a name of their own
-here). ``respond()`` calls none of them and raises or catches none of
-that module's nine exception classes; this module's own read-direction
-anchor resolver validates a real ``trace_events`` row against a stored
-interaction row's fields -- a different check from the staging module's
-``_validate_anchor_fields``, which validates an ``InteractionAnchor``
-value object before an INSERT -- so it is not reused there either.
-``create()`` is the one direction of reuse: it enters
-``interaction_handoff`` on the system principal's write path and
-pre-checks two of its six swallowed exceptions with the same shared
-validation the staging primitive uses internally (see ``create()``'s own
-docstring for the accounting), and ``_resolve_read_direction_anchor``'s
-docstring covers the read-direction anchor-check distinction.
+``interaction_handoff``, and the four exception classes
+``interaction_handoff`` can swallow that this module maps to a distinct
+outcome (``InteractionAnchorCorrupt``, ``InteractionRequestClosed``,
+``InteractionRunPartitionMismatch``, ``InteractionSlotTaken``), all
+imported by name (the ``StagedInteractionRequest`` values
+``interaction_handoff`` produces flow through as ``handoff.staged``, never
+imported as a name of their own here). ``respond()`` calls none of them
+and raises or catches none of that module's nine exception classes; this
+module's own read-direction anchor resolver validates a real
+``trace_events`` row against a stored interaction row's fields -- a
+different check from the staging module's ``_validate_anchor_fields``,
+which validates an ``InteractionAnchor`` value object before an INSERT --
+so it is not reused there either. ``create()`` is the one direction of
+reuse: it enters ``interaction_handoff`` on the system principal's write
+path and reads which of the primitive's own swallowed exceptions the call
+degraded on (``InteractionHandoff.degraded_as``) rather than duplicating
+the primitive's own validation ahead of the call (see
+``_DEGRADED_AS_OUTCOME``'s own docstring for that decision), and
+``_resolve_read_direction_anchor``'s docstring covers the read-direction
+anchor-check distinction.
 
 Concurrency precondition, stated once here because every rowcount-based
 branch this service will grow depends on it: every rowcount-based branch
@@ -155,8 +159,9 @@ from .task_interaction_staging import (
     _KIND_VOCABULARY,
     InteractionAnchor,
     InteractionAnchorCorrupt,
-    _identity_lookup_stmt,
-    _validate_anchor_fields,
+    InteractionRequestClosed,
+    InteractionRunPartitionMismatch,
+    InteractionSlotTaken,
     interaction_handoff,
 )
 from .task_lease_service import TASK_RUN_ID_TRACE_FIELD, TaskLease
@@ -1442,6 +1447,37 @@ def _assert_write_point_admissible(
         )
 
 
+# The four of interaction_handoff's six swallowed exceptions this seam
+# reports as a distinct outcome, keyed by the exact exception type
+# InteractionHandoff.degraded_as records (see that attribute's own
+# docstring). Read after the `with interaction_handoff(...)` block, in the
+# same place `handoff.staged` is read, rather than pre-checked ahead of
+# entering the block: the swallow handler is the one place that actually
+# saw which exception fired, and reporting from there costs no additional
+# statement, unlike a caller-side pre-check duplicating the same check.
+#
+# The two remaining swallowed types, InteractionAttemptMismatch and
+# InteractionOriginUnknown, are not keys here. Both stay unreachable from
+# every wired caller for a caller-side structural reason: the finalizers
+# that call this seam hold their task row's own lock for the span of the
+# call (a SELECT ... FOR UPDATE on PostgreSQL; single-writer serialization
+# on SQLite -- see InteractionHandoff._assert_current_attempt for the same
+# backend-specific distinction stated where the comparison is actually
+# made), which keeps the attempt comparison's window closed before this
+# call is ever reached; and the gating layer in front of native
+# publication (interaction_rollout.evaluate_native_publication) already
+# refuses an out-of-vocabulary task.source before a finalizer would ever
+# call this seam. A caller that cannot provide either property must not
+# use this path. If either exception somehow fires anyway, create() falls
+# back to the single default classification below (slot_taken).
+_DEGRADED_AS_OUTCOME: dict[type[BaseException], "CreateOutcome"] = {
+    InteractionSlotTaken: CreateConflict(reason="slot_taken"),
+    InteractionRequestClosed: CreateConflict(reason="idempotency_key_reused"),
+    InteractionAnchorCorrupt: CreateValidationRejected(reason="invalid_values"),
+    InteractionRunPartitionMismatch: CreateStale(reason="anchor_run_mismatch"),
+}
+
+
 def create(
     db: "Session",
     *,
@@ -1637,45 +1673,33 @@ def create(
     through; a future caller that wants ``ttl_seconds`` actually consulted
     is an explicit bypass this delivery does not add, not a silent gap.
 
-    Two pre-checks run after ``_assert_write_point_admissible`` and before
-    ``interaction_handoff`` is ever entered, converting what would
-    otherwise be two of the staging primitive's six swallowed exceptions
-    into a distinct, caller-visible outcome instead of a generic
-    degradation -- both use the same shared validation the staging
-    primitive itself uses, so the primitive's own re-validation inside the
-    handoff can never disagree with this seam's verdict on the same input:
+    No pre-check runs ahead of ``interaction_handoff`` for any of the six
+    exceptions it can swallow: entering the block always issues the same
+    statements (see ``_DEGRADED_AS_OUTCOME``'s own docstring for why a
+    caller-side pre-check duplicating the primitive's own validation was
+    rejected). Four of the six are reported as a distinct, caller-visible
+    outcome instead of a generic degradation:
 
-    * The anchor's own field consistency, via
-      ``_validate_anchor_fields`` -- the same helper
-      ``InteractionHandoff.stage()`` calls internally. A corrupt anchor is
-      returned as ``CreateValidationRejected(reason="invalid_values")``,
-      with a position identifier of ``anchor.<field_name>`` (matching that
-      helper's own message shape -- see ``InteractionWriteRefusal``'s
-      docstring on that convention). ``invalid_values`` therefore covers
-      two different caller-supplied shapes this seam validates: the
-      envelope's ``values`` against the v1 ``request_payload`` contract
-      (position ``request_payload...``), and the ``anchor`` argument
-      against the anchor field rules the staging primitive shares
-      (position ``anchor...``). Which of the two produced a refusal is
-      carried by the position, not by the reason word.
-    * Whether this call's own run matches the anchor's, via
-      ``lease.run_id != anchor.resume_run_partition`` -- the same
-      condition ``stage_interaction_request``'s own validation block
-      checks. A mismatch is returned as
+    * ``InteractionAnchorCorrupt`` (a malformed ``anchor`` argument) maps to
+      ``CreateValidationRejected(reason="invalid_values")``. ``invalid_values``
+      therefore covers two different caller-supplied shapes this seam
+      validates: the envelope's ``values`` against the v1
+      ``request_payload`` contract, and the ``anchor`` argument against the
+      anchor field rules the staging primitive shares.
+    * ``InteractionRunPartitionMismatch`` (``lease.run_id`` disagreeing with
+      ``anchor.resume_run_partition``) maps to
       ``CreateStale(reason="anchor_run_mismatch")``.
-
-    A third condition -- this call's idempotency key already naming a
-    closed (``answered``/``terminated``) request on this run -- is also
-    pre-checked, via the same identity lookup
-    (``_identity_lookup_stmt``) the staging primitive's own idempotency
-    pre-read uses, and returned as
-    ``CreateConflict(reason="idempotency_key_reused")`` without ever
-    entering the handoff for that call. A hit whose row is still
-    ``active`` is *not* preempted here -- that is a legitimate replay,
-    left for ``stage_interaction_request``'s own step-3 pre-read to
-    return normally (``created=False``), which this function turns into
-    ``CreateCreated`` the same as a fresh insert (see this function's own
-    body for why a replay is not a distinct outcome).
+    * ``InteractionRequestClosed`` (this call's idempotency key already
+      naming a closed -- ``answered``/``terminated`` -- request on this run)
+      maps to ``CreateConflict(reason="idempotency_key_reused")``. A hit
+      whose row is still ``active`` does not raise this at all -- that is a
+      legitimate replay, returned normally (``created=False``) by
+      ``stage_interaction_request``'s own step-3 pre-read, which this
+      function turns into ``CreateCreated`` the same as a fresh insert (see
+      this function's own body for why a replay is not a distinct outcome).
+    * ``InteractionSlotTaken`` (a concurrent INSERT that won a race against
+      this call's own, discoverable only by attempting the write) maps to
+      ``CreateConflict(reason="slot_taken")``.
 
     ``request_idempotency_key`` is normalized once, via
     ``task_command_transport._normalize_command_id``, and that normalized
@@ -1685,36 +1709,24 @@ def create(
     the receipt must name the identity actually written, which is the
     normalized key, not whatever the caller happened to send.
 
-    ``InteractionAttemptMismatch`` and ``InteractionOriginUnknown`` are
-    the two of the staging primitive's six swallowed exceptions this seam
-    does not pre-check, and stay unreachable from every wired caller for a
-    caller-side structural reason rather than a check here: the finalizers
-    that call this seam hold their task row's own lock for the span of the
-    call (a ``SELECT ... FOR UPDATE`` on PostgreSQL; single-writer
-    serialization on SQLite -- see
-    ``InteractionHandoff._assert_current_attempt`` for the same
-    backend-specific distinction stated where the comparison is actually
-    made), which keeps the attempt comparison's window closed before this
-    call is ever reached; and the gating layer in front of native
-    publication (``interaction_rollout.evaluate_native_publication``)
-    already refuses an out-of-vocabulary ``task.source`` before a
-    finalizer would ever call this seam. A caller that cannot provide
-    either property must not use this path. If either exception somehow
-    fires anyway, it is swallowed the same as the third truly
-    unpredictable case below, indistinguishably.
-
-    ``InteractionSlotTaken`` is the one swallowed exception this seam
-    genuinely cannot pre-check: it names a concurrent INSERT that won a
-    race against this call's own, discoverable only by attempting the
-    write. When ``interaction_handoff``'s ``with`` block exits with
-    ``handoff.staged`` still ``None`` -- meaning something was swallowed,
-    despite every pre-checkable condition above having already passed --
-    this function reports ``CreateConflict(reason="slot_taken")``, the
-    single default classification for that state. ``InteractionRunPartitionMismatch``
-    would also land here if it somehow fired despite the pre-check above
-    having passed (a race between this call's own read of ``anchor`` and
-    the pre-check, for instance); it is not given its own outcome, for the
-    same reason the two caller-guaranteed exceptions above are not.
+    ``InteractionAttemptMismatch`` and ``InteractionOriginUnknown`` are the
+    two of the staging primitive's six swallowed exceptions this seam does
+    not map to a distinct outcome, and stay unreachable from every wired
+    caller for a caller-side structural reason: the finalizers that call
+    this seam hold their task row's own lock for the span of the call (a
+    ``SELECT ... FOR UPDATE`` on PostgreSQL; single-writer serialization on
+    SQLite -- see ``InteractionHandoff._assert_current_attempt`` for the
+    same backend-specific distinction stated where the comparison is
+    actually made), which keeps the attempt comparison's window closed
+    before this call is ever reached; and the gating layer in front of
+    native publication (``interaction_rollout.evaluate_native_publication``)
+    already refuses an out-of-vocabulary ``task.source`` before a finalizer
+    would ever call this seam. A caller that cannot provide either property
+    must not use this path. When ``interaction_handoff``'s ``with`` block
+    exits with ``handoff.staged`` still ``None`` and ``handoff.degraded_as``
+    is one of these two, or is unrecognized, this function reports
+    ``CreateConflict(reason="slot_taken")``, the single default
+    classification for that state.
     """
 
     if (
@@ -1753,7 +1765,7 @@ def create(
 
     authorized_task: "Task | None"
     if principal.kind == InteractionPrincipalKind.SYSTEM:
-        # No query issued on this path (I-a-5): the caller's own
+        # No Task query issued on this path: the caller's own
         # already-loaded, already-locked row is trusted as-is, and its id
         # must agree with the id the caller separately named.
         if task is None or int(task.id) != task_id:
@@ -1879,35 +1891,23 @@ def create(
     # Every check above ran regardless of principal kind; everything from
     # here on is reachable only by the system principal (the assertion
     # above raised for anything else), so lease/anchor/now/expires_at are
-    # exactly the arguments the caller must have supplied.
-    if lease is None or anchor is None or now is None or expires_at is None:
+    # exactly the arguments the caller must have supplied. lease.run_id is
+    # checked here too, not left for interaction_handoff's own stage() to
+    # reject: a lease with no run_id can never stage anything (stage()
+    # raises ValueError for exactly that), so failing here is the same
+    # outcome, one call earlier, and it is what lets every use of
+    # lease.run_id below be treated as the str it now provably is.
+    if (
+        lease is None
+        or anchor is None
+        or now is None
+        or expires_at is None
+        or lease.run_id is None
+    ):
         raise ValueError(
-            "create() requires lease/anchor/now/expires_at for a system principal"
+            "create() requires lease/anchor/now/expires_at for a system "
+            "principal, with lease.run_id set"
         )
-
-    try:
-        _validate_anchor_fields(anchor)
-    except InteractionAnchorCorrupt as exc:
-        logger.warning(
-            "v1 interaction write payload refused for task_id=%s: "
-            "rule=anchor_invalid position=anchor detail=%s",
-            task_id,
-            exc,
-        )
-        return CreateValidationRejected(reason="invalid_values")
-
-    if lease.run_id != anchor.resume_run_partition:
-        return CreateStale(reason="anchor_run_mismatch")
-
-    identity_row = db.execute(
-        _identity_lookup_stmt(
-            task_id=int(authorized_task.id),
-            run_id=lease.run_id,
-            request_idempotency_key=normalized_idempotency_key,
-        )
-    ).first()
-    if identity_row is not None and identity_row.status != "active":
-        return CreateConflict(reason="idempotency_key_reused")
 
     with interaction_handoff(
         db, lease, task=authorized_task, anchor=anchor, now=now
@@ -1921,14 +1921,18 @@ def create(
         )
 
     if handoff.staged is None:
-        # interaction_handoff swallowed one of its six expected failures
-        # with no signal telling this function which one -- see this
-        # function's own docstring on why the two structurally-guaranteed
-        # exceptions never reach here in practice and why this single
-        # classification stands in for the one that genuinely can
-        # (InteractionSlotTaken), and, on the rare chance it fires anyway,
-        # for InteractionRunPartitionMismatch too.
-        return CreateConflict(reason="slot_taken")
+        # interaction_handoff swallowed one of its six expected failures.
+        # handoff.degraded_as records which one -- read here, in the same
+        # place handoff.staged itself is read -- and _DEGRADED_AS_OUTCOME
+        # maps four of the six to a distinct outcome each. The remaining
+        # two (see that dict's own docstring), and an unset/unrecognized
+        # degraded_as, fall through to this default.
+        mapped_outcome = (
+            _DEGRADED_AS_OUTCOME.get(handoff.degraded_as)
+            if handoff.degraded_as is not None
+            else None
+        )
+        return mapped_outcome or CreateConflict(reason="slot_taken")
 
     receipt = CreatedInteractionReceipt(
         interaction_id=handoff.staged.staged_db_id,

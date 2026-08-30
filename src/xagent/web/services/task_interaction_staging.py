@@ -1203,6 +1203,15 @@ class InteractionHandoff:
         # to know whether this round staged an interaction row, without
         # consulting the ops_signals registry.
         self.staged: StagedInteractionRequest | None = None
+        # Which of the six swallowed exception types this round's `with`
+        # block degraded on, or None if it did not degrade at all. Set by
+        # interaction_handoff itself, on this same object, before it
+        # registers a degradation signal or logs -- a caller-local
+        # complement to that call's own process-global signal, letting a
+        # caller distinguish which of the six happened without parsing a
+        # log line or consulting a signal registry that cannot tell them
+        # apart (five of the six share one signal).
+        self.degraded_as: type[BaseException] | None = None
 
     def _assert_current_attempt(self) -> None:
         """Raise unless the task row's current attempt is this lease's.
@@ -1615,6 +1624,12 @@ def interaction_handoff(
     try:
         yield handoff
     except _SWALLOWED as exc:
+        # Recorded on the handoff object itself, before anything else in
+        # this block runs: a caller-local record of which of the six
+        # swallowed types this round degraded on, distinguishable even
+        # among the five that share one process-global signal below (see
+        # InteractionHandoff.degraded_as's own docstring).
+        handoff.degraded_as = type(exc)
         # The except clause matches subclasses (isinstance semantics), so the
         # signal lookup must too: an exact type(exc) key lookup would raise
         # KeyError for a future subclass of a swallowed type, and KeyError is
