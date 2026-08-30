@@ -676,7 +676,7 @@ async def test_execution_result_identity_at_finalize_resources(
 
 
 def test_execution_result_never_reaches_a_log_or_exception_message() -> None:
-    """M-7: this module must never hand execution_result to a logger call
+    """This module must never hand execution_result to a logger call
     or an exception constructor. finalize_managed_task_lease_result_isolated
     hands its call off to a worker thread, so a lambda closure holds this
     mapping across that thread boundary; it may carry large, untruncated
