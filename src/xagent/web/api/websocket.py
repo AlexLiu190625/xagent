@@ -3279,6 +3279,11 @@ async def execute_resume_background(
     delivery_already_dispatched: bool = False,
     delivery_websocket: WebSocket | None = None,
     delivery_client_message_id: str | None = None,
+    # Defaulting to None is a structurally open door, not exercised by any
+    # caller today: acquire_task_lease_no_commit (task_lease_service.py)
+    # mints a fresh uuid for a None here, so a future call site that
+    # forgets to pass its own run id would silently claim a lease under a
+    # run nobody else knows about instead of failing loudly.
     expected_run_id: str | None = None,
     resolved_execution_scope: Union[
         ExecutionScope, None, ExecutionScopeNotProvided
