@@ -4612,7 +4612,15 @@ def test_fast_paths_without_a_steps_version_reader_is_a_call_error():
     between the steps read and the fence, and a reader-less call would
     otherwise run the fast path with that signal silently absent. This
     pins the call itself as the failure point -- a ``TypeError`` naming
-    the argument, raised before any reader runs."""
+    the argument, raised before any reader runs.
+
+    ``build_event_stream_response`` is pinned the same way. It is the
+    only entry point a caller outside this module reaches, so a default
+    restored there would accept reader-less attaches even with all three
+    inner entry points still required. Its own missing-argument
+    ``TypeError`` is raised at the call, not at the await: binding
+    happens before the coroutine object exists, so nothing is left
+    un-awaited by the assertion below."""
 
     def _unused(task_id_, principal_):
         raise AssertionError("must not run before the missing-argument TypeError")
@@ -4650,6 +4658,15 @@ def test_fast_paths_without_a_steps_version_reader_is_a_call_error():
             read_task_snapshot=_unused,
             build_conclusion=lambda snapshot_total_steps: "",
             path_name="terminal",
+        )
+
+    with pytest.raises(TypeError, match="read_task_steps_version"):
+        es.build_event_stream_response(
+            task_id=1,
+            principal=None,
+            initial_snapshot=terminal_snapshot,
+            read_task_snapshot=_unused,
+            read_task_steps_response=_unused,
         )
 
 
