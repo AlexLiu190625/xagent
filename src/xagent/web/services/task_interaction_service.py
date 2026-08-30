@@ -1496,11 +1496,12 @@ def create(
     the write point, calls ``interaction_handoff`` + ``handoff.stage()`` to
     stage a row -- never ``stage_interaction_request`` directly, the same
     way every other caller of the staging primitive goes through that
-    context manager rather than around it. This is the change that retired
-    the zero-production-caller gate in
-    ``tests/web/services/test_interaction_staging_production_gate.py``
+    context manager rather than around it. This is the change that made
+    ``interaction_handoff``'s production use point a legitimate one,
+    watched by
+    ``tests/web/services/test_interaction_handoff_production_surface.py``
     (see ``test_handoff_is_entered_only_from_the_create_seam`` and its two
-    sibling guards for what replaced it). It is not, on its own, the change
+    sibling guards). It is not, on its own, the change
     that gives this seam a production caller: the three finalizers that
     will call it, the Task-side protocol marker, and the read-surface
     switch are a separate change (see
