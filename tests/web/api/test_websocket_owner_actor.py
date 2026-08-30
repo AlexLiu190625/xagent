@@ -2106,7 +2106,10 @@ async def test_live_injection_skips_the_close_on_a_replayed_turn_id(
     fresh write produces. The interaction row this test seeds is not the
     question the replay answered, so the online injection site must leave
     it untouched: still active, uncleared marker, and the close statement
-    must not run at all."""
+    must not run at all -- asserted directly on the mock, not only inferred
+    from the unchanged row: replacing the guard with `if True:` calls the
+    close for real and turns this assertion red on its own, independent of
+    the DB-state assertions below."""
     owner = _user(db_session, "close-replay-owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
     task.runner_id = "close-replay-runner"
@@ -2143,6 +2146,9 @@ async def test_live_injection_skips_the_close_on_a_replayed_turn_id(
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
         patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch(
+            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+        ) as close_mock,
     ):
         await _handle_chat_message_unserialized(
             MagicMock(),
@@ -2156,6 +2162,7 @@ async def test_live_injection_skips_the_close_on_a_replayed_turn_id(
         )
 
     agent.post_user_message.assert_awaited_once()
+    close_mock.assert_not_called()
     db_session.expire_all()
     row = (
         db_session.query(TaskInteractionRequest)
@@ -4428,7 +4435,9 @@ async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
     using the carried one would retire this live question; asserting
     active_interaction_id_sync is never called pins that the deferred path
     still takes no read of its own, replay or not -- the same technique
-    the carried-vs-observed test above uses."""
+    the carried-vs-observed test above uses. close_legacy_resume_interaction_sync
+    is asserted uncalled directly too: replacing the guard with `if True:`
+    calls it for real and turns this assertion red on its own."""
     owner = _user(db_session, "deferred-replay-owner")
     task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
     task.interaction_protocol_version = 1
@@ -4483,6 +4492,9 @@ async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
             "xagent.web.api.websocket.active_interaction_id_sync",
             side_effect=AssertionError("the deferred path must not read its own"),
         ),
+        patch(
+            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+        ) as close_mock,
     ):
         await execute_resume_background(
             task_id=task_id,
@@ -4503,6 +4515,7 @@ async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
         )
 
     agent.post_user_message.assert_awaited_once()
+    close_mock.assert_not_called()
     db_session.expire_all()
     row = (
         db_session.query(TaskInteractionRequest)

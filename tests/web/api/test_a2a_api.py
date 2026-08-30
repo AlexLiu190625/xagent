@@ -964,7 +964,10 @@ def test_message_send_skips_the_close_on_a_replayed_injection() -> None:
     short-circuits that repeat and reports POSTED_REPLAY; the interaction
     row this test seeds is not the question the replay answered, so the
     close must leave it untouched -- neither retired nor its rowcount
-    matching anything -- and the task's protocol marker must survive."""
+    matching anything -- and the task's protocol marker must survive.
+    close_legacy_resume_interaction is asserted uncalled directly too:
+    replacing the guard with `if True:` calls it for real and turns this
+    assertion red on its own."""
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()
     try:
@@ -1010,6 +1013,9 @@ def test_message_send_skips_the_close_on_a_replayed_injection() -> None:
             "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
             new=AsyncMock(),
         ),
+        patch(
+            "xagent.web.api.a2a.close_legacy_resume_interaction",
+        ) as close_mock,
     ):
         response = client.post(
             f"/api/a2a/agents/{agent_id}/message:send",
@@ -1027,6 +1033,7 @@ def test_message_send_skips_the_close_on_a_replayed_injection() -> None:
 
     assert response.status_code == 200, response.text
     agent_service.post_user_message.assert_awaited_once()
+    close_mock.assert_not_called()
     db = _direct_db_session()
     try:
         row = (

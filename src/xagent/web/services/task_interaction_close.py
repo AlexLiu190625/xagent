@@ -68,17 +68,20 @@ reason as the reader fallback documented above: a reader keys off
 asking the legacy question again.
 
 The replay ``AgentRunner.inject_user_message`` short-circuits on a
-repeated turn id is not a window of that same benign family, and is
-not covered by the argument above. A replay persists nothing and still
-reports success to its caller, so an injection site cannot tell it from
-a first attempt; the row that site observed before calling is then not
-the question the replayed message answered but whatever the resumed
-agent has asked since, and closing it retires a live question instead
-of leaving a stale one behind. That is the opposite failure from the
-one this paragraph describes, and it is not fixed here -- see the
-comment at the online WebSocket injection site (``websocket.py``) for
-the precondition it puts on the change that wires the first production
-writer.
+repeated turn id is not a window of that same benign family. A replay
+persists nothing, and the row an injection site observed before calling
+is then not the question the replayed message answered but whatever the
+resumed agent has asked since; closing on it would retire a live
+question instead of leaving a stale one behind. The injection layer
+reports which case it is -- ``UserMessageInjectionOutcome`` on
+``AgentRunner.inject_user_message`` and everything that forwards its
+result, rather than the same truthy value a fresh write produces -- and
+each of the three sites that call into this module (the two WebSocket
+injection sites and the A2A resume-input site) reads that report and
+skips its close call on a replay before ever reaching the statements
+below. This module's own close statement, and the lock-ordering
+obligation each caller carries, are unchanged by that guard: it decides
+whether the call happens, not what the call does.
 
 The close statement binds to one primary key, read before the injection
 by ``active_interaction_id_sync`` and carried to the close by whichever
