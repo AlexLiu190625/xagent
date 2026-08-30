@@ -1,6 +1,10 @@
 """Real-PostgreSQL coverage for the row lock ``update_custom_api`` and
 ``delete_custom_api`` take on the ``CustomApi`` definition row before
-propagating a rename or removing the link row, respectively.
+propagating a rename or removing the link row, respectively -- and, for
+the edit route, for the payloads that must *not* take it: a PUT that sets
+only ``is_active`` writes the caller's own ``UserCustomApi`` link row and
+never the definition row, so it reads the definition row without locking
+it.
 
 ``FOR UPDATE`` is a no-op on SQLite -- every other suite in this repo runs
 against SQLite, so nothing there can tell a genuine second-writer block
@@ -175,6 +179,25 @@ def test_a_second_editor_blocks_until_the_first_editors_transaction_finishes(
         session_a.close()
         session_b.close()
 
+    # Both writer sessions are closed above, so this reads what actually
+    # committed rather than either session's own uncommitted view. The
+    # block above proves the second editor waited; without this it would
+    # still pass if neither editor's write survived.
+    with session_factory() as fresh:
+        row = fresh.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert row.name == "renamed-by-first-editor"
+        assert row.description == "edited-by-second-editor"
+        assert (
+            fresh.query(UserCustomApi)
+            .filter(
+                UserCustomApi.custom_api_id == api_id,
+                UserCustomApi.user_id == owner_id,
+            )
+            .one()
+            .is_active
+            is True
+        )
+
 
 def test_the_second_editors_rename_reports_the_first_editors_committed_name_as_old(
     session_factory, seeded
@@ -272,6 +295,23 @@ def test_the_second_editors_rename_reports_the_first_editors_committed_name_as_o
         session_a.close()
         session_b.close()
 
+    # The hook tuples above are in-process call records; this reads what
+    # actually committed, so a rename that reported the right pair of names
+    # and then failed to persist cannot pass.
+    with session_factory() as fresh:
+        row = fresh.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert row.name == "renamed-by-second-editor"
+        assert (
+            fresh.query(UserCustomApi)
+            .filter(
+                UserCustomApi.custom_api_id == api_id,
+                UserCustomApi.user_id == owner_id,
+            )
+            .one()
+            .is_active
+            is True
+        )
+
 
 def test_a_row_that_vanishes_after_the_gate_but_before_the_lock_is_a_404_not_a_500(
     session_factory, seeded
@@ -331,16 +371,23 @@ def test_a_row_that_vanishes_after_the_gate_but_before_the_lock_is_a_404_not_a_5
 def test_a_delete_blocks_until_a_concurrent_edits_transaction_finishes(
     session_factory, seeded
 ) -> None:
-    """``delete_custom_api`` takes the same definition-row lock
-    ``update_custom_api`` does, in the same order (``CustomApi`` first),
-    precisely so that a concurrent edit/delete pair cannot deadlock
-    (PostgreSQL 40P01): the edit's transaction below must finish -- commit
-    or roll back -- before the delete's own lock statement can proceed,
-    the same block ``test_a_second_editor_blocks_until_the_first_editors_
-    transaction_finishes`` above demonstrates between two edits. Before
+    """``delete_custom_api`` takes the same definition-row lock an
+    ``update_custom_api`` call that writes the definition row does, in the
+    same order (``CustomApi`` first), precisely so that a concurrent
+    edit/delete pair cannot deadlock (PostgreSQL 40P01): the edit's
+    transaction below must finish -- commit or roll back -- before the
+    delete's own lock statement can proceed, the same block
+    ``test_a_second_editor_blocks_until_the_first_editors_transaction_
+    finishes`` above demonstrates between two edits. Before
     delete_custom_api took this lock, its own child-row-first deletion
     order (see custom_api.py) and the PUT's parent-row-first order let the
     two routes take these same two rows in opposite orders.
+
+    The concurrent editor below sets a definition field, not ``is_active``.
+    That is load-bearing: an ``is_active``-only PUT writes the caller's own
+    link row and takes no lock on the definition row at all, so it would
+    hold nothing for this delete to wait on and this test would prove
+    nothing about lock order.
     """
     import xagent.web.api.custom_api as custom_api_api
     from xagent.web.api.custom_api import CustomApiUpdate
@@ -370,7 +417,7 @@ def test_a_delete_blocks_until_a_concurrent_edits_transaction_finishes(
         def run_edit():
             return custom_api_api.update_custom_api(
                 api_id,
-                CustomApiUpdate(is_active=False),
+                CustomApiUpdate(description="edited-by-the-concurrent-editor"),
                 current_user=current_user,
                 db=session_a,
             )
@@ -497,4 +544,172 @@ def test_a_delete_whose_row_vanishes_after_the_gate_but_before_the_lock_is_a_404
         assert commits == [], "the refused delete must commit nothing"
     finally:
         set_connector_team_hooks()
+        db.close()
+
+
+def test_an_activation_only_edit_does_not_wait_on_a_concurrent_definition_edit(
+    session_factory, seeded
+) -> None:
+    """A payload that sets only ``is_active`` writes this caller's own
+    ``UserCustomApi`` link row and never the shared ``CustomApi``
+    definition row, so it must not queue behind a concurrent editor that
+    holds the definition row.
+
+    Same barrier as
+    ``test_a_second_editor_blocks_until_the_first_editors_transaction_finishes``
+    above, with the two roles kept apart: the holder edits a definition
+    field and stops inside the patched validation call with its
+    transaction still open, and the activation-only request then has to
+    finish while that transaction is still open. When this route took the
+    definition row's lock for every payload, this request waited for the
+    holder instead.
+    """
+    import xagent.web.api.custom_api as custom_api_api
+    from xagent.web.api.custom_api import CustomApiUpdate
+
+    owner_id, api_id = seeded
+    current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+    second_finished = threading.Event()
+    first_call_claimed = threading.Event()
+    first_call_lock = threading.Lock()
+
+    real_validate = custom_api_api.validate_runtime_config_declaration
+
+    def paced_validate(**kwargs):
+        with first_call_lock:
+            is_first_call = not first_call_claimed.is_set()
+            first_call_claimed.set()
+        if is_first_call:
+            lock_acquired.set()
+            assert release_lock.wait(timeout=10), "the holder was never released"
+        return real_validate(**kwargs)
+
+    custom_api_api.validate_runtime_config_declaration = paced_validate
+    session_a = session_factory()
+    session_b = session_factory()
+    try:
+
+        def run_definition_edit():
+            return custom_api_api.update_custom_api(
+                api_id,
+                CustomApiUpdate(description="held-by-the-definition-editor"),
+                current_user=current_user,
+                db=session_a,
+            )
+
+        def run_activation_only():
+            result = custom_api_api.update_custom_api(
+                api_id,
+                CustomApiUpdate(is_active=False),
+                current_user=current_user,
+                db=session_b,
+            )
+            second_finished.set()
+            return result
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            holder = executor.submit(run_definition_edit)
+            assert lock_acquired.wait(timeout=5), (
+                "the definition editor never reached the lock"
+            )
+
+            activator = executor.submit(run_activation_only)
+            # Released in ``finally`` before anything is asserted: a
+            # failure here means the activation-only call is still parked
+            # on the holder's lock, and leaving the holder paused would
+            # hang this executor's shutdown instead of failing the test.
+            try:
+                finished_while_held = second_finished.wait(timeout=5.0)
+            finally:
+                release_lock.set()
+            holder.result(timeout=10)
+            activator.result(timeout=10)
+
+        assert finished_while_held, (
+            "the activation-only edit did not finish while the definition "
+            "editor still held the definition row -- it is waiting on a "
+            "lock for a row it does not write"
+        )
+    finally:
+        custom_api_api.validate_runtime_config_declaration = real_validate
+        session_a.close()
+        session_b.close()
+
+    with session_factory() as fresh:
+        assert (
+            fresh.query(UserCustomApi)
+            .filter(
+                UserCustomApi.custom_api_id == api_id,
+                UserCustomApi.user_id == owner_id,
+            )
+            .one()
+            .is_active
+            is False
+        )
+        assert (
+            fresh.query(CustomApi).filter(CustomApi.id == api_id).one().description
+            == "held-by-the-definition-editor"
+        )
+
+
+def test_an_activation_only_edit_whose_row_vanishes_before_its_read_is_a_404(
+    session_factory, seeded
+) -> None:
+    """The activation-only path skips the lock but keeps the same
+    vanished-definition handling: its own fresh read of ``CustomApi`` must
+    return ``None`` and raise the route's 404, rather than leaving
+    ``db.refresh`` to fail on a row that is no longer there.
+
+    Same wrapper as
+    ``test_a_row_that_vanishes_after_the_gate_but_before_the_lock_is_a_404_not_a_500``
+    above: the concurrent delete fires from this session's own ``query``,
+    which lands it strictly between the access read (which asks for
+    ``UserCustomApi``) and this route's only ``CustomApi`` query.
+    """
+    import xagent.web.api.custom_api as custom_api_api
+    from xagent.web.api.custom_api import CustomApiUpdate
+
+    owner_id, api_id = seeded
+    current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+    db = session_factory()
+    real_query = db.query
+    deleted_already = threading.Event()
+    queried_entities: list[tuple] = []
+
+    def delete_the_row_when_the_definition_query_starts(*entities, **kwargs):
+        queried_entities.append(entities)
+        if entities == (CustomApi,) and not deleted_already.is_set():
+            deleted_already.set()
+            with session_factory() as other:
+                other.execute(
+                    sa.delete(UserCustomApi).where(
+                        UserCustomApi.custom_api_id == api_id
+                    )
+                )
+                other.execute(sa.delete(CustomApi).where(CustomApi.id == api_id))
+                other.commit()
+        return real_query(*entities, **kwargs)
+
+    db.query = delete_the_row_when_the_definition_query_starts
+    try:
+        with pytest.raises(HTTPException) as exc:
+            custom_api_api.update_custom_api(
+                api_id,
+                CustomApiUpdate(is_active=False),
+                current_user=current_user,
+                db=db,
+            )
+        assert exc.value.status_code == 404
+        assert deleted_already.is_set(), "the concurrent delete never ran"
+        assert queried_entities[:2] == [(UserCustomApi,), (CustomApi,)], (
+            "the concurrent delete must land after the access gate's own "
+            "read and before this route's definition read; otherwise the "
+            "404 under test could be the access gate's -- saw "
+            f"{queried_entities!r}"
+        )
+    finally:
         db.close()

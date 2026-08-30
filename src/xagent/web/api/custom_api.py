@@ -315,42 +315,79 @@ def update_custom_api(
             detail="You do not have permission to edit this Custom API",
         )
 
-    # A second, single-table lock on the definition row, taken before any
-    # field below reads or mutates it. The read above comes through the
-    # personal link row's relationship and cannot itself lock just this
-    # table; this is a fresh statement, so a row deleted between the two
-    # still yields None here (handled as the same 404) rather than
-    # surfacing as an unrelated error out of the write path below.
-    # ``populate_existing()`` makes the locked row the one the rest of this
-    # route reads: without it the already-identity-mapped instance the
+    # Which row a request writes decides which row it locks. Every field of
+    # ``CustomApiUpdate`` except ``is_active`` writes the shared
+    # ``CustomApi`` definition row; ``is_active`` writes this caller's own
+    # ``UserCustomApi`` link row and nothing else. Locking the definition
+    # row for a payload that never writes it made an activate/deactivate
+    # queue behind an unrelated edit of the same connector -- a wait that
+    # request has no write to justify, and one that surfaces as an error
+    # rather than a delay wherever a lock timeout is configured.
+    #
+    # ``model_fields_set`` decides this, not the values: an explicitly-null
+    # ``runtime_input_schema`` is written to the definition row below even
+    # though its value is ``None``, while an absent field is not written at
+    # all. The set is a superset of the writes below -- a payload carrying
+    # ``description=None`` is counted here and then skipped by the write at
+    # its own ``is not None`` guard -- so this takes the lock in a few
+    # cases that did not need it and skips it in none that do.
+    fields_set = api_data.model_fields_set
+    writes_definition_row = bool(fields_set - {"is_active"})
+
+    # A fresh single-table read of the definition row, on both paths. The
+    # read above comes through the personal link row's relationship and
+    # cannot itself address just this table; this is a separate statement,
+    # so a row deleted between the two yields None here (handled as the
+    # same 404) rather than surfacing as an unrelated error out of the
+    # write path or out of ``db.refresh`` below. ``populate_existing()``
+    # makes this statement's row the one the rest of this route reads and
+    # responds with: without it the already-identity-mapped instance the
     # relationship loaded would be returned unrefreshed, and every field
-    # below would still be the pre-lock snapshot.
-    locked_api = (
-        db.query(CustomApi)
-        .filter(CustomApi.id == api_id)
-        .populate_existing()
-        .with_for_update()
-        .first()
+    # below would still be that earlier snapshot.
+    #
+    # ``FOR UPDATE`` is added only on the path that writes this row, so a
+    # request that writes it still waits for another request holding it.
+    # That clause is a PostgreSQL/MySQL row lock only: SQLAlchemy renders
+    # no locking clause at all on SQLite -- the statement it emits there is
+    # byte-for-byte the one it emits without this call -- so on a SQLite
+    # deployment the read-modify-write below is not serialized and two
+    # concurrent edits of one connector can still interleave. The
+    # single-statement conditional ``UPDATE``s elsewhere in this repository
+    # (services/task_interaction_staging.py,
+    # services/chat_history_service.py) are safe on SQLite without a lock
+    # because one statement is atomic there; that reasoning does not carry
+    # to this route, which reads the row, computes in Python, and writes it
+    # back. Closing the SQLite window needs the dual-dialect fence
+    # ``_lock_user_row_for_preferences_update`` (api/auth.py) and
+    # ``acquire_runtime_key_transition_fence`` (services/api_keys.py) use
+    # -- a no-op ``UPDATE`` that takes SQLite's writer lock -- and is left
+    # to a change of its own.
+    definition_query = (
+        db.query(CustomApi).filter(CustomApi.id == api_id).populate_existing()
     )
-    if locked_api is None:
+    if writes_definition_row:
+        definition_query = definition_query.with_for_update()
+    current_api = definition_query.first()
+    if current_api is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Custom API not found",
         )
-    api = locked_api
+    api = current_api
 
-    # Read only after the lock: rename_team_connector's "old" argument must
-    # be the name this transaction actually holds locked, not whatever the
-    # pre-lock read above saw -- a concurrent committed rename in between
-    # would otherwise make this stale, and the rewrite below would look for
-    # a name that no longer exists anywhere, leaving the previous renamer's
-    # selectors dangling with no error.
+    # Read only after the statement above: rename_team_connector's "old"
+    # argument must be the name this transaction's own read established --
+    # under the lock, on the path that renames -- not whatever the
+    # relationship read further up saw. A concurrent committed rename in
+    # between would otherwise make this stale, and the rewrite below would
+    # look for a name that no longer exists anywhere, leaving the previous
+    # renamer's selectors dangling with no error.
     old_name = str(api.name)
 
     # The row's declared type from here on is loosened for mypy's sake: the
     # column-typed attributes below (name, description, env, ...) are all
     # mutated directly by this route, exactly as they were when this local
-    # came off the relationship instead of off the locked query.
+    # came off the relationship instead of off the definition query above.
     mutable_api = cast(Any, api)
 
     # Check name uniqueness if name is changed
@@ -389,7 +426,6 @@ def update_custom_api(
             ) from exc
         mutable_api.env = processed_env
 
-    fields_set = api_data.model_fields_set
     runtime_input_schema = (
         api_data.runtime_input_schema
         if "runtime_input_schema" in fields_set
@@ -475,10 +511,10 @@ def delete_custom_api(
             detail="You do not have permission to delete this Custom API",
         )
 
-    # One lock order across every row this pair of routes touches.
-    # ``update_custom_api`` locks this same ``CustomApi`` definition row
-    # first, calls ``rename_team_connector`` afterwards, and writes the
-    # ``UserCustomApi`` link row afterwards too; both branches below delete
+    # One lock order across every row this pair of routes touches. An
+    # ``update_custom_api`` call that writes the definition row locks this
+    # same row first, calls ``rename_team_connector`` afterwards, and
+    # writes the ``UserCustomApi`` link row afterwards too; both branches below delete
     # the link row first and the definition row second, inside one
     # transaction. Taking the lock here -- before ``delete_team_connector``
     # rather than after it -- puts both routes in one order on both sides of
@@ -503,12 +539,24 @@ def delete_custom_api(
     # route holds the row for longer than it did with the lock last.
     #
     # What this statement orders is this route against ``update_custom_api``
-    # on the same connector: those two can no longer form a cycle with each
-    # other, whatever the hook locks, because both reach the hook with this
-    # row already held and so cannot be inside the hook at the same time. A
-    # hook that additionally locks rows of its own in some other order
-    # relative to this repository's statements is outside what this
+    # on the same connector. A PUT that writes the definition row cannot
+    # form a cycle with this route, whatever the hook locks, because both
+    # reach the hook with this row already held and so cannot be inside the
+    # hook at the same time. A PUT that writes only the caller's own
+    # ``UserCustomApi`` link row takes no lock on this row at all: it reads
+    # the definition row without locking it and waits only for the link
+    # row, so it has nothing this route waits for and cannot close a cycle
+    # either. A hook that additionally locks rows of its own in some other
+    # order relative to this repository's statements is outside what this
     # statement arranges; only the installing application can order those.
+    #
+    # ``FOR UPDATE`` here is a PostgreSQL/MySQL row lock only: SQLAlchemy
+    # renders no locking clause at all on SQLite, so on a SQLite deployment
+    # this statement does not order this route against anything. Closing
+    # that window needs the dual-dialect fence
+    # ``acquire_runtime_key_transition_fence`` (services/api_keys.py) uses
+    # -- a no-op ``UPDATE`` that takes SQLite's writer lock -- and is left
+    # to a change of its own.
     locked_api = (
         db.query(CustomApi)
         .filter(CustomApi.id == api_id)

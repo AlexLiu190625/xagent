@@ -588,9 +588,9 @@ def _count_custom_apis_selects_before_first_delete(statements: list[str]) -> int
 
 
 class TestDeleteLockOrderMatchesThePutsLockOrder:
-    """``update_custom_api`` locks the ``CustomApi`` definition row first,
-    calls ``rename_team_connector`` after that lock, and writes the
-    ``UserCustomApi`` link row after that. For the two routes to share one
+    """An ``update_custom_api`` call that writes the definition row locks
+    it first, calls ``rename_team_connector`` after that lock, and writes
+    the ``UserCustomApi`` link row after that. For the two routes to share one
     lock order, ``delete_custom_api`` must take the same definition-row
     lock before it calls ``delete_team_connector`` and before it deletes
     the link row, in both of its branches. The hook boundary matters as
@@ -661,8 +661,9 @@ class TestDeleteLockOrderMatchesThePutsLockOrder:
         """``delete_team_connector`` runs with the definition row already
         held. That is what puts this route in the same direction as
         ``update_custom_api``, which calls ``rename_team_connector`` after
-        its own lock -- and is therefore what stops the two from forming a
-        cycle through rows the hook locks. The hook counts the
+        its own definition-row lock, on the path that takes one -- and is
+        therefore what stops the two from forming a cycle through rows the
+        hook locks. The hook counts the
         ``custom_apis`` ``SELECT``s issued so far: the not-found guard's
         relationship load, plus the lock's own query.
         """

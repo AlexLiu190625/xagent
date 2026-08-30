@@ -158,6 +158,28 @@ def test_a_second_editor_blocks_until_the_first_editors_transaction_finishes(
         session_a.close()
         session_b.close()
 
+    # Both writer sessions are closed above, so this reads what actually
+    # committed rather than either session's own uncommitted view. The
+    # block above proves the second editor waited; without this it would
+    # still pass if neither editor's write survived.
+    with session_factory() as fresh:
+        row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert row.name == "renamed-by-first-editor"
+        assert row.description == "edited-by-second-editor"
+        assert row.transport == "stdio"
+        assert row.command == "true"
+        assert row.managed == "external"
+        assert (
+            fresh.query(UserMCPServer)
+            .filter(
+                UserMCPServer.mcpserver_id == server_id,
+                UserMCPServer.user_id == owner_id,
+            )
+            .one()
+            .is_active
+            is True
+        )
+
 
 def test_the_second_editors_rename_reports_the_first_editors_committed_name_as_old(
     session_factory, seeded
@@ -254,6 +276,26 @@ def test_the_second_editors_rename_reports_the_first_editors_committed_name_as_o
         mcp_api._build_server_config = real_build_server_config
         session_a.close()
         session_b.close()
+
+    # The hook tuples above are in-process call records; this reads what
+    # actually committed, so a rename that reported the right pair of names
+    # and then failed to persist cannot pass.
+    with session_factory() as fresh:
+        row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert row.name == "renamed-by-second-editor"
+        assert row.transport == "stdio"
+        assert row.command == "true"
+        assert row.managed == "external"
+        assert (
+            fresh.query(UserMCPServer)
+            .filter(
+                UserMCPServer.mcpserver_id == server_id,
+                UserMCPServer.user_id == owner_id,
+            )
+            .one()
+            .is_active
+            is True
+        )
 
 
 def test_a_row_that_vanishes_after_the_gate_but_before_the_lock_is_a_404_not_a_500(

@@ -55,6 +55,9 @@ on:
       - 'tests/web/api/test_custom_api_edit_lock_postgresql.py'
       - 'src/xagent/web/api/mcp.py'
       - 'src/xagent/web/api/custom_api.py'
+      - 'src/xagent/web/services/connector_team_scope.py'
+      - 'src/xagent/web/models/custom_api.py'
+      - 'src/xagent/web/models/mcp.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -146,6 +149,9 @@ jobs:
             tests/web/api/test_custom_api_edit_lock_postgresql.py
             src/xagent/web/api/mcp.py
             src/xagent/web/api/custom_api.py
+            src/xagent/web/services/connector_team_scope.py
+            src/xagent/web/models/custom_api.py
+            src/xagent/web/models/mcp.py
           )
 
           case "$EVENT_NAME" in

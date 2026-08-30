@@ -3253,6 +3253,15 @@ def update_mcp_server(
         # this route reads: without it the already-identity-mapped instance
         # from the join above would be returned unrefreshed, and every field
         # below would still be the pre-lock snapshot.
+        #
+        # ``FOR UPDATE`` here is a PostgreSQL/MySQL row lock only:
+        # SQLAlchemy renders no locking clause at all on SQLite, so on a
+        # SQLite deployment the read-modify-write below is not serialized
+        # and two concurrent edits of one server can still interleave.
+        # Closing that window needs the dual-dialect fence
+        # ``acquire_runtime_key_transition_fence`` (services/api_keys.py)
+        # uses -- a no-op ``UPDATE`` that takes SQLite's writer lock -- and
+        # is left to a change of its own.
         locked_server = (
             db.query(MCPServer)
             .filter(MCPServer.id == server_id)
