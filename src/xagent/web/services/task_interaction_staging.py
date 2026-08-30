@@ -513,20 +513,23 @@ class StagedInteractionRequest:
     attempted) and a pre-existing ``active`` row hit by the post-conflict
     re-check (step 6, after this call's own INSERT lost a race). Both
     replay paths return the *other* request's row, not a new one --
-    ``status`` and ``active_slot`` describe that row as it stood at the
-    moment this call read it, which on the step-3 path may already be
-    expired (see ``stage_interaction_request``'s docstring on why step 3
-    does not consult ``expires_at``). Both replay paths match on the
-    identity key alone -- they never compare payload, anchor, or
-    ``expires_at`` against the row they return -- and the key's own
-    derivation contract belongs to the first production writer (see
-    ``request_idempotency_key``'s column comment, ``models/task_interaction.py``).
+    ``status``, ``active_slot``, ``expires_at``, and ``protocol_version``
+    describe that row as it stood at the moment this call read it, which on
+    the step-3 path may already be expired (see
+    ``stage_interaction_request``'s docstring on why step 3 does not
+    consult ``expires_at``). Both replay paths match on the identity key
+    alone -- they never compare payload, anchor, or ``expires_at`` against
+    the row they return -- and the key's own derivation contract belongs to
+    the first production writer (see ``request_idempotency_key``'s column
+    comment, ``models/task_interaction.py``).
     """
 
     staged_db_id: int
     created: bool
     status: str
     active_slot: int | None
+    expires_at: datetime
+    protocol_version: int
 
 
 # ---------------------------------------------------------------------------
@@ -779,12 +782,21 @@ def _identity_lookup_stmt(
 ) -> sa.Select[Any]:
     """The identical Core SELECT used by both the idempotency pre-read (step
     3) and the post-conflict re-check (step 6). Written once so the two
-    statements cannot drift apart at the edges of what they match."""
+    statements cannot drift apart at the edges of what they match.
+
+    ``expires_at`` and ``protocol_version`` are carried for
+    ``StagedInteractionRequest``'s own two fields of the same name -- a
+    replay needs the row's real values for both, not the caller's proposed
+    ones (see that dataclass's docstring). Neither column is added to the
+    ``WHERE`` clause: this remains the identity lookup, matching only on
+    ``(task_id, run_id, request_idempotency_key)``."""
 
     return sa.select(
         TaskInteractionRequest.id,
         TaskInteractionRequest.status,
         TaskInteractionRequest.active_slot,
+        TaskInteractionRequest.expires_at,
+        TaskInteractionRequest.protocol_version,
     ).where(
         TaskInteractionRequest.task_id == task_id,
         TaskInteractionRequest.run_id == run_id,
@@ -899,6 +911,8 @@ def _replay_or_raise_closed(
             created=False,
             status=row.status,
             active_slot=row.active_slot,
+            expires_at=row.expires_at,
+            protocol_version=row.protocol_version,
         )
     raise InteractionRequestClosed(
         f"request {key!r} on task {task_id} run {run_id!r} is already {row.status}"
@@ -1124,6 +1138,8 @@ def stage_interaction_request(
             created=True,
             status="active",
             active_slot=1,
+            expires_at=expires_at,
+            protocol_version=protocol_version,
         )
     finally:
         # Three states are possible here. Active: roll back normally.

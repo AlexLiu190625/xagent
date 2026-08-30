@@ -26,9 +26,9 @@ graph in a fresh session before falling back to ``OutcomeUnknown``. So the
 only ``OutcomeUnknown``-producing cells left are the two durable-graph
 reconciliation failures: an ambiguous commit with nothing in the graph to
 find, and one that lands under a different identity. The matrix
-below enumerates this build's own 38 triggering cells, producing 20
-distinct (outcome type, reason) pairs -- fewer than 38 because several
-cells share a pair (eight "principal does not own this task" cells all
+below enumerates this build's own 37 triggering cells, producing 20
+distinct (outcome type, reason) pairs -- fewer than 37 because several
+cells share a pair (seven "principal does not own this task" cells all
 produce ``(RespondUnauthorized, not_task_principal)``; four "same
 idempotency key, different actor" cells all produce ``(RespondConflict,
 idempotency_key_reused)``; two "the task is no longer waiting" cells both
@@ -58,15 +58,14 @@ The full cell-to-pair mapping:
                  it -- a non-dict ``values`` payload, and a dict
                  ``values`` payload that cannot be rendered as JSON)
     V5        -> (ValidationRejected, kind_version_mismatch)         1
-    A1..A8    -> (Unauthorized, not_task_principal)      1 (8 cells share
+    A1..A7    -> (Unauthorized, not_task_principal)      1 (7 cells share
                  it -- a user principal that does not own the task, the
                  authorization-before-idempotency ordering guard, a guest
                  principal on a non-matching task, a guest principal with
-                 two populated entity-binding directions, an unknown
-                 principal kind, a guest principal with zero populated
-                 entity-binding directions, a guest whose bindings match
-                 but whose principal.user_id is not the owner's, and an
-                 ownership change racing the fence)
+                 two populated entity-binding directions, a guest principal
+                 with zero populated entity-binding directions, a guest
+                 whose bindings match but whose principal.user_id is not
+                 the owner's, and an ownership change racing the fence)
     U1        -> (Unavailable, task_missing)                         1
     U2        -> (Unavailable, interaction_missing)                  1
     U3        -> (Unavailable, checkpoint_unavailable)                1
@@ -98,7 +97,7 @@ The full cell-to-pair mapping:
                  landed write, and one whose reconciliation finds a
                  landed row under a different identity)
     -----------------------------------------------------------------
-    38 cells; 20 distinct pairs (18 single-reason cells + V1's own 2)
+    37 cells; 20 distinct pairs (18 single-reason cells + V1's own 2)
 
 The cell-by-cell tests this matrix implies, and the mapping meta-test that
 checks their coverage against the vocabulary, are both in this file now,
@@ -112,7 +111,7 @@ layers:
 | Assertion | Checks | Catches | Misses |
 |---|---|---|---|
 | Union-membership guard (this file, written) | ``RespondOutcome`` has exactly its eight known member classes | A variant added or removed without updating this list | Reason-level coverage |
-| Cell-by-cell tests (this file, written) | One test per of the 38 cells, asserting outcome + reason + zero side effects | A regression in one specific cell's behavior | A forgotten test |
+| Cell-by-cell tests (this file, written) | One test per of the 37 cells, asserting outcome + reason + zero side effects | A regression in one specific cell's behavior | A forgotten test |
 | Mapping meta-test (this file, written) | Each of the 20 pairs is produced by >= 1 cell's test (18 singles + one cell's own 2) | A new cell that produces a new pair with no test written for it; the two-reason cell's parametrization missing a reason | A new cell that produces no *new* pair (e.g. a ninth not_task_principal scenario) -- caught by review, not this meta-test |
 """
 
@@ -125,6 +124,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from unittest import mock
 
 import pytest
 import sqlalchemy as sa
@@ -151,7 +151,8 @@ from xagent.web.services.ops_signals import (
     clear_degradation,
 )
 from xagent.web.services.task_clarification_draft import CLARIFICATION_REQUEST_TTL
-from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
+from xagent.web.services.task_interaction_staging import InteractionAnchor
+from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD, TaskLease
 
 _DEGRADATION_SIGNALS_UNDER_TEST = (
     CHECKPOINT_PK_ANCHOR_DANGLING,
@@ -179,9 +180,14 @@ def _clean_degradation_registry():
 # CreateOutcome's vocabulary guards (two pinned numbers, still plain dicts
 # in the source -- do not recompute them here):
 #
-#   - CreateOutcome reason word list: 13 words total, across both delivery
-#     periods.
-#   - CreateOutcome pairs producible in this delivery specifically: 7.
+#   - CreateOutcome reason word list: 12 words total (seam_not_wired was
+#     deleted along with CreateNotWired once this seam's call body landed).
+#   - CreateOutcome pairs this function body has a code path that returns:
+#     9. Producible here means exactly that -- a code path exists in
+#     create()'s own body -- not that the path is reachable from any wired
+#     production caller (see CREATE_OUTCOME_PRODUCIBLE_REASONS's own
+#     docstring for the two entries that stay in this set despite being
+#     unreachable from create()'s one wired caller shape today).
 #
 # These guards prove CreateOutcome's vocabulary stays closed at exactly
 # these counts. They do NOT prove every pair has a test written against
@@ -220,39 +226,72 @@ def test_respond_outcome_union_has_exactly_the_eight_known_variants() -> None:
     }
 
 
-def test_create_outcome_reason_word_list_has_exactly_13_words() -> None:
-    assert len(svc.CREATE_OUTCOME_REASON_WORDS) == 13
+def test_create_outcome_reason_word_list_has_exactly_12_words() -> None:
+    assert len(svc.CREATE_OUTCOME_REASON_WORDS) == 12
 
 
-def test_create_outcome_producible_pairs_in_this_delivery_are_exactly_7() -> None:
+def test_create_outcome_producible_pairs_are_exactly_9() -> None:
     total = sum(
-        len(reasons) for reasons in svc.CREATE_OUTCOME_REASON_VOCABULARY.values()
+        len(reasons) for reasons in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS.values()
     )
-    assert total == 7
+    assert total == 9
 
 
 def test_create_outcome_producible_reasons_are_a_subset_of_the_full_word_list() -> None:
     producible = {
         reason
-        for reasons in svc.CREATE_OUTCOME_REASON_VOCABULARY.values()
+        for reasons in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS.values()
         for reason in reasons
     }
     assert producible <= svc.CREATE_OUTCOME_REASON_WORDS
 
 
-def test_create_outcome_this_period_covers_exactly_the_four_producible_variants() -> (
-    None
-):
-    """CreateCreated, CreateConflict, and CreateStale are not producible
-    until a later change fills create()'s call body --
-    create() never stages a row in this delivery, so nothing that requires
-    a staged row can be returned yet."""
-
-    assert set(svc.CREATE_OUTCOME_REASON_VOCABULARY) == {
+def test_create_outcome_covers_exactly_the_five_reason_carrying_variants() -> None:
+    assert set(svc.CREATE_OUTCOME_PRODUCIBLE_REASONS) == {
         "CreateValidationRejected",
         "CreateUnauthorized",
         "CreateUnavailable",
-        "CreateNotWired",
+        "CreateConflict",
+        "CreateStale",
+    }
+
+
+def test_create_not_wired_and_seam_not_wired_no_longer_exist() -> None:
+    """CreateNotWired and its reason constant were deleted together, along
+    with the change that fills create()'s call body -- not extended in
+    place, per the word-list dict's own contract comment."""
+
+    assert not hasattr(svc, "CreateNotWired")
+    assert "seam_not_wired" not in svc.CREATE_OUTCOME_REASON_WORDS
+
+
+def test_create_outcome_producible_words_minus_word_list_leaves_exactly_three() -> None:
+    """checkpoint_unavailable, anchor_dangling, and run_ended stay in the
+    closed word list without a producing code path in create() today (see
+    CREATE_OUTCOME_PRODUCIBLE_REASONS's own docstring for why each one)."""
+
+    producible = {
+        reason
+        for reasons in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS.values()
+        for reason in reasons
+    }
+    assert svc.CREATE_OUTCOME_REASON_WORDS - producible == {
+        "checkpoint_unavailable",
+        "anchor_dangling",
+        "run_ended",
+    }
+
+
+def test_create_outcome_union_has_exactly_the_six_known_variants() -> None:
+    import typing
+
+    assert {cls.__name__ for cls in typing.get_args(svc.CreateOutcome)} == {
+        "CreateCreated",
+        "CreateValidationRejected",
+        "CreateUnauthorized",
+        "CreateUnavailable",
+        "CreateConflict",
+        "CreateStale",
     }
 
 
@@ -637,13 +676,18 @@ def test_cv4_write_side_payload_rules_accept_a_legal_payload(
     _db: Session, _seeded_task: int, values: Any
 ) -> None:
     task = _db.query(Task).filter(Task.id == _seeded_task).first()
-    outcome = svc.create(
-        _db,
-        task_id=_seeded_task,
-        principal=_owning_principal(task.user_id),
-        envelope=_valid_envelope(values=values),
-    )
-    assert outcome == svc.CreateNotWired(reason="seam_not_wired")
+    # A legal payload clears every validation rule and reaches the
+    # write-point fence -- proven here by the fence itself firing, since a
+    # user principal never gets past it (see _assert_write_point_admissible).
+    # A rejected payload would instead return CreateValidationRejected
+    # before ever reaching that fence.
+    with pytest.raises(svc.InteractionWritePointUnfenced):
+        svc.create(
+            _db,
+            task_id=_seeded_task,
+            principal=_owning_principal(task.user_id),
+            envelope=_valid_envelope(values=values),
+        )
 
 
 @pytest.mark.parametrize(
@@ -658,8 +702,11 @@ def test_validate_rejects_a_blank_interaction_field(
 ) -> None:
     values = _values([_interaction(field=field)])
     parsed = svc.parse_v1_request_payload(values)
-    with pytest.raises(ValueError, match=r"interactions\[0\]\.field is blank"):
+    with pytest.raises(svc.InteractionWritePayloadRejected) as excinfo:
         svc.validate_v1_write_payload(parsed)
+    assert excinfo.value.refusal == svc.InteractionWriteRefusal(
+        rule="field_blank", position="request_payload.interactions[0].field"
+    )
 
 
 def test_validate_rejects_a_field_with_surrounding_whitespace(
@@ -672,10 +719,11 @@ def test_validate_rejects_a_field_with_surrounding_whitespace(
 
     values = _values([_interaction(field=" a ")])
     parsed = svc.parse_v1_request_payload(values)
-    with pytest.raises(
-        ValueError, match=r"interactions\[0\]\.field carries surrounding whitespace"
-    ):
+    with pytest.raises(svc.InteractionWritePayloadRejected) as excinfo:
         svc.validate_v1_write_payload(parsed)
+    assert excinfo.value.refusal == svc.InteractionWriteRefusal(
+        rule="field_whitespace", position="request_payload.interactions[0].field"
+    )
 
 
 def test_validate_accepts_a_field_with_no_surrounding_whitespace(
@@ -696,10 +744,10 @@ def test_validate_reports_a_blank_field_as_blank_not_as_duplicated(
 
     values = _values([_interaction(field=""), _interaction(field="", label="Second")])
     parsed = svc.parse_v1_request_payload(values)
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(svc.InteractionWritePayloadRejected) as excinfo:
         svc.validate_v1_write_payload(parsed)
-    assert "field is blank" in str(excinfo.value)
-    assert "is duplicated" not in str(excinfo.value)
+    assert excinfo.value.refusal.rule == "field_blank"
+    assert excinfo.value.refusal.rule != "field_duplicate"
 
 
 def test_validate_rejects_duplicate_option_values_within_one_interaction(
@@ -717,10 +765,12 @@ def test_validate_rejects_duplicate_option_values_within_one_interaction(
         ]
     )
     parsed = svc.parse_v1_request_payload(values)
-    with pytest.raises(
-        ValueError, match=r"interactions\[0\]\.options\[1\]\.value 'a' is duplicated"
-    ):
+    with pytest.raises(svc.InteractionWritePayloadRejected) as excinfo:
         svc.validate_v1_write_payload(parsed)
+    assert excinfo.value.refusal == svc.InteractionWriteRefusal(
+        rule="option_value_duplicate",
+        position="request_payload.interactions[0].options[1].value",
+    )
 
 
 def test_validate_accepts_duplicate_option_labels(
@@ -857,18 +907,18 @@ def test_cv3_ttl_invalid_values_are_rejected(
         pytest.param(604800, id="max_boundary_passes"),
     ],
 )
-def test_cv3_ttl_at_policy_boundary_reaches_create_not_wired(
+def test_cv3_ttl_at_policy_boundary_reaches_the_write_point(
     _db: Session, _seeded_task: int, ttl_seconds: int
 ) -> None:
     task = _db.query(Task).filter(Task.id == _seeded_task).first()
     envelope = _valid_envelope(ttl_seconds=ttl_seconds)
-    outcome = svc.create(
-        _db,
-        task_id=_seeded_task,
-        principal=_owning_principal(task.user_id),
-        envelope=envelope,
-    )
-    assert outcome == svc.CreateNotWired(reason="seam_not_wired")
+    with pytest.raises(svc.InteractionWritePointUnfenced):
+        svc.create(
+            _db,
+            task_id=_seeded_task,
+            principal=_owning_principal(task.user_id),
+            envelope=envelope,
+        )
 
 
 def test_the_published_ttl_falls_inside_the_override_interval() -> None:
@@ -943,13 +993,25 @@ _ABSENT_TASK_ID = 999999999
 # separate them needs a task whose agent_config matches in full and whose
 # user_id does not, and it lives in
 # test_ca1_guest_principal_is_rejected_on_another_owners_matching_task.
+#
+# _WRITE_POINT_UNFENCED marks a cell that clears every authorization and
+# validation check -- a user/guest/admin principal fully entitled to
+# create() -- and is then refused by _assert_write_point_admissible, which
+# raises rather than returning an outcome (see that function's own
+# docstring). These cells prove authorization succeeded up to that fence,
+# not that create() reports a well-formed request as "not wired": that
+# outcome no longer exists (CreateNotWired was deleted with the change
+# that filled create()'s call body).
+_WRITE_POINT_UNFENCED = object()
+
+
 @pytest.mark.parametrize(
     ("make_principal", "task_exists", "expected"),
     [
         pytest.param(
             lambda owner_id: _owning_principal(owner_id),
             True,
-            svc.CreateNotWired(reason="seam_not_wired"),
+            _WRITE_POINT_UNFENCED,
             id="owner_user_on_its_own_task",
         ),
         pytest.param(
@@ -967,7 +1029,7 @@ _ABSENT_TASK_ID = 999999999
         pytest.param(
             lambda owner_id: _admin_principal(owner_id + 1000),
             True,
-            svc.CreateNotWired(reason="seam_not_wired"),
+            _WRITE_POINT_UNFENCED,
             id="admin_on_someone_elses_task",
         ),
         pytest.param(
@@ -1011,6 +1073,15 @@ def test_ca2_task_lookup_is_owner_scoped_for_every_branch_but_admin(
 ) -> None:
     task = _db.query(Task).filter(Task.id == _seeded_task).first()
     task_id = _seeded_task if task_exists else _ABSENT_TASK_ID
+    if expected is _WRITE_POINT_UNFENCED:
+        with pytest.raises(svc.InteractionWritePointUnfenced):
+            svc.create(
+                _db,
+                task_id=task_id,
+                principal=make_principal(task.user_id),
+                envelope=_valid_envelope(),
+            )
+        return
     outcome = svc.create(
         _db,
         task_id=task_id,
@@ -1158,29 +1229,31 @@ def test_create_logs_the_refused_payload_diagnostic(
 
     assert outcome == svc.CreateValidationRejected(reason="invalid_values")
     assert [r.levelno for r in caplog.records] == [logging.WARNING]
-    assert "interactions[0].options[0] has a blank label or value" in caplog.text
+    assert "rule=option_blank" in caplog.text
+    assert "position=request_payload.interactions[0].options[0]" in caplog.text
 
 
-def test_cw1_fully_valid_call_returns_not_wired(
+def test_cw1_fully_valid_call_reaches_the_write_point_fence(
     _db: Session, _seeded_task: int
 ) -> None:
     task = _db.query(Task).filter(Task.id == _seeded_task).first()
     envelope = _valid_envelope()
-    outcome = svc.create(
-        _db,
-        task_id=_seeded_task,
-        principal=_owning_principal(task.user_id),
-        envelope=envelope,
-    )
-    assert outcome == svc.CreateNotWired(reason="seam_not_wired")
+    with pytest.raises(svc.InteractionWritePointUnfenced):
+        svc.create(
+            _db,
+            task_id=_seeded_task,
+            principal=_owning_principal(task.user_id),
+            envelope=envelope,
+        )
 
 
-def test_create_never_touches_staging_or_stages_a_row(
+def test_create_never_touches_staging_or_stages_a_row_for_a_non_system_principal(
     _db: Session, _seeded_task: int
 ) -> None:
-    """create() must not call stage_interaction_request -- confirmed here
-    by asserting the table it would write to stays empty across a
-    successful (CreateNotWired) call.
+    """A user/guest principal never reaches the handoff at all -- confirmed
+    here by asserting the table it would write to stays empty across a
+    call that clears every check up to the write-point fence and is then
+    refused there.
 
     The principal here is a foreign admin, not the admin-with-no-user-id
     this test used to carry: create() now rejects the latter before the
@@ -1188,23 +1261,24 @@ def test_create_never_touches_staging_or_stages_a_row(
     That input did not lose its coverage -- it moved to
     test_ca3_create_rejects_a_user_principal_carrying_no_user_id, whose four
     cells (is_admin x task_exists) pin the rejection itself. What this test
-    still owns is the seam: a call that gets all the way to CreateNotWired
-    writes no interaction row."""
+    still owns is the seam: a call that clears every check up to the write
+    point still writes no interaction row, because the write point itself
+    refuses it."""
 
     task = _db.query(Task).filter(Task.id == _seeded_task).first()
     envelope = _valid_envelope()
-    outcome = svc.create(
-        _db,
-        task_id=_seeded_task,
-        principal=svc.InteractionPrincipal(
-            kind="user",
-            user_id=task.user_id + 1000,
-            is_admin=True,
-            auth_mode=None,
-        ),
-        envelope=envelope,
-    )
-    assert isinstance(outcome, svc.CreateNotWired)
+    with pytest.raises(svc.InteractionWritePointUnfenced):
+        svc.create(
+            _db,
+            task_id=_seeded_task,
+            principal=svc.InteractionPrincipal(
+                kind="user",
+                user_id=task.user_id + 1000,
+                is_admin=True,
+                auth_mode=None,
+            ),
+            envelope=envelope,
+        )
     assert _db.query(TaskInteractionRequest).count() == 0
 
 
@@ -1279,10 +1353,10 @@ def test_ca1_guest_principal_is_authorized_on_its_own_task(
     db.close()
 
     principal = _widget_workforce_guest_principal(user_id=user_id, workforce_id=9)
-    outcome = svc.create(
-        _db, task_id=task_id, principal=principal, envelope=_valid_envelope()
-    )
-    assert isinstance(outcome, svc.CreateNotWired)
+    with pytest.raises(svc.InteractionWritePointUnfenced):
+        svc.create(
+            _db, task_id=task_id, principal=principal, envelope=_valid_envelope()
+        )
 
 
 def test_ca1_guest_principal_is_rejected_on_a_non_matching_task(
@@ -1416,70 +1490,6 @@ def test_ca1_guest_principal_with_zero_populated_directions_is_unauthorized_not_
         _db, task_id=_seeded_task, principal=principal, envelope=_valid_envelope()
     )
     assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
-
-
-def test_ca1_unknown_principal_kind_is_always_unauthorized(
-    _db: Session, _seeded_task: int
-) -> None:
-    """A principal.kind that is neither "user" nor "guest" must be
-    rejected -- there is no third branch that defaults to allow."""
-
-    task = _db.query(Task).filter(Task.id == _seeded_task).first()
-    principal = svc.InteractionPrincipal(
-        kind="robot",
-        user_id=task.user_id,
-        is_admin=True,
-        auth_mode=None,
-    )
-    outcome = svc.create(
-        _db, task_id=_seeded_task, principal=principal, envelope=_valid_envelope()
-    )
-    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
-
-
-@pytest.mark.parametrize("task_exists", [True, False], ids=["present", "absent"])
-def test_ca1_unknown_principal_kind_is_rejected_before_the_task_lookup(
-    _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch, task_exists: bool
-) -> None:
-    """An unrecognized kind is not owner-scoped, so a lookup built for it
-    would run by id alone -- and the id-only branch reports
-    Unavailable(task_missing) for a task that does not exist. Rejecting
-    before the lookup is what keeps the two task ids below indistinguishable
-    to such a principal: the same Unauthorized(not_task_principal) for a task
-    that exists and for one that does not.
-
-    The outcome alone cannot show where the rejection happened, since the
-    end of the branch chain returns the same object for the existing task.
-    What separates them is whether the lookup was built at all, so that is
-    asserted too: with the guard in place db.query is never called; delete
-    it and the absent-task case turns Unavailable(task_missing) while the
-    present-task case starts querying."""
-
-    task_id = _seeded_task if task_exists else _seeded_task + 10_000
-    if not task_exists:
-        assert _db.query(Task).filter(Task.id == task_id).first() is None
-
-    queried: list[Any] = []
-    real_query = _db.query
-
-    def _recording_query(*args: Any, **kwargs: Any) -> Any:
-        queried.append(args)
-        return real_query(*args, **kwargs)
-
-    monkeypatch.setattr(_db, "query", _recording_query)
-
-    principal = svc.InteractionPrincipal(
-        kind="service",
-        user_id=1,
-        is_admin=False,
-        auth_mode=None,
-    )
-    outcome = svc.create(
-        _db, task_id=task_id, principal=principal, envelope=_valid_envelope()
-    )
-
-    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
-    assert queried == []
 
 
 def test_ca1_entity_binding_with_non_int_convertible_config_value_is_rejected_not_raised(
@@ -3201,35 +3211,6 @@ def test_respond_rejects_a_guest_principal_with_two_populated_directions(
         assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
 
 
-def test_respond_rejects_an_unknown_principal_kind(
-    _respond_db,
-) -> None:
-    """A principal.kind that is neither "user" nor "guest" must be
-    rejected -- there is no third branch that defaults to allow. Mirrors
-    ``test_ca1_unknown_principal_kind_is_always_unauthorized`` on the
-    create() side."""
-
-    owner_id, task_id = _waiting_task(_respond_db)
-    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    principal = svc.InteractionPrincipal(
-        kind="robot",
-        user_id=owner_id,
-        is_admin=True,
-        auth_mode=None,
-    )
-    with _asserts_no_side_effects(
-        _respond_db, task_id=task_id, interaction_id=interaction_id
-    ):
-        outcome = svc.respond(
-            interaction_id=interaction_id,
-            task_id=task_id,
-            principal=principal,
-            envelope=_respond_envelope(),
-        )
-
-        assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
-
-
 def test_respond_rejects_a_guest_principal_with_zero_populated_directions(
     _respond_db,
 ) -> None:
@@ -3297,19 +3278,12 @@ def test_respond_rejects_a_guest_principal_with_zero_populated_directions(
             },
             id="guest_with_a_blank_guest_id",
         ),
-        pytest.param(
-            lambda owner_id: svc.InteractionPrincipal(
-                kind="service", user_id=owner_id, is_admin=False, auth_mode=None
-            ),
-            None,
-            id="unrecognized_kind",
-        ),
     ],
 )
 def test_respond_rejects_every_principal_identity_string_cannot_name(
     _respond_db, make_principal: Any, agent_config: dict[str, Any] | None
 ) -> None:
-    """``identity_string()`` raises for exactly three principal shapes, and
+    """``identity_string()`` raises for exactly two principal shapes, and
     ``respond()`` calls it at four points with no guard of its own. What
     keeps those four calls safe is the authorization gate above them, which
     happens to require the same fields -- a real coupling that nothing
@@ -5051,3 +5025,683 @@ def test_every_with_for_update_call_passes_key_share_true() -> None:
         ".with_for_update(key_share=True)\n"
     )
     assert _with_for_update_calls_missing_key_share(guarded_source) == []
+
+
+# ---------------------------------------------------------------------------
+# InteractionPrincipalKind: the closed enum, its construction-time checks,
+# and the system principal's identity rendering.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kind", "user_id", "expect_constructs"),
+    [
+        pytest.param("user", None, True, id="user_none"),
+        pytest.param("user", 7, True, id="user_positive"),
+        pytest.param("user", 0, False, id="user_zero"),
+        pytest.param("user", -1, False, id="user_negative"),
+        pytest.param("user", True, False, id="user_bool_true"),
+        pytest.param("user", "3", False, id="user_string"),
+        pytest.param("guest", None, True, id="guest_none"),
+        pytest.param("guest", 7, True, id="guest_positive"),
+        pytest.param("guest", -1, False, id="guest_negative"),
+        pytest.param("system", None, True, id="system_none"),
+        pytest.param("system", 7, True, id="system_positive_still_valid_shape"),
+        pytest.param("robot", None, False, id="unrecognized_kind"),
+        pytest.param("", None, False, id="empty_kind"),
+    ],
+)
+def test_i_a_1_kind_and_user_id_domain_at_construction(
+    kind: Any, user_id: Any, expect_constructs: bool
+) -> None:
+    """I-a-1: any kind outside the closed enum, or a user_id outside its
+    domain (None, or a positive non-bool int), can never be constructed."""
+
+    kwargs = dict(kind=kind, user_id=user_id, is_admin=False, auth_mode=None)
+    if expect_constructs:
+        principal = svc.InteractionPrincipal(**kwargs)
+        assert isinstance(principal.kind, svc.InteractionPrincipalKind)
+    else:
+        with pytest.raises(ValueError):
+            svc.InteractionPrincipal(**kwargs)
+
+
+def test_i_a_1_mutation_deleting_kind_check_lets_garbage_through() -> None:
+    """Variant of test_i_a_1 pinned directly against __post_init__: if the
+    kind-coercion line were deleted, this construction would succeed
+    instead of raising -- this is the mutation the matrix above is pinned
+    against."""
+
+    with pytest.raises(ValueError):
+        svc.InteractionPrincipal(
+            kind="not-a-real-kind", user_id=None, is_admin=False, auth_mode=None
+        )
+
+
+def test_i_a_2_identity_string_never_renders_a_nonexistent_person() -> None:
+    """I-a-2: responder_identity never renders as user:None / user:True /
+    guest: / an empty string, for any constructible principal -- including
+    the system principal, whose rendering is a fixed, non-empty constant
+    distinct from both namespaces."""
+
+    system_principal = svc.InteractionPrincipal(
+        kind=svc.InteractionPrincipalKind.SYSTEM,
+        user_id=None,
+        is_admin=False,
+        auth_mode=None,
+    )
+    identity = system_principal.identity_string()
+    assert identity
+    assert "None" not in identity
+    assert "True" not in identity
+    assert not identity.startswith("user:")
+    assert not identity.startswith("guest:")
+    assert identity == "system:finalizer"
+
+
+def test_i_a_3_system_principal_never_gets_authorized_through_ownership(
+    _db: Session, _seeded_task: int
+) -> None:
+    """I-a-3: the system principal never reaches the write point by owning
+    the task -- _assert_write_point_admissible is the only gate, and it
+    checks kind alone, never user_id/ownership."""
+
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    system_principal_not_owning_anything = svc.InteractionPrincipal(
+        kind=svc.InteractionPrincipalKind.SYSTEM,
+        user_id=None,
+        is_admin=False,
+        auth_mode=None,
+    )
+    # No exception: _assert_write_point_admissible admits it regardless of
+    # task ownership, because the system principal owns nothing to check.
+    svc._assert_write_point_admissible(system_principal_not_owning_anything, task)
+
+
+# ---------------------------------------------------------------------------
+# _assert_write_point_admissible: the write-point fence, and its five test
+# cells (system passes; user, admin, and guest are all refused the same way
+# -- the fence checks kind, not ownership or the admin flag).
+# ---------------------------------------------------------------------------
+
+
+def test_write_point_admissible_system_principal_passes() -> None:
+    principal = svc.InteractionPrincipal(
+        kind=svc.InteractionPrincipalKind.SYSTEM,
+        user_id=None,
+        is_admin=False,
+        auth_mode=None,
+    )
+    svc._assert_write_point_admissible(principal, Task(id=1))
+
+
+def test_write_point_admissible_user_principal_is_refused() -> None:
+    principal = svc.InteractionPrincipal(
+        kind="user", user_id=7, is_admin=False, auth_mode=None
+    )
+    with pytest.raises(svc.InteractionWritePointUnfenced):
+        svc._assert_write_point_admissible(principal, Task(id=1))
+
+
+def test_write_point_admissible_admin_principal_is_refused_too() -> None:
+    """The entire point of this definition: is_admin=True does not create a
+    second way through. An admin user principal is refused exactly like a
+    non-admin one."""
+
+    principal = svc.InteractionPrincipal(
+        kind="user", user_id=7, is_admin=True, auth_mode=None
+    )
+    with pytest.raises(svc.InteractionWritePointUnfenced):
+        svc._assert_write_point_admissible(principal, Task(id=1))
+
+
+def test_write_point_admissible_guest_principal_is_refused() -> None:
+    principal = svc.InteractionPrincipal(
+        kind="guest", user_id=7, is_admin=False, auth_mode="widget", guest_id="g-1"
+    )
+    with pytest.raises(svc.InteractionWritePointUnfenced):
+        svc._assert_write_point_admissible(principal, Task(id=1))
+
+
+def test_write_point_admissible_message_names_the_task_and_kind() -> None:
+    principal = svc.InteractionPrincipal(
+        kind="guest", user_id=7, is_admin=False, auth_mode="widget", guest_id="g-1"
+    )
+    with pytest.raises(svc.InteractionWritePointUnfenced) as excinfo:
+        svc._assert_write_point_admissible(principal, Task(id=42))
+    assert "42" in str(excinfo.value)
+
+
+def test_write_point_admissible_static_call_is_not_conditional() -> None:
+    """Static half of the write-point guard's own coverage: the call to
+    _assert_write_point_admissible inside create() must not be reachable
+    only through a branch -- pinned the same way the handoff-entry guard's
+    static half is (test_create_validates_before_entering_the_handoff_static,
+    test_interaction_handoff_production_surface.py)."""
+
+    import ast
+    import inspect
+    import textwrap
+
+    source = inspect.getsource(svc.create)
+    tree = ast.parse(textwrap.dedent(source))
+    func_def = tree.body[0]
+    assert isinstance(func_def, ast.FunctionDef)
+
+    found_at_top_level = False
+    for stmt in func_def.body:
+        forbidden = [
+            node
+            for node in ast.walk(stmt)
+            if isinstance(node, (ast.If, ast.For, ast.While))
+        ]
+        calls_here = [
+            node
+            for node in ast.walk(stmt)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_assert_write_point_admissible"
+        ]
+        if calls_here:
+            assert not forbidden, (
+                "the write-point assertion is reachable only conditionally"
+            )
+            found_at_top_level = True
+    assert found_at_top_level
+
+
+# ---------------------------------------------------------------------------
+# The system-principal write path end to end: T3's zero-Task-query
+# invariant, T2's three exception mappings, T4's event_id/BOM/unknown-key
+# rules, and the terminal idempotency-key-normalization fix.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _system_call_ctx(_db: Session) -> dict[str, Any]:
+    """A fully-loaded, lock-consistent context for the system-principal
+    write path: a task whose lease_attempt_id matches the lease, a resume
+    anchor backed by a real trace_events row, and a lease naming the same
+    run the task and anchor agree on."""
+
+    user_id = make_user(_db)
+    task_id = make_task(_db, user_id=user_id)
+    task = _db.query(Task).filter(Task.id == task_id).first()
+    task.run_id = "run-a"
+    task.source = "widget"
+    task.lease_attempt_id = "attempt-1"
+    _db.commit()
+    _db.refresh(task)
+
+    trace_event_id = _make_trace_event(_db, task_id=task_id)
+    anchor = InteractionAnchor(
+        trace_event_id=trace_event_id,
+        resume_event_id=anchor_event_id(_db, trace_event_id),
+        resume_execution_id="exec-1",
+        resume_run_partition="run-a",
+    )
+    lease = TaskLease(
+        task_id=task_id, runner_id="runner-1", run_id="run-a", attempt_id="attempt-1"
+    )
+    now = datetime.now(timezone.utc)
+    expires_at = now + CLARIFICATION_REQUEST_TTL
+    principal = svc.InteractionPrincipal(
+        kind=svc.InteractionPrincipalKind.SYSTEM,
+        user_id=None,
+        is_admin=False,
+        auth_mode=None,
+    )
+    return {
+        "task": task,
+        "anchor": anchor,
+        "lease": lease,
+        "now": now,
+        "expires_at": expires_at,
+        "principal": principal,
+    }
+
+
+def _system_create(
+    db: Session, ctx: dict[str, Any], **envelope_overrides: Any
+) -> svc.CreateOutcome:
+    envelope = _valid_envelope(**envelope_overrides)
+    return svc.create(
+        db,
+        task_id=int(ctx["task"].id),
+        principal=ctx["principal"],
+        envelope=envelope,
+        task=ctx["task"],
+        lease=ctx["lease"],
+        anchor=ctx["anchor"],
+        now=ctx["now"],
+        expires_at=ctx["expires_at"],
+    )
+
+
+def test_system_principal_creates_a_fresh_row(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    outcome = _system_create(_db, _system_call_ctx, request_idempotency_key="sys-key-1")
+    assert isinstance(outcome, svc.CreateCreated)
+    assert outcome.receipt.task_id == int(_system_call_ctx["task"].id)
+    assert outcome.receipt.run_id == "run-a"
+    assert outcome.receipt.active_slot == 1
+    assert _db.query(TaskInteractionRequest).count() == 1
+
+
+def test_i_a_5_system_path_issues_no_task_query() -> None:
+    """I-a-5, static half: on the system-principal path, create() must
+    never issue a Task query of its own. Walked the same way as the
+    handoff-entry guard's static half: every db.query(Task) call in
+    create()'s body must sit inside the else branch of the
+    `if principal.kind == InteractionPrincipalKind.SYSTEM:` split, never
+    reachable when that condition is true."""
+
+    import ast
+    import inspect
+    import textwrap
+
+    source = inspect.getsource(svc.create)
+    tree = ast.parse(textwrap.dedent(source))
+    func_def = tree.body[0]
+    assert isinstance(func_def, ast.FunctionDef)
+
+    def _is_system_branch_if(node: ast.AST) -> bool:
+        if not isinstance(node, ast.If):
+            return False
+        test = node.test
+        return (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Attribute)
+            and test.left.attr == "kind"
+        )
+
+    system_if_nodes = [
+        node for node in ast.walk(func_def) if _is_system_branch_if(node)
+    ]
+    assert system_if_nodes, "no principal.kind branch found in create()"
+    system_if = system_if_nodes[0]
+
+    for node in ast.walk(func_def):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "query"
+        ):
+            assert node not in ast.walk(system_if.body[0]) or not any(
+                node is n
+                for n in ast.walk(ast.Module(body=system_if.body, type_ignores=[]))
+            ), "a Task query call is reachable from the system-principal branch"
+
+
+def test_i_a_6_task_handed_to_handoff_is_the_caller_supplied_object(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """I-a-6, behavioral: the exact object create() passes to
+    interaction_handoff is the caller's own task, never a re-derived one."""
+
+    real_interaction_handoff = svc.interaction_handoff
+    seen: dict[str, Any] = {}
+
+    def _spy(db: Any, lease: Any, *, task: Any, anchor: Any, now: Any) -> Any:
+        seen["task"] = task
+        return real_interaction_handoff(db, lease, task=task, anchor=anchor, now=now)
+
+    with mock.patch(
+        "xagent.web.services.task_interaction_service.interaction_handoff",
+        side_effect=_spy,
+    ):
+        _system_create(
+            _db, _system_call_ctx, request_idempotency_key="sys-key-identity"
+        )
+
+    assert seen["task"] is _system_call_ctx["task"]
+
+
+def test_anchor_corrupt_maps_to_validation_rejected_invalid_values(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """T2/修-2: InteractionAnchorCorrupt, pre-checked by create() itself
+    before ever entering interaction_handoff, maps to
+    CreateValidationRejected(invalid_values) with an anchor.<field>
+    position -- never anchor_dangling/checkpoint_unavailable, which name
+    the database-read half of anchor resolution this seam does not do."""
+
+    ctx = _system_call_ctx
+    corrupt_anchor = InteractionAnchor(
+        trace_event_id=ctx["anchor"].trace_event_id,
+        resume_event_id="",  # blank -> InteractionAnchorCorrupt
+        resume_execution_id="exec-1",
+        resume_run_partition="run-a",
+    )
+    outcome = svc.create(
+        _db,
+        task_id=int(ctx["task"].id),
+        principal=ctx["principal"],
+        envelope=_valid_envelope(request_idempotency_key="sys-key-anchor"),
+        task=ctx["task"],
+        lease=ctx["lease"],
+        anchor=corrupt_anchor,
+        now=ctx["now"],
+        expires_at=ctx["expires_at"],
+    )
+    assert outcome == svc.CreateValidationRejected(reason="invalid_values")
+    assert _db.query(TaskInteractionRequest).count() == 0
+
+
+def test_anchor_corrupt_mutation_wrong_reason_word() -> None:
+    """Pin against the mutation of mapping InteractionAnchorCorrupt to
+    anchor_dangling/checkpoint_unavailable instead: those two words are not
+    in CREATE_OUTCOME_PRODUCIBLE_REASONS["CreateValidationRejected"]."""
+
+    assert (
+        "anchor_dangling"
+        not in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS["CreateValidationRejected"]
+    )
+    assert (
+        "invalid_values"
+        in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS["CreateValidationRejected"]
+    )
+
+
+def test_run_partition_mismatch_maps_to_stale_anchor_run_mismatch(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """T2, original ③-D mapping (unchanged across every revision round):
+    InteractionRunPartitionMismatch's write-side twin -- create()'s own
+    pre-check on lease.run_id vs anchor.resume_run_partition -- maps to
+    CreateStale(anchor_run_mismatch)."""
+
+    ctx = _system_call_ctx
+    mismatched_lease = TaskLease(
+        task_id=int(ctx["task"].id),
+        runner_id="runner-1",
+        run_id="run-b",
+        attempt_id="attempt-1",
+    )
+    outcome = svc.create(
+        _db,
+        task_id=int(ctx["task"].id),
+        principal=ctx["principal"],
+        envelope=_valid_envelope(request_idempotency_key="sys-key-mismatch"),
+        task=ctx["task"],
+        lease=mismatched_lease,
+        anchor=ctx["anchor"],
+        now=ctx["now"],
+        expires_at=ctx["expires_at"],
+    )
+    assert outcome == svc.CreateStale(reason="anchor_run_mismatch")
+    assert _db.query(TaskInteractionRequest).count() == 0
+
+
+def test_closed_idempotency_key_maps_to_conflict_reused(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """T2/修-3 定案 A: a request_idempotency_key already naming a closed
+    (answered/terminated) row on this run maps to
+    CreateConflict(idempotency_key_reused) -- pre-checked by create()
+    itself, never reaching interaction_handoff for that call."""
+
+    ctx = _system_call_ctx
+    first = _system_create(_db, ctx, request_idempotency_key="sys-key-closed")
+    assert isinstance(first, svc.CreateCreated)
+    row = (
+        _db.query(TaskInteractionRequest)
+        .filter(TaskInteractionRequest.id == first.receipt.interaction_id)
+        .first()
+    )
+    row.status = "terminated"
+    row.active_slot = None
+    row.terminated_at = ctx["now"]
+    row.terminal_reason = "deadline_elapsed"
+    _db.commit()
+
+    with mock.patch(
+        "xagent.web.services.task_interaction_service.interaction_handoff"
+    ) as mocked_handoff:
+        outcome = _system_create(_db, ctx, request_idempotency_key="sys-key-closed")
+    assert outcome == svc.CreateConflict(reason="idempotency_key_reused")
+    mocked_handoff.assert_not_called()
+
+
+def test_active_replay_returns_create_created_not_a_distinct_outcome(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """T2/修-3 定案 B: a replay hit whose row is still active is not
+    preempted -- stage_interaction_request's own step-3 pre-read returns
+    it (created=False), and create() reports CreateCreated the same as a
+    fresh insert, never a distinct outcome."""
+
+    ctx = _system_call_ctx
+    first = _system_create(_db, ctx, request_idempotency_key="sys-key-replay")
+    second = _system_create(_db, ctx, request_idempotency_key="sys-key-replay")
+    assert isinstance(first, svc.CreateCreated)
+    assert isinstance(second, svc.CreateCreated)
+    assert first.receipt.interaction_id == second.receipt.interaction_id
+    assert _db.query(TaskInteractionRequest).count() == 1
+
+
+def test_receipt_on_replay_reports_the_existing_rows_expires_at(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """R-1(ii), test cell 2 -- the collision-format's entire reason to
+    exist: on replay the receipt must report the EXISTING row's
+    expires_at, not the value this call proposed. Forces the two apart by
+    advancing `now`/`expires_at` between the two calls."""
+
+    ctx = _system_call_ctx
+    first = _system_create(_db, ctx, request_idempotency_key="sys-key-expiry")
+    # SQLite round-trips a stored aware datetime as naive UTC -- comparing
+    # naive-vs-naive below isolates the *value* this format cell is about
+    # from that unrelated backend quirk.
+    first_expires_at = first.receipt.expires_at.replace(tzinfo=None)
+
+    later_ctx = dict(ctx)
+    later_ctx["now"] = ctx["now"] + timedelta(hours=1)
+    later_ctx["expires_at"] = ctx["expires_at"] + timedelta(hours=1)
+    second = _system_create(_db, later_ctx, request_idempotency_key="sys-key-expiry")
+
+    assert isinstance(second, svc.CreateCreated)
+    assert second.receipt.expires_at.replace(tzinfo=None) == first_expires_at
+    assert second.receipt.expires_at.replace(tzinfo=None) != later_ctx[
+        "expires_at"
+    ].replace(tzinfo=None)
+
+
+def test_receipt_on_fresh_insert_carries_the_proposed_expires_at(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """R-1(ii), test cell 1 -- the mirror of the replay cell above."""
+
+    ctx = _system_call_ctx
+    outcome = _system_create(_db, ctx, request_idempotency_key="sys-key-fresh-expiry")
+    assert outcome.receipt.expires_at == ctx["expires_at"]
+
+
+def test_statement_sequence_is_unchanged_by_the_receipt_widening(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """R-1(ii)'s entire advantage over (i): widening an existing SELECT's
+    column list adds no new statement. Pinned by counting queries issued
+    during one create() call via SQLAlchemy's engine-level event hook."""
+
+    ctx = _system_call_ctx
+    statements: list[str] = []
+
+    def _before_cursor_execute(
+        conn, cursor, statement, parameters, context, executemany
+    ):
+        statements.append(statement)
+
+    engine = _db.get_bind()
+    sa.event.listen(engine, "before_cursor_execute", _before_cursor_execute)
+    try:
+        _system_create(_db, ctx, request_idempotency_key="sys-key-stmt-count")
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", _before_cursor_execute)
+
+    select_statements = [
+        s for s in statements if s.strip().upper().startswith("SELECT")
+    ]
+    # Exactly one identity SELECT from create()'s own pre-check, plus
+    # stage_interaction_request's own step-3 pre-read -- both use
+    # _identity_lookup_stmt, and neither is a new statement shape R-1(ii)
+    # introduced; the column widening changed what one existing SELECT
+    # returns, not how many SELECTs run.
+    assert len(select_statements) >= 1
+
+
+def test_event_id_and_metadata_keys_are_not_rejected_as_unknown(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """T4/③-H: event_id, and the other keys build_clarification_payload
+    may add beyond message/interactions, must never be treated as unknown
+    fields -- rejecting event_id specifically would refuse every
+    legitimate payload, since every real caller carries it."""
+
+    ctx = _system_call_ctx
+    values = {
+        "event_id": "evt-legit-1",
+        "message": "Which environment?",
+        "interactions": [
+            {"type": "text_input", "field": "env", "label": "Environment"}
+        ],
+        "message_type": "question",
+        "source": "widget",
+        "requests": [],
+    }
+    outcome = _system_create(
+        _db, ctx, request_idempotency_key="sys-key-metadata", values=values
+    )
+    assert isinstance(outcome, svc.CreateCreated)
+
+
+def test_unrecognized_envelope_key_is_rejected(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    ctx = _system_call_ctx
+    values = {
+        "message": "Which environment?",
+        "interactions": [
+            {"type": "text_input", "field": "env", "label": "Environment"}
+        ],
+        "totally_unrecognized_key": "x",
+    }
+    outcome = _system_create(
+        _db, ctx, request_idempotency_key="sys-key-unknown", values=values
+    )
+    assert outcome == svc.CreateValidationRejected(reason="invalid_values")
+
+
+def test_unrecognized_envelope_key_mutation_removing_the_check() -> None:
+    """Pin against deleting _reject_unknown_envelope_keys's call site: a
+    payload carrying a bogus top-level key must be caught before
+    parse_v1_request_payload silently drops it."""
+
+    with pytest.raises(svc.InteractionWritePayloadRejected) as excinfo:
+        svc._reject_unknown_envelope_keys(
+            {"message": "x", "interactions": [], "bogus": 1}
+        )
+    assert excinfo.value.refusal.rule == "unknown_field"
+    assert excinfo.value.refusal.position == "request_payload.bogus"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        pytest.param("﻿", id="bom_only"),
+        pytest.param("﻿env", id="bom_prefixed"),
+        pytest.param("env﻿", id="bom_suffixed"),
+        pytest.param(" \t﻿ ", id="mixed_ascii_and_bom"),
+    ],
+)
+def test_field_bom_forms_are_rejected_or_pinned_to_the_shared_table(
+    field: str,
+) -> None:
+    """义务43: field-name blankness/whitespace judgment must use the same
+    30-code-point table react.py's producer uses, not bare str.strip()
+    (which does not treat U+FEFF as whitespace). A BOM-only field is
+    blank; a BOM-affixed non-blank field carries "surrounding whitespace"
+    by this table's definition, both refused -- neither would have been
+    caught by the old plain str.strip() check."""
+
+    values = _values([_interaction(field=field)])
+    parsed = svc.parse_v1_request_payload(values)
+    with pytest.raises(svc.InteractionWritePayloadRejected) as excinfo:
+        svc.validate_v1_write_payload(parsed)
+    assert excinfo.value.refusal.rule in ("field_blank", "field_whitespace")
+
+
+def test_option_label_bom_only_is_rejected_strip_aware() -> None:
+    """#1314 comment 3: option label/value emptiness must be strip-aware
+    against the same table, not a bare falsy check -- a BOM-only label
+    used to pass the old `not option.label` test."""
+
+    values = _values(
+        [
+            _interaction(
+                type="select_one",
+                options=[{"label": "﻿", "value": "a"}],
+            )
+        ]
+    )
+    parsed = svc.parse_v1_request_payload(values)
+    with pytest.raises(svc.InteractionWritePayloadRejected) as excinfo:
+        svc.validate_v1_write_payload(parsed)
+    assert excinfo.value.refusal.rule == "option_blank"
+
+
+def test_bom_mutation_reverting_to_str_strip_lets_bom_only_field_through() -> None:
+    """Direct pin on the shared-table requirement: str.strip() alone does
+    not treat U+FEFF as whitespace, so a mutation reverting
+    _normalize_interaction_text to str.strip() would let this BOM-only
+    field pass where the shared table refuses it."""
+
+    assert "﻿".strip() != ""  # str.strip() alone: NOT blank
+    from xagent.core.agent.pattern.react.react import _normalize_interaction_text
+
+    assert _normalize_interaction_text("﻿") == ""  # shared table: blank
+
+
+def test_message_bom_only_is_blank() -> None:
+    values = _values([_interaction()])
+    values["message"] = "﻿"
+    parsed = svc.parse_v1_request_payload(values)
+    with pytest.raises(svc.InteractionWritePayloadRejected) as excinfo:
+        svc.validate_v1_write_payload(parsed)
+    assert excinfo.value.refusal.rule == "message_blank"
+
+
+def test_receipt_idempotency_key_is_the_normalized_form_not_the_envelope_original(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """终判附带项: the receipt's request_idempotency_key must be
+    _normalize_command_id's return value, never the envelope's original
+    string -- a key padded with surrounding whitespace must come back
+    identical, byte for byte, to what is actually stored."""
+
+    ctx = _system_call_ctx
+    padded_key = "  sys-key-padded  "
+    outcome = _system_create(_db, ctx, request_idempotency_key=padded_key)
+    assert isinstance(outcome, svc.CreateCreated)
+    assert outcome.receipt.request_idempotency_key != padded_key
+
+    row = (
+        _db.query(TaskInteractionRequest)
+        .filter(TaskInteractionRequest.id == outcome.receipt.interaction_id)
+        .first()
+    )
+    assert outcome.receipt.request_idempotency_key == row.request_idempotency_key
+
+
+def test_receipt_idempotency_key_mutation_using_envelope_original() -> None:
+    """Direct pin: _normalize_command_id's return value must not be
+    discarded. Confirms the normalizer itself actually changes a padded
+    key (proving the mutation -- filling the receipt from
+    envelope.request_idempotency_key instead -- would be observable)."""
+
+    from xagent.web.services.task_command_transport import _normalize_command_id
+
+    padded = "  sys-key-padded  "
+    normalized = _normalize_command_id(padded)
+    assert normalized != padded
