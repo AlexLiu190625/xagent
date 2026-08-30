@@ -588,11 +588,15 @@ def _count_custom_apis_selects_before_first_delete(statements: list[str]) -> int
 
 
 class TestDeleteLockOrderMatchesThePutsLockOrder:
-    """``update_custom_api`` locks the ``CustomApi`` definition row first and
-    writes the ``UserCustomApi`` link row afterwards. For the two routes to
-    share one global lock order, ``delete_custom_api`` must take the same
-    definition-row lock before it deletes the link row, in both of its
-    branches.
+    """``update_custom_api`` locks the ``CustomApi`` definition row first,
+    calls ``rename_team_connector`` after that lock, and writes the
+    ``UserCustomApi`` link row after that. For the two routes to share one
+    lock order, ``delete_custom_api`` must take the same definition-row
+    lock before it calls ``delete_team_connector`` and before it deletes
+    the link row, in both of its branches. The hook boundary matters as
+    much as the two tables do: a hook that locks rows of its own sees both
+    routes arrive holding the definition row, so the two cannot be inside
+    the hook at the same time on the same connector.
 
     SQLite silently drops ``FOR UPDATE`` (it is a no-op on this dialect), so
     nothing here demonstrates that the lock actually blocks a second writer
@@ -651,4 +655,53 @@ class TestDeleteLockOrderMatchesThePutsLockOrder:
             "expected the not-found guard's relationship load AND the new "
             "lock statement's own SELECT against custom_apis, both before "
             "the first DELETE"
+        )
+
+    def test_the_lock_is_taken_before_the_delete_hook_is_called(self):
+        """``delete_team_connector`` runs with the definition row already
+        held. That is what puts this route in the same direction as
+        ``update_custom_api``, which calls ``rename_team_connector`` after
+        its own lock -- and is therefore what stops the two from forming a
+        cycle through rows the hook locks. The hook counts the
+        ``custom_apis`` ``SELECT``s issued so far: the not-found guard's
+        relationship load, plus the lock's own query.
+        """
+        session_factory, engine = _lock_order_session_factory()
+        owner_id, api_id = _seed_owned_api_for_lock_order(
+            session_factory, name="lock-order-before-hook"
+        )
+        db = session_factory()
+        current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+        statements: list[str] = []
+        selects_seen_by_the_hook: list[int] = []
+
+        def record_query(conn, cursor, statement, parameters, context, executemany):
+            del conn, cursor, parameters, context, executemany
+            statements.append(statement)
+
+        def deleted_hook(_db, _user_id, _connector_type, _connector_id):
+            selects_seen_by_the_hook.append(
+                sum(
+                    1
+                    for statement in statements
+                    if statement.strip().upper().startswith("SELECT")
+                    and "FROM CUSTOM_APIS" in statement.strip().upper()
+                )
+            )
+            return ConnectorDeleteDecision()
+
+        event.listen(engine, "before_cursor_execute", record_query)
+        set_connector_team_hooks(deleted=deleted_hook)
+        try:
+            delete_custom_api(api_id, current_user=current_user, db=db)
+        finally:
+            set_connector_team_hooks()
+            event.remove(engine, "before_cursor_execute", record_query)
+            db.close()
+
+        assert selects_seen_by_the_hook == [2], (
+            "expected the delete hook to be called once, with both the "
+            "not-found guard's relationship load and the lock statement's "
+            "own SELECT against custom_apis already issued"
         )

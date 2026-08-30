@@ -475,6 +475,54 @@ def delete_custom_api(
             detail="You do not have permission to delete this Custom API",
         )
 
+    # One lock order across every row this pair of routes touches.
+    # ``update_custom_api`` locks this same ``CustomApi`` definition row
+    # first, calls ``rename_team_connector`` afterwards, and writes the
+    # ``UserCustomApi`` link row afterwards too; both branches below delete
+    # the link row first and the definition row second, inside one
+    # transaction. Taking the lock here -- before ``delete_team_connector``
+    # rather than after it -- puts both routes in one order on both sides of
+    # the hook boundary: definition row first, then the link row and
+    # whatever rows a connector team hook locks. With the lock after the
+    # hook instead, the two routes waited in opposite directions across that
+    # boundary and a concurrent edit/delete pair on the same connector could
+    # deadlock (PostgreSQL 40P01, surfacing to the caller as HTTP 500).
+    # ``populate_existing`` matches the PUT's own lock: the row this
+    # transaction holds is the one the deletion below acts on, not whatever
+    # the relationship read above happened to see. This is also a fresh
+    # statement, so a row deleted between the access read above and here
+    # still yields None (handled as the same 404) rather than reaching
+    # ``db.delete`` with nothing to delete.
+    #
+    # Two costs come with taking it here rather than last. The two 403
+    # refusals below read ``delete_team_connector``'s answer and so now
+    # happen after this statement: a request that is going to be refused
+    # does briefly hold this row, until the raised ``HTTPException``
+    # propagates out and the request's session is closed without
+    # committing. And the hook's own work now runs inside the lock, so this
+    # route holds the row for longer than it did with the lock last.
+    #
+    # What this statement orders is this route against ``update_custom_api``
+    # on the same connector: those two can no longer form a cycle with each
+    # other, whatever the hook locks, because both reach the hook with this
+    # row already held and so cannot be inside the hook at the same time. A
+    # hook that additionally locks rows of its own in some other order
+    # relative to this repository's statements is outside what this
+    # statement arranges; only the installing application can order those.
+    locked_api = (
+        db.query(CustomApi)
+        .filter(CustomApi.id == api_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
+    if locked_api is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Custom API not found",
+        )
+    api = locked_api
+
     from ..services.connector_team_scope import delete_team_connector
 
     team_delete = delete_team_connector(
@@ -490,42 +538,6 @@ def delete_custom_api(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only a team admin can delete a team Custom API",
         )
-
-    # One global lock order over this pair of tables. ``update_custom_api``
-    # locks the ``CustomApi`` definition row first and writes the
-    # ``UserCustomApi`` link row afterwards; both branches below delete the
-    # link row first and the definition row second, inside one transaction.
-    # Without this statement the two routes take the same two rows in
-    # opposite orders and a concurrent edit/delete pair can deadlock
-    # (PostgreSQL 40P01). Taken after every refusal above, so a request that
-    # is going to be refused never acquires the lock. ``populate_existing``
-    # matches the PUT's own lock: the row this transaction holds is the one
-    # the deletion below acts on, not whatever the relationship read above
-    # happened to see.
-    #
-    # This statement orders THIS repository's two tables and nothing else. A
-    # connector team hook writes its own tables, which this lock does not
-    # cover, and the two routes reach it in opposite orders relative to this
-    # lock: the PUT takes the lock above and calls rename_team_connector
-    # afterwards, while this route calls delete_team_connector before taking
-    # the lock at all. So an installing application whose hooks lock a row of
-    # its own can still deadlock against a concurrent edit/delete pair on the
-    # same connector, and no ordering statement inside this repository can
-    # prevent that -- the hook side has to take its rows in an order
-    # compatible with this one, and only the application can arrange that.
-    locked_api = (
-        db.query(CustomApi)
-        .filter(CustomApi.id == api_id)
-        .populate_existing()
-        .with_for_update()
-        .first()
-    )
-    if locked_api is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Custom API not found",
-        )
-    api = locked_api
 
     if team_delete.team_owned:
         db.delete(user_api)

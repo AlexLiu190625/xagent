@@ -7,10 +7,14 @@ against SQLite, so nothing there can tell a genuine second-writer block
 from a lock statement that silently does nothing. This file is the one
 place that runs the real statement against a real server and proves it
 actually blocks a second writer: two concurrent edits, an edit and a
-concurrent delete both taking the same lock in the same order, and the
-companion path where the row vanishes between the route's first read and
-this lock. Mirrors test_mcp_server_edit_lock_postgresql.py's structure for
-the MCP side of the edit lock. The MCP side's delete route takes no such
+concurrent delete both taking the same lock in the same order, and -- for
+the edit route and the delete route each -- the companion path where the
+row vanishes between the route's first read and this lock. The delete
+route's version of that path additionally pins where the lock sits
+relative to ``delete_team_connector``: it is taken first, so a vanished
+row is refused before the hook is called at all. Mirrors
+test_mcp_server_edit_lock_postgresql.py's structure for the MCP side of
+the edit lock. The MCP side's delete route takes no such
 lock and needs none: it commits its link-row deletion before it goes near
 the definition row, so it never holds both rows in one transaction and
 cannot form the cycle the ordering lock here exists to rule out.
@@ -37,7 +41,10 @@ from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
-from xagent.web.services.connector_team_scope import set_connector_team_hooks
+from xagent.web.services.connector_team_scope import (
+    ConnectorDeleteDecision,
+    set_connector_team_hooks,
+)
 
 pytestmark = pytest.mark.postgresql
 
@@ -401,3 +408,93 @@ def test_a_delete_blocks_until_a_concurrent_edits_transaction_finishes(
         custom_api_api.validate_runtime_config_declaration = real_validate
         session_a.close()
         session_b.close()
+
+
+def test_a_delete_whose_row_vanishes_after_the_gate_but_before_the_lock_is_a_404(
+    session_factory, seeded
+) -> None:
+    """``delete_custom_api`` has the same window ``update_custom_api`` has:
+    its access read can find the row and still lose a race to a concurrent
+    delete that commits before the lock statement runs. Without the lock's
+    own ``None`` guard the route reaches ``db.delete(None)``, which raises
+    ``UnmappedInstanceError`` out of the write path -- an HTTP 500 where a
+    404 is correct.
+
+    The concurrent delete is fired from a wrapper around this session's own
+    ``query``, which lands it strictly between the two reads: the lock is
+    the first statement in this route that asks for ``CustomApi`` (the
+    access read above asks for ``UserCustomApi``, and reaches the
+    definition row through its relationship rather than through ``query``),
+    so the wrapper can recognise the lock query and nothing else. The
+    recorded entity sequence is asserted rather than assumed, so this test
+    cannot quietly pass on a 404 raised by the access gate instead of by
+    the lock.
+
+    Two side-effect assertions come with it. The installed delete hook must
+    never be called: the lock precedes ``delete_team_connector``, so a
+    vanished row is refused before any hook-side mutation is attempted. And
+    the route must not commit: the only ``db.commit()`` in this route is
+    after the deletion, and the refusal returns before it.
+    """
+    import xagent.web.api.custom_api as custom_api_api
+
+    owner_id, api_id = seeded
+    current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+    db = session_factory()
+    real_query = db.query
+    real_commit = db.commit
+    deleted_already = threading.Event()
+    queried_entities: list[tuple] = []
+    commits: list[str] = []
+    hook_calls: list[int] = []
+
+    def spy_deleted_hook(_db, _user_id, _connector_type, connector_id):
+        hook_calls.append(int(connector_id))
+        return ConnectorDeleteDecision()
+
+    def delete_the_row_when_the_lock_query_starts(*entities, **kwargs):
+        queried_entities.append(entities)
+        if entities == (CustomApi,) and not deleted_already.is_set():
+            deleted_already.set()
+            with session_factory() as other:
+                other.execute(
+                    sa.delete(UserCustomApi).where(
+                        UserCustomApi.custom_api_id == api_id
+                    )
+                )
+                other.execute(sa.delete(CustomApi).where(CustomApi.id == api_id))
+                other.commit()
+        return real_query(*entities, **kwargs)
+
+    def record_commit():
+        commits.append("commit")
+        return real_commit()
+
+    db.query = delete_the_row_when_the_lock_query_starts
+    db.commit = record_commit
+    set_connector_team_hooks(deleted=spy_deleted_hook)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            custom_api_api.delete_custom_api(
+                api_id,
+                current_user=current_user,
+                db=db,
+            )
+        assert exc.value.status_code == 404
+        assert deleted_already.is_set(), "the concurrent delete never ran"
+        assert queried_entities[:2] == [(UserCustomApi,), (CustomApi,)], (
+            "the concurrent delete must land after the access gate's own "
+            "read and before the lock; otherwise the 404 under test could "
+            f"be the access gate's rather than the lock's -- saw "
+            f"{queried_entities!r}"
+        )
+        assert hook_calls == [], (
+            "the lock's 404 must precede delete_team_connector, so a "
+            "vanished row is refused before any hook-side mutation is "
+            "attempted"
+        )
+        assert commits == [], "the refused delete must commit nothing"
+    finally:
+        set_connector_team_hooks()
+        db.close()
