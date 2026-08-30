@@ -5291,11 +5291,12 @@ def test_system_principal_creates_a_fresh_row(
 
 def test_i_a_5_system_path_issues_no_task_query() -> None:
     """I-a-5, static half: on the system-principal path, create() must
-    never issue a Task query of its own. Walked the same way as the
-    handoff-entry guard's static half: every db.query(Task) call in
-    create()'s body must sit inside the else branch of the
-    `if principal.kind == InteractionPrincipalKind.SYSTEM:` split, never
-    reachable when that condition is true."""
+    never issue a Task query of its own. Walks the actual AST subtree of
+    the `if principal.kind == InteractionPrincipalKind.SYSTEM:` branch's
+    own body (its True side, never its `else`) and fails if any
+    ``.query(...)`` call is reachable there at all -- not scoped to
+    ``Task`` specifically, since the system branch has no legitimate
+    reason to query anything through `db.query` at all."""
 
     import ast
     import inspect
@@ -5310,28 +5311,41 @@ def test_i_a_5_system_path_issues_no_task_query() -> None:
         if not isinstance(node, ast.If):
             return False
         test = node.test
-        return (
+        if not (
             isinstance(test, ast.Compare)
             and isinstance(test.left, ast.Attribute)
             and test.left.attr == "kind"
-        )
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+        ):
+            return False
+        (comparator,) = test.comparators
+        return isinstance(comparator, ast.Attribute) and comparator.attr == "SYSTEM"
 
     system_if_nodes = [
         node for node in ast.walk(func_def) if _is_system_branch_if(node)
     ]
-    assert system_if_nodes, "no principal.kind branch found in create()"
+    assert len(system_if_nodes) == 1, (
+        f"expected exactly one `principal.kind == ...SYSTEM` branch, found "
+        f"{len(system_if_nodes)}"
+    )
     system_if = system_if_nodes[0]
 
-    for node in ast.walk(func_def):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "query"
-        ):
-            assert node not in ast.walk(system_if.body[0]) or not any(
-                node is n
-                for n in ast.walk(ast.Module(body=system_if.body, type_ignores=[]))
-            ), "a Task query call is reachable from the system-principal branch"
+    # Walk only the True-branch statement list (system_if.body), never
+    # system_if.orelse -- ast.walk over a bare list of statements requires
+    # wrapping each one individually, since ast.walk expects a single node.
+    query_calls_in_system_branch = [
+        node
+        for stmt in system_if.body
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "query"
+    ]
+    assert query_calls_in_system_branch == [], (
+        "a .query(...) call is reachable from the system-principal branch: "
+        f"{ast.dump(query_calls_in_system_branch[0]) if query_calls_in_system_branch else ''}"
+    )
 
 
 def test_i_a_6_task_handed_to_handoff_is_the_caller_supplied_object(
