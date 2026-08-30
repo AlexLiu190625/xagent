@@ -53,6 +53,7 @@ from ...core.agent.checkpoint import (
     CheckpointReadError,
     CheckpointUnavailableError,
 )
+from ...core.agent.runner import UserMessageInjectionOutcome
 from ...core.agent.trace import TraceEvent, TraceHandler
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
@@ -3542,35 +3543,50 @@ async def execute_resume_background(
             # staged since, not the one the message answered. Bound to a
             # plain local before the lambda below, like close_run_id above.
             close_interaction_id = pending_user_message.get("interaction_id")
-            try:
-                await run_db_io_cancellation_safe(
-                    lambda: close_legacy_resume_interaction_sync(
-                        task_id=task_id,
-                        run_id=close_run_id,
-                        interaction_id=close_interaction_id,
+            # Distinct from the "unconditional" argument above, which is
+            # only about not borrowing the delivery_turn_id branch's
+            # condition: this task can itself be retried across runs with
+            # the same pending_user_message, and post_user_message reports
+            # that retry explicitly as a replay instead of a bare truthy
+            # `posted`. On a replay, the interaction id carried above is
+            # not the question this turn answered -- the first attempt
+            # already retired that one -- it is whatever question the
+            # resumed agent has staged since, so closing here would retire
+            # a live question nobody has answered. The v1 reply resume-
+            # input path (task_reply.py) needs no equivalent guard: its
+            # turn id embeds a fresh uuid on every call and can never hit
+            # the short circuit that produces a replay.
+            if posted is not UserMessageInjectionOutcome.POSTED_REPLAY:
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: close_legacy_resume_interaction_sync(
+                            task_id=task_id,
+                            run_id=close_run_id,
+                            interaction_id=close_interaction_id,
+                        )
                     )
-                )
-            except Exception:
-                logger.warning(
-                    "legacy resume interaction close failed after deferred "
-                    "message seal for task %s run %s",
-                    task_id,
-                    close_run_id,
-                    exc_info=True,
-                )
-            except asyncio.CancelledError:
-                # See run_db_io_cancellation_safe's docstring: it drains its
-                # worker to completion before propagating a cancellation
-                # raised while awaiting it, so the close-and-clear
-                # transaction has already committed or failed by the time
-                # this branch runs. Only the log statement was interrupted.
-                logger.warning(
-                    "legacy resume interaction close was cancelled after "
-                    "deferred message seal for task %s run %s; continuing "
-                    "resume",
-                    task_id,
-                    close_run_id,
-                )
+                except Exception:
+                    logger.warning(
+                        "legacy resume interaction close failed after deferred "
+                        "message seal for task %s run %s",
+                        task_id,
+                        close_run_id,
+                        exc_info=True,
+                    )
+                except asyncio.CancelledError:
+                    # See run_db_io_cancellation_safe's docstring: it drains
+                    # its worker to completion before propagating a
+                    # cancellation raised while awaiting it, so the
+                    # close-and-clear transaction has already committed or
+                    # failed by the time this branch runs. Only the log
+                    # statement was interrupted.
+                    logger.warning(
+                        "legacy resume interaction close was cancelled after "
+                        "deferred message seal for task %s run %s; continuing "
+                        "resume",
+                        task_id,
+                        close_run_id,
+                    )
             if delivery_turn_id is not None:
                 try:
                     await run_db_io_cancellation_safe(
@@ -6644,7 +6660,7 @@ async def _handle_chat_message_unserialized(
                         lambda: active_interaction_id_sync(task_id)
                     )
 
-                    posted = False
+                    posted = UserMessageInjectionOutcome.NOT_POSTED
                     if live_task_lease is not None:
                         with bind_task_lease_context(live_task_lease):
                             try:
@@ -6658,14 +6674,14 @@ async def _handle_chat_message_unserialized(
                                     reason="new websocket user message",
                                 )
                             except CheckpointUnavailableError:
-                                # Fold into the existing posted=False path
+                                # Fold into the existing not-posted path
                                 # below: the durable message is deferred to
                                 # the resume owner instead of injected live,
                                 # exactly as when there was no exact lease
                                 # or checkpoint to inject into. Distinct
                                 # from corrupt/refused, which are not
                                 # retryable by simply deferring.
-                                posted = False
+                                posted = UserMessageInjectionOutcome.NOT_POSTED
                             except CheckpointReadError:
                                 # Corrupt and refused reach here today. The
                                 # base class is deliberate: a read failure
@@ -6685,7 +6701,7 @@ async def _handle_chat_message_unserialized(
                                     ClientErrorCode.TASK_CHECKPOINT_UNREADABLE
                                 )
                                 return
-                    delivery_injected = posted
+                    delivery_injected = bool(posted)
                     if not posted:
                         logger.warning(
                             "Agent execution %s had no exact live lease or "
@@ -6745,7 +6761,7 @@ async def _handle_chat_message_unserialized(
                                 }
                             ),
                             delivery_turn_id=turn_id,
-                            delivery_already_dispatched=posted,
+                            delivery_already_dispatched=bool(posted),
                             delivery_websocket=(
                                 None if posted or suppress_delivery_ack else websocket
                             ),
@@ -6793,44 +6809,34 @@ async def _handle_chat_message_unserialized(
                                 turn_id,
                                 exc_info=True,
                             )
-                        # `posted` is true, meaning a message with this turn
-                        # id is in a live checkpoint. Retire the interaction
-                        # row observed before the injection and clear the
-                        # task's marker in the same short transaction: the
-                        # message went in outside the native interaction
-                        # protocol's answer path, so a question this run had
-                        # open under that protocol was answered by other
-                        # means.
+                        # `posted` being truthy means a message with this
+                        # turn id is in a live checkpoint. For a first
+                        # attempt, retiring the interaction row observed
+                        # before the injection and clearing the task's
+                        # marker in the same short transaction is correct:
+                        # the message went in outside the native
+                        # interaction protocol's answer path, so a question
+                        # this run had open under that protocol was
+                        # answered by other means.
                         #
-                        # That reading holds for a first attempt and not for
-                        # a replay, and `posted` cannot tell the two apart.
-                        # AgentRunner.inject_user_message short-circuits a
-                        # repeated turn id by returning the existing context
-                        # without persisting anything, which reaches here as
-                        # the same `True`. On a replay the id read just above
-                        # is not the question the replayed message answered
-                        # -- that one was retired by the first attempt -- but
-                        # whatever the resumed agent has asked since, and
-                        # retiring it discards a live question nobody
-                        # answered. This close call is live production code --
-                        # it runs on every websocket chat message that
-                        # reaches a running task -- so what makes the window
-                        # harmless today is not that the code is dormant. It
-                        # is that there is nothing for it to retire: the only
-                        # INSERT into task_interaction_requests is
-                        # stage_interaction_request
-                        # (task_interaction_staging.py), which has no caller
-                        # in src/ and is held at none by
-                        # tests/web/services/test_interaction_staging_production_gate.py.
-                        # The pre-injection read therefore returns None on
-                        # every call, and the close matches zero rows. The
-                        # change that wires the first production writer has
-                        # to close this window before that writer ships:
-                        # the runner has to report whether it persisted a
-                        # new message or replayed an existing turn, and this
-                        # site has to skip the close on the replay answer.
-                        # The A2A injection site (a2a.py) carries the same
-                        # window and the same precondition.
+                        # That reading breaks on a replay of an
+                        # already-seen turn id: the id read above is not
+                        # the question the replayed message answered --
+                        # the first attempt already retired that one -- it
+                        # is whatever question the resumed agent has staged
+                        # since, and closing on it would retire a live
+                        # question nobody has answered. `posted` alone
+                        # cannot tell a fresh write from a replay, so this
+                        # site does not try to; AgentRunner.inject_user_message
+                        # reports the distinction explicitly (see
+                        # UserMessageInjectionOutcome) and this guard reads
+                        # that report instead of the bare truthy value. The
+                        # v1 reply resume-input path (task_reply.py) needs
+                        # no equivalent guard: its turn id embeds a fresh
+                        # uuid on every call and can never hit the short
+                        # circuit that produces a replay. The A2A injection
+                        # site (a2a.py) carries the same guard for the same
+                        # reason.
                         #
                         # The run fence
                         # is live_task_lease.run_id, not task_run_id: posted
@@ -6845,40 +6851,41 @@ async def _handle_chat_message_unserialized(
                         assert live_task_lease.run_id is not None
                         close_run_id = live_task_lease.run_id
                         close_interaction_id = active_interaction_id
-                        try:
-                            await run_db_io_cancellation_safe(
-                                lambda: close_legacy_resume_interaction_sync(
-                                    task_id=task_id,
-                                    run_id=close_run_id,
-                                    interaction_id=close_interaction_id,
+                        if posted is not UserMessageInjectionOutcome.POSTED_REPLAY:
+                            try:
+                                await run_db_io_cancellation_safe(
+                                    lambda: close_legacy_resume_interaction_sync(
+                                        task_id=task_id,
+                                        run_id=close_run_id,
+                                        interaction_id=close_interaction_id,
+                                    )
                                 )
-                            )
-                        except Exception:
-                            logger.warning(
-                                "legacy resume interaction close failed after "
-                                "registered resume handoff for task %s run %s",
-                                task_id,
-                                close_run_id,
-                                exc_info=True,
-                            )
-                        except asyncio.CancelledError:
-                            # run_db_io_cancellation_safe drains its worker
-                            # thread to completion before propagating a
-                            # cancellation raised while awaiting it, so by the
-                            # time this branch runs the close-and-clear
-                            # transaction has already committed or failed on
-                            # its own; there is nothing left in flight to
-                            # protect. This only logs the interruption instead
-                            # of letting it escape as an unhandled
-                            # cancellation. Unlike the delivery marker above,
-                            # this branch is deliberate, not a gap to copy.
-                            logger.warning(
-                                "legacy resume interaction close was cancelled "
-                                "for task %s run %s; the resume proceeds "
-                                "unaffected",
-                                task_id,
-                                close_run_id,
-                            )
+                            except Exception:
+                                logger.warning(
+                                    "legacy resume interaction close failed after "
+                                    "registered resume handoff for task %s run %s",
+                                    task_id,
+                                    close_run_id,
+                                    exc_info=True,
+                                )
+                            except asyncio.CancelledError:
+                                # run_db_io_cancellation_safe drains its worker
+                                # thread to completion before propagating a
+                                # cancellation raised while awaiting it, so by the
+                                # time this branch runs the close-and-clear
+                                # transaction has already committed or failed on
+                                # its own; there is nothing left in flight to
+                                # protect. This only logs the interruption instead
+                                # of letting it escape as an unhandled
+                                # cancellation. Unlike the delivery marker above,
+                                # this branch is deliberate, not a gap to copy.
+                                logger.warning(
+                                    "legacy resume interaction close was cancelled "
+                                    "for task %s run %s; the resume proceeds "
+                                    "unaffected",
+                                    task_id,
+                                    close_run_id,
+                                )
                 except BaseException:
                     if bg_task is not None and not handoff_registered:
                         bg_task.cancel()

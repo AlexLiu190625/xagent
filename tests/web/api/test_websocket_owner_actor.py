@@ -30,6 +30,7 @@ from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointUnavailableError,
 )
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.execution_scope import (
     ExecutionScope,
 )
@@ -52,8 +53,9 @@ from xagent.web.api.websocket import (
 )
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services import task_orchestrator
@@ -108,6 +110,45 @@ def _task(db, owner_id: int, status: TaskStatus = TaskStatus.RUNNING) -> Task:
     db.commit()
     db.refresh(t)
     return t
+
+
+def _seed_active_interaction_row(
+    db: Session, *, task_id: int, run_id: str, idempotency_key: str
+) -> int:
+    """One legal active TaskInteractionRequest row, for the replay-skips-
+    close tests below. Mirrors test_a2a_api.py's local, single-purpose row
+    builder of the same name rather than sharing it across test files."""
+    anchor = TraceEvent(
+        task_id=task_id,
+        event_id=f"anchor-{idempotency_key}",
+        event_type="agent_execution_checkpoint",
+        timestamp=datetime.now(timezone.utc),
+        data={},
+    )
+    db.add(anchor)
+    db.flush()
+    row = TaskInteractionRequest(
+        task_id=task_id,
+        run_id=run_id,
+        kind="clarification",
+        protocol_version=1,
+        status="active",
+        active_slot=1,
+        origin="sdk",
+        request_payload={"prompt": "example"},
+        request_idempotency_key=idempotency_key,
+        resume_trace_event_id=int(anchor.id),
+        resume_event_id="resume-event-1",
+        resume_execution_id="resume-execution-1",
+        resume_locator_format="trace_event_pk_v1",
+        resume_checkpoint_type="agent_execution_checkpoint",
+        resume_run_partition=run_id,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return int(row.id)
 
 
 # Anti-hang bounds, not latency assertions. Nothing here is measuring speed:
@@ -2054,6 +2095,76 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
     close_mock.assert_called_once_with(
         task_id=int(task.id), run_id="close-order-run", interaction_id=4321
     )
+
+
+@pytest.mark.asyncio
+async def test_live_injection_skips_the_close_on_a_replayed_turn_id(
+    db_session,
+) -> None:
+    """A replayed turn id short-circuits inside AgentRunner.inject_user_message
+    and is reported back as POSTED_REPLAY, not the same truthy value a
+    fresh write produces. The interaction row this test seeds is not the
+    question the replay answered, so the online injection site must leave
+    it untouched: still active, uncleared marker, and the close statement
+    must not run at all."""
+    owner = _user(db_session, "close-replay-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "close-replay-runner"
+    task.run_id = "close-replay-run"
+    task.interaction_protocol_version = 1
+    db_session.commit()
+    task_id = int(task.id)
+    row_id = _seed_active_interaction_row(
+        db_session,
+        task_id=task_id,
+        run_id="close-replay-run",
+        idempotency_key="close-replay-q1",
+    )
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_REPLAY
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            task_id,
+            {
+                "message": "a retried delivery",
+                "client_message_id": "close-replay-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    agent.post_user_message.assert_awaited_once()
+    db_session.expire_all()
+    row = (
+        db_session.query(TaskInteractionRequest)
+        .filter(TaskInteractionRequest.id == row_id)
+        .one()
+    )
+    assert row.status == "active"
+    refreshed = db_session.query(Task).filter(Task.id == task_id).one()
+    assert refreshed.interaction_protocol_version == 1
 
 
 @pytest.mark.asyncio
@@ -4300,6 +4411,107 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
     close_mock.assert_called_once()
     assert close_mock.call_args.kwargs["task_id"] == int(task.id)
     assert close_mock.call_args.kwargs["interaction_id"] == 9876
+
+
+@pytest.mark.asyncio
+async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
+    db_session,
+) -> None:
+    """A cross-run retry of this background task re-enters with the same
+    pending_user_message. post_user_message short-circuits the repeated
+    turn id and reports POSTED_REPLAY, so the close must be skipped
+    entirely -- not just matched against the carried (stale) interaction
+    id, but never attempted. The row this test seeds is the question the
+    resumed agent has staged *since* the first attempt (a different id
+    from the one carried in pending_user_message), so a site that
+    re-derived its close key by reading the current active row instead of
+    using the carried one would retire this live question; asserting
+    active_interaction_id_sync is never called pins that the deferred path
+    still takes no read of its own, replay or not -- the same technique
+    the carried-vs-observed test above uses."""
+    owner = _user(db_session, "deferred-replay-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    task.interaction_protocol_version = 1
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Deferred guidance",
+            message_type="user_message",
+            turn_id="deferred-replay-turn",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+    task_id = int(task.id)
+    # The question staged since the first attempt -- a different row from
+    # the one named in pending_user_message below.
+    row_id = _seed_active_interaction_row(
+        db_session,
+        task_id=task_id,
+        run_id="deferred-replay-run",
+        idempotency_key="deferred-replay-q1",
+    )
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={"turn_id": "deferred-replay-turn"})
+        ]
+    )
+    agent = MagicMock(
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_REPLAY
+        ),
+        resume_execution_by_id=AsyncMock(
+            return_value={
+                "status": "completed",
+                "success": True,
+                "output": "Applied",
+                "agent_result": {"context": context},
+            }
+        ),
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
+        patch(
+            "xagent.web.api.websocket.active_interaction_id_sync",
+            side_effect=AssertionError("the deferred path must not read its own"),
+        ),
+    ):
+        await execute_resume_background(
+            task_id=task_id,
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            pending_user_message={
+                "execution_message": "Deferred guidance",
+                "display_message": "Deferred guidance",
+                "files": [],
+                "turn_id": "deferred-replay-turn",
+                # The stale id carried from the first attempt -- not the
+                # row seeded above, which is what a re-read would find.
+                "interaction_id": 424242,
+            },
+            delivery_turn_id="deferred-replay-turn",
+            delivery_websocket=MagicMock(),
+            delivery_client_message_id="deferred-replay-turn",
+        )
+
+    agent.post_user_message.assert_awaited_once()
+    db_session.expire_all()
+    row = (
+        db_session.query(TaskInteractionRequest)
+        .filter(TaskInteractionRequest.id == row_id)
+        .one()
+    )
+    assert row.status == "active"
+    refreshed = db_session.query(Task).filter(Task.id == task_id).one()
+    assert refreshed.interaction_protocol_version == 1
 
 
 @pytest.mark.asyncio
