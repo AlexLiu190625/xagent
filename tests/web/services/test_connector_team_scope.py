@@ -476,6 +476,23 @@ def test_resolve_connector_access_or_raise_converts_value_error_to_503():
     assert excinfo.value.status_code == 503
 
 
+def test_resolve_connector_access_or_raise_converts_even_with_uncomparable_refs():
+    """The failure arm logs the refs it resolved with, and those refs are only
+    type-checked statically. A collection whose members do not compare against
+    each other must still leave through the typed 503 rather than through a
+    TypeError raised by the logging call itself."""
+
+    def _hook(db, user_id, refs):
+        raise RuntimeError("hook exploded")
+
+    connector_team_scope.set_connector_team_hooks(access=_hook)
+    with pytest.raises(ConnectorRuntimeError) as excinfo:
+        connector_team_scope.resolve_connector_access_or_raise(
+            None, 7, [("mcp", 11), (5, 12)]
+        )
+    assert excinfo.value.status_code == 503
+
+
 def test_resolve_connector_access_or_raise_passes_through_planted_error():
     planted = ConnectorRuntimeError(
         "planted_code", "planted", details={"reason": "planted_reason"}

@@ -632,7 +632,11 @@ def resolve_connector_access_or_raise(
             "Failed to resolve connector access for user %s across %s connectors: %s",
             user_id,
             len(requested),
-            sorted(requested),
+            # ``key=str`` because the failure arm must not fail: the refs a caller
+            # hands in are only type-checked statically, so a mixed-type collection
+            # reaches here intact and a bare ``sorted`` would raise TypeError from
+            # inside this handler, replacing the typed 503 with an untyped error.
+            sorted(requested, key=str),
             exc_info=True,
         )
         raise ConnectorRuntimeError(
