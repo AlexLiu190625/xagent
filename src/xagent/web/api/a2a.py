@@ -391,18 +391,14 @@ def _update_a2a_resume_input_sync(
             # A retried A2A message replays this site's deterministic turn
             # id (f"a2a:{task_id}:{message_id}"), and inject_user_message
             # short-circuits a repeated turn id without persisting
-            # anything -- reported here as injection_outcome being
-            # POSTED_REPLAY rather than folded into the same truthy
-            # "posted" a fresh write produces. On such a replay,
-            # interaction_id above is not the question this call answered
-            # -- the first attempt already retired that one -- it is
-            # whatever question the resumed agent has staged since, and a
-            # cross-run retry closing on it would retire a live question
-            # nobody has answered. The v1 reply resume-input path
-            # (task_reply.py) needs no equivalent guard: its turn id
-            # embeds a fresh uuid on every call and can never hit the
-            # short circuit that produces a replay.
-            if injection_outcome is not UserMessageInjectionOutcome.POSTED_REPLAY:
+            # anything. interaction_id above was read fresh by this
+            # attempt, so on such a replay it names whatever the resumed
+            # agent has staged since rather than the question this call
+            # answered, and closing on it would retire a live question.
+            # See task_interaction_close's module docstring for the rule,
+            # the other sites, and why the v1 reply resume-input path
+            # needs no guard at all.
+            if injection_outcome is UserMessageInjectionOutcome.POSTED_FRESH:
                 close_legacy_resume_interaction(
                     db,
                     task_id=task_lease.task_id,

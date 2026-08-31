@@ -3553,15 +3553,17 @@ async def execute_resume_background(
             # condition: this task can itself be retried across runs with
             # the same pending_user_message, and post_user_message reports
             # that retry explicitly as a replay instead of a bare truthy
-            # `posted`. On a replay, the interaction id carried above is
-            # not the question this turn answered -- the first attempt
-            # already retired that one -- it is whatever question the
-            # resumed agent has staged since, so closing here would retire
-            # a live question nobody has answered. The v1 reply resume-
-            # input path (task_reply.py) needs no equivalent guard: its
-            # turn id embeds a fresh uuid on every call and can never hit
-            # the short circuit that produces a replay.
-            if posted is not UserMessageInjectionOutcome.POSTED_REPLAY:
+            # `posted`. What the guard buys here is narrower than at the
+            # sites that read their own id: the id carried above is a
+            # primary key the first attempt already retired, and the close
+            # statement binds to it, so on a replay the close would be a
+            # no-op rather than a retirement of a live question. The guard
+            # stays as defense in depth -- it is what keeps this site safe
+            # if it ever stops carrying the id forward and starts deriving
+            # its own. See task_interaction_close's module docstring for
+            # the rule, the other sites, and why the v1 reply resume-input
+            # path needs no guard at all.
+            if posted is UserMessageInjectionOutcome.POSTED_FRESH:
                 try:
                     await run_db_io_cancellation_safe(
                         lambda: close_legacy_resume_interaction_sync(
@@ -6814,34 +6816,27 @@ async def _handle_chat_message_unserialized(
                                 turn_id,
                                 exc_info=True,
                             )
-                        # `posted` being truthy means a message with this
-                        # turn id is in a live checkpoint. For a first
-                        # attempt, retiring the interaction row observed
-                        # before the injection and clearing the task's
-                        # marker in the same short transaction is correct:
-                        # the message went in outside the native
+                        # For a first attempt, retiring the interaction row
+                        # observed before the injection and clearing the
+                        # task's marker in the same short transaction is
+                        # correct: the message went in outside the native
                         # interaction protocol's answer path, so a question
                         # this run had open under that protocol was
                         # answered by other means.
                         #
-                        # That reading breaks on a replay of an
-                        # already-seen turn id: the id read above is not
-                        # the question the replayed message answered --
-                        # the first attempt already retired that one -- it
-                        # is whatever question the resumed agent has staged
-                        # since, and closing on it would retire a live
-                        # question nobody has answered. `posted` alone
-                        # cannot tell a fresh write from a replay, so this
-                        # site does not try to; AgentRunner.inject_user_message
-                        # reports the distinction explicitly (see
-                        # UserMessageInjectionOutcome) and this guard reads
-                        # that report instead of the bare truthy value. The
-                        # v1 reply resume-input path (task_reply.py) needs
-                        # no equivalent guard: its turn id embeds a fresh
-                        # uuid on every call and can never hit the short
-                        # circuit that produces a replay. The A2A injection
-                        # site (a2a.py) carries the same guard for the same
-                        # reason.
+                        # That reading breaks on a replay. This site reads
+                        # its own id fresh on every attempt, so on a replay
+                        # the id above is not the question the replayed
+                        # message answered -- the first attempt retired
+                        # that one -- it is whatever the resumed agent has
+                        # staged since, and closing on it would retire a
+                        # live question. `posted` alone cannot tell a fresh
+                        # write from a replay; AgentRunner.inject_user_message
+                        # reports the distinction explicitly and this guard
+                        # reads that report. See task_interaction_close's
+                        # module docstring for the rule, the other sites,
+                        # and why the v1 reply resume-input path needs no
+                        # guard at all.
                         #
                         # The run fence
                         # is live_task_lease.run_id, not task_run_id: posted
@@ -6856,7 +6851,7 @@ async def _handle_chat_message_unserialized(
                         assert live_task_lease.run_id is not None
                         close_run_id = live_task_lease.run_id
                         close_interaction_id = active_interaction_id
-                        if posted is not UserMessageInjectionOutcome.POSTED_REPLAY:
+                        if posted is UserMessageInjectionOutcome.POSTED_FRESH:
                             try:
                                 await run_db_io_cancellation_safe(
                                     lambda: close_legacy_resume_interaction_sync(

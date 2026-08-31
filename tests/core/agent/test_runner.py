@@ -299,6 +299,22 @@ class EmptyCanonicalCheckpointStore:
         raise AssertionError("canonical empty result must end checkpoint lookup")
 
 
+def test_user_message_injection_outcome_truthiness_contract() -> None:
+    """``NOT_POSTED`` is the empty string, and the other two members are
+    not. That is the whole reason an unmodified ``if not posted`` /
+    ``bool(posted)`` caller keeps asking exactly the question it always
+    asked -- "did this hand back a usable context at all" -- across the
+    fresh/replay split. Roughly a dozen call sites in ``websocket.py``,
+    ``a2a.py`` and ``task_reply.py`` rest on it, and none of them names
+    the enum, so an edit to these values would break them all silently.
+    Assert the contract here instead, where the values live.
+    """
+    assert UserMessageInjectionOutcome.NOT_POSTED == ""
+    assert not UserMessageInjectionOutcome.NOT_POSTED
+    assert UserMessageInjectionOutcome.POSTED_FRESH
+    assert UserMessageInjectionOutcome.POSTED_REPLAY
+
+
 @pytest.mark.asyncio
 async def test_runner_treats_canonical_empty_checkpoint_as_authoritative() -> None:
     checkpoint_store = EmptyCanonicalCheckpointStore()

@@ -649,7 +649,9 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
 
     observed_lease: dict[str, object] = {}
 
-    async def post_user_message(*_args: object, **_kwargs: object) -> bool:
+    async def post_user_message(
+        *_args: object, **_kwargs: object
+    ) -> UserMessageInjectionOutcome:
         lease = current_task_lease()
         assert lease is not None
         assert lease.run_id is not None
@@ -663,7 +665,7 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
             assert leased.lease_expires_at is not None
         finally:
             lease_db.close()
-        return True
+        return UserMessageInjectionOutcome.POSTED_FRESH
 
     agent_service = MagicMock()
     agent_service.post_user_message = AsyncMock(side_effect=post_user_message)
@@ -747,7 +749,9 @@ def test_checkpoint_resume_schedule_failure_exactly_restores_waiting_task() -> N
         db.close()
 
     agent_service = MagicMock()
-    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_service.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     agent_manager = MagicMock()
     agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
     scheduled_lease: dict[str, object] = {}
@@ -912,7 +916,9 @@ def test_message_send_closes_the_legacy_resume_interaction_row_on_successful_inj
         db.close()
 
     agent_service = MagicMock()
-    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_service.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     agent_manager = MagicMock()
     agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
     begin_turn = AsyncMock()
@@ -963,11 +969,12 @@ def test_message_send_skips_the_close_on_a_replayed_injection() -> None:
     (f"a2a:{task_id}:{message_id}"). AgentRunner.inject_user_message
     short-circuits that repeat and reports POSTED_REPLAY; the interaction
     row this test seeds is not the question the replay answered, so the
-    close must leave it untouched -- neither retired nor its rowcount
-    matching anything -- and the task's protocol marker must survive.
-    close_legacy_resume_interaction is asserted uncalled directly too:
-    replacing the guard with `if True:` calls it for real and turns this
-    assertion red on its own."""
+    close must not run at all. That is asserted directly on the mock:
+    replacing the guard with `if True:` calls close_legacy_resume_interaction
+    for real and turns assert_not_called red. No DB-state assertion is
+    made here -- with the close function mocked out, nothing writes to the
+    row or the marker, so "still active" would hold no matter what the
+    guard did."""
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()
     try:
@@ -988,7 +995,7 @@ def test_message_send_skips_the_close_on_a_replayed_injection() -> None:
         db.commit()
         db.refresh(task)
         task_id = int(task.id)
-        row_id = _seed_active_interaction_row(
+        _seed_active_interaction_row(
             db,
             task_id=task_id,
             run_id="run-close-replay",
@@ -1034,18 +1041,6 @@ def test_message_send_skips_the_close_on_a_replayed_injection() -> None:
     assert response.status_code == 200, response.text
     agent_service.post_user_message.assert_awaited_once()
     close_mock.assert_not_called()
-    db = _direct_db_session()
-    try:
-        row = (
-            db.query(TaskInteractionRequest)
-            .filter(TaskInteractionRequest.id == row_id)
-            .one()
-        )
-        assert row.status == "active"
-        refreshed = db.query(Task).filter(Task.id == task_id).one()
-        assert refreshed.interaction_protocol_version == 1
-    finally:
-        db.close()
 
 
 # A fabricated id, not the seeded row's -- test_message_send_reads_the_
@@ -1103,9 +1098,11 @@ def test_message_send_reads_the_interaction_row_before_injecting() -> None:
         order.append("read")
         return _OBSERVED_INTERACTION_ID
 
-    async def record_injection(*_args: object, **_kwargs: object) -> bool:
+    async def record_injection(
+        *_args: object, **_kwargs: object
+    ) -> UserMessageInjectionOutcome:
         order.append("inject")
-        return True
+        return UserMessageInjectionOutcome.POSTED_FRESH
 
     agent_service = MagicMock()
     agent_service.post_user_message = AsyncMock(side_effect=record_injection)
@@ -1183,7 +1180,9 @@ async def test_a2a_handover_restores_input_required_on_unreadable_checkpoint() -
         db.close()
 
     agent_service = MagicMock()
-    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_service.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     agent_service.resume_execution_by_id = AsyncMock(
         side_effect=CheckpointUnavailableError("checkpoint store unavailable")
     )
@@ -1259,7 +1258,9 @@ def test_recovered_paused_checkpoint_resumes_without_transcript_fallback() -> No
         db.close()
 
     agent_service = MagicMock()
-    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_service.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     agent_manager = MagicMock()
     agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
     begin_turn = AsyncMock()
