@@ -1353,6 +1353,29 @@ def _bad_request_error(message: str) -> openai.BadRequestError:
     )
 
 
+def _bad_request_error_with_metadata(
+    message: str, metadata: dict
+) -> openai.BadRequestError:
+    """Build a real SDK ``BadRequestError`` carrying an ``error.metadata`` body.
+
+    Used to reproduce OpenRouter's provider-level 400 shape (a
+    ``provider_name`` and sometimes a ``raw`` echo of the provider's own
+    response nested under ``metadata``), which ``_bad_request_error`` above
+    does not model.
+    """
+    payload = {"message": message, "code": 400, "metadata": metadata}
+    return openai.BadRequestError(
+        f"Error code: 400 - {payload!r}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://openrouter.ai/api/v1/chat/completions"
+            ),
+        ),
+        body={"error": payload},
+    )
+
+
 @pytest.mark.asyncio
 async def test_openrouter_direct_relaxes_tool_choice_after_wrapped_resend_failure(
     mock_chat_completion, mocker
@@ -1440,6 +1463,118 @@ async def test_openrouter_vision_relaxes_tool_choice_after_wrapped_resend_failur
     assert mock_client.chat.completions.create.await_count == 3
     final_call = mock_client.chat.completions.create.call_args_list[2].kwargs
     assert final_call["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_direct_relaxes_tool_choice_on_provider_level_400(
+    mock_chat_completion, mocker
+):
+    """Z.AI's provider-level 400 is recognized through the structured body.
+
+    Regression test for xagent#1960: Z.AI rejects a strict ``tool_choice``
+    with ``{'error': {'message': 'Tool choice must be auto', 'metadata':
+    {'provider_name': 'Z.AI'}}}``. That message spells ``tool choice`` with
+    a space (not the ``tool_choice`` token the old flattened-string match
+    looked for) and never contains ``no endpoints found``, so the
+    pre-existing string match never fired for this shape -- the whole reason
+    #1960 was filed. The structured path reads ``error.message`` directly and
+    normalizes the spacing, so it must fire here.
+    """
+    zai_error = _bad_request_error_with_metadata(
+        "Tool choice must be auto", metadata={"provider_name": "Z.AI"}
+    )
+    assert openrouter_module._should_retry_with_relaxed_tool_choice(
+        zai_error, tools=_two_tool_schema(), tool_choice="required"
+    )
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        zai_error,
+        mock_chat_completion,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+
+    result = await llm.chat(
+        [{"role": "user", "content": "score?"}],
+        tools=_two_tool_schema(),
+        tool_choice="required",
+    )
+
+    assert result["content"] == "Hello World"
+    assert mock_client.chat.completions.create.await_count == 2
+    second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+    assert second_call["tool_choice"] == "auto"
+
+
+def test_relaxed_tool_choice_ignores_unrelated_400_with_provider_name():
+    """A provider-level 400 unrelated to tool_choice must not trigger relax.
+
+    Same ``provider_name``-bearing shape as the Z.AI regression above, but
+    the message itself is about context length. Guards against a structured
+    implementation that only checks "did some provider respond" instead of
+    "did it reject tool_choice specifically" -- ``metadata.provider_name``
+    alone says the former, not the latter (see design note in
+    ``_should_retry_with_relaxed_tool_choice``).
+    """
+    unrelated_error = _bad_request_error_with_metadata(
+        "This model's maximum context length is 4096 tokens",
+        metadata={"provider_name": "Z.AI"},
+    )
+
+    assert not openrouter_module._should_retry_with_relaxed_tool_choice(
+        unrelated_error, tools=_two_tool_schema(), tool_choice="required"
+    )
+
+
+def test_relaxed_tool_choice_does_not_match_on_provider_raw_echo():
+    """A route-level phrase echoed only in ``metadata.raw`` must not trigger relax.
+
+    ``_openai_error_details`` folds ``metadata.raw`` (up to 4000 characters
+    of provider-controlled text) into the flattened ``str(exc)`` used by the
+    string-matching fallback. Here the real ``error.message`` is unrelated
+    ("Upstream provider error"), but a provider echoed a route-level 404's
+    wording inside ``metadata.raw``. The structured path reads only
+    ``error.message`` and must ignore ``raw`` entirely, so this must stay
+    False even though the flattened string contains both trigger tokens.
+    """
+    raw_echo_error = _bad_request_error_with_metadata(
+        "Upstream provider error",
+        metadata={
+            "provider_name": "SomeProvider",
+            "raw": _OPENROUTER_TOOL_CHOICE_ERROR,
+        },
+    )
+
+    # Sanity check on the premise: the flattened string this test guards
+    # against really does contain both tokens the old code searched for.
+    assert "no endpoints found" in str(raw_echo_error).lower()
+    assert "tool_choice" in str(raw_echo_error).lower()
+
+    assert not openrouter_module._should_retry_with_relaxed_tool_choice(
+        raw_echo_error, tools=_two_tool_schema(), tool_choice="required"
+    )
+
+
+def test_relaxed_tool_choice_falls_back_to_string_match_without_structured_body():
+    """A bare exception with no parseable body still relies on string matching.
+
+    OpenRouter's own route-level 404 sometimes reaches this predicate as a
+    plain ``RuntimeError`` with no ``openai.BadRequestError`` anywhere in its
+    cause chain (e.g. raised directly by a test double, or by any future
+    non-SDK transport). The structured extractor can only return
+    ``(None, None)`` for that shape, and the predicate must fall back to
+    exactly the old flattened-string check rather than treating "no
+    structured body" as "do not retry".
+    """
+    bare_error = RuntimeError(_OPENROUTER_TOOL_CHOICE_ERROR)
+
+    assert openrouter_module._should_retry_with_relaxed_tool_choice(
+        bare_error, tools=_two_tool_schema(), tool_choice="required"
+    )
 
 
 @pytest.mark.asyncio

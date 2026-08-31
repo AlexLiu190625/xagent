@@ -18,7 +18,7 @@ from .deepseek_tool_protocol import (
     reasoning_field_names,
     restore_deepseek_reasoning_content,
 )
-from .openai import OpenAILLM, field_content
+from .openai import OpenAILLM, _openai_error_body, field_content
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +210,47 @@ def _should_retry_without_thinking(
     )
 
 
+def _extract_openrouter_structured_error(
+    exc: BaseException,
+) -> tuple[Optional[str], Optional[str]]:
+    """Read OpenRouter's structured 400 body off an exception's cause chain.
+
+    ``OpenAILLM`` always wraps a caught ``openai.BadRequestError`` as
+    ``raise RuntimeError(...) from e``, so the SDK exception is usually one
+    ``__cause__`` hop below what compat-retry predicates see. This walks that
+    chain looking for the first ``openai.BadRequestError`` and returns
+    ``(error_message, provider_name)`` read from its parsed ``.body``
+    (OpenRouter nests both under a top-level ``"error"`` key; a provider that
+    responds without that wrapper is also accepted by falling back to the
+    body itself). Returns ``(None, None)`` if the chain never reaches a
+    ``BadRequestError``, its body is not a dict, or the payload carries no
+    string ``message`` -- callers treat that as "structured read failed,
+    fall back to matching ``str(exc)`` instead". Never raises.
+    """
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, openai.BadRequestError):
+            body = _openai_error_body(current)
+            if not isinstance(body, dict):
+                return None, None
+            payload = body.get("error")
+            if not isinstance(payload, dict):
+                payload = body
+            message = payload.get("message")
+            metadata = payload.get("metadata")
+            provider_name = (
+                metadata.get("provider_name") if isinstance(metadata, dict) else None
+            )
+            return (
+                message if isinstance(message, str) else None,
+                provider_name if isinstance(provider_name, str) else None,
+            )
+        current = current.__cause__
+    return None, None
+
+
 def _should_retry_with_relaxed_tool_choice(
     exc: Exception,
     *,
@@ -220,9 +261,24 @@ def _should_retry_with_relaxed_tool_choice(
         return False
 
     # Deliberate OpenRouter compatibility bridge: official provider routing can
-    # reject strict tool_choice values before selecting an endpoint. This
-    # degrades forced tool use to "auto" instead of failing the whole agent run.
-    # Replace string matching with typed provider errors when available.
+    # reject strict tool_choice values before selecting an endpoint, and a
+    # provider endpoint can separately reject a strict tool_choice itself.
+    # This degrades forced tool use to "auto" instead of failing the whole
+    # agent run. The structured path matches on OpenRouter's own
+    # ``error.message`` field alone, which excludes the provider-controlled
+    # ``metadata.raw`` echo that ``_openai_error_details`` folds into
+    # ``str(exc)``; the plain string match below is only reached when the
+    # cause chain does not yield a parseable structured body, and it keeps
+    # today's exact behavior for that case.
+    error_message, provider_name = _extract_openrouter_structured_error(exc)
+    if error_message is not None:
+        normalized = error_message.lower().replace("tool choice", "tool_choice")
+        if "tool_choice" not in normalized:
+            return False
+        if "no endpoints found" in normalized:
+            return True
+        return provider_name is not None and "must be auto" in normalized
+
     exc_msg = str(exc).lower()
     return "no endpoints found" in exc_msg and "tool_choice" in exc_msg
 
