@@ -156,7 +156,12 @@ from ..services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
-from ..services.task_command_terminal_events import is_external_cancel_command
+from ..services.task_command_terminal_events import (
+    TerminalTaskEventDraft,
+    TerminalTaskEventMessageCode,
+    bind_terminal_event_draft,
+    is_external_cancel_command,
+)
 from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
@@ -4222,6 +4227,7 @@ class BackgroundTaskManager:
         # a newer run as an idempotent success.
         self._resume_run_ids: dict[int, str | None] = {}
         self._resume_reservations: set[int] = set()
+        self._resume_owner_started_at: dict[int, float] = {}
         self._shutting_down = False
         self._shutdown_lock = asyncio.Lock()
 
@@ -4234,6 +4240,7 @@ class BackgroundTaskManager:
             or self.resume_tasks
             or self._resume_run_ids
             or self._resume_reservations
+            or self._resume_owner_started_at
         ):
             raise RuntimeError("Background task manager still owns background work")
         # asyncio synchronization primitives are bound to the event loop that
@@ -4307,7 +4314,16 @@ class BackgroundTaskManager:
         if existing is not None:
             self.resume_tasks.pop(task_id, None)
             self._resume_run_ids.pop(task_id, None)
+            self._resume_owner_started_at.pop(task_id, None)
         return None
+
+    def resume_holder_age_seconds(self, task_id: int) -> float | None:
+        """Return the local resume-slot holder's monotonic age, if known."""
+
+        started_at = self._resume_owner_started_at.get(task_id)
+        if started_at is None:
+            return None
+        return max(0.0, time.monotonic() - started_at)
 
     def try_reserve_resume(
         self,
@@ -4326,6 +4342,7 @@ class BackgroundTaskManager:
         if existing_state is not None:
             return existing_state
         self._resume_reservations.add(task_id)
+        self._resume_owner_started_at[task_id] = time.monotonic()
         return ResumeReservationOutcome.RESERVED
 
     def reserve_resume(self, task_id: int) -> bool:
@@ -4353,6 +4370,7 @@ class BackgroundTaskManager:
         if task_id not in self._resume_reservations:
             raise RuntimeError(f"Task {task_id} has no reserved resume slot")
         self._resume_reservations.discard(task_id)
+        self._resume_owner_started_at.setdefault(task_id, time.monotonic())
         self.resume_tasks[task_id] = task
         self._resume_run_ids[task_id] = run_id
         logger.info("Registered resume coordinator for task %s", task_id)
@@ -4361,6 +4379,7 @@ class BackgroundTaskManager:
         if self._shutting_down:
             return
         self._resume_reservations.discard(task_id)
+        self._resume_owner_started_at.pop(task_id, None)
 
     def promote_resume_task(self, task_id: int, task: asyncio.Task) -> None:
         if self._shutting_down:
@@ -4397,6 +4416,7 @@ class BackgroundTaskManager:
         if resume_task is not None and owns_registration(resume_task):
             self.resume_tasks.pop(task_id, None)
             self._resume_run_ids.pop(task_id, None)
+            self._resume_owner_started_at.pop(task_id, None)
             logger.info("Cleaned up resume coordinator for task %s", task_id)
 
     async def cancel_task(
@@ -4412,6 +4432,12 @@ class BackgroundTaskManager:
             )
             if task is not None
         }
+        if not self._shutting_down:
+            # A cancel can race the await between reservation and coordinator
+            # registration. Clear that pre-registration owner even when there
+            # is no asyncio task to cancel yet.
+            self._resume_reservations.discard(task_id)
+            self._resume_owner_started_at.pop(task_id, None)
         if not tasks:
             return BackgroundTaskCancelOutcome(requested=False)
 
@@ -4441,7 +4467,7 @@ class BackgroundTaskManager:
             self.running_tasks.pop(task_id, None)
             self.resume_tasks.pop(task_id, None)
             self._resume_run_ids.pop(task_id, None)
-            self._resume_reservations.discard(task_id)
+            self._resume_owner_started_at.pop(task_id, None)
         return BackgroundTaskCancelOutcome(requested=requested)
 
     async def shutdown(self) -> None:
@@ -4473,6 +4499,7 @@ class BackgroundTaskManager:
                 self.resume_tasks.clear()
                 self._resume_run_ids.clear()
                 self._resume_reservations.clear()
+                self._resume_owner_started_at.clear()
 
 
 # Global background task manager
@@ -6512,7 +6539,46 @@ async def _handle_chat_message_unserialized(
             if task_uses_live_control and supports_live_control:
                 logger.info(f"Using agent message control for task {task_id}")
                 assert agent_service is not None
-                if not background_task_manager.reserve_resume(task_id):
+                reservation = background_task_manager.try_reserve_resume(
+                    task_id,
+                    expected_run_id=task_run_id,
+                )
+                if reservation is not ResumeReservationOutcome.RESERVED:
+                    if suppress_delivery_ack:
+                        # Durable commands own their retry budget. All three
+                        # occupied states can clear without this attempt doing
+                        # anything: a reservation can register or release, a
+                        # coordinator can finish, and shutdown is retained as
+                        # a defensive state even though normal shutdown stops
+                        # the dispatcher before setting the manager flag.
+                        holder_age_seconds = (
+                            background_task_manager.resume_holder_age_seconds(task_id)
+                        )
+                        holder_age_text = (
+                            f"{holder_age_seconds:.3f}"
+                            if holder_age_seconds is not None
+                            else "unknown"
+                        )
+                        logger.info(
+                            "Deferring message %s for task %s: resume slot "
+                            "unavailable (%s), holder_age_seconds=%s",
+                            turn_id,
+                            task_id,
+                            reservation.value,
+                            holder_age_text,
+                        )
+                        message_data["_durable_command_defer"] = turn_id
+                        message_data["_durable_command_defer_reason"] = (
+                            f"Message {turn_id} is waiting for the live-control "
+                            f"resume slot ({reservation.value})"
+                        )
+                        if recovered_delivery is not None:
+                            # A prior attempt claimed the durable delivery and
+                            # may have injected it. Task/run-local occupancy is
+                            # not evidence that this command owns the live
+                            # coordinator after a worker handoff.
+                            message_data["_durable_command_defer_unsafe"] = turn_id
+                        return
                     await finish_delivery(
                         False,
                         CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
@@ -9394,6 +9460,28 @@ async def _execute_durable_task_command(
         await _handle_chat_message_unserialized(
             websocket, command.task_id, message_data
         )
+        if message_data.get("_durable_command_defer") == command.command_id:
+            # This marker is mutually exclusive with commit-outcome-unknown:
+            # the handler returns immediately after recording contention.
+            raise TaskCommandDeferred(
+                str(message_data["_durable_command_defer_reason"]),
+                resend_safe=(
+                    # Every settled contention increments defer_count once.
+                    # Equality proves there is no extra expired/failed claim
+                    # whose worker might still resume and inject after this
+                    # attempt observed no delivery row.
+                    #
+                    # The equality couples two write sites: claiming is the
+                    # only writer of attempt_count and defer_task_command the
+                    # only writer of defer_count. retry_failed_task_command
+                    # resets defer_count but not attempt_count, so an
+                    # operator-retried command can never prove safety again
+                    # (the safe direction for a duplicate-send decision).
+                    command.attempt_count == command.defer_count + 1
+                    and message_data.get("_durable_command_defer_unsafe")
+                    != command.command_id
+                ),
+            )
         if message_data.get("_commit_outcome_unknown") == command.command_id:
             raise ClientVisibleTaskCommandDeferred(
                 f"Message {command.command_id} has an unknown commit outcome"
@@ -9614,6 +9702,45 @@ async def _broadcast_terminal_command_error(
     )
 
 
+async def _terminal_command_event_draft(
+    command: ClaimedTaskCommand,
+    error: BaseException,
+) -> TerminalTaskEventDraft:
+    """Build safe presentation metadata; disposition code persists it."""
+
+    scope = _command_scope(command)
+    if is_external_cancel_command(kind=command.kind.value, scope=scope):
+        try:
+            task_status = await _load_terminal_command_task_status(command.task_id)
+        except Exception as exc:
+            logger.warning(
+                "Could not classify external terminal command outcome; "
+                "using conservative client message task_id=%s error_type=%s",
+                command.task_id,
+                type(exc).__name__,
+            )
+            task_status = None
+        return TerminalTaskEventDraft(
+            message_code=(
+                TerminalTaskEventMessageCode.EXTERNAL_TURN_INTERRUPTED
+                if task_status in {TaskStatus.COMPLETED, TaskStatus.FAILED}
+                else TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED
+            ),
+            resend_safe=False,
+            include_command_identity=False,
+        )
+    return TerminalTaskEventDraft(
+        message_code=(
+            TerminalTaskEventMessageCode.TASK_COMMAND_DEFERRED
+            if isinstance(error, TaskCommandDeferred)
+            else TerminalTaskEventMessageCode.TASK_COMMAND_FAILED
+        ),
+        resend_safe=(
+            error.resend_safe if isinstance(error, TaskCommandDeferred) else False
+        ),
+    )
+
+
 async def execute_durable_task_command(
     command: ClaimedTaskCommand,
 ) -> dict[str, Any] | None:
@@ -9624,6 +9751,10 @@ async def execute_durable_task_command(
     except TaskCommandDeferred as exc:
         if command.defer_count + 1 >= MAX_COMMAND_DEFERS:
             _command_origins.discard_command(command.command_id, command.task_id)
+            bind_terminal_event_draft(
+                exc,
+                await _terminal_command_event_draft(command, exc),
+            )
             await _broadcast_terminal_command_error(command, exc)
         # A deferral that will retry keeps its origin entry.
         raise
@@ -9635,6 +9766,10 @@ async def execute_durable_task_command(
     except Exception as exc:
         if command.failure_count + 1 >= MAX_COMMAND_FAILURES:
             _command_origins.discard_command(command.command_id, command.task_id)
+            bind_terminal_event_draft(
+                exc,
+                await _terminal_command_event_draft(command, exc),
+            )
             await _broadcast_terminal_command_error(command, exc)
         raise
     _command_origins.discard_command(command.command_id, command.task_id)

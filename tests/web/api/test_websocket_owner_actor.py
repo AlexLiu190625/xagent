@@ -1242,7 +1242,7 @@ async def test_running_chat_message_is_persisted_before_resume(db_session) -> No
     )
     resume_bg = AsyncMock()
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
 
     with (
@@ -1434,7 +1434,7 @@ async def test_running_chat_message_uses_one_offloop_scope_and_no_request_sessio
     )
     resume_bg = AsyncMock()
     bg_manager = MagicMock()
-    bg_manager.reserve_resume.return_value = True
+    bg_manager.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_manager.running_tasks.get.return_value = None
 
     try:
@@ -1501,7 +1501,7 @@ async def test_deferred_chat_message_is_acked_after_durable_command_commit(
     )
     resume_bg = AsyncMock()
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     websocket = MagicMock()
 
@@ -1581,7 +1581,7 @@ async def test_live_lease_injection_degrades_to_deferred_on_checkpoint_unavailab
     )
     resume_bg = AsyncMock()
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     websocket = MagicMock()
 
@@ -1703,7 +1703,7 @@ async def test_durable_failure_keeps_detail_sender_only(
     )
     resume_bg = AsyncMock()
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     origin_socket = MagicMock(name="origin-socket")
     payload = {
@@ -1817,7 +1817,7 @@ async def test_attachment_bind_race_keeps_specific_failure_on_origin_lane(
     agent.get_dag_pattern.return_value = None
     agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
     bg_manager = MagicMock()
-    bg_manager.reserve_resume.return_value = True
+    bg_manager.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_manager.running_tasks.get.return_value = None
 
     with (
@@ -1882,7 +1882,7 @@ async def test_resume_registration_failure_keeps_injected_delivery_pending(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     bg_mgr.register_reserved_resume.side_effect = RuntimeError("reservation lost")
     bg_handle = MagicMock()
@@ -1948,7 +1948,7 @@ async def test_live_marker_failure_after_registered_handoff_is_still_accepted(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
 
     with (
@@ -2019,7 +2019,7 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
 
     with (
@@ -2076,7 +2076,7 @@ async def test_live_close_failure_after_registered_handoff_is_still_accepted(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
 
     with (
@@ -2135,7 +2135,7 @@ async def test_live_close_cancellation_does_not_abort_registered_handoff(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
 
     def raise_cancelled(*_args: object, **_kwargs: object) -> int:
@@ -2348,7 +2348,7 @@ async def test_message_handoff_registers_the_minted_run_not_the_stale_one(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     registered_run_ids: list[str | None] = []
     registered_handles: list[asyncio.Task] = []
@@ -2428,7 +2428,7 @@ async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
     marker_started = threading.Event()
     marker_release = threading.Event()
@@ -2734,7 +2734,7 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     mark_delivery = MagicMock(
         side_effect=SQLAlchemyTimeoutError("delivery pool exhausted")
     )
@@ -2800,7 +2800,7 @@ async def test_delivery_failure_persistence_drains_before_cancellation(
         send_personal_message=AsyncMock(),
     )
     bg_manager = MagicMock()
-    bg_manager.reserve_resume.return_value = True
+    bg_manager.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     persistence_started = threading.Event()
     allow_persistence = threading.Event()
     persistence_finished = threading.Event()
