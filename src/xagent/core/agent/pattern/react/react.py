@@ -2814,6 +2814,33 @@ class ReActPattern(AgentPattern):
             if record is not None:
                 self.tool_ledger[tool_id] = record
 
+    def _disabled_control_tool_index(
+        self,
+        tool_calls: list[dict[str, Any]],
+        *,
+        user_interaction_enabled: bool,
+    ) -> int | None:
+        """Index of the first disabled user-interaction control tool, if any.
+
+        Shared by ``_execute_pending_tool_calls`` (which cancels every call
+        ahead of that index) and ``_close_streamed_answer`` (which must treat
+        a batch the same way whether or not its first call has already run).
+        Both callers pass their own ``user_interaction_enabled`` state rather
+        than this reading ``self`` directly, so the two call sites cannot
+        silently drift onto different predicates.
+        """
+
+        if user_interaction_enabled:
+            return None
+        return next(
+            (
+                index
+                for index, pending in enumerate(tool_calls)
+                if pending.get("name") in USER_INTERACTION_CONTROL_TOOL_NAMES
+            ),
+            None,
+        )
+
     async def _execute_pending_tool_calls(
         self,
         *,
@@ -2823,13 +2850,9 @@ class ReActPattern(AgentPattern):
         runtime: PatternRuntime,
     ) -> dict[str, Any] | None:
         if not self.user_interaction_enabled:
-            disabled_index = next(
-                (
-                    index
-                    for index, pending in enumerate(self.pending_tool_calls)
-                    if pending.get("name") in USER_INTERACTION_CONTROL_TOOL_NAMES
-                ),
-                None,
+            disabled_index = self._disabled_control_tool_index(
+                self.pending_tool_calls,
+                user_interaction_enabled=self.user_interaction_enabled,
             )
             if disabled_index is not None:
                 preceding = self.pending_tool_calls[:disabled_index]
