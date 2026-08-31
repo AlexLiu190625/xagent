@@ -217,9 +217,22 @@ def _extract_openrouter_structured_error(
 
     ``OpenAILLM`` always wraps a caught ``openai.BadRequestError`` as
     ``raise RuntimeError(...) from e``, so the SDK exception is usually one
-    ``__cause__`` hop below what compat-retry predicates see. This walks that
-    chain looking for the first ``openai.BadRequestError`` and returns
-    ``(error_message, provider_name)`` read from its parsed ``.body``
+    ``__cause__`` hop below what compat-retry predicates see. This walks only
+    ``__cause__``, deliberately: every ``OpenAILLM`` entrypoint raises with
+    explicit ``from e`` chaining, so the current request's
+    ``BadRequestError`` is always reachable that way. ``__context__`` is not
+    walked because the one place a ``BadRequestError`` lands there is the
+    response_format degrade-and-resend in ``openai.py``, where the retried
+    call sits inside the ``except openai.BadRequestError`` block handling the
+    first attempt's rejection; if that retry also fails, Python implicitly
+    sets its ``__context__`` to the superseded first-attempt error rather
+    than anything about the retry itself. Reading ``__context__`` there would
+    attribute the current failure to a different, already-discarded
+    request's rejection reason, which is the opposite of this function's
+    contract of reporting the current failure's own provider message.
+
+    This walks the chain looking for the first ``openai.BadRequestError`` and
+    returns ``(error_message, provider_name)`` read from its parsed ``.body``
     (OpenRouter nests both under a top-level ``"error"`` key; a provider that
     responds without that wrapper is also accepted by falling back to the
     body itself). The returned message is ``None`` whenever the chain never
