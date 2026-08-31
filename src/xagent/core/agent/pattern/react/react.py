@@ -920,7 +920,7 @@ class ReActPattern(AgentPattern):
                 )
 
             if answer_streamer is not None:
-                await self._finish_streamed_answer_if_final(
+                await self._close_streamed_answer(
                     answer_streamer=answer_streamer,
                     assistant_content=assistant_content,
                     tool_calls=tool_calls,
@@ -1010,33 +1010,64 @@ class ReActPattern(AgentPattern):
             },
         ).to_dict()
 
-    async def _finish_streamed_answer_if_final(
+    async def _close_streamed_answer(
         self,
         *,
         answer_streamer: ReActFinalAnswerStreamer,
         assistant_content: Any,
         tool_calls: list[dict[str, Any]],
     ) -> None:
+        """Ensure a started answer stream reaches exactly one terminal event.
+
+        If ``answer_streamer`` never streamed any content, this is a no-op
+        (R0) - there is nothing to close. Otherwise exactly one of the
+        following fires:
+
+        - R1: ``tool_calls[0]`` is a ``final_answer`` call with a non-blank
+          answer, and no disabled user-interaction control tool preempts it
+          (``_disabled_control_tool_index``) -> ``finish`` with that answer's
+          exact text, unstripped. The batch's first call is the only one
+          ``_execute_pending_tool_calls`` can ever actually deliver (its
+          ``final_answer`` branch finalizes the run immediately and discards
+          whatever follows), so the streamed content must match it exactly -
+          not a later or "nicer-looking" candidate elsewhere in the batch,
+          and not the same text with whitespace trimmed off.
+        - R2: the batch has no tool calls at all and the model produced
+          plain text -> ``finish`` with that text.
+        - R3: neither of the above -> ``fail`` with a fixed reason. This
+          covers a stream left open by a batch whose first call is not a
+          deliverable final_answer (including one already closed earlier in
+          this same response, e.g. by the bundled-final_answer strip - see
+          ``FinalAnswerStreamSession``, whose ``fail`` is a no-op once
+          already closed) as well as shapes with no known production
+          trigger, kept as an explicit fallback rather than an unhandled
+          state.
+
+        Do not relax R1 to "a final_answer anywhere in the batch" - only the
+        batch's first call is ever delivered, and treating a later one as
+        authoritative would stream text the run does not actually produce as
+        its answer. Do not turn R3 into a ``finish`` to avoid the error
+        event it produces - that would report an undelivered candidate as
+        the completed answer.
+        """
+
         if not answer_streamer.started:
             return
-        final_answer = self._final_answer_tool_content(tool_calls)
-        if final_answer is not None and len(tool_calls) == 1:
-            await answer_streamer.finish(final_answer)
-            return
+        if tool_calls and tool_calls[0].get("name") == "final_answer":
+            answer = self._final_answer_text(tool_calls[0].get("args"))
+            if answer.strip() and (
+                self._disabled_control_tool_index(
+                    tool_calls,
+                    user_interaction_enabled=self.user_interaction_enabled,
+                )
+                is None
+            ):
+                await answer_streamer.finish(answer)
+                return
         if not tool_calls and assistant_content is not None:
             await answer_streamer.finish(str(assistant_content))
-
-    def _final_answer_tool_content(
-        self,
-        tool_calls: list[dict[str, Any]],
-    ) -> str | None:
-        for tool_call in tool_calls:
-            if tool_call.get("name") != "final_answer":
-                continue
-            args = tool_call.get("args")
-            if isinstance(args, dict):
-                return self._final_answer_text(args)
-        return None
+            return
+        await answer_streamer.fail("no deliverable final_answer in this batch")
 
     def _messages_for_llm(
         self,
