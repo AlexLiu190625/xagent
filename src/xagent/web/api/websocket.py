@@ -119,6 +119,7 @@ from ..services.external_task_cancel import (
     cancel_external_task_unserialized,
     external_cancel_exhausted_message,
 )
+from ..services.external_task_input import execute_external_task_input_command
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
@@ -5672,6 +5673,16 @@ async def _enqueue_websocket_task_command(
         for key, value in message_data.items()
         if key not in {"user", "user_id"} and not key.startswith("_durable_")
     }
+    if "scope" in payload:
+        # ``scope`` routes a durable command to a non-first-party execution
+        # core (see ``_execute_durable_task_command``); only server-side
+        # producers may name one. A client frame that carries it is refused
+        # rather than silently stripped, so the sender learns the frame was
+        # not accepted as written.
+        raise ClientVisibleValidationError(
+            "Reserved field 'scope' is not accepted from clients",
+            error_code=ClientErrorCode.INVALID_MESSAGE,
+        )
     if kind == TaskCommandKind.MESSAGE:
         # The durable command identity is also the delivery/turn identity.
         # This remains stable across retries even when an API client omitted
@@ -9418,6 +9429,26 @@ async def _execute_durable_task_command(
     task-level state/error events are still broadcast normally.
     """
 
+    if command.kind == TaskCommandKind.MESSAGE and "scope" in command.payload:
+        # The first-party chat adapter below resolves its actor, origin
+        # socket, and delivery ledger from first-party rows. A MESSAGE that
+        # names a scope is not that command: "external" belongs to the
+        # embedding application's execution core, reached through the
+        # registered seam, and any other value names a core that does not
+        # exist here -- running the first-party core against it would inject
+        # the message while attributing it to the wrong audience. Equality
+        # rather than set membership so an unhashable payload value lands in
+        # the terminal rejection instead of raising ``TypeError`` into the
+        # retry path.
+        scope_value = command.payload["scope"]
+        if scope_value != EXTERNAL_COMMAND_SCOPE:
+            raise TaskCommandRejected(
+                f"Message command {command.command_id} names task scope "
+                f"{scope_value!r}, which has no execution core",
+                reason="unsupported_scope",
+            )
+        return await execute_external_task_input_command(command)
+
     websocket: Any = _command_origins.resolve(command.command_id, command.task_id)
     if websocket is None:
         websocket = _DiscardingCommandWebSocket()
@@ -9738,6 +9769,13 @@ async def _terminal_command_event_draft(
         resend_safe=(
             error.resend_safe if isinstance(error, TaskCommandDeferred) else False
         ),
+        # The disclosure rule the cancel branch above states — an anonymous
+        # external audience cannot act on durable command identity and is not
+        # shown it — holds for every external-scope command, including the
+        # external input MESSAGEs routed through the registered seam. This
+        # rebind runs after the executor's own draft and would otherwise
+        # silently restore the identity the executor withheld.
+        include_command_identity=scope != EXTERNAL_COMMAND_SCOPE,
     )
 
 
