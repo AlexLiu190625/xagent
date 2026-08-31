@@ -70,6 +70,25 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/skill-hub", tags=["skill-hub"])
 
 
+# ``CreateSkillRequest``/``EditSkillRequest`` cap ``skill_md`` at this many
+# characters. SKILL.md is injected into the system prompt on every model turn,
+# so an upload that bypassed the cap would push the context past what providers
+# accept. Both write paths answer to the same number.
+_MAX_SKILL_MD_CHARS = 200_000
+
+# The longest a single character can be in UTF-8. Used to reject an oversized
+# SKILL.md on its byte length, before anything is decoded.
+_MAX_UTF8_BYTES_PER_CHAR = 4
+
+# Characters that render as nothing but are *not* Unicode whitespace, so
+# ``str.strip()`` leaves them: BOM / zero-width no-break space, zero-width
+# space, and the zero-width non-joiner, joiner and word joiner. Stripped in
+# addition to the default set, never instead of it -- passing an explicit
+# argument to ``str.strip`` *replaces* the default, which silently dropped 21
+# of the 29 characters ``isspace()`` recognizes, U+2003 EM SPACE among them.
+_ZERO_WIDTH_CHARS = "\ufeff\u200b\u200c\u200d\u2060"
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Schemas — local
 # ──────────────────────────────────────────────────────────────────────
@@ -106,7 +125,7 @@ class CreateSkillRequest(BaseModel):
     (xagent always uses the dir name as the source of truth)."""
 
     name: str = Field(..., min_length=1, max_length=64)
-    skill_md: str = Field(..., min_length=1, max_length=200_000)
+    skill_md: str = Field(..., min_length=1, max_length=_MAX_SKILL_MD_CHARS)
     scope: str = Field("personal", pattern="^(personal|team)$")
 
 
@@ -114,7 +133,7 @@ class EditSkillRequest(BaseModel):
     """``PUT /installed/{name}`` body. ``name`` is taken from the URL;
     only the SKILL.md content is mutable in v0."""
 
-    skill_md: str = Field(..., min_length=1, max_length=200_000)
+    skill_md: str = Field(..., min_length=1, max_length=_MAX_SKILL_MD_CHARS)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -356,6 +375,23 @@ _IGNORED_ARCHIVE_NAMES = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
 # peak footprint a multiple of the size budget.
 _ARCHIVE_CHUNK_BYTES = 1024 * 1024
 
+# A skill bundle is a handful of documents. The byte budget alone does not bound
+# the *count*: a 16 MiB archive of 100k empty padding directories passes it, and
+# costs ~3s of CPU and ~62 MiB of allocation inside ``ZipFile(...)`` itself —
+# before a single member is read. Cap the count, directories included: they are
+# skipped for content but still cost a central-directory entry to walk, so
+# excluding them would leave the cap evadable with padding folders. The same
+# goes for AppleDouble cruft: a Finder-zipped bundle carries an "__MACOSX/._x"
+# entry per file, so the cap is effectively halved for those. That is
+# deliberate -- the cap is applied to what the archive actually contains,
+# before anything knows which entries will be filtered out later.
+_MAX_ARCHIVE_ENTRIES = 2000
+
+# ``UserSkillFile.path`` is String(500). Beyond it PostgreSQL raises DataError
+# at commit and the request dies as a 500; SQLite silently accepts, so this
+# bound has to be enforced here rather than left to the database.
+_MAX_SKILL_FILE_PATH_CHARS = 500
+
 
 def _is_archive_cruft(path: str) -> bool:
     """True for OS bookkeeping files that are never part of a skill."""
@@ -367,12 +403,36 @@ def _is_archive_cruft(path: str) -> bool:
     )
 
 
+def _canonical_skill_path(raw_path: str) -> str:
+    """Canonical POSIX form of a bundle path, or "" if nothing is left.
+
+    One place decides what a path *is*, so root selection, containment and
+    storage cannot disagree about it. Backslashes become separators (archives
+    written on Windows use them), "." segments and repeated or leading slashes
+    collapse. ".." is deliberately *not* resolved here: this returns a shape,
+    and the caller rejects traversal rather than quietly resolving it into
+    somewhere else.
+    """
+    segments = [
+        seg for seg in str(raw_path).replace("\\", "/").split("/") if seg and seg != "."
+    ]
+    return "/".join(segments)
+
+
 def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
     out: dict[str, bytes] = {}
     total = 0
     for raw_path, content in files.items():
-        path = str(raw_path).replace("\\", "/").lstrip("/")
-        if not path or ".." in path.split("/"):
+        path = _canonical_skill_path(raw_path)
+        if not path:
+            # Nothing survived canonicalization ("///", ".", "./"). Refusing is
+            # right, but it is not traversal, and saying so sent people looking
+            # for a ".." that is not there.
+            raise HTTPException(
+                status_code=400,
+                detail=f"Skill bundle contains an empty file path ({raw_path!r}).",
+            )
+        if ".." in path.split("/"):
             raise HTTPException(
                 status_code=400,
                 detail="Skill file path contains a path-traversal sequence.",
@@ -390,6 +450,31 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
                     "Remove it and try again."
                 ),
             )
+        # Bound the path before the database has to. UserSkillFile.path is
+        # String(500): PostgreSQL raises DataError at commit and the request
+        # dies as a 500, while SQLite accepts it silently, so the check cannot
+        # be left to the storage layer.
+        if len(path) > _MAX_SKILL_FILE_PATH_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Skill file path is longer than "
+                    f"{_MAX_SKILL_FILE_PATH_CHARS} characters: {path[:60]}…"
+                ),
+            )
+        # Two distinct inputs can canonicalize to one path -- "./SKILL.md" and
+        # "SKILL.md", or "a\\b.md" and "a/b.md". Writing both meant the last
+        # one silently won and its neighbour vanished from a bundle the route
+        # then reported as installed. Refuse instead: which of the two the
+        # uploader meant is not ours to guess.
+        if path in out:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Skill bundle contains two entries for {path!r}. "
+                    "Remove the duplicate and try again."
+                ),
+            )
         total += len(content)
         if total > _MAX_DOWNLOAD_BYTES:
             raise HTTPException(
@@ -398,12 +483,43 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
         out[path] = bytes(content)
     if "SKILL.md" not in out:
         raise HTTPException(status_code=400, detail="Skill has no SKILL.md.")
+    _check_skill_md_content(out["SKILL.md"])
+    # Last gate before any caller writes. Everything above bounds the bundle's
+    # shape; this asks the parser whether it can actually be loaded, so a
+    # bundle that would fail on read-back is refused with a 400 naming the
+    # file instead of being persisted and then surfacing as a post-write 500
+    # with an orphaned row. Every write path -- registry install, personal
+    # create, the migration loader -- reaches it through here.
+    _assert_bundle_parses(out)
     return out
+
+
+def _reject_oversized_text(content: bytes, label: str) -> None:
+    """Refuse text past the character cap without decoding it.
+
+    A UTF-8 character is at most four bytes, so anything longer than
+    ``4 * _MAX_SKILL_MD_CHARS`` is over the cap whatever it decodes to, and no
+    string has to be built to know it. The cost this avoids is real, not
+    theoretical: a 40 KiB archive holding a 40 MiB member peaked at 120 MiB
+    before being refused, because the decoded copy joined the extractor's
+    chunks and joined bytes, all of it synchronous inside the install path.
+    """
+    if len(content) > _MAX_UTF8_BYTES_PER_CHAR * _MAX_SKILL_MD_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{label} is over {_MAX_SKILL_MD_CHARS} characters "
+                f"({len(content)} bytes); the limit is {_MAX_SKILL_MD_CHARS}."
+            ),
+        )
 
 
 # The only files ``SkillParser.parse_bundle`` decodes, in the order it reads
 # them. Everything else in a bundle is carried as opaque bytes, so a decode
-# failure can only have come from one of these.
+# failure can only have come from one of these. Kept in step with the parser
+# by a test that reads parse_bundle's source, since a third decoded file added
+# there would otherwise leave this list silently stale -- and silently skip
+# the byte bound above.
 _PARSER_DECODED_FILES = ("SKILL.md", "template.md")
 
 # ``parse_bundle`` wants a name, but validation happens before naming matters
@@ -444,6 +560,15 @@ def _assert_bundle_parses(files: dict[str, bytes]) -> None:
     or the primary key recycled.
     """
     from xagent.skills.parser import SkillParser
+
+    # Bound every file the parser will decode, not just SKILL.md: both are
+    # decoded in full by ``parse_bundle``, so leaving template.md unbounded
+    # reproduced the allocation spike SKILL.md was fixed for -- 120 MiB peak
+    # for a 41 KiB archive.
+    for path in _PARSER_DECODED_FILES:
+        content = files.get(path)
+        if content is not None:
+            _reject_oversized_text(content, path)
 
     try:
         SkillParser.parse_bundle(name=_VALIDATION_PLACEHOLDER_NAME, files=files)
@@ -505,6 +630,46 @@ def _is_skill_name_unique_violation(error: BaseException) -> bool:
     return False
 
 
+def _check_skill_md_content(skill_md: bytes) -> None:
+    """Enforce the non-empty and character-count contract on SKILL.md.
+
+    The byte bound runs first so nothing large is decoded to be rejected; past
+    it the content is small by construction, so the remaining two questions
+    are cheap to answer from text. ``errors="replace"`` keeps a non-UTF-8
+    SKILL.md from raising here -- naming that file is the parser's job -- and a
+    replacement character still occupies one character, so the cap holds
+    either way.
+    """
+    _reject_oversized_text(skill_md, "SKILL.md")
+    text = skill_md.decode("utf-8", errors="replace")
+    # Match the non-empty contract Create/Edit enforce. A blank SKILL.md
+    # persists happily and returns 200, then contributes nothing but a name to
+    # every system prompt that loads it.
+    #
+    # Asked as a property of every character, not by stripping. Stripping only
+    # peels the ends, so no fixed number of passes converges: three passes let
+    # "\u200b \u200b \u200b" through, because each pass exposes the next
+    # layer and the last one still leaves a zero-width character standing.
+    # ``str.strip()`` also cannot be given the zero-width set as an argument --
+    # that *replaces* the default rather than extending it, and drops 21 of the
+    # 29 characters ``isspace()`` knows.
+    if all(char.isspace() or char in _ZERO_WIDTH_CHARS for char in text):
+        raise HTTPException(status_code=400, detail="SKILL.md is empty.")
+    # Hold every write path to the character cap the Create/Edit schemas
+    # already enforce. SKILL.md reaches the system prompt on every model turn,
+    # so a bundle that skipped the cap would fail far from here, at inference
+    # time. Counted in characters, not bytes, to match those schemas.
+    char_count = len(text)
+    if char_count > _MAX_SKILL_MD_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"SKILL.md is {char_count} characters; the limit is "
+                f"{_MAX_SKILL_MD_CHARS}."
+            ),
+        )
+
+
 def _write_personal_skill(
     *,
     db: Any,
@@ -517,18 +682,23 @@ def _write_personal_skill(
 ) -> None:
     """Persist one personal skill, refusing anything that would not load.
 
-    The bundle goes through ``_assert_bundle_parses`` before the commit, so a
-    committed row is one the skill machinery can read and nothing here has to
-    be undone afterwards. See that function for why undoing is the thing worth
-    avoiding.
+    The bundle goes through ``_assert_bundle_parses`` before the commit -- by
+    way of ``_normalize_skill_files`` below -- so a committed row is one the
+    skill machinery can read and nothing here has to be undone afterwards. See
+    that function for why undoing is the thing worth avoiding.
     """
     from xagent.skills.library import guess_media_type
     from xagent.web.models.skill import UserSkill, UserSkillFile
 
     _validate_skill_name(name)
     user_id = int(user.id)
+    # Re-normalize rather than trusting the caller: this is the boundary the
+    # registry install, personal create and migration paths all reach, and the
+    # only place all three are guaranteed to be validated. The parse check the
+    # commit depends on runs inside that call, so it is not repeated here --
+    # it lives in the normalizer rather than in this writer because the team
+    # scope reaches the write provider without passing through here at all.
     normalized = _normalize_skill_files(files)
-    _assert_bundle_parses(normalized)
     existing = (
         db.query(UserSkill)
         .filter(UserSkill.user_id == user_id, UserSkill.name == name)
@@ -729,13 +899,49 @@ def _safe_zip_extract(
     raw_files: dict[str, bytes] = {}
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
-        for info in zf.infolist():
+        # Cap the entry count. This runs *after* ZipFile has materialized the
+        # central directory, so it bounds the per-entry work that follows --
+        # the ORM insert per file, the walk over every member -- but not the
+        # construction itself. Bounding construction needs the archive's cost
+        # to be limited before CPython parses it, which is a separate problem
+        # with its own failure history; it is tracked in #1941 rather than
+        # solved here. Measured, the worst archive this admits costs ~0.6s and
+        # ~11 MiB inside the constructor before this rejects it.
+        entries = zf.infolist()
+        if len(entries) > _MAX_ARCHIVE_ENTRIES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Skill archive holds {len(entries)} entries; the limit is "
+                    f"{_MAX_ARCHIVE_ENTRIES}."
+                ),
+            )
+        for info in entries:
             if info.is_dir():
                 continue
-            path = info.filename.replace("\\", "/").lstrip("/")
+            # Canonicalize here, not at the tail. Root selection, the
+            # containment check below and the normalizer all key off this
+            # string, and they only agree if one function decides its shape:
+            # "./SKILL.md" counts as depth 0 rather than losing to a nested
+            # real root, and "my-skill\\notes.md" is seen as living under
+            # "my-skill/" instead of being dropped as outside it.
+            path = _canonical_skill_path(info.filename)
             if not path or ".." in path.split("/"):
                 raise HTTPException(
                     status_code=400, detail="Skill ZIP contains unsafe paths."
+                )
+            # Distinct members can canonicalize to one path. Left alone the
+            # later one overwrote the earlier, so a bundle came back missing a
+            # file with a 200 attached. The normalizer refuses duplicates too;
+            # this one has to exist as well because that check runs on the
+            # already-collapsed dict, after the loss it is meant to catch.
+            if path in raw_files:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Skill archive contains two entries for {path!r}. "
+                        "Remove the duplicate and try again."
+                    ),
                 )
             remaining = _MAX_DOWNLOAD_BYTES - total
             # Reject on the declared size before inflating anything. zipfile
