@@ -320,12 +320,16 @@ def _validate_connector_access_answer(
     question than the one it was asked, and silently dropping it would
     hide that the hook and the caller have gone out of sync.
 
-    Each value must be a ``ConnectorAccess`` with ``team_owned`` exactly
-    ``True`` (an identity check, not a truthiness check, matching
-    ``knowledge_base_team_scope.py``'s ``element.team_owned is not True``)
-    and ``can_edit`` exactly ``True`` or ``False`` -- ``bool`` is a
-    subclass of ``int`` in Python, so a merely truthy value is never
-    accepted as a legitimate grant.
+    Each value must be a ``ConnectorAccess`` whose ``team_owned`` is
+    exactly ``True`` and whose ``can_edit`` is a ``bool``. The two are
+    deliberately spelled differently because they are different
+    requirements: ``team_owned`` admits one specific value, so it is an
+    identity check matching ``knowledge_base_team_scope.py``'s
+    ``element.team_owned is not True``, while ``can_edit`` admits either
+    ``True`` or ``False``, which is a type check and reads as one. Neither
+    is a truthiness check: ``bool`` is a subclass of ``int`` in Python, so
+    a merely truthy stand-in such as ``1`` is never accepted as a
+    legitimate grant.
 
     Each key must be an exact ``(str, int)`` pair before it is even checked
     for membership: ``bool``, ``float`` and ``Decimal`` all compare equal
@@ -383,7 +387,7 @@ def _validate_connector_access_answer(
                 "caller's team does not link is expressed by leaving it "
                 f"out of the answer, not by a verdict, got {verdict.team_owned!r}"
             )
-        if verdict.can_edit is not True and verdict.can_edit is not False:
+        if not isinstance(verdict.can_edit, bool):
             raise ValueError(
                 "connector access hook returned a malformed answer for "
                 f"{key!r}: can_edit must be exactly True or False (bool is "
