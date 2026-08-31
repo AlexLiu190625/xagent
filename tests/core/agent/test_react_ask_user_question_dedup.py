@@ -1,8 +1,8 @@
 """Single-tool ``ask_user_question`` field-name deduplication.
 
-The multi-tool waiting path (``_pause_for_tool_results``) has run a
-same-shape dedup loop across every waiting tool's interactions for a while
-(``:2629-2646`` in ``react.py``); the single-tool ``ask_user_question``
+The multi-tool waiting path (``_pause_for_tool_results`` in
+``react.py``) has run a same-shape dedup loop across every waiting
+tool's interactions for a while; the single-tool ``ask_user_question``
 branch in ``_handle_control_tool`` did not, so two interactions the model
 named the same field would both reach the write-side validator unchanged,
 tripping its duplicate-field rule and costing the whole question. This
@@ -11,8 +11,8 @@ narrower scope: ``used_fields`` spans only this one call's own
 interactions, never a sibling tool's, because a single-tool call has no
 sibling to collide with.
 
-Rules pinned here, each aligned to the batch path's own four (react.py
-``:2629-2646``):
+Rules pinned here, each aligned to the batch path's own four (the dedup
+loop in ``_pause_for_tool_results``):
 
 1. base name is ``str(item.get("field") or "response")``
 2. the first occupant of a base keeps it; suffixing starts at ``_2``

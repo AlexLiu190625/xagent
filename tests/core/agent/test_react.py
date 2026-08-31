@@ -4780,10 +4780,11 @@ def test_normalize_keeps_colliding_fields_at_single_tool_callsite(
 ) -> None:
     """Within one ask_user_question call, a BOM-wrapped field name and
     its plain counterpart now normalize to the same field. This function
-    does not deduplicate -- both interactions are kept unchanged, and the
-    single-tool call site sends the result on as-is (the multi-tool call
-    site has its own dedup, covered separately below). One warning is
-    logged, with an integer-only extra/message-args payload."""
+    does not deduplicate -- both interactions are kept unchanged. Both
+    call sites deduplicate afterward: the multi-tool one is covered
+    below in this file, the single-tool one in
+    test_react_ask_user_question_dedup.py. One warning is logged, with
+    an integer-only extra/message-args payload."""
     with caplog.at_level(
         logging.WARNING, logger="xagent.core.agent.pattern.react.react"
     ):
