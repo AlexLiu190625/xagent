@@ -578,8 +578,11 @@ class TestModelAPI:
         data = response.json()
         assert data["status"] == "failed"
         assert data["message"] == "Connection timed out"
-        configured_seconds = int(model_module._CONNECTION_TEST_TIMEOUT_SECONDS)
-        assert f"{configured_seconds} seconds" in data["error"]
+        # Pin the contract value independently of the production constant:
+        # deriving the expected copy from _CONNECTION_TEST_TIMEOUT_SECONDS
+        # would keep this test green if the budget silently regressed.
+        assert model_module._CONNECTION_TEST_TIMEOUT_SECONDS == 60.0
+        assert "60 seconds" in data["error"]
         assert "network" not in data["error"].lower()
 
     def test_create_model_as_admin(
