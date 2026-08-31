@@ -2144,7 +2144,7 @@ async def test_live_injection_skips_the_close_on_a_replayed_turn_id(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
     bg_mgr.running_tasks.get.return_value = None
 
     with (
