@@ -1156,7 +1156,8 @@ def _reject_unknown_envelope_keys(values: Any) -> None:
     if not isinstance(values, dict):
         return
     unknown = sorted(
-        set(values) - {"message", "interactions"} - _V1_ENVELOPE_METADATA_KEYS
+        set(values) - {"message", "interactions"} - _V1_ENVELOPE_METADATA_KEYS,
+        key=str,
     )
     if unknown:
         raise InteractionWritePayloadRejected(
