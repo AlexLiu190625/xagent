@@ -744,6 +744,15 @@ def test_managed_lease_publication_requires_an_execution_result() -> None:
     this pin currently passes on absence. Do not rewrite it to assert the
     call exists: the smallest way to turn this red is adding the call
     without the guard, which is exactly the mistake it exists to catch.
+
+    Two mutations were run against this assertion and both turn it red: a
+    mutation adding an unguarded call, and one demoting the guard to
+    truthiness (``if execution_result:``).
+
+    One guard shape only is recognized -- an ``if execution_result is not
+    None:`` block dominating the call. An early-return ``is None`` guard
+    is equally safe at runtime and still turns this red, so the change
+    that wires the resolver has to use the block shape.
     """
 
     source = inspect.getsource(finalize_managed_task_lease_result)
@@ -806,6 +815,8 @@ def test_finalize_without_execution_result_creates_no_interaction_row_in_native_
     assert policy.mode == "native"
 
     task = _create_task(db_session)
+    task.source = "sdk"
+    db_session.commit()
     lease = acquire_task_lease(db_session, int(task.id), new_run=True)
     assert lease is not None
 

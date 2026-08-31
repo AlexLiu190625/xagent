@@ -44,8 +44,12 @@ def finalize_managed_task_lease_result(
     interactions: list[dict[str, Any]] | None = None,
     message_type: str = ASSISTANT_RESPONSE_MESSAGE_TYPE,
     error_message: str | None = None,
-    # Fed only to resolve_publishable_clarification; never pass this to a
-    # logger or an exception. finalize_managed_task_lease_result_isolated
+    # Reserved for a future reader and unconsumed today: this function
+    # never reads it, and resolve_publishable_clarification -- the reader
+    # it is reserved for -- has no production caller anywhere yet. The
+    # change that wires that resolver is what will read it. Never pass
+    # this to a logger or an exception.
+    # finalize_managed_task_lease_result_isolated
     # hands its call off to a worker thread, so this mapping is held by a
     # closure across that thread boundary for a while, and it can carry
     # large structures such as file_outputs with no truncation applied.
