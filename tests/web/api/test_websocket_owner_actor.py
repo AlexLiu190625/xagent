@@ -30,6 +30,7 @@ from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointUnavailableError,
 )
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.execution_scope import (
     ExecutionScope,
 )
@@ -52,8 +53,9 @@ from xagent.web.api.websocket import (
 )
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services import task_orchestrator
@@ -108,6 +110,45 @@ def _task(db, owner_id: int, status: TaskStatus = TaskStatus.RUNNING) -> Task:
     db.commit()
     db.refresh(t)
     return t
+
+
+def _seed_active_interaction_row(
+    db: Session, *, task_id: int, run_id: str, idempotency_key: str
+) -> int:
+    """One legal active TaskInteractionRequest row, for the replay-skips-
+    close tests below. Mirrors test_a2a_api.py's local, single-purpose row
+    builder of the same name rather than sharing it across test files."""
+    anchor = TraceEvent(
+        task_id=task_id,
+        event_id=f"anchor-{idempotency_key}",
+        event_type="agent_execution_checkpoint",
+        timestamp=datetime.now(timezone.utc),
+        data={},
+    )
+    db.add(anchor)
+    db.flush()
+    row = TaskInteractionRequest(
+        task_id=task_id,
+        run_id=run_id,
+        kind="clarification",
+        protocol_version=1,
+        status="active",
+        active_slot=1,
+        origin="sdk",
+        request_payload={"prompt": "example"},
+        request_idempotency_key=idempotency_key,
+        resume_trace_event_id=int(anchor.id),
+        resume_event_id="resume-event-1",
+        resume_execution_id="resume-execution-1",
+        resume_locator_format="trace_event_pk_v1",
+        resume_checkpoint_type="agent_execution_checkpoint",
+        resume_run_partition=run_id,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return int(row.id)
 
 
 # Anti-hang bounds, not latency assertions. Nothing here is measuring speed:
@@ -1230,9 +1271,9 @@ async def test_running_chat_message_is_persisted_before_resume(db_session) -> No
     agent.get_dag_pattern.return_value = None
     observed_leases: list[TaskLease | None] = []
 
-    async def post_user_message(*_args, **_kwargs) -> bool:
+    async def post_user_message(*_args, **_kwargs) -> UserMessageInjectionOutcome:
         observed_leases.append(current_task_lease())
-        return True
+        return UserMessageInjectionOutcome.POSTED_FRESH
 
     agent.post_user_message = AsyncMock(side_effect=post_user_message)
     mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
@@ -1403,7 +1444,9 @@ async def test_running_chat_message_uses_one_offloop_scope_and_no_request_sessio
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     manager_calls: list[tuple[object, dict]] = []
     claim_threads: list[int] = []
 
@@ -1875,7 +1918,9 @@ async def test_resume_registration_failure_keeps_injected_delivery_pending(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
@@ -1942,7 +1987,9 @@ async def test_live_marker_failure_after_registered_handoff_is_still_accepted(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
@@ -2009,9 +2056,11 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
         order.append("read")
         return 4321
 
-    async def record_injection(*_args: object, **_kwargs: object) -> bool:
+    async def record_injection(
+        *_args: object, **_kwargs: object
+    ) -> UserMessageInjectionOutcome:
         order.append("inject")
-        return True
+        return UserMessageInjectionOutcome.POSTED_FRESH
 
     agent.post_user_message = AsyncMock(side_effect=record_injection)
     ws_manager = MagicMock(
@@ -2057,6 +2106,75 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
 
 
 @pytest.mark.asyncio
+async def test_live_injection_skips_the_close_on_a_replayed_turn_id(
+    db_session,
+) -> None:
+    """A replayed turn id short-circuits inside AgentRunner.inject_user_message
+    and is reported back as POSTED_REPLAY, not the same truthy value a
+    fresh write produces. The interaction row this test seeds is not the
+    question the replay answered, so the online injection site must leave
+    it untouched: still active, uncleared marker, and the close statement
+    must not run at all. That is asserted directly on the mock: replacing
+    the guard with `if True:` calls the close for real and turns
+    assert_not_called red. No DB-state assertion is made here -- with the
+    close function mocked out, nothing writes to the row or the marker, so
+    "still active" would hold no matter what the guard did."""
+    owner = _user(db_session, "close-replay-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "close-replay-runner"
+    task.run_id = "close-replay-run"
+    task.interaction_protocol_version = 1
+    db_session.commit()
+    task_id = int(task.id)
+    _seed_active_interaction_row(
+        db_session,
+        task_id=task_id,
+        run_id="close-replay-run",
+        idempotency_key="close-replay-q1",
+    )
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_REPLAY
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch(
+            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+        ) as close_mock,
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            task_id,
+            {
+                "message": "a retried delivery",
+                "client_message_id": "close-replay-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    agent.post_user_message.assert_awaited_once()
+    close_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_live_close_failure_after_registered_handoff_is_still_accepted(
     db_session,
 ) -> None:
@@ -2070,7 +2188,9 @@ async def test_live_close_failure_after_registered_handoff_is_still_accepted(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
@@ -2129,7 +2249,9 @@ async def test_live_close_cancellation_does_not_abort_registered_handoff(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
@@ -2422,7 +2544,9 @@ async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
@@ -3991,7 +4115,9 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
         ]
     )
     agent = MagicMock(
-        post_user_message=AsyncMock(return_value=True),
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_FRESH
+        ),
         resume_execution_by_id=AsyncMock(
             return_value={
                 "status": "completed",
@@ -4070,7 +4196,9 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
         ]
     )
     agent = MagicMock(
-        post_user_message=AsyncMock(return_value=True),
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_FRESH
+        ),
         resume_execution_by_id=AsyncMock(
             return_value={
                 "status": "completed",
@@ -4151,7 +4279,9 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
         ]
     )
     agent = MagicMock(
-        post_user_message=AsyncMock(return_value=True),
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_FRESH
+        ),
         resume_execution_by_id=AsyncMock(
             return_value={
                 "status": "completed",
@@ -4254,7 +4384,9 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
         ]
     )
     agent = MagicMock(
-        post_user_message=AsyncMock(return_value=True),
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_FRESH
+        ),
         resume_execution_by_id=AsyncMock(
             return_value={
                 "status": "completed",
@@ -4303,6 +4435,104 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
 
 
 @pytest.mark.asyncio
+async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
+    db_session,
+) -> None:
+    """A cross-run retry of this background task re-enters with the same
+    pending_user_message. post_user_message short-circuits the repeated
+    turn id and reports POSTED_REPLAY, so the close must be skipped
+    entirely -- not just matched against the carried (stale) interaction
+    id, but never attempted. The row this test seeds is the question the
+    resumed agent has staged *since* the first attempt (a different id
+    from the one carried in pending_user_message), so a site that
+    re-derived its close key by reading the current active row instead of
+    using the carried one would retire this live question; asserting
+    active_interaction_id_sync is never called pins that the deferred path
+    still takes no read of its own, replay or not -- the same technique
+    the carried-vs-observed test above uses. close_legacy_resume_interaction_sync
+    is asserted uncalled directly: replacing the guard with `if True:`
+    calls it for real and turns this assertion red on its own."""
+    owner = _user(db_session, "deferred-replay-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    task.interaction_protocol_version = 1
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Deferred guidance",
+            message_type="user_message",
+            turn_id="deferred-replay-turn",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+    task_id = int(task.id)
+    # The question staged since the first attempt -- a different row from
+    # the one named in pending_user_message below.
+    _seed_active_interaction_row(
+        db_session,
+        task_id=task_id,
+        run_id="deferred-replay-run",
+        idempotency_key="deferred-replay-q1",
+    )
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={"turn_id": "deferred-replay-turn"})
+        ]
+    )
+    agent = MagicMock(
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_REPLAY
+        ),
+        resume_execution_by_id=AsyncMock(
+            return_value={
+                "status": "completed",
+                "success": True,
+                "output": "Applied",
+                "agent_result": {"context": context},
+            }
+        ),
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
+        patch(
+            "xagent.web.api.websocket.active_interaction_id_sync",
+            side_effect=AssertionError("the deferred path must not read its own"),
+        ),
+        patch(
+            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+        ) as close_mock,
+    ):
+        await execute_resume_background(
+            task_id=task_id,
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            pending_user_message={
+                "execution_message": "Deferred guidance",
+                "display_message": "Deferred guidance",
+                "files": [],
+                "turn_id": "deferred-replay-turn",
+                # The stale id carried from the first attempt -- not the
+                # row seeded above, which is what a re-read would find.
+                "interaction_id": 424242,
+            },
+            delivery_turn_id="deferred-replay-turn",
+            delivery_websocket=MagicMock(),
+            delivery_client_message_id="deferred-replay-turn",
+        )
+
+    agent.post_user_message.assert_awaited_once()
+    close_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_deferred_injection_close_cancellation_does_not_abort_resume(
     db_session,
 ) -> None:
@@ -4330,7 +4560,9 @@ async def test_deferred_injection_close_cancellation_does_not_abort_resume(
         ]
     )
     agent = MagicMock(
-        post_user_message=AsyncMock(return_value=True),
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_FRESH
+        ),
         resume_execution_by_id=AsyncMock(
             return_value={
                 "status": "completed",
@@ -4417,7 +4649,9 @@ async def test_deferred_injection_rejects_before_post_when_lease_is_denied(
     )
     db_session.commit()
     agent = MagicMock(
-        post_user_message=AsyncMock(return_value=True),
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.POSTED_FRESH
+        ),
         resume_execution_by_id=AsyncMock(),
     )
     ws_manager = MagicMock(
