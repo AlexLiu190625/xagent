@@ -228,7 +228,7 @@ async def test_validate_provider_model_listing_honors_caller_supplied_timeout():
 
     Guards against reintroducing the second hardcoded timeout this helper
     used to carry independently of ``test_model_connection``'s own budget
-    (xagent#1960): the two ``asyncio.wait_for`` layers wrapping a listing
+    (xorbitsai/xagent#1960): the two ``asyncio.wait_for`` layers wrapping a listing
     call (the endpoint's own, and this helper's inner one around the actual
     provider fetch) must always share the exact same number, sourced from
     the ``timeout_seconds`` parameter -- never a second literal in here.
@@ -547,7 +547,7 @@ class TestModelAPI:
     ):
         """A connection-test timeout must name the app's own wait budget.
 
-        xagent#1960: the old message ("Please check your network connection
+        xorbitsai/xagent#1960: the old message ("Please check your network connection
         and provider status") told the user to go check their network when
         the actual cause was this endpoint's own wait budget (10 seconds at
         the time) expiring before a slow or reasoning-heavy model answered.

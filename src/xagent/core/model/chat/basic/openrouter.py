@@ -222,10 +222,14 @@ def _extract_openrouter_structured_error(
     ``(error_message, provider_name)`` read from its parsed ``.body``
     (OpenRouter nests both under a top-level ``"error"`` key; a provider that
     responds without that wrapper is also accepted by falling back to the
-    body itself). Returns ``(None, None)`` if the chain never reaches a
-    ``BadRequestError``, its body is not a dict, or the payload carries no
-    string ``message`` -- callers treat that as "structured read failed,
-    fall back to matching ``str(exc)`` instead". Never raises.
+    body itself). The returned message is ``None`` whenever the chain never
+    reaches a ``BadRequestError``, that error's body is not a dict, or the
+    payload carries no string ``message``; callers key off that alone and
+    treat it as "structured read failed, fall back to matching ``str(exc)``
+    instead", so a provider name recovered alongside a missing message is
+    never acted on by itself. Only ``openai.BadRequestError`` is read here:
+    every other shape reaching the compat-retry predicates keeps the plain
+    ``str(exc)`` behavior. Never raises.
     """
     current: Optional[BaseException] = exc
     seen: set[int] = set()
