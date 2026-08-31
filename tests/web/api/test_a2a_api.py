@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from threading import Event, get_ident
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,7 +27,7 @@ from xagent.core.agent.checkpoint import (
 from xagent.web.api import a2a as a2a_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.agent_api_key import AgentApiKey
-from xagent.web.models.database import Base
+from xagent.web.models.database import Base, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_interaction import TaskInteractionRequest
@@ -2392,7 +2393,7 @@ def test_cancel_is_idempotent_and_subscribe_rejects_terminal_task() -> None:
     assert subscribed.json()["error"]["details"][0]["reason"] == "UNSUPPORTED_OPERATION"
 
 
-def test_cancel_retries_a_previous_terminal_transport_failure() -> None:
+def test_cancel_retries_a_pre_upgrade_terminal_transport_failure() -> None:
     agent_id, full_key = _create_published_agent_with_key()
     with patch(
         "xagent.web.services.task_orchestrator._schedule_bg",
@@ -2413,15 +2414,19 @@ def test_cancel_retries_a_previous_terminal_transport_failure() -> None:
     assert created.status_code == 200, created.text
     task_id = int(created.json()["task"]["id"])
 
+    database_path: str | None = None
     db = _direct_db_session()
     try:
         agent = db.query(Agent).filter(Agent.id == agent_id).one()
         task = db.query(Task).filter(Task.id == task_id).one()
         target_state_version = int(task.state_version or 0)
+        actor_subject = agent.user.actor_subject
+        assert actor_subject is not None
         db.add(
             TaskExecutionCommand(
                 task_id=task_id,
                 actor_user_id=int(agent.user_id),
+                actor_subject=str(actor_subject),
                 command_id=f"cancel:{task_id}:{target_state_version}",
                 kind="cancel",
                 payload={
@@ -2439,8 +2444,29 @@ def test_cancel_retries_a_previous_terminal_transport_failure() -> None:
             )
         )
         db.commit()
+        database_path = get_engine().url.database
     finally:
         db.close()
+
+    assert database_path is not None
+    get_engine().dispose()
+    legacy = sqlite3.connect(database_path)
+    try:
+        legacy.execute("DROP TABLE task_command_terminal_events")
+        legacy.execute("ALTER TABLE task_execution_commands DROP COLUMN actor_subject")
+        legacy.execute("DROP INDEX ix_users_actor_subject")
+        legacy.execute("ALTER TABLE users DROP COLUMN actor_subject")
+        legacy.execute(
+            "ALTER TABLE task_execution_commands DROP COLUMN target_state_version"
+        )
+        legacy.execute(
+            "UPDATE alembic_version SET version_num = ?",
+            ("20260821_actor_oauth_flow_states",),
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+    init_db(db_url=f"sqlite:///{database_path}")
 
     response = client.post(
         f"/api/a2a/agents/{agent_id}/tasks/{task_id}:cancel",

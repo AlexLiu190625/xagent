@@ -156,6 +156,7 @@ from ..services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
+from ..services.task_command_terminal_events import is_external_cancel_command
 from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
@@ -443,7 +444,7 @@ def client_safe_task_command_failure(
     running would be false, and the visitor would keep waiting on a turn
     nobody stopped.
     """
-    if kind == TaskCommandKind.CANCEL and scope == EXTERNAL_COMMAND_SCOPE:
+    if is_external_cancel_command(kind=kind.value, scope=scope):
         return external_cancel_exhausted_message(task_status)
     return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
 
@@ -9562,15 +9563,6 @@ def _command_turn_id(task_id: int, message_data: dict[str, Any]) -> str | None:
     return None
 
 
-def _is_external_cancel(command: ClaimedTaskCommand) -> bool:
-    """Whether this command is a stop issued by a task's external audience."""
-
-    return (
-        command.kind == TaskCommandKind.CANCEL
-        and _command_scope(command) == EXTERNAL_COMMAND_SCOPE
-    )
-
-
 async def _broadcast_terminal_command_error(
     command: ClaimedTaskCommand,
     error: BaseException,
@@ -9585,7 +9577,7 @@ async def _broadcast_terminal_command_error(
     # one built and trimmed: the client-safe guard only inspects dict
     # literals passed straight to the sink, and a payload assembled in a
     # variable would drop this site out of its view entirely.
-    if _is_external_cancel(command):
+    if is_external_cancel_command(kind=command.kind.value, scope=scope):
         task_status = await _load_terminal_command_task_status(command.task_id)
         await manager.broadcast_to_task(
             {
