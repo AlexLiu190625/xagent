@@ -1,5 +1,14 @@
 """Real-PostgreSQL coverage for the row lock ``update_mcp_server`` takes on
-the ``MCPServer`` definition row before building the new config.
+the ``MCPServer`` definition row before building the new config -- and, for
+the payloads that must *not* take it: a PUT that sets only ``is_active``
+and/or ``user_env`` writes the caller's own ``UserMCPServer`` link row. On
+a server carrying no global ``env`` or ``auth`` the rebuild writes nothing
+back to the definition row, so it reads that row without locking it (a
+server with a global ``env`` or ``auth`` still gets its re-encrypted
+secret written back on this path -- pre-existing behavior, tracked in
+#1945). Under PostgreSQL REPEATABLE READ that distinction is the
+difference between HTTP 200 and a serialization failure surfacing as
+HTTP 500.
 
 ``FOR UPDATE`` is a no-op on SQLite -- every other suite in this repo runs
 against SQLite, so nothing there can tell a genuine second-writer block
@@ -68,6 +77,74 @@ def seeded(session_factory):
         )
         db.commit()
         return int(owner.id), int(server.id)
+
+
+def _seed_by_the_create_route(session_factory) -> tuple[int, int]:
+    """One owner and one server created the way the API actually creates
+    one -- through ``create_mcp_server`` itself, not hand-built rows.
+
+    The shape matters for the activation-only tests below. ``MCPServer``
+    rows the create route makes store ``concurrent_tools`` as an empty
+    list (``MCPServerConfig`` declares it ``default_factory=list`` and
+    ``MCPServer.from_config`` normalizes it), while a hand-built row
+    leaves the column NULL. An update rebuilds the shared config on every
+    payload and assigns ``[]`` back, which is a no-op against ``[]`` and a
+    real ``UPDATE`` against NULL -- so a hand-built row would make the
+    activation-only request write the definition row for a reason that
+    exists nowhere in production, and the tests below would be measuring
+    that instead of what they claim to measure.
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerCreate
+
+    with session_factory() as db:
+        owner = User(username="mcp-activation-owner", password_hash="x", is_admin=False)
+        db.add(owner)
+        db.commit()
+        owner_id = int(owner.id)
+
+        mcp_api.create_mcp_server(
+            MCPServerCreate(
+                name="activation-target",
+                transport="stdio",
+                config={"command": "true"},
+            ),
+            current_user=SimpleNamespace(id=owner_id, is_admin=False),
+            db=db,
+        )
+
+    with session_factory() as db:
+        server = db.query(MCPServer).filter(MCPServer.name == "activation-target").one()
+        # The anchor for the docstring above: if the create route ever stops
+        # storing an empty list here, these tests must be re-derived rather
+        # than silently start measuring a different row shape.
+        assert server.concurrent_tools == [], (
+            "the create route no longer stores concurrent_tools as an empty "
+            f"list (saw {server.concurrent_tools!r}); the activation-only "
+            "tests below depend on that shape"
+        )
+        return owner_id, int(server.id)
+
+
+@pytest.fixture()
+def repeatable_read_sessions():
+    """Two session factories on one disposable database: the first at the
+    server's default isolation level (used to seed and to read back what
+    committed), the second at REPEATABLE READ -- the level the route runs
+    at on a deployment configured that way, and the one under which the
+    interleaving below used to fail.
+    """
+    with disposable_database_factory("xagent_mcp_activation_rr") as make_database:
+        engine = make_database("rr")
+        Base.metadata.create_all(bind=engine)
+        yield (
+            sessionmaker(autocommit=False, autoflush=False, bind=engine),
+            sessionmaker(
+                autocommit=False,
+                autoflush=False,
+                bind=engine.execution_options(isolation_level="REPEATABLE READ"),
+            ),
+        )
 
 
 def test_a_second_editor_blocks_until_the_first_editors_transaction_finishes(
@@ -348,5 +425,149 @@ def test_a_row_that_vanishes_after_the_gate_but_before_the_lock_is_a_404_not_a_5
             )
         assert deleted_already.is_set(), "the concurrent delete never ran"
         assert exc.value.status_code == 404
+    finally:
+        db.close()
+
+
+def test_an_activation_only_edit_survives_a_concurrent_definition_commit_under_repeatable_read(
+    repeatable_read_sessions,
+) -> None:
+    """A payload that sets only ``is_active`` writes this caller's own
+    ``UserMCPServer`` link row. Under PostgreSQL REPEATABLE READ the
+    route's own snapshot is fixed by its first read, so a definition edit
+    another request commits after that read is invisible to this one --
+    which is harmless for a request that does not write the definition
+    row, and fatal for one that asks the database to lock it: the lock
+    statement raises SQLSTATE 40001 and this route's generic handler turns
+    that into HTTP 500 with the requested activation state unwritten.
+
+    The concurrent commit is fired from a wrapper around this session's
+    own ``query``, which lands it strictly between the access read (which
+    asks for ``UserMCPServer`` joined to ``MCPServer``) and this route's
+    first single-entity ``MCPServer`` read.
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    default_factory, rr_factory = repeatable_read_sessions
+    owner_id, server_id = _seed_by_the_create_route(default_factory)
+
+    db = rr_factory()
+    real_query = db.query
+    committed = threading.Event()
+    queried_entities: list[tuple] = []
+
+    def commit_a_definition_edit_when_the_definition_query_starts(*entities, **kwargs):
+        queried_entities.append(entities)
+        if entities == (MCPServer,) and not committed.is_set():
+            committed.set()
+            with default_factory() as other:
+                other.execute(
+                    sa.update(MCPServer)
+                    .where(MCPServer.id == server_id)
+                    .values(description="edited-by-the-concurrent-definition-editor")
+                )
+                other.commit()
+        return real_query(*entities, **kwargs)
+
+    db.query = commit_a_definition_edit_when_the_definition_query_starts
+    try:
+        response = mcp_api.update_mcp_server(
+            server_id,
+            MCPServerUpdate(is_active=False),
+            current_user=SimpleNamespace(id=owner_id, is_admin=False),
+            db=db,
+        )
+    finally:
+        db.close()
+
+    assert committed.is_set(), "the concurrent definition edit never ran"
+    assert queried_entities[:2] == [(UserMCPServer, MCPServer), (MCPServer,)], (
+        "the concurrent commit must land after the access read's own read and "
+        "before this route's definition read; otherwise this test is not "
+        "exercising the window it claims to -- saw "
+        f"{queried_entities!r}"
+    )
+    assert response.is_active is False
+
+    with default_factory() as fresh:
+        assert (
+            fresh.query(UserMCPServer)
+            .filter(
+                UserMCPServer.mcpserver_id == server_id,
+                UserMCPServer.user_id == owner_id,
+            )
+            .one()
+            .is_active
+            is False
+        )
+        assert (
+            fresh.query(MCPServer).filter(MCPServer.id == server_id).one().description
+            == "edited-by-the-concurrent-definition-editor"
+        )
+
+
+def test_an_activation_only_edit_whose_row_vanishes_before_its_read_is_a_404(
+    session_factory, seeded
+) -> None:
+    """The activation-only path skips the lock but keeps the same
+    vanished-definition handling: its own fresh read of ``MCPServer`` must
+    return ``None`` and raise the route's 404, rather than leaving the
+    write path below to fail on a row that is no longer there.
+
+    Uses the plain hand-built ``seeded`` fixture rather than the
+    create-route seeding helper: this request 404s before any write is
+    attempted, so the row's shape (NULL vs. ``[]`` ``concurrent_tools``)
+    plays no part in what this test measures.
+
+    Same wrapper shape as
+    ``test_a_row_that_vanishes_after_the_gate_but_before_the_lock_is_a_404_not_a_500``
+    above: the concurrent delete fires from this session's own ``query``,
+    which lands it strictly between the access read (which asks for
+    ``UserMCPServer`` joined to ``MCPServer``) and this route's first
+    single-entity ``MCPServer`` read.
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    owner_id, server_id = seeded
+    current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+    db = session_factory()
+    real_query = db.query
+    deleted_already = threading.Event()
+    queried_entities: list[tuple] = []
+
+    def delete_the_row_when_the_definition_query_starts(*entities, **kwargs):
+        queried_entities.append(entities)
+        if entities == (MCPServer,) and not deleted_already.is_set():
+            deleted_already.set()
+            with session_factory() as other:
+                other.execute(
+                    sa.delete(UserMCPServer).where(
+                        UserMCPServer.mcpserver_id == server_id
+                    )
+                )
+                other.execute(sa.delete(MCPServer).where(MCPServer.id == server_id))
+                other.commit()
+        return real_query(*entities, **kwargs)
+
+    db.query = delete_the_row_when_the_definition_query_starts
+    try:
+        with pytest.raises(HTTPException) as exc:
+            mcp_api.update_mcp_server(
+                server_id,
+                MCPServerUpdate(is_active=False),
+                current_user=current_user,
+                db=db,
+            )
+        assert exc.value.status_code == 404
+        assert deleted_already.is_set(), "the concurrent delete never ran"
+        assert queried_entities[:2] == [(UserMCPServer, MCPServer), (MCPServer,)], (
+            "the concurrent delete must land after the access read's own "
+            "read and before this route's definition read; otherwise the "
+            "404 under test could be the access read's -- saw "
+            f"{queried_entities!r}"
+        )
     finally:
         db.close()
