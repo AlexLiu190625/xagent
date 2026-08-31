@@ -89,6 +89,12 @@ from ...result import (
     unwrap_final_answer_content,
 )
 from ...runtime import (
+    DISCARDED_BUNDLED_FINAL_ANSWER_REASON,
+    INTERRUPTED_DURING_LLM_STREAM_REASON,
+    INVALID_TOOL_PROTOCOL_AFTER_RECOVERY_REASON,
+    INVALID_TOOL_PROTOCOL_AFTER_RETRY_REASON,
+    INVALID_TOOL_PROTOCOL_RETRYING_REASON,
+    NO_DELIVERABLE_FINAL_ANSWER_REASON,
     ExecutionInterrupted,
     LLMCallInterrupted,
     PatternRuntime,
@@ -709,7 +715,7 @@ class ReActPattern(AgentPattern):
                     response = await runtime.stream_final_answer(call_llm, **llm_kwargs)
             except LLMCallInterrupted:
                 if answer_streamer is not None:
-                    await answer_streamer.fail("interrupted during LLM stream")
+                    await answer_streamer.fail(INTERRUPTED_DURING_LLM_STREAM_REASON)
                 interrupted = await self._interrupt_if_requested(
                     runtime=runtime,
                     context=context,
@@ -795,13 +801,13 @@ class ReActPattern(AgentPattern):
                         context=context,
                         iteration=iteration,
                         answer_streamer=answer_streamer,
-                        stream_failure_message=("invalid tool protocol after recovery"),
+                        stream_failure_message=INVALID_TOOL_PROTOCOL_AFTER_RECOVERY_REASON,
                         empty_final_answer=(
                             self._empty_final_answer_call(normalized) is not None
                         ),
                     )
                 if answer_streamer is not None:
-                    await answer_streamer.fail("invalid tool protocol, retrying")
+                    await answer_streamer.fail(INVALID_TOOL_PROTOCOL_RETRYING_REASON)
                 # Rejecting the whole response drops any assistant preamble it
                 # carried: the response is discarded before ``add_assistant_message``,
                 # so the retry rebuilds from context without it. Deliberate - the
@@ -868,7 +874,7 @@ class ReActPattern(AgentPattern):
                         context=context,
                         iteration=iteration,
                         answer_streamer=answer_streamer,
-                        stream_failure_message="invalid tool protocol after retry",
+                        stream_failure_message=INVALID_TOOL_PROTOCOL_AFTER_RETRY_REASON,
                         empty_final_answer=(
                             self._empty_final_answer_call(normalized) is not None
                         ),
@@ -893,10 +899,7 @@ class ReActPattern(AgentPattern):
                     # The discarded text may already be streaming to the UI.
                     # Nothing downstream closes that stream once the batch no
                     # longer carries a final_answer, so close it here.
-                    await answer_streamer.fail(
-                        "discarded an answer that arrived together with tool "
-                        "calls; answering again once the tools have run"
-                    )
+                    await answer_streamer.fail(DISCARDED_BUNDLED_FINAL_ANSWER_REASON)
             if force_final_answer_now and not normalized.get("tool_calls"):
                 normalized["done"] = True
 
@@ -1067,7 +1070,7 @@ class ReActPattern(AgentPattern):
         if not tool_calls and assistant_content is not None:
             await answer_streamer.finish(str(assistant_content))
             return
-        await answer_streamer.fail("no deliverable final_answer in this batch")
+        await answer_streamer.fail(NO_DELIVERABLE_FINAL_ANSWER_REASON)
 
     def _messages_for_llm(
         self,
@@ -1285,7 +1288,7 @@ class ReActPattern(AgentPattern):
                 on_chunk=answer_streamer.handle_chunk,
             )
         except LLMCallInterrupted:
-            await answer_streamer.fail("interrupted during LLM stream")
+            await answer_streamer.fail(INTERRUPTED_DURING_LLM_STREAM_REASON)
             raise
         except Exception as exc:
             await answer_streamer.fail(str(exc))
