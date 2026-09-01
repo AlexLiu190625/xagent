@@ -66,7 +66,6 @@ const en = {
     errors: {
       unknown: "Unknown error",
       taskFailed: "Something went wrong. Please try again.",
-      connectorRuntimeMissingKey: "This connector still needs a value for \"{key}\".",
       connectorRuntimeMissing: "This connector needs additional runtime input before it can run.",
     },
   },

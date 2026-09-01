@@ -938,11 +938,13 @@ const CONNECTOR_RUNTIME_MISSING_VALUE_CODES = new Set([
   "scheduled_secret_unavailable",
 ])
 
-// The frame deliberately carries no connector identity: its audience includes
-// anonymous widget and share-link visitors. A missing key name parsed out of
-// the reason is the only connector-specific thing available here; anything
-// more (which connector, the declared type of each key) comes from the
-// per-task requirements endpoint, which is owner-only.
+// The frame deliberately carries nothing connector-specific beyond the code:
+// its audience includes anonymous widget and share-link visitors, and the
+// server's reason whitelist admits only fixed strings it controls -- never a
+// reason assembled from a key name the connector's owner declared. Which
+// connector, which key, and each key's declared type all come from the
+// per-task requirements endpoint, which selects on
+// `Task.id == task_id AND Task.user_id == current_user.id`.
 const getTaskErrorProjection = (
   message: WebSocketMessage,
 ): TaskErrorProjection | null => {
@@ -957,16 +959,6 @@ const getTaskErrorProjection = (
       : null
   const reason = getString(details?.reason)
   return { code, details: reason ? { reason } : {} }
-}
-
-// A reason is either a bare enum value or "<prefix>.<declared key name>". Only
-// the second form names a key the user has to fill in.
-const missingRuntimeKeyFromReason = (reason: string | undefined): string | null => {
-  if (!reason) return null
-  const separator = reason.lastIndexOf(".")
-  if (separator < 0) return null
-  const key = reason.slice(separator + 1)
-  return key || null
 }
 
 const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | null => {
@@ -5723,22 +5715,17 @@ export function AppProvider({
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
-        // A missing runtime value is the one failure here the user can fix,
-        // so name the key instead of relaying the server's sentence. The
-        // reason is dropped by the server whitelist whenever it is not a
-        // listed value, which is why the keyless wording has to exist.
-        let connectorRuntimeBubble: string | null = null
-        if (
+        // A missing runtime value is the one failure here the user can act on,
+        // so the bubble says so in the viewer's own language instead of relaying
+        // the server's fixed English sentence. It does not name the missing key:
+        // the key name is configuration the connector's owner wrote, and this
+        // frame reaches anonymous widget and share-link visitors. An owner reads
+        // the key names from the per-task requirements endpoint instead.
+        const connectorRuntimeBubble =
           taskErrorProjection
           && CONNECTOR_RUNTIME_MISSING_VALUE_CODES.has(taskErrorProjection.code)
-        ) {
-          const missingKey = missingRuntimeKeyFromReason(
-            taskErrorProjection.details.reason
-          )
-          connectorRuntimeBubble = missingKey
-            ? t('common.errors.connectorRuntimeMissingKey', { key: missingKey })
-            : t('common.errors.connectorRuntimeMissing')
-        }
+            ? t('common.errors.connectorRuntimeMissing')
+            : null
         const errorBubbleContent = connectorRuntimeBubble
           ?? `${t('agent.logs.event.messages.errorPrefix')} ${websocketErrorMessage}`
 

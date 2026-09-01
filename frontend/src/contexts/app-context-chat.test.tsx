@@ -80,7 +80,10 @@ vi.mock("@/contexts/auth-context", () => ({
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
-  useI18n: () => ({ t: (key: string) => key }),
+  useI18n: () => ({
+    t: (key: string, vars?: Record<string, string | number>) =>
+      vars ? `${key}:${JSON.stringify(vars)}` : key,
+  }),
 }))
 
 vi.mock("@/hooks/use-websocket", () => ({
@@ -5696,52 +5699,9 @@ describe("terminal error frames", () => {
     }
   )
 
-  it("names the missing connector key instead of relaying the server sentence", async () => {
-    render(
-      <AppProvider token="token">
-        <SeedRunningTask />
-        <StateProbe />
-      </AppProvider>
-    )
-
-    const onMessage = webSocketOptions.current?.onMessage
-    expect(onMessage).toBeDefined()
-
-    act(() => {
-      onMessage?.({
-        type: "task_error",
-        timestamp: "2026-05-27T05:00:02Z",
-        task_id: 1,
-        task: { id: 1, status: "failed" },
-        message: "Required connector runtime context is missing.",
-        error: "Required connector runtime context is missing.",
-        code: "missing_runtime_context",
-        details: { reason: "missing_context.auth_token" },
-      } as TestWebSocketMessage)
-    })
-
-    // The i18n mock in this file returns the key and drops the variables, so
-    // the assertion is on which wording was chosen, not on the rendered key
-    // name. The reason the key name is parsed from is asserted below.
-    await waitFor(() => {
-      expect(screen.getByTestId("messages").textContent).toContain(
-        "common.errors.connectorRuntimeMissingKey"
-      )
-    })
-
-    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
-    const bubble = messages.find((m: { content: string }) =>
-      m.content.includes("common.errors.connectorRuntimeMissingKey")
-    )
-    expect(bubble?.isResult).toBe(true)
-    // No prefix: this wording replaces the server sentence rather than
-    // decorating it.
-    expect(bubble?.content).toBe("common.errors.connectorRuntimeMissingKey")
-  })
-
   // A listed reason that is a bare enum value names no key, so the keyless
   // wording is chosen even though the code is a missing-value one.
-  it("falls back to the generic wording when the reason names no key", async () => {
+  it("uses the same wording for a listed bare reason", async () => {
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -5771,14 +5731,24 @@ describe("terminal error frames", () => {
       )
     })
 
-    expect(screen.getByTestId("messages").textContent).not.toContain(
-      "common.errors.connectorRuntimeMissingKey"
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    const bubble = messages.find((m: { content: string }) =>
+      m.content.includes("common.errors.connectorRuntimeMissing")
     )
+    // Same toBe as the test below, on the other input: this branch is reached
+    // with a listed bare reason rather than an empty details, and an
+    // interpolation regression has to be caught on both.
+    expect(bubble?.content).toBe("common.errors.connectorRuntimeMissing")
   })
 
-  // The server drops a reason it cannot place on its whitelist, so the
-  // keyless wording has to exist and the frame still carries the code.
-  it("falls back to the generic wording when the reason was dropped", async () => {
+  // What the server now sends for a missing declared context key: the code
+  // survives, the reason naming the key does not. The bubble therefore says a
+  // value is missing without saying which -- the key name is owner
+  // configuration and this frame reaches anonymous widget and share-link
+  // visitors. Asserted with toBe, under a variable-aware i18n mock: had the
+  // wording interpolated anything, the content would read
+  // "<key>:{...}" and this assertion would fail.
+  it("names no declared key when a runtime value is missing", async () => {
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -5808,9 +5778,15 @@ describe("terminal error frames", () => {
       )
     })
 
-    expect(screen.getByTestId("messages").textContent).not.toContain(
-      "common.errors.connectorRuntimeMissingKey"
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    const bubble = messages.find((m: { content: string }) =>
+      m.content.includes("common.errors.connectorRuntimeMissing")
     )
+    // No prefix: this wording replaces the server sentence rather than
+    // decorating it. Exactly the key, with nothing appended: no variable was
+    // interpolated, so no key name can be in the rendered text.
+    expect(bubble?.content).toBe("common.errors.connectorRuntimeMissing")
+    expect(bubble?.isResult).toBe(true)
   })
 
   // connector_runtime_unavailable reports a server-side component being
@@ -5850,104 +5826,4 @@ describe("terminal error frames", () => {
     )
   })
 
-  // The server sends one fixed sentence per error code, so the message alone
-  // cannot tell two missing keys apart. Inside the 30-second dedup window the
-  // second bubble would vanish and the surviving one would name whichever key
-  // failed first -- one value standing for two facts, which is the shape this
-  // whole change exists to remove.
-  it("keeps both bubbles when two turns miss two different keys", async () => {
-    render(
-      <AppProvider token="token">
-        <SeedRunningTask />
-        <StateProbe />
-      </AppProvider>
-    )
-
-    const onMessage = webSocketOptions.current?.onMessage
-    expect(onMessage).toBeDefined()
-
-    const frameForKey = (reason: string, timestamp: string) => ({
-      type: "task_error",
-      timestamp,
-      task_id: 1,
-      task: { id: 1, status: "failed" },
-      // Identical on both frames: _message_for_code returns one string per
-      // code and does not vary with the reason.
-      message: "Required connector runtime context is missing.",
-      error: "Required connector runtime context is missing.",
-      code: "missing_runtime_context",
-      details: { reason },
-    }) as TestWebSocketMessage
-
-    act(() => {
-      onMessage?.(frameForKey("missing_context.auth_token", "2026-05-27T05:00:02Z"))
-    })
-    await waitFor(() => {
-      expect(screen.getByTestId("messages").textContent).toContain(
-        "common.errors.connectorRuntimeMissingKey"
-      )
-    })
-
-    act(() => {
-      onMessage?.(frameForKey("missing_context.tenant_id", "2026-05-27T05:00:03Z"))
-    })
-
-    await waitFor(() => {
-      const messages = JSON.parse(
-        screen.getByTestId("messages").textContent || "[]"
-      )
-      const bubbles = messages.filter((m: { content: string }) =>
-        m.content.includes("common.errors.connectorRuntimeMissingKey")
-      )
-      expect(bubbles).toHaveLength(2)
-    })
-  })
-
-  // The other half of the same contract: a genuine repeat of one failure is
-  // still collapsed, so the identity did not simply disable deduplication.
-  it("still collapses a repeat of the same missing key", async () => {
-    render(
-      <AppProvider token="token">
-        <SeedRunningTask />
-        <StateProbe />
-      </AppProvider>
-    )
-
-    const onMessage = webSocketOptions.current?.onMessage
-    expect(onMessage).toBeDefined()
-
-    const frame = {
-      type: "task_error",
-      timestamp: "2026-05-27T05:00:02Z",
-      task_id: 1,
-      task: { id: 1, status: "failed" },
-      message: "Required connector runtime context is missing.",
-      error: "Required connector runtime context is missing.",
-      code: "missing_runtime_context",
-      details: { reason: "missing_context.auth_token" },
-    } as TestWebSocketMessage
-
-    act(() => {
-      onMessage?.(frame)
-    })
-    await waitFor(() => {
-      expect(screen.getByTestId("messages").textContent).toContain(
-        "common.errors.connectorRuntimeMissingKey"
-      )
-    })
-
-    act(() => {
-      onMessage?.({ ...frame, timestamp: "2026-05-27T05:00:03Z" })
-    })
-
-    await waitFor(() => {
-      const messages = JSON.parse(
-        screen.getByTestId("messages").textContent || "[]"
-      )
-      const bubbles = messages.filter((m: { content: string }) =>
-        m.content.includes("common.errors.connectorRuntimeMissingKey")
-      )
-      expect(bubbles).toHaveLength(1)
-    })
-  })
 })
