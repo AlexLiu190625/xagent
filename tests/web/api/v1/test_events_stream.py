@@ -3349,11 +3349,78 @@ async def test_replay_watermark_excludes_a_row_committed_after_registration():
     assert sink.queue.empty()  # exactly once -- no duplicate from replay
 
 
+async def test_a_planning_row_folded_twice_in_the_residual_window_leaves_one_step_running():
+    """Pins the accepted residual of registering before reading the
+    watermark, so it cannot drift silently. Tracked as #1776.
+
+    A row that commits inside the registration-to-watermark gap is both
+    at or below the watermark (so the replay folds it) and already
+    staged (so ``finish_warm_up``'s drain folds it again). This test
+    builds that same end state directly: insert the row, capture a
+    watermark above it, then hand the sink the row's broadcast while it
+    is still cold.
+
+    The planning family is the one that cannot absorb it. Its public
+    step id comes from an in-memory counter rather than from a key the
+    event carries, so two folds mint two different ids, and the row's
+    single end event -- arriving live, after the handoff -- closes only
+    the later one. The earlier step stays ``running`` for the rest of
+    the connection.
+
+    Asserting the duplicate is deliberate. Exactly one start with its
+    matching completion is the acceptance test for #1776, and it
+    belongs with the fix that carries a persisted identity onto
+    broadcast frames.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="dag_plan_start",
+        event_id="gap-plan",
+        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        data={},
+    )
+    watermark = v1_tasks._load_task_steps_version_snapshot(
+        task_id, principal
+    ).max_event_id
+
+    sink = _make_sink(task_id=task_id, warm=False)
+    await sink.send_text(_trace_event_frame("dag_plan_start", task_id=task_id, data={}))
+    assert sink.staged_message_count == 1
+
+    warmed_projector, warm_up_frames = es._build_warm_up_frames(
+        task_id, principal, v1_tasks._load_task_steps_snapshot, watermark
+    )
+    replayed = json.loads(warm_up_frames[0].split("data: ", 1)[1])["step"]
+
+    sink.finish_warm_up(warmed_projector)
+    drained_text, _ = sink.queue.get_nowait()
+    drained = json.loads(drained_text.split("data: ", 1)[1])["step"]
+
+    # One row, two public ids: the counter advanced on each fold.
+    assert drained["id"] != replayed["id"]
+    assert drained["status"] == "running"
+
+    await sink.send_text(_trace_event_frame("dag_plan_end", task_id=task_id, data={}))
+    completed_text, _ = sink.queue.get_nowait()
+    completed = json.loads(completed_text.split("data: ", 1)[1])["step"]
+    # The single end event closes only the later id; the replayed one is
+    # never finalized.
+    assert completed["id"] == drained["id"]
+    assert completed["status"] == "completed"
+    assert sink.queue.empty()
+
+
 async def test_generate_wires_read_task_steps_version_into_the_watermark(monkeypatch):
     """Wiring smoke test through the real generator (not just the
     ``_build_warm_up_frames`` unit above): ``read_task_steps_version``
-    passed into ``_generate`` is actually called once, right after
-    registration, and its result reaches ``_build_warm_up_frames`` as
+    passed into ``_generate`` is actually called exactly once, and by
+    the time it runs the sink is already visible in ``manager`` --
+    proof that registration happened first, not just that the reader
+    ran once -- and its result reaches ``_build_warm_up_frames`` as
     ``replay_watermark`` -- catches a signature/plumbing regression the
     sink-level test above wouldn't (it calls ``_build_warm_up_frames``
     directly, bypassing ``_generate`` entirely)."""
@@ -3370,11 +3437,25 @@ async def test_generate_wires_read_task_steps_version_into_the_watermark(monkeyp
         data={"tool_call_id": "call-1", "tool_name": "search", "tool_args": {}},
     )
 
-    calls: list[int] = []
+    calls: list[str] = []
     original = v1_tasks._load_task_steps_version_snapshot
 
     def _tracking_version_reader(task_id_, principal_):
-        calls.append(1)
+        # Ordering-sensitive on purpose: the sink only becomes visible
+        # in the manager once ``register_connection`` has run, so a
+        # reader moved ahead of registration records "unregistered"
+        # here and fails the assertion below. A count alone cannot see
+        # that, and the order is load-bearing -- registering second
+        # turns the gap this reader bounds from a duplicated row into a
+        # lost one.
+        calls.append(
+            "registered"
+            if any(
+                isinstance(c, es.V1EventStreamSink)
+                for c in es.manager.connections_for_task(task_id_)
+            )
+            else "unregistered"
+        )
         return original(task_id_, principal_)
 
     snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
@@ -3393,7 +3474,7 @@ async def test_generate_wires_read_task_steps_version_into_the_watermark(monkeyp
         assert "event: task.status" in first
         second = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
         assert second.startswith("event: step.started\n")
-        assert calls == [1]  # the version reader ran exactly once
+        assert calls == ["registered"]  # ran exactly once, and after registration
     finally:
         await resp.body_iterator.aclose()
 
@@ -3809,16 +3890,23 @@ def test_attach_step_batch_bounds_match_the_documented_endpoint_contract():
     Pinning the two module constants alone does not do that: a constant
     can drift out of sync with the docstring's own hardcoded numbers
     without either assertion below ever noticing, since neither reads
-    the docstring. The two assertions on ``__doc__`` close that gap by
-    checking the actual literal text the endpoint's real docstring
-    still carries, not just this module's own copies of the numbers.
+    the docstring. The assertions on ``__doc__`` close that gap by
+    pinning the authoritative passage's exact wording and requiring
+    each number to appear exactly once across the whole docstring, so a
+    second copy reappearing elsewhere -- the failure mode a bare
+    membership check cannot see -- fails the count.
     """
     assert es.REPLAY_MAX_STEPS == 512
     assert es.MAX_SNAPSHOT_WIRE_BYTES == 4 * 1024 * 1024
 
     endpoint_doc = v1_tasks.stream_chat_task_events.__doc__ or ""
-    assert "512" in endpoint_doc
-    assert "4 MiB" in endpoint_doc
+    assert "a step-count cap (512) keeps the most recent steps" in endpoint_doc
+    assert "total-wire-bytes budget (4 MiB)" in endpoint_doc
+    # Exactly one passage carries each number. A second copy is what
+    # lets one of them drift while the other stays right, so the count
+    # is part of the contract this test pins, not incidental.
+    assert endpoint_doc.count("512") == 1
+    assert endpoint_doc.count("4 MiB") == 1
 
 
 @pytest.mark.parametrize(
