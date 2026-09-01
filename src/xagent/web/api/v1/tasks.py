@@ -1372,7 +1372,11 @@ async def stream_chat_task_events(
       replay, and once more as a live broadcast that carries no
       persisted id to dedupe it against -- which can push a live
       planning-cycle count out of step with ``steps()`` from that point
-      on. Trying to actively correlate a step id across either of these
+      on. A planning step opened inside that window can also be left at
+      ``status: "running"`` for the rest of the connection: the row is
+      folded twice, so it produces two public step ids, and the row's
+      single end event closes only the later one. Tracked as #1776.
+      Trying to actively correlate a step id across either of these
       two live cases corrupts client state rather than merely missing a
       match. These live ids are stable within one connection and nowhere
       else: a re-attach after ``stream_expired`` (the 1-hour cap) or
@@ -1441,11 +1445,10 @@ async def stream_chat_task_events(
         later has a start to pair with and reaches the client as
         ``step.completed`` rather than being dropped as an orphan.
       - The replay is bounded, and a client must not treat it as the
-        task's complete history. It is capped in series: at most 512
-        steps, then at most 4 MiB of serialized step frames over that
-        window (the same two bounds the fast paths' snapshot uses,
-        applied in the same order; see ``step.started``/``step.completed``
-        above for which end of the window each one drops). A task with
+        task's complete history. It carries the same two caps, applied
+        in the same order, that ``step.started``/``step.completed``
+        above states for every attach-time batch, including which end
+        of the window each one drops. A task with
         more history than that gets a partial replay, with no marker
         frame saying so, and a replay can legitimately be empty. This is
         a bound, not a failure:

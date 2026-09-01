@@ -2792,8 +2792,13 @@ async def _generate(
         # single end event can only close the second, later id. That step
         # is left stuck at ``status="running"`` for the rest of the
         # connection -- the same symptom this warm-up replay exists to
-        # eliminate, reintroduced in this one residual window. A task
-        # deleted in the gap
+        # eliminate, reintroduced in this one residual window.
+        # Tracked as #1776: removing this window needs the broadcast
+        # producer to carry the originating trace event's persisted
+        # identity onto live frames, which is a change in
+        # ``api/websocket.py`` and visible to every consumer of that
+        # broadcast, not just this stream.
+        # A task deleted in the gap
         # between attach and this read closes the stream the same way
         # the watchdog would for the same race, instead of raising out of
         # the generator. Any other failure here -- a transient DB error,
