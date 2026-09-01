@@ -3479,26 +3479,103 @@ async def test_generate_wires_read_task_steps_version_into_the_watermark(monkeyp
         await resp.body_iterator.aclose()
 
 
-async def test_a_task_deleted_during_the_watermark_read_closes_with_task_deleted():
-    """The watermark read re-resolves the task in its own session, so a
-    delete landing while it is in flight raises ``TASK_NOT_FOUND`` into
-    this generator's handler -- before the watchdog exists, so nothing
-    later can correct the code. The client must be told the task is
-    gone, not told to call ``steps()`` and re-attach, which can only
-    404 for a row that no longer exists."""
+def _delete_the_task_then_read_the_watermark(task_id_, principal_):
+    """The race this split exists for: a supported DELETE removes the
+    row while this read is in flight, so the production reader's own
+    ``_resolve_task_or_404`` raises ``V1ApiError(TASK_NOT_FOUND)``. The
+    delete is real and the reader is the production one -- nothing
+    about the ``TASK_NOT_FOUND`` reaching the handler is synthesized."""
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id_).delete()
+        db.commit()
+    finally:
+        db.close()
+    return v1_tasks._load_task_steps_version_snapshot(task_id_, principal_)
+
+
+def _fail_the_watermark_read_transiently(task_id_, principal_):
+    """A failure that is not the task being gone.
+
+    A bare ``RuntimeError`` rather than a ``V1ApiError`` carrying some
+    other code, deliberately. The guard being pinned is
+    ``isinstance(exc, V1ApiError) and exc.code is TASK_NOT_FOUND``, and
+    this exercises the ``isinstance`` half: it is the shape a
+    driver-level or connection-level database failure actually reaches
+    this handler as, and the shape the comment above the handler names
+    when it says "a transient DB error". The task row is untouched and
+    still readable, which is exactly why ``resync_required`` -- call
+    ``steps()``, re-attach -- is the recovery that works here and
+    ``task_deleted`` is not."""
+    raise RuntimeError("transient database failure")
+
+
+def _fail_the_watermark_read_with_a_different_v1_api_error(task_id_, principal_):
+    """A ``V1ApiError`` that is not ``TASK_NOT_FOUND``.
+
+    Pins the other half of the guard: ``isinstance(exc, V1ApiError) and
+    exc.code is TASK_NOT_FOUND``. The two legs above only exercise the
+    ``isinstance`` half -- a bare ``RuntimeError`` is never a
+    ``V1ApiError`` in the first place, so a guard loosened to just
+    ``isinstance(exc, V1ApiError)`` would still pass both of them. This
+    leg is the one that would catch that: a rate-limited read is a real
+    ``V1ApiError``, but its code is not ``TASK_NOT_FOUND``, so this
+    close must still be ``resync_required`` -- the task itself is fine,
+    only this one read was throttled."""
+    raise V1ApiError(V1ErrorCode.RATE_LIMITED, 429)
+
+
+@pytest.mark.parametrize(
+    ("read_task_steps_version", "expected_code"),
+    [
+        pytest.param(
+            _delete_the_task_then_read_the_watermark,
+            "task_deleted",
+            id="task-deleted",
+        ),
+        pytest.param(
+            _fail_the_watermark_read_transiently,
+            "resync_required",
+            id="transient-read-failure",
+        ),
+        pytest.param(
+            _fail_the_watermark_read_with_a_different_v1_api_error,
+            "resync_required",
+            id="other-v1-api-error",
+        ),
+    ],
+)
+async def test_the_watermark_read_splits_task_deleted_from_every_other_failure(
+    read_task_steps_version, expected_code
+):
+    """The watermark read's handler classifies by cause, and every half
+    of that split is load-bearing.
+
+    This read re-resolves the task in its own session, so a delete
+    landing while it is in flight raises ``TASK_NOT_FOUND`` into the
+    handler. That close is claimed before the watchdog exists, so
+    nothing later can correct the code, and a client told to call
+    ``steps()`` and re-attach for a row that no longer exists only gets
+    a 404 back.
+
+    The other two legs matter just as much, and are the ones a
+    collapsed or loosened guard breaks silently: a failure that is not
+    the task being gone must still close with ``resync_required``,
+    because the task is there and resynchronizing does work -- whether
+    that failure is not a ``V1ApiError`` at all, or is a ``V1ApiError``
+    whose code is not ``TASK_NOT_FOUND``.
+
+    ``_long_intervals()`` keeps the watchdog asleep for the whole test,
+    so the close frame either leg observes can only be the one this
+    handler queued -- not the watchdog independently discovering the
+    same deleted row. Either way the warm-up block is skipped
+    (``replay_watermark`` stays ``None``), so no history reaches the
+    client from this attach; that is what the ``step.started``
+    assertion pins."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id)
     principal = _principal_for(full_key)
     snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
-
-    def _deleting_version_reader(task_id_, principal_):
-        db = _direct_db_session()
-        try:
-            db.query(Task).filter(Task.id == task_id_).delete()
-            db.commit()
-        finally:
-            db.close()
-        return v1_tasks._load_task_steps_version_snapshot(task_id_, principal_)
 
     resp = await es.build_event_stream_response(
         task_id=task_id,
@@ -3507,14 +3584,15 @@ async def test_a_task_deleted_during_the_watermark_read_closes_with_task_deleted
         read_task_snapshot=v1_tasks._load_task_info_snapshot,
         read_task_steps=v1_tasks._load_task_steps_snapshot,
         read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
-        read_task_steps_version=_deleting_version_reader,
+        read_task_steps_version=read_task_steps_version,
         **_long_intervals(),
     )
     frames = []
-    async for chunk in resp.body_iterator:
+    async for chunk in asyncio_timeout_iter(resp.body_iterator, timeout=2):
         frames.append(chunk)
     body = "".join(frames)
-    assert _parse_error_frame(body)["code"] == "task_deleted"
+    assert "event: task.status" in body
+    assert _parse_error_frame(body)["code"] == expected_code
     assert "event: step.started" not in body
 
 

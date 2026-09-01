@@ -2798,17 +2798,17 @@ async def _generate(
         # identity onto live frames, which is a change in
         # ``api/websocket.py`` and visible to every consumer of that
         # broadcast, not just this stream.
-        # A task deleted in the gap
-        # between attach and this read closes the stream the same way
-        # the watchdog would for the same race, instead of raising out of
-        # the generator. Any other failure here -- a transient DB error,
-        # a bug in the projector fold -- gets the same ``resync_required``
-        # close every other overload/backlog condition in this module
-        # gets, instead of letting the exception propagate out of the
-        # generator and leave the client with a response that just stops,
-        # no close frame at all: that would break this module's own
-        # invariant that a close frame is always how a client tells "the
-        # task ended" apart from "the stream ended".
+        # A task deleted in the gap between attach and this read closes
+        # the stream the same way the watchdog would for the same race,
+        # instead of raising out of the generator. Any other failure
+        # here -- a transient DB error, a bug in the projector fold --
+        # gets the same ``resync_required`` close every other
+        # overload/backlog condition in this module gets, instead of
+        # letting the exception propagate out of the generator and
+        # leave the client with a response that just stops, no close
+        # frame at all: that would break this module's own invariant
+        # that a close frame is always how a client tells "the task
+        # ended" apart from "the stream ended".
         # Skipped when the watermark read above already failed and
         # closed the stream (for resync, or as ``task_deleted``):
         # there is no watermark to bound this read to, and the close
