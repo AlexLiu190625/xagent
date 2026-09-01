@@ -17,12 +17,16 @@ duplicate a third).
 
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
+
 import pytest
 import sqlalchemy as sa
 from sqlalchemy import text
 
 from tests.shared.postgres_disposable import disposable_database_factory
-from xagent.web.models.database import Base
+from xagent.web.models.database import Base, _initialize_database_schema
 from xagent.web.models.task import (
     TaskStatus,
     TaskStatusEnumDriftError,
@@ -36,17 +40,30 @@ def _label_list_sql(labels: list[str]) -> str:
     return ", ".join(f"'{label}'" for label in labels)
 
 
-def _create_taskstatus_type_and_table(conn: sa.Connection, labels: list[str]) -> None:
-    """Minimal ``taskstatus`` enum plus a ``tasks`` table using it -- enough
-    for ``check_task_status_enum_drift`` to see (it only queries
-    ``pg_catalog`` for a type literally named ``taskstatus`` and calls
-    ``has_table("tasks")``), without going through the full ``Task`` ORM
-    schema this check has no other dependency on."""
-    conn.execute(text(f"CREATE TYPE taskstatus AS ENUM ({_label_list_sql(labels)})"))
+def _create_taskstatus_type(
+    conn: sa.Connection, labels: list[str], schema: str | None = None
+) -> None:
+    """A ``taskstatus`` enum carrying exactly ``labels``, in ``schema`` when
+    one is named and in whatever ``search_path`` picks otherwise."""
+    qualified = f"{schema}.taskstatus" if schema else "taskstatus"
+    conn.execute(text(f"CREATE TYPE {qualified} AS ENUM ({_label_list_sql(labels)})"))
+
+
+def _create_taskstatus_type_and_table(
+    conn: sa.Connection, labels: list[str], schema: str | None = None
+) -> None:
+    """Minimal ``taskstatus`` enum plus a ``tasks`` table whose ``status``
+    column is declared with it -- enough for ``check_task_status_enum_drift``
+    to see (it resolves ``tasks``, reads the type of that table's ``status``
+    column, and lists that type's labels), without going through the full
+    ``Task`` ORM schema this check has no other dependency on."""
+    _create_taskstatus_type(conn, labels, schema)
+    prefix = f"{schema}." if schema else ""
+    type_name = f"{schema}.taskstatus" if schema else "taskstatus"
     conn.execute(
         text(
-            "CREATE TABLE tasks (id SERIAL PRIMARY KEY, "
-            f"status taskstatus NOT NULL DEFAULT '{labels[0]}')"
+            f"CREATE TABLE {prefix}tasks (id SERIAL PRIMARY KEY, "
+            f"status {type_name} NOT NULL DEFAULT '{labels[0]}')"
         )
     )
 
@@ -89,7 +106,10 @@ def test_pg_enum_missing_label_raises(postgresql_engine_factory) -> None:
     message = str(exc_info.value)
     assert missing_label in message
     assert "pending migration" in message
-    assert "unexpected" not in message.split("missing labels")[0]
+    # Exclusive, not merely present: the combined branch also says "pending
+    # migration", so only the absence of its own wording distinguishes them.
+    assert "unexpected label(s) indicate" not in message
+    assert "DROP VALUE" not in message
 
 
 @pytest.mark.postgresql
@@ -105,8 +125,13 @@ def test_pg_enum_extra_label_raises(postgresql_engine_factory) -> None:
 
     message = str(exc_info.value)
     assert extra_label in message
+    assert "No migration can remove them" in message
     assert "ALTER TYPE" in message
     assert "DROP VALUE" in message
+    # The combined branch carries ALTER TYPE and DROP VALUE too, so those
+    # alone cannot tell the two apart; these two exclusions can.
+    assert "pending migration" not in message
+    assert "unexpected label(s) indicate" not in message
 
 
 @pytest.mark.postgresql
@@ -192,54 +217,209 @@ def test_sqlite_backend_never_reaches_the_catalog_query(
 
 
 @pytest.mark.postgresql
-def test_search_path_schema_with_extra_labels_does_not_reject_correct_deployment(
+def test_shadow_type_first_on_search_path_does_not_mask_a_missing_label(
     postgresql_engine_factory,
 ) -> None:
-    """A same-named ``taskstatus`` type in a schema later on the search path,
-    carrying labels this database's real type does not have, must not make
-    a correct deployment look drifted. Without the ``pg_type_is_visible``
-    narrowing, the raw label join across both schemas would surface the
-    other schema's extra label as if it belonged to the resolved type.
+    """``search_path = shadow, app``: ``shadow`` holds a complete
+    ``taskstatus`` and no ``tasks`` at all, while the ``tasks`` that does
+    resolve lives in ``app`` and its ``status`` column is missing a label.
+    Relation visibility and type visibility are separate resolutions in
+    PostgreSQL, so a check that finds the type by name reads ``shadow``'s
+    complete copy, sees no drift, and lets the process start against a
+    database whose next write of that label will fail.
+
+    The assertion names the missing label exactly rather than merely
+    looking for it in the message: with the application schema deliberately
+    somewhere other than ``public``, hard-coding a schema onto the
+    ``to_regclass`` argument would resolve nothing, report every member as
+    missing, and still contain this label.
     """
-    engine = postgresql_engine_factory("visible_extra")
+    engine = postgresql_engine_factory("shadow_masks")
+    missing_label = _ALL_LABELS[-1]
     with engine.begin() as conn:
-        conn.execute(text("CREATE SCHEMA other_app"))
-        conn.execute(text("SET search_path TO other_app"))
-        conn.execute(
-            text(
-                "CREATE TYPE taskstatus AS ENUM "
-                f"({_label_list_sql([*_ALL_LABELS, 'SHADOWED_EXTRA'])})"
-            )
-        )
-        conn.execute(text("SET search_path TO public"))
-        _create_taskstatus_type_and_table(conn, _ALL_LABELS)
+        conn.execute(text("CREATE SCHEMA shadow"))
+        conn.execute(text("CREATE SCHEMA app"))
+        _create_taskstatus_type(conn, _ALL_LABELS, schema="shadow")
+        _create_taskstatus_type_and_table(conn, _ALL_LABELS[:-1], schema="app")
 
     with engine.connect() as conn:
-        conn.execute(text("SET search_path TO public"))
-        check_task_status_enum_drift(conn)  # must not raise
-
-
-@pytest.mark.postgresql
-def test_search_path_schema_with_complete_copy_does_not_mask_missing_label_here(
-    postgresql_engine_factory,
-) -> None:
-    """The inverse: a complete, correct copy of the type sitting in a schema
-    that is *not* first on the search path must not hide a genuinely
-    incomplete type in the schema that is. Without the visibility
-    narrowing, the join across both schemas would produce the full label
-    set and mask the drift this check exists to catch.
-    """
-    engine = postgresql_engine_factory("visible_masked")
-    with engine.begin() as conn:
-        conn.execute(text("CREATE SCHEMA complete_copy"))
-        conn.execute(text("SET search_path TO complete_copy"))
-        _create_taskstatus_type_and_table(conn, _ALL_LABELS)
-        conn.execute(text("SET search_path TO public"))
-        _create_taskstatus_type_and_table(conn, _ALL_LABELS[:-1])
-
-    with engine.connect() as conn:
-        conn.execute(text("SET search_path TO public"))
+        conn.execute(text("SET search_path TO shadow, app"))
         with pytest.raises(TaskStatusEnumDriftError) as exc_info:
             check_task_status_enum_drift(conn)
 
-    assert _ALL_LABELS[-1] in str(exc_info.value)
+    message = str(exc_info.value)
+    assert f"missing labels ['{missing_label}']" in message
+    assert "unexpected labels []" in message
+
+
+@pytest.mark.postgresql
+def test_shadow_type_first_on_search_path_does_not_reject_a_correct_column(
+    postgresql_engine_factory,
+) -> None:
+    """The other direction of the same asymmetry: ``shadow`` is first on
+    the search path and holds a ``taskstatus`` carrying a label this
+    application does not know, but no ``tasks``; the ``tasks`` that
+    resolves is in ``app`` and its ``status`` column's type is exactly
+    right. Finding the type by name would read ``shadow``'s copy and
+    refuse to start a correct deployment.
+    """
+    engine = postgresql_engine_factory("shadow_rejects")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA shadow"))
+        conn.execute(text("CREATE SCHEMA app"))
+        _create_taskstatus_type(conn, [*_ALL_LABELS, "SHADOWED_EXTRA"], schema="shadow")
+        _create_taskstatus_type_and_table(conn, _ALL_LABELS, schema="app")
+
+    with engine.connect() as conn:
+        conn.execute(text("SET search_path TO shadow, app"))
+        check_task_status_enum_drift(conn)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Startup wiring. Every cell above calls check_task_status_enum_drift
+# directly, so none of them can observe whether startup still calls it.
+# ---------------------------------------------------------------------------
+
+_CHECK_NAME = "check_task_status_enum_drift"
+
+
+def _calls_named(node: ast.AST, name: str) -> list[ast.Call]:
+    """Every call to ``name`` anywhere under ``node``, matching a bare name
+    (``check_task_status_enum_drift(...)``) and an attribute tail
+    (``Base.metadata.create_all(...)``) alike."""
+    found: list[ast.Call] = []
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        func = child.func
+        if isinstance(func, ast.Name) and func.id == name:
+            found.append(child)
+        elif isinstance(func, ast.Attribute) and func.attr == name:
+            found.append(child)
+    return found
+
+
+def _statement_blocks(tree: ast.AST) -> list[list[ast.stmt]]:
+    """Every statement list in ``tree`` -- one per suite, so a statement's
+    position relative to its own block's other statements can be read."""
+    blocks: list[list[ast.stmt]] = []
+    for node in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(node, field, None)
+            if isinstance(block, list) and block and isinstance(block[0], ast.stmt):
+                blocks.append(block)
+    return blocks
+
+
+def _calls_in_own_scope(statement: ast.stmt, name: str) -> list[ast.Call]:
+    """Calls to ``name`` reachable from ``statement`` without descending into
+    any suite it owns (``body``/``orelse``/``finalbody``) -- so a bare
+    ``try_upgrade_db(...)`` line matches, but a ``with`` or ``if`` that
+    merely contains such a call somewhere inside it does not.
+
+    ``_statement_blocks`` returns every suite in the function, including the
+    function's own top-level suite, which contains the ``with
+    database_startup_lock(...)`` statement as a single statement. A loose,
+    fully recursive call search (``_calls_named``) matches that one
+    statement for both ``try_upgrade_db`` and ``check_task_status_enum_drift``
+    at once -- they are both nested somewhere inside its body -- which
+    collapses the two calls to the same index and can never show one after
+    the other. Selecting the ``with`` statement's own suite (the block whose
+    statements make the calls directly) needs this narrower match.
+    """
+    found: list[ast.Call] = []
+
+    def visit(node: ast.AST) -> None:
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (isinstance(func, ast.Name) and func.id == name) or (
+                isinstance(func, ast.Attribute) and func.attr == name
+            ):
+                found.append(node)
+        for field, value in ast.iter_fields(node):
+            if field in ("body", "orelse", "finalbody"):
+                continue
+            if isinstance(value, ast.AST):
+                visit(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, ast.AST):
+                        visit(item)
+
+    visit(statement)
+    return found
+
+
+def test_startup_initializer_still_runs_the_drift_check() -> None:
+    """``_initialize_database_schema`` (``models/database.py``) is this
+    check's only production caller, and nothing else in the test suite can
+    see it: every cell above calls the checker directly, the initializer
+    test in tests/migration/test_migration.py drives a ``MagicMock`` engine
+    whose dialect is not PostgreSQL (so the checker returns before reading
+    anything), and the startup tests monkeypatch ``init_db`` and never
+    enter the initializer at all. Deleting the call, moving it ahead of the
+    migrations it depends on, dropping it from one of the two return
+    paths, or wrapping it in a ``try``/``except`` would leave all of those
+    green while the process stopped refusing to serve on a drifted enum.
+
+    Read off the source rather than by driving the initializer: all four of
+    those are properties of the call site's shape, which the syntax tree
+    answers directly, and standing up a PostgreSQL-shaped engine, a startup
+    lock, a migration runner and a seed path just to watch one call would
+    make this test more fragile than the four lines it protects.
+    """
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(_initialize_database_schema)))
+
+    # (1) Called, and on every path that returns.
+    assert _calls_named(tree, _CHECK_NAME), (
+        f"_initialize_database_schema no longer calls {_CHECK_NAME}: startup "
+        "would begin serving against a database whose taskstatus enum has "
+        "drifted from TaskStatus"
+    )
+    for block in _statement_blocks(tree):
+        for index, statement in enumerate(block):
+            if not any(isinstance(n, ast.Return) for n in ast.walk(statement)):
+                continue
+            assert any(
+                _calls_named(earlier, _CHECK_NAME) for earlier in block[: index + 1]
+            ), (
+                "_initialize_database_schema returns without having run "
+                f"{_CHECK_NAME} on that path (source line "
+                f"{statement.lineno} of the function)"
+            )
+
+    # (2) Not inside a try block, where a handler could swallow the refusal.
+    for try_node in (n for n in ast.walk(tree) if isinstance(n, ast.Try)):
+        assert not [
+            call
+            for statement in try_node.body
+            for call in _calls_named(statement, _CHECK_NAME)
+        ], (
+            f"{_CHECK_NAME} sits inside a try block: a handler there can "
+            "swallow TaskStatusEnumDriftError and let startup continue"
+        )
+
+    # (3) After the migrations and the schema creation it reads the result of.
+    lock_body = next(
+        block
+        for block in _statement_blocks(tree)
+        if any(_calls_in_own_scope(statement, "try_upgrade_db") for statement in block)
+    )
+
+    def first_index(name: str) -> int:
+        for index, statement in enumerate(lock_body):
+            if _calls_named(statement, name):
+                return index
+        raise AssertionError(f"{name} is no longer called under the startup lock")
+
+    check_index = first_index(_CHECK_NAME)
+    assert check_index > first_index("try_upgrade_db"), (
+        f"{_CHECK_NAME} runs before try_upgrade_db: a migration that adds a "
+        "TaskStatus label with ALTER TYPE ... ADD VALUE would then trip this "
+        "check into a startup crash loop"
+    )
+    assert check_index > first_index("create_all"), (
+        f"{_CHECK_NAME} runs before Base.metadata.create_all: a fresh "
+        "database would have no taskstatus type yet"
+    )

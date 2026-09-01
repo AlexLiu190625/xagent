@@ -88,20 +88,30 @@ def check_task_status_enum_drift(bind: Connection) -> None:
     must not begin serving at all.
 
     Keyed on the ``tasks`` table's existence rather than on an empty live
-    label set: ``taskstatus`` is the type of ``tasks.status``, so "``tasks``
-    is present but ``taskstatus`` is not" produces the same empty set as
-    "nothing has been created yet" while being exactly the drift this check
-    exists to catch. Callers that run schema creation first (the startup path
-    does) always find ``tasks`` present; the guard covers a caller that
-    passes a bind whose schema has not been created.
+    label set, because two different situations produce that same empty
+    set and only one of them is drift. "Nothing has been created yet" is
+    not; "``tasks`` is present and its ``status`` column yields no enum
+    labels" is, and it stays caught: the column is gone (``DROP TYPE ...
+    CASCADE`` takes the column with the type), or ``status`` is not an
+    enum column at all. Both of those report every ``TaskStatus`` member
+    as missing and refuse to serve, which is the direction to fail in.
+    Callers that run schema creation first (the startup path does) always
+    find ``tasks`` present; the guard covers a caller that passes a bind
+    whose schema has not been created.
 
-    Resolves ``taskstatus`` the way an unqualified name resolves at runtime:
-    ``pg_type_is_visible`` narrows the label set to the single type the
-    connection's ``search_path`` picks, the same schema the
-    ``has_table("tasks")`` call above already resolves against. Without that
-    narrowing every same-named enum in the database joins the result -- extra
-    labels on a copy in another schema would reject a correct deployment, and
-    a complete copy there would hide a label genuinely missing here.
+    Reads the labels off ``tasks.status``'s own type rather than off
+    whichever type happens to be named ``taskstatus``. ``to_regclass``
+    resolves the unqualified ``tasks`` exactly as the ``has_table("tasks")``
+    guard above does, ``pg_attribute`` names the column, and ``atttypid``
+    is the type that column is declared with -- one resolution, not two
+    that can disagree. Matching on the type name would be the second,
+    independent one: PostgreSQL resolves relation names and type names
+    against ``search_path`` separately, so with ``search_path = shadow,
+    public``, a ``shadow.taskstatus`` and a ``public.tasks`` whose column
+    uses ``public.taskstatus`` send the two lookups to different schemas.
+    A complete copy in ``shadow`` would then hide a label genuinely missing
+    from the type the column uses, and an extra label on that copy would
+    reject a correct deployment.
     """
 
     if bind.dialect.name != "postgresql":
@@ -113,10 +123,11 @@ def check_task_status_enum_drift(bind: Connection) -> None:
     live_labels = set(
         bind.scalars(
             text(
-                "SELECT e.enumlabel FROM pg_catalog.pg_type t "
-                "JOIN pg_catalog.pg_enum e ON t.oid = e.enumtypid "
-                "WHERE t.typname = 'taskstatus' "
-                "AND pg_catalog.pg_type_is_visible(t.oid)"
+                "SELECT e.enumlabel "
+                "FROM pg_catalog.pg_attribute a "
+                "JOIN pg_catalog.pg_enum e ON e.enumtypid = a.atttypid "
+                "WHERE a.attrelid = pg_catalog.to_regclass('tasks') "
+                "AND a.attname = 'status'"
             )
         )
     )
