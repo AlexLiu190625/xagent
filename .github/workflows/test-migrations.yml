@@ -181,7 +181,7 @@ jobs:
 
       - name: Set up Python
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -266,7 +266,7 @@ jobs:
 
       - name: Set up Python
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 

@@ -298,7 +298,7 @@ jobs:
           python3 -m uv sync --group dev
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: 'npm'
@@ -380,7 +380,7 @@ jobs:
 
       - name: Setup Node.js
         if: needs.changes.outputs.code == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
 
@@ -550,7 +550,7 @@ jobs:
 
       - name: Setup Node.js
         if: needs.changes.outputs.code == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
 
@@ -698,7 +698,7 @@ jobs:
 
       - name: Setup Node.js
         if: needs.changes.outputs.code == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
 
@@ -796,7 +796,7 @@ jobs:
 
       - name: Setup Node.js
         if: needs.changes.outputs.frontend == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
@@ -804,7 +804,7 @@ jobs:
 
       - name: Setup Python
         if: needs.changes.outputs.frontend == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
