@@ -375,6 +375,58 @@ def update_custom_api(
         )
     api = current_api
 
+    if writes_definition_row:
+        # The access gate above ran before the lock statement; the lock
+        # statement waits. Everything this route decided from the gate's
+        # ``UserCustomApi`` row -- that the caller still has a link to this
+        # connector at all, and that the link grants edit -- was therefore
+        # established before a wait of unbounded length, and nothing has
+        # re-established it since. A supported admin user deletion
+        # (``admin_users.py``, which removes a user's association rows and
+        # leaves every definition row standing) or a connector-team delete
+        # that removes only the caller's link can commit inside that wait.
+        # The request would then resume on a row that is gone, write the
+        # shared definition row anyway, commit it, and only fail afterwards
+        # in response construction -- an HTTP 500 over a durable shared
+        # mutation the caller was no longer authorized to make.
+        #
+        # ``populate_existing()`` on the definition query above refreshes
+        # the row of that statement and nothing else, so it does not cover
+        # this: the link row needs its own statement. This one is a
+        # single-table read of the caller's link, with
+        # ``populate_existing()`` so its columns are overwritten with the
+        # database's current values rather than the ones the gate loaded,
+        # and the object it returns replaces ``user_api`` for the rest of
+        # the route -- the link-row write below and the response both read it.
+        # A revocation that commits after this statement is the window
+        # this route had before it took any lock at all: in-process, with
+        # no wait in it. Closing that one needs the authorization fence
+        # designed for the team-edit changes and is not attempted here.
+        #
+        # Same order as the gate, so the same request gets the same answer
+        # it would have got had it arrived a moment later: gone is a 404,
+        # present but no longer permitted is a 403.
+        current_user_api = (
+            db.query(UserCustomApi)
+            .filter(
+                UserCustomApi.custom_api_id == api_id,
+                UserCustomApi.user_id == current_user.id,
+            )
+            .populate_existing()
+            .first()
+        )
+        if current_user_api is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Custom API not found",
+            )
+        if not current_user_api.can_edit:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to edit this Custom API",
+            )
+        user_api = current_user_api
+
     # Read only after the statement above: rename_team_connector's "old"
     # argument must be the name this transaction's own read established --
     # under the lock, on the path that renames -- not whatever the
@@ -570,6 +622,46 @@ def delete_custom_api(
             detail="Custom API not found",
         )
     api = locked_api
+
+    # This route's gate ran before the lock statement, and the lock
+    # statement waits. The gate's two answers -- the caller has a link to
+    # this connector, and that link grants delete -- were both established
+    # before that wait, and this route's effects are the widest in the
+    # pair: with no connector-team hook installed it takes the ``db.delete(api)``
+    # branch below, which removes the shared definition row and cascades
+    # away every other user's link to it. A supported admin user deletion
+    # or a team delete of the caller's own link can commit inside the
+    # wait, and the request would then answer 204 and delete the shared
+    # row for a caller who no longer had any link to it.
+    #
+    # Re-read the link row here, before ``delete_team_connector`` is
+    # called and before anything is deleted, so a revoked request produces
+    # its refusal with zero shared effect: no hook call, no delete, no
+    # commit. ``populate_existing()`` on the lock statement above refreshes
+    # the definition row only, so the link row needs this separate
+    # statement; the object it returns replaces ``user_api`` for the
+    # team-owned branch's own ``db.delete``. Same order and same answers as
+    # the gate: gone is a 404, present but no longer permitted is a 403.
+    current_user_api = (
+        db.query(UserCustomApi)
+        .filter(
+            UserCustomApi.custom_api_id == api_id,
+            UserCustomApi.user_id == current_user.id,
+        )
+        .populate_existing()
+        .first()
+    )
+    if current_user_api is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Custom API not found",
+        )
+    if not current_user_api.can_delete:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to delete this Custom API",
+        )
+    user_api = current_user_api
 
     from ..services.connector_team_scope import delete_team_connector
 

@@ -3305,6 +3305,58 @@ def update_mcp_server(
             )
         server = current_server
 
+        if writes_definition_row:
+            # The join gate above ran before the lock statement, and the
+            # lock statement waits. Both things that read established --
+            # that the caller still has a ``UserMCPServer`` link to this
+            # server, and whether that link owns it (``can_edit_global``)
+            # -- were fixed before a wait of unbounded length. A supported
+            # admin user deletion removes association rows and leaves
+            # every definition row standing, and an MCP disconnect removes
+            # the caller's own link while another user's link keeps the
+            # definition alive; either can commit inside the wait. The
+            # request would then write and commit the shared definition
+            # row on a revoked authority, and fail only afterwards, in
+            # ``db.refresh(user_mcp)`` below -- which runs after the
+            # commit, so the generic handler's rollback cannot take the
+            # shared write back and the caller sees a 500 over a durable
+            # change.
+            #
+            # ``populate_existing()`` on the definition query above
+            # refreshes that statement's row and nothing else, so the link
+            # row needs its own statement. This is a single-table read of
+            # it -- the gate above is a two-table join and cannot address
+            # this table alone -- and the row it returns replaces
+            # ``user_mcp`` and re-derives ``can_edit_global`` for the rest
+            # of the route: the per-user env write, the activation write,
+            # the refresh and the response all read it.
+            #
+            # A gone link is this route's existing 404, matching the gate.
+            # A link that is still there but no longer owns the server is
+            # not an error by itself here -- the gate does not refuse a
+            # non-owner either -- so it is answered exactly as the gate
+            # would have answered it: the owner-only guard below rejects a
+            # payload that changes the shared configuration and drops one
+            # that does not.
+            current_user_mcp = (
+                db.query(UserMCPServer)
+                .filter(
+                    UserMCPServer.user_id == user_id,
+                    UserMCPServer.mcpserver_id == server_id,
+                )
+                .populate_existing()
+                .first()
+            )
+            if current_user_mcp is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="MCP server not found",
+                )
+            user_mcp = current_user_mcp
+            can_edit_global = _check_mcp_permission(
+                user_mcp, getattr(current_user, "is_admin", False), require="edit"
+            )
+
         # Read from the fresh definition-row read above, not the pre-lock
         # read further up: rename_team_connector's "old" argument must be
         # the name that read actually returned. On the path that writes

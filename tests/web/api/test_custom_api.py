@@ -500,6 +500,10 @@ async def test_delete_team_custom_api_flushes_only_current_user_link():
     db.query().filter().populate_existing().with_for_update().first.return_value = (
         mock_api
     )
+    # The lock-order re-read of the link row is a third mock chain, distinct
+    # from the access gate's plain ``.filter().first()`` above: unrevoked,
+    # it must return the same still-``can_delete`` link the gate saw.
+    db.query().filter().populate_existing().first.return_value = mock_user_api
 
     decision = ConnectorDeleteDecision(
         team_owned=True,
@@ -540,12 +544,16 @@ def _lock_order_session_factory():
     return sessionmaker(autocommit=False, autoflush=False, bind=engine), engine
 
 
-def _seed_owned_api_for_lock_order(session_factory, *, name: str) -> tuple[int, int]:
+def _seed_owned_api_for_lock_order(
+    session_factory, *, name: str, description: str | None = None
+) -> tuple[int, int]:
     db = session_factory()
     owner = User(username=f"user-{name}", password_hash="x", is_admin=False)
     db.add(owner)
     db.flush()
-    api = CustomApi(name=name, url="https://example.test/api", method="GET")
+    api = CustomApi(
+        name=name, url="https://example.test/api", method="GET", description=description
+    )
     db.add(api)
     db.flush()
     db.add(
@@ -585,6 +593,117 @@ def _count_custom_apis_selects_before_first_delete(statements: list[str]) -> int
         if upper.startswith("SELECT") and "FROM CUSTOM_APIS" in upper:
             count += 1
     return count
+
+
+def _updated_table_names(statements: list[str]) -> list[str]:
+    """The table name out of each recorded ``UPDATE`` statement, in order.
+
+    Matched off the second token rather than a substring check: SQLite
+    renders ``UPDATE user_custom_apis SET ...``, and a plain ``"CUSTOM_APIS"
+    in statement`` check would also match that table's own name, since it
+    contains the shorter table name as a substring.
+    """
+    tables = []
+    for statement in statements:
+        tokens = statement.strip().split()
+        if tokens and tokens[0].upper() == "UPDATE":
+            tables.append(tokens[1].strip('"').upper())
+    return tables
+
+
+def _assert_is_active_edit_writes_link_row_only(
+    *,
+    seed_name: str,
+    payload_kwargs: dict,
+    expected_description,
+    seed_description: str | None = None,
+) -> None:
+    """Shared body for the two ``is_active``-plus-sibling-field tests
+    below: run the edit, assert the response and the persisted link row,
+    then assert that no ``UPDATE`` reached ``custom_apis`` while exactly
+    one reached ``user_custom_apis``.
+    """
+    session_factory, engine = _lock_order_session_factory()
+    owner_id, api_id = _seed_owned_api_for_lock_order(
+        session_factory, name=seed_name, description=seed_description
+    )
+    db = session_factory()
+    current_user = SimpleNamespace(id=owner_id, is_admin=False)
+    statements: list[str] = []
+
+    def record_query(conn, cursor, statement, parameters, context, executemany):
+        del conn, cursor, parameters, context, executemany
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record_query)
+    try:
+        response = update_custom_api(
+            api_id,
+            CustomApiUpdate(is_active=False, **payload_kwargs),
+            current_user=current_user,
+            db=db,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_query)
+        db.close()
+
+    assert isinstance(response, CustomApiResponse)
+    assert response.is_active is False
+
+    with session_factory() as fresh:
+        link = (
+            fresh.query(UserCustomApi)
+            .filter(
+                UserCustomApi.custom_api_id == api_id,
+                UserCustomApi.user_id == owner_id,
+            )
+            .one()
+        )
+        assert link.is_active is False
+        api = fresh.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert api.name == seed_name
+        assert api.description == expected_description
+
+    updated_tables = _updated_table_names(statements)
+    assert updated_tables.count("CUSTOM_APIS") == 0, (
+        f"an is_active edit for {seed_name!r} must not write the "
+        f"definition row -- saw UPDATEs against {updated_tables!r}"
+    )
+    assert updated_tables.count("USER_CUSTOM_APIS") == 1
+
+
+def test_an_is_active_edit_with_an_explicit_null_description_writes_no_definition_field():
+    """``model_fields_set`` decides ``writes_definition_row``, not the
+    values -- so a payload pairing ``is_active`` with an explicit-null
+    ``description`` still counts ``description`` into that set and takes
+    the lock, even though the write below it is skipped by its own
+    ``is not None`` guard. Despite taking the lock, only the caller's own
+    link row may see an ``UPDATE``.
+
+    The seed's own description is non-``None`` (``"seed-desc"``): if the
+    guard were ever bypassed, assigning the payload's ``None`` over that
+    would be an observable change, not a same-value no-op silently skipped
+    by SQLAlchemy's own dirty-tracking.
+    """
+    _assert_is_active_edit_writes_link_row_only(
+        seed_name="is-active-null-description",
+        seed_description="seed-desc",
+        payload_kwargs={"description": None},
+        expected_description="seed-desc",
+    )
+
+
+def test_an_is_active_edit_repeating_the_current_name_writes_no_definition_field():
+    """Same shape as the explicit-null-description case above, with
+    ``name`` as the sibling field: it counts into ``fields_set`` and takes
+    the lock, but the name-change guard (``api_data.name != api.name``) is
+    false, so the definition row must still see no ``UPDATE``.
+    """
+    _assert_is_active_edit_writes_link_row_only(
+        seed_name="is-active-repeated-name",
+        payload_kwargs={"name": "is-active-repeated-name"},
+        expected_description=None,
+    )
 
 
 class TestDeleteLockOrderMatchesThePutsLockOrder:

@@ -28,6 +28,10 @@ Obtains its database through ``tests/shared/postgres_disposable.py``
 helper the other ``*_postgresql.py`` suites in this repo use, rather than
 opening a hand-rolled connection. That helper reads
 ``XAGENT_TEST_POSTGRES_URL`` and skips the whole module when it is unset.
+
+Also covers the caller's own ``UserCustomApi`` link row being revoked --
+deleted, or stripped of its edit/delete flag -- by a second connection
+while a locking route holds the definition row, one case per route.
 """
 
 from __future__ import annotations
@@ -713,3 +717,200 @@ def test_an_activation_only_edit_whose_row_vanishes_before_its_read_is_a_404(
         )
     finally:
         db.close()
+
+
+def _revoke_link_after_lock(
+    db, session_factory, owner_id, api_id, revocation, clear_column
+):
+    """Revoke the caller's own link row -- via a second, committing
+    connection -- on the *second* time this session asks for
+    ``(UserCustomApi,)``: the gate's ask is the first, the re-read added
+    after the lock is the second, landing inside the window the lock holds.
+    """
+    real_query = db.query
+    revoked_already = threading.Event()
+    queried_entities: list[tuple] = []
+    occurrences = 0
+
+    def revoke_when_the_recheck_query_starts(*entities, **kwargs):
+        nonlocal occurrences
+        queried_entities.append(entities)
+        if entities == (UserCustomApi,):
+            occurrences += 1
+            if occurrences == 2 and not revoked_already.is_set():
+                revoked_already.set()
+                with session_factory() as other:
+                    if revocation == "link-deleted":
+                        other.execute(
+                            sa.delete(UserCustomApi).where(
+                                UserCustomApi.user_id == owner_id,
+                                UserCustomApi.custom_api_id == api_id,
+                            )
+                        )
+                    else:
+                        other.execute(
+                            sa.update(UserCustomApi)
+                            .where(
+                                UserCustomApi.user_id == owner_id,
+                                UserCustomApi.custom_api_id == api_id,
+                            )
+                            .values(**{clear_column: False})
+                        )
+                    other.commit()
+        return real_query(*entities, **kwargs)
+
+    db.query = revoke_when_the_recheck_query_starts
+    return revoked_already, queried_entities
+
+
+@pytest.mark.parametrize(
+    ("revocation", "expected_status"),
+    [("link-deleted", 404), ("can-edit-cleared", 403)],
+)
+def test_a_put_whose_association_is_revoked_after_the_lock_is_refused_with_no_shared_write(
+    session_factory, seeded, revocation, expected_status
+) -> None:
+    """A revoked caller (link deleted, or ``can_edit`` cleared) committed
+    by a second connection while this route holds the definition row
+    locked must get the gate's own 404/403 from the re-read added after
+    the lock, with the shared definition row left untouched either way.
+
+    The payload carries a real rename (not just a description edit): the
+    unrevoked path would call ``rename_team_connector`` for it, so its
+    absence here is only meaningful because the hook had something to fire
+    on. Without that, a passing ``hook_calls == []`` would prove nothing --
+    the hook only fires when the name actually changes.
+    """
+    import xagent.web.api.custom_api as custom_api_api
+    from xagent.web.api.custom_api import CustomApiUpdate
+
+    owner_id, api_id = seeded
+    current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+    db = session_factory()
+    real_commit = db.commit
+    commits: list[str] = []
+    hook_calls: list[tuple] = []
+
+    def record_commit():
+        commits.append("commit")
+        return real_commit()
+
+    def spy_renamed_hook(_db, _user_id, _connector_type, _connector_id, old, new):
+        hook_calls.append((old, new))
+
+    db.commit = record_commit
+    revoked_already, queried_entities = _revoke_link_after_lock(
+        db, session_factory, owner_id, api_id, revocation, "can_edit"
+    )
+    set_connector_team_hooks(renamed=spy_renamed_hook)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            custom_api_api.update_custom_api(
+                api_id,
+                CustomApiUpdate(
+                    description="edited-after-revocation",
+                    name="renamed-after-revocation",
+                ),
+                current_user=current_user,
+                db=db,
+            )
+        assert exc.value.status_code == expected_status
+        assert revoked_already.is_set(), "the concurrent revocation never ran"
+        assert queried_entities[:3] == [
+            (UserCustomApi,),
+            (CustomApi,),
+            (UserCustomApi,),
+        ], (
+            "the revocation must land after the gate's own read and after "
+            f"the lock, caught by the re-read -- saw {queried_entities!r}"
+        )
+        assert hook_calls == [], "the re-read must precede rename_team_connector"
+        assert commits == [], "the refused edit must commit nothing"
+    finally:
+        set_connector_team_hooks()
+        db.close()
+
+    with session_factory() as fresh:
+        row = fresh.query(CustomApi).filter(CustomApi.id == api_id).one()
+        assert row.description is None, (
+            "the shared definition row must be untouched by a refused edit"
+        )
+        assert row.name == "edit-lock-target", (
+            "the shared definition row's name must be untouched by a refused edit"
+        )
+        if revocation == "can-edit-cleared":
+            link = (
+                fresh.query(UserCustomApi)
+                .filter(
+                    UserCustomApi.custom_api_id == api_id,
+                    UserCustomApi.user_id == owner_id,
+                )
+                .one()
+            )
+            assert link.can_edit is False
+            assert link.is_active is True
+
+
+@pytest.mark.parametrize(
+    ("revocation", "expected_status"),
+    [("link-deleted", 404), ("can-delete-cleared", 403)],
+)
+def test_a_delete_whose_association_is_revoked_after_the_lock_is_refused_before_the_hook(
+    session_factory, seeded, revocation, expected_status
+) -> None:
+    """Same window as the PUT test above, on the delete route: the re-read
+    added after the lock, before ``delete_team_connector`` is ever called,
+    must catch a revoked link with the route's existing 404/403, touching
+    neither the hook nor the shared definition row.
+    """
+    import xagent.web.api.custom_api as custom_api_api
+
+    owner_id, api_id = seeded
+    current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+    db = session_factory()
+    real_commit = db.commit
+    commits: list[str] = []
+    hook_calls: list[int] = []
+
+    def record_commit():
+        commits.append("commit")
+        return real_commit()
+
+    def spy_deleted_hook(_db, _user_id, _connector_type, connector_id):
+        hook_calls.append(int(connector_id))
+        return ConnectorDeleteDecision()
+
+    db.commit = record_commit
+    revoked_already, queried_entities = _revoke_link_after_lock(
+        db, session_factory, owner_id, api_id, revocation, "can_delete"
+    )
+    set_connector_team_hooks(deleted=spy_deleted_hook)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            custom_api_api.delete_custom_api(
+                api_id,
+                current_user=current_user,
+                db=db,
+            )
+        assert exc.value.status_code == expected_status
+        assert revoked_already.is_set(), "the concurrent revocation never ran"
+        assert queried_entities[:3] == [
+            (UserCustomApi,),
+            (CustomApi,),
+            (UserCustomApi,),
+        ], (
+            "the revocation must land after the gate's own read and after "
+            f"the lock, caught by the re-read -- saw {queried_entities!r}"
+        )
+        assert hook_calls == [], "the re-read must precede delete_team_connector"
+        assert commits == [], "the refused delete must commit nothing"
+    finally:
+        set_connector_team_hooks()
+        db.close()
+
+    with session_factory() as fresh:
+        assert fresh.query(CustomApi).filter(CustomApi.id == api_id).one(), (
+            "the shared definition row must survive a refused delete"
+        )

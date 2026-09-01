@@ -22,6 +22,10 @@ Obtains its database through ``tests/shared/postgres_disposable.py``
 helper the other ``*_postgresql.py`` suites in this repo use, rather than
 opening a hand-rolled connection. That helper reads
 ``XAGENT_TEST_POSTGRES_URL`` and skips the whole module when it is unset.
+
+Also covers the caller's own ``UserMCPServer`` link row being revoked --
+deleted, or stripped of ownership -- by a second connection while the
+route holds the definition row locked.
 """
 
 from __future__ import annotations
@@ -571,3 +575,111 @@ def test_an_activation_only_edit_whose_row_vanishes_before_its_read_is_a_404(
         )
     finally:
         db.close()
+
+
+@pytest.mark.parametrize(
+    ("revocation", "expected_status"),
+    [("link-deleted", 404), ("ownership-cleared", 403)],
+)
+def test_a_put_whose_association_is_revoked_after_the_lock_is_refused_with_no_shared_write(
+    session_factory, seeded, revocation, expected_status
+) -> None:
+    """A second connection can revoke the caller's own link -- delete it,
+    or clear ``is_owner`` -- and commit while this route still holds the
+    definition row locked, after the gate already let the request through.
+    The re-read added after the lock, which re-derives ``can_edit_global``,
+    must catch that: a gone link is the gate's own 404. A link that no
+    longer owns the server is not an error by itself -- the gate does not
+    refuse a non-owner either -- so a payload that changes the shared
+    configuration is refused by the existing owner-only guard instead.
+
+    The revocation fires on this route's first single-entity
+    ``UserMCPServer`` read -- the gate's own read joins it to ``MCPServer``,
+    so a bare ``(UserMCPServer,)`` can only be the re-read after the lock.
+    The recorded sequence is filtered to the three statements under test
+    (``DatabaseMCPServerManager`` may issue queries of its own).
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    owner_id, server_id = seeded
+    current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+    db = session_factory()
+    real_query = db.query
+    real_commit = db.commit
+    revoked_already = threading.Event()
+    queried_entities: list[tuple] = []
+    tracked_keys = {(UserMCPServer, MCPServer), (MCPServer,), (UserMCPServer,)}
+    commits: list[str] = []
+
+    def revoke_when_the_recheck_query_starts(*entities, **kwargs):
+        if entities in tracked_keys:
+            queried_entities.append(entities)
+        if entities == (UserMCPServer,) and not revoked_already.is_set():
+            revoked_already.set()
+            with session_factory() as other:
+                if revocation == "link-deleted":
+                    other.execute(
+                        sa.delete(UserMCPServer).where(
+                            UserMCPServer.user_id == owner_id,
+                            UserMCPServer.mcpserver_id == server_id,
+                        )
+                    )
+                else:
+                    other.execute(
+                        sa.update(UserMCPServer)
+                        .where(
+                            UserMCPServer.user_id == owner_id,
+                            UserMCPServer.mcpserver_id == server_id,
+                        )
+                        .values(is_owner=False)
+                    )
+                other.commit()
+        return real_query(*entities, **kwargs)
+
+    def record_commit():
+        commits.append("commit")
+        return real_commit()
+
+    db.query = revoke_when_the_recheck_query_starts
+    db.commit = record_commit
+    try:
+        with pytest.raises(HTTPException) as exc:
+            mcp_api.update_mcp_server(
+                server_id,
+                MCPServerUpdate(name="renamed-after-revocation"),
+                current_user=current_user,
+                db=db,
+            )
+        assert exc.value.status_code == expected_status
+        assert revoked_already.is_set(), "the concurrent revocation never ran"
+        assert queried_entities[:3] == [
+            (UserMCPServer, MCPServer),
+            (MCPServer,),
+            (UserMCPServer,),
+        ], (
+            "the concurrent revocation must land after the gate's own read "
+            "and after the lock statement, and be caught by the re-read "
+            "added after the lock -- otherwise the status under test could "
+            f"be the gate's rather than the re-read's -- saw "
+            f"{queried_entities!r}"
+        )
+        if revocation == "ownership-cleared":
+            assert (
+                exc.value.detail
+                == "Only the server owner can change the shared configuration"
+            ), (
+                "the 403 for a link that no longer owns the server must come "
+                "from the route's existing owner-only guard, not a new error "
+                f"shape -- saw {exc.value.detail!r}"
+            )
+        assert commits == [], "the refused edit must commit nothing"
+    finally:
+        db.close()
+
+    with session_factory() as fresh:
+        row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert row.name == "edit-lock-target", (
+            "the shared definition row must be untouched by a refused edit"
+        )
