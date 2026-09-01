@@ -398,6 +398,36 @@ def _validate_connector_access_answer(
     return validated
 
 
+def _resolve_normalized_connector_access(
+    db: Any,
+    user_id: int,
+    hook: "ConnectorAccessHook",
+    requested: "frozenset[ConnectorRef]",
+) -> "dict[ConnectorRef, ConnectorAccess]":
+    """Ask an already-resolved hook about an already-normalized ref set.
+
+    Exists so each public entry point normalizes exactly once.
+    ``resolve_connector_access_or_raise`` has to normalize above its ``try``,
+    so it cannot hand ``refs`` down; before this split it handed the
+    normalized set to ``resolve_connector_access``, which normalized it again.
+
+    ``hook`` is a parameter rather than a read of the module global, so "is a
+    hook installed" is answered once per call, by the entry point, and that
+    same answer is what gets used. Reading the global here instead would make
+    the ``None`` check every future caller's job to remember.
+    """
+    if not requested:
+        return {}
+    return _call_connector_hook_gate(
+        db,
+        hook,
+        db,
+        int(user_id),
+        requested,
+        validate=lambda answer: _validate_connector_access_answer(answer, requested),
+    )
+
+
 def resolve_connector_access(
     db: Any, user_id: int, refs: "Collection[ConnectorRef]"
 ) -> "dict[ConnectorRef, ConnectorAccess]":
@@ -432,18 +462,11 @@ def resolve_connector_access(
     the other omits is not a defect in xagent -- it is what the installed
     answers said.
     """
-    if _connector_access_hook is None:
+    hook = _connector_access_hook
+    if hook is None:
         return {}
-    requested = _normalize_connector_refs(refs)
-    if not requested:
-        return {}
-    return _call_connector_hook_gate(
-        db,
-        _connector_access_hook,
-        db,
-        int(user_id),
-        requested,
-        validate=lambda answer: _validate_connector_access_answer(answer, requested),
+    return _resolve_normalized_connector_access(
+        db, user_id, hook, _normalize_connector_refs(refs)
     )
 
 
@@ -618,9 +641,9 @@ def resolve_connector_access_or_raise(
     all.
 
     A ``ConnectorRuntimeError`` -- whether raised by the hook itself or by
-    ``resolve_connector_access``'s own answer validation -- passes through
-    unchanged (same object, not re-wrapped). Any other exception is logged
-    at ``WARNING`` and converted into
+    ``_validate_connector_access_answer`` rejecting what the hook answered --
+    passes through unchanged (same object, not re-wrapped). Any other
+    exception is logged at ``WARNING`` and converted into
     ``ConnectorRuntimeError(ERROR_CONNECTOR_RUNTIME_UNAVAILABLE, "Connector
     access is unavailable.", details={"reason":
     "connector_access_resolution_failed"}, status_code=503)``. Unlike
@@ -642,16 +665,19 @@ def resolve_connector_access_or_raise(
     rejects. Neither is something the generic-exception arm below could
     own, and both are restored before either arm sees the exception.
     """
-    # Not redundant with the identical gate inside ``resolve_connector_access``:
-    # this one has to run before the normalization below, which is itself
-    # deliberately above the ``try``. Without it a standalone deployment raises
-    # on a malformed ref through this entry point while the other one returns
-    # ``{}`` for the very same input.
-    if _connector_access_hook is None:
+    # Answered before the normalization below, which is itself deliberately
+    # above the ``try``. Both public entry points owe the same answer here:
+    # without this gate a standalone deployment raises on a malformed ref
+    # through this entry point while ``resolve_connector_access`` returns
+    # ``{}`` for the very same input. Each entry point reads the slot once and
+    # passes what it read down, so the call below cannot act on a hook other
+    # than the one this check just cleared.
+    hook = _connector_access_hook
+    if hook is None:
         return {}
     requested = _normalize_connector_refs(refs)
     try:
-        return resolve_connector_access(db, user_id, requested)
+        return _resolve_normalized_connector_access(db, user_id, hook, requested)
     except ConnectorRuntimeError:
         raise
     except Exception as exc:

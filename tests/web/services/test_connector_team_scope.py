@@ -609,6 +609,46 @@ def test_resolve_connector_access_or_raise_still_converts_with_well_formed_refs(
     assert excinfo.value.details["reason"] == "connector_access_resolution_failed"
 
 
+@pytest.mark.parametrize(
+    "entry_point",
+    ["resolve_connector_access", "resolve_connector_access_or_raise"],
+)
+def test_each_entry_point_normalizes_the_refs_exactly_once(entry_point, monkeypatch):
+    """Both public entry points share one normalization pass.
+
+    The raising entry point has to normalize above its ``try``, so it cannot
+    simply hand ``refs`` down; it hands the normalized set to
+    ``_resolve_normalized_connector_access`` instead, which is the same
+    function the non-raising entry point calls. Nothing else in the suite can
+    see this: a second normalization is idempotent over an already-normalized,
+    already-deduplicated set, so every observable result stays identical and
+    only the call count changes.
+    """
+    calls = []
+    original = connector_team_scope._normalize_connector_refs
+
+    def _counting(refs):
+        calls.append(list(refs))
+        return original(refs)
+
+    monkeypatch.setattr(connector_team_scope, "_normalize_connector_refs", _counting)
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda db, user_id, requested: {
+            ref: connector_team_scope.ConnectorAccess(team_owned=True, can_edit=True)
+            for ref in requested
+        }
+    )
+
+    resolved = getattr(connector_team_scope, entry_point)(
+        None, 7, [("mcp", "5"), ("mcp", 5)]
+    )
+
+    assert len(calls) == 1, f"normalized {len(calls)} times, received {calls}"
+    assert resolved == {
+        ("mcp", 5): connector_team_scope.ConnectorAccess(team_owned=True, can_edit=True)
+    }
+
+
 # ---------------------------------------------------------------------------
 # snapshot_connector_team_hooks and its discovery-based coverage test.
 # ---------------------------------------------------------------------------
