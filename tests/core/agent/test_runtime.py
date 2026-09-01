@@ -730,6 +730,8 @@ async def test_runtime_stream_events_are_logged_once_each(
     logged_end = recording_logger.info_calls[1][0] % recording_logger.info_calls[1][1]
     assert message_id in logged_end
     assert "content_chars=11" in logged_end
+    # The answer text itself must never reach the log - only its length.
+    assert "answer text" not in logged_end
 
     second_message_id = await runtime.start_final_answer_stream()
     assert second_message_id is not None

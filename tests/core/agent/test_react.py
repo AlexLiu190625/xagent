@@ -29,6 +29,7 @@ from xagent.core.agent.pattern.react.react import (
     _normalize_ask_user_interactions,
 )
 from xagent.core.agent.result import tool_result_succeeded
+from xagent.core.agent.runtime import NO_DELIVERABLE_FINAL_ANSWER_REASON
 from xagent.core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
@@ -8191,7 +8192,10 @@ async def test_react_control_tool_before_final_answer_opens_no_answer_stream(
     """I-4: a control tool ahead of final_answer in the same batch disables
     the answer streamer before any answer bytes are emitted (the streamer
     self-disables on the first non-final_answer tool name it sees), so no
-    final_answer_* event of any kind is ever produced for that response."""
+    final_answer_* event of any kind is ever produced for that response.
+    The run's delivered outcome is pinned too: the later final_answer is
+    still executed and delivered unless a response-expecting control tool
+    pauses the run before reaching it."""
 
     llm = ScriptedStreamLLM([[control_call, _fa("Answer one.")], _FALLBACK_BATCH])
     pattern = ReActPattern(max_iterations=3)
@@ -8200,9 +8204,15 @@ async def test_react_control_tool_before_final_answer_opens_no_answer_stream(
     outbound = OutboundCollector()
     runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
 
-    await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
 
     assert not any(e["type"].startswith("final_answer_") for e in outbound.events)
+    control_name, control_args = control_call
+    if control_name == "ask_user_question" or control_args.get("expect_response"):
+        assert result["status"] == "waiting_for_user"
+    else:
+        assert result["success"] is True
+        assert result["response"] == "Answer one."
 
 
 @pytest.mark.asyncio
@@ -8457,4 +8467,4 @@ async def test_react_close_streamed_answer_fails_open_stream_without_deliverable
     )
 
     assert streamer.finish_calls == []
-    assert len(streamer.fail_calls) == 1
+    assert streamer.fail_calls == [NO_DELIVERABLE_FINAL_ANSWER_REASON]

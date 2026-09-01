@@ -95,6 +95,7 @@ from ...runtime import (
     INVALID_TOOL_PROTOCOL_AFTER_RETRY_REASON,
     INVALID_TOOL_PROTOCOL_RETRYING_REASON,
     NO_DELIVERABLE_FINAL_ANSWER_REASON,
+    UNAVAILABLE_TOOL_CALL_RESTORING_TOOLS_REASON,
     ExecutionInterrupted,
     LLMCallInterrupted,
     PatternRuntime,
@@ -728,7 +729,7 @@ class ReActPattern(AgentPattern):
                 unavailable_tool_call = exc.code == "unavailable_tool_call"
                 if answer_streamer is not None:
                     await answer_streamer.fail(
-                        "unavailable tool call, restoring available tools"
+                        UNAVAILABLE_TOOL_CALL_RESTORING_TOOLS_REASON
                         if unavailable_tool_call
                         else f"invalid {exc.code} tool protocol, retrying"
                     )
@@ -1022,36 +1023,28 @@ class ReActPattern(AgentPattern):
     ) -> None:
         """Ensure a started answer stream reaches exactly one terminal event.
 
-        If ``answer_streamer`` never streamed any content, this is a no-op
-        (R0) - there is nothing to close. Otherwise exactly one of the
-        following fires:
+        The branches below are R0 (nothing streamed - no-op), R1
+        (``tool_calls[0]`` is a ``final_answer`` with a non-blank answer and
+        no disabled user-interaction control tool in the batch, per
+        ``_disabled_control_tool_index`` - ``finish`` with that answer's
+        exact, unstripped text, the same text ``_handle_control_tool``
+        delivers), R2 (no tool calls, plain assistant text - ``finish`` with
+        that text) and R3 (anything else - ``fail`` with a fixed reason;
+        ``fail`` is a no-op for a stream already closed earlier in this
+        response).
 
-        - R1: ``tool_calls[0]`` is a ``final_answer`` call with a non-blank
-          answer, and no disabled user-interaction control tool preempts it
-          (``_disabled_control_tool_index``) -> ``finish`` with that answer's
-          exact text, unstripped. The batch's first call is the only one
-          ``_execute_pending_tool_calls`` can ever actually deliver (its
-          ``final_answer`` branch finalizes the run immediately and discards
-          whatever follows), so the streamed content must match it exactly -
-          not a later or "nicer-looking" candidate elsewhere in the batch,
-          and not the same text with whitespace trimmed off.
-        - R2: the batch has no tool calls at all and the model produced
-          plain text -> ``finish`` with that text.
-        - R3: neither of the above -> ``fail`` with a fixed reason. This
-          covers a stream left open by a batch whose first call is not a
-          deliverable final_answer (including one already closed earlier in
-          this same response, e.g. by the bundled-final_answer strip - see
-          ``FinalAnswerStreamSession``, whose ``fail`` is a no-op once
-          already closed) as well as shapes with no known production
-          trigger, kept as an explicit fallback rather than an unhandled
-          state.
-
-        Do not relax R1 to "a final_answer anywhere in the batch" - only the
-        batch's first call is ever delivered, and treating a later one as
-        authoritative would stream text the run does not actually produce as
-        its answer. Do not turn R3 into a ``finish`` to avoid the error
-        event it produces - that would report an undelivered candidate as
-        the completed answer.
+        Do not relax R1's first-position condition. A later ``final_answer``
+        in a mixed batch can still be delivered
+        (``_execute_pending_tool_calls`` keeps walking past e.g. a
+        ``send_message`` that expects no response), but such a batch never
+        leaves an open stream to close: ``ReActFinalAnswerStreamer``
+        permanently disables itself as soon as a non-``final_answer`` tool
+        name appears in the response, before any answer content for a
+        non-first ``final_answer`` has accumulated, so R0 applies. Relaxing
+        the condition would finish streams with candidates whose delivery
+        this method has not checked. Do not turn R3 into a ``finish`` to
+        avoid the error event it produces - that would report an undelivered
+        candidate as the completed answer.
         """
 
         if not answer_streamer.started:

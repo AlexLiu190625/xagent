@@ -642,19 +642,19 @@ class PatternRuntime:
             return None
         message_id = f"final_answer_{uuid4().hex}"
         self.last_final_answer_stream_message_id = None
-        logger.info(
-            "final_answer stream opened. task_id=%s step=%s turn=%s message_id=%s",
-            self.execution_id,
-            self.active_react_step_id,
-            self.active_turn_id,
-            message_id,
-        )
         await self._emit_outbound(
             {
                 "type": "final_answer_start",
                 "message_id": message_id,
                 "task_id": self.execution_id,
             }
+        )
+        logger.info(
+            "final_answer stream opened. task_id=%s step=%s turn=%s message_id=%s",
+            self.execution_id,
+            self.active_react_step_id,
+            self.active_turn_id,
+            message_id,
         )
         return message_id
 
@@ -672,6 +672,14 @@ class PatternRuntime:
 
     async def end_final_answer_stream(self, message_id: str, content: str) -> None:
         self.last_final_answer_stream_message_id = message_id
+        await self._emit_outbound(
+            {
+                "type": "final_answer_end",
+                "message_id": message_id,
+                "task_id": self.execution_id,
+                "content": content,
+            }
+        )
         logger.info(
             "final_answer stream closed. task_id=%s step=%s turn=%s "
             "message_id=%s content_chars=%d",
@@ -681,18 +689,18 @@ class PatternRuntime:
             message_id,
             len(content),
         )
-        await self._emit_outbound(
-            {
-                "type": "final_answer_end",
-                "message_id": message_id,
-                "task_id": self.execution_id,
-                "content": content,
-            }
-        )
 
     async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
         if self.last_final_answer_stream_message_id == message_id:
             self.last_final_answer_stream_message_id = None
+        await self._emit_outbound(
+            {
+                "type": "final_answer_error",
+                "message_id": message_id,
+                "task_id": self.execution_id,
+                "error": error,
+            }
+        )
         logger.warning(
             "final_answer stream failed. task_id=%s step=%s turn=%s "
             "message_id=%s reason=%s",
@@ -701,14 +709,6 @@ class PatternRuntime:
             self.active_turn_id,
             message_id,
             _normalize_stream_close_reason(error),
-        )
-        await self._emit_outbound(
-            {
-                "type": "final_answer_error",
-                "message_id": message_id,
-                "task_id": self.execution_id,
-                "error": error,
-            }
         )
 
     def _has_native_stream_chat(self, llm: Any) -> bool:
