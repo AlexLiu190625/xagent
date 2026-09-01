@@ -3864,6 +3864,14 @@ CONNECTOR_RUNTIME_CODES = [
     "scheduled_secret_unavailable",
 ]
 
+# The reason a missing declared context key produces. It is deliberately not
+# public: the key half is a name the connector's owner chose, and the frame's
+# audience includes anonymous widget and share-link visitors.
+WITHHELD_KEY_REASON = "missing_context.auth_token"
+# A listed reason, so the assertions below can speak about a reason that does
+# reach the wire.
+PUBLIC_REASON = "not_provided"
+
 
 @contextmanager
 def _captured_terminal_broadcast(setup_or_run_error: BaseException, db_session):
@@ -3954,7 +3962,7 @@ async def test_connector_runtime_failure_broadcasts_its_safe_message(
     error = ConnectorRuntimeError(
         code,
         safe_message,
-        details={"reason": "missing_context.auth_token"},
+        details={"reason": WITHHELD_KEY_REASON},
     )
 
     with _captured_terminal_broadcast(error, db_session) as (
@@ -4007,10 +4015,10 @@ async def test_connector_runtime_frame_details_shape(db_session) -> None:
     """Whatever the raise site attached, only ``reason`` can reach the wire."""
 
     error = ConnectorRuntimeError(
-        "missing_runtime_context",
-        "Required connector runtime context is missing.",
+        "runtime_secret_unavailable",
+        "Required runtime secret is unavailable.",
         details={
-            "reason": "missing_context.auth_token",
+            "reason": PUBLIC_REASON,
             "internal_sql": "SELECT value FROM task_connector_runtime_contexts",
             "raw_value": "tenant-secret",
             "connector_ref": {"connector_type": "mcp", "connector_id": 7},
@@ -4026,7 +4034,7 @@ async def test_connector_runtime_frame_details_shape(db_session) -> None:
         await _run_failing_turn(task_id, int(task.user_id), task.source)
 
     assert set(frames[0]["details"]) <= {"reason"}
-    assert frames[0]["details"] == {"reason": "missing_context.auth_token"}
+    assert frames[0]["details"] == {"reason": PUBLIC_REASON}
 
 
 @pytest.mark.asyncio
@@ -4042,10 +4050,10 @@ async def test_connector_runtime_frame_never_carries_connector_ref(
     """
 
     error = ConnectorRuntimeError(
-        "missing_runtime_context",
-        "Required connector runtime context is missing.",
+        "runtime_secret_unavailable",
+        "Required runtime secret is unavailable.",
         connector_ref=ConnectorRef(connector_type="mcp", connector_id=7),
-        details={"reason": "missing_context.auth_token"},
+        details={"reason": PUBLIC_REASON},
     )
 
     with _captured_terminal_broadcast(error, db_session) as (
@@ -4082,7 +4090,7 @@ async def test_connector_runtime_frame_reason_matches_direct_construction(
     error = ConnectorRuntimeError(
         "missing_runtime_context",
         "Required connector runtime context is missing.",
-        details={"reason": "missing_context.auth_token"},
+        details={"reason": PUBLIC_REASON},
     )
 
     with _captured_terminal_broadcast(error, db_session) as (
@@ -4093,10 +4101,8 @@ async def test_connector_runtime_frame_reason_matches_direct_construction(
         task = db_session.query(Task).filter(Task.id == task_id).one()
         await _run_failing_turn(task_id, int(task.user_id), task.source)
 
-    assert (
-        frames[0]["details"]
-        == PublicErrorDetails(reason="missing_context.auth_token").to_wire()
-    )
+    assert frames[0]["details"] == PublicErrorDetails(reason=PUBLIC_REASON).to_wire()
+    assert frames[0]["details"] == {"reason": PUBLIC_REASON}
 
 
 @pytest.mark.asyncio
@@ -4112,7 +4118,7 @@ async def test_connector_runtime_failure_logs_missing_key(
         code,
         "Required connector runtime context is missing.",
         connector_ref=ConnectorRef(connector_type="mcp", connector_id=7),
-        details={"reason": "missing_context.auth_token"},
+        details={"reason": WITHHELD_KEY_REASON},
     )
 
     with caplog.at_level(logging.ERROR):
@@ -4132,7 +4138,7 @@ async def test_connector_runtime_failure_logs_missing_key(
     ]
     assert len(structured) == 1
     assert f"code={code}" in structured[0]
-    assert "reason=missing_context.auth_token" in structured[0]
+    assert f"reason={WITHHELD_KEY_REASON}" in structured[0]
     assert "connector=" in structured[0]
     assert "'connector_id': 7" in structured[0]
 
@@ -4156,7 +4162,7 @@ async def test_connector_runtime_failure_persists_client_safe_history(
     error = ConnectorRuntimeError(
         code,
         safe_message,
-        details={"reason": "missing_context.auth_token"},
+        details={"reason": WITHHELD_KEY_REASON},
     )
 
     with _captured_terminal_broadcast(error, db_session) as (
@@ -4170,9 +4176,17 @@ async def test_connector_runtime_failure_persists_client_safe_history(
     assert len(settlements) == 1
     settled = settlements[0]
     assert settled["client_message_type"] == CLIENT_SAFE_FAILURE_MESSAGE_TYPE
-    # The reloaded transcript says the same thing the live bubble said.
+    # The durable row and the frame's own message field are the same server
+    # sentence. The live bubble is not that sentence: for a missing-value code
+    # the client replaces it with its own localized wording (see the
+    # "terminal error frames" suite in app-context-chat.test.tsx). What the two
+    # views owe each other is the facts they carry, and the key name is in
+    # neither -- the whitelist drops the reason that names it, so the frame
+    # cannot carry it and the client cannot render it.
     assert settled["client_error_message"] == safe_message
     assert settled["client_error_message"] == frames[0]["message"]
+    assert frames[0]["details"] == {}
+    assert "auth_token" not in json.dumps(frames[0])
     # The durable error keeps the code prefix operators grep for, and never
     # the "setup/run error: <ExceptionType>" shape the else branch produces.
     assert settled["error_message"] == f"{code}: {safe_message}"

@@ -19,7 +19,6 @@ from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeEr
 from xagent.web.services import client_error_messages
 from xagent.web.services.client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
-    CONNECTOR_RUNTIME_PUBLIC_REASON_PREFIXES,
     CONNECTOR_RUNTIME_PUBLIC_REASONS,
     PublicErrorDetails,
     connector_runtime_client_message,
@@ -92,6 +91,15 @@ ILLEGAL_REASONS: list[object] = [
     # anonymous widget and share-link visitors.
     "runtime_owner_mismatch",
     "runtime_task_identity_mismatch",
+    # Shape-legal, free of ownership and authorization content, and withheld
+    # anyway: the key half is a name the connector's owner declared, and this
+    # frame reaches anonymous widget and share-link visitors. Owners read key
+    # names from the per-task requirements endpoint, which selects on
+    # Task.id == task_id AND Task.user_id == current_user.id.
+    "missing_context.auth_token",
+    "missing_context.tenant_secret",
+    "type_mismatch.context.tenant_id",
+    "conflict.secrets.authorization",
 ]
 
 
@@ -112,9 +120,6 @@ LEGAL_REASONS = [
     "team_scope_resolution_failed",
     "runtime_view_resolution_failed",
     "custom_api_config_load_failed",
-    "missing_context.auth_token",
-    "type_mismatch.context.tenant_id",
-    "conflict.secrets.authorization",
 ]
 
 
@@ -137,15 +142,44 @@ def test_public_error_details_accepts_an_absent_reason() -> None:
 
 def test_public_error_projects_code_and_whitelisted_reason() -> None:
     error = ConnectorRuntimeError(
+        "runtime_secret_unavailable",
+        "Required runtime secret is unavailable.",
+        details={"reason": "not_provided"},
+    )
+
+    projected = connector_runtime_public_error(error)
+
+    assert projected is not None
+    code, details = projected
+    # Asserted through to_wire(), not by comparing to a second
+    # PublicErrorDetails: the comparison value runs the same __post_init__, so
+    # a whitelist that stopped admitting this reason would null both sides and
+    # the assertion would pass while verifying nothing.
+    assert code == "runtime_secret_unavailable"
+    assert details.to_wire() == {"reason": "not_provided"}
+
+
+def test_a_reason_built_from_a_declared_key_name_never_reaches_the_wire() -> None:
+    """The one reason in this repository assembled from owner-written text.
+
+    ``_require_context_values`` raises ``missing_context.<key>``, where the key
+    is a name the connector's owner chose. It is dropped whole rather than
+    trimmed to its prefix: a prefix that only ever pairs with a dropped key
+    tells a visitor nothing the code has not already told them.
+    """
+
+    error = ConnectorRuntimeError(
         "missing_runtime_context",
         "Required connector runtime context is missing.",
         details={"reason": "missing_context.auth_token"},
     )
 
-    assert connector_runtime_public_error(error) == (
-        "missing_runtime_context",
-        PublicErrorDetails(reason="missing_context.auth_token"),
-    )
+    projected = connector_runtime_public_error(error)
+
+    assert projected is not None
+    code, details = projected
+    assert code == "missing_runtime_context"
+    assert details.to_wire() == {}
 
 
 @pytest.mark.parametrize(
@@ -202,7 +236,7 @@ def test_public_error_drops_every_field_but_reason() -> None:
         "missing_runtime_context",
         "x",
         details={
-            "reason": "missing_context.auth_token",
+            "reason": "not_provided",
             "internal_sql": "SELECT 1",
             "raw_value": "tenant-secret",
             "connector_ref": {"id": 7, "name": "acme"},
@@ -388,10 +422,7 @@ def _derive_reasons() -> tuple[set[str], set[str]]:
 
 
 def _is_listed(reason: str) -> bool:
-    if reason in CONNECTOR_RUNTIME_PUBLIC_REASONS:
-        return True
-    prefix, separator, key = reason.rpartition(".")
-    return bool(separator) and prefix in CONNECTOR_RUNTIME_PUBLIC_REASON_PREFIXES
+    return reason in CONNECTOR_RUNTIME_PUBLIC_REASONS
 
 
 def test_public_reason_whitelist_covers_every_raise_site() -> None:
@@ -454,3 +485,30 @@ def test_knowledge_base_scope_reason_is_not_in_the_derived_surface() -> None:
     tree = ast.parse(path.read_text(encoding="utf-8"))
 
     assert _reason_expressions(tree) == []
+
+
+def test_no_reason_assembled_by_interpolation_is_admitted_by_its_shape() -> None:
+    """A reason with an interpolated half is never admitted by its shape.
+
+    The two assertions above read only the literal reasons, because a reason
+    built by interpolation has no single value to look up. This one reads the
+    derived shapes instead: for every interpolated reason the scan finds, an
+    arbitrary instantiation of it must be dropped. Admitting a whole shape is
+    how a name the connector's owner chose reaches a visitor without any one
+    line of code saying so, and this is the assertion that a re-added prefix
+    set breaks.
+    """
+
+    _, patterns = _derive_reasons()
+
+    assert patterns, "the derivation found no interpolated reason; the scan is broken"
+    for pattern in patterns:
+        probe = (
+            pattern.removeprefix("^")
+            .removesuffix("$")
+            .replace("\\.", ".")
+            .replace(".+", "zzz-probe-zzz")
+        )
+        assert PublicErrorDetails(reason=probe).to_wire() == {}, (
+            f"a reason of shape {pattern} is admitted by its shape: {probe}"
+        )

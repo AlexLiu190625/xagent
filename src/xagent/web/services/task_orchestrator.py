@@ -1969,10 +1969,14 @@ def _schedule_bg(
                         )
                     elif isinstance(setup_or_run_err, ConnectorRuntimeError):
                         # This exception's message is a curated public-safe
-                        # sentence naming what the connector still needs, so
-                        # the client gets it instead of the opaque fallback.
-                        # ``code`` and the whitelisted ``reason`` ride along on
-                        # the frame; the projector decides what is wire-safe.
+                        # sentence -- it says a runtime input is missing, not
+                        # which one -- so the client gets it instead of the
+                        # opaque fallback. ``code`` rides along on the frame,
+                        # and so does ``reason`` when the whitelist admits it;
+                        # a reason assembled from a key name the connector's
+                        # owner declared is dropped at the projector, so this
+                        # branch's own reason reaches the frame for two of the
+                        # three codes and not for missing_runtime_context.
                         settlement_error = str(setup_or_run_err)
                         client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
                         broadcast_error_message = connector_runtime_client_message(

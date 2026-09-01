@@ -10,10 +10,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
-from ...core.tools.adapters.vibe.connector_runtime import (
-    RUNTIME_SOURCE_KEY_RE,
-    ConnectorRuntimeError,
-)
+from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 
 CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
 
@@ -171,47 +168,34 @@ CONNECTOR_RUNTIME_PUBLIC_REASONS = frozenset(
 # adds the site raising it, never ahead of it: a listed reason nothing produces
 # is an allowance with no expiry date, and by the time the raising code arrives
 # nobody remembers which audience the reason was judged against.
-CONNECTOR_RUNTIME_PUBLIC_REASON_PREFIXES = frozenset(
-    {
-        "missing_context",
-        "type_mismatch.context",
-        "type_mismatch.secrets",
-        "type_mismatch.auth_selector",
-        "conflict.context",
-        "conflict.secrets",
-        "conflict.auth_selector",
-    }
-)
 
 
 def _is_public_reason(reason: object) -> bool:
     """True when this reason may reach a client. Used by PublicErrorDetails.
 
-    The key half of a prefixed reason is matched against the declared runtime
-    key grammar itself, not a copy of it, so the two cannot drift apart.
+    Membership is the whole rule: the listed values are fixed strings this
+    repository writes, so reading the list tells you exactly what can reach a
+    visitor. A reason assembled from something the connector's owner wrote --
+    ``missing_context.<declared key name>`` is the one such reason raised here
+    -- is not admitted, however legal its shape, because this frame reaches
+    anonymous widget and share-link visitors and a key name is the owner's
+    configuration. Owners read key names from the per-task requirements
+    endpoint, which selects on ``Task.id == task_id AND
+    Task.user_id == current_user.id``.
     """
 
-    if not isinstance(reason, str):
-        return False
-    if reason in CONNECTOR_RUNTIME_PUBLIC_REASONS:
-        return True
-    prefix, separator, key = reason.rpartition(".")
-    if not separator:
-        return False
-    if prefix not in CONNECTOR_RUNTIME_PUBLIC_REASON_PREFIXES:
-        return False
-    return RUNTIME_SOURCE_KEY_RE.fullmatch(key) is not None
+    return isinstance(reason, str) and reason in CONNECTOR_RUNTIME_PUBLIC_REASONS
 
 
 @dataclass(frozen=True)
 class PublicErrorDetails:
     """The only shape allowed into a task_error frame's ``details``.
 
-    ``reason`` is normalized on construction: a value that is not a listed
-    enum member, and not ``<listed prefix>.<declared key name>``, becomes
-    ``None``. Constructing this type and passing the reason whitelist are
-    therefore the same act -- there is no path that produces an instance
-    carrying free text, including a direct call from another module.
+    ``reason`` is normalized on construction: anything that is not a listed
+    enum member becomes ``None``. Constructing this type and passing the
+    reason whitelist are therefore the same act -- there is no path that
+    produces an instance carrying free text, including a direct call from
+    another module.
 
     Nulling rather than raising is deliberate: every construction site is on
     the reporting path of an already-failed task, and raising there would
@@ -219,10 +203,14 @@ class PublicErrorDetails:
 
     The sink is ``broadcast_to_task``, whose audience includes anonymous
     widget and share-link visitors, so every listed reason and every new
-    field must answer one question first: can a visitor who is not the task
-    owner read the task's ownership, or the outcome of an authorization
-    check, out of it? There is no ``connector_ref`` field because the answer
-    for it is yes; two runtime reasons are omitted for the same answer.
+    field has to answer two questions, and a yes to either keeps it off this
+    frame. First: can a visitor who is not the task owner read the task's
+    ownership, or the outcome of an authorization check, out of it? Second:
+    does any part of it come from something the connector's owner wrote down
+    -- a key name, a label, a ref -- rather than from a fixed string this
+    repository controls? There is no ``connector_ref`` field and two runtime
+    reasons are omitted on the first question; the
+    ``<prefix>.<declared key name>`` forms are omitted on the second.
     """
 
     reason: str | None

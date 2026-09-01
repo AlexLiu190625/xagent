@@ -46,12 +46,12 @@ def test_terminal_error_event_carries_both_new_fields_together() -> None:
         1,
         "x",
         code="missing_runtime_context",
-        details=PublicErrorDetails(reason="missing_context.auth_token"),
+        details=PublicErrorDetails(reason="not_provided"),
     )
 
     assert set(event.keys()) == BASE_FIELDS | {"code", "details"}
     assert event["code"] == "missing_runtime_context"
-    assert event["details"] == {"reason": "missing_context.auth_token"}
+    assert event["details"] == {"reason": "not_provided"}
 
 
 def test_terminal_error_event_keeps_an_emptied_details_object() -> None:
