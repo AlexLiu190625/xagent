@@ -8271,11 +8271,9 @@ async def test_react_work_tool_batch_still_fails_stream_before_close(
 
     by_id = _terminal_events_by_message_id(outbound.events)
     assert len(by_id) == 2
-    sequences = list(by_id.values())
-    assert sequences[0] == ["final_answer_start", "final_answer_error"]
-    assert sequences[1] == ["final_answer_start", "final_answer_error"] or sequences[
-        1
-    ] == ["final_answer_start", "final_answer_end"]
+    first_id, second_id = by_id.keys()
+    assert by_id[first_id] == ["final_answer_start", "final_answer_error"]
+    assert by_id[second_id] == ["final_answer_start", "final_answer_end"]
     first_stream_error = next(
         e for e in outbound.events if e["type"] == "final_answer_error"
     )
@@ -8283,6 +8281,13 @@ async def test_react_work_tool_batch_still_fails_stream_before_close(
         "discarded an answer that arrived together with tool "
         "calls; answering again once the tools have run"
     )
+    second_stream_end = next(
+        e
+        for e in outbound.events
+        if e["type"] == "final_answer_end" and e["message_id"] == second_id
+    )
+    assert second_stream_end["content"] == _FALLBACK_ANSWER
+    assert runtime.last_final_answer_stream_message_id == second_id
 
 
 @pytest.mark.asyncio

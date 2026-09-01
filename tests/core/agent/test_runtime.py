@@ -749,6 +749,38 @@ async def test_runtime_stream_events_are_logged_once_each(
 
 
 @pytest.mark.asyncio
+async def test_runtime_stream_log_suppressed_when_outbound_handler_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The opened/closed/failed log lines sit after the outbound emit call in
+    all three stream methods, not before it - so when the outbound handler
+    itself raises, the exception propagates to the caller and the
+    corresponding log line is never written, because the emit it was meant
+    to describe never actually succeeded."""
+
+    async def raising_handler(payload: dict[str, Any]) -> None:
+        raise RuntimeError("outbound send failed")
+
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+    runtime = PatternRuntime(
+        execution_id="task-1", outbound_message_handler=raising_handler
+    )
+
+    with pytest.raises(RuntimeError, match="outbound send failed"):
+        await runtime.start_final_answer_stream()
+    assert recording_logger.info_calls == []
+
+    with pytest.raises(RuntimeError, match="outbound send failed"):
+        await runtime.end_final_answer_stream("final_answer_abc", "answer text")
+    assert recording_logger.info_calls == []
+
+    with pytest.raises(RuntimeError, match="outbound send failed"):
+        await runtime.fail_final_answer_stream("final_answer_abc", "some reason")
+    assert recording_logger.warning_calls == []
+
+
+@pytest.mark.asyncio
 async def test_runtime_streaming_llm_call_merges_tool_call_argument_deltas() -> None:
     runtime = PatternRuntime()
 
