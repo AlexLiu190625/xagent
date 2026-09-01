@@ -117,6 +117,13 @@ describe("widget chrome", () => {
     }
   })
 
+  it("keeps the chrome-readiness message type literals in sync with the host script", () => {
+    const ready: WidgetParentMessageType = "widget_chrome_ready"
+    const notReady: WidgetParentMessageType = "widget_chrome_not_ready"
+    expect(widgetScript).toContain(`data.type === '${ready}'`)
+    expect(widgetScript).toContain(`data.type === '${notReady}'`)
+  })
+
   it("starts closed for a first-time visitor", () => {
     runWidget()
 
@@ -138,6 +145,20 @@ describe("widget chrome", () => {
     fabEl()?.click()
 
     expect(panelEl()).not.toHaveClass("open")
+  })
+
+  it("labels the FAB for screen readers, and keeps the label in sync with open/close state", () => {
+    // In the no-ready mobile states this is the only dismiss control the
+    // panel has at all -- an unlabeled icon-only button leaves a screen
+    // reader user with no way to know what it does.
+    runWidget()
+    expect(fabEl()).toHaveAttribute("aria-label", "Open chat")
+
+    fabEl()?.click()
+    expect(fabEl()).toHaveAttribute("aria-label", "Close chat")
+
+    fabEl()?.click()
+    expect(fabEl()).toHaveAttribute("aria-label", "Open chat")
   })
 
   it("closes the panel when the iframe posts widget_close", () => {
@@ -175,19 +196,30 @@ describe("widget chrome", () => {
     runWidget()
     fabEl()?.click()
     expect(panelEl()).toHaveClass("open")
-    // Both captured before removal: querying by class after the container is
+    // All captured before removal: querying by class after the container is
     // detached returns null (the element still exists, just outside the
     // document), and jsdom may separately null out a detached iframe's own
     // contentWindow, which would make the pre-existing origin/source check
     // reject the message on its own -- this proves the *teardown* path
     // specifically, independent of that check, by keeping the source a
     // match regardless.
-    const capturedPanel = panelEl()
     const capturedSource = iframeEl()?.contentWindow as Window
+    const capturedFab = fabEl()!
+    // Teardown itself now clears the panel's 'open' class directly (so a
+    // reinserted stale node can't render an unclosable full-screen overlay
+    // -- see widget-bootstrap.test.ts), so the panel being closed afterward
+    // no longer distinguishes "the message was ignored" from "teardown
+    // already did this." Teardown never touches the FAB's icon markup
+    // though (only its display), so that staying exactly what it was
+    // immediately after teardown -- not reset back to the closed-state icon
+    // by a live closePanel() call -- is what actually proves the stray
+    // message never ran anything.
+    const fabIconAfterTeardown = () => capturedFab.innerHTML
 
     document.querySelector(".xagent-widget-container")?.remove()
     // The teardown observer's callback fires as a microtask.
     await Promise.resolve()
+    const iconRightAfterTeardown = fabIconAfterTeardown()
 
     window.dispatchEvent(new MessageEvent("message", {
       data: { xagent: true, v: 1, type: "widget_close" },
@@ -195,9 +227,34 @@ describe("widget chrome", () => {
       source: capturedSource,
     }))
 
-    // Unchanged from the open-click above: a stray post-teardown widget_close
-    // must not have run closePanel().
-    expect(capturedPanel).toHaveClass("open")
+    expect(fabIconAfterTeardown()).toBe(iconRightAfterTeardown)
+  })
+
+  it("marks the panel chrome-ready once the iframe's own close control confirms it's mounted", () => {
+    runWidget()
+    fabEl()?.click()
+    expect(panelEl()).not.toHaveClass("xagent-widget-chrome-ready")
+
+    fromIframe("widget_chrome_ready")
+
+    expect(panelEl()).toHaveClass("xagent-widget-chrome-ready")
+  })
+
+  it("revokes chrome-ready if the child's close control unmounts while the panel stays open", () => {
+    // e.g. an active Session degrading mid-conversation: WidgetChromeControls
+    // unmounts, but nothing closes the panel itself. The mobile FAB-hiding
+    // CSS rule keys off this class specifically so the parent's fallback
+    // close control reappears instead of leaving the visitor stuck behind a
+    // full-screen overlay with no dismiss action at all.
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_chrome_ready")
+    expect(panelEl()).toHaveClass("xagent-widget-chrome-ready")
+
+    fromIframe("widget_chrome_not_ready")
+
+    expect(panelEl()).not.toHaveClass("xagent-widget-chrome-ready")
+    expect(panelEl()).toHaveClass("open")
   })
 
   it("ignores an unrecognized chrome message type", () => {

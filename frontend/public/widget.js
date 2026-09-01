@@ -238,8 +238,19 @@
   var MOBILE_BREAKPOINT = 480;
   var HORIZONTAL_VIEWPORT_MARGIN = 40;
 
+  // window.innerWidth includes a classic (non-overlay) scrollbar's own
+  // width, but the CSS media query below measures the viewport itself -- on
+  // a desktop browser with a visible scrollbar those two can disagree by a
+  // few pixels right at the boundary. matchMedia asks the CSS engine the
+  // same question directly, so it can never drift from it; fall back to the
+  // innerWidth comparison only where matchMedia itself is unavailable (this
+  // project's own jsdom test environment has no matchMedia at all).
+  var mobileMediaQuery = typeof window.matchMedia === 'function'
+    ? window.matchMedia('(max-width: ' + MOBILE_BREAKPOINT + 'px)')
+    : null;
+
   function isMobileViewport() {
-    return window.innerWidth <= MOBILE_BREAKPOINT;
+    return mobileMediaQuery ? mobileMediaQuery.matches : window.innerWidth <= MOBILE_BREAKPOINT;
   }
 
   function clampPanelWidth(width) {
@@ -379,13 +390,33 @@
       background: rgba(0, 0, 0, 0.15);
     }
 
-    /* visibility transitions to a closed panel keep it hit-testable for the
-       duration of the transition (per spec, as long as either end of the
-       transition is 'visible') -- without this, the handle stays draggable
-       and cursor-hinting during that window even though the panel is
-       already fading out. */
+    /* visibility transitions keep an element hit-testable for the whole
+       transition (per spec, as long as either end is 'visible') -- without
+       this, a closed-but-still-fading panel stays clickable/touchable for
+       the ~300ms fade, silently swallowing input meant for whatever's
+       underneath it on the host page. On mobile this covers the entire
+       viewport, not just the small desktop popup's footprint. */
+    .xagent-widget-panel:not(.open) {
+      pointer-events: none;
+    }
+
+    /* Same transition-visibility gap as above, applied to the resize handle
+       specifically: without this it stays draggable and cursor-hinting
+       during that window even though the panel is already fading out. */
     .xagent-widget-panel:not(.open) .xagent-widget-resize-handle {
       display: none;
+    }
+
+    /* Toggled by acquireScrollLock/releaseScrollLock below, on whichever
+       element document.scrollingElement says actually scrolls the document
+       (see scrollLockTarget's own comment), while the mobile full-screen
+       panel is open. !important so it reliably wins over a host page's own
+       inline overflow write on that element -- this lock deliberately never
+       reads or writes that shared value itself, so it can neither be fooled
+       by, nor interfere with, a host page's own separate scroll-lock
+       mechanism. */
+    .xagent-widget-scroll-locked {
+      overflow: hidden !important;
     }
 
     /* Expand mode jumps straight to the same max width the drag-resize
@@ -414,11 +445,71 @@
 
     @media (max-width: ${MOBILE_BREAKPOINT}px) {
       .xagent-widget-panel {
-        width: calc(100vw - ${HORIZONTAL_VIEWPORT_MARGIN}px);
-        height: calc(100vh - 120px);
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        max-height: 100%;
+        /* Dynamic viewport units track a mobile browser's address-bar
+           show/hide (under the default interactive-widget=resizes-visual
+           behavior this widget doesn't override, an on-screen keyboard
+           opening does NOT change dvh on either iOS Safari or Android
+           Chrome); browsers that don't parse dvh at all ignore these two
+           lines entirely and keep the 100% fallback above. */
+        height: 100dvh;
+        max-height: 100dvh;
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+        /* The safe-area padding strips below have no scrollable content of
+           their own -- without this, a touch-drag starting on one of them
+           can chain into scrolling the host page hidden behind this "modal"
+           instead of doing nothing, even with body scroll separately locked
+           in JS (a known gap in body-only overflow:hidden on iOS Safari). */
+        overscroll-behavior: none;
+        /* Full-screen means edge-to-edge, including under a notch/home
+           indicator or, in landscape, a side notch -- the fallback keeps
+           unsupporting browsers at 0. */
+        padding-top: env(safe-area-inset-top, 0px);
+        padding-bottom: env(safe-area-inset-bottom, 0px);
+        padding-left: env(safe-area-inset-left, 0px);
+        padding-right: env(safe-area-inset-right, 0px);
       }
 
       .xagent-widget-resize-handle {
+        display: none;
+      }
+
+      /* The container (not the FAB itself) is what anchors the fallback
+         FAB's on-screen position -- the panel's own safe-area padding above
+         has no effect on it, so without this a notch/home-indicator inset
+         wider than the base 20px can leave part of the touch target inside
+         that unsafe area while the child hasn't confirmed readiness. */
+      .xagent-widget-container {
+        bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+        right: calc(20px + env(safe-area-inset-right, 0px));
+      }
+
+      /* The panel and the FAB are stacking siblings inside the same
+         z-index:999999 container -- a position:fixed panel always paints
+         above a plain in-flow (position:static, the FAB's default) sibling
+         regardless of DOM order, so without this the fixed full-screen panel
+         would visually cover, and fail hit-testing against, the FAB in every
+         state below that intentionally keeps it as the fallback close
+         control. */
+      .xagent-widget-fab {
+        position: relative;
+        z-index: 1;
+      }
+
+      /* Hide the FAB only once the iframe has confirmed (via
+         widget_chrome_ready in onChromeMessage) that its own in-header
+         close control is actually mounted -- loading, auth-failure, and
+         degraded/terminal Session states render no header at all, and
+         without this guard the FAB would disappear as soon as the panel
+         opens regardless, leaving a full-screen overlay with no dismiss
+         action at all in those states. */
+      .xagent-widget-panel.open.xagent-widget-chrome-ready ~ .xagent-widget-fab {
         display: none;
       }
     }
@@ -628,6 +719,10 @@
     // the drag -- worse than doing nothing.
     if (!widthChanged) return;
     applyPanelWidth();
+    // Crossing the breakpoint while open -- realistically a device rotation,
+    // since virtually every phone's landscape width already exceeds it --
+    // must re-evaluate the lock either way, not just apply it once at open.
+    applyScrollLock();
     // A genuine width change mid-drag invalidates this drag's frozen startX/
     // startWidth anchors -- rather than let a later pointermove misread the
     // viewport's own movement as the user shrinking the panel (and persist
@@ -672,11 +767,26 @@
     document.removeEventListener('pointerup', endDrag);
     document.removeEventListener('pointercancel', cancelDrag);
     cancelDrag();
+    // A host SPA removing the widget while open must not leave the host
+    // page's own scroll stranded locked -- there'd be nothing left to
+    // reopen and unlock it.
+    isOpen = false;
+    applyScrollLock();
     // Belt-and-suspenders for a host SPA that re-inserts this same node
     // later (torndown permanently blocks a new drag regardless, but without
     // this the handle would still show its ew-resize cursor and hover
     // highlight, looking interactive while doing nothing).
     resizeHandle.style.display = 'none';
+    // Same belt-and-suspenders, but for a much worse failure mode on
+    // reinsertion: fab.onclick and the iframe's own postMessage close
+    // channel are BOTH permanently guarded by torndown now, so a reinserted
+    // node that still carried a stale 'open'/'xagent-widget-chrome-ready'
+    // class from before teardown would render a full-screen mobile overlay
+    // with no way left to dismiss it. Clearing them here means a reinserted
+    // node always starts fully closed; hiding the FAB keeps a now-
+    // permanently-inert control from looking like it still does something.
+    panel.classList.remove('open', 'xagent-widget-chrome-ready');
+    fab.style.display = 'none';
   });
 
   // FAB
@@ -688,19 +798,100 @@
   var closeIcon = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>';
 
   fab.innerHTML = chatIcon;
+  // In the no-ready mobile states, this is the only dismiss control the
+  // panel has at all -- an unlabeled icon-only button leaves a screen
+  // reader user with no way to know what it does. Kept in sync with the
+  // icon swap in openPanel/closePanel below.
+  fab.setAttribute('aria-label', 'Open chat');
 
   var isOpen = false;
+
+  // Non-null exactly while THIS instance owns a reference on the shared lock
+  // below, and which element that reference is against -- a second widget
+  // script on the same host page (or this one reloaded into an SPA route)
+  // runs its own independent copy of this whole closure, so per-instance
+  // state alone can't tell whether some other instance still needs the lock
+  // this one is about to release.
+  var scrollLockedEl = null;
+
+  // document.scrollingElement is whichever element actually scrolls the
+  // document (the same thing scrollTop/scrollLeft on it would move) --
+  // <html> in standards mode almost always, but <body> in quirks mode, and
+  // <html> again (rather than <body>) even when a host page's own CSS
+  // leaves <body> as the one with propagation-eligible overflow. Locking
+  // document.body directly, as this used to, does nothing on a host page
+  // that sets its own overflow on <html> (e.g. html{overflow-y:scroll}, a
+  // common technique to avoid scrollbar-width layout shift) -- overflow
+  // propagation from body to the viewport only happens when html's own
+  // overflow is left at its default 'visible', so an explicit host value on
+  // html defeats a body-only lock entirely while the fixed full-screen panel
+  // stays pinned over a background that's still freely scrollable.
+  function scrollLockTarget() {
+    return document.scrollingElement || document.documentElement;
+  }
+
+  // The lock is a namespaced CSS class, ref-counted on the element it was
+  // applied to (not a module-level variable) -- deliberately NOT the shared
+  // overflow value a host page might independently set on that same element
+  // for its own scroll-locking. Reading/writing that shared value has no way
+  // to tell "the host set this same value independently" apart from "we set
+  // it ourselves", which can either unlock a host modal still open behind us
+  // or leave our own lock silently defeated by the host releasing its own
+  // value. A class only WE add/remove has no such ambiguity, and !important
+  // in the rule above means it wins regardless of what the host does to its
+  // own style while it's present. Ref-counting still covers multiple widget
+  // instances on one page; a body/documentElement swap mid-lock naturally
+  // starts a fresh count on the new element.
+  function acquireScrollLock() {
+    if (scrollLockedEl) return;
+    var target = scrollLockTarget();
+    if (!target) return;
+    var state = target.__xagentScrollLockV2 || (target.__xagentScrollLockV2 = { count: 0 });
+    state.count += 1;
+    target.classList.add('xagent-widget-scroll-locked');
+    scrollLockedEl = target;
+  }
+
+  function releaseScrollLock() {
+    var target = scrollLockedEl;
+    if (!target) return;
+    scrollLockedEl = null;
+    var state = target.__xagentScrollLockV2;
+    if (!state) return;
+    state.count -= 1;
+    if (state.count > 0) return;
+    delete target.__xagentScrollLockV2;
+    target.classList.remove('xagent-widget-scroll-locked');
+  }
+
+  // The full-screen mobile panel has no scrollable ancestor of its own
+  // outside the iframe (the safe-area padding strips are plain background),
+  // so a touch-scroll gesture starting there would otherwise fall through to
+  // the host page and scroll it invisibly behind the "modal" overlay.
+  // Re-evaluated on resize too (see onWindowResize) so rotating a device
+  // across the breakpoint while open doesn't strand the lock.
+  function applyScrollLock() {
+    if (isOpen && isMobileViewport()) {
+      acquireScrollLock();
+    } else {
+      releaseScrollLock();
+    }
+  }
 
   function openPanel() {
     isOpen = true;
     panel.classList.add('open');
     fab.innerHTML = closeIcon;
+    fab.setAttribute('aria-label', 'Close chat');
+    applyScrollLock();
   }
 
   function closePanel() {
     isOpen = false;
     panel.classList.remove('open');
     fab.innerHTML = chatIcon;
+    fab.setAttribute('aria-label', 'Open chat');
+    applyScrollLock();
   }
 
   // Returns whether it actually expanded -- onChromeMessage uses this to
@@ -737,6 +928,12 @@
   }
 
   fab.onclick = function () {
+    // A host SPA can remove just the panel (leaving container/FAB in place;
+    // panelRemovalObserver already covers that -- see its own comment
+    // above), which disconnects the observer with no future chance to
+    // release a lock a stray later click would otherwise reacquire on a
+    // detached panel that nothing will ever clean back up.
+    if (torndown) return;
     if (isOpen) {
       closePanel();
     } else {
@@ -772,6 +969,15 @@
     if (!data || data.xagent !== true || data.v !== 1) return;
     if (data.type === 'widget_close') {
       closePanel();
+    } else if (data.type === 'widget_chrome_ready') {
+      // The child's own close control only exists once its "active" header
+      // has actually mounted -- loading/error/expired states render none.
+      // Until this arrives (or after it's revoked below), the FAB stays the
+      // parent-owned fallback so a stuck child state can never fully trap
+      // the visitor behind a full-screen mobile panel with no dismiss action.
+      panel.classList.add('xagent-widget-chrome-ready');
+    } else if (data.type === 'widget_chrome_not_ready') {
+      panel.classList.remove('xagent-widget-chrome-ready');
     } else if (data.type === 'widget_expand') {
       // Correct the iframe's optimistic isExpanded guess when the mobile
       // guard above rejects it -- otherwise the menu keeps reading "Collapse
