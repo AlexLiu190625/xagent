@@ -2620,10 +2620,11 @@ async def _generate(
     ``read_task_steps_version`` is read once right after registration to
     capture the watermark the warm-up replay bounds itself to (see
     ``_build_warm_up_frames``). It is required: a failed read of that
-    watermark closes the stream for resync rather than replaying the
-    task's history unbounded, and an absent *reader* would produce that
-    same unbounded replay silently, which is the one outcome this path
-    refuses.
+    watermark closes the stream -- with ``resync_required``, or with
+    ``task_deleted`` when the failure is the task itself being gone --
+    rather than replaying the task's history unbounded, and an absent
+    *reader* would produce that same unbounded replay silently, which
+    is the one outcome this path refuses.
     """
     deadline = monotonic() + stream_max_duration_seconds
     sink = V1EventStreamSink(
@@ -2662,9 +2663,12 @@ async def _generate(
         # Capture the replay watermark as close to registration as this
         # generator can manage -- see ``TaskStepsVersionReader`` and
         # ``_build_warm_up_frames``'s docstring for what it bounds and
-        # why. A failure here (a transient DB error, or the task
-        # deleted in the instant after registration) closes the stream
-        # for resync instead of falling back to an unbounded replay.
+        # why. A failure here never falls back to an unbounded
+        # replay; it closes the stream, and the close reason splits
+        # by cause: a transient DB error gets ``resync_required``,
+        # while a task deleted in the instant after registration gets
+        # ``task_deleted`` (see the handler below for why those are
+        # not the same recovery for a client).
         # The watermark is what bounds the warm-up replay's duplicate
         # window to "registration to this one ``max(id)`` query" (see
         # ``_build_warm_up_frames``'s docstring); falling back to an
@@ -2690,9 +2694,10 @@ async def _generate(
             # reader handing back a ``max_event_id`` that is not an
             # integer is a failed read like any other, and the comment
             # above promises every failure at this step closes the
-            # stream for resync rather than propagating out of this
-            # generator. In an ``else`` the conversion sits outside
-            # that promise.
+            # stream rather than propagating out of this generator --
+            # with ``resync_required`` for exactly this kind of
+            # failure, since the task itself is fine. In an ``else``
+            # the conversion sits outside that promise.
             replay_watermark = int(version_snapshot.max_event_id)
             # Nothing else in this generator reads ``version_snapshot`` --
             # the one field it carries is already copied into
@@ -2701,22 +2706,32 @@ async def _generate(
             # frame's locals for the rest of a connection that can live
             # an hour.
             del version_snapshot
-        except Exception:
-            logger.exception(
-                "v1 SSE replay watermark read failed for task %s; "
-                "closing for resync instead of falling back to an "
-                "unbounded warm-up replay",
-                task_id,
-            )
-            sink.enqueue_close(
-                error_frame(
-                    "resync_required",
-                    message=(
-                        "Reading the replay watermark failed; call "
-                        "steps() to resync, then re-attach."
-                    ),
+        except Exception as exc:
+            if isinstance(exc, V1ApiError) and exc.code is V1ErrorCode.TASK_NOT_FOUND:
+                # Same split, and the same reason, as the history-read
+                # branch below: the task is gone, not merely unreadable,
+                # so telling the client to call steps() and re-attach
+                # would send it to a 404. Not logged, for the same
+                # reason that branch and the watchdog don't log it -- a
+                # task deleted while an attach is in flight is a race,
+                # not a bug in this stream.
+                sink.enqueue_close(error_frame("task_deleted"))
+            else:
+                logger.exception(
+                    "v1 SSE replay watermark read failed for task %s; "
+                    "closing for resync instead of falling back to an "
+                    "unbounded warm-up replay",
+                    task_id,
                 )
-            )
+                sink.enqueue_close(
+                    error_frame(
+                        "resync_required",
+                        message=(
+                            "Reading the replay watermark failed; call "
+                            "steps() to resync, then re-attach."
+                        ),
+                    )
+                )
         watchdog_task = asyncio.create_task(
             _watchdog_loop(
                 sink,
@@ -2789,9 +2804,10 @@ async def _generate(
         # no close frame at all: that would break this module's own
         # invariant that a close frame is always how a client tells "the
         # task ended" apart from "the stream ended".
-        # Skipped when the watermark read above already failed and closed
-        # for resync: there is no watermark to bound this read to, and
-        # the close frame it queued is what the loop below will deliver.
+        # Skipped when the watermark read above already failed and
+        # closed the stream (for resync, or as ``task_deleted``):
+        # there is no watermark to bound this read to, and the close
+        # frame it queued is what the loop below will deliver.
         if replay_watermark is not None:
             watermark = replay_watermark
             try:

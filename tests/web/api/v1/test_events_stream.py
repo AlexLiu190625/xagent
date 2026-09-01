@@ -3398,6 +3398,45 @@ async def test_generate_wires_read_task_steps_version_into_the_watermark(monkeyp
         await resp.body_iterator.aclose()
 
 
+async def test_a_task_deleted_during_the_watermark_read_closes_with_task_deleted():
+    """The watermark read re-resolves the task in its own session, so a
+    delete landing while it is in flight raises ``TASK_NOT_FOUND`` into
+    this generator's handler -- before the watchdog exists, so nothing
+    later can correct the code. The client must be told the task is
+    gone, not told to call ``steps()`` and re-attach, which can only
+    404 for a row that no longer exists."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    def _deleting_version_reader(task_id_, principal_):
+        db = _direct_db_session()
+        try:
+            db.query(Task).filter(Task.id == task_id_).delete()
+            db.commit()
+        finally:
+            db.close()
+        return v1_tasks._load_task_steps_version_snapshot(task_id_, principal_)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=_deleting_version_reader,
+        **_long_intervals(),
+    )
+    frames = []
+    async for chunk in resp.body_iterator:
+        frames.append(chunk)
+    body = "".join(frames)
+    assert _parse_error_frame(body)["code"] == "task_deleted"
+    assert "event: step.started" not in body
+
+
 def test_fast_paths_without_a_steps_version_reader_is_a_call_error():
     """``read_task_steps_version`` is a required argument on all three
     attach-time fast-path entry points -- ``_terminal_snapshot_stream``,
