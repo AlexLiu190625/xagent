@@ -5705,7 +5705,19 @@ export function AppProvider({
           ? t(clientErrorTranslationKey(websocketErrorCode))
           : getWebSocketErrorMessage(message, trustLegacyErrorProse)
         const websocketTaskStatus = getWebSocketTaskStatus(message)
-        const taskErrorProjection = getTaskErrorProjection(message)
+        // Only task_error is terminal. Every frame of that type is emitted after
+        // the row has been committed FAILED -- task_orchestrator.py's settled
+        // branch, and websocket.py's legacy helper, which settles under
+        // only_if_running=True and does not broadcast when that update matches
+        // no row -- and task_error is also the only frame that carries the
+        // structured code/details pair. The root "error" type is a mixed
+        // channel: rejected chat messages, rejected pause and rejected resume
+        // all arrive on it while the viewed task is still RUNNING or
+        // WAITING_FOR_USER, and a rejection is not this turn's answer.
+        const isTerminalErrorFrame = message.type === "task_error"
+        const taskErrorProjection = isTerminalErrorFrame
+          ? getTaskErrorProjection(message)
+          : null
 
         if (websocketTaskStatus) {
           dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: websocketTaskStatus } })
@@ -5757,11 +5769,15 @@ export function AppProvider({
               content: errorBubbleContent,
               timestamp: message.timestamp,
               status: "failed",
-              // Terminal failure IS this turn's result. Without the flag the
-              // conversation panel (which only shows user / isResult /
-              // system-notice messages) filters the bubble out and falls back
-              // to a virtual "unknown error" placeholder until reload.
-              isResult: true,
+              // A terminal failure IS this turn's result: without the flag the
+              // conversation panel (which renders only user / isResult /
+              // system-notice messages) filters the bubble out and falls back to
+              // a virtual "unknown error" placeholder until reload. A
+              // non-terminal rejection is not, and flagging it would close the
+              // live progress indicator and the waiting-answer form of a turn
+              // that is still running, and drain this turn's accumulated trace
+              // events into the rejection bubble (see ADD_MESSAGE above).
+              isResult: isTerminalErrorFrame,
             },
           })
         }

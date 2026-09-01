@@ -5659,45 +5659,150 @@ describe("terminal error frames", () => {
   // The conversation panel renders only user / isResult / system-notice
   // messages. Without the flag the bubble is filtered out and the UI falls
   // back to a generic "unknown error" placeholder until the page reloads.
-  it.each(["error", "task_error"])(
-    "flags the %s bubble as the turn's result",
-    async (frameType) => {
-      render(
-        <AppProvider token="token">
-          <SeedRunningTask />
-          <StateProbe />
-        </AppProvider>
+  it("flags the terminal task_error bubble as the turn's result", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Task execution failed.",
+        error: "Task execution failed.",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Task execution failed."
       )
+    })
 
-      const onMessage = webSocketOptions.current?.onMessage
-      expect(onMessage).toBeDefined()
+    const messages = JSON.parse(
+      screen.getByTestId("messages").textContent || "[]"
+    )
+    const bubble = messages.find((m: { content: string }) =>
+      m.content.includes("Task execution failed.")
+    )
+    expect(bubble?.isResult).toBe(true)
+  })
 
-      act(() => {
-        onMessage?.({
-          type: frameType,
-          timestamp: "2026-05-27T05:00:02Z",
-          task_id: 1,
-          task: { id: 1, status: "failed" },
-          message: "Task execution failed.",
-          error: "Task execution failed.",
-        } as TestWebSocketMessage)
-      })
+  // Rejections arrive on the root "error" type while the task keeps running:
+  // websocket.py refuses a chat message (:5521-5554) and a pause command
+  // (:8491, :8502) that way. Flagging one as this turn's result makes the
+  // conversation panel treat the turn as answered -- it renders only user /
+  // isResult / system-notice messages, so a flagged rejection ends the live
+  // progress indicator of a turn that is still running.
+  it("does not treat a rejection on a running task as the turn's result", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
 
-      await waitFor(() => {
-        expect(screen.getByTestId("messages").textContent).toContain(
-          "Task execution failed."
-        )
-      })
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
 
-      const messages = JSON.parse(
-        screen.getByTestId("messages").textContent || "[]"
+    act(() => {
+      onMessage?.({
+        type: "error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "running" },
+        message: "Task is currently busy; please wait for the previous turn to finish.",
+        error_code: "task_busy",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.taskBusy"
       )
-      const bubble = messages.find((m: { content: string }) =>
-        m.content.includes("Task execution failed.")
+    })
+
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    const bubble = messages.find((m: { content: string }) =>
+      m.content.includes("clientErrors.taskBusy")
+    )
+    expect(bubble).toBeDefined()
+    expect(bubble?.isResult).not.toBe(true)
+    // The turn is untouched: still running, still processing.
+    expect(screen.getByTestId("task-status").textContent).toBe("running")
+    expect(screen.getByTestId("processing").textContent).toBe("true")
+  })
+
+  // The waiting half. A refused resume arrives on the root "error" type
+  // carrying the task's real current status (websocket.py:8935 builds it from
+  // TaskControlSnapshot). The question the user still has to answer lives on
+  // the panel's virtual bubble, which a flagged rejection would remove.
+  it("does not treat a rejection on a waiting task as the turn's result", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    // Put the task where a resume can be refused: waiting on a question that
+    // carries an interaction the user has to fill in.
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+        request_id: "req-1",
+        interactions: [
+          { type: "text", request_id: "req-1", prompt: "Which region should I use?" },
+        ],
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+    })
+    expect(screen.getByTestId("waiting-interactions").textContent).not.toBe("[]")
+
+    act(() => {
+      onMessage?.({
+        type: "error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Task pause is still being applied; please retry shortly.",
+        error_code: "task_pause_in_progress",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.taskPauseInProgress"
       )
-      expect(bubble?.isResult).toBe(true)
-    }
-  )
+    })
+
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    const bubble = messages.find((m: { content: string }) =>
+      m.content.includes("clientErrors.taskPauseInProgress")
+    )
+    expect(bubble).toBeDefined()
+    expect(bubble?.isResult).not.toBe(true)
+    // The question the user still owes an answer to is untouched.
+    expect(screen.getByTestId("task-status").textContent).toBe("waiting_for_user")
+    expect(screen.getByTestId("waiting-interactions").textContent).not.toBe("[]")
+  })
 
   // A listed reason that is a bare enum value names no key, so the keyless
   // wording is chosen even though the code is a missing-value one.
