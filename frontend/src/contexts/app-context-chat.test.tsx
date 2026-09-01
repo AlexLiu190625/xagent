@@ -5745,6 +5745,13 @@ describe("terminal error frames", () => {
   // carrying the task's real current status (websocket.py:8935 builds it from
   // TaskControlSnapshot). The question the user still has to answer lives on
   // the panel's virtual bubble, which a flagged rejection would remove.
+  // The fixture below combines fields from two producers: `task` comes from
+  // the resume-refusal path (websocket.py:8935), `error_code` comes from the
+  // pause-refusal path (websocket.py:8491). Neither path emits both fields
+  // together today; each field is genuinely emitted by its own path.
+  // Carrying `task` drives the reducer's preservation branch (it is what
+  // makes `UPDATE_TASK_STATUS` dispatch at all) -- without it the assertions
+  // below would pass vacuously instead of exercising that branch.
   it("does not treat a rejection on a waiting task as the turn's result", async () => {
     render(
       <AppProvider token="token">

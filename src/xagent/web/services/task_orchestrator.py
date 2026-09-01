@@ -1976,7 +1976,8 @@ def _schedule_bg(
                         # a reason assembled from a key name the connector's
                         # owner declared is dropped at the projector, so this
                         # branch's own reason reaches the frame for two of the
-                        # three codes and not for missing_runtime_context.
+                        # three missing-value codes and not for
+                        # missing_runtime_context.
                         settlement_error = str(setup_or_run_err)
                         client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
                         broadcast_error_message = connector_runtime_client_message(
