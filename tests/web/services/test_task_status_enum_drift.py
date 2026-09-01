@@ -28,6 +28,7 @@ from sqlalchemy import text
 from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.web.models.database import Base, _initialize_database_schema
 from xagent.web.models.task import (
+    TASKSTATUS_ENUM_REPAIR_REVISION,
     TaskStatus,
     TaskStatusEnumDriftError,
     check_task_status_enum_drift,
@@ -105,9 +106,11 @@ def test_pg_enum_missing_label_raises(postgresql_engine_factory) -> None:
 
     message = str(exc_info.value)
     assert missing_label in message
-    assert "pending migration" in message
-    # Exclusive, not merely present: the combined branch also says "pending
-    # migration", so only the absence of its own wording distinguishes them.
+    assert "Upgrade this database to the Alembic head" in message
+    assert TASKSTATUS_ENUM_REPAIR_REVISION in message
+    # Exclusive, not merely present: the combined branch carries the same
+    # upgrade instruction, so only the absence of its own wording
+    # distinguishes them.
     assert "unexpected label(s) indicate" not in message
     assert "DROP VALUE" not in message
 
@@ -129,8 +132,10 @@ def test_pg_enum_extra_label_raises(postgresql_engine_factory) -> None:
     assert "ALTER TYPE" in message
     assert "DROP VALUE" in message
     # The combined branch carries ALTER TYPE and DROP VALUE too, so those
-    # alone cannot tell the two apart; these two exclusions can.
-    assert "pending migration" not in message
+    # alone cannot tell the two apart; these two exclusions can. No migration
+    # repairs an unexpected label, so the upgrade instruction must not appear
+    # on this branch.
+    assert "Upgrade this database to the Alembic head" not in message
     assert "unexpected label(s) indicate" not in message
 
 
@@ -156,6 +161,7 @@ def test_pg_enum_missing_and_extra_labels_name_both_in_the_message(
     message = str(exc_info.value)
     assert _ALL_LABELS[-1] in message
     assert extra_label in message
+    assert "Upgrade this database to the Alembic head" in message
     assert "cannot be reconciled by a migration" in message
 
 

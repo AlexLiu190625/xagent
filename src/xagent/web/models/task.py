@@ -60,6 +60,24 @@ class TaskStatusEnumDriftError(RuntimeError):
     """
 
 
+#: The Alembic revision that adds ``WAITING_FOR_USER`` to a native
+#: ``taskstatus`` enum created before that member existed. Named in the
+#: remediation text below so an operator reading a startup failure has an
+#: exact revision rather than a description; pinned against the revision file
+#: itself by
+#: tests/migrations/test_20260901_add_task_status_waiting_for_user_enum_label.py.
+TASKSTATUS_ENUM_REPAIR_REVISION = "20260901_taskstatus_waiting_for_user"
+
+_MISSING_LABEL_REMEDY = (
+    "Upgrade this database to the Alembic head: revision "
+    f"{TASKSTATUS_ENUM_REPAIR_REVISION} adds WAITING_FOR_USER to the type "
+    "backing tasks.status. A label no revision adds needs one written; to "
+    "repair a database by hand instead, run ALTER TYPE <the type tasks.status "
+    "is declared with> ADD VALUE IF NOT EXISTS '<label>' for each missing "
+    "label, then restart this process."
+)
+
+
 def check_task_status_enum_drift(bind: Connection) -> None:
     """Refuse to serve when the live ``taskstatus`` enum's labels disagree
     with ``TaskStatus``'s own members.
@@ -75,7 +93,9 @@ def check_task_status_enum_drift(bind: Connection) -> None:
     follow from that placement and are the reason for it. A migration that
     adds a ``TaskStatus`` label via ``ALTER TYPE ... ADD VALUE`` has already
     run by the time this check reads the catalog, so shipping one cannot
-    trip this check into a crash loop. The connection is the startup lock's
+    trip this check into a crash loop -- revision
+    ``20260901_taskstatus_waiting_for_user`` is that migration for
+    ``WAITING_FOR_USER``. The connection is the startup lock's
     own, so this check adds no failure mode of its own beyond the ones
     schema initialization already has. And no second backend worker can
     observe a half-initialized database while it runs.
@@ -140,16 +160,12 @@ def check_task_status_enum_drift(bind: Connection) -> None:
     extra = sorted(live_labels - expected_labels)
     if missing and extra:
         remedy = (
-            "Run the pending migration that adds the missing label(s); the "
-            "unexpected label(s) indicate this process is older than the "
-            "database and cannot be reconciled by a migration, since "
-            "PostgreSQL has no ALTER TYPE ... DROP VALUE."
+            f"{_MISSING_LABEL_REMEDY} The unexpected label(s) indicate this "
+            "process is older than the database and cannot be reconciled by "
+            "a migration, since PostgreSQL has no ALTER TYPE ... DROP VALUE."
         )
     elif missing:
-        remedy = (
-            "Run the pending migration that adds the missing label(s) before "
-            "starting this process."
-        )
+        remedy = _MISSING_LABEL_REMEDY
     else:
         remedy = (
             "No migration can remove them -- PostgreSQL has no ALTER TYPE ... "
