@@ -66,6 +66,11 @@ class TaskStatusEnumDriftError(RuntimeError):
 #: exact revision rather than a description; pinned against the revision file
 #: itself by
 #: tests/migrations/test_20260901_add_task_status_waiting_for_user_enum_label.py.
+#: This revision only backfills the ``WAITING_FOR_USER`` label. Each future
+#: ``TaskStatus`` member needs its own ``ALTER TYPE ... ADD VALUE``
+#: migration, and this constant needs updating to name it, or the
+#: remediation text above keeps pointing an operator at a revision that
+#: does not add the label they are missing.
 TASKSTATUS_ENUM_REPAIR_REVISION = "20260901_taskstatus_waiting_for_user"
 
 _MISSING_LABEL_REMEDY = (
@@ -80,7 +85,7 @@ _MISSING_LABEL_REMEDY = (
 
 def check_task_status_enum_drift(bind: Connection) -> None:
     """Refuse to serve when the live ``taskstatus`` enum's labels disagree
-    with ``TaskStatus``'s own members.
+    with the labels ``Task.status`` is declared with.
 
     A no-op on every backend other than PostgreSQL: ``pg_enum`` is a
     PostgreSQL system catalog, and the other backends this repo supports
@@ -132,6 +137,15 @@ def check_task_status_enum_drift(bind: Connection) -> None:
     A complete copy in ``shadow`` would then hide a label genuinely missing
     from the type the column uses, and an extra label on that copy would
     reject a correct deployment.
+
+    Expected labels come from ``Task.__table__.c.status.type.enums`` --
+    the ``Enum`` column's own declared labels -- rather than from
+    ``{member.name for member in TaskStatus}``. Today the two sets are
+    equal, because the column has no ``values_callable`` and SQLAlchemy's
+    default is to persist member names. If the column is ever given a
+    ``values_callable`` that persists something else (member values, for
+    instance), the column's declared labels stop matching the member-name
+    set, and only the column is still the live database's contract.
     """
 
     if bind.dialect.name != "postgresql":
@@ -152,7 +166,7 @@ def check_task_status_enum_drift(bind: Connection) -> None:
         )
     )
 
-    expected_labels = {member.name for member in TaskStatus}
+    expected_labels = set(Task.__table__.c.status.type.enums)
     if live_labels == expected_labels:
         return
 

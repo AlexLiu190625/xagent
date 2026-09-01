@@ -29,12 +29,19 @@ from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.web.models.database import Base, _initialize_database_schema
 from xagent.web.models.task import (
     TASKSTATUS_ENUM_REPAIR_REVISION,
+    Task,
     TaskStatus,
     TaskStatusEnumDriftError,
     check_task_status_enum_drift,
 )
 
-_ALL_LABELS = [member.name for member in TaskStatus]
+# Same source as check_task_status_enum_drift's own expected_labels: the
+# status column's declared enum labels, not TaskStatus's member names. The
+# two happen to agree today (see test_expected_labels_match_taskstatus_members
+# below for why, and what it means when they stop), but building the
+# fixture labels from the member names directly would let this file drift
+# out of sync with what the guard actually compares against.
+_ALL_LABELS = list(Task.__table__.c.status.type.enums)
 
 
 def _label_list_sql(labels: list[str]) -> str:
@@ -75,16 +82,45 @@ def postgresql_engine_factory():
         yield make
 
 
+def test_expected_labels_match_taskstatus_members() -> None:
+    """Sentinel, not a functional test of the guard itself.
+
+    check_task_status_enum_drift's expected_labels comes from
+    Task.__table__.c.status.type.enums (the status column's own declared
+    labels), not from iterating TaskStatus's member names. The two sets are
+    equal only because the column has no values_callable, so SQLAlchemy's
+    default -- persist the member name -- is in effect. Nothing keeps that
+    true: give Task.status a values_callable that persists something else
+    (member values, for instance) and this equality breaks.
+
+    test_pg_enum_reflects_exactly_the_taskstatus_members
+    (test_task_status_storage_postgresql.py) pins the same equality, but
+    its db_session fixture skips whenever XAGENT_TEST_POSTGRES_URL is
+    unset, and the ordinary test matrix never sets it -- so that cell is
+    green-by-skip in exactly the runs where a values_callable change would
+    first appear. It also compares a different pair of sources (a real
+    create_all schema vs. TaskStatus's member names), so its failure
+    message blames create_all rather than the column declaration. This
+    test opens no database, so it actually executes in the ordinary
+    matrix. A red run here means the column's storage format is changing
+    and needs a data migration for every existing row, not just a code
+    change.
+    """
+    assert {member.name for member in TaskStatus} == set(
+        Task.__table__.c.status.type.enums
+    )
+
+
 @pytest.mark.postgresql
 def test_pg_enum_labels_match_passes(postgresql_engine_factory) -> None:
     """A correct schema must pass. Both label sets here come from the same
-    ``TaskStatus`` class (the live one via ``create_all``, expected via
-    iterating the enum), so this cell cannot fail on a genuine label
-    mismatch -- that direction is covered by the failure cells below. What
-    it does pin is the opposite direction: the check must not reject a
-    deployment whose enum is correct, which is the regression a stricter
-    query (an unqualified type name, a missing visibility predicate) would
-    introduce.
+    ``TaskStatus`` class (the live one via ``create_all``, expected from
+    the status column's declared labels), so this cell cannot fail on a
+    genuine label mismatch -- that direction is covered by the failure
+    cells below. What it does pin is the opposite direction: the check
+    must not reject a deployment whose enum is correct, which is the
+    regression a stricter query (an unqualified type name, a missing
+    visibility predicate) would introduce.
     """
     engine = postgresql_engine_factory("correct")
     Base.metadata.create_all(bind=engine)
