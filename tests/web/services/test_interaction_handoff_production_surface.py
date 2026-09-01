@@ -81,41 +81,176 @@ def _module_stem_from_import(node: ast.ImportFrom, target_stem: str) -> bool:
 
 # ---------------------------------------------------------------------------
 # Guard 1: interaction_handoff's production use points are exactly
-# {task_interaction_service}.
+# {task_interaction_service}, and Guard 1b: stage_interaction_request has no
+# direct production caller at all -- create()'s own docstring says it
+# reaches the row through interaction_handoff, "never
+# stage_interaction_request directly".
+#
+# One shared scanner, watching each name separately rather than as one set:
+# interaction_handoff has exactly one legitimate production use point
+# (create()'s seam), while stage_interaction_request has none. The two
+# names are never checked against a merged "either name" set for that
+# reason -- a module calling the primitive directly must not be hidden by
+# a passing handoff check on the same line.
 # ---------------------------------------------------------------------------
 
+_STAGING_MODULE = "task_interaction_staging"
+_HANDOFF = "interaction_handoff"
+_PRIMITIVE = "stage_interaction_request"
 
-def _modules_using_interaction_handoff(root: Path) -> set[str]:
+
+def _names_used_by(source: str, watched: frozenset[str]) -> set[str]:
+    """Which watched names this source imports or calls.
+
+    Four shapes, each independently detected -- the retired gate and this
+    file's first version each saw only a subset:
+
+      from ...task_interaction_staging import X      (ImportFrom, per alias)
+      from ...task_interaction_staging import *      (ImportFrom, star)
+      import xagent...task_interaction_staging [as m] (Import)
+      X(...) / anything.X(...)                        (Call, Name/Attribute)
+
+    The Import shape matters because it needs no ImportFrom at all: a
+    module can reach the primitive through `import ... as s` plus
+    `s.stage_interaction_request(...)`, which an ImportFrom-only scanner
+    cannot see. The blind spots the retired gate documented and did not
+    close (importlib + getattr, alias chains through a third module) stay
+    open here for the same reason: they are out of scope for a static AST
+    scan.
+    """
+
     found: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom):
+            if _module_stem_from_import(node, _STAGING_MODULE):
+                found.update(a.name for a in node.names if a.name in watched)
+                if any(a.name == "*" for a in node.names):
+                    found.update(watched)
+        elif isinstance(node, ast.Import):
+            if any(a.name.split(".")[-1] == _STAGING_MODULE for a in node.names):
+                # A bare module import binds every watched name behind an
+                # attribute access; the Call arm below is what says which
+                # one is actually reached, so this arm records the module,
+                # not the names.
+                found.add(_STAGING_MODULE)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in watched:
+                found.add(func.id)
+            elif isinstance(func, ast.Attribute) and func.attr in watched:
+                found.add(func.attr)
+    return found
+
+
+def _modules_using(root: Path, watched: frozenset[str]) -> dict[str, set[str]]:
+    found: dict[str, set[str]] = {}
     for path in root.rglob("*.py"):
-        if path.stem == "task_interaction_staging":
-            continue  # the primitive's own definition module
-        source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        used = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and _module_stem_from_import(
-                node, "task_interaction_staging"
-            ):
-                if any(a.name in ("interaction_handoff", "*") for a in node.names):
-                    used = True
-            elif isinstance(node, ast.Call):
-                func = node.func
-                if isinstance(func, ast.Name) and func.id == "interaction_handoff":
-                    used = True
-                elif (
-                    isinstance(func, ast.Attribute)
-                    and func.attr == "interaction_handoff"
-                ):
-                    used = True
-        if used:
-            found.add(path.stem)
+        if path.stem == _STAGING_MODULE:
+            continue  # the primitives' own definition module
+        uses = _names_used_by(path.read_text(encoding="utf-8"), watched)
+        if uses:
+            found[path.stem] = uses
     return found
 
 
 def test_handoff_is_entered_only_from_the_create_seam() -> None:
     root = Path(next(iter(xagent.__path__)))
-    assert _modules_using_interaction_handoff(root) == {"task_interaction_service"}
+    assert set(_modules_using(root, frozenset({_HANDOFF}))) == {
+        "task_interaction_service"
+    }
+
+
+def test_the_staging_primitive_has_no_direct_production_caller() -> None:
+    """The half of the retired gate this file's first version did not
+    replace. create()'s own docstring says it reaches the row through
+    interaction_handoff, "never stage_interaction_request directly"; this
+    is the only thing that holds that sentence to account.
+
+    Scans for the NAME, not for which modules import the staging module:
+    task_interaction_service is already an allowed importer (Guard 3
+    below), so a module-level "does it import from staging" check stays
+    green while that very module starts calling the primitive directly
+    (measured before this guard existed -- a synthetic module named
+    task_interaction_service that called stage_interaction_request via a
+    bare module import passed both of the guards that existed at the
+    time)."""
+
+    root = Path(next(iter(xagent.__path__)))
+    assert _modules_using(root, frozenset({_PRIMITIVE})) == {}
+
+
+@pytest.mark.parametrize(
+    ("source", "watched", "expected"),
+    [
+        pytest.param(
+            "from xagent.web.services.task_interaction_staging import"
+            " stage_interaction_request\n"
+            "def h(db, **kw):\n"
+            "    return stage_interaction_request(db, **kw)\n",
+            frozenset({_PRIMITIVE}),
+            {_PRIMITIVE},
+            id="from_import_and_direct_call",
+        ),
+        pytest.param(
+            "from xagent.web.services.task_interaction_staging import"
+            " interaction_handoff\n"
+            "def h(db, lease, task, anchor, now):\n"
+            "    with interaction_handoff(db, lease, task=task, anchor=anchor,"
+            " now=now):\n"
+            "        pass\n",
+            frozenset({_HANDOFF}),
+            {_HANDOFF},
+            id="context_manager_call_by_name",
+        ),
+        pytest.param(
+            "from xagent.web.services.task_interaction_staging import *\n",
+            frozenset({_HANDOFF, _PRIMITIVE}),
+            {_HANDOFF, _PRIMITIVE},
+            id="star_import_binds_both",
+        ),
+        pytest.param(
+            "import xagent.web.services.task_interaction_staging as s\n"
+            "def h(db, **kw):\n"
+            "    return s.stage_interaction_request(db, **kw)\n",
+            frozenset({_PRIMITIVE}),
+            {_STAGING_MODULE, _PRIMITIVE},
+            id="bare_import_alias_and_attribute_call",
+        ),
+        pytest.param(
+            "import xagent.web.services.task_interaction_staging\n"
+            "def h(db, **kw):\n"
+            "    return xagent.web.services.task_interaction_staging."
+            "stage_interaction_request(db, **kw)\n",
+            frozenset({_PRIMITIVE}),
+            {_STAGING_MODULE, _PRIMITIVE},
+            id="bare_import_fully_qualified_attribute_call",
+        ),
+    ],
+)
+def test_scanner_positive_controls(
+    source: str, watched: frozenset[str], expected: set[str]
+) -> None:
+    """Each import/call shape must be individually detected. The last two
+    are the ones an ImportFrom-only scanner cannot see at all -- measured
+    against the module-level scanner this replaces (Guard 3's
+    ``_modules_importing_from_staging``), a module written that way passed
+    that scanner while directly calling the primitive."""
+
+    assert _names_used_by(source, watched) == expected
+
+
+def test_scanner_negative_control_unrelated_module_is_clean() -> None:
+    """The scanner must not fire on a module that merely mentions the names
+    in prose or defines something similarly named -- otherwise the real-tree
+    assertions above would be passing for the wrong reason."""
+
+    source = (
+        '"""Prose mentioning stage_interaction_request and'
+        ' interaction_handoff."""\n'
+        "def interaction_handoff_helper_name_only():\n"
+        "    return None\n"
+    )
+    assert _names_used_by(source, frozenset({_HANDOFF, _PRIMITIVE})) == set()
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +437,14 @@ def _modules_importing_from_staging(root: Path) -> set[str]:
 
 
 def test_staging_module_import_surface_is_closed() -> None:
+    """Which modules depend on the staging module at all -- a dependency-
+    surface guard, not a name-use guard. It does not replace
+    ``test_the_staging_primitive_has_no_direct_production_caller`` above:
+    task_interaction_service is already in the set this asserts, so this
+    guard alone would stay green the moment that very module started
+    calling stage_interaction_request directly -- the failure Guard 1b
+    exists to catch."""
+
     root = Path(next(iter(xagent.__path__)))
     assert _modules_importing_from_staging(root) == {
         "task_interaction_anchor",

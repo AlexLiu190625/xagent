@@ -152,7 +152,33 @@ async def test_dedup_cell_5_no_collision_leaves_every_name_unchanged() -> None:
 # The batch-path regression cell (multi-tool dedup unchanged, byte for
 # byte) is already covered by the existing, untouched
 # test_pause_for_tool_results_deduplicates_normalized_fields
-# (test_react.py) -- not duplicated here.
+# (test_react.py) -- covered there, not assigned a numbered cell here.
+
+
+@pytest.mark.asyncio
+async def test_dedup_cell_6_a_literal_suffixed_name_yields_to_an_earlier_auto_suffix() -> (
+    None
+):
+    """The reverse ordering of cell 3. Cell 3 pins "an auto-generated
+    suffix must skip a name already present"; this pins "a literal name
+    that collides with an auto-generated one yields in turn":
+    ["a", "a", "a_2"] -> ["a", "a_2", "a_2_2"].
+
+    Honest note on discriminating power: every mutation this cell kills
+    (if-instead-of-while, suffixing the current name instead of the base,
+    seeding used_fields with base names, two-pass assignment) is already
+    killed by cells 1-3. It is here for ordering coverage, not as a new
+    mutation control -- the measured output is recorded rather than a
+    behaviour claimed."""
+
+    out = await _run_ask_user_question(
+        [
+            {"type": "text_input", "field": "a", "label": "A"},
+            {"type": "text_input", "field": "a", "label": "B"},
+            {"type": "text_input", "field": "a_2", "label": "C"},
+        ]
+    )
+    assert [item["field"] for item in out] == ["a", "a_2", "a_2_2"]
 
 
 @pytest.mark.asyncio
@@ -176,6 +202,24 @@ async def test_dedup_cell_7_deduplicated_output_passes_the_write_side_validator(
         {"message": "Question", "interactions": out}
     )
     validate_v1_write_payload(parsed)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_dedup_cell_8_an_empty_interactions_list_survives_untouched() -> None:
+    """The degenerate input. The dedup loop must be a no-op on an empty
+    list, not a short-circuit that skips the surrounding waiting path:
+    ``_run_ask_user_question`` already asserts status == "waiting_for_user"
+    internally, so reaching its return at all proves that; this test
+    additionally pins the empty interactions list itself.
+
+    Mutation (measured): an early `if not interactions: ...` short-circuit
+    before the waiting path turns this red -- not on the status assertion
+    itself, but because the short-circuit skips the wait entirely and the
+    pattern loop asks the fake LLM for a further response it was never
+    given, an IndexError on the test double's own canned-response list."""
+
+    out = await _run_ask_user_question([])
+    assert out == []
 
 
 # ---------------------------------------------------------------------------

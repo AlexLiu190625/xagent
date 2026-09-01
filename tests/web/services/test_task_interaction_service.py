@@ -733,7 +733,6 @@ def test_validate_reports_a_blank_field_as_blank_not_as_duplicated(
     with pytest.raises(svc.InteractionWritePayloadRejected) as excinfo:
         svc.validate_v1_write_payload(parsed)
     assert excinfo.value.refusal.rule == "field_blank"
-    assert excinfo.value.refusal.rule != "field_duplicate"
 
 
 def test_validate_rejects_duplicate_option_values_within_one_interaction(
@@ -5087,6 +5086,40 @@ def test_i_a_2_identity_string_never_renders_a_nonexistent_person() -> None:
     assert identity == "system:finalizer"
 
 
+def test_identity_string_refuses_a_principal_built_around_post_init() -> None:
+    """The defense-in-depth branch identity_string's own docstring names:
+    "a frozen dataclass can still be produced by means that skip
+    __post_init__ (object.__new__ plus direct attribute assignment, or a
+    future subclass)". The kind coercion __post_init__ now does made the
+    previous string-kind construction route illegal, and the tests that
+    used to reach this branch that way (constructing with kind="robot"
+    directly) were removed along with that route -- this test is the
+    replacement, reaching the same branch the only way still possible:
+    around the constructor entirely.
+
+    Mutation: deleting the `self.kind != "user"` branch's raise turns this
+    red -- the unrecognized kind would fall through to the user branch and
+    render as `user:7`, exactly the audit corruption identity_string's
+    docstring says this branch exists to stop."""
+
+    smuggled = object.__new__(svc.InteractionPrincipal)
+    object.__setattr__(smuggled, "kind", "robot")
+    object.__setattr__(smuggled, "user_id", 7)
+    object.__setattr__(smuggled, "is_admin", False)
+    object.__setattr__(smuggled, "auth_mode", None)
+    for optional in (
+        "widget_agent_id",
+        "widget_workforce_id",
+        "share_agent_id",
+        "share_workforce_id",
+        "guest_id",
+    ):
+        object.__setattr__(smuggled, optional, None)
+
+    with pytest.raises(ValueError, match="has no identity namespace"):
+        smuggled.identity_string()
+
+
 def test_i_a_3_system_principal_never_gets_authorized_through_ownership(
     _db: Session, _seeded_task: int
 ) -> None:
@@ -5266,6 +5299,154 @@ def _system_create(
             expires_at=ctx["expires_at"],
         ),
     )
+
+
+def test_system_write_context_rejects_a_blank_run_id(
+    _system_call_ctx: dict[str, Any],
+) -> None:
+    """The lease preconditions are judged where the caller builds the
+    context, not deep inside interaction_handoff. Before this, an empty
+    run_id escaped create() as a bare ValueError from
+    _validate_request_fields (task_interaction_staging.py), outside the
+    typed-outcome contract entirely.
+
+    Mutation: deleting the run_id branch of __post_init__ turns this red."""
+
+    ctx = _system_call_ctx
+    with pytest.raises(ValueError, match="non-empty str"):
+        svc.SystemWriteContext(
+            task=ctx["task"],
+            lease=TaskLease(
+                task_id=int(ctx["task"].id), runner_id="runner-1", run_id=""
+            ),
+            anchor=ctx["anchor"],
+            now=ctx["now"],
+            expires_at=ctx["expires_at"],
+        )
+
+
+@pytest.mark.parametrize(
+    "run_id",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(12345, id="int"),
+        pytest.param(b"run-a", id="bytes"),
+    ],
+)
+def test_system_write_context_rejects_a_non_str_run_id(
+    _system_call_ctx: dict[str, Any], run_id: Any
+) -> None:
+    """`isinstance(..., str)`, not just `is not None`: create()'s own
+    comment claims every downstream use of context.lease.run_id is provably
+    a str, and only this check makes that claim true. An int run_id
+    previously passed create()'s `is None` precheck and failed far
+    downstream with `run_id must be a str, got int`.
+
+    Mutation: narrowing the check back to `is None` turns the int/bytes
+    cases red."""
+
+    ctx = _system_call_ctx
+    with pytest.raises(ValueError, match="non-empty str"):
+        svc.SystemWriteContext(
+            task=ctx["task"],
+            lease=TaskLease(
+                task_id=int(ctx["task"].id), runner_id="runner-1", run_id=run_id
+            ),
+            anchor=ctx["anchor"],
+            now=ctx["now"],
+            expires_at=ctx["expires_at"],
+        )
+
+
+def test_system_write_context_rejects_a_lease_naming_another_task(
+    _system_call_ctx: dict[str, Any],
+) -> None:
+    """Previously escaped create() as a bare ValueError raised inside
+    InteractionHandoff.stage() ("lease names task N but this handoff was
+    given task M") -- after the savepoint had already been opened.
+
+    Mutation: deleting the task_id branch of __post_init__ turns this red."""
+
+    ctx = _system_call_ctx
+    with pytest.raises(ValueError, match="lease names task"):
+        svc.SystemWriteContext(
+            task=ctx["task"],
+            lease=TaskLease(
+                task_id=int(ctx["task"].id) + 1000,
+                runner_id="runner-1",
+                run_id="run-a",
+            ),
+            anchor=ctx["anchor"],
+            now=ctx["now"],
+            expires_at=ctx["expires_at"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("bad", "match"),
+    [
+        pytest.param(
+            "expires_at_naive", "expires_at must be an aware UTC", id="expires_at_naive"
+        ),
+        pytest.param(
+            "expires_at_non_utc",
+            "expires_at must be UTC",
+            id="expires_at_non_utc",
+        ),
+        pytest.param(
+            "expires_at_in_the_past",
+            "expires_at must be after now",
+            id="expires_at_past",
+        ),
+        pytest.param("now_naive", "now must be an aware UTC", id="now_naive"),
+        pytest.param("now_non_utc", "now must be UTC", id="now_non_utc"),
+    ],
+)
+def test_create_surfaces_staging_time_preconditions_as_valueerror(
+    _db: Session, _system_call_ctx: dict[str, Any], bad: str, match: str
+) -> None:
+    """R-7's coverage gap, pinned as it stands rather than changed: these
+    five remain bare ValueError by design (create()'s documented
+    programming-error pattern, matching interaction_handoff's own
+    _validate_request_fields). The test exists so the classification is a
+    decision on record, not an untested accident -- if a later change turns
+    any of them into a typed outcome, this is where it must be argued.
+
+    Each also asserts zero persisted rows: a rejected precondition must
+    leave nothing behind. SystemWriteContext.__post_init__ deliberately does
+    not re-check now/expires_at (only the lease preconditions above), so
+    each of these five still reaches _validate_request_fields, deep inside
+    the with-block, unchanged by this delivery."""
+
+    ctx = _system_call_ctx
+    now = ctx["now"]
+    expires_at = ctx["expires_at"]
+    if bad == "expires_at_naive":
+        expires_at = expires_at.replace(tzinfo=None)
+    elif bad == "expires_at_non_utc":
+        expires_at = expires_at.astimezone(timezone(timedelta(hours=1)))
+    elif bad == "expires_at_in_the_past":
+        expires_at = now - timedelta(hours=1)
+    elif bad == "now_naive":
+        now = now.replace(tzinfo=None)
+    elif bad == "now_non_utc":
+        now = now.astimezone(timezone(timedelta(hours=1)))
+
+    with pytest.raises(ValueError, match=match):
+        svc.create(
+            _db,
+            task_id=int(ctx["task"].id),
+            principal=ctx["principal"],
+            envelope=_valid_envelope(request_idempotency_key="sys-key-time-precond"),
+            system_context=svc.SystemWriteContext(
+                task=ctx["task"],
+                lease=ctx["lease"],
+                anchor=ctx["anchor"],
+                now=now,
+                expires_at=expires_at,
+            ),
+        )
+    assert _db.query(TaskInteractionRequest).count() == 0
 
 
 def test_system_principal_creates_a_fresh_row(
