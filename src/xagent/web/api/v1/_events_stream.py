@@ -1202,7 +1202,8 @@ class V1EventStreamSink:
         that race still revoked the client's standing to see the rest
         of the buffered history. Meaningless (always False) while
         ``closing`` is itself False -- check both, not this alone; see
-        ``enqueue_close``."""
+        ``enqueue_close``. Also decides how long the watchdog keeps
+        checking; see ``_watchdog_coverage_done``."""
         return self._abortive_close
 
     @property
@@ -1232,9 +1233,11 @@ class V1EventStreamSink:
         stream.
 
         ``abortive`` (default False) records *why* on ``abortive_close``,
-        for the one caller that needs to react before this close frame
-        is even dequeued -- ``_generate``'s warm-up replay loop, which
-        checks it between each already-built history frame it yields.
+        for the two readers that need it before this close frame is
+        even dequeued: ``_generate``'s warm-up replay loop, which
+        checks it between each already-built history frame it yields,
+        and ``_watchdog_coverage_done``, which uses it to decide
+        whether this stream still needs an authorization check at all.
         An abortive close means the client has lost the right to see
         *any* further data, including history that predates the close:
         today that's the watchdog's ``unauthorized`` (key
@@ -1732,10 +1735,29 @@ async def watchdog_check_once(
         # so they only measure how long ago the pause happened, not
         # whether anyone is still managing it. Closing on that signal
         # would kill legitimately paused streams too. The 1-hour absolute
-        # cap is what actually bounds an orphaned paused stream's lifetime.
+        # cap is what actually bounds an orphaned paused stream's
+        # lifetime while a client is still reading it -- it closes
+        # non-abortively (``stream_expired``), so it does not bound this
+        # watchdog's own lifetime; see ``_watchdog_coverage_done``.
         sink.enqueue_status(status.value)
         return False
     return False  # pending/running: keep streaming
+
+
+def _watchdog_coverage_done(sink: V1EventStreamSink) -> bool:
+    """Whether this watchdog has anything left to protect.
+
+    A close on its own is not enough. ``_generate`` hands the initial
+    status frame and every warm-up replay frame straight to the client,
+    bypassing ``_put_or_overflow``'s closing guard, so an ordinary close
+    -- a staging overflow's ``resync_required``, a terminal
+    ``task.completed`` -- stops nothing on that path. Only
+    ``abortive_close`` stops it, and this loop is the only thing that
+    ever sets it (see ``watchdog_check_once``). Coverage therefore ends
+    when the revocation is already latched; otherwise it ends with the
+    connection, when ``_generate``'s ``finally`` cancels this task.
+    """
+    return sink.closing and sink.abortive_close
 
 
 async def _watchdog_loop(
@@ -1754,10 +1776,23 @@ async def _watchdog_loop(
     watchdog coverage for the rest of the stream's lifetime -- that
     would leave an orphaned stream open until the 1-hour absolute cap
     with nobody watching it. So every per-cycle check is wrapped and
-    logged; only cancellation (this loop's own teardown, not a check
-    failure) ends the loop early.
+    logged and the loop keeps going.
+
+    The exit rule is coverage, not closing: this loop only returns once
+    ``_watchdog_coverage_done`` is true -- the revocation is already
+    latched -- or it is cancelled during ``_generate``'s teardown. A
+    close by itself does not end the loop, because ``_generate``'s
+    warm-up replay yields its frames directly to the client, bypassing
+    the outbound queue's closing guard; an ordinary close (a staging
+    overflow, a terminal state this loop itself just found) leaves that
+    direct path free to keep emitting, so this loop has to stay alive to
+    catch a revocation that lands afterward. A consumer that stops
+    reading gives this loop no way to observe that closing ever
+    happened, so it keeps polling on its normal cadence until the
+    generator's teardown cancels it -- there is no time bound on that
+    other than the connection's own.
     """
-    while not sink.closing:
+    while not _watchdog_coverage_done(sink):
         try:
             await asyncio.wait_for(
                 sink.completion_hint.wait(), timeout=interval_seconds
@@ -1766,13 +1801,18 @@ async def _watchdog_loop(
             pass
         else:
             sink.completion_hint.clear()
-        if sink.closing:
+        if _watchdog_coverage_done(sink):
             return
         try:
-            if await watchdog_check_once(
+            # The return value is deliberately not an exit condition. A
+            # check that closes the stream non-abortively -- a terminal
+            # task found while the warm-up read is still in flight --
+            # leaves the direct replay free to keep emitting, so this
+            # loop must stay alive to observe a revocation that lands
+            # after it. Only the condition above ends it.
+            await watchdog_check_once(
                 sink, task_id, principal, read_task_snapshot=read_task_snapshot
-            ):
-                return
+            )
         except Exception:
             logger.exception(
                 "v1 SSE watchdog check failed for task %s; retrying next cycle",

@@ -1510,6 +1510,38 @@ async def _three_step_task() -> tuple[int, ApiKeyPrincipal]:
     return task_id, principal
 
 
+def _revoke_key_for(principal: ApiKeyPrincipal) -> None:
+    """Revoke the API key this principal authenticated with -- the same
+    row edit ``test_watchdog_closes_within_one_cycle_on_key_invalidation``
+    makes, reachable from a principal alone."""
+    db = _direct_db_session()
+    try:
+        key_row = (
+            db.query(AgentApiKey)
+            .filter(AgentApiKey.key_prefix == principal.key.key_prefix)
+            .one()
+        )
+        key_row.revoked_at = datetime.now(UTC)
+        db.commit()
+    finally:
+        db.close()
+
+
+async def _poll_until(predicate) -> None:
+    """Wait for a state the watchdog reaches on its own cadence.
+
+    Bounded and re-checked rather than one sleep sized to a guessed
+    number of cycles: each cycle does two real database reads through
+    the shared thread pool, so a fixed sleep is a timing bet that gets
+    thinner the more loaded the machine is.
+    """
+    for _ in range(200):
+        if predicate():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("the watchdog did not reach the expected state in 4s")
+
+
 async def test_abortive_close_during_replay_stops_further_history_frames():
     """An abortive close landing between two replayed history frames
     must stop the replay right there -- the client must never see
@@ -1616,6 +1648,80 @@ async def test_abortive_close_after_a_non_abortive_one_still_stops_the_replay():
         assert "event: step.completed" not in remaining_body
         assert remaining_body.count("event: stream.error") == 1
         assert "resync_required" in remaining_body
+    finally:
+        await resp.body_iterator.aclose()
+
+
+@pytest.mark.parametrize(
+    ("close_claimed_by_watchdog", "expected_close_event"),
+    [
+        pytest.param(False, "event: stream.error", id="close-claimed-elsewhere"),
+        pytest.param(True, "event: task.completed", id="close-claimed-by-the-watchdog"),
+    ],
+)
+async def test_watchdog_keeps_checking_authorization_across_an_ordinary_close(
+    close_claimed_by_watchdog, expected_close_event
+):
+    """An ordinary close must not end authorization coverage.
+
+    The warm-up replay hands its frames to the client directly, bypassing
+    the outbound queue's closing guard, so a close that is not abortive
+    stops nothing on that path -- only ``abortive_close`` does, and only
+    ``watchdog_check_once`` ever sets it. A watchdog that stops at a
+    close therefore never observes a key revoked afterwards, and the
+    replay hands that key the task's persisted history.
+
+    The two legs differ in one variable, who claims the close, because
+    the loop had two separate exits that both ended coverage: one on
+    seeing ``closing`` before running a check, and one on a check of its
+    own having closed the stream. A terminal task found while the
+    warm-up read is still in flight reaches the second one without any
+    staging overflow at all.
+    """
+    task_id, principal = await _three_step_task()
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
+        watchdog_interval_seconds=0.05,
+        stream_max_duration_seconds=600.0,
+        heartbeat_interval_seconds=600.0,
+    )
+    try:
+        status = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert "event: task.status" in status
+        # Suspended on the initial status yield, which runs before the
+        # warm-up read: the sink is registered and still cold, the
+        # watchdog is running, and no history has been read or handed
+        # out yet.
+        sink = next(
+            c
+            for c in es.manager.connections_for_task(task_id)
+            if isinstance(c, es.V1EventStreamSink)
+        )
+        assert sink.warm is False
+
+        if close_claimed_by_watchdog:
+            _set_task_status(task_id, TaskStatus.COMPLETED, output="done")
+            await _poll_until(lambda: sink.closing)
+        else:
+            assert sink.enqueue_close(es.error_frame("resync_required")) is True
+        assert sink.abortive_close is False
+
+        _revoke_key_for(principal)
+        await _poll_until(lambda: sink.abortive_close)
+
+        frames = []
+        async for chunk in resp.body_iterator:
+            frames.append(chunk)
+        body = "".join(frames)
+        assert "event: step.started" not in body
+        assert frames[-1].startswith(expected_close_event)
     finally:
         await resp.body_iterator.aclose()
 
