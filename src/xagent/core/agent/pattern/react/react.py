@@ -672,7 +672,21 @@ class ReActPattern(AgentPattern):
             }
             await runtime.compact_context_if_needed(
                 context=context,
-                llm=compact_llm,
+                # Fall back to the main model when no compact model is
+                # configured. PatternRuntime skips summarization entirely
+                # without one and drops all but the last few messages
+                # instead, losing what the agent actually did; agent preview
+                # and delegated sub-agents resolve the compact slot on their
+                # own and validate only the default model, so an empty slot
+                # is ordinary rather than exceptional.
+                #
+                # Substituting here, rather than defaulting the field further
+                # up, keeps "unset" distinguishable from "explicitly set to
+                # the main model" -- and hands compaction the *resolved*
+                # per-call model, so a virtual model reuses this turn's
+                # routing decision instead of routing again on the compaction
+                # prompt, whose only user message is the whole transcript.
+                llm=compact_llm if compact_llm is not None else call_llm,
                 metadata={"iteration": iteration},
             )
 

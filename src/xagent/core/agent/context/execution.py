@@ -17,6 +17,10 @@ from ...context_ref import (
     split_tool_result_supersedes_scope,
 )
 from ...file_ref import FILE_REF_MODEL_INSTRUCTIONS
+from ...model.chat.types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+)
 from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
@@ -48,8 +52,29 @@ from .skill_tool import (
 )
 
 READ_FILE_CONTEXT_LIMIT = 12_000
-COMPACT_SUMMARY_MAX_TOKENS = 1024
+COMPACT_SUMMARY_MAX_TOKENS = 8192
 COMPACT_SUMMARY_MIN_TOKENS = 256
+# Budgets to fall back through when the requested one is refused, largest
+# first. The request is derived from the model's *input* window while
+# providers cap the *output* separately and much lower, and that limit is not
+# recorded anywhere -- so the budget is a guess and this ladder lets the
+# provider correct it.
+#
+# The rungs are dense between the ceiling and the floor because the first
+# budget the provider *accepts* is the one the summary gets written with, and
+# a reasoning model draws its reasoning from that same allowance: accepted is
+# not the same as sufficient. A ladder of only (1024, 256) meant a model
+# capped at 4096 fell from 8192 straight to 1024 -- the very allowance this
+# change raised the ceiling to get away from -- and produced a reasoning trace
+# instead of a summary. Halving keeps the first accepted rung as large as the
+# cap allows.
+#
+# Descending stops at the first accepted budget even when its response turns
+# out to be unusable. Usability is monotone in the budget: a response is
+# unusable because the allowance was too small for the model to finish, so
+# every smaller rung is unusable too and stepping further down only spends
+# requests to reach the same truncation.
+COMPACT_SUMMARY_FALLBACK_BUDGETS = (4096, 2048, 1024, COMPACT_SUMMARY_MIN_TOKENS)
 COMPACT_CONTEXT_REF_MAX_TOKENS = 2048
 COMPACT_DROPPED_REF_NOTICE_MAX_CHARS = 2048
 COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1024
@@ -1146,7 +1171,11 @@ class ExecutionContext:
         original_tokens: int | None = None,
     ) -> CompactResult:
         original_count = len(self.messages)
-        summary = self._compact_response_text(response).strip()
+        summary = (
+            ""
+            if self._is_reasoning_fallback(response)
+            else self._compact_response_text(response).strip()
+        )
         if not summary:
             return CompactResult(
                 compacted=False,
@@ -1399,6 +1428,25 @@ class ExecutionContext:
         ]
 
     def _llm_compact_max_tokens(self) -> int:
+        """Output budget for the compaction summary.
+
+        Two bounds, both load-bearing. ``threshold // 4`` is what keeps
+        compaction from looping: the post-compaction context is the summary
+        plus the latest user message, so a summary bounded by a quarter of the
+        threshold is necessarily well under the threshold that triggered this
+        pass. ``COMPACT_SUMMARY_MAX_TOKENS`` bounds it in absolute terms,
+        because the threshold scales with the *input* window while providers
+        cap the *output* separately and much lower -- at a 1M-token window,
+        ``threshold // 4`` alone would ask for ~187k output tokens and the
+        request would simply be rejected, collapsing compaction to the
+        message-dropping fallback it exists to avoid.
+
+        The absolute ceiling was 1024, which bound at every realistic window
+        and left no room for a reasoning model, whose reasoning is drawn from
+        this same allowance and could consume it entirely before any summary
+        text was emitted. 8192 clears that while staying under the output
+        limits mainstream providers actually enforce.
+        """
         return max(
             COMPACT_SUMMARY_MIN_TOKENS,
             min(COMPACT_SUMMARY_MAX_TOKENS, self.compact_config.threshold // 4),
@@ -1422,6 +1470,28 @@ class ExecutionContext:
                 if context_refs_text:
                     chunks.append(context_refs_text)
         return "\n".join(chunks)
+
+    @staticmethod
+    def _is_reasoning_fallback(response: Any) -> bool:
+        """True when the client substituted a reasoning trace for content.
+
+        A reasoning model that spends its whole output budget thinking returns
+        no content, and the OpenAI-compatible client surfaces the trace in its
+        place so a caller does not read a truncated-but-healthy response as an
+        empty one -- reasonable for a connection test, wrong here. The summary
+        replaces every prior message, so accepting a chain of thought as the
+        summary rewrites the agent's history into deliberation it never
+        concluded. Better to have no summary and fall back to dropping
+        messages, which at least leaves real ones.
+
+        The client declares the substitution rather than leaving it to be
+        recognised by shape, so this cannot drift apart from the code that
+        performs it.
+        """
+        return (
+            isinstance(response, dict)
+            and response.get(CONTENT_SOURCE_KEY) == CONTENT_SOURCE_REASONING_FALLBACK
+        )
 
     def _compact_response_text(self, response: Any) -> str:
         if isinstance(response, str):

@@ -32,6 +32,10 @@ from xagent.core.agent.language import (
 )
 from xagent.core.agent.utils.context_builder import ContextBuilder
 from xagent.core.context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
+from xagent.core.model.chat.types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+)
 from xagent.web.user_isolated_memory import current_user_id
 
 
@@ -1885,3 +1889,78 @@ def test_clock_timezone_survives_serialization_and_child_contexts() -> None:
 
     child = context.create_child_context(task="sub-task")
     assert child.clock_zone().key == "Australia/Melbourne"
+
+
+def _context_over_threshold(threshold: int) -> ExecutionContext:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = threshold
+    ctx.add_user_message("current request")
+    # Token estimation is chars//4, so this clears the threshold and makes the
+    # request materialize.
+    ctx.add_tool_result(
+        "read_file", {"output": "x" * (threshold * 8)}, tool_call_id="call-1"
+    )
+    return ctx
+
+
+def test_llm_compact_budget_scales_with_the_threshold() -> None:
+    """Below the absolute ceiling the budget tracks the threshold.
+
+    The old ceiling of 1024 bound at every realistic window, leaving a
+    reasoning model no room -- its reasoning comes out of this same allowance.
+    """
+    request = _context_over_threshold(20_000).build_llm_compact_request_if_needed()
+
+    assert request is not None
+    assert request["max_tokens"] == 5_000
+
+
+def test_llm_compact_budget_stays_under_provider_output_limits() -> None:
+    """The absolute ceiling is what makes a large window safe.
+
+    The threshold scales with the *input* window, while providers cap the
+    *output* separately and much lower. Without a ceiling a 1M-token window
+    asks for ~187k output tokens, the request is rejected, and compaction
+    collapses into the message-dropping fallback it exists to avoid.
+    """
+    for window_threshold in (96_000, 150_000, 750_000):
+        request = _context_over_threshold(
+            window_threshold
+        ).build_llm_compact_request_if_needed()
+
+        assert request is not None
+        assert request["max_tokens"] == 8192
+
+
+def _compactable_context() -> ExecutionContext:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("current request")
+    ctx.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    return ctx
+
+
+def test_compact_rejects_content_the_client_marked_as_a_reasoning_fallback() -> None:
+    """Accepting one would rewrite the whole history into a chain of thought.
+
+    The summary replaces every prior message, so a substituted reasoning trace
+    does not merely add noise -- it becomes the agent's account of what it
+    already did, describing deliberation it never concluded. Having no summary
+    is better: the fallback keeps real messages.
+    """
+    ctx = _compactable_context()
+    original = list(ctx.messages)
+
+    result = ctx.compact_with_llm_response(
+        {
+            "type": "text",
+            "content": "Let me think. The user wants a report. First I should",
+            CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
+            "reasoning_content": "Let me think. The user wants a report. First I should",
+        },
+        llm=None,
+    )
+
+    assert not result.compacted
+    assert result.strategy == "none"
+    assert ctx.messages == original
