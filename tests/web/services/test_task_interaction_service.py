@@ -248,12 +248,23 @@ def test_create_outcome_producible_reasons_are_a_subset_of_the_full_word_list() 
 
 def test_create_outcome_covers_exactly_the_five_reason_carrying_variants() -> None:
     assert set(svc.CREATE_OUTCOME_PRODUCIBLE_REASONS) == {
-        "CreateValidationRejected",
-        "CreateUnauthorized",
-        "CreateUnavailable",
-        "CreateConflict",
-        "CreateStale",
+        svc.CreateValidationRejected,
+        svc.CreateUnauthorized,
+        svc.CreateUnavailable,
+        svc.CreateConflict,
+        svc.CreateStale,
     }
+
+
+def test_producible_reasons_keys_are_the_outcome_types_themselves() -> None:
+    """Keyed by type, not by class-name string: a rename of any outcome
+    class must break loudly here rather than silently orphan its entry.
+
+    Mutation: switching any key back to its name string turns this red."""
+
+    for key in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS:
+        assert isinstance(key, type), key
+        assert key.__module__ == svc.__name__, key
 
 
 def test_create_not_wired_and_seam_not_wired_no_longer_exist() -> None:
@@ -341,7 +352,7 @@ def test_build_v1_request_payload_rejects_nan_default_value() -> None:
 
 
 def test_create_rejects_nan_default_value_as_invalid_values(
-    _db: Session, _seeded_task: int
+    _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
     values = {
         "message": "Pick a number",
@@ -354,10 +365,7 @@ def test_create_rejects_nan_default_value_as_invalid_values(
             }
         ],
     }
-    envelope = _valid_envelope(values=values)
-    outcome = svc.create(
-        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
-    )
+    outcome = _system_create(_db, _system_call_ctx, values=values)
     assert outcome == svc.CreateValidationRejected(reason="invalid_values")
 
 
@@ -450,15 +458,9 @@ def _owning_principal(user_id: int) -> svc.InteractionPrincipal:
     ],
 )
 def test_cv1_unknown_kind_or_protocol_version_is_rejected(
-    _db: Session, _seeded_task: int, overrides: dict[str, Any]
+    _db: Session, _system_call_ctx: dict[str, Any], overrides: dict[str, Any]
 ) -> None:
-    envelope = _valid_envelope(**overrides)
-    outcome = svc.create(
-        _db,
-        task_id=_seeded_task,
-        principal=_owning_principal(1),
-        envelope=envelope,
-    )
+    outcome = _system_create(_db, _system_call_ctx, **overrides)
     assert isinstance(outcome, svc.CreateValidationRejected)
     expected = "unknown_kind" if "kind" in overrides else "unknown_protocol_version"
     assert outcome.reason == expected
@@ -472,7 +474,7 @@ def test_cv1_unknown_kind_or_protocol_version_is_rejected(
     ],
 )
 def test_cv1_unhashable_kind_is_rejected_without_raising(
-    _db: Session, _seeded_task: int, bad_kind: Any
+    _db: Session, _system_call_ctx: dict[str, Any], bad_kind: Any
 ) -> None:
     """A ``kind`` that is not a str -- in particular one that is unhashable,
     like a list or a dict -- must be caught by an isinstance guard before the
@@ -486,10 +488,7 @@ def test_cv1_unhashable_kind_is_rejected_without_raising(
     ``request_idempotency_key`` already gets (see
     ``test_cv2_non_string_idempotency_key_is_rejected_without_raising``
     above)."""
-    envelope = _valid_envelope(kind=bad_kind)
-    outcome = svc.create(
-        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
-    )
+    outcome = _system_create(_db, _system_call_ctx, kind=bad_kind)
     assert outcome == svc.CreateValidationRejected(reason="unknown_kind")
 
 
@@ -501,7 +500,7 @@ def test_cv1_unhashable_kind_is_rejected_without_raising(
     ],
 )
 def test_cv1_protocol_version_type_confusable_values_are_rejected(
-    _db: Session, _seeded_task: int, bad_version: Any
+    _db: Session, _system_call_ctx: dict[str, Any], bad_version: Any
 ) -> None:
     """``protocol_version != INTERACTION_PROTOCOL_VERSION`` alone is not
     enough: ``True == 1`` and ``1.0 == 1`` both hold in Python, so a bare
@@ -509,30 +508,23 @@ def test_cv1_protocol_version_type_confusable_values_are_rejected(
     The check must reject any non-``int`` (bools included, since ``bool`` is
     a subclass of ``int``) the same way the existing ``ttl_seconds`` check a
     few lines below already does."""
-    envelope = _valid_envelope(protocol_version=bad_version)
-    outcome = svc.create(
-        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
-    )
+    outcome = _system_create(_db, _system_call_ctx, protocol_version=bad_version)
     assert outcome == svc.CreateValidationRejected(reason="unknown_protocol_version")
 
 
 def test_cv2_malformed_idempotency_key_is_rejected(
-    _db: Session, _seeded_task: int
+    _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
-    envelope = _valid_envelope(request_idempotency_key="has a space")
-    outcome = svc.create(
-        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
+    outcome = _system_create(
+        _db, _system_call_ctx, request_idempotency_key="has a space"
     )
     assert outcome == svc.CreateValidationRejected(reason="malformed_idempotency_key")
 
 
 def test_cv3_values_not_shaped_like_v1_payload_is_rejected(
-    _db: Session, _seeded_task: int
+    _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
-    envelope = _valid_envelope(values={"not": "a valid payload"})
-    outcome = svc.create(
-        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
-    )
+    outcome = _system_create(_db, _system_call_ctx, values={"not": "a valid payload"})
     assert outcome == svc.CreateValidationRejected(reason="invalid_values")
 
 
@@ -626,15 +618,9 @@ def _values(interactions: list[dict[str, Any]], message: str = "Which one?") -> 
     ],
 )
 def test_cv4_write_side_payload_rules_reject_the_envelope(
-    _db: Session, _seeded_task: int, values: Any
+    _db: Session, _system_call_ctx: dict[str, Any], values: Any
 ) -> None:
-    task = _db.query(Task).filter(Task.id == _seeded_task).first()
-    outcome = svc.create(
-        _db,
-        task_id=_seeded_task,
-        principal=_owning_principal(task.user_id),
-        envelope=_valid_envelope(values=values),
-    )
+    outcome = _system_create(_db, _system_call_ctx, values=values)
     assert outcome == svc.CreateValidationRejected(reason="invalid_values")
 
 
@@ -863,13 +849,10 @@ def test_cv4_the_read_direction_parser_still_accepts_what_the_write_side_rejects
 
 
 def test_cv3_ttl_out_of_policy_range_is_rejected_not_clamped(
-    _db: Session, _seeded_task: int
+    _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
-    envelope = _valid_envelope(ttl_seconds=1)
-    assert envelope.ttl_seconds < svc._MIN_INTERACTION_TTL_SECONDS
-    outcome = svc.create(
-        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
-    )
+    assert 1 < svc._MIN_INTERACTION_TTL_SECONDS
+    outcome = _system_create(_db, _system_call_ctx, ttl_seconds=1)
     assert outcome == svc.CreateValidationRejected(reason="invalid_values")
 
 
@@ -891,12 +874,9 @@ def test_cv3_ttl_out_of_policy_range_is_rejected_not_clamped(
     ],
 )
 def test_cv3_ttl_invalid_values_are_rejected(
-    _db: Session, _seeded_task: int, ttl_seconds: Any
+    _db: Session, _system_call_ctx: dict[str, Any], ttl_seconds: Any
 ) -> None:
-    envelope = _valid_envelope(ttl_seconds=ttl_seconds)
-    outcome = svc.create(
-        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
-    )
+    outcome = _system_create(_db, _system_call_ctx, ttl_seconds=ttl_seconds)
     assert outcome == svc.CreateValidationRejected(reason="invalid_values")
 
 
@@ -1192,39 +1172,50 @@ def test_ca4_an_absent_task_is_reported_before_the_payload_is_judged(
         ),
     ],
 )
-def test_cv_authorized_caller_still_gets_every_validation_reason(
+def test_cv_non_system_principal_is_fenced_before_validation_ever_runs(
     _db: Session,
     _seeded_task: int,
     envelope_overrides: dict[str, Any],
     expected_reason: str,
 ) -> None:
-    """Authorization moving ahead of validation must not change what an
-    authorized caller sees: the same four reasons, unchanged, for the same
-    four malformed shapes."""
+    """The write-point fence now runs immediately after authorization, ahead
+    of every envelope check -- so a non-system principal that clears
+    authorization never reaches CreateValidationRejected at all, for any of
+    these four malformed shapes: InteractionWritePointUnfenced fires first,
+    every time, payload untouched. This retires the earlier contract this
+    same parametrization pinned (authorization moving ahead of validation
+    must not change the four reasons an authorized caller sees) -- that
+    contract no longer holds by design, per the reviewed decision to fence
+    ahead of validation rather than after it.
+
+    ``expected_reason`` is unused by the assertion below; kept on the
+    parametrization only so this test and its retired predecessor share one
+    parameter list, which is itself part of the point -- the same four
+    malformed shapes that used to reach validation now never do.
+
+    Mutation: moving ``_assert_write_point_admissible``'s call back to
+    after payload validation turns this red -- each case would instead
+    return CreateValidationRejected(reason=expected_reason)."""
 
     task = _db.query(Task).filter(Task.id == _seeded_task).first()
-    outcome = svc.create(
-        _db,
-        task_id=_seeded_task,
-        principal=_owning_principal(task.user_id),
-        envelope=_valid_envelope(**envelope_overrides),
-    )
-    assert outcome == svc.CreateValidationRejected(reason=expected_reason)
+    with pytest.raises(svc.InteractionWritePointUnfenced):
+        svc.create(
+            _db,
+            task_id=_seeded_task,
+            principal=_owning_principal(task.user_id),
+            envelope=_valid_envelope(**envelope_overrides),
+        )
 
 
 def test_create_logs_the_refused_payload_diagnostic(
-    _db: Session, _seeded_task: int, caplog: pytest.LogCaptureFixture
+    _db: Session, _system_call_ctx: dict[str, Any], caplog: pytest.LogCaptureFixture
 ) -> None:
-    task = _db.query(Task).filter(Task.id == _seeded_task).first()
     values = _values(
         [_interaction(type="select_one", options=[{"label": "", "value": "a"}])]
     )
     with caplog.at_level(logging.WARNING):
-        outcome = svc.create(
-            _db,
-            task_id=_seeded_task,
-            principal=_owning_principal(task.user_id),
-            envelope=_valid_envelope(values=values),
+        outcome = _system_create(
+            _db, _system_call_ctx, request_idempotency_key="sys-key-diag", values=values
         )
 
     assert outcome == svc.CreateValidationRejected(reason="invalid_values")
@@ -1291,7 +1282,7 @@ def test_create_never_touches_staging_or_stages_a_row_for_a_non_system_principal
     ],
 )
 def test_cv2_non_string_idempotency_key_is_rejected_without_raising(
-    _db: Session, _seeded_task: int, bad_key: Any
+    _db: Session, _system_call_ctx: dict[str, Any], bad_key: Any
 ) -> None:
     """A non-string request_idempotency_key must be caught by the isinstance
     guard before _normalize_command_id is ever called -- none of these three
@@ -1303,10 +1294,7 @@ def test_cv2_non_string_idempotency_key_is_rejected_without_raising(
     three must produce the same typed rejection with no exception
     escaping."""
 
-    envelope = _valid_envelope(request_idempotency_key=bad_key)
-    outcome = svc.create(
-        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
-    )
+    outcome = _system_create(_db, _system_call_ctx, request_idempotency_key=bad_key)
     assert outcome == svc.CreateValidationRejected(reason="malformed_idempotency_key")
 
 
@@ -5270,11 +5258,13 @@ def _system_create(
         task_id=int(ctx["task"].id),
         principal=ctx["principal"],
         envelope=envelope,
-        task=ctx["task"],
-        lease=ctx["lease"],
-        anchor=ctx["anchor"],
-        now=ctx["now"],
-        expires_at=ctx["expires_at"],
+        system_context=svc.SystemWriteContext(
+            task=ctx["task"],
+            lease=ctx["lease"],
+            anchor=ctx["anchor"],
+            now=ctx["now"],
+            expires_at=ctx["expires_at"],
+        ),
     )
 
 
@@ -5392,11 +5382,13 @@ def test_i_a_6_task_handed_to_handoff_is_the_caller_supplied_object(
                 task_id=int(ctx["task"].id),
                 principal=ctx["principal"],
                 envelope=_valid_envelope(request_idempotency_key="sys-key-identity"),
-                task=cross_session_task,
-                lease=ctx["lease"],
-                anchor=ctx["anchor"],
-                now=ctx["now"],
-                expires_at=ctx["expires_at"],
+                system_context=svc.SystemWriteContext(
+                    task=cross_session_task,
+                    lease=ctx["lease"],
+                    anchor=ctx["anchor"],
+                    now=ctx["now"],
+                    expires_at=ctx["expires_at"],
+                ),
             )
     finally:
         second_session.close()
@@ -5432,11 +5424,13 @@ def test_i_a_6_uncommitted_in_memory_task_state_is_what_gets_staged(
             task_id=int(ctx["task"].id),
             principal=ctx["principal"],
             envelope=_valid_envelope(request_idempotency_key="sys-key-uncommitted"),
-            task=cross_session_task,
-            lease=ctx["lease"],
-            anchor=ctx["anchor"],
-            now=ctx["now"],
-            expires_at=ctx["expires_at"],
+            system_context=svc.SystemWriteContext(
+                task=cross_session_task,
+                lease=ctx["lease"],
+                anchor=ctx["anchor"],
+                now=ctx["now"],
+                expires_at=ctx["expires_at"],
+            ),
         )
     finally:
         second_session.close()
@@ -5471,11 +5465,13 @@ def test_anchor_corrupt_maps_to_validation_rejected_invalid_values(
         task_id=int(ctx["task"].id),
         principal=ctx["principal"],
         envelope=_valid_envelope(request_idempotency_key="sys-key-anchor"),
-        task=ctx["task"],
-        lease=ctx["lease"],
-        anchor=corrupt_anchor,
-        now=ctx["now"],
-        expires_at=ctx["expires_at"],
+        system_context=svc.SystemWriteContext(
+            task=ctx["task"],
+            lease=ctx["lease"],
+            anchor=corrupt_anchor,
+            now=ctx["now"],
+            expires_at=ctx["expires_at"],
+        ),
     )
     assert outcome == svc.CreateValidationRejected(reason="invalid_values")
     assert _db.query(TaskInteractionRequest).count() == 0
@@ -5484,15 +5480,15 @@ def test_anchor_corrupt_maps_to_validation_rejected_invalid_values(
 def test_anchor_corrupt_mutation_wrong_reason_word() -> None:
     """Pin against the mutation of mapping InteractionAnchorCorrupt to
     anchor_dangling/checkpoint_unavailable instead: those two words are not
-    in CREATE_OUTCOME_PRODUCIBLE_REASONS["CreateValidationRejected"]."""
+    in CREATE_OUTCOME_PRODUCIBLE_REASONS[CreateValidationRejected]."""
 
     assert (
         "anchor_dangling"
-        not in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS["CreateValidationRejected"]
+        not in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS[svc.CreateValidationRejected]
     )
     assert (
         "invalid_values"
-        in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS["CreateValidationRejected"]
+        in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS[svc.CreateValidationRejected]
     )
 
 
@@ -5517,14 +5513,70 @@ def test_run_partition_mismatch_maps_to_stale_anchor_run_mismatch(
         task_id=int(ctx["task"].id),
         principal=ctx["principal"],
         envelope=_valid_envelope(request_idempotency_key="sys-key-mismatch"),
-        task=ctx["task"],
-        lease=mismatched_lease,
-        anchor=ctx["anchor"],
-        now=ctx["now"],
-        expires_at=ctx["expires_at"],
+        system_context=svc.SystemWriteContext(
+            task=ctx["task"],
+            lease=mismatched_lease,
+            anchor=ctx["anchor"],
+            now=ctx["now"],
+            expires_at=ctx["expires_at"],
+        ),
     )
     assert outcome == svc.CreateStale(reason="anchor_run_mismatch")
     assert _db.query(TaskInteractionRequest).count() == 0
+
+
+def test_degraded_as_subclass_maps_to_the_parents_outcome(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """A future subclass of a mapped swallowed type must classify as its
+    parent does, not fall through to the slot_taken default.
+    InteractionRunPartitionMismatch is the discriminating choice: its
+    outcome (CreateStale) is the one the default can never produce, so an
+    exact-type lookup's failure is visible in the outcome itself.
+
+    Mutation: restoring `_DEGRADED_AS_OUTCOME.get(handoff.degraded_as)`
+    turns this red with CreateConflict(slot_taken)."""
+
+    from xagent.web.services import task_interaction_staging as staging_module
+    from xagent.web.services.task_interaction_staging import (
+        InteractionRunPartitionMismatch,
+    )
+
+    class _FutureRunPartitionMismatch(InteractionRunPartitionMismatch):
+        pass
+
+    ctx = _system_call_ctx
+    real_stage = staging_module.stage_interaction_request
+
+    def _raise_subclass(*args: Any, **kwargs: Any) -> Any:
+        raise _FutureRunPartitionMismatch("forced subclass degradation")
+
+    with mock.patch.object(
+        staging_module, "stage_interaction_request", side_effect=_raise_subclass
+    ):
+        outcome = _system_create(_db, ctx, request_idempotency_key="sys-key-subclass")
+
+    assert outcome == svc.CreateStale(reason="anchor_run_mismatch")
+    assert real_stage is staging_module.stage_interaction_request
+    assert _db.query(TaskInteractionRequest).count() == 0
+
+
+def test_swallowed_exception_types_are_mutually_unrelated() -> None:
+    """The linear issubclass scan in create()'s degraded_as handling is
+    order-independent only while no swallowed type subclasses another.
+    Pins that premise so a future hierarchy change surfaces here rather
+    than as a misclassification."""
+
+    from xagent.web.services import task_interaction_staging as staging_module
+
+    types = staging_module._SWALLOWED
+    for first in types:
+        for second in types:
+            if first is not second:
+                assert not issubclass(first, second), (
+                    f"{first.__name__} subclasses {second.__name__}; the "
+                    "issubclass scan in create() is no longer order-independent"
+                )
 
 
 def test_closed_idempotency_key_maps_to_conflict_reused(
@@ -5642,10 +5694,10 @@ def test_receipt_on_replay_reports_the_existing_rows_expires_at(
 
     ctx = _system_call_ctx
     first = _system_create(_db, ctx, request_idempotency_key="sys-key-expiry")
-    # SQLite round-trips a stored aware datetime as naive UTC -- comparing
-    # naive-vs-naive below isolates the *value* this format cell is about
-    # from that unrelated backend quirk.
-    first_expires_at = first.receipt.expires_at.replace(tzinfo=None)
+    # No tzinfo workaround any more: the replay path normalizes the stored
+    # value back to aware UTC (task_interaction_staging._replay_or_raise_closed),
+    # so both paths hand back the same shape and these compare directly.
+    first_expires_at = first.receipt.expires_at
 
     later_ctx = dict(ctx)
     later_ctx["now"] = ctx["now"] + timedelta(hours=1)
@@ -5653,10 +5705,8 @@ def test_receipt_on_replay_reports_the_existing_rows_expires_at(
     second = _system_create(_db, later_ctx, request_idempotency_key="sys-key-expiry")
 
     assert isinstance(second, svc.CreateCreated)
-    assert second.receipt.expires_at.replace(tzinfo=None) == first_expires_at
-    assert second.receipt.expires_at.replace(tzinfo=None) != later_ctx[
-        "expires_at"
-    ].replace(tzinfo=None)
+    assert second.receipt.expires_at == first_expires_at
+    assert second.receipt.expires_at != later_ctx["expires_at"]
 
 
 def test_receipt_on_fresh_insert_carries_the_proposed_expires_at(
@@ -5668,6 +5718,29 @@ def test_receipt_on_fresh_insert_carries_the_proposed_expires_at(
     ctx = _system_call_ctx
     outcome = _system_create(_db, ctx, request_idempotency_key="sys-key-fresh-expiry")
     assert outcome.receipt.expires_at == ctx["expires_at"]
+
+
+def test_receipt_expires_at_is_aware_utc_on_both_paths(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """The format invariant behind the two value cells above: a consumer
+    doing `receipt.expires_at > datetime.now(timezone.utc)` must not hit a
+    TypeError on one path and succeed on the other.
+
+    Mutation: reverting to `expires_at=row.expires_at` turns the replay
+    half red (tzinfo is None -> the comparison raises TypeError)."""
+
+    ctx = _system_call_ctx
+    fresh = _system_create(_db, ctx, request_idempotency_key="sys-key-tz")
+    replay = _system_create(_db, ctx, request_idempotency_key="sys-key-tz")
+
+    for label, outcome in (("fresh", fresh), ("replay", replay)):
+        assert isinstance(outcome, svc.CreateCreated), label
+        expires_at = outcome.receipt.expires_at
+        assert expires_at.tzinfo is not None, label
+        assert expires_at.utcoffset() == timedelta(0), label
+        # The arithmetic the reviewer named: must not raise on either path.
+        assert expires_at > datetime.now(timezone.utc), label
 
 
 def _leading_keyword(statement: str) -> str:
@@ -5812,7 +5885,56 @@ def test_unrecognized_envelope_key_mutation_removing_the_check() -> None:
             {"message": "x", "interactions": [], "bogus": 1}
         )
     assert excinfo.value.refusal.rule == "unknown_field"
-    assert excinfo.value.refusal.position == "request_payload.bogus"
+    assert excinfo.value.refusal.position == "request_payload"
+
+
+def test_unknown_envelope_key_never_reaches_the_refusal_or_the_log(
+    _db: Session, _system_call_ctx: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """InteractionWriteRefusal promises position never carries a value out
+    of the payload (#1314 item 3), and this refusal is logged at WARNING.
+    A key chosen to be unmistakable if it leaked -- and to be a log-injection
+    payload if it reached an unsanitized %s -- must appear in neither.
+
+    Mutation: restoring ``position=f"request_payload.{...}"`` turns both
+    assertions below red."""
+
+    ctx = _system_call_ctx
+    hostile_key = "leaked\nWARNING forged log line\r\n" + "A" * 500
+    values = {
+        "message": "Which environment?",
+        "interactions": [
+            {"type": "text_input", "field": "env", "label": "Environment"}
+        ],
+        hostile_key: "x",
+    }
+    with caplog.at_level(logging.WARNING):
+        outcome = _system_create(
+            _db, ctx, request_idempotency_key="sys-key-hostile", values=values
+        )
+
+    assert outcome == svc.CreateValidationRejected(reason="invalid_values")
+    assert "rule=unknown_field" in caplog.text
+    assert "position=request_payload" in caplog.text
+    assert "leaked" not in caplog.text
+    assert "forged log line" not in caplog.text
+
+
+def test_unknown_envelope_key_with_mixed_key_types_does_not_raise() -> None:
+    """The TypeError guard the previous `sorted(..., key=str)` provided is
+    now structural: no ordering is computed at all. A payload whose
+    top-level keys mix str and int must still produce the refusal, not a
+    TypeError.
+
+    Mutation: reintroducing any `sorted(...)` over the unknown key set
+    without `key=str` turns this red."""
+
+    with pytest.raises(svc.InteractionWritePayloadRejected) as excinfo:
+        svc._reject_unknown_envelope_keys(
+            {"message": "x", "interactions": [], "bogus": 1, 7: "int key"}
+        )
+    assert excinfo.value.refusal.rule == "unknown_field"
+    assert excinfo.value.refusal.position == "request_payload"
 
 
 @pytest.mark.parametrize(

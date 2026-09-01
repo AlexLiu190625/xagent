@@ -157,6 +157,7 @@ from .ops_signals import (
 )
 from .task_command_transport import COMMAND_ID_PATTERN
 from .task_lease_service import TaskLease, task_row_matches_lease_attempt
+from .time_utils import coerce_utc as _coerce_utc
 
 logger = logging.getLogger(__name__)
 
@@ -906,12 +907,25 @@ def _replay_or_raise_closed(
     if row is None:
         return None
     if row.status == "active":
+        # Normalized, not passed through: SQLite's DateTime(timezone=True)
+        # drops tzinfo on the round trip, so a stored value comes back naive
+        # here while the fresh-insert path below returns the caller's own
+        # aware-UTC value. Without this, StagedInteractionRequest.expires_at
+        # would be aware on one path and naive on the other, and the first
+        # consumer to do arithmetic against datetime.now(timezone.utc) would
+        # hit a TypeError on the replay path only. The column is documented
+        # as always-UTC (models/task_interaction.py), so reading it back as
+        # aware UTC is what the column contract already promises;
+        # ``coerce_utc`` is this package's existing owner for exactly that
+        # read (see triggers.py / gmail_provisioning.py / gmail_triggers.py).
+        expires_at = _coerce_utc(row.expires_at)
+        assert expires_at is not None  # expires_at is NOT NULL on this table
         return StagedInteractionRequest(
             staged_db_id=int(row.id),
             created=False,
             status=row.status,
             active_slot=row.active_slot,
-            expires_at=row.expires_at,
+            expires_at=expires_at,
             protocol_version=row.protocol_version,
         )
     raise InteractionRequestClosed(

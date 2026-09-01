@@ -266,11 +266,13 @@ def test_create_validates_before_entering_the_handoff_behavioral(_db: Any) -> No
             task_id=int(ctx["task"].id),
             principal=ctx["principal"],
             envelope=bad_envelope,
-            task=ctx["task"],
-            lease=ctx["lease"],
-            anchor=ctx["anchor"],
-            now=ctx["now"],
-            expires_at=ctx["expires_at"],
+            system_context=svc.SystemWriteContext(
+                task=ctx["task"],
+                lease=ctx["lease"],
+                anchor=ctx["anchor"],
+                now=ctx["now"],
+                expires_at=ctx["expires_at"],
+            ),
         )
     assert outcome == svc.CreateValidationRejected(reason="invalid_values")
     mocked_handoff.assert_not_called()

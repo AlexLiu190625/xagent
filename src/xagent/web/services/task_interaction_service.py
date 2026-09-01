@@ -230,7 +230,14 @@ class InteractionPrincipal:
     two kinds -- an authenticated user is also the task owner or an admin
     acting on it, and a guest's owning user is the entity (agent/workforce)
     owner the guest is chatting through, not the guest itself -- and is
-    ``None`` for a system principal, which has no owning user at all.
+    ``None`` for a system principal by convention, which has no owning user
+    to name. That convention is not enforced at construction: this
+    ``__post_init__`` validates each field against its own domain and
+    leaves cross-field agreement to the call sites, the same way it leaves
+    a missing ``user_id`` on a user principal to ``create()``/``respond()``.
+    A system principal's ``user_id`` is inert either way -- ``identity_string``
+    renders the fixed ``"system:finalizer"`` without reading it, and
+    ``_assert_write_point_admissible`` checks ``kind`` alone.
     ``__post_init__`` also rejects a populated ``user_id`` that is not a
     positive ``int`` (``bool`` included, since ``bool`` is a subclass of
     ``int``); ``None`` remains legal for every kind, since ``create()`` and
@@ -836,8 +843,9 @@ class CreatedInteractionReceipt:
     successful ``create()`` call, whether it staged a fresh row or replayed
     an existing one under the same idempotency key.
 
-    On a replay (``created=False``) the receipt reports the *existing*
-    row's ``expires_at``, not the value this call proposed: the identity
+    On a replay -- ``CreateCreated`` carrying a receipt built from a row
+    this call did not insert -- the receipt reports the *existing* row's
+    ``expires_at``, not the value this call proposed: the identity
     pre-read that finds the row matches on the identity key alone and never
     compares expiry, so the two can differ and the row may already be
     expired. This receipt states what the row is, not that it is still
@@ -952,8 +960,8 @@ CREATE_OUTCOME_REASON_WORDS: frozenset[str] = frozenset(
 # defined by production reachability instead would be a different, smaller
 # set, and the exhaustion test would have to be rewritten with it -- which
 # is why the criterion is stated here rather than left to be inferred.
-CREATE_OUTCOME_PRODUCIBLE_REASONS: dict[str, frozenset[str]] = {
-    "CreateValidationRejected": frozenset(
+CREATE_OUTCOME_PRODUCIBLE_REASONS: dict[type, frozenset[str]] = {
+    CreateValidationRejected: frozenset(
         {
             "unknown_kind",
             "unknown_protocol_version",
@@ -961,10 +969,10 @@ CREATE_OUTCOME_PRODUCIBLE_REASONS: dict[str, frozenset[str]] = {
             "invalid_values",
         }
     ),
-    "CreateUnauthorized": frozenset({"not_task_principal"}),
-    "CreateUnavailable": frozenset({"task_missing"}),
-    "CreateConflict": frozenset({"slot_taken", "idempotency_key_reused"}),
-    "CreateStale": frozenset({"anchor_run_mismatch"}),
+    CreateUnauthorized: frozenset({"not_task_principal"}),
+    CreateUnavailable: frozenset({"task_missing"}),
+    CreateConflict: frozenset({"slot_taken", "idempotency_key_reused"}),
+    CreateStale: frozenset({"anchor_run_mismatch"}),
 }
 
 
@@ -1060,25 +1068,18 @@ def build_v1_request_payload(parsed: AskUserQuestionArgs) -> dict[str, Any]:
 # is what keeps either surface from having to.
 _V1_INTERACTION_TYPES = frozenset(INTERACTION_TYPES)
 
-# The types whose whole purpose is picking from a supplied list, mapped to
-# whether that type requires or rejects an ``options`` list -- one dict
-# keyed by interaction type, per #1314 item 2 ("key rules by interaction
-# type, rather than one flat list"), rather than the two independent flat
-# sets this replaces. The split is the render surface's, not this
-# module's: ``select_one``, ``select_multiple``, and ``action_cards``
-# iterate ``interaction.options``
+# The types whose whole purpose is picking from a supplied list -- one set,
+# per #1314 item 2 ("key rules by interaction type, rather than one flat
+# list"), read below as a total function of membership rather than the two
+# independent flat sets this replaces. The split is the render surface's,
+# not this module's: ``select_one``, ``select_multiple``, and
+# ``action_cards`` iterate ``interaction.options``
 # (``frontend/src/components/chat/clarification-form.tsx``), while
 # ``confirm`` renders a switch, ``text_input`` a field, ``number_input`` a
 # spinner, and ``file_upload`` a picker -- none of which read ``options``.
 _V1_TYPES_REQUIRING_OPTIONS = frozenset(
     {"select_one", "select_multiple", "action_cards"}
 )
-_OPTIONS_RULE_BY_TYPE: dict[str, str] = {
-    interaction_type: (
-        "required" if interaction_type in _V1_TYPES_REQUIRING_OPTIONS else "forbidden"
-    )
-    for interaction_type in _V1_INTERACTION_TYPES
-}
 
 
 @dataclass(frozen=True)
@@ -1123,11 +1124,11 @@ class InteractionWritePayloadRejected(ValueError):
 # ever emits, beyond the two AskUserQuestionArgs fields (message/
 # interactions) parse_v1_request_payload validates -- verified against that
 # function's own source, which is the only producer of a payload carrying
-# any of these keys today. All five are metadata the v1 question-shape
+# any of these keys today. All six are metadata the v1 question-shape
 # readers intentionally ignore (see that module's own docstring on
 # ``event_id``); pydantic's default ``model_validate`` behavior already
 # drops every one of them silently, which is not a rule a reader can find
-# by looking at this module -- naming them here instead means a sixth,
+# by looking at this module -- naming them here instead means a seventh,
 # genuinely unknown key does not vanish the same silent way. ``event_id``
 # is the one that matters most to get right: it is the authoritative
 # staging identity (#1800), carried on every legitimate payload, so
@@ -1155,15 +1156,20 @@ def _reject_unknown_envelope_keys(values: Any) -> None:
 
     if not isinstance(values, dict):
         return
-    unknown = sorted(
-        set(values) - {"message", "interactions"} - _V1_ENVELOPE_METADATA_KEYS,
-        key=str,
-    )
-    if unknown:
+    # The refusal names the container, never the offending key: this
+    # refusal reaches a WARNING log line (see create()'s two logger.warning
+    # call sites), and InteractionWriteRefusal's own docstring -- per #1314
+    # item 3 -- promises position is built from fixed field names and
+    # indices, never a value out of the payload. Naming the key was this
+    # module's one violation of that promise.
+    #
+    # No ordering is computed here any more, which also retires the reason
+    # the previous `sorted(..., key=str)` existed: with no key selected, a
+    # payload mixing str and non-str top-level keys can no longer reach a
+    # comparison at all.
+    if set(values) - {"message", "interactions"} - _V1_ENVELOPE_METADATA_KEYS:
         raise InteractionWritePayloadRejected(
-            InteractionWriteRefusal(
-                rule="unknown_field", position=f"request_payload.{unknown[0]}"
-            )
+            InteractionWriteRefusal(rule="unknown_field", position="request_payload")
         )
 
 
@@ -1174,8 +1180,9 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
     identifier and the position it fired at, never producer-supplied text
     (``#1314`` item 3) -- describing the first violation found; returns
     ``None`` when the payload may be written. Each rule below is scoped by
-    ``interaction.type`` through ``_OPTIONS_RULE_BY_TYPE`` where a rule is
-    type-specific at all (``#1314`` item 2); the rules that apply to every
+    ``interaction.type`` through ``_V1_TYPES_REQUIRING_OPTIONS`` where a
+    rule is type-specific at all (``#1314`` item 2); the rules that apply
+    to every
     type (blank/duplicate field, blank/duplicate option) are not, because
     they are not about what a given type renders.
 
@@ -1308,14 +1315,21 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
                 )
             )
         seen_fields.add(interaction.field)
-        options_rule = _OPTIONS_RULE_BY_TYPE[interaction.type]
-        if options_rule == "required" and not interaction.options:
+        # One set, read as a total function of membership: every type in
+        # _V1_INTERACTION_TYPES either requires options or forbids them,
+        # with no third case. #1314 item 2's concern was two independent
+        # flat sets that could drift apart; a single set with a derived
+        # rule cannot drift from itself. interaction.type is provably in
+        # _V1_INTERACTION_TYPES by here -- the unsupported_type check
+        # above rejects anything else.
+        requires_options = interaction.type in _V1_TYPES_REQUIRING_OPTIONS
+        if requires_options and not interaction.options:
             raise InteractionWritePayloadRejected(
                 InteractionWriteRefusal(
                     rule="options_required", position=f"{where}.options"
                 )
             )
-        if options_rule == "forbidden" and interaction.options:
+        if not requires_options and interaction.options:
             raise InteractionWritePayloadRejected(
                 InteractionWriteRefusal(
                     rule="options_forbidden", position=f"{where}.options"
@@ -1479,17 +1493,56 @@ _DEGRADED_AS_OUTCOME: dict[type[BaseException], "CreateOutcome"] = {
 }
 
 
+@dataclass(frozen=True)
+class SystemWriteContext:
+    """The already-loaded, already-locked state a system-principal
+    ``create()`` call supplies instead of loading it itself.
+
+    One parameter, not five: the five values are meaningless for a
+    user/guest principal and mandatory for the system principal, and five
+    independent ``| None`` parameters cannot express that all-or-nothing
+    relationship -- only a runtime check could, and a runtime check is
+    what this replaces. Passing four of the five is now unrepresentable
+    rather than rejected.
+
+    ``__post_init__`` validates the two lease preconditions the staging
+    layer would otherwise reject far downstream, with a bare ``ValueError``
+    that escapes ``create()``'s typed-outcome contract entirely
+    (``_validate_request_fields`` on ``run_id``, ``InteractionHandoff.stage``
+    on the task id). Judging them here means the error names the caller's
+    own construction site, which is where the bug is, rather than
+    surfacing from inside a context manager three layers down. Length is
+    deliberately NOT re-checked here: ``_MAX_LENGTHS["run_id"]`` is the
+    staging layer's column-domain constant and copying it here would be a
+    second, drift-capable copy of the same rule.
+    """
+
+    task: "Task"
+    lease: TaskLease
+    anchor: InteractionAnchor
+    now: datetime
+    expires_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.lease.run_id, str) or not self.lease.run_id:
+            raise ValueError(
+                "SystemWriteContext requires lease.run_id to be a non-empty "
+                f"str, got {self.lease.run_id!r}"
+            )
+        if self.lease.task_id != int(self.task.id):
+            raise ValueError(
+                f"SystemWriteContext lease names task {self.lease.task_id} "
+                f"but the task supplied is {int(self.task.id)}"
+            )
+
+
 def create(
     db: "Session",
     *,
     task_id: int,
     principal: InteractionPrincipal,
     envelope: CreateInteractionEnvelope,
-    task: "Task | None" = None,
-    lease: TaskLease | None = None,
-    anchor: InteractionAnchor | None = None,
-    now: datetime | None = None,
-    expires_at: datetime | None = None,
+    system_context: SystemWriteContext | None = None,
 ) -> CreateOutcome:
     """Typed seam for publishing a native clarification interaction.
 
@@ -1514,7 +1567,7 @@ def create(
     against a task this call loads itself, by id, the same way it always
     has; for the system principal it runs against the caller-supplied
     ``task`` argument, and this function issues no query of its own on
-    that path (see the task/lease/anchor/now/expires_at paragraph below).
+    that path (see the `system_context` paragraph below).
     Only a caller that has been authorized against a real task row reaches
     the envelope checks below, so a rejection reason describing the payload
     shape is never returned to a caller that is not entitled to the task in
@@ -1585,7 +1638,7 @@ def create(
     - The ``system`` principal has no ownership relationship to a task at
       all -- it acts on behalf of the finalizer layer, which has already
       loaded and locked the row itself before ever calling this function
-      (see the task/lease/anchor/now/expires_at paragraph below). It is
+      (see the `system_context` paragraph below). It is
       authorized unconditionally at this step, the same as an admin
       ``"user"`` principal, and for the identical reason "authorized here
       is not allowed to write": ``_assert_write_point_admissible``, called
@@ -1652,21 +1705,23 @@ def create(
     the finalizer layer that calls this seam, not to the
     validation-and-authorization facade in front of the write point.
 
-    ``task`` / ``lease`` / ``anchor`` / ``now`` / ``expires_at``: five
-    keyword arguments meaningful only on the system-principal path (every
-    other principal kind is refused by ``_assert_write_point_admissible``
-    before any of them is read, so they may be left ``None`` for a
-    ``user``/``guest`` caller). ``task`` is the finalizer's own
-    already-loaded, already-locked row -- this function never issues a
-    ``Task`` query of its own to reach it, and it is the exact object
-    handed to ``interaction_handoff``, never a re-derived one. ``lease`` is
-    the finalizer's held lease; ``lease.run_id`` is what this call stages
-    under and what its own run-partition pre-check (below) compares
-    against ``anchor.resume_run_partition``. ``anchor`` is the
-    already-resolved resume anchor (the caller's own database read against
-    ``trace_events`` has already happened -- see ``InteractionAnchor``'s
-    docstring on why that half of anchor resolution is not this module's
-    job). ``now`` and ``expires_at`` are the caller's own clock reading and
+    ``system_context``: a ``SystemWriteContext``, meaningful only on the
+    system-principal path (every other principal kind is refused by
+    ``_assert_write_point_admissible`` before it is read, so it may be
+    left ``None`` for a ``user``/``guest`` caller). ``system_context.task``
+    is the finalizer's own already-loaded, already-locked row -- this
+    function never issues a ``Task`` query of its own to reach it, and it
+    is the exact object handed to ``interaction_handoff``, never a
+    re-derived one. ``system_context.lease`` is the finalizer's held
+    lease; ``lease.run_id`` is what this call stages under and what its
+    own run-partition pre-check (below) compares against
+    ``anchor.resume_run_partition`` -- both preconditions judged at
+    ``SystemWriteContext`` construction, not here. ``system_context.anchor``
+    is the already-resolved resume anchor (the caller's own database read
+    against ``trace_events`` has already happened -- see
+    ``InteractionAnchor``'s docstring on why that half of anchor
+    resolution is not this module's job). ``system_context.now`` and
+    ``system_context.expires_at`` are the caller's own clock reading and
     proposed expiry; this facade's ``ttl_seconds`` bound-check (above)
     validates the shape of an optional caller-requested override but does
     not derive ``expires_at`` from it in this delivery -- the finalizer
@@ -1766,16 +1821,19 @@ def create(
         return CreateUnauthorized(reason="not_task_principal")
 
     authorized_task: "Task | None"
+    resolved_context: SystemWriteContext | None = None
     if principal.kind == InteractionPrincipalKind.SYSTEM:
         # No Task query issued on this path: the caller's own
         # already-loaded, already-locked row is trusted as-is, and its id
         # must agree with the id the caller separately named.
-        if task is None or int(task.id) != task_id:
+        if system_context is None or int(system_context.task.id) != task_id:
             raise ValueError(
-                "create() requires a caller-loaded `task` matching "
-                f"task_id={task_id!r} for a system principal, got {task!r}"
+                "create() requires a `system_context` whose task matches "
+                f"task_id={task_id!r} for a system principal, got "
+                f"{system_context!r}"
             )
-        authorized_task = task
+        resolved_context = system_context
+        authorized_task = system_context.task
     else:
         owner_scoped = principal.kind == "guest" or (
             principal.kind == "user" and not principal.is_admin
@@ -1813,6 +1871,8 @@ def create(
             authorized = False
         if not authorized:
             return CreateUnauthorized(reason="not_task_principal")
+
+    _assert_write_point_admissible(principal, authorized_task)
 
     if not isinstance(envelope.kind, str) or envelope.kind not in _KIND_VOCABULARY:
         return CreateValidationRejected(reason="unknown_kind")
@@ -1888,38 +1948,35 @@ def create(
         ):
             return CreateValidationRejected(reason="invalid_values")
 
-    _assert_write_point_admissible(principal, authorized_task)
-
     # Every check above ran regardless of principal kind; everything from
     # here on is reachable only by the system principal (the assertion
-    # above raised for anything else), so lease/anchor/now/expires_at are
-    # exactly the arguments the caller must have supplied. lease.run_id is
-    # checked here too, not left for interaction_handoff's own stage() to
-    # reject: a lease with no run_id can never stage anything (stage()
-    # raises ValueError for exactly that), so failing here is the same
-    # outcome, one call earlier, and it is what lets every use of
-    # lease.run_id below be treated as the str it now provably is.
-    if (
-        lease is None
-        or anchor is None
-        or now is None
-        or expires_at is None
-        or lease.run_id is None
-    ):
-        raise ValueError(
-            "create() requires lease/anchor/now/expires_at for a system "
-            "principal, with lease.run_id set"
-        )
+    # above raised for anything else), so the context is exactly the one
+    # argument the caller must have supplied. The lease preconditions the
+    # staging layer would otherwise reject with a bare ValueError -- run_id
+    # a non-empty str, task_id agreeing with the task -- are
+    # SystemWriteContext.__post_init__'s, judged when the caller built it;
+    # by here they hold, which is what lets every use of
+    # ``context.lease.run_id`` below be treated as the str it provably is.
+    if resolved_context is None:
+        raise ValueError("create() requires a `system_context` for a system principal")
+    context = resolved_context
+    # SystemWriteContext.__post_init__ already proved this non-None -- in a
+    # different function's scope, which the type checker cannot see across.
+    # Re-asserted here, not re-validated: TaskLease.run_id is str | None for
+    # lease shapes this dataclass does not accept, and this is what lets
+    # every use of ``context.lease.run_id`` below be treated as the str it
+    # provably is.
+    assert context.lease.run_id is not None
 
     with interaction_handoff(
-        db, lease, task=authorized_task, anchor=anchor, now=now
+        db, context.lease, task=authorized_task, anchor=context.anchor, now=context.now
     ) as handoff:
         handoff.stage(
             kind=envelope.kind,
             protocol_version=envelope.protocol_version,
             request_payload=request_payload,
             request_idempotency_key=normalized_idempotency_key,
-            expires_at=expires_at,
+            expires_at=context.expires_at,
         )
 
     if handoff.staged is None:
@@ -1929,8 +1986,28 @@ def create(
         # maps four of the six to a distinct outcome each. The remaining
         # two (see that dict's own docstring), and an unset/unrecognized
         # degraded_as, fall through to this default.
+        #
+        # issubclass, not an exact-type key lookup: the ``except _SWALLOWED``
+        # clause that produced this value matches subclasses, so a future
+        # subclass of any mapped type would miss an exact lookup and be
+        # silently reclassified as the default below. Same reasoning, same
+        # linear scan, as interaction_handoff's own signal lookup
+        # (task_interaction_staging.py:1633-1640) -- that one scans the
+        # caught exception *instance* with isinstance, this one scans the
+        # recorded *type* with issubclass. The six swallowed types are
+        # mutually unrelated (each subclasses InteractionHandoffError
+        # directly, none subclasses another -- see
+        # test_swallowed_exception_types_are_mutually_unrelated), so scan
+        # order carries no ambiguity.
         mapped_outcome = (
-            _DEGRADED_AS_OUTCOME.get(handoff.degraded_as)
+            next(
+                (
+                    outcome
+                    for exc_type, outcome in _DEGRADED_AS_OUTCOME.items()
+                    if issubclass(handoff.degraded_as, exc_type)
+                ),
+                None,
+            )
             if handoff.degraded_as is not None
             else None
         )
@@ -1939,7 +2016,7 @@ def create(
     receipt = CreatedInteractionReceipt(
         interaction_id=handoff.staged.staged_db_id,
         task_id=int(authorized_task.id),
-        run_id=lease.run_id,
+        run_id=context.lease.run_id,
         active_slot=handoff.staged.active_slot,
         protocol_version=handoff.staged.protocol_version,
         request_idempotency_key=normalized_idempotency_key,
