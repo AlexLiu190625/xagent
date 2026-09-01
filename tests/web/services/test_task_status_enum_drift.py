@@ -365,8 +365,17 @@ def test_startup_initializer_still_runs_the_drift_check() -> None:
     anything), and the startup tests monkeypatch ``init_db`` and never
     enter the initializer at all. Deleting the call, moving it ahead of the
     migrations it depends on, dropping it from one of the two return
-    paths, or wrapping it in a ``try``/``except`` would leave all of those
-    green while the process stopped refusing to serve on a drifted enum.
+    paths, wrapping it in a ``try``/``except``, or nesting it under a
+    condition the return does not share -- ``if
+    should_seed_builtin_mcp_registry``, which is false on every database
+    that already has tables -- would leave all of those green while the
+    process stopped refusing to serve on a drifted enum.
+
+    The return-path assertion below is what closes that last one, and it is
+    why it matches only a ``return`` that is a statement of the block being
+    scanned and only a checker call made directly by that same block: a
+    recursive match finds the checker "before" a return that a nested
+    condition can skip.
 
     Read off the source rather than by driving the initializer: all four of
     those are properties of the call site's shape, which the syntax tree
@@ -377,7 +386,8 @@ def test_startup_initializer_still_runs_the_drift_check() -> None:
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(_initialize_database_schema)))
 
-    # (1) Called, and on every path that returns.
+    # (1) Called, and directly on every block that returns -- not merely
+    # somewhere inside a statement that block happens to contain.
     assert _calls_named(tree, _CHECK_NAME), (
         f"_initialize_database_schema no longer calls {_CHECK_NAME}: startup "
         "would begin serving against a database whose taskstatus enum has "
@@ -385,10 +395,11 @@ def test_startup_initializer_still_runs_the_drift_check() -> None:
     )
     for block in _statement_blocks(tree):
         for index, statement in enumerate(block):
-            if not any(isinstance(n, ast.Return) for n in ast.walk(statement)):
+            if not isinstance(statement, ast.Return):
                 continue
             assert any(
-                _calls_named(earlier, _CHECK_NAME) for earlier in block[: index + 1]
+                _calls_in_own_scope(earlier, _CHECK_NAME)
+                for earlier in block[: index + 1]
             ), (
                 "_initialize_database_schema returns without having run "
                 f"{_CHECK_NAME} on that path (source line "
@@ -429,3 +440,51 @@ def test_startup_initializer_still_runs_the_drift_check() -> None:
         f"{_CHECK_NAME} runs before Base.metadata.create_all: a fresh "
         "database would have no taskstatus type yet"
     )
+
+
+@pytest.mark.postgresql
+def test_startup_refuses_to_serve_a_database_with_an_unrepairable_extra_label(
+    postgresql_engine_factory,
+) -> None:
+    """The static test above pins the call site's shape; this one drives
+    the real ``_initialize_database_schema`` path and pins the outcome a
+    caller actually observes, on the one drift shape no migration can heal.
+
+    An extra, unrecognized label is deliberately not the missing-label shape
+    the taskstatus-repair migration (``20260901_taskstatus_waiting_for_user``)
+    exists for: ``ALTER TYPE ... ADD VALUE`` only ever adds labels, so
+    ``try_upgrade_db`` running ahead of this check cannot make an extra label
+    disappear the way it makes a missing one appear. That is what makes this
+    fixture load-bearing for startup wiring specifically, where the
+    missing-label fixture the migration's own test drives is not: on a
+    database that is already complete except for one label the application
+    does not expect, ``check_task_status_enum_drift`` is the *only* thing
+    standing between a drifted enum and a serving process, so nesting its
+    call under a condition that is false on any already-populated database
+    (``should_seed_builtin_mcp_registry``, via ``is_database_empty`` -- this
+    fixture creates the full schema before startup runs, so it is never
+    empty) removes the only thing that would have refused to serve.
+    """
+    engine = postgresql_engine_factory("unrepairable_extra_label")
+    extra_label = "LEGACY_EXTRA"
+
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text("CREATE TABLE alembic_version (version_num VARCHAR(255) NOT NULL)")
+        )
+        connection.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
+            {"revision": TASKSTATUS_ENUM_REPAIR_REVISION},
+        )
+        connection.execute(text(f"ALTER TYPE taskstatus ADD VALUE '{extra_label}'"))
+
+    with pytest.raises(TaskStatusEnumDriftError) as exc_info:
+        _initialize_database_schema(engine)
+
+    message = str(exc_info.value)
+    assert extra_label in message
+    # The extra-only branch's own wording (see check_task_status_enum_drift):
+    # exclusive to this branch is exactly the point, since it is what a
+    # nested-under-seed-condition mutation removes.
+    assert "No migration can remove them" in message
