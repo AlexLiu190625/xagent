@@ -527,6 +527,16 @@ MALFORMED_REFS = [
     ("mcp", None),
     ("mcp",),
     ("mcp", 1, 2),
+    # An id that WOULD have converted to an int is malformed too, not something
+    # to convert quietly. Converting asked the hook about ``("mcp", 11)`` while
+    # the caller still held ``("mcp", "11")``, so the answer came back under a
+    # key the caller could not look up, and the single-ref wrapper read the
+    # miss as "the team does not link it".
+    ("mcp", "11"),
+    # ``isinstance(True, int)`` is ``True`` in Python and ``("mcp", True)``
+    # hashes and compares equal to ``("mcp", 1)``, so tolerating it resolved
+    # connector 1's access under another connector's name.
+    ("mcp", True),
 ]
 
 
@@ -534,12 +544,12 @@ MALFORMED_REFS = [
 def test_resolve_connector_access_or_raise_lets_a_malformed_ref_raise_raw(
     malformed_ref,
 ):
-    """A ref that is not a ``(str, int-coercible)`` pair is a defect in the
-    calling route, not an outage of the installing application, so it stays
-    the ``ValueError``/``TypeError`` it is instead of being converted into
-    the seam's retryable 503. A hook is installed here on purpose: it is
-    what gives the trailing ``assert calls == []`` its meaning, by showing
-    the raise lands before the hook is ever reached."""
+    """A ref whose id is not already an ``int`` is a defect in the calling
+    route, not an outage of the installing application, so it stays the
+    ``ValueError``/``TypeError`` it is instead of being converted into the
+    seam's retryable 503. A hook is installed here on purpose: it is what
+    gives the trailing ``assert calls == []`` its meaning, by showing the
+    raise lands before the hook is ever reached."""
     calls: list[object] = []
 
     def _hook(db, user_id, refs):
@@ -609,6 +619,44 @@ def test_resolve_connector_access_or_raise_still_converts_with_well_formed_refs(
     assert excinfo.value.details["reason"] == "connector_access_resolution_failed"
 
 
+def test_resolve_one_connector_access_or_raise_returns_what_the_batch_form_resolved():
+    """The single-ref wrapper agrees with the batch form it wraps.
+
+    It unwraps with ``.get(ref)``, which is only correct while every answer
+    comes back keyed on the ref the caller passed. That holds because
+    ``_normalize_connector_refs`` rejects an id that is not already an ``int``
+    instead of rewriting it -- back when it coerced, ``("mcp", "11")`` was
+    asked about as ``("mcp", 11)`` and this lookup missed, reporting ``None``
+    for a connector the hook had granted. The malformed-ref cases above pin
+    the rejecting half; this pins that a legitimate ref still round-trips.
+    """
+    grant = connector_team_scope.ConnectorAccess(team_owned=True, can_edit=True)
+    connector_team_scope.set_connector_team_hooks(
+        access=lambda db, user_id, requested: {r: grant for r in requested}
+    )
+
+    batch = connector_team_scope.resolve_connector_access_or_raise(
+        None, 7, [("mcp", 11)]
+    )
+    one = connector_team_scope.resolve_one_connector_access_or_raise(
+        None, 7, ("mcp", 11)
+    )
+
+    assert batch == {("mcp", 11): grant}
+    assert one == grant, f"batch resolved {batch!r} but the wrapper said {one!r}"
+
+
+def test_resolve_one_connector_access_or_raise_still_reports_an_unlinked_connector():
+    """The other direction, so the check above cannot be satisfied by a
+    wrapper that returns a grant for everything: a hook that links nothing
+    still unwraps to ``None``."""
+    connector_team_scope.set_connector_team_hooks(access=lambda *a: {})
+    assert (
+        connector_team_scope.resolve_one_connector_access_or_raise(None, 7, ("mcp", 11))
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     "entry_point",
     ["resolve_connector_access", "resolve_connector_access_or_raise"],
@@ -639,8 +687,11 @@ def test_each_entry_point_normalizes_the_refs_exactly_once(entry_point, monkeypa
         }
     )
 
+    # A duplicated ref rather than a text id: the seam rejects a text id
+    # outright now, and this test is about the number of passes, not about
+    # what a pass does.
     resolved = getattr(connector_team_scope, entry_point)(
-        None, 7, [("mcp", "5"), ("mcp", 5)]
+        None, 7, [("mcp", 5), ("mcp", 5)]
     )
 
     assert len(calls) == 1, f"normalized {len(calls)} times, received {calls}"

@@ -269,7 +269,8 @@ def team_connector_hook_installed() -> bool:
 def _normalize_connector_refs(
     refs: "Collection[ConnectorRef]",
 ) -> "frozenset[ConnectorRef]":
-    """Canonicalize a batch of connector refs, coercing every id to ``int``.
+    """Canonicalize a batch of connector refs, rejecting any id that is not
+    already an ``int``.
 
     Written once because the result is not merely an argument passed on to
     the hook -- it is also the baseline the hook's answer is checked
@@ -279,14 +280,31 @@ def _normalize_connector_refs(
     different notion of canonical shape than the one it was built from,
     with nothing failing to say so.
 
-    An id that will not coerce to ``int`` is deliberately not tolerated,
-    skipped, or defaulted here. Callers are expected to build their refs
-    from FastAPI-validated ``int`` path parameters or from non-nullable
-    integer primary keys, so an un-coercible id means xagent's own code
-    built the list wrong; it surfaces as the ``TypeError``/``ValueError``
-    it is. Dropping such a ref instead would silently turn a caller's bug
-    into a connector the hook was never asked about, and the caller would
-    read the resulting gap as "the team does not link it".
+    An id that is not already an ``int`` is rejected here -- never coerced,
+    skipped, or defaulted. Callers are expected to build their refs from
+    FastAPI-validated ``int`` path parameters or from non-nullable integer
+    primary keys, so anything else means xagent's own code built the list
+    wrong; it surfaces as the ``TypeError``/``ValueError`` it is. Dropping
+    such a ref instead would silently turn a caller's bug into a connector
+    the hook was never asked about, and the caller would read the resulting
+    gap as "the team does not link it".
+
+    Coercing was worse than either, which is why it is gone. ``int("11")``
+    looked harmless, because the batch answer did come back correct -- but it
+    asked about a different tuple than the caller was holding. The answer came
+    back keyed ``("mcp", 11)`` while the caller still had ``("mcp", "11")``,
+    so ``resolve_one_connector_access_or_raise`` looked its own ref up, missed,
+    and returned ``None`` -- this seam's word for "the team does not link it"
+    -- about a connector the hook had just granted. Rejecting instead means
+    the ref the hook is asked about is always the ref the caller passed, so an
+    answer key can never fail to match the ref it answers.
+
+    ``bool`` is excluded explicitly, the same way
+    ``_validate_connector_access_answer`` and
+    ``_validate_team_connector_answer`` exclude it: ``isinstance(True, int)``
+    is ``True`` in Python, and ``("mcp", True)`` compares and hashes equal to
+    ``("mcp", 1)``, so tolerating it would resolve a different connector's
+    access with nothing failing to say so.
 
     Only the id half is checked at run time. The connector type is carried
     by the ``ConnectorRef`` annotation, so a non-``str`` type is not
@@ -297,9 +315,16 @@ def _normalize_connector_refs(
     type checker has not already constrained is the one that owes a
     run-time check.
     """
-    return frozenset(
-        (connector_type, int(connector_id)) for connector_type, connector_id in refs
-    )
+    validated: "set[ConnectorRef]" = set()
+    for connector_type, connector_id in refs:
+        if isinstance(connector_id, bool) or not isinstance(connector_id, int):
+            raise TypeError(
+                "connector ref id must already be an int (bool is a subclass "
+                "of int in Python and is never a legitimate connector id), got "
+                f"{connector_id!r} for connector type {connector_type!r}"
+            )
+        validated.add((connector_type, connector_id))
+    return frozenset(validated)
 
 
 def _validate_connector_access_answer(
@@ -442,6 +467,12 @@ def resolve_connector_access(
     all, when no hook is installed or when ``refs`` is empty: an empty
     request is never worth a call, and a standalone deployment with no
     hook installed sees zero queries and zero behavior change.
+
+    The returned map is keyed on the refs as the caller passed them. That is
+    a consequence of ``_normalize_connector_refs`` rejecting an id that is not
+    already an ``int`` rather than coercing it: there is no input that reaches
+    the hook under one key and comes back under another, so a caller may look
+    its own ref straight back up in this map.
 
     A ref missing from the returned map means "the caller's team does not
     link this connector" -- the only way that fact is ever expressed (see
@@ -622,15 +653,15 @@ def resolve_connector_access_or_raise(
     would ever produce. The rest of this docstring describes what happens once
     one is installed.
 
-    Normalizing ``refs`` then happens before the 503 conversion and is
-    deliberately outside it. An id that will not coerce to ``int`` is a defect
+    Validating ``refs`` then happens before the 503 conversion and is
+    deliberately outside it. An id that is not already an ``int`` is a defect
     in the calling route, not an outage of the installing application: every
     caller builds its refs from FastAPI-validated ``int`` path parameters or
-    from non-nullable integer primary keys, so an un-coercible id means
-    xagent's own code is wrong. It surfaces as the ``TypeError``/``ValueError``
-    it is, raised before the hook is reached, rather than as a retryable
-    "connector access is unavailable" that would send an operator to look at
-    the application instead of at the route.
+    from non-nullable integer primary keys, so an id that is not already an
+    ``int`` means xagent's own code is wrong. It surfaces as the
+    ``TypeError``/``ValueError`` it is, raised before the hook is reached,
+    rather than as a retryable "connector access is unavailable" that would
+    send an operator to look at the application instead of at the route.
 
     Only the id half is checked that way. The connector type is carried by the
     ``ConnectorRef`` annotation and is not re-checked at run time, so a
@@ -649,12 +680,13 @@ def resolve_connector_access_or_raise(
     "connector_access_resolution_failed"}, status_code=503)``. Unlike
     ``resolve_team_connector_ids_or_raise``, there is no separate
     ``log_subject`` parameter: ``user_id`` here already identifies the
-    caller directly, so it doubles as the value logged. The logged refs
-    are the normalized ``(connector_type, int(id))`` tuples this function
-    resolved with -- ``('mcp', '5')`` in, ``('mcp', 5)`` logged -- sorted
-    for a stable log line, and never an ORM attribute read off a row,
-    which could itself fail if the session is left unusable by whatever
-    just failed.
+    caller directly, so it doubles as the value logged. The logged refs are
+    the validated ``(connector_type, int)`` tuples this function resolved
+    with, which are the caller's own refs -- ids are rejected rather than
+    rewritten, so nothing appears in the log under a shape the caller never
+    passed. They are sorted for a stable log line, and are never an ORM
+    attribute read off a row, which could itself fail if the session is left
+    unusable by whatever just failed.
 
     The session restore lives on ``_call_connector_hook_gate``, the single
     door every installed hook is invoked through, rather than on either
