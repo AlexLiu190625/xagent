@@ -5826,4 +5826,108 @@ describe("terminal error frames", () => {
     )
   })
 
+  // The dedup key is the server sentence, and one sentence covers a whole
+  // code. These two turns fail under one code for two different admitted
+  // reasons -- the same runtime secret, first never provided, then lost from
+  // its store -- so they share that key while being two distinct failures.
+  // Without the (code, reason) identity the second bubble vanishes, and that
+  // bubble is the turn's result.
+  it("keeps both bubbles when one code fails for two different reasons", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const frameForReason = (reason: string, timestamp: string) => ({
+      type: "task_error",
+      timestamp,
+      task_id: 1,
+      task: { id: 1, status: "failed" },
+      // Identical on both frames, and that is the production shape:
+      // _message_for_code returns one string per code and does not vary with
+      // the reason.
+      message: "Required runtime secret is unavailable.",
+      error: "Required runtime secret is unavailable.",
+      code: "runtime_secret_unavailable",
+      details: { reason },
+    }) as TestWebSocketMessage
+
+    act(() => {
+      onMessage?.(frameForReason("not_provided", "2026-05-27T05:00:02Z"))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "common.errors.connectorRuntimeMissing"
+      )
+    })
+
+    act(() => {
+      onMessage?.(frameForReason("store_lost", "2026-05-27T05:00:03Z"))
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      )
+      const bubbles = messages.filter(
+        (m: { content: string }) =>
+          m.content === "common.errors.connectorRuntimeMissing"
+      )
+      expect(bubbles).toHaveLength(2)
+    })
+  })
+
+  // The other half of the same contract: a genuine repeat of one failure is
+  // still collapsed, so the identity did not simply disable deduplication.
+  it("still collapses a repeat of the same code and reason", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const frame = {
+      type: "task_error",
+      timestamp: "2026-05-27T05:00:02Z",
+      task_id: 1,
+      task: { id: 1, status: "failed" },
+      message: "Required runtime secret is unavailable.",
+      error: "Required runtime secret is unavailable.",
+      code: "runtime_secret_unavailable",
+      details: { reason: "not_provided" },
+    } as TestWebSocketMessage
+
+    act(() => {
+      onMessage?.(frame)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "common.errors.connectorRuntimeMissing"
+      )
+    })
+
+    act(() => {
+      onMessage?.({ ...frame, timestamp: "2026-05-27T05:00:03Z" })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      )
+      const bubbles = messages.filter(
+        (m: { content: string }) =>
+          m.content === "common.errors.connectorRuntimeMissing"
+      )
+      expect(bubbles).toHaveLength(1)
+    })
+  })
 })

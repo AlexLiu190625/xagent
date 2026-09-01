@@ -5729,11 +5729,16 @@ export function AppProvider({
         const errorBubbleContent = connectorRuntimeBubble
           ?? `${t('agent.logs.event.messages.errorPrefix')} ${websocketErrorMessage}`
 
-        // The server sentence alone is too coarse to dedup on: one fixed
-        // string covers a whole error code, so two turns failing on two
-        // different missing keys share it while the bubbles above differ.
-        // Carry the code and reason as the occurrence identity so the second
-        // key still gets its own bubble.
+        // The string this dedup keys on is the server sentence -- or, on a
+        // transport that marks legacy prose untrusted, a single constant
+        // standing in for it -- and either way one value covers a whole error
+        // code: two turns failing under one code for two different admitted
+        // reasons -- a runtime secret not_provided, then the same secret
+        // store_lost -- share that key while being two distinct failures.
+        // Collapsing the second one now costs more than a bubble, because the
+        // bubble is the turn's result: that turn would end showing nothing.
+        // The structured (code, reason) pair is the occurrence axis instead;
+        // a genuine repeat of one failure still collapses.
         const errorOccurrenceIdentity = taskErrorProjection
           ? `${taskErrorProjection.code}:${taskErrorProjection.details.reason ?? ""}`
           : undefined
