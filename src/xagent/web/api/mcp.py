@@ -3352,10 +3352,137 @@ def update_mcp_server(
             )
 
         user_mcp, server = result
-        old_name = str(server.name)
         can_edit_global = _check_mcp_permission(
             user_mcp, getattr(current_user, "is_admin", False), require="edit"
         )
+
+        # Which row a request writes decides which row it locks. Seven of the
+        # nine fields of ``MCPServerUpdate`` target the shared ``MCPServer``
+        # definition row; ``is_active`` and ``user_env`` write this caller's
+        # own ``UserMCPServer`` link row and nothing else. Locking the
+        # definition row for a payload that carries only those two made an
+        # activate/deactivate queue behind an unrelated edit of the same
+        # connector -- and, under PostgreSQL REPEATABLE READ, made it fail
+        # outright: the lock statement follows the snapshot the joined read
+        # above already established, so a definition edit committed in between
+        # raises SQLSTATE 40001 and the route's generic handler answers 500
+        # with the requested activation state unwritten.
+        #
+        # ``model_fields_set`` decides this, not the values, because that is
+        # what decides the writes themselves: an explicitly-null
+        # ``runtime_input_schema`` is written to the definition row below even
+        # though its value is ``None``, while an absent field is not written at
+        # all. So a payload carrying ``description=None`` is counted here and
+        # then skipped by the write at its own ``is not None`` guard -- the
+        # lock is taken in a few cases that did not need it, and skipped in
+        # none whose fields target that row.
+        #
+        # One caveat: this set is not a superset of the writes that follow.
+        # ``_update_server_from_config`` below
+        # re-encrypts a global ``env`` or ``auth`` on every call and Fernet
+        # ciphertext differs each time, so on a server carrying one of those
+        # the rebuild still writes the definition row on this lock-free path.
+        # That write is the pre-existing behavior of this route, unchanged
+        # here; the isolation-level contract governing it is tracked in #1945.
+        fields_set = server_data.model_fields_set
+        writes_definition_row = bool(fields_set - {"is_active", "user_env"})
+
+        # A fresh single-table read of the definition row, on both paths. The
+        # read above is a two-table join and cannot itself address just this
+        # table; this is a separate statement, so a row deleted between the two
+        # still yields None here (handled as the same 404) rather than
+        # surfacing as an unrelated error out of the write path below.
+        # ``populate_existing()`` makes this statement's row the one the rest
+        # of this route reads: without it the already-identity-mapped instance
+        # from the join above would be returned unrefreshed, and every field
+        # below would still be that earlier snapshot.
+        #
+        # ``FOR UPDATE`` is added only on the path that writes this row, so a
+        # request that writes it still waits for another request holding it.
+        # That clause is a PostgreSQL/MySQL row lock only: SQLAlchemy renders
+        # no locking clause at all on SQLite, so on a SQLite deployment the
+        # read-modify-write below is not serialized and two concurrent edits of
+        # one server can still interleave. Closing that window needs the
+        # dual-dialect fence ``acquire_runtime_key_transition_fence``
+        # (services/api_keys.py) uses -- a no-op ``UPDATE`` that takes SQLite's
+        # writer lock -- and is left to a change of its own.
+        definition_query = (
+            db.query(MCPServer).filter(MCPServer.id == server_id).populate_existing()
+        )
+        if writes_definition_row:
+            definition_query = definition_query.with_for_update()
+        current_server = definition_query.first()
+        if current_server is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
+            )
+        server = current_server
+
+        if writes_definition_row:
+            # The join gate above ran before the lock statement, and the
+            # lock statement waits. Both things that read established --
+            # that the caller still has a ``UserMCPServer`` link to this
+            # server, and whether that link owns it (``can_edit_global``)
+            # -- were fixed before a wait of unbounded length. A supported
+            # admin user deletion removes association rows and leaves
+            # every definition row standing, and an MCP disconnect removes
+            # the caller's own link while another user's link keeps the
+            # definition alive; either can commit inside the wait. The
+            # request would then write and commit the shared definition
+            # row on a revoked authority, and fail only afterwards, in
+            # ``db.refresh(user_mcp)`` below -- which runs after the
+            # commit, so the generic handler's rollback cannot take the
+            # shared write back and the caller sees a 500 over a durable
+            # change.
+            #
+            # ``populate_existing()`` on the definition query above
+            # refreshes that statement's row and nothing else, so the link
+            # row needs its own statement. This is a single-table read of
+            # it -- the gate above is a two-table join and cannot address
+            # this table alone -- and the row it returns replaces
+            # ``user_mcp`` and re-derives ``can_edit_global`` for the rest
+            # of the route: the per-user env write, the activation write,
+            # the refresh and the response all read it.
+            #
+            # A gone link is this route's existing 404, matching the gate.
+            # A link that is still there but no longer owns the server is
+            # not an error by itself here -- the gate does not refuse a
+            # non-owner either -- so it is answered exactly as the gate
+            # would have answered it: the owner-only guard below rejects a
+            # payload that changes the shared configuration and drops one
+            # that does not.
+            current_user_mcp = (
+                db.query(UserMCPServer)
+                .filter(
+                    UserMCPServer.user_id == user_id,
+                    UserMCPServer.mcpserver_id == server_id,
+                )
+                .populate_existing()
+                .first()
+            )
+            if current_user_mcp is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="MCP server not found",
+                )
+            user_mcp = current_user_mcp
+            can_edit_global = _check_mcp_permission(
+                user_mcp, getattr(current_user, "is_admin", False), require="edit"
+            )
+
+        # Read from the fresh definition-row read above, not the pre-lock
+        # read further up: rename_team_connector's "old" argument must be
+        # the name that read actually returned. On the path that writes
+        # this row, that read is also the locked one, so this is the name
+        # this transaction holds locked -- a concurrent committed rename in
+        # between would otherwise make this stale, and the rewrite below
+        # would then look for a name that no longer exists anywhere,
+        # leaving the previous renamer's selectors dangling with no error.
+        # On the lock-free path this concern does not arise: a payload that
+        # skips the lock never carries ``name`` in ``fields_set``, so
+        # ``old_name`` and the name written back below are always the same
+        # string, and the rename hook below never fires for it.
+        old_name = str(server.name)
 
         # Non-owners may not touch the shared global config (env, command, etc.);
         # they only get to set their own per-user env override below. Reject a
@@ -3411,7 +3538,6 @@ def update_mcp_server(
         # Build and validate config
         try:
             config = _build_server_config(update_data, server)
-            fields_set = server_data.model_fields_set
             runtime_input_schema = (
                 server_data.runtime_input_schema
                 if can_edit_global and "runtime_input_schema" in fields_set
