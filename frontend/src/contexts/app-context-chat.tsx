@@ -1041,12 +1041,12 @@ export const projectErrorFrameForDisplay = (
   // those two apart, and on this handler the collapsed frame is the turn's
   // result. The identity is withheld when the frame carries no version (the
   // row was already gone when it was broadcast, so no state tuple was
-  // attached), which falls back to keying on the text alone: the version gate
-  // above drops such a frame once any versioned event has been seen for the
-  // task, and when none has, two of them key on the same text and the second
-  // still collapses -- the behaviour that predates this change. Withholding
-  // the identity is the honest answer there; attaching a state tuple needs
-  // the row, and a settled FAILED task has one.
+  // attached), which falls back to keying on the text alone:
+  // canAcceptTaskControlVersion drops such a frame once any versioned event
+  // has been seen for the task, and when none has, two of them key on the
+  // same text and the second still collapses -- the behaviour that predates
+  // this change. Withholding the identity is the honest answer there;
+  // attaching a state tuple needs the row, and a settled FAILED task has one.
   const occurrenceIdentity =
     isTerminal && controlEnvelope.stateVersion !== undefined
       ? `${controlEnvelope.runId ?? ""}:${controlEnvelope.stateVersion}`
@@ -1066,8 +1066,9 @@ export const projectErrorFrameForDisplay = (
     // error" placeholder until reload. A non-terminal rejection is not, and
     // flagging it would close the live progress indicator and the
     // waiting-answer form of a turn that is still running, and drain this
-    // turn's accumulated trace events into the rejection bubble (see
-    // ADD_MESSAGE above).
+    // turn's accumulated trace events into the rejection bubble (see the
+    // ADD_MESSAGE reducer case's isResult branch, which merges
+    // state.traceEvents into the message and clears it).
     isResult: isTerminal,
   }
 }

@@ -6550,7 +6550,7 @@ describe("error frame display projection", () => {
     // The envelope is parsed here rather than hand-built, matching the one
     // call site in production (app-context-chat.tsx, before the switch): a
     // hand-built envelope would be non-production-shaped input, and this is
-    // also what makes the no-version cell below (see its comment) actually
+    // also what makes the no-version cell above (see its comment) actually
     // exercise stateVersion being undefined rather than a value we chose.
     const controlEnvelope = extractTaskControlEnvelope(frame)
     expect(
