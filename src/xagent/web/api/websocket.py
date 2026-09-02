@@ -13,7 +13,6 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -322,13 +321,13 @@ def _task_error_payload(
     return payload
 
 
-@lru_cache(maxsize=1)
 def _client_visible_error_codes() -> frozenset[str]:
     """The closed set of client-visible error codes, reused not recopied.
 
     Imported inside the function on purpose: the ``v1`` package's ``__init__``
     pulls in routers that import this module, so a module-level import would
-    close a cycle. The set is built once and cached.
+    close a cycle. Rebuilt per call: a ~30-member frozenset is cheaper than a
+    cache to reason about.
     """
 
     from .v1.errors import V1ErrorCode
@@ -383,8 +382,13 @@ def create_terminal_task_error_event(
 
     # ConnectorRuntimeError types its code as a bare str and stores it
     # unvalidated, so "only the ten module constants reach here" is a fact
-    # about today's raise sites, not a property the code holds.
-    if code is not None and code not in _client_visible_error_codes():
+    # about today's raise sites, not a property the code holds. The type
+    # check comes first for the same reason `details` has one: annotations
+    # are not enforced, and an unhashable value would raise inside the
+    # membership test on a path whose whole point is that it never raises.
+    if code is not None and (
+        not isinstance(code, str) or code not in _client_visible_error_codes()
+    ):
         logger.error(
             "task_id=%s component=terminal-error-frame dropped=code "
             "value=%r; the frame is still sent without it",

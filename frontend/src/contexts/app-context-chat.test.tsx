@@ -6362,6 +6362,39 @@ describe("terminal error frames", () => {
       )
     })
   })
+
+  // getTaskErrorProjection reads `data?.code` before `root.code` -- this
+  // pins the nested half of that fallback, which no existing fixture
+  // exercises (they all carry code/details on the root).
+  it("reads code and details nested under data", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        data: {
+          code: "missing_runtime_context",
+          details: {},
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.missingRuntimeContext"
+      )
+    })
+  })
 })
 
 describe("error frame display projection", () => {

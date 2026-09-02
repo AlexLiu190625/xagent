@@ -1991,13 +1991,19 @@ def _schedule_bg(
                         # the connector identity is useful here and does not
                         # leave the server, while the broadcast frame carries
                         # neither it nor any reason that was filtered out.
+                        # The projector two modules over checks the same
+                        # attribute for a different reason; checking here too
+                        # costs one line and removes the question.
+                        raw_details = setup_or_run_err.details
+                        if not isinstance(raw_details, dict):
+                            raw_details = {}
                         logger.error(
                             "task_id=%s component=connector-runtime code=%s "
                             "reason=%s connector=%s",
                             task_id,
                             setup_or_run_err.code,
-                            setup_or_run_err.details.get("reason"),
-                            setup_or_run_err.details.get("connector_ref"),
+                            raw_details.get("reason"),
+                            raw_details.get("connector_ref"),
                         )
                     else:
                         settlement_error = (

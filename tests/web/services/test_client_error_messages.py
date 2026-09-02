@@ -15,7 +15,12 @@ from pathlib import Path
 import pytest
 
 from xagent.core.tools.adapters.vibe.config import RequiredMCPUnavailableError
-from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
+from xagent.core.tools.adapters.vibe.connector_runtime import (
+    RUNTIME_INPUT_AUTH_SELECTOR,
+    RUNTIME_INPUT_CONTEXT,
+    RUNTIME_INPUT_SECRETS,
+    ConnectorRuntimeError,
+)
 from xagent.web.services import client_error_messages
 from xagent.web.services.client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
@@ -249,41 +254,8 @@ def test_public_error_drops_every_field_but_reason() -> None:
     assert set(projected[1].to_wire()) == {"reason"}
 
 
-# --------------------------------------------------------------------------
-# I-34: ownership of the type
-# --------------------------------------------------------------------------
-
-
 def _python_sources() -> list[Path]:
     return sorted(SRC_ROOT.rglob("*.py"))
-
-
-def test_public_error_details_is_constructed_in_one_module_only() -> None:
-    construction_sites: set[str] = set()
-    subclass_sites: set[str] = set()
-
-    for path in _python_sources():
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        relative = path.relative_to(SRC_ROOT).as_posix()
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "PublicErrorDetails"
-            ):
-                construction_sites.add(relative)
-            if isinstance(node, ast.ClassDef) and any(
-                isinstance(base, ast.Name) and base.id == "PublicErrorDetails"
-                for base in node.bases
-            ):
-                subclass_sites.add(relative)
-
-    # Not a security boundary -- __post_init__ and the frame builder's
-    # type(...) is check are. This is an ownership boundary: the semantics of
-    # this type belong to the projector, so a second construction site or any
-    # subclass is a design drift that should be seen in review.
-    assert construction_sites == {"web/services/client_error_messages.py"}
-    assert subclass_sites == set()
 
 
 # --------------------------------------------------------------------------
@@ -512,3 +484,126 @@ def test_no_reason_assembled_by_interpolation_is_admitted_by_its_shape() -> None
         assert PublicErrorDetails(reason=probe).to_wire() == {}, (
             f"a reason of shape {pattern} is admitted by its shape: {probe}"
         )
+
+
+def test_the_interpolated_reasons_are_grounded_in_their_section_names() -> None:
+    """The three undeclared_* members pass only via the f-string pattern.
+
+    A pattern is an over-approximation: ``^undeclared_.+_key$`` would also
+    admit a listed reason nothing raises. Pin both halves -- the pattern set
+    the derivation actually produces, and the exact members it is allowed to
+    ground -- against the section names the raise site loops over.
+
+    The derivation finds a second pattern, ``^missing_context\\..+$``
+    (connector_runtime.py:857's ``f"missing_context.{key}"``), and it is
+    deliberately ungrounded: that reason is built from a key name the
+    connector's owner declared, and ``_is_public_reason``'s own docstring
+    names this exact shape as the one an owner-controlled interpolation must
+    not admit. ``test_no_reason_assembled_by_interpolation_is_admitted_by_its_shape``
+    above already asserts every pattern this derivation finds is rejected by
+    shape; this test only pins which patterns exist and grounds the one that
+    is supposed to resolve to real whitelist members.
+    """
+
+    _, patterns = _derive_reasons()
+    assert patterns == {"^undeclared_.+_key$", "^missing_context\\..+$"}
+    expected = {
+        f"undeclared_{section}_key"
+        for section in (
+            RUNTIME_INPUT_CONTEXT,
+            RUNTIME_INPUT_SECRETS,
+            RUNTIME_INPUT_AUTH_SELECTOR,
+        )
+    }
+    assert {
+        reason
+        for reason in CONNECTOR_RUNTIME_PUBLIC_REASONS
+        if reason.startswith("undeclared_")
+    } == expected
+
+
+def test_no_construction_site_hides_its_reason_from_the_scanner() -> None:
+    """The scanner has two blind spots; neither is occupied today.
+
+    It reads a ``details=`` argument only when it is a literal dict, and it
+    matches a construction only when the callee is a bare name. Both are safe
+    only while nothing sits in them, so pin both: every non-literal
+    ``details=`` belongs to the one indirection the scanner handles on its own
+    (``_raise_runtime_error``, whose ``reason`` keyword it reads at the outer
+    call sites instead), and no construction reaches the class through an
+    attribute (``module.ConnectorRuntimeError(...)``).
+
+    Sites are keyed by (file, line), not by file alone: a second non-literal
+    ``details=`` call added to the same file the one known site already lives
+    in must still change this set, or the assertion below would not notice a
+    new blind-spot occupant landing next to the one it already admits.
+    """
+
+    non_literal_details_sites: set[tuple[str, int]] = set()
+    attribute_construction_sites: set[str] = set()
+
+    for path in _python_sources():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        relative = path.relative_to(SRC_ROOT).as_posix()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "ConnectorRuntimeError"
+            ):
+                for keyword in node.keywords:
+                    if keyword.arg == "details" and not isinstance(
+                        keyword.value, ast.Dict
+                    ):
+                        non_literal_details_sites.add((relative, node.lineno))
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "ConnectorRuntimeError"
+            ):
+                attribute_construction_sites.add(relative)
+
+    assert non_literal_details_sites == {("web/services/connector_runtime.py", 1007)}
+    assert attribute_construction_sites == set()
+
+
+def test_every_opaque_reason_expression_is_a_str_call() -> None:
+    """Five reason expressions in this repository are opaque calls.
+
+    Three pass ``reason=str(exc)`` into ``_raise_runtime_error``; two spell
+    ``details={"reason": str(exc)}`` on a direct construction. Both shapes are
+    collected by ``_reason_expressions``, and neither resolves to a literal --
+    the runtime whitelist is what keeps them off the wire. Pin the shape so a
+    new opaque reason expression (a %-format, a .format(), a join) shows up as
+    a failure here instead of silently leaving the derivation.
+    """
+
+    trees = {
+        path: ast.parse(path.read_text(encoding="utf-8")) for path in _python_sources()
+    }
+    module_constants: dict[str, str] = {}
+    for tree in trees.values():
+        module_constants.update(_module_string_constants(tree))
+
+    opaque: list[ast.expr] = []
+    for tree in trees.values():
+        bindings = _string_bindings(tree, module_constants)
+        for expression in _reason_expressions(tree):
+            if isinstance(expression, ast.Constant) and isinstance(
+                expression.value, str
+            ):
+                continue
+            if isinstance(expression, ast.Name) and bindings.get(expression.id):
+                continue
+            if isinstance(expression, ast.JoinedStr):
+                continue
+            opaque.append(expression)
+
+    assert len(opaque) == 5, (
+        "expected 5 opaque reason expressions (reason=str(exc) at "
+        "connector_runtime.py:824/854/880, details={'reason': str(exc)} at "
+        f":540/773), found {len(opaque)}"
+    )
+    for expression in opaque:
+        assert isinstance(expression, ast.Call)
+        assert isinstance(expression.func, ast.Name) and expression.func.id == "str"

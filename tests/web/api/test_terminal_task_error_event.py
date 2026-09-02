@@ -157,6 +157,33 @@ def test_unknown_code_is_dropped_and_logged(
     assert "not_a_listed_code" in dropped[0]
 
 
+@pytest.mark.parametrize("code", [["not", "hashable"], 7, object()])
+def test_a_non_string_code_is_dropped_without_raising(
+    code: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The type gate runs before the membership test.
+
+    ``ConnectorRuntimeError`` types its code as a bare ``str`` and stores it
+    unvalidated, and this builder runs inside an ``except`` that only logs a
+    failed broadcast -- so a non-string value must cost the argument, not the
+    frame. Only the unhashable case actually needs the gate: without it a list
+    raises inside the frozenset membership test, while a hashable non-string
+    (an int, a bare object) is simply not a member and already takes the drop
+    path. All three are pinned so the outcome is the same shape either way.
+    """
+    with caplog.at_level(logging.ERROR):
+        event = create_terminal_task_error_event(
+            1, "x", code=code, details=PublicErrorDetails(reason="not_provided")
+        )
+    assert set(event.keys()) == BASE_FIELDS
+    dropped = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.ERROR and "dropped=code" in record.getMessage()
+    ]
+    assert len(dropped) == 1
+
+
 @pytest.mark.parametrize(
     "code",
     [
