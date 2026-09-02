@@ -1000,9 +1000,13 @@ export type ErrorFrameDisplay = {
 // above already uses.
 export const projectErrorFrameForDisplay = (
   message: WebSocketMessage,
-  options: { trustLegacyErrorProse: boolean; translate: Translate },
+  options: {
+    trustLegacyErrorProse: boolean
+    translate: Translate
+    controlEnvelope: TaskControlEnvelope
+  },
 ): ErrorFrameDisplay => {
-  const { trustLegacyErrorProse, translate } = options
+  const { trustLegacyErrorProse, translate, controlEnvelope } = options
   const websocketErrorCode = getWebSocketErrorCode(message)
   const dedupText = websocketErrorCode
     ? translate(clientErrorTranslationKey(websocketErrorCode))
@@ -1029,19 +1033,29 @@ export const projectErrorFrameForDisplay = (
     projection && CONNECTOR_RUNTIME_MISSING_VALUE_CODES.has(projection.code)
       ? translate('common.errors.connectorRuntimeMissing')
       : null
-  // The string this dedup keys on is the server sentence -- or, on a
-  // transport that marks legacy prose untrusted, a single constant
-  // standing in for it -- and either way one value covers a whole error
-  // code: two turns failing under one code for two different admitted
-  // reasons -- a runtime secret not_provided, then the same secret
-  // store_lost -- share that key while being two distinct failures.
-  // Collapsing the second one now costs more than a bubble, because the
-  // bubble is the turn's result: that turn would end showing nothing.
-  // The structured (code, reason) pair is the occurrence axis instead;
-  // a genuine repeat of one failure still collapses.
-  const occurrenceIdentity = projection
-    ? `${projection.code}:${projection.details.reason ?? ""}`
-    : undefined
+  // The dedup identity has to name WHICH occurrence this frame reports, not
+  // which class of failure it belongs to. broadcast_to_task stamps every frame
+  // of this type with the row's (run_id, state_version) pair before it goes
+  // out -- task_error is in websocket.py's _VERSIONED_TASK_EVENT_TYPES -- and
+  // state_version is bumped by every control transition that actually changes
+  // (status, control_state). So one settlement broadcast twice carries one
+  // version and still collapses, while two failed turns are at least two
+  // versions apart (the retry takes the lease FAILED -> RUNNING, then settles
+  // RUNNING -> FAILED) and both are shown. Keying on the failure's class
+  // instead -- the code, the reason, or the rendered sentence -- cannot tell
+  // those two apart, and on this handler the collapsed frame is the turn's
+  // result. The identity is withheld when the frame carries no version (the
+  // row was already gone when it was broadcast, so no state tuple was
+  // attached), which falls back to keying on the text alone: the version gate
+  // above drops such a frame once any versioned event has been seen for the
+  // task, and when none has, two of them key on the same text and the second
+  // still collapses -- the behaviour that predates this change. Withholding
+  // the identity is the honest answer there; attaching a state tuple needs
+  // the row, and a settled FAILED task has one.
+  const occurrenceIdentity =
+    isTerminal && controlEnvelope.stateVersion !== undefined
+      ? `${controlEnvelope.runId ?? ""}:${controlEnvelope.stateVersion}`
+      : undefined
   return {
     isTerminal,
     taskStatus,
@@ -5794,6 +5808,7 @@ export function AppProvider({
         const errorFrame = projectErrorFrameForDisplay(message, {
           trustLegacyErrorProse,
           translate: t,
+          controlEnvelope,
         })
 
         if (errorFrame.taskStatus) {
