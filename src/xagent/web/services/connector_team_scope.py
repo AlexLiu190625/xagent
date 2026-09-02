@@ -513,9 +513,16 @@ def _restore_session_after_hook_failure(db: Any) -> None:
     later statement in the request, including the ones a degradation path
     needs to build its response, would be refused. Rolling back here, at
     the one door every hook call and every answer check passes through, is
-    what keeps the degradation contract true; the roll back happens after
-    the route's own ``db.commit()`` on the post-commit decoration paths, so
-    it never discards durable work.
+    what keeps the degradation contract true.
+
+    No durable work is discarded, and not because of where the rollback
+    sits relative to a commit: every call site today invokes its hook
+    *before* the route's own ``db.commit()`` -- both rename paths and both
+    delete paths do. What the rollback can reach is therefore only the
+    aborting request's own pending mutations, which the re-raised
+    exception was going to strand uncommitted anyway. A call site that
+    ever decorated *after* committing would keep the same property for
+    the opposite reason, its work already being durable by then.
 
     A rollback that itself fails is logged and swallowed: this runs on an
     already-failing path, the original failure is re-raised by the caller
@@ -524,6 +531,13 @@ def _restore_session_after_hook_failure(db: Any) -> None:
     rollback = getattr(db, "rollback", None)
     if rollback is None:
         return
+    # Unconditional, unlike ``release_db_connection_if_clean``
+    # (``models/database.py``), which refuses to roll back a session
+    # carrying pending ORM changes: that helper runs on the success path,
+    # where discarding work the request still intends to commit would be
+    # data loss. Here the request is aborting -- the caller re-raises --
+    # so there is no such work to protect, and leaving the session
+    # unusable is the worse outcome.
     try:
         rollback()
     except Exception:

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -41,8 +42,9 @@ def _reset_hooks_scope() -> Iterator[None]:
     # ``set_connector_team_hooks`` docstring says it clears every slot it
     # is not given, so calling it bare to "reset" would drop whatever the
     # process had installed before this file ran. ``snapshot_connector_team_hooks``
-    # is what the newer suites in this repo use, and this file is the last
-    # one that did not. Pulled out of the fixture below so a test can
+    # is what the newer suites in this repo use; older suites elsewhere in
+    # tests/ still reset by clearing, which is a separate cleanup and not
+    # this file's to make. Pulled out of the fixture below so a test can
     # exercise this scope directly (see
     # ``test_the_reset_scope_restores_a_pre_installed_hook_rather_than_clearing_it``),
     # since the fixture itself wraps the whole test body and cannot be
@@ -328,40 +330,37 @@ def test_resolve_connector_access_rejects_a_key_whose_id_is_only_equal_to_an_int
         )
 
 
-def test_resolve_connector_access_rejects_a_key_that_is_not_a_tuple():
+@pytest.mark.parametrize(
+    "bad_key,requested,expected_message",
+    [
+        ("mcp", [("mcp", 1)], r"not a \(connector_type, connector_id\) pair"),
+        (
+            ("mcp", 1, "x"),
+            [("mcp", 1)],
+            r"not a \(connector_type, connector_id\) pair",
+        ),
+        ((1, 1), [(1, 1)], "connector type that is not a str"),
+    ],
+    ids=["not-a-tuple", "wrong-length", "connector-type-not-a-str"],
+)
+def test_resolve_connector_access_rejects_a_structurally_malformed_answer_key(
+    bad_key, requested, expected_message
+):
+    """A key the seam cannot even read as a ref is rejected before it is
+    matched against what was asked. The three shapes differ only in how
+    they fail to be a ``(connector_type, connector_id)`` pair -- not a
+    tuple at all, a tuple of the wrong length, or a pair whose type half
+    is not a ``str`` -- so they share one body and differ only in the key
+    and the message it must produce."""
     connector_team_scope.set_connector_team_hooks(
         access=lambda *a: {
-            "mcp": connector_team_scope.ConnectorAccess(team_owned=True, can_edit=True)
-        }
-    )
-    with pytest.raises(
-        ValueError, match=r"not a \(connector_type, connector_id\) pair"
-    ):
-        connector_team_scope.resolve_connector_access(None, 7, [("mcp", 1)])
-
-
-def test_resolve_connector_access_rejects_a_key_of_the_wrong_length():
-    connector_team_scope.set_connector_team_hooks(
-        access=lambda *a: {
-            ("mcp", 1, "x"): connector_team_scope.ConnectorAccess(
+            bad_key: connector_team_scope.ConnectorAccess(
                 team_owned=True, can_edit=True
             )
         }
     )
-    with pytest.raises(
-        ValueError, match=r"not a \(connector_type, connector_id\) pair"
-    ):
-        connector_team_scope.resolve_connector_access(None, 7, [("mcp", 1)])
-
-
-def test_resolve_connector_access_rejects_a_key_whose_connector_type_is_not_a_str():
-    connector_team_scope.set_connector_team_hooks(
-        access=lambda *a: {
-            (1, 1): connector_team_scope.ConnectorAccess(team_owned=True, can_edit=True)
-        }
-    )
-    with pytest.raises(ValueError, match="connector type that is not a str"):
-        connector_team_scope.resolve_connector_access(None, 7, [(1, 1)])
+    with pytest.raises(ValueError, match=expected_message):
+        connector_team_scope.resolve_connector_access(None, 7, requested)
 
 
 @pytest.mark.parametrize(
@@ -832,7 +831,11 @@ def test_every_hook_door_restores_the_session_when_the_hook_fails(
         connector_team_scope.set_connector_team_hooks(
             **{slot: _poisoning_hook_by_orm_flush(int(existing.id))}
         )
-        with pytest.raises(Exception):
+        # Narrow on purpose: the hook fails by colliding on a primary key,
+        # so what leaves the door is the driver's own IntegrityError. A bare
+        # ``Exception`` here would also swallow a TypeError from a mis-built
+        # ``invoke`` and let a broken setup pass as a passing test.
+        with pytest.raises(SQLAlchemyError):
             invoke(db_session)
 
     # Without the restore this raises PendingRollbackError instead.
