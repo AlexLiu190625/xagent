@@ -913,6 +913,10 @@ def test_a_hook_that_swallows_its_failure_and_answers_malformed_restores_too(
         with pytest.raises(ConnectorRuntimeError) as excinfo:
             invoke(db_session)
         assert excinfo.value.status_code == 503
+        # The cause is the seam's own rejection of the answer, not the DB
+        # failure the hook swallowed: the two failure modes stay apart.
+        assert isinstance(excinfo.value.__cause__, ValueError)
+        assert not isinstance(excinfo.value.__cause__, SQLAlchemyError)
 
     # No rollback of our own before this line: the query is the statement
     # that proves the door restored the session, and its count proves the
@@ -1386,3 +1390,42 @@ def test_the_team_scope_wrapper_also_restores_the_session(db_session):
     # The session must be usable again immediately afterward.
     result = db_session.execute(select(1)).scalar()
     assert result == 1
+
+
+# ---------------------------------------------------------------------------
+# The access wrapper restores the shared session after a hook that raises
+# outright, on a real session rather than the ``None`` stand-in the
+# conversion tests use.
+# ---------------------------------------------------------------------------
+
+
+def test_the_access_wrapper_restores_the_session_when_the_hook_raises(db_session):
+    """The conversion tests above hand this wrapper ``None`` for the session,
+    so they say nothing about the restore. A hook that poisons the shared
+    session via a failed ORM flush and lets that failure propagate must leave
+    the session usable for whatever runs next in the same request, and the
+    typed error must still carry the hook's own failure as its cause -- which
+    is what tells this failure mode apart from a rejected answer."""
+    poisoning_user_id = 900002
+    db_session.add(
+        User(id=poisoning_user_id, username="access-poison", password_hash="x")
+    )
+    db_session.commit()
+
+    def poisoning_access(db, user_id, refs):
+        # A duplicate primary key -- a real ORM flush failure, not a
+        # simulated one -- propagates out of this hook uncaught.
+        db.add(User(id=poisoning_user_id, username="dup", password_hash="x"))
+        db.flush()
+        return {}  # pragma: no cover - unreachable
+
+    connector_team_scope.set_connector_team_hooks(access=poisoning_access)
+    with pytest.raises(ConnectorRuntimeError) as excinfo:
+        connector_team_scope.resolve_connector_access_or_raise(
+            db_session, 7, [("mcp", 11)]
+        )
+    assert excinfo.value.status_code == 503
+    assert isinstance(excinfo.value.__cause__, SQLAlchemyError)
+
+    # The session must be usable again immediately afterward.
+    assert db_session.execute(select(1)).scalar() == 1
