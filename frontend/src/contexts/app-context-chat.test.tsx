@@ -145,12 +145,14 @@ vi.mock("sonner", () => ({
 import {
   AppProvider,
   extractTaskControlEnvelope,
+  projectErrorFrameForDisplay,
   type AppProviderTransportConfig,
   useApp,
 } from "./app-context-chat"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { TASK_ERROR_EVENT, type TaskErrorEventDetail } from "@/lib/task-error-events"
+import type { Translate } from "@/contexts/i18n-context"
 
 type TaskControlMessage = Parameters<typeof extractTaskControlEnvelope>[0]
 
@@ -6041,5 +6043,154 @@ describe("terminal error frames", () => {
       )
       expect(bubbles).toHaveLength(1)
     })
+  })
+})
+
+describe("error frame display projection", () => {
+  const translate = ((key: string) => key) as unknown as Translate
+
+  it.each([
+    {
+      name: "a terminal frame with a missing-value code on a trusted transport",
+      frame: {
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Required connector runtime context is missing.",
+        error: "Required connector runtime context is missing.",
+        code: "missing_runtime_context",
+        details: {},
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: true,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed",
+        stopsProcessing: true,
+        dedupText: "Required connector runtime context is missing.",
+        occurrenceIdentity: "missing_runtime_context:",
+        bubbleContent: "common.errors.connectorRuntimeMissing",
+        isResult: true,
+      },
+    },
+    {
+      name: "a terminal frame with no code on a trusted transport",
+      frame: {
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Task execution failed.",
+        error: "Task execution failed.",
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: true,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed",
+        stopsProcessing: true,
+        dedupText: "Task execution failed.",
+        occurrenceIdentity: undefined,
+        bubbleContent: "agent.logs.event.messages.errorPrefix Task execution failed.",
+        isResult: true,
+      },
+    },
+    {
+      name: "a terminal frame with a missing-value code on an untrusted transport",
+      frame: {
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Required connector runtime context is missing.",
+        error: "Required connector runtime context is missing.",
+        code: "missing_runtime_context",
+        details: {},
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: false,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed",
+        stopsProcessing: true,
+        dedupText: "Unknown error",
+        occurrenceIdentity: "missing_runtime_context:",
+        bubbleContent: "common.errors.connectorRuntimeMissing",
+        isResult: true,
+      },
+    },
+    {
+      name: "a terminal frame with a state version and a listed reason on a trusted transport",
+      frame: {
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Required runtime secret is unavailable.",
+        error: "Required runtime secret is unavailable.",
+        code: "runtime_secret_unavailable",
+        details: { reason: "not_provided" },
+        run_id: "run-1",
+        state_version: 12,
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: true,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed",
+        stopsProcessing: true,
+        dedupText: "Required runtime secret is unavailable.",
+        occurrenceIdentity: "runtime_secret_unavailable:not_provided",
+        bubbleContent: "common.errors.connectorRuntimeMissing",
+        isResult: true,
+      },
+    },
+    {
+      name: "a terminal frame with a state version and no code on a trusted transport",
+      frame: {
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Task execution failed.",
+        error: "Task execution failed.",
+        run_id: "run-1",
+        state_version: 12,
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: true,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed",
+        stopsProcessing: true,
+        dedupText: "Task execution failed.",
+        occurrenceIdentity: undefined,
+        bubbleContent: "agent.logs.event.messages.errorPrefix Task execution failed.",
+        isResult: true,
+      },
+    },
+    {
+      name: "a non-terminal frame with a code and a state version on a trusted transport",
+      frame: {
+        type: "error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "running" },
+        message: "Task is currently busy; please wait for the previous turn to finish.",
+        error: "Task is currently busy; please wait for the previous turn to finish.",
+        code: "connector_runtime_unavailable",
+        state_version: 12,
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: true,
+      expected: {
+        isTerminal: false,
+        taskStatus: "running",
+        stopsProcessing: false,
+        dedupText: "Task is currently busy; please wait for the previous turn to finish.",
+        occurrenceIdentity: undefined,
+        bubbleContent: "agent.logs.event.messages.errorPrefix Task is currently busy; please wait for the previous turn to finish.",
+        isResult: false,
+      },
+    },
+  ])("derives $name", ({ frame, trustLegacyErrorProse, expected }) => {
+    expect(
+      projectErrorFrameForDisplay(frame, { trustLegacyErrorProse, translate }),
+    ).toEqual(expected)
   })
 })

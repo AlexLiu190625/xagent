@@ -360,7 +360,7 @@ import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTask
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
-import { useI18n } from "@/contexts/i18n-context"
+import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
 import { normalizeTaskCompletedMessage } from "@/lib/task-completion"
@@ -971,6 +971,97 @@ const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | nul
 
 const shouldStopProcessingForTaskStatus = (status: unknown): boolean =>
   isStoppedTaskStatus(status)
+
+export type ErrorFrameDisplay = {
+  /** Terminal (`task_error`) or a rejection on the mixed root `error` channel. */
+  isTerminal: boolean
+  /** Status carried by the frame, or null when it carries none. */
+  taskStatus: Task["status"] | null
+  stopsProcessing: boolean
+  /** First argument to the dedup check: the server sentence, or the constant
+   *  that stands in for it on a transport that marks legacy prose untrusted. */
+  dedupText: string
+  /** Third argument to the dedup check. Undefined means "no identity, key on
+   *  the text alone". */
+  occurrenceIdentity: string | undefined
+  bubbleContent: string
+  isResult: boolean
+}
+
+// One place where a frame on the error/task_error handler becomes the five
+// values the handler needs: the bubble's wording, the dedup text, the dedup
+// identity, the result flag, and the task status to dispatch. Each of those
+// needs a different subset of "is this terminal / is legacy prose trusted /
+// did a code survive / is there a state version", and deriving each subset at
+// its own use site is what let five separate defects land in this handler
+// across two review rounds. Pure on purpose: no dispatch, no refs, nothing
+// outside its arguments, so every cell of that matrix is unit-testable
+// without rendering the provider -- the same shape extractTaskControlEnvelope
+// above already uses.
+export const projectErrorFrameForDisplay = (
+  message: WebSocketMessage,
+  options: { trustLegacyErrorProse: boolean; translate: Translate },
+): ErrorFrameDisplay => {
+  const { trustLegacyErrorProse, translate } = options
+  const websocketErrorCode = getWebSocketErrorCode(message)
+  const dedupText = websocketErrorCode
+    ? translate(clientErrorTranslationKey(websocketErrorCode))
+    : getWebSocketErrorMessage(message, trustLegacyErrorProse)
+  const taskStatus = getWebSocketTaskStatus(message)
+  // Only task_error is terminal. Every frame of that type is emitted after
+  // the row has been committed FAILED -- task_orchestrator.py's settled
+  // branch, and websocket.py's legacy helper, which settles under
+  // only_if_running=True and does not broadcast when that update matches
+  // no row -- and task_error is also the only frame that carries the
+  // structured code/details pair. The root "error" type is a mixed
+  // channel: rejected chat messages, rejected pause and rejected resume
+  // all arrive on it while the viewed task is still RUNNING or
+  // WAITING_FOR_USER, and a rejection is not this turn's answer.
+  const isTerminal = message.type === "task_error"
+  const projection = isTerminal ? getTaskErrorProjection(message) : null
+  // A missing runtime value is the one failure here the user can act on,
+  // so the bubble says so in the viewer's own language instead of relaying
+  // the server's fixed English sentence. It does not name the missing key:
+  // the key name is configuration the connector's owner wrote, and this
+  // frame reaches anonymous widget and share-link visitors. An owner reads
+  // the key names from the per-task requirements endpoint instead.
+  const connectorRuntimeBubble =
+    projection && CONNECTOR_RUNTIME_MISSING_VALUE_CODES.has(projection.code)
+      ? translate('common.errors.connectorRuntimeMissing')
+      : null
+  // The string this dedup keys on is the server sentence -- or, on a
+  // transport that marks legacy prose untrusted, a single constant
+  // standing in for it -- and either way one value covers a whole error
+  // code: two turns failing under one code for two different admitted
+  // reasons -- a runtime secret not_provided, then the same secret
+  // store_lost -- share that key while being two distinct failures.
+  // Collapsing the second one now costs more than a bubble, because the
+  // bubble is the turn's result: that turn would end showing nothing.
+  // The structured (code, reason) pair is the occurrence axis instead;
+  // a genuine repeat of one failure still collapses.
+  const occurrenceIdentity = projection
+    ? `${projection.code}:${projection.details.reason ?? ""}`
+    : undefined
+  return {
+    isTerminal,
+    taskStatus,
+    stopsProcessing: shouldStopProcessingForTaskStatus(taskStatus),
+    dedupText,
+    occurrenceIdentity,
+    bubbleContent:
+      connectorRuntimeBubble
+      ?? `${translate('agent.logs.event.messages.errorPrefix')} ${dedupText}`,
+    // A terminal failure IS this turn's result: without the flag the
+    // conversation panel (which renders only user / isResult / system-notice
+    // messages) filters the bubble out and falls back to a virtual "unknown
+    // error" placeholder until reload. A non-terminal rejection is not, and
+    // flagging it would close the live progress indicator and the
+    // waiting-answer form of a turn that is still running, and drain this
+    // turn's accumulated trace events into the rejection bubble (see
+    // ADD_MESSAGE above).
+    isResult: isTerminal,
+  }
+}
 
 const stepsFromPlanData = (planData: unknown, existingSteps: StepExecution[]): StepExecution[] | null => {
   const planRecord = planData && typeof planData === "object" ? planData as Record<string, unknown> : null
@@ -5698,67 +5789,26 @@ export function AppProvider({
         break
 
       case "error":
-      case "task_error":
+      case "task_error": {
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (error)')
-        const websocketErrorCode = getWebSocketErrorCode(message)
-        const websocketErrorMessage = websocketErrorCode
-          ? t(clientErrorTranslationKey(websocketErrorCode))
-          : getWebSocketErrorMessage(message, trustLegacyErrorProse)
-        const websocketTaskStatus = getWebSocketTaskStatus(message)
-        // Only task_error is terminal. Every frame of that type is emitted after
-        // the row has been committed FAILED -- task_orchestrator.py's settled
-        // branch, and websocket.py's legacy helper, which settles under
-        // only_if_running=True and does not broadcast when that update matches
-        // no row -- and task_error is also the only frame that carries the
-        // structured code/details pair. The root "error" type is a mixed
-        // channel: rejected chat messages, rejected pause and rejected resume
-        // all arrive on it while the viewed task is still RUNNING or
-        // WAITING_FOR_USER, and a rejection is not this turn's answer.
-        const isTerminalErrorFrame = message.type === "task_error"
-        const taskErrorProjection = isTerminalErrorFrame
-          ? getTaskErrorProjection(message)
-          : null
+        const errorFrame = projectErrorFrameForDisplay(message, {
+          trustLegacyErrorProse,
+          translate: t,
+        })
 
-        if (websocketTaskStatus) {
-          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: websocketTaskStatus } })
+        if (errorFrame.taskStatus) {
+          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: errorFrame.taskStatus } })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
         }
-        if (shouldStopProcessingForTaskStatus(websocketTaskStatus)) {
+        if (errorFrame.stopsProcessing) {
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
-        // A missing runtime value is the one failure here the user can act on,
-        // so the bubble says so in the viewer's own language instead of relaying
-        // the server's fixed English sentence. It does not name the missing key:
-        // the key name is configuration the connector's owner wrote, and this
-        // frame reaches anonymous widget and share-link visitors. An owner reads
-        // the key names from the per-task requirements endpoint instead.
-        const connectorRuntimeBubble =
-          taskErrorProjection
-          && CONNECTOR_RUNTIME_MISSING_VALUE_CODES.has(taskErrorProjection.code)
-            ? t('common.errors.connectorRuntimeMissing')
-            : null
-        const errorBubbleContent = connectorRuntimeBubble
-          ?? `${t('agent.logs.event.messages.errorPrefix')} ${websocketErrorMessage}`
-
-        // The string this dedup keys on is the server sentence -- or, on a
-        // transport that marks legacy prose untrusted, a single constant
-        // standing in for it -- and either way one value covers a whole error
-        // code: two turns failing under one code for two different admitted
-        // reasons -- a runtime secret not_provided, then the same secret
-        // store_lost -- share that key while being two distinct failures.
-        // Collapsing the second one now costs more than a bubble, because the
-        // bubble is the turn's result: that turn would end showing nothing.
-        // The structured (code, reason) pair is the occurrence axis instead;
-        // a genuine repeat of one failure still collapses.
-        const errorOccurrenceIdentity = taskErrorProjection
-          ? `${taskErrorProjection.code}:${taskErrorProjection.details.reason ?? ""}`
-          : undefined
         if (
           !isDuplicateMessageForViewedTask(
-            websocketErrorMessage,
+            errorFrame.dedupText,
             "agent-error",
-            errorOccurrenceIdentity,
+            errorFrame.occurrenceIdentity,
           )
         ) {
           dispatch({
@@ -5766,22 +5816,15 @@ export function AppProvider({
             payload: {
               id: generateMessageId("msg-error"),
               role: "assistant",
-              content: errorBubbleContent,
+              content: errorFrame.bubbleContent,
               timestamp: message.timestamp,
               status: "failed",
-              // A terminal failure IS this turn's result: without the flag the
-              // conversation panel (which renders only user / isResult /
-              // system-notice messages) filters the bubble out and falls back to
-              // a virtual "unknown error" placeholder until reload. A
-              // non-terminal rejection is not, and flagging it would close the
-              // live progress indicator and the waiting-answer form of a turn
-              // that is still running, and drain this turn's accumulated trace
-              // events into the rejection bubble (see ADD_MESSAGE above).
-              isResult: isTerminalErrorFrame,
+              isResult: errorFrame.isResult,
             },
           })
         }
         break
+      }
 
       case "message_received":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (message_received)')
