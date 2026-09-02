@@ -5841,18 +5841,18 @@ describe("terminal error frames", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("messages").textContent).toContain(
-        "common.errors.connectorRuntimeMissing"
+        "clientErrors.runtimeSecretUnavailable"
       )
     })
 
     const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
     const bubble = messages.find((m: { content: string }) =>
-      m.content.includes("common.errors.connectorRuntimeMissing")
+      m.content.includes("clientErrors.runtimeSecretUnavailable")
     )
     // Same toBe as the test below, on the other input: this branch is reached
     // with a listed bare reason rather than an empty details, and an
     // interpolation regression has to be caught on both.
-    expect(bubble?.content).toBe("common.errors.connectorRuntimeMissing")
+    expect(bubble?.content).toBe("clientErrors.runtimeSecretUnavailable")
   })
 
   // What the server now sends for a missing declared context key: the code
@@ -5888,24 +5888,25 @@ describe("terminal error frames", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("messages").textContent).toContain(
-        "common.errors.connectorRuntimeMissing"
+        "clientErrors.missingRuntimeContext"
       )
     })
 
     const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
     const bubble = messages.find((m: { content: string }) =>
-      m.content.includes("common.errors.connectorRuntimeMissing")
+      m.content.includes("clientErrors.missingRuntimeContext")
     )
     // No prefix: this wording replaces the server sentence rather than
     // decorating it. Exactly the key, with nothing appended: no variable was
     // interpolated, so no key name can be in the rendered text.
-    expect(bubble?.content).toBe("common.errors.connectorRuntimeMissing")
+    expect(bubble?.content).toBe("clientErrors.missingRuntimeContext")
     expect(bubble?.isResult).toBe(true)
   })
 
-  // connector_runtime_unavailable reports a server-side component being
-  // down, which the user cannot act on, so it keeps the generic prefix.
-  it("keeps the plain failure wording for a non-missing-value code", async () => {
+  // The frame's code decides the wording -- this code reports a server-side
+  // component being down, and it has its own table entry rather than the
+  // generic prefix.
+  it("uses the code's own wording when a server-side component is down", async () => {
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -5931,12 +5932,15 @@ describe("terminal error frames", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("messages").textContent).toContain(
-        "Connector runtime is unavailable."
+        "clientErrors.connectorRuntimeUnavailable"
       )
     })
 
+    // The server sentence is no longer relayed: this code has its own table
+    // entry now, on every transport, so the logged-in audience no longer sees
+    // a different wording than the one an untrusted transport gets.
     expect(screen.getByTestId("messages").textContent).not.toContain(
-      "common.errors.connectorRuntimeMissing"
+      "Connector runtime is unavailable."
     )
   })
 
@@ -5980,7 +5984,7 @@ describe("terminal error frames", () => {
     })
     await waitFor(() => {
       expect(screen.getByTestId("messages").textContent).toContain(
-        "common.errors.connectorRuntimeMissing"
+        "clientErrors.runtimeSecretUnavailable"
       )
     })
 
@@ -5994,7 +5998,7 @@ describe("terminal error frames", () => {
       )
       const bubbles = messages.filter(
         (m: { content: string }) =>
-          m.content === "common.errors.connectorRuntimeMissing"
+          m.content === "clientErrors.runtimeSecretUnavailable"
       )
       expect(bubbles).toHaveLength(2)
     })
@@ -6032,7 +6036,7 @@ describe("terminal error frames", () => {
     })
     await waitFor(() => {
       expect(screen.getByTestId("messages").textContent).toContain(
-        "common.errors.connectorRuntimeMissing"
+        "clientErrors.runtimeSecretUnavailable"
       )
     })
 
@@ -6046,7 +6050,7 @@ describe("terminal error frames", () => {
       )
       const bubbles = messages.filter(
         (m: { content: string }) =>
-          m.content === "common.errors.connectorRuntimeMissing"
+          m.content === "clientErrors.runtimeSecretUnavailable"
       )
       expect(bubbles).toHaveLength(1)
     })
@@ -6086,7 +6090,7 @@ describe("terminal error frames", () => {
     })
     await waitFor(() => {
       expect(screen.getByTestId("messages").textContent).toContain(
-        "common.errors.connectorRuntimeMissing"
+        "clientErrors.runtimeSecretUnavailable"
       )
     })
 
@@ -6100,7 +6104,7 @@ describe("terminal error frames", () => {
       )
       const bubbles = messages.filter(
         (m: { content: string }) =>
-          m.content === "common.errors.connectorRuntimeMissing"
+          m.content === "clientErrors.runtimeSecretUnavailable"
       )
       expect(bubbles).toHaveLength(2)
     })
@@ -6192,7 +6196,7 @@ describe("terminal error frames", () => {
     })
     await waitFor(() => {
       expect(screen.getByTestId("messages").textContent).toContain(
-        "common.errors.connectorRuntimeMissing"
+        "clientErrors.missingRuntimeContext"
       )
     })
 
@@ -6216,7 +6220,7 @@ describe("terminal error frames", () => {
       expect(messages).toHaveLength(2)
       const codedBubbles = messages.filter(
         (m: { content: string }) =>
-          m.content === "common.errors.connectorRuntimeMissing"
+          m.content === "clientErrors.missingRuntimeContext"
       )
       const genericBubbles = messages.filter(
         (m: { content: string }) =>
@@ -6278,6 +6282,86 @@ describe("terminal error frames", () => {
       expect(bubbles).toHaveLength(1)
     })
   })
+
+  // Blocking issue 3's direct anchor: connector_runtime_unavailable now has
+  // its own table entry, so it survives a transport that marks legacy prose
+  // untrusted the same way the three previously-curated codes always did.
+  // Before this, only those three had client-side wording; every other code,
+  // this one included, fell through to "Unknown error" for an anonymous
+  // widget or share-link visitor.
+  it("localizes a connector-runtime code for an untrusted transport", async () => {
+    render(
+      <AppProvider token="public-token" transport={{ legacyErrorProse: "untrusted" }}>
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Connector runtime is unavailable.",
+        error: "Connector runtime is unavailable.",
+        code: "connector_runtime_unavailable",
+        details: { reason: "team_env_resolution_failed" },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.connectorRuntimeUnavailable"
+      )
+    })
+
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "Unknown error"
+    )
+  })
+
+  // The boundary the client wording table draws: a code the table does not
+  // list keeps the generic prefixed wording, even though it is a member of
+  // the same connector-runtime family. connector_not_found is real -- it is
+  // one of the ten V1ErrorCode connector-runtime members -- but its only
+  // raise site is in the payload-validation stage before a task row exists,
+  // so it never reaches a terminal frame in production; this pins what the
+  // table does when a code outside its five members shows up anyway, not a
+  // claim that this specific code will arrive on this path.
+  it("falls back to generic wording for a code the table does not list", async () => {
+    render(
+      <AppProvider token="public-token" transport={{ legacyErrorProse: "untrusted" }}>
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Connector could not be found.",
+        error: "Connector could not be found.",
+        code: "connector_not_found",
+        details: {},
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "agent.logs.event.messages.errorPrefix Unknown error"
+      )
+    })
+  })
 })
 
 describe("error frame display projection", () => {
@@ -6306,7 +6390,7 @@ describe("error frame display projection", () => {
         // frame the version gate would drop once any versioned event has
         // been seen -- see I-A and cell 2 below.
         occurrenceIdentity: undefined,
-        bubbleContent: "common.errors.connectorRuntimeMissing",
+        bubbleContent: "clientErrors.missingRuntimeContext",
         isResult: true,
       },
     },
@@ -6352,7 +6436,7 @@ describe("error frame display projection", () => {
         stopsProcessing: true,
         dedupText: "Unknown error",
         occurrenceIdentity: undefined,
-        bubbleContent: "common.errors.connectorRuntimeMissing",
+        bubbleContent: "clientErrors.missingRuntimeContext",
         isResult: true,
       },
     },
@@ -6377,7 +6461,7 @@ describe("error frame display projection", () => {
         stopsProcessing: true,
         dedupText: "Required runtime secret is unavailable.",
         occurrenceIdentity: "run-1:12",
-        bubbleContent: "common.errors.connectorRuntimeMissing",
+        bubbleContent: "clientErrors.runtimeSecretUnavailable",
         isResult: true,
       },
     },

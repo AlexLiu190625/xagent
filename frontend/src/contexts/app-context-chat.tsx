@@ -928,16 +928,6 @@ const getWebSocketErrorCode = (message: WebSocketMessage) => {
   return errorCode.present ? readClientErrorCode(errorCode.value) : null
 }
 
-// The task_error codes that mean a connector is still missing a runtime value
-// the user can supply. The other connector-runtime code
-// (connector_runtime_unavailable) reports a server-side component being down,
-// which the user cannot act on, so it keeps the generic failure wording.
-const CONNECTOR_RUNTIME_MISSING_VALUE_CODES = new Set([
-  "missing_runtime_context",
-  "runtime_secret_unavailable",
-  "scheduled_secret_unavailable",
-])
-
 // The frame deliberately carries nothing connector-specific beyond the code:
 // its audience includes anonymous widget and share-link visitors, and the
 // server's reason whitelist admits only fixed strings it controls -- never a
@@ -1023,16 +1013,21 @@ export const projectErrorFrameForDisplay = (
   // WAITING_FOR_USER, and a rejection is not this turn's answer.
   const isTerminal = message.type === "task_error"
   const projection = isTerminal ? getTaskErrorProjection(message) : null
-  // A missing runtime value is the one failure here the user can act on,
-  // so the bubble says so in the viewer's own language instead of relaying
-  // the server's fixed English sentence. It does not name the missing key:
-  // the key name is configuration the connector's owner wrote, and this
-  // frame reaches anonymous widget and share-link visitors. An owner reads
-  // the key names from the per-task requirements endpoint instead.
-  const connectorRuntimeBubble =
-    projection && CONNECTOR_RUNTIME_MISSING_VALUE_CODES.has(projection.code)
-      ? translate('common.errors.connectorRuntimeMissing')
-      : null
+  // The frame's own code decides the wording, and one code has one sentence
+  // for every audience. This is the same table the root error channel already
+  // uses for its error_code field, extended with the connector-runtime codes
+  // that reach this frame -- not a second vocabulary beside it. It also fixes
+  // what the relayed sentence could not: on a transport that marks legacy
+  // prose untrusted, getWebSocketErrorMessage returns a constant by design
+  // (#1938: never render server free text there), so before this the curated
+  // sentence existed for three codes and every other code read "Unknown
+  // error". Nothing here relays server prose; the wording is the client's own,
+  // selected by code. A code the table does not list keeps the generic
+  // prefixed wording.
+  const projectedCode = projection ? readClientErrorCode(projection.code) : null
+  const connectorRuntimeBubble = projectedCode
+    ? translate(clientErrorTranslationKey(projectedCode))
+    : null
   // The dedup identity has to name WHICH occurrence this frame reports, not
   // which class of failure it belongs to. broadcast_to_task stamps every frame
   // of this type with the row's (run_id, state_version) pair before it goes

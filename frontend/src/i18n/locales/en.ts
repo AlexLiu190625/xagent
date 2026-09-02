@@ -22,6 +22,11 @@ const en = {
     uploadTooLarge: "File is too large. Please reduce the upload size and try again.",
     uploadProxyError: "Upload failed before reaching the application. Please check the server upload limit.",
     uploadFailed: "Upload failed. Please try again.",
+    missingRuntimeContext: "This connector needs additional runtime input before it can run.",
+    runtimeSecretUnavailable: "This connector needs a runtime credential that is not available.",
+    scheduledSecretUnavailable: "A scheduled run needs a runtime credential that is not available.",
+    invalidRuntimeContext: "This connector's runtime input is not valid, so the task could not run.",
+    connectorRuntimeUnavailable: "A service this connector needs is unavailable. Please try again later.",
   },
   common: {
     optional: "(Optional)",
@@ -66,7 +71,6 @@ const en = {
     errors: {
       unknown: "Unknown error",
       taskFailed: "Something went wrong. Please try again.",
-      connectorRuntimeMissing: "This connector needs additional runtime input before it can run.",
     },
   },
   voiceInput: {

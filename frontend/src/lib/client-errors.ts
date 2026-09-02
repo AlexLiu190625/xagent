@@ -23,6 +23,34 @@ const CLIENT_ERROR_CODES = [
   "upload_too_large",
   "upload_proxy_error",
   "upload_failed",
+  // Connector-runtime codes that reach the client on a terminal task_error
+  // frame's `code` field. They come from V1ErrorCode rather than the backend's
+  // ClientErrorCode enum -- this list is already a superset of that enum (the
+  // three upload_* codes are client-side only) and stays one table so a code
+  // has one wording for every audience. Only codes with a producer that can
+  // reach that frame today are listed, the same rule the server's reason
+  // whitelist states about itself: a listed code nothing produces is an entry
+  // with no expiry date. Which codes those are is a fact about this
+  // repository's raise sites, not a property the wire holds -- the field is
+  // typed as a bare string and validated only against the full V1ErrorCode
+  // set (see websocket.py's own note above that check), and a resolver
+  // installed through set_connector_runtime_resolver lives outside this
+  // repository and can raise any member. The other five members of the
+  // connector-runtime family are absent because nothing here produces them on
+  // this path: two have no raise site in this repository at all, and three are
+  // raised while a connector-runtime payload is being validated. Nothing that
+  // reaches those checks settles a task: a request handler answers the call
+  // with an error response (the /v1 task endpoints, and the trigger-config
+  // endpoints, which convert the failure into their own service error), and
+  // the trigger run-preparation path throws before the task row is created
+  // and records the failure on its TriggerRun row. No settled task means no
+  // terminal frame. A code this table does not list keeps the generic
+  // prefixed wording.
+  "missing_runtime_context",
+  "runtime_secret_unavailable",
+  "scheduled_secret_unavailable",
+  "invalid_runtime_context",
+  "connector_runtime_unavailable",
 ] as const
 
 export type ClientErrorCode = (typeof CLIENT_ERROR_CODES)[number]
@@ -50,6 +78,11 @@ const CLIENT_ERROR_TRANSLATION_KEYS: Record<ClientErrorCode, TranslationKey> = {
   upload_too_large: "clientErrors.uploadTooLarge",
   upload_proxy_error: "clientErrors.uploadProxyError",
   upload_failed: "clientErrors.uploadFailed",
+  missing_runtime_context: "clientErrors.missingRuntimeContext",
+  runtime_secret_unavailable: "clientErrors.runtimeSecretUnavailable",
+  scheduled_secret_unavailable: "clientErrors.scheduledSecretUnavailable",
+  invalid_runtime_context: "clientErrors.invalidRuntimeContext",
+  connector_runtime_unavailable: "clientErrors.connectorRuntimeUnavailable",
 }
 
 const CLIENT_ERROR_FALLBACKS: Record<ClientErrorCode, string> = {
@@ -75,6 +108,11 @@ const CLIENT_ERROR_FALLBACKS: Record<ClientErrorCode, string> = {
   upload_too_large: "File is too large. Please reduce the upload size and try again.",
   upload_proxy_error: "Upload failed before reaching the application. Please check the server upload limit.",
   upload_failed: "Upload failed. Please try again.",
+  missing_runtime_context: "This connector needs additional runtime input before it can run.",
+  runtime_secret_unavailable: "This connector needs a runtime credential that is not available.",
+  scheduled_secret_unavailable: "A scheduled run needs a runtime credential that is not available.",
+  invalid_runtime_context: "This connector's runtime input is not valid, so the task could not run.",
+  connector_runtime_unavailable: "A service this connector needs is unavailable. Please try again later.",
 }
 
 const CLIENT_ERROR_CODE_SET = new Set<string>(CLIENT_ERROR_CODES)
