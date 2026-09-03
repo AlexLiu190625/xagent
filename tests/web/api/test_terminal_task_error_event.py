@@ -236,13 +236,18 @@ def _raise_site_error_names() -> set[str]:
     return names
 
 
-def test_every_client_code_has_a_raise_site() -> None:
-    """Every code in the closed set is actually produced somewhere.
+def test_every_client_code_is_named_at_a_producer_site() -> None:
+    """Every code in the closed set is named where connector-runtime errors are made.
 
-    A code that reaches the closed set ahead of its raise site is an
-    allowance with no expiry date: nothing enforces that a promise like this
-    stays true, so this test derives the raise sites fresh from the AST
-    instead of trusting a hand-maintained list of them.
+    A code that reaches the closed set ahead of its producer is an allowance
+    with no expiry date, so this test derives the producer names fresh from
+    the AST instead of trusting a hand-maintained list. What it pins is
+    narrower than "raised somewhere": a code counts as produced when its
+    constant is the first argument of a ``ConnectorRuntimeError`` or
+    ``_raise_runtime_error`` call, or is returned by one of the helpers that
+    pick the code before such a call. A helper that returns a code and is
+    never called would satisfy this test; reachability of the helper is not
+    checked here.
     """
 
     error_names = _raise_site_error_names()

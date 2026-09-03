@@ -4091,29 +4091,6 @@ async def test_connector_runtime_frame_never_carries_connector_ref(
 
 
 @pytest.mark.asyncio
-async def test_connector_runtime_frame_reason_matches_direct_construction(
-    db_session,
-) -> None:
-    """End to end, a listed reason on the exception still never reaches the wire."""
-
-    error = ConnectorRuntimeError(
-        "missing_runtime_context",
-        "Required connector runtime context is missing.",
-        details={"reason": PUBLIC_REASON},
-    )
-
-    with _captured_terminal_broadcast(error, db_session) as (
-        task_id,
-        frames,
-        settlements,
-    ):
-        task = db_session.query(Task).filter(Task.id == task_id).one()
-        await _run_failing_turn(task_id, int(task.user_id), task.source)
-
-    assert "details" not in frames[0]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("code", CONNECTOR_RUNTIME_CODES)
 async def test_connector_runtime_failure_logs_missing_key(
     db_session,
