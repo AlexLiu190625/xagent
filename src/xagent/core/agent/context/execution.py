@@ -42,6 +42,7 @@ from .enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
+    top_level_user_request,
 )
 from .memory_tool import MEMORY_TOOLS_METADATA_KEY
 from .message import LLMCallRecord, Message
@@ -932,6 +933,9 @@ class ExecutionContext:
         include_system_prompt: bool = True,
         metadata: dict[str, Any] | None = None,
     ) -> "ExecutionContext":
+        # Child compaction may discard the copied root message, so snapshot its
+        # request provenance before metadata is cloned.
+        top_level_user_request(self)
         child_metadata = dict(self.metadata)
         if metadata:
             child_metadata.update(metadata)
@@ -1113,6 +1117,7 @@ class ExecutionContext:
                 strategy="none",
             )
 
+        top_level_user_request(self)
         total_tokens = self._get_total_tokens()
         if total_tokens > self.compact_config.threshold:
             result = self._drop_oldest_messages()
@@ -1129,6 +1134,7 @@ class ExecutionContext:
         if not self.compact_config.enabled:
             return None
 
+        top_level_user_request(self)
         total_tokens = self._get_total_tokens()
         if total_tokens <= self.compact_config.threshold:
             return None
@@ -1205,6 +1211,7 @@ class ExecutionContext:
         llm: Any = None,
         original_tokens: int | None = None,
     ) -> CompactResult:
+        top_level_user_request(self)
         original_count = len(self.messages)
         summary = (
             ""

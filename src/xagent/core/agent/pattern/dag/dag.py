@@ -14,6 +14,7 @@ from ....task_runtime import (
 )
 from ...context.enrichment import (
     enrich_context_with_memory,
+    hydrate_top_level_user_request,
     latest_user_text,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
@@ -1928,6 +1929,8 @@ class DAGPattern(AgentPattern):
         root_context: Any,
     ) -> None:
         """Refresh volatile routing metadata on a checkpoint-restored DAG step."""
+
+        hydrate_top_level_user_request(child_context, root_context)
 
         root_metadata = getattr(root_context, "metadata", {})
         preferred_modalities = normalize_input_modalities(

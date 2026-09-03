@@ -1645,6 +1645,31 @@ async def test_runner_initial_user_message_preserves_display_metadata(
     assert user_event["data"]["turn_id"] == turn_id
 
 
+@pytest.mark.parametrize(
+    ("request_context", "expected"),
+    [
+        pytest.param({}, None, id="missing"),
+        pytest.param({"display_message": None}, "", id="null"),
+        pytest.param({"display_message": 17}, "", id="non-string"),
+        pytest.param({"display_message": ""}, "", id="blank"),
+        pytest.param({"display_message": "  \n\t"}, "  \n\t", id="whitespace"),
+        pytest.param({"display_message": "Read file"}, "Read file", id="text"),
+    ],
+)
+def test_runner_normalizes_initial_display_message_state(
+    request_context: dict[str, Any], expected: str | None
+) -> None:
+    runner = AgentRunner(agent=Agent(name="writer", patterns=[]))
+    context = ExecutionContext(metadata={"request_context": request_context})
+
+    metadata = runner._initial_user_message_metadata(context)
+
+    if expected is None:
+        assert "display_message" not in metadata
+    else:
+        assert metadata["display_message"] == expected
+
+
 @pytest.mark.asyncio
 async def test_runner_attaches_uploaded_image_refs_to_initial_user_message(
     tmp_path: Path,
