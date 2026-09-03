@@ -104,6 +104,7 @@ from ..services.client_error_messages import (
     CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
     CLIENT_SAFE_TASK_FAILURE,
     CLIENT_SAFE_VALIDATION_ERROR,
+    CONNECTOR_RUNTIME_CLIENT_ERROR_CODES,
     ClientErrorCode,
     client_error_message,
 )
@@ -332,20 +333,6 @@ def _task_error_payload(
     return payload
 
 
-def _client_visible_error_codes() -> frozenset[str]:
-    """The closed set of client-visible error codes, reused not recopied.
-
-    Imported inside the function on purpose: the ``v1`` package's ``__init__``
-    pulls in routers that import this module, so a module-level import would
-    close a cycle. Rebuilt per call: a ~30-member frozenset is cheaper than a
-    cache to reason about.
-    """
-
-    from .v1.errors import V1ErrorCode
-
-    return frozenset(member.value for member in V1ErrorCode)
-
-
 def create_terminal_task_error_event(
     task_id: int,
     message: str,
@@ -364,8 +351,7 @@ def create_terminal_task_error_event(
     failure this path exists to remove. A bad optional argument costs that
     argument and nothing else. The rejection is logged with its stack.
 
-    ``code`` must be a member of the connector-runtime family the client
-    renders, the repository's closed set of client-visible error codes.
+    ``code`` must be a member of ``CONNECTOR_RUNTIME_CLIENT_ERROR_CODES``.
     """
 
     # Python annotations are not enforced at run time, so the mypy gate on the
@@ -375,13 +361,13 @@ def create_terminal_task_error_event(
     # instead.
     #
     # ConnectorRuntimeError types its code as a bare str and stores it
-    # unvalidated, so "only the ten module constants reach here" is a fact
+    # unvalidated, so "only the eight module constants reach here" is a fact
     # about today's raise sites, not a property the code holds. The type
     # check comes first for the same reason: annotations are not enforced,
     # and an unhashable value would raise inside the membership test on a
     # path whose whole point is that it never raises.
     if code is not None and (
-        not isinstance(code, str) or code not in _client_visible_error_codes()
+        not isinstance(code, str) or code not in CONNECTOR_RUNTIME_CLIENT_ERROR_CODES
     ):
         logger.error(
             "task_id=%s component=terminal-error-frame dropped=code "

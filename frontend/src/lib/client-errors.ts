@@ -31,20 +31,19 @@ const CLIENT_ERROR_CODES = [
   // reach that frame today are listed: a listed code nothing produces is an
   // entry with no expiry date. Which codes those are is a fact about this
   // repository's raise sites, not a property the wire holds -- the field is
-  // typed as a bare string and validated only against the full V1ErrorCode
-  // set (see websocket.py's own note above that check), and a resolver
-  // installed through set_connector_runtime_resolver lives outside this
-  // repository and can raise any member. The other five members of the
-  // connector-runtime family are absent because nothing here produces them on
-  // this path: two have no raise site in this repository at all, and three are
-  // raised while a connector-runtime payload is being validated. Nothing that
-  // reaches those checks settles a task: a request handler answers the call
-  // with an error response (the /v1 task endpoints, and the trigger-config
-  // endpoints, which convert the failure into their own service error), and
-  // the trigger run-preparation path throws before the task row is created
-  // and records the failure on its TriggerRun row. No settled task means no
-  // terminal frame. A code this table does not list keeps the generic
-  // prefixed wording.
+  // typed as a bare string and validated against the connector-runtime closed
+  // set the server keeps next to its fallback table, and a resolver installed
+  // through set_connector_runtime_resolver lives outside this repository and
+  // can raise any member of that set. The closed set has eight members, and
+  // only five have their own entry below; the other three --
+  // connector_not_found, runtime_context_immutable, and
+  // runtime_secret_not_allowed -- have no producer that can reach a terminal
+  // frame in this repository today, so they keep the generic prefixed
+  // wording. Two further connector-runtime codes are outside the closed set
+  // entirely (mcp_oauth_authorization_failed, delegated_authorization_failed):
+  // each names the outcome of an authorization check, so the server drops
+  // them before this frame is built. A code this table does not list keeps
+  // the generic prefixed wording.
   "missing_runtime_context",
   "runtime_secret_unavailable",
   "scheduled_secret_unavailable",

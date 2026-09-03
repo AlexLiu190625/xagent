@@ -9,7 +9,17 @@ task_error frame.
 from enum import StrEnum
 
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
-from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
+from ...core.tools.adapters.vibe.connector_runtime import (
+    ERROR_CONNECTOR_NOT_FOUND,
+    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+    ERROR_INVALID_RUNTIME_CONTEXT,
+    ERROR_MISSING_RUNTIME_CONTEXT,
+    ERROR_RUNTIME_CONTEXT_IMMUTABLE,
+    ERROR_RUNTIME_SECRET_NOT_ALLOWED,
+    ERROR_RUNTIME_SECRET_UNAVAILABLE,
+    ERROR_SCHEDULED_SECRET_UNAVAILABLE,
+    ConnectorRuntimeError,
+)
 
 CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
 
@@ -162,3 +172,26 @@ def connector_runtime_client_code(error: BaseException) -> str | None:
         return None
     code = error.code
     return code if isinstance(code, str) else None
+
+
+# The connector-runtime codes a terminal task_error frame may carry. Every
+# member is raised as a ``ConnectorRuntimeError`` somewhere in this
+# repository today, and none of them states who owns the task or how an
+# authorization check resolved -- the two questions a value has to answer
+# "no" to before it may reach anonymous widget and share-link visitors.
+# ``mcp_oauth_authorization_failed`` and ``delegated_authorization_failed``
+# are deliberately absent: nothing here raises them as this exception, and
+# each one is the outcome of an authorization check. Add a code here in the
+# same change that adds the raise site, never ahead of it.
+CONNECTOR_RUNTIME_CLIENT_ERROR_CODES = frozenset(
+    {
+        ERROR_CONNECTOR_NOT_FOUND,
+        ERROR_INVALID_RUNTIME_CONTEXT,
+        ERROR_MISSING_RUNTIME_CONTEXT,
+        ERROR_RUNTIME_CONTEXT_IMMUTABLE,
+        ERROR_RUNTIME_SECRET_NOT_ALLOWED,
+        ERROR_RUNTIME_SECRET_UNAVAILABLE,
+        ERROR_SCHEDULED_SECRET_UNAVAILABLE,
+        ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+    }
+)
