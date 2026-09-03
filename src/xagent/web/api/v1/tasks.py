@@ -1443,7 +1443,9 @@ async def stream_chat_task_events(
         resolve: a step whose ``step.started`` was broadcast before the
         connection existed is replayed here, so its end event arriving
         later has a start to pair with and reaches the client as
-        ``step.completed`` rather than being dropped as an orphan.
+        ``step.completed`` rather than being dropped as an orphan --
+        unless the replay's byte budget trimmed that step out of the
+        batch, which is reason (5) below.
       - The replay is bounded, and a client must not treat it as the
         task's complete history. It carries the same two caps, applied
         in the same order, that ``step.started``/``step.completed``
@@ -1461,7 +1463,7 @@ async def stream_chat_task_events(
         ``task.status`` (``"failed"``) from the failure broadcast first,
         then the watchdog's authoritative ``task.completed`` close
         frame. Delivery of every ``step.*``/``message.*`` content frame
-        on this stream is best-effort, not guaranteed, for four
+        on this stream is best-effort, not guaranteed, for five
         separate reasons: (1) closing a stream for any reason drains its
         queued backlog before inserting the close frame, so any
         already-queued frame -- a ``task.status``, a ``step.*``, a
@@ -1489,7 +1491,17 @@ async def stream_chat_task_events(
         stream's life (``_step_mapping.py``'s ``dag_execute_start``
         branch). This one is not a stream-only artifact: ``GET
         .../steps`` folds the same events and shows that step the same
-        way. (2), (3) and (4) are silent: none of them ever produces a
+        way. (5) the replay's byte budget can trim a still-running step
+        out of the batch it sends at attach time: the projector that
+        feeds the live view is still warmed from the task's whole
+        history regardless, so that step's ``step.completed`` still
+        arrives once it resolves, but this stream never sent the
+        ``step.started`` the replay would otherwise have given it, so
+        the end arrives with no start on this stream to pair with. This
+        one is a stream-only artifact, unlike (4): ``GET .../steps``
+        reads the task's full history directly and is unaffected by
+        what one stream attach's replay admitted. (2), (3), (4) and (5)
+        are silent: none of them ever produces a
         ``stream.error`` frame or any other signal on the wire. (1) is
         not silent in the same way -- the
         close frame that follows a queue-drain is often itself a
@@ -1578,8 +1590,10 @@ async def stream_chat_task_events(
         order against anything (``step.*``/``message.*`` frames are a
         separate story -- attaching mid-task replays known steps before
         going live specifically so a step's end event isn't misread as
-        an orphan; that ordering guarantee doesn't extend to
-        ``task.status``). Accepted because only the three close frames
+        an orphan, unless the replay's byte budget trimmed that step
+        out of the batch, which is reason (5) below; that ordering
+        guarantee doesn't extend to ``task.status``). Accepted because
+        only the three close frames
         above are treated as authoritative; each comes from a direct
         read of the task row, never from frame ordering.
 

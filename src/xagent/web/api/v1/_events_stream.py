@@ -2576,12 +2576,13 @@ def _build_warm_up_frames(
 
       - The byte budget keeps a *prefix* of the count-capped window (see
         ``_snapshot_steps_within_wire_budget``), so a window too heavy
-        for the budget loses its newest steps, not its oldest. Nothing
-        about those steps is lost to the client's live view: the
-        projector below is warmed from the *whole* history regardless of
-        what this batch admitted, so a still-running step trimmed here
-        still pairs correctly and still gets its ``step.completed``
-        live.
+        for the budget loses its newest steps, not its oldest. The
+        projector below is still warmed from the *whole* history
+        regardless of what this batch admitted, so a still-running step
+        trimmed here still gets its ``step.completed`` live -- but this
+        stream never sent that step's ``step.started``, so on this
+        stream that end arrives with no start to pair with. See the
+        endpoint's fifth best-effort delivery reason in ``tasks.py``.
       - The budget cutting the batch to zero steps is a legal outcome,
         not an error: the stream simply goes live with no replay. There
         is no marker frame for it and no ``stream.error``. Which steps a
