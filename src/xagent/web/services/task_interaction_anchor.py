@@ -92,8 +92,19 @@ NOT done here: narrowing this resolver's row-validity judgment would make
 it diverge from trace_handlers' for no reachable gain. Whoever does
 reconcile it must change both sides in one change, not one alone. That
 disagreement is about legacy ``checkpoint_type`` only; how a row missing
-the run-partition field is classified is settled, and settled the same way
-on both read paths (see this module's last paragraph).
+the run-partition field is classified is not settled the same way
+everywhere, and that is deliberate. This function and lease recovery's
+own resolver (``resolve_checkpoint_recovery``, ``task_lease_service.py``)
+both reclassify it off the one shared predicate -- lease recovery has no
+resumable verdict for an absent checkpoint, so its deferral still ends in
+FAILED, but neither calls the row corrupt. The by-primary-key *read*
+path (``_load_pk_anchored_checkpoint``, ``trace_handlers.py``) does not:
+it still raises ``CheckpointCorruptError`` for the same row shape,
+unchanged from its behavior before this module existed, because changing
+that verdict is a client-visible behavior change on the resume path and
+the right verdict for it depends on the ordering defect tracked in
+#2023. #2023 converges the three; this module and lease recovery do not
+wait on it.
 
 ``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED`` (``ops_signals.py``) is a
 signal owned by ``interaction_handoff``, not by this function: it is

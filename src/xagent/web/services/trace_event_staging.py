@@ -242,17 +242,25 @@ def failed_checkpoint_row_conditions(
     task's exact-row pointer names. An empty result means the row is a
     legitimate checkpoint for this ``(task_id, run_id, execution_id)``.
 
-    One definition, three readers. ``_load_pk_anchored_checkpoint``
-    (``api/trace_handlers.py``) and ``resolve_interaction_anchor``
-    (``services/task_interaction_anchor.py``) both consume it: they ask the
-    same question about the same row from opposite directions -- one decides
-    whether an already-written anchor still resolves, the other decides what
-    may be anchored to -- and an answer that differs between them is a bug
-    by construction, not a judgment call. They previously kept two
-    hand-copied disjunctions aligned through a static AST comparison; that
-    comparison could only see the operands, not how ``partition_matches``
-    was computed above them, and the two sides did in fact differ there.
-    ``_resolve_read_direction_anchor``
+    One definition, three consumers. ``_load_pk_anchored_checkpoint``
+    (``api/trace_handlers.py``), ``resolve_interaction_anchor``
+    (``services/task_interaction_anchor.py``) and lease recovery's
+    ``_candidate_row_failures`` (``services/task_lease_service.py``) all read
+    it. The first two ask the same question about the same row from opposite
+    directions -- one decides whether an already-written anchor still
+    resolves, the other decides what may be anchored to -- and an answer
+    that differs between them is a bug by construction, not a judgment call.
+    They previously kept two hand-copied disjunctions aligned through a
+    static AST comparison; that comparison could only see the operands, not
+    how ``partition_matches`` was computed above them, and the two sides did
+    in fact differ there. Lease recovery asks the same question from a third
+    direction: whether an expired lease's checkpoint pointer still names a
+    checkpoint to resume from, rather than a task to fail. Its import of
+    this function lives inside the function that calls it, not at module
+    level -- this module already imports ``task_lease_service`` for
+    ``TASK_RUN_ID_TRACE_FIELD`` and ``TaskLease``, so a module-level import
+    in the other direction is a cycle, not a style choice; do not move it to
+    the top of the file. ``_resolve_read_direction_anchor``
     (``services/task_interaction_service.py``) carries a related but not
     identical judgment and is not a caller -- see the note at the end.
 
@@ -318,8 +326,20 @@ def is_missing_run_partition_only(
     failed: frozenset[str], row_data: dict[str, Any]
 ) -> bool:
     """True when the only condition ``row_data``'s row failed is the
-    run-partition match, and it failed because the run field is absent
-    entirely rather than holding the wrong value.
+    run-partition match, and it failed because the run field reads as
+    absent rather than holding the wrong value.
+
+    "Reads as absent" is literal: this is ``row_data.get(...) is None``, so
+    a key that is missing and a key explicitly stored as JSON ``null`` are
+    the same answer here. That is deliberate rather than unnoticed. The
+    writer never stores ``null`` -- ``stage_trace_event_row`` above only
+    writes this field for a current-type checkpoint, and only from a lease
+    whose ``run_id`` it already has -- so an explicit ``null`` is a shape
+    nothing in this system produces. Distinguishing the two would put such a
+    row in the corrupt branch, which is the worse direction to fail for a
+    shape we have no evidence about; treating it as pre-existing costs at
+    most one deferral to the legacy scan, which validates the partition
+    itself.
 
     That shape is a pre-existing checkpoint row, not a corrupt one: the
     checkpoint pointer column is backfilled from the legacy event-id column
@@ -332,6 +352,12 @@ def is_missing_run_partition_only(
     is wrong in some other way as well look pre-existing; dropping the
     "absent" makes a row carrying a genuinely wrong partition look
     pre-existing. Each has its own test.
+
+    ``failed`` must be the result of ``failed_checkpoint_row_conditions``
+    called on this same ``row_data``; nothing in the signature enforces that
+    pairing. Every caller computes the two on adjacent lines from one row,
+    which is the only supported use -- passing a ``failed`` set derived from
+    a different row would produce an answer about neither.
     """
 
     return failed == {CHECKPOINT_ROW_RUN_PARTITION} and (
