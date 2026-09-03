@@ -2936,17 +2936,23 @@ async def _generate(
                 # itself is gone (row deleted) -- continuing to hand out
                 # buffered history after that would leak content the
                 # client is no longer authorized to see, or content for a
-                # task that no longer exists. So only an abortive close
-                # breaks this loop early; every other close reason is
-                # left to arrive after replay finishes, via the queue,
-                # same as it always did. See ``enqueue_close`` and
+                # task that no longer exists. An abortive close and the
+                # connection's absolute deadline are the two conditions
+                # that break this loop early; every *other* close reason
+                # is still left to arrive after replay finishes, via the
+                # queue, same as it always did. See ``enqueue_close`` and
                 # ``abortive_close`` for which reasons set it.
                 for frame_text in warm_up_frames:
                     if sink.closing and sink.abortive_close:
                         break
+                    if monotonic() >= deadline:
+                        # No close of our own needed here: the main loop
+                        # below re-evaluates the deadline on its very
+                        # first pass and enqueues ``stream_expired`` then.
+                        break
                     yield frame_text
                 # Every frame this batch holds has now either been handed
-                # off or abandoned by the abortive-close break above --
+                # off or abandoned by one of the two breaks above --
                 # either way nothing in this generator reads
                 # ``warm_up_frames`` again, but the name stays bound in
                 # this frame's locals for as long as the generator itself
