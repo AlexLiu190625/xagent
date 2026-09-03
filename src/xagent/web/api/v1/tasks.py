@@ -1376,6 +1376,8 @@ async def stream_chat_task_events(
       ``status: "running"`` for the rest of the connection: the row is
       folded twice, so it produces two public step ids, and the row's
       single end event closes only the later one. Tracked as #1776.
+      This is a defect, unlike the final-answer duplication described
+      below, which is deliberate.
       Trying to actively correlate a step id across either of these
       two live cases corrupts client state rather than merely missing a
       match. These live ids are stable within one connection and nowhere
@@ -1402,7 +1404,10 @@ async def stream_chat_task_events(
       that row. This is duplication, not loss: a client that already
       rendered the delta/completed sequence can ignore the matching
       step, or use it as the authoritative record instead, but should
-      not expect the two to be mutually exclusive.
+      not expect the two to be mutually exclusive. Unlike the
+      race-window duplication described above (tracked as #1776),
+      this one is by design on every attach, not a narrow-window
+      defect.
       A ``step.*``/``message.*`` frame whose content-bearing field would
       exceed a per-frame byte cap has that field truncated (or, for a
       step's structured ``data``, replaced) and flagged with

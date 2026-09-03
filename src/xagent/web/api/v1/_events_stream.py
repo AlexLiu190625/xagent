@@ -111,12 +111,13 @@ values it deliberately leaves unbounded, in one place:
     (``_fast_path_step_snapshot``) and the normal streaming path's
     warm-up replay (``_build_warm_up_frames``) alike:
     ``REPLAY_MAX_STEPS`` (512 steps) *and* ``MAX_SNAPSHOT_WIRE_BYTES``
-    (4 MiB of serialized frame text), the same two caps applied through
-    the same ``_snapshot_steps_within_wire_budget`` in all three places.
-    The two are applied in series, step cap first: the step cap binds
-    on a long history of ordinary steps, the byte budget (applied to
-    that already-capped window) on a short history of large ones -- 512
-    steps each carrying a ``data`` sub-object right
+    (4 MiB of serialized frame text). The step cap is written inline
+    at each of the three call sites; ``_snapshot_steps_within_wire_budget``
+    applies the byte cap alone, to whichever window the step cap
+    already produced. The two are applied in series, step cap first:
+    the step cap binds on a long history of ordinary steps, the byte
+    budget (applied to that already-capped window) on a short history
+    of large ones -- 512 steps each carrying a ``data`` sub-object right
     at the 64 KiB cap is ~32 MiB generated into one response, and these
     paths are exempt from the concurrency caps below, so nothing else
     bounds how many such responses run at once. The step cap keeps the
@@ -1370,10 +1371,13 @@ class V1EventStreamSink:
         ``finish_warm_up`` can feed it through a projector that actually
         has the pairing state to fold it correctly.
 
-        Deliberately the same cap and the same overflow policy as
-        ``_put_or_overflow`` -- ``OUTBOUND_QUEUE_MAX_SIZE``, then
-        ``resync_required`` -- rather than a second, differently-sized
-        backlog with its own failure mode. In practice this list only
+        Reuses ``_put_or_overflow``'s own count cap and overflow policy
+        -- ``OUTBOUND_QUEUE_MAX_SIZE``, then ``resync_required`` -- for
+        the constant and the rationale, not the implementation: this
+        list is a plain Python list with its own check here, not a
+        call into ``_put_or_overflow`` (which enforces the outbound
+        queue's own separate ``MAX_QUEUED_WIRE_BYTES`` bound, not this
+        one). In practice this list only
         ever holds what arrives during one warm-up read plus however
         many replay frames get yielded afterward, both bounded by how
         long that takes; hitting the cap here means the same thing
@@ -1976,11 +1980,12 @@ async def _fast_path_step_snapshot(
     instead of each one re-reading and re-projecting independently.
 
     Bounded by two caps applied in series: ``REPLAY_MAX_STEPS`` (step
-    count) first, then ``MAX_SNAPSHOT_WIRE_BYTES`` (serialized size, via
-    ``_snapshot_steps_within_wire_budget``) over that already-capped
-    window -- the same two caps, in the same order, through the same
-    function, that bound the normal streaming path's warm-up replay
-    (see ``_build_warm_up_frames``).
+    count) first, written inline here the same way the normal
+    streaming path's warm-up replay writes it (see
+    ``_build_warm_up_frames``); then ``MAX_SNAPSHOT_WIRE_BYTES``
+    (serialized size) over that already-capped window, applied by the
+    same ``_snapshot_steps_within_wire_budget`` that replay path
+    shares too.
     Without them, a fast-path
     attach to a task with an unusually long or heavy step history
     returned every step from this cached list in one shot, with no
@@ -2581,15 +2586,16 @@ def _build_warm_up_frames(
     which can differ from started_at order when a later-started step
     finishes first.
 
-    That sorted list is then bounded by the same two caps, applied by the
-    same function, that bound the attach-time fast paths' one-shot
-    snapshot: ``REPLAY_MAX_STEPS`` keeps the most recent steps, and
-    ``_snapshot_steps_within_wire_budget`` then trims that window to
-    ``MAX_SNAPSHOT_WIRE_BYTES`` of serialized frames. Sharing the
-    function is the point -- both paths emit a batch of steps with no
-    pacing of their own, so they get one rule rather than each inventing
-    its own. Two consequences follow from that shared rule and are
-    deliberate:
+    That sorted list is then bounded by the same two caps that bound
+    the attach-time fast paths' one-shot snapshot, in the same order:
+    ``REPLAY_MAX_STEPS`` keeps the most recent steps, written inline
+    here just as it is at the fast path's own call site; then
+    ``_snapshot_steps_within_wire_budget`` -- the one function both
+    paths share -- trims that window to ``MAX_SNAPSHOT_WIRE_BYTES`` of
+    serialized frames. Sharing that function is the point -- both
+    paths emit a batch of steps with no pacing of their own, so the
+    byte cap gets one rule rather than each inventing its own. Two
+    consequences follow from that shared rule and are deliberate:
 
       - The byte budget keeps a *prefix* of the count-capped window (see
         ``_snapshot_steps_within_wire_budget``), so a window too heavy
@@ -2632,6 +2638,11 @@ def _build_warm_up_frames(
         for event in steps_snapshot.events
         if _event_row_id(event) <= replay_watermark
     ]
+    # ``from_history`` feeds every event straight into a fresh
+    # projector with none of ``_feed_trace_event``'s three guards (the
+    # delegated-child-agent source check, the ``task_info``
+    # short-circuit, the audit-only-data drop) -- the same
+    # live-vs-batch equivalence gap already tracked as #1405.
     warmed_projector = PublicStepProjector.from_history(events)
     steps = warmed_projector.take_materialized_steps()
     steps.sort(key=lambda step: step["started_at"])
