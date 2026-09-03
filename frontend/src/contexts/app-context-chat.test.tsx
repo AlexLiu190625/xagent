@@ -5744,13 +5744,19 @@ describe("terminal error frames", () => {
   })
 
   // The waiting half. A refused resume arrives on the root "error" type
-  // carrying the task's real current status (websocket.py:8935 builds it from
-  // TaskControlSnapshot). The question the user still has to answer lives on
-  // the panel's virtual bubble, which a flagged rejection would remove.
+  // carrying the task's real current status (built from TaskControlSnapshot
+  // in websocket.py's _handle_resume_task_unserialized, near where
+  // resume_control_state is assembled -- that function is long, so look for
+  // the assignment rather than a fixed offset). The question the user still
+  // has to answer lives on the panel's virtual bubble, which a flagged
+  // rejection would remove.
   // The fixture below combines fields from two producers: `task` comes from
-  // the resume-refusal path (websocket.py:8935), `error_code` comes from the
-  // pause-refusal path (websocket.py:8491). Neither path emits both fields
-  // together today; each field is genuinely emitted by its own path.
+  // the resume-refusal branch, websocket.py's
+  // _handle_resume_task_unserialized; `error_code` comes from the
+  // pause-refusal branch, websocket.py's handle_pause_task, near its
+  // ClientErrorCode.MESSAGE_PROCESSING_FAILED fallback. Neither path emits
+  // both fields together today; each field is genuinely emitted by its own
+  // path.
   // Carrying `task` drives the reducer's preservation branch (it is what
   // makes `UPDATE_TASK_STATUS` dispatch at all) -- without it the assertions
   // below would pass vacuously instead of exercising that branch.
