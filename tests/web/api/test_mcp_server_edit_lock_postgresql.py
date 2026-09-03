@@ -21,9 +21,12 @@ helper the other ``*_postgresql.py`` suites in this repo use, rather than
 opening a hand-rolled connection. That helper reads
 ``XAGENT_TEST_POSTGRES_URL`` and skips the whole module when it is unset.
 
-Also covers the caller's own ``UserMCPServer`` link row being revoked --
-deleted, or stripped of ownership -- by a second connection while the
-route holds the definition row locked.
+Also covers the caller's own permission inputs being revoked by a second
+connection while the route holds the definition row locked: the
+``UserMCPServer`` link row deleted or stripped of ownership, and the
+caller's ``User.is_admin`` flag cleared. Those two values are what
+``_check_mcp_permission`` reads, and the route re-derives both after the
+lock rather than answering from what it read before the wait.
 """
 
 from __future__ import annotations
@@ -576,8 +579,10 @@ def test_a_user_env_only_edit_on_a_server_with_a_global_env_does_not_take_the_lo
     db = rr_factory()
     real_query = db.query
     committed = threading.Event()
+    queried_entities: list[tuple] = []
 
     def commit_a_definition_edit_when_the_definition_query_starts(*entities, **kwargs):
+        queried_entities.append(entities)
         if entities == (MCPServer,) and not committed.is_set():
             committed.set()
             with default_factory() as other:
@@ -601,6 +606,12 @@ def test_a_user_env_only_edit_on_a_server_with_a_global_env_does_not_take_the_lo
         db.close()
 
     assert committed.is_set(), "the concurrent definition edit never ran"
+    assert queried_entities[:2] == [(UserMCPServer, MCPServer), (MCPServer,)], (
+        "the concurrent commit must land after the access read's own read and "
+        "before this route's definition read; otherwise this test is not "
+        "exercising the window it claims to -- saw "
+        f"{queried_entities!r}"
+    )
     assert response is not None
 
     with default_factory() as fresh:
@@ -714,8 +725,10 @@ def test_an_is_active_only_edit_on_a_server_with_concurrent_tools_null_does_not_
     db = rr_factory()
     real_query = db.query
     committed = threading.Event()
+    queried_entities: list[tuple] = []
 
     def commit_a_definition_edit_when_the_definition_query_starts(*entities, **kwargs):
+        queried_entities.append(entities)
         if entities == (MCPServer,) and not committed.is_set():
             committed.set()
             with default_factory() as other:
@@ -739,6 +752,12 @@ def test_an_is_active_only_edit_on_a_server_with_concurrent_tools_null_does_not_
         db.close()
 
     assert committed.is_set(), "the concurrent definition edit never ran"
+    assert queried_entities[:2] == [(UserMCPServer, MCPServer), (MCPServer,)], (
+        "the concurrent commit must land after the access read's own read and "
+        "before this route's definition read; otherwise this test is not "
+        "exercising the window it claims to -- saw "
+        f"{queried_entities!r}"
+    )
     assert response.is_active is False
 
     with default_factory() as fresh:
@@ -833,8 +852,10 @@ def test_a_user_env_only_edit_on_a_server_with_restart_policy_always_does_not_ta
     db = rr_factory()
     real_query = db.query
     committed = threading.Event()
+    queried_entities: list[tuple] = []
 
     def commit_a_definition_edit_when_the_definition_query_starts(*entities, **kwargs):
+        queried_entities.append(entities)
         if entities == (MCPServer,) and not committed.is_set():
             committed.set()
             with default_factory() as other:
@@ -858,6 +879,12 @@ def test_a_user_env_only_edit_on_a_server_with_restart_policy_always_does_not_ta
         db.close()
 
     assert committed.is_set(), "the concurrent definition edit never ran"
+    assert queried_entities[:2] == [(UserMCPServer, MCPServer), (MCPServer,)], (
+        "the concurrent commit must land after the access read's own read and "
+        "before this route's definition read; otherwise this test is not "
+        "exercising the window it claims to -- saw "
+        f"{queried_entities!r}"
+    )
     assert response is not None
 
     with default_factory() as fresh:
@@ -1079,5 +1106,144 @@ def test_a_put_whose_association_is_revoked_after_the_lock_is_refused_with_no_sh
     with session_factory() as fresh:
         row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
         assert row.name == "edit-lock-target", (
+            "the shared definition row must be untouched by a refused edit"
+        )
+
+
+def test_a_put_whose_admin_flag_is_revoked_after_the_lock_is_refused_with_no_shared_write(
+    session_factory,
+) -> None:
+    """The other half of the post-lock permission re-derivation. A caller
+    who is an admin but not the server's owner passes the gate on admin
+    status alone; a second connection can strip that status and commit
+    while this route is still waiting on, or already holding, the
+    definition-row lock. ``_check_mcp_permission`` reads exactly two
+    things -- the link row's ``is_owner`` and the caller's ``is_admin`` --
+    so re-reading only the link row after the lock leaves this half
+    answering from the pre-wait value the auth dependency fixed.
+
+    Both inputs are re-read now, and this pins the second one: a rename
+    from a caller whose admin flag was revoked during the wait must be
+    refused by the route's existing owner-only guard, commit nothing, and
+    leave the shared row's name alone.
+
+    The revocation fires on the route's ``User`` read, which exists only
+    after the lock -- this suite calls the route function directly, so no
+    auth dependency has read a ``User`` on this session beforehand. The
+    recorded sequence is filtered to the four statements under test
+    (``DatabaseMCPServerManager`` may issue queries of its own).
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    with session_factory() as db:
+        owner = User(
+            username="mcp-admin-revoke-owner", password_hash="x", is_admin=False
+        )
+        admin = User(
+            username="mcp-admin-revoke-admin", password_hash="x", is_admin=True
+        )
+        db.add_all([owner, admin])
+        db.flush()
+        server = MCPServer(
+            name="admin-revoke-target",
+            transport="stdio",
+            managed="external",
+            command="true",
+            concurrent_tools=[],
+        )
+        db.add(server)
+        db.flush()
+        db.add_all(
+            [
+                UserMCPServer(
+                    user_id=int(owner.id),
+                    mcpserver_id=int(server.id),
+                    is_owner=True,
+                    is_active=True,
+                ),
+                # The admin's own link row: not the owner. Before the
+                # revocation their edit rights come from ``is_admin``
+                # alone, which is exactly the value under test.
+                UserMCPServer(
+                    user_id=int(admin.id),
+                    mcpserver_id=int(server.id),
+                    is_owner=False,
+                    is_active=True,
+                ),
+            ]
+        )
+        db.commit()
+        admin_id, server_id = int(admin.id), int(server.id)
+
+    current_user = SimpleNamespace(id=admin_id, is_admin=True)
+
+    db = session_factory()
+    real_query = db.query
+    real_commit = db.commit
+    revoked_already = threading.Event()
+    queried_entities: list[tuple] = []
+    tracked_keys = {
+        (UserMCPServer, MCPServer),
+        (MCPServer,),
+        (UserMCPServer,),
+        (User,),
+    }
+    commits: list[str] = []
+
+    def revoke_admin_when_the_admin_read_starts(*entities, **kwargs):
+        if entities in tracked_keys:
+            queried_entities.append(entities)
+        if entities == (User,) and not revoked_already.is_set():
+            revoked_already.set()
+            with session_factory() as other:
+                other.execute(
+                    sa.update(User).where(User.id == admin_id).values(is_admin=False)
+                )
+                other.commit()
+        return real_query(*entities, **kwargs)
+
+    def record_commit():
+        commits.append("commit")
+        return real_commit()
+
+    db.query = revoke_admin_when_the_admin_read_starts
+    db.commit = record_commit
+    try:
+        with pytest.raises(HTTPException) as exc:
+            mcp_api.update_mcp_server(
+                server_id,
+                MCPServerUpdate(name="renamed-after-admin-revocation"),
+                current_user=current_user,
+                db=db,
+            )
+        assert exc.value.status_code == 403
+        assert revoked_already.is_set(), "the concurrent revocation never ran"
+        assert queried_entities[:4] == [
+            (UserMCPServer, MCPServer),
+            (MCPServer,),
+            (UserMCPServer,),
+            (User,),
+        ], (
+            "the concurrent revocation must land after the gate's own read, "
+            "after the lock statement and after the link re-read, and be "
+            "caught by the admin re-read that follows them -- otherwise the "
+            "403 under test could be the gate's rather than the re-read's -- "
+            f"saw {queried_entities!r}"
+        )
+        assert (
+            exc.value.detail
+            == "Only the server owner can change the shared configuration"
+        ), (
+            "the refusal must come from the route's existing owner-only "
+            f"guard, not a new error shape -- saw {exc.value.detail!r}"
+        )
+        assert commits == [], "the refused edit must commit nothing"
+    finally:
+        db.close()
+
+    with session_factory() as fresh:
+        row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert row.name == "admin-revoke-target", (
             "the shared definition row must be untouched by a refused edit"
         )
