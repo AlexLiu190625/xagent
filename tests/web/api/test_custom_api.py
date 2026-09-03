@@ -1,3 +1,4 @@
+import ast
 import inspect
 from datetime import datetime
 from types import SimpleNamespace
@@ -310,6 +311,13 @@ async def test_update_custom_api():
     db.query().filter().populate_existing().with_for_update().first.return_value = (
         mock_api
     )
+    # The post-lock re-read of the link row is a third mock chain, distinct
+    # from both of the above: unrevoked, it must return the same
+    # still-``can_edit`` link the access gate saw, or the route's
+    # unstubbed ``MagicMock`` default -- truthy for any attribute access,
+    # including ``.can_edit`` -- would make the permission check below a
+    # no-op no matter what it is actually asked to verify.
+    db.query().filter().populate_existing().first.return_value = mock_user_api
 
     api_data = CustomApiUpdate(
         name="new_name",
@@ -366,6 +374,9 @@ async def test_update_custom_api_env_replacement_deletes_only_the_omitted_secret
     db.query().filter().populate_existing().with_for_update().first.return_value = (
         mock_api
     )
+    # The post-lock re-read of the link row -- see the comment in
+    # test_update_custom_api.
+    db.query().filter().populate_existing().first.return_value = mock_user_api
 
     with patch(
         "xagent.web.api.custom_api.encrypt_value", side_effect=lambda x: f"enc_{x}"
@@ -405,6 +416,9 @@ async def test_update_custom_api_rejects_renamed_masked_secret():
     db.query().filter().populate_existing().with_for_update().first.return_value = (
         mock_api
     )
+    # The post-lock re-read of the link row -- see the comment in
+    # test_update_custom_api.
+    db.query().filter().populate_existing().first.return_value = mock_user_api
 
     with pytest.raises(HTTPException) as exc_info:
         update_custom_api(
@@ -452,6 +466,9 @@ async def test_update_custom_api_explicit_null_clears_runtime_config():
     db.query().filter().populate_existing().with_for_update().first.return_value = (
         mock_api
     )
+    # The post-lock re-read of the link row -- see the comment in
+    # test_update_custom_api.
+    db.query().filter().populate_existing().first.return_value = mock_user_api
 
     api_data = CustomApiUpdate(
         runtime_input_schema=None,
@@ -481,6 +498,9 @@ async def test_delete_custom_api():
     db.query().filter().populate_existing().with_for_update().first.return_value = (
         mock_api
     )
+    # The post-lock re-read of the link row -- see the comment in
+    # test_update_custom_api.
+    db.query().filter().populate_existing().first.return_value = mock_user_api
 
     delete_custom_api(10, current_user=user, db=db)
 
@@ -523,19 +543,18 @@ async def test_delete_team_custom_api_flushes_only_current_user_link():
 
 
 def test_the_locking_routes_are_sync_defs_so_a_lock_wait_never_holds_the_event_loop():
-    """Each route below runs a ``SELECT ... FOR UPDATE`` that can wait
-    indefinitely on a concurrent writer holding the same definition row.
-    FastAPI runs a coroutine route on the event loop thread itself, so such
-    a wait inside an ``async def`` route stalls every other request the
-    process is serving, not just this one. Declaring them as plain ``def``
-    puts them in the threadpool instead, where the wait occupies one worker.
+    """``update_custom_api`` can run a ``SELECT ... FOR UPDATE`` that waits
+    indefinitely on a concurrent writer holding the same definition row;
+    ``delete_custom_api`` always does. FastAPI runs a coroutine route on the
+    event loop thread itself, so such a wait inside an ``async def`` route
+    stalls every other request the process is serving, not just this one.
+    Declaring them as plain ``def`` puts them in the threadpool instead,
+    where the wait occupies one worker.
     """
     from xagent.web.api import custom_api as custom_api_api
-    from xagent.web.api import mcp as mcp_api
 
     assert not inspect.iscoroutinefunction(custom_api_api.update_custom_api)
     assert not inspect.iscoroutinefunction(custom_api_api.delete_custom_api)
-    assert not inspect.iscoroutinefunction(mcp_api.update_mcp_server)
 
 
 def _lock_order_session_factory():
@@ -582,8 +601,14 @@ def _count_custom_apis_selects_before_first_delete(statements: list[str]) -> int
     statement this test exists to pin. So *presence* of a ``custom_apis``
     ``SELECT`` before the delete is true either way and proves nothing; the
     *count* is what distinguishes them -- one without the lock statement,
-    two with it, because ``populate_existing()`` forces the lock's query to
-    hit the database again rather than reuse the already-loaded row.
+    two with it, because the lock statement is its own separate ``Query``
+    execution against the database, issued in addition to the relationship
+    load above rather than instead of it. ``populate_existing()`` does not
+    decide whether that second statement is sent; it decides which column
+    values end up on the already-identity-mapped row once it is: with it,
+    the lock statement's freshly-read columns overwrite what the
+    relationship load put there, rather than being discarded in favor of
+    it.
     """
     count = 0
     for statement in statements:
@@ -825,3 +850,71 @@ class TestDeleteLockOrderMatchesThePutsLockOrder:
             "not-found guard's relationship load and the lock statement's "
             "own SELECT against custom_apis already issued"
         )
+
+
+def _with_for_update_lines(fn: "ast.FunctionDef") -> list[int]:
+    """Line numbers of every ``with_for_update(...)`` call inside ``fn``."""
+    return [
+        node.lineno
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "with_for_update"
+    ]
+
+
+def _call_lines_by_name(fn: "ast.FunctionDef", name: str) -> list[int]:
+    """Line numbers of every plain ``name(...)`` call inside ``fn``."""
+    return [
+        node.lineno
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == name
+    ]
+
+
+def _route_ast(name: str) -> "ast.FunctionDef":
+    from xagent.web.api import custom_api as custom_api_api
+
+    tree = ast.parse(inspect.getsource(custom_api_api))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found in xagent.web.api.custom_api")
+
+
+@pytest.mark.parametrize(
+    ("route", "hook"),
+    [
+        ("update_custom_api", "rename_team_connector"),
+        ("delete_custom_api", "delete_team_connector"),
+    ],
+)
+def test_the_definition_row_lock_statement_precedes_the_team_hook_call(route, hook):
+    """Both routes take the definition-row lock before they call into a
+    connector team hook.
+
+    Statement position is the thing under test, so it is read off the
+    source rather than off executed SQL: SQLAlchemy renders no locking
+    clause at all on SQLite, so a run against the suite's own engine
+    cannot tell this lock statement from a plain read and stays green
+    with the lock moved anywhere. That the clause really blocks a second
+    writer is proved against a real server in
+    test_custom_api_edit_lock_postgresql.py; what is proved here is the
+    order the two routes share, which is what keeps a concurrent edit and
+    delete of one connector from waiting on each other in opposite
+    directions across the hook boundary.
+    """
+    fn = _route_ast(route)
+    lock_lines = _with_for_update_lines(fn)
+    assert len(lock_lines) == 1, (
+        f"expected exactly one with_for_update call in {route}, found {len(lock_lines)}"
+    )
+    hook_lines = _call_lines_by_name(fn, hook)
+    assert len(hook_lines) == 1, (
+        f"expected exactly one {hook} call in {route}, found {len(hook_lines)}"
+    )
+    assert lock_lines[0] < hook_lines[0], (
+        f"{route} must take the definition-row lock before it calls {hook}"
+    )

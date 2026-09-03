@@ -333,6 +333,11 @@ def update_custom_api(
     # cases that did not need it and skips it in none that do.
     fields_set = api_data.model_fields_set
     writes_definition_row = bool(fields_set - {"is_active"})
+    # This flag also gates the post-lock re-read of the caller's link row
+    # further down, not only the lock itself: adding a future field to the
+    # ``{"is_active"}`` exclusion set above -- because it too writes only
+    # the link row -- would silently skip that re-authorization as well,
+    # not just the lock, for any payload that sets only that field.
 
     # A fresh single-table read of the definition row, on both paths. The
     # read above comes through the personal link row's relationship and
@@ -373,7 +378,11 @@ def update_custom_api(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Custom API not found",
         )
-    api = current_api
+    # Declared as ``Any`` from here on, for mypy's sake: the column-typed
+    # attributes below (name, description, env, ...) are all mutated
+    # directly by this route, which mypy rejects against the ORM's declared
+    # column types.
+    api = cast(Any, current_api)
 
     if writes_definition_row:
         # The access gate above ran before the lock statement; the lock
@@ -436,12 +445,6 @@ def update_custom_api(
     # renamer's selectors dangling with no error.
     old_name = str(api.name)
 
-    # The row's declared type from here on is loosened for mypy's sake: the
-    # column-typed attributes below (name, description, env, ...) are all
-    # mutated directly by this route, exactly as they were when this local
-    # came off the relationship instead of off the definition query above.
-    mutable_api = cast(Any, api)
-
     # Check name uniqueness if name is changed
     if api_data.name and api_data.name != api.name:
         existing = db.query(CustomApi).filter(CustomApi.name == api_data.name).first()
@@ -450,25 +453,23 @@ def update_custom_api(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Custom API with name '{api_data.name}' already exists",
             )
-        mutable_api.name = api_data.name
+        api.name = api_data.name
 
     # Update fields
     if api_data.description is not None:
-        mutable_api.description = api_data.description
+        api.description = api_data.description
     if api_data.url is not None:
-        mutable_api.url = api_data.url
+        api.url = api_data.url
     if api_data.method is not None:
-        mutable_api.method = api_data.method
+        api.method = api_data.method
     if api_data.headers is not None:
-        mutable_api.headers = api_data.headers
+        api.headers = api_data.headers
     if api_data.body is not None:
-        mutable_api.body = api_data.body
+        api.body = api_data.body
 
     # Process env variables
     if api_data.env is not None:
-        existing_env: Dict[str, str] = (
-            mutable_api.env if isinstance(api.env, dict) else {}
-        )
+        existing_env: Dict[str, str] = api.env if isinstance(api.env, dict) else {}
         try:
             processed_env = _process_env_vars(api_data.env, existing_env)
         except ValueError as exc:
@@ -476,7 +477,7 @@ def update_custom_api(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid environment variables: {exc}",
             ) from exc
-        mutable_api.env = processed_env
+        api.env = processed_env
 
     runtime_input_schema = (
         api_data.runtime_input_schema
@@ -499,7 +500,7 @@ def update_custom_api(
             runtime_input_schema=runtime_input_schema,
             runtime_bindings=runtime_bindings,
             allow_delegated_authorization=allow_delegated_authorization,
-            static_headers=mutable_api.headers,
+            static_headers=api.headers,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -507,11 +508,11 @@ def update_custom_api(
             detail=f"Invalid runtime configuration: {exc}",
         ) from exc
     if "runtime_input_schema" in fields_set:
-        mutable_api.runtime_input_schema = runtime_input_schema
+        api.runtime_input_schema = runtime_input_schema
     if "runtime_bindings" in fields_set:
-        mutable_api.runtime_bindings = runtime_bindings
+        api.runtime_bindings = runtime_bindings
     if "allow_delegated_authorization" in fields_set:
-        mutable_api.allow_delegated_authorization = allow_delegated_authorization
+        api.allow_delegated_authorization = allow_delegated_authorization
 
     from ..services.connector_team_scope import rename_team_connector
 
@@ -575,12 +576,14 @@ def delete_custom_api(
     # hook instead, the two routes waited in opposite directions across that
     # boundary and a concurrent edit/delete pair on the same connector could
     # deadlock (PostgreSQL 40P01, surfacing to the caller as HTTP 500).
-    # ``populate_existing`` matches the PUT's own lock: the row this
-    # transaction holds is the one the deletion below acts on, not whatever
-    # the relationship read above happened to see. This is also a fresh
-    # statement, so a row deleted between the access read above and here
-    # still yields None (handled as the same 404) rather than reaching
-    # ``db.delete`` with nothing to delete.
+    # ``populate_existing`` matches the PUT's own lock: it is the same
+    # identity-mapped instance the relationship read above returned, with
+    # its column values overwritten by whatever this statement reads under
+    # the lock, so the deletion below acts on this transaction's own view
+    # of the row rather than a snapshot from before the lock was taken.
+    # This is also a fresh statement, so a row deleted between the access
+    # read above and here still yields None (handled as the same 404)
+    # rather than reaching ``db.delete`` with nothing to delete.
     #
     # Two costs come with taking it here rather than last. The two 403
     # refusals below read ``delete_team_connector``'s answer and so now
@@ -589,6 +592,19 @@ def delete_custom_api(
     # propagates out and the request's session is closed without
     # committing. And the hook's own work now runs inside the lock, so this
     # route holds the row for longer than it did with the lock last.
+    #
+    # On the success path, a hook that calls a helper which ends this
+    # session's own transaction -- ``release_db_connection_if_clean``
+    # (``models/database.py``) is the one this repository has -- releases
+    # this lock without the route ever knowing: at this point in the route
+    # the session has run nothing but ``SELECT``s, which is exactly the
+    # condition that helper treats as safe to roll back, so it takes the
+    # rollback branch, raises nothing, and the route carries on to delete
+    # and commit believing it still holds the row it locked above. A hook
+    # that raises instead is not this case: the exception propagates out of
+    # this route unhandled, so the request is aborted rather than
+    # continuing to commit, and the transaction's own rollback on session
+    # close is the ordinary way this lock is released.
     #
     # What this statement orders is this route against ``update_custom_api``
     # on the same connector. A PUT that writes the definition row cannot
@@ -640,8 +656,12 @@ def delete_custom_api(
     # commit. ``populate_existing()`` on the lock statement above refreshes
     # the definition row only, so the link row needs this separate
     # statement; the object it returns replaces ``user_api`` for the
-    # team-owned branch's own ``db.delete``. Same order and same answers as
-    # the gate: gone is a 404, present but no longer permitted is a 403.
+    # team-owned branch's own ``db.delete``. A revocation that commits
+    # after this statement is the window this route had before it took any
+    # lock at all: in-process, with no wait in it. Closing that one needs
+    # the authorization fence designed for the team-edit changes and is
+    # not attempted here. Same order and same answers as the gate: gone is
+    # a 404, present but no longer permitted is a 403.
     current_user_api = (
         db.query(UserCustomApi)
         .filter(

@@ -16,12 +16,7 @@ the edit route and the delete route each -- the companion path where the
 row vanishes between the route's first read and this lock. The delete
 route's version of that path additionally pins where the lock sits
 relative to ``delete_team_connector``: it is taken first, so a vanished
-row is refused before the hook is called at all. Mirrors
-test_mcp_server_edit_lock_postgresql.py's structure for the MCP side of
-the edit lock. The MCP side's delete route takes no such
-lock and needs none: it commits its link-row deletion before it goes near
-the definition row, so it never holds both rows in one transaction and
-cannot form the cycle the ordering lock here exists to rule out.
+row is refused before the hook is called at all.
 
 Obtains its database through ``tests/shared/postgres_disposable.py``
 (``disposable_database_factory``), the same disposable-CREATE-DATABASE
@@ -168,12 +163,18 @@ def test_a_second_editor_blocks_until_the_first_editors_transaction_finishes(
             # on the database at this point. If the lock were not real (or
             # a no-op, as on SQLite), the second call would sail through
             # almost immediately and this would flip to True.
-            assert not second_finished.wait(timeout=1.0), (
-                "the second editor finished before the first one released "
-                "the row -- the lock did not actually block it"
-            )
-
-            release_lock.set()
+            # Released in ``finally`` before anything is asserted: a
+            # failure here means the second editor is still parked on the
+            # first editor's lock, and leaving the first editor paused
+            # would hang this executor's shutdown instead of failing the
+            # test.
+            try:
+                assert not second_finished.wait(timeout=1.0), (
+                    "the second editor finished before the first one "
+                    "released the row -- the lock did not actually block it"
+                )
+            finally:
+                release_lock.set()
             first.result(timeout=10)
             second.result(timeout=10)
 
@@ -281,11 +282,15 @@ def test_the_second_editors_rename_reports_the_first_editors_committed_name_as_o
             )
 
             second = executor.submit(run_second)
-            assert not second_finished.wait(timeout=1.0), (
-                "the second editor finished before the first one released the row"
-            )
-
-            release_lock.set()
+            # Released in ``finally`` before anything is asserted -- see
+            # the comment in
+            # test_a_second_editor_blocks_until_the_first_editors_transaction_finishes.
+            try:
+                assert not second_finished.wait(timeout=1.0), (
+                    "the second editor finished before the first one released the row"
+                )
+            finally:
+                release_lock.set()
             first.result(timeout=10)
             second.result(timeout=10)
 
@@ -332,7 +337,9 @@ def test_a_row_that_vanishes_after_the_gate_but_before_the_lock_is_a_404_not_a_5
     access read above asks for ``UserCustomApi``, and reaches the
     definition row through its relationship rather than through
     ``query``), so the wrapper can recognise the lock query and nothing
-    else.
+    else. The recorded entity sequence is asserted rather than assumed, so
+    this test cannot quietly pass on a 404 raised by the access gate
+    instead of by the lock.
     """
     import xagent.web.api.custom_api as custom_api_api
     from xagent.web.api.custom_api import CustomApiUpdate
@@ -343,8 +350,10 @@ def test_a_row_that_vanishes_after_the_gate_but_before_the_lock_is_a_404_not_a_5
     db = session_factory()
     real_query = db.query
     deleted_already = threading.Event()
+    queried_entities: list[tuple] = []
 
     def delete_the_row_when_the_lock_query_starts(*entities, **kwargs):
+        queried_entities.append(entities)
         if entities == (CustomApi,) and not deleted_already.is_set():
             deleted_already.set()
             with session_factory() as other:
@@ -368,6 +377,12 @@ def test_a_row_that_vanishes_after_the_gate_but_before_the_lock_is_a_404_not_a_5
             )
         assert deleted_already.is_set(), "the concurrent delete never ran"
         assert exc.value.status_code == 404
+        assert queried_entities[:2] == [(UserCustomApi,), (CustomApi,)], (
+            "the concurrent delete must land after the access gate's own "
+            "read and before the lock; otherwise the 404 under test could "
+            f"be the access gate's rather than the lock's -- saw "
+            f"{queried_entities!r}"
+        )
     finally:
         db.close()
 
@@ -445,12 +460,16 @@ def test_a_delete_blocks_until_a_concurrent_edits_transaction_finishes(
             # of rows in opposite orders (or if either lock were a no-op,
             # as on SQLite), the delete would sail through almost
             # immediately and this would flip to True.
-            assert not second_finished.wait(timeout=1.0), (
-                "the delete finished before the concurrent editor released "
-                "the row -- the lock did not actually block it"
-            )
-
-            release_lock.set()
+            # Released in ``finally`` before anything is asserted -- see
+            # the comment in
+            # test_a_second_editor_blocks_until_the_first_editors_transaction_finishes.
+            try:
+                assert not second_finished.wait(timeout=1.0), (
+                    "the delete finished before the concurrent editor "
+                    "released the row -- the lock did not actually block it"
+                )
+            finally:
+                release_lock.set()
             editor.result(timeout=10)
             deleter.result(timeout=10)
 
