@@ -404,19 +404,67 @@ class DatabaseTraceHandler(BaseTraceHandler):
         finally:
             db.close()
 
+    def _task_has_run_tagged_checkpoint(self, db: Session) -> bool:
+        """Probe whether any readable checkpoint row for this task carries
+        the run-tag field (``_task_run_id`` is not null).
+
+        A DB failure while probing must not collapse into "no tagged row
+        found" -- that would silently widen the read partition instead of
+        surfacing the read as incomplete. Callers rely on this raising
+        ``CheckpointUnavailableError`` rather than returning a false
+        negative.
+        """
+        try:
+            return (
+                db.query(DatabaseTraceEvent.id)
+                .filter(
+                    DatabaseTraceEvent.task_id == self.task_id,
+                    DatabaseTraceEvent.build_id.is_(None),
+                    DatabaseTraceEvent.event_type == "system_update_general",
+                    DatabaseTraceEvent.data["checkpoint_type"]
+                    .as_string()
+                    .in_(sorted(READABLE_CHECKPOINT_TYPES)),
+                    DatabaseTraceEvent.data[TASK_RUN_ID_TRACE_FIELD]
+                    .as_string()
+                    .is_not(None),
+                )
+                .first()
+                is not None
+            )
+        except Exception as exc:
+            raise CheckpointUnavailableError(
+                f"task {self.task_id}: could not determine whether a "
+                "run-tagged checkpoint exists"
+            ) from exc
+
     def _root_checkpoint_read_partition(
         self,
         db: Session,
     ) -> str | None:
         """Resolve the run partition this reader may read, or refuse.
 
-        Exact executions read only checkpoints tagged with their bound run.
-        Legacy callers can read only untagged rows, and only while the task
-        has no active run and no run has ever been tagged. Build-scoped
-        checkpoints retain their historical build-only partitioning and do
-        not call this helper. A refusal means the checkpoint may exist but
-        this reader is not authoritative for it right now -- distinct from
-        a query that completed and found nothing.
+        Exact executions bound to a lease read the partition tagged with
+        their bound run -- but only once the task has a tagged checkpoint
+        row on record at all. A resume mints a fresh run id before any
+        checkpoint has been written under it, so a lease-bound reader whose
+        task has no tagged row yet (from any run) falls back to the legacy
+        (untagged) partition instead of refusing: this is what lets a
+        resume read the checkpoint that was written before partitioning
+        existed, under the task's previous (unminted) run. The widening is
+        self-extinguishing -- the first checkpoint written under the newly
+        minted run tags the task, and the probe below starts returning
+        ``True`` for this task from then on.
+
+        Legacy (unleased) callers can read only untagged rows, and only
+        while the task has no active run and no run has ever been tagged.
+        Build-scoped checkpoints retain their historical build-only
+        partitioning and do not call this helper.
+
+        A refusal means the checkpoint may exist but this reader is not
+        authoritative for it right now -- distinct from a query that
+        completed and found nothing. A failure to determine any of the
+        above (the tag probe raising) is distinct from both: it means the
+        partition could not be resolved at all.
         """
 
         lease = current_task_lease()
@@ -426,7 +474,13 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     f"task {self.task_id}: active lease is not bound to this reader",
                     reason="lease_mismatch",
                 )
-            return lease.run_id
+            if self._task_has_run_tagged_checkpoint(db):
+                return lease.run_id
+            # This task has no run-tagged checkpoint yet -- most likely the
+            # bound run was just minted by a resume and the only checkpoint
+            # on record predates partitioning. Widen to the legacy partition
+            # so it stays readable instead of refusing on a technicality.
+            return None
 
         task_run = db.query(Task.run_id).filter(Task.id == self.task_id).one_or_none()
         if task_run is None:
@@ -445,23 +499,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 "a different lease",
                 reason="active_run",
             )
-        tagged_checkpoint_exists = (
-            db.query(DatabaseTraceEvent.id)
-            .filter(
-                DatabaseTraceEvent.task_id == self.task_id,
-                DatabaseTraceEvent.build_id.is_(None),
-                DatabaseTraceEvent.event_type == "system_update_general",
-                DatabaseTraceEvent.data["checkpoint_type"]
-                .as_string()
-                .in_(sorted(READABLE_CHECKPOINT_TYPES)),
-                DatabaseTraceEvent.data[TASK_RUN_ID_TRACE_FIELD]
-                .as_string()
-                .is_not(None),
-            )
-            .first()
-            is not None
-        )
-        if tagged_checkpoint_exists:
+        if self._task_has_run_tagged_checkpoint(db):
             # Positive proof a checkpoint exists in a partition this legacy
             # reader is not allowed to read -- a refusal, not an absence.
             raise CheckpointAccessRefusedError(
