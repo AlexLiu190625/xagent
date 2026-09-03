@@ -2544,16 +2544,8 @@ def _event_row_id(event: Any) -> int:
     exposed to clients as part of a public step's derived id) --
     ``id`` is ``TraceEvent.id``, the same column
     ``_load_task_steps_version_snapshot``'s ``SELECT max(...)`` reads.
-    Duck-typed the same way ``_step_mapping.py``'s own accessors are,
-    so this works against both a real ``_TraceEventSnapshot`` (attribute
-    access) and a dict-shaped test double (mapping access).
     """
-    value = getattr(event, "id", None)
-    if value is None and isinstance(event, dict):
-        value = event.get("id")
-    if value is None:
-        raise TypeError(f"event has no 'id' to filter by: {event!r}")
-    return int(value)
+    return int(event.id)
 
 
 def _build_warm_up_frames(
@@ -2943,7 +2935,7 @@ async def _generate(
                 # queue, same as it always did. See ``enqueue_close`` and
                 # ``abortive_close`` for which reasons set it.
                 for frame_text in warm_up_frames:
-                    if sink.closing and sink.abortive_close:
+                    if sink.abortive_close:
                         break
                     if monotonic() >= deadline:
                         # No close of our own needed here: the main loop
