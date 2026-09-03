@@ -17,7 +17,6 @@ from ...context.enrichment import (
     SELECTED_SKILL_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
     enrich_context_with_memory,
-    latest_user_text,
 )
 from ...context.skill_tool import (
     LOAD_SKILL_TOOL_NAME,
@@ -490,10 +489,10 @@ class AutoPattern(AgentPattern):
         final_answer_stream: FinalAnswerStreamSession | None = None
         if self.decision is None:
             self.status = "deciding"
-            task_text = latest_user_text(context)
+            memory_text = context.current_user_request_text(prefer_display=True)
             await enrich_context_with_memory(
                 context=context,
-                query=task_text,
+                query=memory_text,
                 category="react_memory",
                 memory_store=memory_store,
                 runtime=runtime,
@@ -763,9 +762,21 @@ class AutoPattern(AgentPattern):
         # Every fresh routing decision drops all derived labels and re-derives the
         # caller's; a resumed pattern skips _decide, so the runner migration does it.
         self._clear_response_language(context)
+        # Resolve a virtual model before compacting, the order
+        # prepare_llm_for_context documents and ReAct already follows. The
+        # resolver recomputes the compaction threshold from the selected
+        # model's context window, which is useless once compaction has
+        # already run -- so this stays unconditional even when a separate
+        # compact model makes the returned handle itself unused.
+        route_llm = await prepare_llm_for_context(
+            llm=llm,
+            messages=context.get_messages_for_llm(),
+            context=context,
+        )
         await runtime.compact_context_if_needed(
             context=context,
-            llm=compact_llm,
+            # See ReActPattern for why the fallback lives at the call site.
+            llm=compact_llm if compact_llm is not None else route_llm,
             metadata={"phase": "auto_decision"},
         )
 

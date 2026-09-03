@@ -82,8 +82,9 @@ from ..services.agent_team_scope import (
     resolve_authorized_agent,
 )
 from ..services.assistant_history_safety import ASSISTANT_RESPONSE_MESSAGE_TYPE
+from ..services.channel_runtime import ChannelTaskMode
 from ..services.chat_history_service import (
-    load_task_transcript,
+    load_task_transcript_window,
     persist_assistant_message_no_commit,
 )
 from ..services.connector_runtime import (
@@ -110,6 +111,10 @@ from ..services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyMismatchError,
     MCPBuiltinOAuthActorPolicyRequiredError,
+)
+from ..services.memory_policy import (
+    MemoryPolicyRequest,
+    resolve_trusted_memory_policy,
 )
 from ..services.model_service import _get_visible_user_ids
 from ..services.task_deletion import purge_task_rows
@@ -138,6 +143,7 @@ from ..services.task_runtime import (
     create_task_extensions,
     delete_task_extensions,
     get_task_runtime_public_metadata,
+    mcp_runtime_authorization_policy_identity,
     mcp_runtime_authorization_policy_required,
     registered_task_extensions,
     sanitize_client_agent_config,
@@ -310,6 +316,13 @@ def _get_task_activity_ids(db: Session, task_id: int) -> tuple[int, int]:
 class AgentServiceMemoryPolicy:
     memory: MemoryStore
     memory_enabled: bool
+    memory_available: bool = True
+    memory_availability_reason: str | None = None
+
+
+def _optional_task_int(task: Any, field: str) -> int | None:
+    value = getattr(task, field, None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def resolve_agent_service_memory_policy(
@@ -323,13 +336,31 @@ def resolve_agent_service_memory_policy(
         task_config = getattr(task, "agent_config", None)
         config = task_config if isinstance(task_config, Mapping) else {}
 
-    if config.get("is_preview") is True:
-        return AgentServiceMemoryPolicy(InMemoryMemoryStore(), False)
-
-    if task is not None and task.agent_id:
-        return AgentServiceMemoryPolicy(get_memory_store(), False)
-
-    return AgentServiceMemoryPolicy(get_memory_store(), True)
+    is_preview = config.get("is_preview") is True
+    default_enabled = not is_preview and not (
+        task is not None and getattr(task, "agent_id", None)
+    )
+    source = getattr(task, "source", None)
+    override = resolve_trusted_memory_policy(
+        MemoryPolicyRequest(
+            task_id=_optional_task_int(task, "id"),
+            user_id=_optional_task_int(task, "user_id"),
+            agent_id=_optional_task_int(task, "agent_id"),
+            source=source if isinstance(source, str) else None,
+            is_preview=is_preview,
+        )
+    )
+    enabled = default_enabled if override is None else override.enabled
+    use_in_memory = (is_preview and not enabled) or (
+        override is not None and not override.available
+    )
+    memory = InMemoryMemoryStore() if use_in_memory else get_memory_store()
+    return AgentServiceMemoryPolicy(
+        memory=memory,
+        memory_enabled=enabled,
+        memory_available=True if override is None else override.available,
+        memory_availability_reason=None if override is None else override.reason,
+    )
 
 
 async def resolve_agent_service_memory_policy_async(
@@ -1298,6 +1329,16 @@ class AgentServiceManager:
         # task_id-keyed cache must not silently hand back an instance built
         # under a different user (e.g. once built with the wrong identity).
         self._agent_owner_ids: Dict[int, Optional[int]] = {}
+        # Run generation that currently owns each cached runtime.
+        self._agent_run_ids: Dict[int, str] = {}
+        # Which *acquisition* of that run owns the runtime. The run id alone
+        # cannot answer this: a resume claims the same run deliberately (so a
+        # waiting checkpoint stays readable), which makes two acquisitions of
+        # one run indistinguishable by id. A previous turn's late cleanup then
+        # matched the resume's runtime and evicted it mid-execution. Bumped on
+        # every acquisition, so a cleanup scheduled by an earlier one no longer
+        # recognizes the runtime and correctly does nothing.
+        self._agent_run_generations: Dict[int, int] = {}
         # Keep only the owner needed to retry a failed workspace cleanup.
         self._agent_cleanup_owner_ids: Dict[int, int] = {}
         self._agent_sandbox_keys: Dict[int, str] = {}
@@ -1698,11 +1739,14 @@ class AgentServiceManager:
         if agent is None:
             return
 
-        conversation_history = load_task_transcript(db, task_id)
+        transcript_window = load_task_transcript_window(db, task_id)
+        conversation_history = transcript_window.messages
         if not conversation_history:
             return
 
-        agent.set_conversation_history(conversation_history)
+        agent.set_conversation_history(
+            conversation_history, watermark=transcript_window.watermark
+        )
         logger.info(
             f"Loaded {len(conversation_history)} persisted chat messages for task {task_id}"
         )
@@ -1990,6 +2034,8 @@ class AgentServiceManager:
         parent_tracer: Optional[Any] = None,
         scope: Optional[ExecutionScope] = None,
         task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
+        connector_runtime_turn_id: Optional[str] = None,
+        mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
     ) -> tuple[list[Any], Any]:
         """Build the tool set configured for a web task."""
         if task_setup_snapshot is not None:
@@ -2058,8 +2104,13 @@ class AgentServiceManager:
                         "agent tools"
                     )
 
+        actor_execution = mcp_runtime_authorization_policy is not None
         tool_selection_spec = _build_tool_selection_spec_for_task(
-            agent_config, workforce_runtime, task_id=task_id
+            agent_config,
+            workforce_runtime,
+            task_id=task_id,
+            omit_published_agent_tools=actor_execution,
+            include_mcp_tools=actor_execution,
         )
         workspace_owner_id = int(task.user_id)
         # Actor-logical access policy + CA mount intent, built by
@@ -2122,7 +2173,9 @@ class AgentServiceManager:
             agent_call_stack=workforce_runtime.agent_call_stack
             if workforce_runtime
             else None,
-            connector_runtime_turn_id=None,
+            connector_runtime_turn_id=connector_runtime_turn_id,
+            mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
+            force_mcp_tools=actor_execution,
             mcp_failure_policy=_mcp_failure_policy_for_task_source(task.source),
             mcp_load_summary_tracer=parent_tracer,
             mcp_load_summary_trace_task_id=str(task_id),
@@ -2142,6 +2195,7 @@ class AgentServiceManager:
         task_owner_user_id: Optional[int] = None,
         connector_runtime_turn_id: Optional[str] = None,
         mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+        task_mode: ChannelTaskMode = ChannelTaskMode.DEFAULT,
         resolved_execution_scope: Union[
             ExecutionScope, None, ExecutionScopeNotProvided
         ] = EXECUTION_SCOPE_NOT_PROVIDED,
@@ -2151,7 +2205,7 @@ class AgentServiceManager:
             lock = asyncio.Lock()
             self._agent_build_locks[task_id] = lock
         async with lock:
-            return await self._get_agent_for_task_unlocked(
+            agent = await self._get_agent_for_task_unlocked(
                 task_id,
                 db=db,
                 user=user,
@@ -2159,8 +2213,15 @@ class AgentServiceManager:
                 task_owner_user_id=task_owner_user_id,
                 connector_runtime_turn_id=connector_runtime_turn_id,
                 mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
+                task_mode=task_mode,
                 resolved_execution_scope=resolved_execution_scope,
             )
+            if task_setup_snapshot is not None and task_setup_snapshot.task.run_id:
+                self._agent_run_ids[task_id] = task_setup_snapshot.task.run_id
+            self._agent_run_generations[task_id] = (
+                self._agent_run_generations.get(task_id, 0) + 1
+            )
+            return agent
 
     async def _get_agent_for_task_unlocked(
         self,
@@ -2171,6 +2232,7 @@ class AgentServiceManager:
         task_owner_user_id: Optional[int] = None,
         connector_runtime_turn_id: Optional[str] = None,
         mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+        task_mode: ChannelTaskMode = ChannelTaskMode.DEFAULT,
         resolved_execution_scope: Union[
             ExecutionScope, None, ExecutionScopeNotProvided
         ] = EXECUTION_SCOPE_NOT_PROVIDED,
@@ -2191,6 +2253,9 @@ class AgentServiceManager:
         user's task; callers that loaded/authorized the task should pass it.
         When omitted it falls back to the snapshot owner, then the task row's
         owner, then ``user.id``.
+
+        ``task_mode=ACTOR_INTERACTION`` permits reconstruction only after the
+        channel boundary claims the exact waiting actor task as a new run.
         """
         # Track whether this invocation already tried the worker-owned snapshot
         # boundary. Active-task reconstruction and normal creation must share
@@ -2221,6 +2286,9 @@ class AgentServiceManager:
             task_id in self._mcp_actor_policies
             or mcp_runtime_authorization_policy_required(persisted_agent_config)
         )
+        persisted_policy_identity = mcp_runtime_authorization_policy_identity(
+            persisted_agent_config
+        )
         if actor_marked and mcp_runtime_authorization_policy is None:
             raise MCPBuiltinOAuthActorPolicyRequiredError(
                 f"Task {task_id} requires an MCP runtime authorization policy; "
@@ -2231,6 +2299,22 @@ class AgentServiceManager:
                 raise MCPBuiltinOAuthActorPolicyRequiredError(
                     f"Task {task_id} is not marked for MCP actor execution"
                 )
+            if (
+                persisted_policy_identity is not None
+                and persisted_policy_identity
+                != mcp_runtime_authorization_policy.resource_owner_key
+            ):
+                raise MCPBuiltinOAuthActorPolicyMismatchError(
+                    f"Task {task_id} MCP actor policy does not match its durable identity"
+                )
+            if (
+                task_mode is ChannelTaskMode.ACTOR_INTERACTION
+                and persisted_policy_identity is None
+            ):
+                raise MCPBuiltinOAuthActorPolicyRequiredError(
+                    f"Task {task_id} has no durable MCP actor policy identity"
+                )
+
             bound_policy = self._mcp_actor_policies.get(task_id)
             if (
                 bound_policy is not None
@@ -2244,6 +2328,15 @@ class AgentServiceManager:
                 self._mcp_actor_policies[task_id] = mcp_runtime_authorization_policy
 
         if actor_marked and task_setup_snapshot is not None:
+            if (
+                task_mode is ChannelTaskMode.ACTOR_INTERACTION
+                and task_setup_snapshot.task.agent_id is not None
+                and task_setup_snapshot.agent is None
+            ):
+                raise MCPBuiltinOAuthActorPolicyRequiredError(
+                    f"Task {task_id} claimed agent is unavailable"
+                )
+
             marked_status = task_setup_snapshot.task.status
             fresh_direct_build = marked_status in {
                 TaskStatus.PENDING,
@@ -2252,7 +2345,11 @@ class AgentServiceManager:
                 marked_status == TaskStatus.RUNNING
                 and task_setup_snapshot.has_reconstructable_history
             )
-            if not fresh_direct_build:
+            actor_interaction_reconstruction = (
+                task_mode is ChannelTaskMode.ACTOR_INTERACTION
+                and marked_status == TaskStatus.RUNNING
+            )
+            if not (fresh_direct_build or actor_interaction_reconstruction):
                 raise MCPBuiltinOAuthActorPolicyRequiredError(
                     f"Task {task_id} actor-marked reuse or reconstruction is unsupported"
                 )
@@ -2514,6 +2611,10 @@ class AgentServiceManager:
                                 db,
                                 scope=scope,
                                 task_setup_snapshot=task_setup_snapshot,
+                                connector_runtime_turn_id=connector_runtime_turn_id,
+                                mcp_runtime_authorization_policy=(
+                                    mcp_runtime_authorization_policy
+                                ),
                             )
                             self._agent_owner_ids[task_id] = runtime_user_id
                             self._agent_scope_fingerprints[task_id] = fingerprint
@@ -2968,7 +3069,8 @@ class AgentServiceManager:
                 if task_exists and snapshot is not None:
                     agent_service = self._agents[task_id]
                     agent_service.set_conversation_history(
-                        [dict(message) for message in snapshot.conversation_history]
+                        [dict(message) for message in snapshot.conversation_history],
+                        watermark=snapshot.conversation_watermark,
                     )
                     recovery_state = await materialize_task_execution_recovery_state(
                         snapshot.execution_recovery
@@ -3190,11 +3292,58 @@ class AgentServiceManager:
                 deferred_task_ids,
             )
 
-    def remove_agent(self, task_id: int, user_id: Optional[int] = None) -> None:
-        """Clean a task workspace and unconditionally evict its live runtime.
+    def current_run_generation(self, task_id: int) -> Optional[int]:
+        """Which acquisition of this task's runtime is current, if any.
 
-        A failed cleanup retains only the owner needed for a later cold retry.
+        A caller that will schedule cleanup for the runtime it just acquired
+        reads this and passes it back as ``expected_run_generation``, so its
+        cleanup cannot evict a runtime a *later* acquisition owns. Needed
+        because a resume deliberately re-claims the same run id, which leaves
+        the id unable to tell two acquisitions apart.
         """
+        return self._agent_run_generations.get(task_id)
+
+    def remove_agent(
+        self,
+        task_id: int,
+        user_id: Optional[int] = None,
+        *,
+        expected_run_id: Optional[str] = None,
+        expected_run_generation: Optional[int] = None,
+    ) -> None:
+        """Clean a task runtime only for the run that scheduled cleanup."""
+        current_run_id = self._agent_run_ids.get(task_id)
+        current_generation = self._agent_run_generations.get(task_id)
+        build_lock = self._agent_build_locks.get(task_id)
+        # Checked before the run-id comparison and independently of it: within
+        # one run, the generation is the only thing that distinguishes the
+        # acquisition that scheduled this cleanup from a later one that now
+        # owns the runtime.
+        if (
+            expected_run_generation is not None
+            and current_generation is not None
+            and current_generation != expected_run_generation
+        ):
+            logger.info(
+                "Skipping stale runtime cleanup for task %s generation %s; "
+                "current generation is %s",
+                task_id,
+                expected_run_generation,
+                current_generation,
+            )
+            return
+        if expected_run_id is not None and (
+            (current_run_id is not None and current_run_id != expected_run_id)
+            or (build_lock is not None and build_lock.locked())
+        ):
+            logger.info(
+                "Skipping stale runtime cleanup for task %s run %s; current run is %s",
+                task_id,
+                expected_run_id,
+                current_run_id,
+            )
+            return
+
         agent = self._agents.get(task_id)
         cleanup_user_id = user_id
         if cleanup_user_id is None:
@@ -3228,6 +3377,8 @@ class AgentServiceManager:
 
             self._agents.pop(task_id, None)
             self._agent_owner_ids.pop(task_id, None)
+            self._agent_run_ids.pop(task_id, None)
+            self._agent_run_generations.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
             self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
@@ -3807,6 +3958,8 @@ class AgentServiceManager:
         db: Optional[Session],
         scope: Optional[ExecutionScope] = None,
         task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
+        connector_runtime_turn_id: Optional[str] = None,
+        mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
     ) -> None:
         """Reconstruct from the detached task-runtime snapshot.
 
@@ -3873,6 +4026,8 @@ class AgentServiceManager:
                 parent_tracer=tracer,
                 scope=scope,
                 task_setup_snapshot=snapshot,
+                connector_runtime_turn_id=connector_runtime_turn_id,
+                mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
             )
 
             from .agents import (
@@ -3939,7 +4094,8 @@ class AgentServiceManager:
                 plan_state,
             )
             agent_service.set_conversation_history(
-                [dict(message) for message in snapshot.conversation_history]
+                [dict(message) for message in snapshot.conversation_history],
+                watermark=snapshot.conversation_watermark,
             )
             recovery_state = await materialize_task_execution_recovery_state(
                 snapshot.execution_recovery

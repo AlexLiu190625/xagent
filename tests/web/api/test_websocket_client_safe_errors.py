@@ -198,8 +198,11 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # frame in favour of the control-only ``task_resumed`` shape. The inner
     # RuntimeError arm now also reuses ``answer_durable_turn_failure`` instead
     # of spelling out three error payloads locally, bringing the census to 50.
-    assert result.error_payloads == 50, (
-        f"expected exactly 50 error payloads, matched {result.error_payloads}; "
+    # ``_broadcast_terminal_command_error`` gained a third payload literal for
+    # external-scope non-cancel commands, mirroring the persisted-event
+    # identity rule for the live frame too, bringing the census to 51.
+    assert result.error_payloads == 51, (
+        f"expected exactly 51 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
@@ -2247,7 +2250,9 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = (
+        websocket_api.ResumeReservationOutcome.RESERVED
+    )
 
     def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
         payload = {"type": "agent_error", "message": message, "task_id": task_id}
@@ -2307,7 +2312,9 @@ def _chat_runtime_error_harness(secret_error: Exception):
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = (
+        websocket_api.ResumeReservationOutcome.RESERVED
+    )
 
     def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
         payload = {"type": "agent_error", "message": message, "task_id": task_id}
@@ -2668,7 +2675,7 @@ async def test_origin_entry_dies_with_its_command_or_socket(
         "retrying deferral keeps the origin"
     )
     exhausted = _pause_command(command_id="pause:cleanup")
-    exhausted.defer_count = websocket_api.MAX_COMMAND_DEFERS
+    exhausted.defer_count = websocket_api.max_command_defers()
     with pytest.raises(websocket_api.TaskCommandDeferred):
         await websocket_api.execute_durable_task_command(exhausted)
     assert not origins.has(command.command_id, command.task_id)

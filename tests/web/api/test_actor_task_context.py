@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,6 +13,7 @@ from xagent.core.tools.adapters.vibe.selection_spec import (
 )
 from xagent.web.api.chat import AgentServiceManager, _spec_wants_mcp
 from xagent.web.models.task import TaskStatus
+from xagent.web.services.channel_runtime import ChannelTaskMode
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyMismatchError,
@@ -22,6 +24,7 @@ from xagent.web.services.task_runtime import (
 )
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
+    TaskReconstructionSnapshot,
     TaskSetupSnapshot,
     _TaskFields,
 )
@@ -33,6 +36,10 @@ def _snapshot(
     status: TaskStatus = TaskStatus.PENDING,
     has_reconstructable_history: bool = False,
     agent_config: dict[str, Any] | None = None,
+    task_agent_id: int | None = None,
+    task_agent_config: dict[str, Any] | None = None,
+    runtime_agent: Any = None,
+    task_llm: Any = None,
 ) -> TaskSetupSnapshot:
     return TaskSetupSnapshot(
         task=_TaskFields(
@@ -40,8 +47,19 @@ def _snapshot(
             user_id=1,
             status=status,
             source="external",
-            agent_id=None,
-            agent_config={MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY: marker},
+            agent_id=task_agent_id,
+            agent_config=(
+                task_agent_config
+                if task_agent_config is not None
+                else {
+                    MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY: marker,
+                    **(
+                        {"mcp_runtime_authorization_policy_identity": "actor:alice"}
+                        if marker is True
+                        else {}
+                    ),
+                }
+            ),
             model_name=None,
             compact_model_name=None,
             execution_mode="flash",
@@ -50,13 +68,31 @@ def _snapshot(
         runtime_user=RuntimeUserFields(id=1, is_admin=False),
         has_reconstructable_history=has_reconstructable_history,
         task_pattern="single_call",
-        task_llm=None,
+        task_llm=task_llm,
         task_fast_llm=None,
         task_vision_llm=None,
         task_compact_llm=None,
-        agent=None,
+        agent=runtime_agent,
         agent_config=agent_config,
         excluded_agent_id=None,
+        reconstruction=TaskReconstructionSnapshot(
+            tracer_events=(
+                (
+                    {
+                        "id": "actor-event",
+                        "event_type": "agent_step",
+                        "task_id": "42",
+                        "step_id": None,
+                        "timestamp": None,
+                        "data": {},
+                        "parent_id": None,
+                    },
+                )
+                if has_reconstructable_history
+                else ()
+            ),
+            has_history=has_reconstructable_history,
+        ),
     )
 
 
@@ -66,11 +102,15 @@ class _Agent:
         self.workspace = None
         self.invalidate_tools = MagicMock()
 
-    def set_conversation_history(self, _messages: list[dict[str, Any]]) -> None: ...
+    def set_conversation_history(
+        self, _messages: list[dict[str, Any]], *, watermark: int | None = None
+    ) -> None: ...
 
     def set_execution_context_messages(self, _messages: list[Any]) -> None: ...
 
     def set_recovered_skill_context(self, _context: Any) -> None: ...
+
+    async def reconstruct_from_history(self, *_args: Any) -> None: ...
 
     def cleanup_workspace(self) -> None: ...
 
@@ -139,6 +179,72 @@ async def test_marked_task_binds_policy_and_omits_published_agent_tools(
     assert _spec_wants_mcp(kwargs["tool_selection_spec"])
     assert not kwargs["tool_selection_spec"].includes_published_agent()
     assert manager._mcp_actor_policies[42] is actor_policy
+
+
+@pytest.mark.asyncio
+async def test_actor_interaction_rejects_different_persisted_policy(
+    actor_policy: MCPBuiltinOAuthActorPolicy,
+) -> None:
+    manager = AgentServiceManager()
+    create_tools = AsyncMock()
+
+    with (
+        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
+        pytest.raises(
+            MCPBuiltinOAuthActorPolicyMismatchError,
+            match="durable identity",
+        ),
+    ):
+        await manager.get_agent_for_task(
+            42,
+            task_setup_snapshot=_snapshot(
+                status=TaskStatus.RUNNING,
+                has_reconstructable_history=True,
+                task_agent_id=7,
+                runtime_agent=MagicMock(id=7),
+                task_agent_config={
+                    MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY: True,
+                    "mcp_runtime_authorization_policy_identity": "actor:bob",
+                },
+            ),
+            task_owner_user_id=1,
+            mcp_runtime_authorization_policy=actor_policy,
+            task_mode=ChannelTaskMode.ACTOR_INTERACTION,
+            resolved_execution_scope=None,
+        )
+
+    create_tools.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_actor_interaction_rejects_deleted_claimed_agent(
+    actor_policy: MCPBuiltinOAuthActorPolicy,
+) -> None:
+    manager = AgentServiceManager()
+    create_tools = AsyncMock()
+
+    with (
+        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
+        pytest.raises(
+            MCPBuiltinOAuthActorPolicyRequiredError,
+            match="claimed agent is unavailable",
+        ),
+    ):
+        await manager.get_agent_for_task(
+            42,
+            task_setup_snapshot=_snapshot(
+                status=TaskStatus.RUNNING,
+                has_reconstructable_history=True,
+                task_agent_id=7,
+                runtime_agent=None,
+            ),
+            task_owner_user_id=1,
+            mcp_runtime_authorization_policy=actor_policy,
+            task_mode=ChannelTaskMode.ACTOR_INTERACTION,
+            resolved_execution_scope=None,
+        )
+
+    create_tools.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -225,6 +331,76 @@ async def test_marked_task_reconstruction_is_rejected_even_with_policy(
 
 
 @pytest.mark.asyncio
+async def test_actor_interaction_reconstruction_preserves_tool_context(
+    actor_policy: MCPBuiltinOAuthActorPolicy,
+) -> None:
+    manager = AgentServiceManager()
+    tool_config = MagicMock()
+    tool_config.set_execution_scope.return_value = False
+    create_tools = AsyncMock(return_value=([], tool_config))
+    reconstructed = _Agent(tool_config)
+
+    with (
+        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
+        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
+        patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+        patch("xagent.web.api.chat.AgentService", return_value=reconstructed),
+    ):
+        result = await manager.get_agent_for_task(
+            42,
+            task_setup_snapshot=_snapshot(
+                status=TaskStatus.RUNNING,
+                has_reconstructable_history=True,
+                agent_config={
+                    "knowledge_bases": [],
+                    "skills": [],
+                    "tool_categories": ["web_search", "file"],
+                },
+                task_llm=MagicMock(),
+            ),
+            task_owner_user_id=1,
+            connector_runtime_turn_id="approval-turn",
+            mcp_runtime_authorization_policy=actor_policy,
+            task_mode=ChannelTaskMode.ACTOR_INTERACTION,
+            resolved_execution_scope=None,
+        )
+
+    assert result is reconstructed
+    kwargs = create_tools.await_args.kwargs
+    assert kwargs["connector_runtime_turn_id"] == "approval-turn"
+    assert kwargs["mcp_runtime_authorization_policy"] is actor_policy
+    assert kwargs["force_mcp_tools"] is True
+    assert _spec_wants_mcp(kwargs["tool_selection_spec"])
+    assert not kwargs["tool_selection_spec"].includes_published_agent()
+
+
+@pytest.mark.asyncio
+async def test_actor_interaction_reconstruction_requires_running_claim(
+    actor_policy: MCPBuiltinOAuthActorPolicy,
+) -> None:
+    manager = AgentServiceManager()
+    reconstruct = AsyncMock()
+
+    with (
+        patch.object(manager, "_reconstruct_agent_from_history", new=reconstruct),
+        pytest.raises(MCPBuiltinOAuthActorPolicyRequiredError, match="reconstruction"),
+    ):
+        await manager.get_agent_for_task(
+            42,
+            task_setup_snapshot=_snapshot(
+                status=TaskStatus.WAITING_FOR_USER,
+                has_reconstructable_history=True,
+            ),
+            task_owner_user_id=1,
+            mcp_runtime_authorization_policy=actor_policy,
+            task_mode=ChannelTaskMode.ACTOR_INTERACTION,
+            resolved_execution_scope=None,
+        )
+
+    reconstruct.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("marker", [False, None, "true", 1, {}, []])
 async def test_non_literal_true_marker_preserves_ordinary_task_behavior(
     marker: Any,
@@ -260,6 +436,7 @@ async def test_non_literal_true_marker_preserves_ordinary_task_behavior(
 def _seed_manager_maps(manager: AgentServiceManager, agent: Any) -> None:
     manager._agents[42] = agent
     manager._agent_owner_ids[42] = 7
+    manager._agent_run_ids[42] = "current-run"
     manager._agent_sandbox_keys[42] = "user:7"
     manager._agent_sandbox_providers[42] = object()
     manager._agent_scope_fingerprints[42] = None
@@ -267,6 +444,85 @@ def _seed_manager_maps(manager: AgentServiceManager, agent: Any) -> None:
     manager._mcp_actor_policies[42] = MCPBuiltinOAuthActorPolicy(
         resource_owner_key="actor:alice"
     )
+
+
+def test_remove_agent_ignores_stale_cleanup_within_the_same_run() -> None:
+    """A resume re-claims its own run, so the run id cannot date a cleanup.
+
+    An approval continuation deliberately claims the run the waiting
+    checkpoint was written under -- that is what keeps the checkpoint
+    readable. Both the previous turn's runtime and the continuation's then
+    carry the same run id, so a late cleanup scheduled by the earlier one
+    would match and evict the runtime the continuation is executing in.
+    The generation is what tells the two acquisitions apart.
+    """
+    manager = AgentServiceManager()
+    agent = MagicMock()
+    _seed_manager_maps(manager, agent)
+    # The continuation's acquisition; the stale cleanup below belongs to the
+    # previous one, under the very same run id.
+    manager._agent_run_generations[42] = 2
+
+    manager.remove_agent(42, expected_run_id="current-run", expected_run_generation=1)
+
+    assert manager._agents[42] is agent
+    assert manager._agent_run_generations[42] == 2
+    agent.cleanup_workspace.assert_not_called()
+
+
+def test_remove_agent_evicts_when_the_generation_is_its_own() -> None:
+    """The guard must not become fail-stuck: the owning cleanup still runs."""
+    manager = AgentServiceManager()
+    agent = MagicMock()
+    _seed_manager_maps(manager, agent)
+    manager._agent_run_generations[42] = 2
+
+    manager.remove_agent(42, expected_run_id="current-run", expected_run_generation=2)
+
+    assert 42 not in manager._agents
+    assert 42 not in manager._agent_run_generations
+    agent.cleanup_workspace.assert_called_once()
+
+
+def test_get_agent_for_task_bumps_the_run_generation() -> None:
+    """Each acquisition is a new generation, including a same-run resume."""
+    manager = AgentServiceManager()
+    agent = MagicMock()
+    marker = object()
+
+    async def acquire() -> None:
+        with (
+            patch.object(manager, "_get_agent_for_task_unlocked", return_value=agent),
+        ):
+            await manager.get_agent_for_task(
+                42,
+                task_setup_snapshot=_snapshot(marker=marker),
+                task_owner_user_id=1,
+                resolved_execution_scope=None,
+            )
+
+    assert manager.current_run_generation(42) is None
+    asyncio.run(acquire())
+    first = manager.current_run_generation(42)
+    asyncio.run(acquire())
+    second = manager.current_run_generation(42)
+
+    assert first == 1
+    # The snapshot carries one run id, so only the generation distinguishes
+    # these two acquisitions -- which is the whole point of having it.
+    assert second == 2
+
+
+def test_remove_agent_ignores_stale_run_cleanup() -> None:
+    manager = AgentServiceManager()
+    agent = MagicMock()
+    _seed_manager_maps(manager, agent)
+
+    manager.remove_agent(42, expected_run_id="finished-run")
+
+    assert manager._agents[42] is agent
+    assert manager._agent_run_ids[42] == "current-run"
+    agent.cleanup_workspace.assert_not_called()
 
 
 @pytest.mark.parametrize("cleanup_fails", [False, True])
@@ -289,6 +545,7 @@ def test_remove_agent_evicts_runtime_and_retains_failed_cleanup_owner(
     for runtime_map in (
         manager._agents,
         manager._agent_owner_ids,
+        manager._agent_run_ids,
         manager._agent_sandbox_keys,
         manager._agent_sandbox_providers,
         manager._agent_scope_fingerprints,

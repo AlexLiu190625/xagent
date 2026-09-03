@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import threading
 import time
 from collections.abc import Iterator
@@ -32,6 +33,7 @@ from ..config import (
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
+    get_trigger_dispatcher_startup_jitter_seconds,
     get_uploaded_file_recovery_batch_size,
     get_uploaded_file_recovery_interval_seconds,
     get_uploaded_file_recovery_stale_seconds,
@@ -108,6 +110,7 @@ from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
 )
+from .startup_admission import run_host_startup_admissions
 
 # Configure logging when running under gunicorn/uwsgi (no __main__.py)
 setup_logging()  # Uses XAGENT_LOG_LEVEL env var or defaults to INFO
@@ -271,7 +274,20 @@ async def _run_trigger_dispatcher(
     *,
     poll_interval_seconds: int,
     batch_size: int,
+    startup_jitter_seconds: int = 0,
 ) -> None:
+    if startup_jitter_seconds > 0:
+        # Runs before the loop below's first tick, which otherwise fires
+        # immediately on startup -- see
+        # get_trigger_dispatcher_startup_jitter_seconds for why that's a
+        # problem right after a container restart.
+        delay = random.uniform(0, startup_jitter_seconds)
+        logger.info(
+            "Trigger dispatcher delaying first tick by %.1fs past startup",
+            delay,
+        )
+        await asyncio.sleep(delay)
+
     from .models.database import get_session_local
     from .services.gmail_triggers import scan_due_gmail_watch_renewals
     from .services.triggers import (
@@ -418,18 +434,22 @@ def start_trigger_dispatcher_task(app_instance: FastAPI) -> asyncio.Task[Any] | 
 
     poll_interval_seconds = get_trigger_dispatcher_interval_seconds()
     batch_size = get_trigger_dispatcher_batch_size()
+    startup_jitter_seconds = get_trigger_dispatcher_startup_jitter_seconds()
     task = asyncio.create_task(
         _run_trigger_dispatcher(
             poll_interval_seconds=poll_interval_seconds,
             batch_size=batch_size,
+            startup_jitter_seconds=startup_jitter_seconds,
         )
     )
     _trigger_dispatcher_task = task
     app_instance.state.trigger_dispatcher_task = task
     logger.info(
-        "Started trigger dispatcher task (interval=%ss, batch_size=%s)",
+        "Started trigger dispatcher task (interval=%ss, batch_size=%s, "
+        "startup_jitter=%ss)",
         poll_interval_seconds,
         batch_size,
+        startup_jitter_seconds,
     )
     return task
 
@@ -1212,14 +1232,16 @@ app.include_router(share_router)
 app.include_router(v1_router)
 
 
-# initial database and skill manager
-@app.on_event("startup")
-async def startup_event() -> None:
-    global _migration_task
-    logger.info("Agent runtime configured: %s", get_agent_runtime())
-    validate_interaction_rollout_at_startup()
+async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
+    """Prepare the database, admit the host, then open runtime work ingress."""
     with _startup_phase("database init"):
         init_db()
+
+    # Host checks may rely on the fully migrated database. Nothing below this
+    # boundary may admit tasks or launch a writer/dispatcher until every check
+    # has passed. An exception deliberately aborts startup unchanged.
+    with _startup_phase("host admission"):
+        await run_host_startup_admissions(app_instance)
 
     # Keep built-in task-runtime providers scoped to the application lifespan.
     # Register even when disabled so task creation receives a precise 403
@@ -1232,11 +1254,20 @@ async def startup_event() -> None:
 
     background_task_manager.start_accepting()
 
-    start_file_storage_startup_sync_task(app)
-    start_trigger_dispatcher_task(app)
-    start_task_lease_recovery_task(app)
-    start_uploaded_file_recovery_task(app)
-    start_orphan_upload_gc_task(app)
+    start_file_storage_startup_sync_task(app_instance)
+    start_trigger_dispatcher_task(app_instance)
+    start_task_lease_recovery_task(app_instance)
+    start_uploaded_file_recovery_task(app_instance)
+    start_orphan_upload_gc_task(app_instance)
+
+
+# initial database and skill manager
+@app.on_event("startup")
+async def startup_event() -> None:
+    global _migration_task
+    logger.info("Agent runtime configured: %s", get_agent_runtime())
+    validate_interaction_rollout_at_startup()
+    await _initialize_database_and_admit_runtime(app)
 
     # Persisted ExecutionScope snapshots (workforce sub-tasks) keep a
     # sub-task scoped across process restarts. With no resolver registered

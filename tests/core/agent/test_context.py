@@ -32,6 +32,10 @@ from xagent.core.agent.language import (
 )
 from xagent.core.agent.utils.context_builder import ContextBuilder
 from xagent.core.context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
+from xagent.core.model.chat.types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+)
 from xagent.web.user_isolated_memory import current_user_id
 
 
@@ -56,6 +60,84 @@ def test_create_context() -> None:
     assert ctx.workspace_state["files"] == 2
     assert ctx.memory_session_id == "mem-1"
     assert ctx.memory_snapshot == {"summary": "hello"}
+
+
+def test_memory_input_prefers_display_message_after_context_rebuild() -> None:
+    typed = "Summarize the attachment"
+    augmented = f"{typed}\n\nAttached file: /private/runtime/input.txt"
+    context = ExecutionContext(execution_id="memory-input")
+    context.add_user_message(
+        augmented,
+        metadata={"display_message": typed},
+    )
+
+    rebuilt = ExecutionContext.from_dict(context.to_dict())
+
+    assert rebuilt.current_user_request_text(prefer_display=True) == typed
+
+
+def test_memory_input_preserves_legacy_content_fallback() -> None:
+    context = ExecutionContext(execution_id="legacy-memory-input")
+    context.add_user_message("Legacy execution text")
+
+    assert context.current_user_request_text(prefer_display=True) == (
+        "Legacy execution text"
+    )
+
+
+def test_memory_input_ignores_waiting_response() -> None:
+    original = "Inspect the report"
+    augmented = f"{original}\n\nAttached file: /private/runtime/report.pdf"
+    context = ExecutionContext(execution_id="resumed-memory-input")
+    context.add_user_message(augmented, metadata={"display_message": original})
+    context.add_user_message(
+        "Continue with the second option",
+        metadata={"response_to_waiting_for_user": {"question": "Which option?"}},
+    )
+
+    assert context.current_user_request_text(prefer_display=True) == original
+
+
+def test_memory_input_can_freeze_a_prior_user_message_window() -> None:
+    context = ExecutionContext(execution_id="frozen-memory-input")
+    context.add_user_message(
+        "Original execution text", metadata={"display_message": "Original request"}
+    )
+    context.add_user_message("Later clarification")
+
+    assert (
+        context.current_user_request_text(prefer_display=True, user_message_limit=1)
+        == "Original request"
+    )
+
+
+@pytest.mark.parametrize("display_message", [None, "", 42, {"text": "visible"}])
+def test_memory_input_ignores_unusable_display_metadata(
+    display_message: object,
+) -> None:
+    context = ExecutionContext(execution_id="invalid-display-memory-input")
+    context.add_user_message(
+        "Execution text fallback",
+        metadata={"display_message": display_message},
+    )
+
+    assert context.current_user_request_text(prefer_display=True) == (
+        "Execution text fallback"
+    )
+
+
+def test_dag_memory_input_ignores_internal_step_messages() -> None:
+    typed = "Plan the release"
+    augmented = f"{typed}\n\nAttached file: /private/runtime/input.txt"
+    root = ExecutionContext(execution_id="dag-memory-input")
+    root.add_user_message(augmented, metadata={"display_message": typed})
+    child = root.create_child_context(metadata={"dag_step_id": "draft"})
+    child.add_user_message(
+        "Only execute this internal step.",
+        metadata={"dag_step_id": "draft", "kind": "dag_step_instruction"},
+    )
+
+    assert child.current_user_request_text(prefer_display=True) == typed
 
 
 def test_sanitize_tool_result_for_context_hides_image_path_when_artifact_exists() -> (
@@ -414,6 +496,32 @@ def test_memory_enrichment_uses_web_user_context(
 
     assert memories == [{"content": "memory"}]
     assert observed_user_ids == [42]
+    assert current_user_id.get() is None
+
+
+def test_memory_enrichment_without_user_context_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_lookup(*_: object, **__: object) -> list[dict[str, str]]:
+        raise RuntimeError("memory backend unavailable")
+
+    monkeypatch.setattr(
+        enrichment_module,
+        "lookup_relevant_memories",
+        fail_lookup,
+    )
+
+    memories = _lookup_relevant_memories_with_context(
+        memory_store=object(),
+        query="query",
+        category="general",
+        include_general=True,
+        limit=5,
+        similarity_threshold=None,
+        user_id=None,
+    )
+
+    assert memories == []
     assert current_user_id.get() is None
 
 
@@ -1885,3 +1993,107 @@ def test_clock_timezone_survives_serialization_and_child_contexts() -> None:
 
     child = context.create_child_context(task="sub-task")
     assert child.clock_zone().key == "Australia/Melbourne"
+
+
+def _context_over_threshold(threshold: int) -> ExecutionContext:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = threshold
+    ctx.add_user_message("current request")
+    # Token estimation is chars//4, so this clears the threshold and makes the
+    # request materialize.
+    ctx.add_tool_result(
+        "read_file", {"output": "x" * (threshold * 8)}, tool_call_id="call-1"
+    )
+    return ctx
+
+
+def test_llm_compact_budget_scales_with_the_threshold() -> None:
+    """Below the absolute ceiling the budget tracks the threshold.
+
+    The old ceiling of 1024 bound at every realistic window, leaving a
+    reasoning model no room -- its reasoning comes out of this same allowance.
+    """
+    request = _context_over_threshold(20_000).build_llm_compact_request_if_needed()
+
+    assert request is not None
+    assert request["max_tokens"] == 5_000
+
+
+def test_llm_compact_budget_stays_under_provider_output_limits() -> None:
+    """The absolute ceiling is what makes a large window safe.
+
+    The threshold scales with the *input* window, while providers cap the
+    *output* separately and much lower. Without a ceiling a 1M-token window
+    asks for ~187k output tokens, the request is rejected, and compaction
+    collapses into the message-dropping fallback it exists to avoid.
+    """
+    for window_threshold in (96_000, 150_000, 750_000):
+        request = _context_over_threshold(
+            window_threshold
+        ).build_llm_compact_request_if_needed()
+
+        assert request is not None
+        assert request["max_tokens"] == 8192
+
+
+def _compactable_context() -> ExecutionContext:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("current request")
+    ctx.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    return ctx
+
+
+def test_compact_rejects_content_the_client_marked_as_a_reasoning_fallback() -> None:
+    """Accepting one would rewrite the whole history into a chain of thought.
+
+    The summary replaces every prior message, so a substituted reasoning trace
+    does not merely add noise -- it becomes the agent's account of what it
+    already did, describing deliberation it never concluded. Having no summary
+    is better: the fallback keeps real messages.
+    """
+    ctx = _compactable_context()
+    original = list(ctx.messages)
+
+    result = ctx.compact_with_llm_response(
+        {
+            "type": "text",
+            "content": "Let me think. The user wants a report. First I should",
+            CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
+            "reasoning_content": "Let me think. The user wants a report. First I should",
+        },
+        llm=None,
+    )
+
+    assert not result.compacted
+    assert result.strategy == "none"
+    assert ctx.messages == original
+
+
+def test_compact_config_round_trip_drops_the_retired_strategy_key() -> None:
+    """Pins the rolling-deploy contract for the removed ``strategy`` knob.
+
+    ``to_dict`` must stop emitting the key, and a legacy payload that still
+    carries it -- every row persisted before the removal, reloaded by every
+    resumed execution -- must restore the surrounding fields unchanged. The
+    ``from_dict`` half cannot break as long as the reader uses per-key
+    ``get``; it is pinned because switching to ``CompactConfig(**compact)``
+    would turn those live rows into a crash. The ``hasattr`` check guards the
+    other direction: re-adding the field with a default would silently revive
+    the dispatch this change removed.
+    """
+    context = ExecutionContext()
+    context.compact_config.enabled = False
+    context.compact_config.threshold = 1234
+    context.compact_config.max_messages = 7
+
+    payload = context.to_dict()
+    assert "strategy" not in payload["compact_config"]
+    payload["compact_config"]["strategy"] = "truncate"
+
+    restored = ExecutionContext.from_dict(payload)
+
+    assert restored.compact_config.enabled is False
+    assert restored.compact_config.threshold == 1234
+    assert restored.compact_config.max_messages == 7
+    assert not hasattr(restored.compact_config, "strategy")

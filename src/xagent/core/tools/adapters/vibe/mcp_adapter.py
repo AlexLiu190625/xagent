@@ -8,13 +8,26 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import weakref
 from collections.abc import Coroutine, Iterator
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Mapping, Optional, Type, TypeVar, Union, cast
+from typing import (
+    Annotated,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import httpx
 from mcp.types import Tool as MCPTool
@@ -23,7 +36,7 @@ from pydantic import BaseModel, Field, create_model
 from ..... import config as _root_config
 from .....sandbox.base import Sandbox
 from ...core.mcp.sessions import Connection, create_session
-from ...core.mcp.tools import load_mcp_tools
+from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
 from .base import AbstractBaseTool, ToolVisibility
 from .connector_runtime import (
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
@@ -74,6 +87,73 @@ def mcp_load_failure_message(phase: MCPFailurePhase) -> str:
     return _MCP_LOAD_FAILURE_MESSAGES[phase]
 
 
+class MCPWriteHint(Enum):
+    """What a server's tool annotations claim about a tool's side effects.
+
+    Three states rather than a boolean, because "the server told us this is
+    read-only" and "the server told us nothing" are different facts and only
+    the first one is a claim. Collapsing them into ``is_read_only: bool``
+    would make silence indistinguishable from a promise -- and silence is
+    the common case, since annotations are optional and most connectors
+    omit them.
+
+    A consumer deciding whether an action needs a human in front of it
+    should treat everything except :data:`READ_ONLY` as a write. See
+    ``MCPToolAdapter.write_hint`` for why none of this is a trust boundary.
+    """
+
+    READ_ONLY = "read_only"
+    DESTRUCTIVE = "destructive"
+    UNDECLARED = "undeclared"
+
+
+# The annotation keys this classifier reads, spelled as the MCP wire schema
+# spells them (camelCase is the protocol's, not this codebase's).
+_READ_ONLY_HINT = "readOnlyHint"
+_DESTRUCTIVE_HINT = "destructiveHint"
+
+
+def classify_write_hint(raw_annotations: object) -> MCPWriteHint:
+    """Classify a tool's *raw* wire annotations into a write hint.
+
+    Takes the annotation mapping as it arrived on the wire, before the mcp
+    SDK's models see it. That is deliberate and it is the whole reason this
+    function exists: ``ToolAnnotations`` declares ``bool | None`` under
+    non-strict Pydantic validation, so by the time a parsed object is in
+    hand, ``1`` and ``"true"`` have already become an indistinguishable
+    Python ``True``. Classifying after that boundary cannot tell a server
+    that promised ``true`` from one that sent a coercible non-boolean, which
+    would turn "only an exact boolean counts" into a promise this code does
+    not keep.
+
+    Fail-closed in both directions that matter:
+
+    * A declared ``destructiveHint`` outranks a simultaneous ``readOnlyHint``.
+      The schema marks the two independent with no mutual exclusion, so a peer
+      can send both, and the safe reading of a contradiction is the one that
+      keeps a human in front of the action.
+    * Everything else -- absent, ``None``, ``false``, a non-boolean, or an
+      annotations value that is not even a mapping -- is ``UNDECLARED``,
+      which a consumer must treat as a write.
+
+    None of this makes the result trustworthy: annotations come from a server
+    the client does not control, and the spec says outright that a client
+    "should never make tool use decisions based on ToolAnnotations received
+    from untrusted servers". What this buys is that a *malformed* or
+    *contradictory* claim can never read as the permissive one.
+    """
+    if not isinstance(raw_annotations, Mapping):
+        return MCPWriteHint.UNDECLARED
+    # ``is True`` against the raw value, which is the only place it means what
+    # it says. Checked destructive-first so a both-true peer lands on the
+    # safe side.
+    if raw_annotations.get(_DESTRUCTIVE_HINT) is True:
+        return MCPWriteHint.DESTRUCTIVE
+    if raw_annotations.get(_READ_ONLY_HINT) is True:
+        return MCPWriteHint.READ_ONLY
+    return MCPWriteHint.UNDECLARED
+
+
 @dataclass(frozen=True)
 class MCPServerLoadFailure:
     """Safe MCP load failure data that excludes raw exception details."""
@@ -106,6 +186,386 @@ _HTTP_401_TEXT_RE = re.compile(
     r"\b401\s+unauthorized\b",
     re.IGNORECASE,
 )
+
+# Caps one field's `description` and one field's `pattern`, both of which reach
+# the model on every LLM call. 200 mirrors the cap the repo already uses for
+# a model-facing one-line summary (`INDEX_ENTRY_MAX_CHARS`). `description` and
+# `pattern` share this number, so lowering it also drops mid-length patterns
+# entirely: a pattern is emitted whole or not at all and is never truncated.
+_FIELD_TEXT_MAX_CHARS = 200
+# The `format` tokens carried through: the JSON Schema Draft 2020-12 format
+# vocabulary, plus the OpenAPI 3.0 hints (`byte`, `binary`, `password`,
+# `int32`, `int64`, `float`, `double`) connector authors write in practice.
+# `description` and `pattern` are free text no allowlist could enumerate, but
+# `format` is a closed set of defined tokens, so a token outside it names no
+# rule to pass on and is dropped rather than forwarded to the model as
+# authoritative text. The match is exact, and every defined token is
+# lower-case, so `Date-Time` is not one of them. This set is also what bounds
+# the length of an accepted `format`, so the key carries no length cap of its
+# own.
+_KNOWN_FIELD_FORMATS = frozenset(
+    {
+        "date-time",
+        "date",
+        "time",
+        "duration",
+        "email",
+        "idn-email",
+        "hostname",
+        "idn-hostname",
+        "ipv4",
+        "ipv6",
+        "uri",
+        "uri-reference",
+        "iri",
+        "iri-reference",
+        "uuid",
+        "uri-template",
+        "json-pointer",
+        "relative-json-pointer",
+        "regex",
+        "byte",
+        "binary",
+        "password",
+        "int32",
+        "int64",
+        "float",
+        "double",
+    }
+)
+
+
+def _json_equal(a: Any, b: Any) -> bool:
+    """Compare two JSON values using JSON's own type distinctions.
+
+    JSON Schema treats booleans and numbers as different types, while Python
+    holds ``True == 1``. Enum membership follows JSON, not Python, and the
+    distinction has to hold at every level: the JSON arrays ``[true]`` and
+    ``[1]`` are not the same array, so the comparison recurses instead of
+    handing nested values back to Python's ``==``.
+
+    Recursion is bounded by the shallower of the two values, and an enum only
+    reaches here after ``_is_json_serializable`` has already serialized it,
+    so its nesting is within the interpreter's recursion limit.
+    """
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(
+            _json_equal(item_a, item_b) for item_a, item_b in zip(a, b)
+        )
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_json_equal(a[key], b[key]) for key in a)
+    if isinstance(a, (list, dict)) or isinstance(b, (list, dict)):
+        return False
+    return bool(a == b)
+
+
+def _compact_json(value: Any) -> str:
+    """Serialize a value the way the emitted tool schema will carry it.
+
+    ``allow_nan=False`` matches the provider clients, which reject non-finite
+    numbers, so a value that cannot be serialized here would fail the LLM call.
+    """
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def _is_json_serializable(value: Any) -> bool:
+    """Whether a value survives the serialization the emitted schema applies.
+
+    ``RecursionError`` is refused alongside the type and value errors, because
+    a value nested deeper than the interpreter's recursion limit cannot be
+    emitted either: ``json.dumps`` gives up at roughly 1200 levels. Refusing
+    it here drops the one key it arrived on, whereas letting it escape would
+    reach the caller's fallback and cost the whole tool its arguments.
+    """
+    try:
+        _compact_json(value)
+    except (TypeError, ValueError, RecursionError):
+        return False
+    return True
+
+
+def _is_finite_number(value: Any) -> bool:
+    """Whether a value is a JSON number, excluding booleans and non-finite floats.
+
+    Python integers are unbounded, so for an integer too large to convert to a
+    float ``math.isfinite`` raises ``OverflowError`` rather than answering.
+    Such a number is no more emittable than an infinity, so it is refused the
+    same way: the key it arrived on is dropped and nothing else is affected.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _is_non_negative_integer(value: Any) -> bool:
+    """Whether a value is a JSON integer of zero or more.
+
+    ``minLength`` and ``maxLength`` count characters, so JSON Schema defines
+    them as non-negative integers. A negative or fractional bound is not a
+    stricter rule the model should honour, it is a malformed one.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+# Every field-schema key this adapter reads: the eight it carries into the
+# emitted schema, the four `_json_schema_to_python_type` resolves a type from,
+# and `default`. A key outside this set reaches neither the emitted schema nor
+# the field's type, so it is dropped -- `items`, `const`, `multipleOf`,
+# `exclusiveMinimum` and `title` among them -- and is counted as such.
+_READ_FIELD_SCHEMA_KEYS = frozenset(
+    {
+        "description",
+        "enum",
+        "pattern",
+        "format",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "default",
+        "type",
+        "anyOf",
+        "oneOf",
+        "allOf",
+    }
+)
+# Numeric field-schema keys carried through, in the order they are emitted,
+# each with the check its own JSON Schema definition calls for. Every key is
+# accepted or dropped on its own value; one key never affects another.
+_FIELD_NUMERIC_METADATA_KEYS = (
+    ("minLength", _is_non_negative_integer),
+    ("maxLength", _is_non_negative_integer),
+    ("minimum", _is_finite_number),
+    ("maximum", _is_finite_number),
+)
+
+
+def _bounded_field_text(value: str) -> str:
+    """Collapse a field description to a bounded single line."""
+    text = " ".join(value.split())
+    if len(text) <= _FIELD_TEXT_MAX_CHARS:
+        return text
+    return text[: _FIELD_TEXT_MAX_CHARS - 1].rstrip() + "…"
+
+
+def _emitted_default(field_schema: Mapping[str, Any]) -> tuple[Any, bool]:
+    """Return the default an optional field emits, and whether the server chose it.
+
+    An optional field the server gave no default still emits ``None``, because
+    that is what makes it optional. That ``None`` is this adapter's doing, not
+    something the connector author asserted, and the second element says so.
+
+    A non-finite default survives ``json.loads`` and would be emitted into the
+    tool schema, where the provider client refuses to serialize it and every
+    LLM call for the agent fails -- not only calls to this tool. Only a bare
+    float needs this guard: a non-finite float nested inside a list or object
+    default is already rendered as null by the schema serializer. Replacing it
+    also makes the emitted default this adapter's own, so it is reported the
+    same way as an absent one.
+    """
+    if "default" not in field_schema:
+        return None, False
+    declared = field_schema["default"]
+    if isinstance(declared, float) and not math.isfinite(declared):
+        return None, False
+    return declared, True
+
+
+def _field_metadata_candidates(
+    field_schema: Mapping[str, Any],
+    *,
+    emitted_default: Any,
+    default_is_authored: bool,
+) -> tuple[list[tuple[str, Any]], int]:
+    """Return the metadata one field may emit, in fixed key order.
+
+    ``field_schema`` comes from an MCP server and is untrusted, so every key is
+    judged on its own: a rejected key never removes another key, the field, or
+    the tool. The order is fixed here rather than taken from the incoming
+    mapping, so a server reordering its JSON cannot change what is emitted.
+    The input is not modified. The second element counts the present keys that
+    were rejected.
+    """
+    candidates: list[tuple[str, Any]] = []
+    rejected = 0
+
+    if "description" in field_schema:
+        raw_description = field_schema["description"]
+        if isinstance(raw_description, str) and raw_description.split():
+            candidates.append(("description", _bounded_field_text(raw_description)))
+        else:
+            rejected += 1
+
+    if "enum" in field_schema:
+        raw_enum = field_schema["enum"]
+        # An over-long enum is dropped whole rather than shortened: a clipped
+        # list still reads as the complete set of legal values, so it would
+        # tell the model that a value the server accepts is illegal.
+        # A default the author wrote that sits outside their own enum
+        # contradicts itself, and the enum is the half this code chose to add,
+        # so the enum gives way. A default this adapter invented carries no
+        # such claim: dropping the author's enum over a `null` they never wrote
+        # would silence the enum on exactly the shape it helps most, an
+        # optional field with no default. Membership is tested member by member
+        # because enum members may be objects, which no hash-based container
+        # would accept.
+        # Only an authored default is capable of the contradiction. An
+        # optional field whose author wrote an enum and no default emits that
+        # enum inside the non-null branch of its `anyOf` and `default: null`
+        # beside the wrapper, and the null validates against the null branch,
+        # so those two say nothing conflicting about each other.
+        if (
+            isinstance(raw_enum, list)
+            and raw_enum
+            and _is_json_serializable(raw_enum)
+            and len(_compact_json(raw_enum)) <= _FIELD_TEXT_MAX_CHARS
+            and (
+                not default_is_authored
+                or any(_json_equal(emitted_default, member) for member in raw_enum)
+            )
+        ):
+            candidates.append(("enum", list(raw_enum)))
+        else:
+            rejected += 1
+
+    if "pattern" in field_schema:
+        raw_pattern = field_schema["pattern"]
+        # A pattern is passed through character for character. The whitespace
+        # collapsing `description` gets would change which strings the regex
+        # matches -- `^a  b$` and `^a b$` accept disjoint sets -- and a regex
+        # is read by a matcher, not by a reader. A truncated regex is
+        # syntactically invalid yet still reads to the model as an
+        # authoritative rule, so an over-long pattern is dropped whole. A
+        # blank pattern states nothing and is dropped as malformed.
+        if (
+            isinstance(raw_pattern, str)
+            and raw_pattern.strip()
+            and len(raw_pattern) <= _FIELD_TEXT_MAX_CHARS
+        ):
+            candidates.append(("pattern", raw_pattern))
+        else:
+            rejected += 1
+
+    if "format" in field_schema:
+        raw_format = field_schema["format"]
+        # The allowlist is the whole gate: `format` is emitted verbatim, so
+        # only a defined token passes, and that set also bounds how long an
+        # accepted token can be.
+        if isinstance(raw_format, str) and raw_format in _KNOWN_FIELD_FORMATS:
+            candidates.append(("format", raw_format))
+        else:
+            rejected += 1
+
+    for key, is_acceptable in _FIELD_NUMERIC_METADATA_KEYS:
+        if key not in field_schema:
+            continue
+        value = field_schema[key]
+        if is_acceptable(value):
+            candidates.append((key, value))
+        else:
+            rejected += 1
+
+    # A key this adapter never reads is dropped just as surely as one that
+    # failed its check, and the author has no way to tell the two apart from
+    # the outside. Counting it keeps the reported number the number of things
+    # the connector declared that did not survive.
+    rejected += sum(1 for key in field_schema if key not in _READ_FIELD_SCHEMA_KEYS)
+
+    return candidates, rejected
+
+
+class _FieldMetadata(NamedTuple):
+    """What one field of one tool emits, named so the read site cannot slip.
+
+    The three parts travel together from the one place that decides them to
+    the one place that builds the field, and a caller that mixed two of them
+    up would put a description where a default belongs.
+    """
+
+    emitted_default: Any
+    description: Optional[str]
+    extra: dict[str, Any]
+
+
+class _ToolFieldMetadata(NamedTuple):
+    """Every field's record for one tool, with what was dropped reaching it.
+
+    The two counts are kept apart because they count different things. A
+    field schema that is not a mapping has no keys to enumerate, so folding
+    it into the key count would report a number nothing measured.
+    """
+
+    fields: dict[str, _FieldMetadata]
+    rejected_keys: int
+    unreadable_fields: int
+
+
+def _tool_field_metadata(
+    properties: Mapping[str, Any],
+    required: Any,
+    excluded_names: set[str],
+) -> _ToolFieldMetadata:
+    """Decide what every field of one tool emits.
+
+    Fields are independent: each key is judged on its own, so nothing one
+    field declares can change what another field emits.
+
+    Returns one record per field the args model will carry -- the default it
+    emits, its description, and its other schema keys -- alongside how much
+    was dropped on the way: the present keys that did not survive, and the
+    fields whose schema could not be read at all. The default is decided here
+    rather than by the caller so that it is derived exactly once per field:
+    the enum rules already need to know it.
+    """
+    metadata: dict[str, _FieldMetadata] = {}
+    rejected_keys = 0
+    unreadable_fields = 0
+
+    for field_name, field_schema in properties.items():
+        if field_name in excluded_names:
+            continue
+
+        if not isinstance(field_schema, Mapping):
+            # A field schema that is not a mapping declares nothing readable,
+            # a default included, so it is recorded empty and left to the
+            # type conversion the caller runs. Reading a default off it first
+            # would raise past the caller instead and cost the tool every one
+            # of its arguments over one malformed field.
+            metadata[field_name] = _FieldMetadata(None, None, {})
+            unreadable_fields += 1
+            continue
+
+        if field_name in required:
+            # A required field has no default to emit, and the enum rules that
+            # consult one do not apply to it.
+            emitted_default: Any = None
+            default_is_authored = False
+        else:
+            emitted_default, default_is_authored = _emitted_default(field_schema)
+
+        candidates, rejected = _field_metadata_candidates(
+            field_schema,
+            emitted_default=emitted_default,
+            default_is_authored=default_is_authored,
+        )
+        rejected_keys += rejected
+
+        description: Optional[str] = None
+        extra: dict[str, Any] = {}
+        for key, value in candidates:
+            if key == "description":
+                description = value
+            else:
+                extra[key] = value
+
+        metadata[field_name] = _FieldMetadata(emitted_default, description, extra)
+
+    return _ToolFieldMetadata(metadata, rejected_keys, unreadable_fields)
 
 
 def _bounded_exception_nodes(
@@ -395,6 +855,7 @@ class MCPToolAdapter(AbstractBaseTool):
         source_server: Optional[str] = None,
         concurrency_safe: bool = False,
         concurrent_tools: Optional[List[str]] = None,
+        raw_annotations: Optional[Mapping[str, Any]] = None,
     ):
         """Initialize MCP tool adapter.
 
@@ -413,8 +874,16 @@ class MCPToolAdapter(AbstractBaseTool):
                 after interruption.
             concurrent_tools: Optional allowlist of raw MCP tool names. Empty
                 means every tool from an opted-in server is safe.
+            raw_annotations: The tool's ``annotations`` object exactly as it
+                arrived on the wire, before the mcp SDK's non-strict models
+                coerced it. Required for an honest ``write_hint``: once
+                parsed, ``1`` and ``"true"`` are indistinguishable from a
+                real ``true``. Omitted means no wire evidence reached this
+                adapter, which classifies as ``UNDECLARED`` -- never as a
+                read-only promise.
         """
         self.mcp_tool = mcp_tool
+        self._raw_annotations = raw_annotations
         self.connection = connection
         self._name_prefix = name_prefix or ""
         self._visibility = visibility or ToolVisibility.PRIVATE
@@ -480,6 +949,25 @@ class MCPToolAdapter(AbstractBaseTool):
         return self.mcp_tool.description or f"Execute MCP tool: {self.mcp_tool.name}"
 
     @property
+    def write_hint(self) -> "MCPWriteHint":
+        """What the server's own annotations claim about this tool's writes.
+
+        Classified from the raw wire annotations captured at load time, not
+        from the parsed ``ToolAnnotations`` object -- see
+        ``classify_write_hint`` for why the distinction is the point rather
+        than a detail. An adapter built without that evidence reports
+        ``UNDECLARED``, which a consumer must treat as a write.
+
+        Not a trust boundary. The spec says annotations are hints and a
+        client "should never make tool use decisions based on
+        ToolAnnotations received from untrusted servers". A server that lies
+        in the permissive direction is upstream of anything this can check;
+        what is guaranteed here is only that malformed or self-contradictory
+        input never reads as the permissive answer.
+        """
+        return classify_write_hint(self._raw_annotations)
+
+    @property
     def tags(self) -> List[str]:
         """Get tags for this tool."""
         tags = ["mcp"]
@@ -506,7 +994,31 @@ class MCPToolAdapter(AbstractBaseTool):
         return True
 
     def _build_args_model(self) -> Type[BaseModel]:
-        """Build Pydantic model from MCP tool input schema."""
+        """Build Pydantic model from MCP tool input schema.
+
+        Field-level metadata the connector author wrote (description, enum,
+        pattern, format and the length/range bounds) is carried through to the
+        emitted schema as presentation only: it goes in as
+        ``json_schema_extra``, which never becomes a Pydantic validator, so
+        argument validation behaves exactly as it would without it.
+
+        Only the tool's own top-level fields are read. A nested ``object`` or
+        an ``array`` item schema is already flattened to a bare Python type
+        here, so metadata a connector wrote on a nested sub-field or on an
+        array's items is not extracted and does not reach the model.
+
+        The metadata is attached to the field's annotation rather than placed
+        beside the field. For an optional field Pydantic emits an ``anyOf``
+        wrapper, and a consumer that resolves that wrapper down to its
+        non-null branch keeps only what that branch holds; metadata placed
+        beside the wrapper would be dropped there, which is exactly the shape
+        the fix is for.
+
+        A field's default is the one exception, and it is not presentation: a
+        non-finite default is replaced by ``None``, so such a field is omitted
+        from the arguments sent to the server instead of carrying a value no
+        provider client can serialize.
+        """
         try:
             if not self.mcp_tool.inputSchema:
                 # No input parameters
@@ -532,19 +1044,53 @@ class MCPToolAdapter(AbstractBaseTool):
             # Build field definitions for create_model
             fields: Dict[str, Any] = {}
             runtime_bound_args = self._runtime_bound_tool_argument_names(properties)
+            tool_metadata = _tool_field_metadata(
+                properties, required, runtime_bound_args
+            )
+            metadata = tool_metadata.fields
 
             for field_name, field_schema in properties.items():
                 if field_name in runtime_bound_args:
                     continue
-                field_type = self._json_schema_to_python_type(field_schema)
+                # Both loops walk `properties` skipping the same names, so
+                # every field reaching here has a record.
+                field_metadata = metadata[field_name]
+                annotation: Any = self._json_schema_to_python_type(field_schema)
+
+                if field_metadata.description is not None or field_metadata.extra:
+                    # Carried on the annotation so it lands inside the
+                    # non-null branch of the `anyOf` an optional field gets.
+                    # A field with nothing to say is left alone, so its
+                    # emitted schema is unchanged.
+                    annotation = Annotated[
+                        annotation,
+                        Field(
+                            description=field_metadata.description,
+                            json_schema_extra=field_metadata.extra or None,
+                        ),
+                    ]
 
                 # Check if field is required
                 if field_name in required:
-                    fields[field_name] = (field_type, ...)
+                    fields[field_name] = (annotation, ...)
                 else:
                     # Optional field with default
-                    default_value = field_schema.get("default", None)
-                    fields[field_name] = (Optional[field_type], default_value)
+                    fields[field_name] = (
+                        Optional[annotation],
+                        field_metadata.emitted_default,
+                    )
+
+            if tool_metadata.rejected_keys or tool_metadata.unreadable_fields:
+                # One line per tool, whatever the connector declared. A
+                # malformed schema can drop keys on many fields at once, and
+                # a line per key would turn one bad connector into a flood.
+                logger.debug(
+                    "MCP tool %s dropped %d field schema metadata keys "
+                    "and %d unreadable field schemas",
+                    self.mcp_tool.name,
+                    tool_metadata.rejected_keys,
+                    tool_metadata.unreadable_fields,
+                )
 
             # Create the model
             model_name = f"{self.mcp_tool.name.title().replace('_', '')}Args"
@@ -654,6 +1200,13 @@ class MCPToolAdapter(AbstractBaseTool):
             return all(item == "null" for item in schema_type)
         return False
 
+    # Caps the string this method will attempt to recover as a double-encoded
+    # array/scalar (see below). A real LLM double-encoding mistake is small —
+    # '["date"]', not a multi-KB blob — so anything past this length is out of
+    # scope for the recovery and just takes the raw-wrap fallback instead of
+    # being handed to json.loads at all.
+    _ARRAY_ARG_JSON_RECOVERY_MAX_CHARS = 4096
+
     def _normalize_args_by_schema(self, args: Mapping[str, Any]) -> Dict[str, Any]:
         """Normalize common LLM argument shape mistakes using the MCP input schema."""
         normalized_args = dict(args)
@@ -672,6 +1225,31 @@ class MCPToolAdapter(AbstractBaseTool):
             if value is None:
                 continue
             if self._schema_is_array_only(field_schema) and not isinstance(value, list):
+                if (
+                    isinstance(value, str)
+                    and len(value) <= self._ARRAY_ARG_JSON_RECOVERY_MAX_CHARS
+                ):
+                    # Tool-calling models sometimes double-encode an
+                    # array-only argument as a JSON string instead of a real
+                    # array — e.g. '["date"]', or even a lone item as
+                    # '"date"'. Recover the intended value before falling
+                    # back to the raw wrap below, which would otherwise
+                    # leak the string's own brackets/quotes into a garbled
+                    # single item. Both ValueError (json.JSONDecodeError,
+                    # and CPython's int-string-conversion digit-limit guard
+                    # for a long run of digits) and RecursionError (a
+                    # pathologically deep bracket string) mean the same
+                    # thing here: not recoverable, fall back below.
+                    try:
+                        parsed_value = json.loads(value)
+                    except (ValueError, RecursionError):
+                        parsed_value = None
+                    if isinstance(parsed_value, list):
+                        normalized_args[field_name] = parsed_value
+                        continue
+                    if isinstance(parsed_value, str):
+                        normalized_args[field_name] = [parsed_value]
+                        continue
                 normalized_args[field_name] = [value]
 
         return normalized_args
@@ -1195,6 +1773,10 @@ def _build_mcp_tool_adapter(
         source_server=normalize_mcp_server_name(server_name),
         concurrency_safe=concurrency_safe,
         concurrent_tools=concurrent_tools,
+        # Read off the tool the loader produced -- both the direct and the
+        # sandboxed loader attach it, so one builder serves both paths and
+        # neither can quietly lose the evidence the other keeps.
+        raw_annotations=raw_annotations_for(mcp_tool),
     )
 
 

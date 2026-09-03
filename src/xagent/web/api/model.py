@@ -52,11 +52,24 @@ from ..schemas.model import (
     UserDefaultModelCreate,
     UserDefaultModelResponse,
 )
-from ..services.llm_utils import CoreStorage
+from ..services.llm_utils import (
+    PLATFORM_MODEL_MANAGER,
+    CoreStorage,
+    is_platform_model_id,
+)
 from ..services.model_store import ModelSharingConflictError, ModelStore
 from ..user_isolated_memory import UserContext
 
 logger = logging.getLogger(__name__)
+
+# Single source of truth for the connection-test wait budget: how long this
+# endpoint waits for a provider to answer before giving up, not a statement
+# about the provider's own health. Shared by the per-category probes in
+# ``test_model_connection`` and by ``_validate_provider_model_listing``,
+# which those probes call for the "image"/"speech" categories -- passing it
+# through as a parameter there keeps this the only literal, so the two
+# layers of ``asyncio.wait_for`` around a listing call can never diverge.
+_CONNECTION_TEST_TIMEOUT_SECONDS = 60.0
 
 # ---------------------------------------------------------------------------
 # Hook infrastructure for dynamic model sharing
@@ -320,9 +333,20 @@ async def _validate_provider_model_listing(
     model_name: str,
     api_key: Optional[str],
     base_url: Optional[str],
+    timeout_seconds: float,
     requested_abilities: Optional[List[str]] = None,
 ) -> None:
-    """Validate provider connectivity by fetching the provider model list."""
+    """Validate provider connectivity by fetching the provider model list.
+
+    ``timeout_seconds`` is the caller's connection-test budget
+    (``_CONNECTION_TEST_TIMEOUT_SECONDS`` in ``test_model_connection``), not
+    a separate value owned by this function -- it must be threaded through
+    rather than re-hardcoded here, or the outer ``wait_for`` around this call
+    and this one can silently diverge. The aiohttp transport-level ``total``
+    timeout inside ``fetch_models_from_provider`` (30s, in
+    ``model_list_service.py``) is a different, lower-level bound and is
+    unaffected by this parameter.
+    """
 
     import asyncio
 
@@ -339,7 +363,7 @@ async def _validate_provider_model_listing(
 
     models = await asyncio.wait_for(
         fetch_models_from_provider(provider, api_key or "", base_url),
-        timeout=10.0,
+        timeout=timeout_seconds,
     )
     # "auto" is a virtual OpenRouter model routed in-process by xrouter-llm; it is
     # not a real OpenRouter slug, so the fetch above only confirms connectivity —
@@ -416,6 +440,12 @@ async def create_model(
     logger.info(f"  Provider: {model.model_provider}")
     logger.info(f"  Abilities: {model.abilities}")
     logger.info(f"  Model name: {model.model_name}")
+
+    if is_platform_model_id(model.model_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Model IDs beginning with 'platform/' are reserved",
+        )
 
     # Check if model_id already exists
     model_storage = CoreStorage(db, DBModel)
@@ -678,7 +708,7 @@ async def test_model_connection(
     from xagent.core.model.xinference_base import BaseXinferenceModel
 
     start_time = time.time()
-    timeout_seconds = 10.0
+    timeout_seconds = _CONNECTION_TEST_TIMEOUT_SECONDS
     try:
         provider = canonical_provider_name(request.model_provider)
         base_url = request.base_url or default_base_url_for_provider(provider)
@@ -775,6 +805,7 @@ async def test_model_connection(
                     model_name=request.model_name,
                     api_key=request.api_key,
                     base_url=base_url,
+                    timeout_seconds=timeout_seconds,
                     requested_abilities=request.abilities,
                 ),
                 timeout=timeout_seconds,
@@ -822,6 +853,7 @@ async def test_model_connection(
                     model_name=request.model_name,
                     api_key=request.api_key,
                     base_url=base_url,
+                    timeout_seconds=timeout_seconds,
                     requested_abilities=requested_abilities,
                 ),
                 timeout=timeout_seconds,
@@ -955,7 +987,11 @@ async def test_model_connection(
             status="failed",
             response_time=response_time,
             message="Connection timed out",
-            error=f"Connection timed out after {int(timeout_seconds)} seconds. Please check your network connection and provider status.",
+            error=(
+                f"The model did not respond within {int(timeout_seconds)} seconds "
+                "(this application's waiting limit). Slow or reasoning-heavy "
+                "models may need longer; the provider may still be healthy."
+            ),
         )
     except Exception as e:
         logger.error(f"Model connection test failed: {e}")
@@ -1857,6 +1893,23 @@ async def update_model(
     """Update a model configuration"""
     _, db_model_ref, user_model = _resolve_accessible_model(db, user, model_id)
 
+    category_changes = (
+        model_update.category is not None
+        and model_update.category != db_model_ref.category
+    )
+    if db_model_ref.managed_by == PLATFORM_MODEL_MANAGER and category_changes:
+        raise HTTPException(
+            status_code=409,
+            detail="The category of a platform-managed model is immutable",
+        )
+    if is_platform_model_id(db_model_ref.model_id) or (
+        db_model_ref.managed_by == PLATFORM_MODEL_MANAGER
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Platform model identities cannot be mutated by users",
+        )
+
     # Permission: only owner can edit
     if user_model.user_id != user.id or not user_model.can_edit:
         raise HTTPException(status_code=403, detail="No permission to edit this model")
@@ -1942,7 +1995,15 @@ async def delete_model(
     model_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ) -> dict:
     """Delete a model configuration"""
-    model_storage, _, user_model = _resolve_accessible_model(db, user, model_id)
+    model_storage, db_model, user_model = _resolve_accessible_model(db, user, model_id)
+
+    if is_platform_model_id(db_model.model_id) or (
+        db_model.managed_by == PLATFORM_MODEL_MANAGER
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Platform model identities cannot be mutated by users",
+        )
 
     # Permission: only owner can delete
     if user_model.user_id != user.id or not user_model.can_delete:
