@@ -105,7 +105,6 @@ from ..services.client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
     CLIENT_SAFE_VALIDATION_ERROR,
     ClientErrorCode,
-    PublicErrorDetails,
     client_error_message,
 )
 from ..services.db_runtime import (
@@ -352,52 +351,35 @@ def create_terminal_task_error_event(
     message: str,
     *,
     code: str | None = None,
-    details: PublicErrorDetails | None = None,
 ) -> dict[str, Any]:
     """Shape an error event after the exact lease owner commits FAILED.
 
-    ``code`` and ``details`` are written only when both survive validation, so
-    a caller that passes neither still gets the same six-key frame, and a
-    caller that passes something unusable gets that same frame rather than an
-    exception. This runs on the reporting path of an already-failed task, and
-    the one call site that passes these arguments evaluates them inside the
-    ``except Exception`` that only logs a failed broadcast -- so raising here
-    would cost the terminal frame outright and leave the user on the silent
+    ``code`` is written only when it survives validation, so a caller that
+    passes none still gets the same six-key frame, and a caller that passes
+    something unusable gets that same frame rather than an exception. This
+    runs on the reporting path of an already-failed task, and the one call
+    site that passes this argument evaluates it inside the ``except
+    Exception`` that only logs a failed broadcast -- so raising here would
+    cost the terminal frame outright and leave the user on the silent
     failure this path exists to remove. A bad optional argument costs that
-    argument and nothing else. Both rejections are logged with their stack.
+    argument and nothing else. The rejection is logged with its stack.
 
-    ``details`` is accepted as ``PublicErrorDetails`` itself and nothing else
-    -- not a subclass -- because that class's ``__post_init__`` is where the
-    reason whitelist lives. ``code`` must be a member of ``V1ErrorCode``, the
-    repository's closed set of client-visible error codes.
+    ``code`` must be a member of the connector-runtime family the client
+    renders, the repository's closed set of client-visible error codes.
     """
 
     # Python annotations are not enforced at run time, so the mypy gate on the
     # signature above is not the whole door: a caller that routes through Any
     # (a dict from JSON, a **kwargs splat) type-checks clean and would reach
-    # to_wire() as an AttributeError deep in this function. Name the contract
-    # here instead.
+    # this function with a value of the wrong shape. Name the contract here
+    # instead.
     #
-    # `type(...) is`, not isinstance: a frozen dataclass can be subclassed, and
-    # a subclass that overrides to_wire() without reading self.reason passes
-    # both isinstance and mypy while bypassing the whitelist in __post_init__.
-    # Only the class itself carries that guarantee.
-    if details is not None and type(details) is not PublicErrorDetails:
-        logger.error(
-            "task_id=%s component=terminal-error-frame dropped=details "
-            "type=%s; the frame is still sent without it",
-            task_id,
-            type(details).__name__,
-            stack_info=True,
-        )
-        details = None
-
     # ConnectorRuntimeError types its code as a bare str and stores it
     # unvalidated, so "only the ten module constants reach here" is a fact
     # about today's raise sites, not a property the code holds. The type
-    # check comes first for the same reason `details` has one: annotations
-    # are not enforced, and an unhashable value would raise inside the
-    # membership test on a path whose whole point is that it never raises.
+    # check comes first for the same reason: annotations are not enforced,
+    # and an unhashable value would raise inside the membership test on a
+    # path whose whole point is that it never raises.
     if code is not None and (
         not isinstance(code, str) or code not in _client_visible_error_codes()
     ):
@@ -421,9 +403,8 @@ def create_terminal_task_error_event(
         "error": message,
         "timestamp": datetime.now(timezone.utc).timestamp(),
     }
-    if code is not None and details is not None:
+    if code is not None:
         event["code"] = code
-        event["details"] = details.to_wire()
     return event
 
 

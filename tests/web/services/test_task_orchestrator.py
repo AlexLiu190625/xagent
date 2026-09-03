@@ -71,10 +71,7 @@ from xagent.web.services.chat_history_service import (
     inspect_user_message_delivery,
     mark_user_message_delivery,
 )
-from xagent.web.services.client_error_messages import (
-    CLIENT_SAFE_TASK_FAILURE,
-    PublicErrorDetails,
-)
+from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from xagent.web.services.connector_runtime import (
     get_ephemeral_runtime_values,
     pop_ephemeral_runtime_values,
@@ -4015,8 +4012,8 @@ async def test_incidental_failure_still_redacts(
 
 
 @pytest.mark.asyncio
-async def test_connector_runtime_frame_details_shape(db_session) -> None:
-    """Whatever the raise site attached, only ``reason`` can reach the wire."""
+async def test_connector_runtime_frame_carries_code_only(db_session) -> None:
+    """Whatever the raise site attached to ``details``, none of it reaches the wire."""
 
     error = ConnectorRuntimeError(
         "runtime_secret_unavailable",
@@ -4037,8 +4034,16 @@ async def test_connector_runtime_frame_details_shape(db_session) -> None:
         task = db_session.query(Task).filter(Task.id == task_id).one()
         await _run_failing_turn(task_id, int(task.user_id), task.source)
 
-    assert set(frames[0]["details"]) <= {"reason"}
-    assert frames[0]["details"] == {"reason": PUBLIC_REASON}
+    assert set(frames[0]) == {
+        "type",
+        "message",
+        "task_id",
+        "task",
+        "error",
+        "timestamp",
+        "code",
+    }
+    assert "details" not in frames[0]
 
 
 @pytest.mark.asyncio
@@ -4077,9 +4082,7 @@ async def test_connector_runtime_frame_never_carries_connector_ref(
         "error",
         "timestamp",
         "code",
-        "details",
     }
-    assert set(frame["details"]) <= {"reason"}
     serialized = json.dumps(frame)
     assert "connector_ref" not in serialized
     assert "connector_id" not in serialized
@@ -4089,7 +4092,7 @@ async def test_connector_runtime_frame_never_carries_connector_ref(
 async def test_connector_runtime_frame_reason_matches_direct_construction(
     db_session,
 ) -> None:
-    """End to end, the frame carries exactly what the type would produce."""
+    """End to end, a listed reason on the exception still never reaches the wire."""
 
     error = ConnectorRuntimeError(
         "missing_runtime_context",
@@ -4105,8 +4108,7 @@ async def test_connector_runtime_frame_reason_matches_direct_construction(
         task = db_session.query(Task).filter(Task.id == task_id).one()
         await _run_failing_turn(task_id, int(task.user_id), task.source)
 
-    assert frames[0]["details"] == PublicErrorDetails(reason=PUBLIC_REASON).to_wire()
-    assert frames[0]["details"] == {"reason": PUBLIC_REASON}
+    assert "details" not in frames[0]
 
 
 @pytest.mark.asyncio
@@ -4185,11 +4187,11 @@ async def test_connector_runtime_failure_persists_client_safe_history(
     # the client replaces it with its own localized wording (see the
     # "terminal error frames" suite in app-context-chat.test.tsx). What the two
     # views owe each other is the facts they carry, and the key name is in
-    # neither -- the whitelist drops the reason that names it, so the frame
-    # cannot carry it and the client cannot render it.
+    # neither -- the frame never carries a details object at all, so there is
+    # no key name for the client to render.
     assert settled["client_error_message"] == safe_message
     assert settled["client_error_message"] == frames[0]["message"]
-    assert frames[0]["details"] == {}
+    assert "details" not in frames[0]
     assert "auth_token" not in json.dumps(frames[0])
     # The durable error keeps the code prefix operators grep for, and never
     # the "setup/run error: <ExceptionType>" shape the else branch produces.

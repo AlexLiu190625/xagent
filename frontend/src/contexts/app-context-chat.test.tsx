@@ -5819,9 +5819,10 @@ describe("terminal error frames", () => {
     expect(screen.getByTestId("waiting-interactions").textContent).not.toBe("[]")
   })
 
-  // A listed reason that is a bare enum value names no key, so the keyless
-  // wording is chosen even though the code is a missing-value one.
-  it("uses the same wording for a listed bare reason", async () => {
+  // The frame's code alone decides the wording -- nothing the raise site
+  // attached beyond the code reaches the client, so a missing-value code
+  // gets its own table entry regardless of what it would have named.
+  it("resolves wording from the code alone", async () => {
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -5841,7 +5842,6 @@ describe("terminal error frames", () => {
         message: "Connector secrets are unavailable.",
         error: "Connector secrets are unavailable.",
         code: "runtime_secret_unavailable",
-        details: { reason: "not_provided" },
       } as TestWebSocketMessage)
     })
 
@@ -5855,19 +5855,19 @@ describe("terminal error frames", () => {
     const bubble = messages.find((m: { content: string }) =>
       m.content.includes("clientErrors.runtimeSecretUnavailable")
     )
-    // Same toBe as the test below, on the other input: this branch is reached
-    // with a listed bare reason rather than an empty details, and an
-    // interpolation regression has to be caught on both.
+    // Same toBe as the test below, on a different code: an interpolation
+    // regression has to be caught on both.
     expect(bubble?.content).toBe("clientErrors.runtimeSecretUnavailable")
   })
 
   // What the server now sends for a missing declared context key: the code
-  // survives, the reason naming the key does not. The bubble therefore says a
-  // value is missing without saying which -- the key name is owner
-  // configuration and this frame reaches anonymous widget and share-link
-  // visitors. Asserted with toBe, under a variable-aware i18n mock: had the
-  // wording interpolated anything, the content would read
-  // "<key>:{...}" and this assertion would fail.
+  // survives, and nothing else about the failure -- the key name included --
+  // ever reaches this frame at all. The bubble therefore says a value is
+  // missing without saying which -- the key name is owner configuration and
+  // this frame reaches anonymous widget and share-link visitors. Asserted
+  // with toBe, under a variable-aware i18n mock: had the wording
+  // interpolated anything, the content would read "<key>:{...}" and this
+  // assertion would fail.
   it("names no declared key when a runtime value is missing", async () => {
     render(
       <AppProvider token="token">
@@ -5888,7 +5888,6 @@ describe("terminal error frames", () => {
         message: "Required connector runtime context is missing.",
         error: "Required connector runtime context is missing.",
         code: "missing_runtime_context",
-        details: {},
       } as TestWebSocketMessage)
     })
 
@@ -5932,7 +5931,6 @@ describe("terminal error frames", () => {
         message: "Connector runtime is unavailable.",
         error: "Connector runtime is unavailable.",
         code: "connector_runtime_unavailable",
-        details: { reason: "team_env_resolution_failed" },
       } as TestWebSocketMessage)
     })
 
@@ -5951,13 +5949,12 @@ describe("terminal error frames", () => {
   })
 
   // The dedup identity is the frame's own (run_id, state_version), not its
-  // code or reason. These two turns fail under one code for two different
-  // admitted reasons -- the same runtime secret, first never provided, then
-  // lost from its store -- and each settlement bumps state_version at least
-  // once (the retry takes the lease FAILED -> RUNNING, then settles RUNNING
-  // -> FAILED), so the second turn's version is strictly greater. Two
-  // distinct versions mean two distinct identities, and the bubble is the
-  // turn's result.
+  // code. These two turns fail under the same code -- the same runtime
+  // secret, both times unavailable -- and each settlement bumps
+  // state_version at least once (the retry takes the lease FAILED ->
+  // RUNNING, then settles RUNNING -> FAILED), so the second turn's version
+  // is strictly greater. Two distinct versions mean two distinct
+  // identities, and the bubble is the turn's result.
   it("keeps both bubbles when one code fails twice at different state versions", async () => {
     render(
       <AppProvider token="token">
@@ -5969,24 +5966,22 @@ describe("terminal error frames", () => {
     const onMessage = webSocketOptions.current?.onMessage
     expect(onMessage).toBeDefined()
 
-    const frameForReason = (reason: string, timestamp: string, stateVersion: number) => ({
+    const frameAtVersion = (timestamp: string, stateVersion: number) => ({
       type: "task_error",
       timestamp,
       task_id: 1,
       task: { id: 1, status: "failed" },
       // Identical on both frames, and that is the production shape:
-      // _message_for_code returns one string per code and does not vary with
-      // the reason.
+      // _message_for_code returns one string per code.
       message: "Required runtime secret is unavailable.",
       error: "Required runtime secret is unavailable.",
       code: "runtime_secret_unavailable",
-      details: { reason },
       run_id: "run-1",
       state_version: stateVersion,
     }) as TestWebSocketMessage
 
     act(() => {
-      onMessage?.(frameForReason("not_provided", "2026-05-27T05:00:02Z", 12))
+      onMessage?.(frameAtVersion("2026-05-27T05:00:02Z", 12))
     })
     await waitFor(() => {
       expect(screen.getByTestId("messages").textContent).toContain(
@@ -5995,7 +5990,7 @@ describe("terminal error frames", () => {
     })
 
     act(() => {
-      onMessage?.(frameForReason("store_lost", "2026-05-27T05:00:03Z", 14))
+      onMessage?.(frameAtVersion("2026-05-27T05:00:03Z", 14))
     })
 
     await waitFor(() => {
@@ -6032,7 +6027,6 @@ describe("terminal error frames", () => {
       message: "Required runtime secret is unavailable.",
       error: "Required runtime secret is unavailable.",
       code: "runtime_secret_unavailable",
-      details: { reason: "not_provided" },
       run_id: "run-1",
       state_version: 12,
     } as TestWebSocketMessage
@@ -6062,11 +6056,10 @@ describe("terminal error frames", () => {
     })
   })
 
-  // Blocking issue 1's direct anchor: two failed turns under the same code
-  // and the same reason, distinguished only by their state_version. Keying
-  // on the failure's class -- the code, the reason, or the rendered
-  // sentence -- cannot tell these apart; keying on the frame's own state
-  // tuple can.
+  // Two failed turns under the same code, distinguished only by their
+  // state_version. Keying on the failure's class -- the code or the
+  // rendered sentence -- cannot tell these apart; keying on the frame's own
+  // state tuple can.
   it("keeps both bubbles when one failure repeats on the next turn", async () => {
     render(
       <AppProvider token="token">
@@ -6086,7 +6079,6 @@ describe("terminal error frames", () => {
       message: "Required runtime secret is unavailable.",
       error: "Required runtime secret is unavailable.",
       code: "runtime_secret_unavailable",
-      details: { reason: "not_provided" },
       run_id: "run-1",
       state_version: stateVersion,
     }) as TestWebSocketMessage
@@ -6116,10 +6108,10 @@ describe("terminal error frames", () => {
     })
   })
 
-  // Blocking issue 2's direct anchor: two failed turns that carry no code at
-  // all -- the rendered sentence is identical on both -- distinguished only
-  // by their state_version. Before this change the dedup key was the
-  // rendered sentence alone, so the second of these vanished and that bubble
+  // Two failed turns that carry no code at all -- the rendered sentence is
+  // identical on both -- distinguished only by their state_version. Before
+  // this change the dedup key was the rendered sentence alone, so the
+  // second of these vanished and that bubble
   // is the turn's result.
   it("keeps both bubbles for two generic failures on consecutive turns", async () => {
     render(
@@ -6168,7 +6160,7 @@ describe("terminal error frames", () => {
     })
   })
 
-  // The widest form of blocking issue 2: a generic failure on an untrusted
+  // The widest form of the same case: a generic failure on an untrusted
   // transport reads the same fixed "Unknown error" constant regardless of
   // what precedes it, so a version-blind identity would collapse it into
   // whatever coded failure happened to precede it within the window. The
@@ -6195,7 +6187,6 @@ describe("terminal error frames", () => {
         message: "Required connector runtime context is missing.",
         error: "Required connector runtime context is missing.",
         code: "missing_runtime_context",
-        details: {},
         run_id: "run-1",
         state_version: 12,
       } as TestWebSocketMessage)
@@ -6237,7 +6228,7 @@ describe("terminal error frames", () => {
     })
   })
 
-  // I-B's witness at the integration level: two non-terminal rejections each
+  // The witness at the integration level: two non-terminal rejections each
   // carry a version ("error" is in VERSIONED_TASK_EVENT_TYPES too), but the
   // terminal-only identity must not leak into this channel -- if it did, two
   // different versions would make these look like two distinct rejections
@@ -6289,12 +6280,11 @@ describe("terminal error frames", () => {
     })
   })
 
-  // Blocking issue 3's direct anchor: connector_runtime_unavailable now has
-  // its own table entry, so it survives a transport that marks legacy prose
-  // untrusted the same way the three previously-curated codes always did.
-  // Before this, only those three had client-side wording; every other code,
-  // this one included, fell through to "Unknown error" for an anonymous
-  // widget or share-link visitor.
+  // connector_runtime_unavailable has its own table entry, so it survives a
+  // transport that marks legacy prose untrusted the same way the three
+  // previously-curated codes always did. Before this, only those three had
+  // client-side wording; every other code, this one included, fell through
+  // to "Unknown error" for an anonymous widget or share-link visitor.
   it("localizes a connector-runtime code for an untrusted transport", async () => {
     render(
       <AppProvider token="public-token" transport={{ legacyErrorProse: "untrusted" }}>
@@ -6315,7 +6305,6 @@ describe("terminal error frames", () => {
         message: "Connector runtime is unavailable.",
         error: "Connector runtime is unavailable.",
         code: "connector_runtime_unavailable",
-        details: { reason: "team_env_resolution_failed" },
       } as TestWebSocketMessage)
     })
 
@@ -6358,7 +6347,6 @@ describe("terminal error frames", () => {
         message: "Connector could not be found.",
         error: "Connector could not be found.",
         code: "connector_not_found",
-        details: {},
       } as TestWebSocketMessage)
     })
 
@@ -6371,8 +6359,8 @@ describe("terminal error frames", () => {
 
   // getTaskErrorProjection reads `data?.code` before `root.code` -- this
   // pins the nested half of that fallback, which no existing fixture
-  // exercises (they all carry code/details on the root).
-  it("reads code and details nested under data", async () => {
+  // exercises (they all carry code on the root).
+  it("reads code nested under data", async () => {
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -6390,7 +6378,6 @@ describe("terminal error frames", () => {
         task_id: 1,
         data: {
           code: "missing_runtime_context",
-          details: {},
         },
       } as TestWebSocketMessage)
     })
@@ -6417,7 +6404,6 @@ describe("error frame display projection", () => {
         message: "Required connector runtime context is missing.",
         error: "Required connector runtime context is missing.",
         code: "missing_runtime_context",
-        details: {},
       } as unknown as TaskControlMessage,
       trustLegacyErrorProse: true,
       expected: {
@@ -6427,7 +6413,7 @@ describe("error frame display projection", () => {
         dedupText: "Required connector runtime context is missing.",
         // No run_id/state_version on this fixture, same as production for a
         // frame the version gate would drop once any versioned event has
-        // been seen -- see I-A and cell 2 below.
+        // been seen; the second case below is the witness for that fallback.
         occurrenceIdentity: undefined,
         bubbleContent: "clientErrors.missingRuntimeContext",
         isResult: true,
@@ -6450,7 +6436,7 @@ describe("error frame display projection", () => {
         stopsProcessing: true,
         dedupText: "Task execution failed.",
         // This is the witness for withholding the identity when the frame
-        // has no state version -- see I-A.
+        // has no state version.
         occurrenceIdentity: undefined,
         bubbleContent: "agent.logs.event.messages.errorPrefix Task execution failed.",
         isResult: true,
@@ -6466,7 +6452,6 @@ describe("error frame display projection", () => {
         message: "Required connector runtime context is missing.",
         error: "Required connector runtime context is missing.",
         code: "missing_runtime_context",
-        details: {},
       } as unknown as TaskControlMessage,
       trustLegacyErrorProse: false,
       expected: {
@@ -6480,7 +6465,7 @@ describe("error frame display projection", () => {
       },
     },
     {
-      name: "a terminal frame with a state version and a listed reason on a trusted transport",
+      name: "a terminal frame with a state version on a trusted transport",
       frame: {
         type: "task_error",
         timestamp: "2026-05-27T05:00:02Z",
@@ -6489,7 +6474,6 @@ describe("error frame display projection", () => {
         message: "Required runtime secret is unavailable.",
         error: "Required runtime secret is unavailable.",
         code: "runtime_secret_unavailable",
-        details: { reason: "not_provided" },
         run_id: "run-1",
         state_version: 12,
       } as unknown as TaskControlMessage,
@@ -6546,7 +6530,7 @@ describe("error frame display projection", () => {
         stopsProcessing: false,
         dedupText: "Task is currently busy; please wait for the previous turn to finish.",
         // This is the witness for keeping the terminal-only identity out of
-        // the rejection channel -- see I-B.
+        // the rejection channel.
         occurrenceIdentity: undefined,
         bubbleContent: "agent.logs.event.messages.errorPrefix Task is currently busy; please wait for the previous turn to finish.",
         isResult: false,

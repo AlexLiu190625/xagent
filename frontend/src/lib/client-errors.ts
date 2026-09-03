@@ -28,9 +28,8 @@ const CLIENT_ERROR_CODES = [
   // ClientErrorCode enum -- this list is already a superset of that enum (the
   // three upload_* codes are client-side only) and stays one table so a code
   // has one wording for every audience. Only codes with a producer that can
-  // reach that frame today are listed, the same rule the server's reason
-  // whitelist states about itself: a listed code nothing produces is an entry
-  // with no expiry date. Which codes those are is a fact about this
+  // reach that frame today are listed: a listed code nothing produces is an
+  // entry with no expiry date. Which codes those are is a fact about this
   // repository's raise sites, not a property the wire holds -- the field is
   // typed as a bare string and validated only against the full V1ErrorCode
   // set (see websocket.py's own note above that check), and a resolver

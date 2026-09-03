@@ -2,11 +2,10 @@
 
 Holds the fixed fallback strings used when a failure has nothing safe to
 say, the per-exception adapters that pass a curated message through, and
-``PublicErrorDetails`` -- the only structured payload allowed onto a
-task_error frame, together with the reason allowlist that governs it.
+the projector that lifts a connector-runtime failure's code onto a
+task_error frame.
 """
 
-from dataclasses import dataclass
 from enum import StrEnum
 
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
@@ -140,125 +139,26 @@ def connector_runtime_client_message(
     return fallback
 
 
-CONNECTOR_RUNTIME_PUBLIC_REASONS = frozenset(
-    {
-        # Missing values and binding.
-        "not_provided",
-        "store_lost",
-        "connector_not_selected",
-        "auth_selector_not_supported",
-        "duplicate_ref",
-        "undeclared_context_key",
-        "undeclared_secrets_key",
-        "undeclared_auth_selector_key",
-        # Fixed 503 strings built by direct ConnectorRuntimeError construction
-        # in three other modules. Each one states that a server-side component
-        # is unavailable; none of them states who owns the task, or how an
-        # authorization check resolved. Two further strings of exactly this
-        # shape (runtime_task_identity_mismatch, runtime_owner_mismatch) are
-        # deliberately absent for that reason -- see the class docstring below.
-        "team_scope_resolution_failed",
-        # Same module, same shape: the generic-exception fallback arm of
-        # resolve_connector_access_or_raise() in connector_team_scope.py.
-        # It states that resolving connector access failed, not who owns the
-        # task or what the access check concluded.
-        "connector_access_resolution_failed",
-        "team_env_resolution_failed",
-        "runtime_view_resolution_failed",
-        "custom_api_config_load_failed",
-    }
-)
-# Every member above is raised somewhere in this repository today, and a test
-# asserts that in both directions. Add a reason here in the same change that
-# adds the site raising it, never ahead of it: a listed reason nothing produces
-# is an allowance with no expiry date, and by the time the raising code arrives
-# nobody remembers which audience the reason was judged against.
-
-
-def _is_public_reason(reason: object) -> bool:
-    """True when this reason may reach a client. Used by PublicErrorDetails.
-
-    Membership is the whole rule: the listed values are fixed strings this
-    repository writes, so reading the list tells you exactly what can reach a
-    visitor. A reason assembled from something the connector's owner wrote --
-    ``missing_context.<declared key name>`` is the one such reason raised here
-    -- is not admitted, however legal its shape, because this frame reaches
-    anonymous widget and share-link visitors and a key name is the owner's
-    configuration. Owners read key names from the per-task requirements
-    endpoint, which selects on ``Task.id == task_id AND
-    Task.user_id == current_user.id``.
-    """
-
-    return isinstance(reason, str) and reason in CONNECTOR_RUNTIME_PUBLIC_REASONS
-
-
-@dataclass(frozen=True)
-class PublicErrorDetails:
-    """The only shape allowed into a task_error frame's ``details``.
-
-    ``reason`` is normalized on construction: anything that is not a listed
-    enum member becomes ``None``. Constructing this type and passing the
-    reason whitelist are therefore the same act -- there is no path that
-    produces an instance carrying free text, including a direct call from
-    another module.
-
-    Nulling rather than raising is deliberate: every construction site is on
-    the reporting path of an already-failed task, and raising there would
-    turn a diagnosable failure into an undiagnosable crash.
-
-    The sink is ``broadcast_to_task``, whose audience includes anonymous
-    widget and share-link visitors, so every listed reason and every new
-    field has to answer two questions, and a yes to either keeps it off this
-    frame. First: can a visitor who is not the task owner read the task's
-    ownership, or the outcome of an authorization check, out of it? Second:
-    does any part of it come from something the connector's owner wrote down
-    -- a key name, a label, a ref -- rather than from a fixed string this
-    repository controls? There is no ``connector_ref`` field and two runtime
-    reasons are omitted on the first question; the
-    ``<prefix>.<declared key name>`` forms are omitted on the second.
-    """
-
-    reason: str | None
-
-    def __post_init__(self) -> None:
-        if self.reason is not None and not _is_public_reason(self.reason):
-            object.__setattr__(self, "reason", None)
-
-    def to_wire(self) -> dict[str, str]:
-        return {"reason": self.reason} if self.reason is not None else {}
-
-
-def connector_runtime_public_error(
-    error: BaseException,
-) -> tuple[str, PublicErrorDetails] | None:
-    """Project a connector-runtime failure onto the wire-safe (code, details).
+def connector_runtime_client_code(error: BaseException) -> str | None:
+    """Project a connector-runtime failure onto its wire-safe error code.
 
     Returns ``None`` for anything else, so a caller cannot widen the surface
-    by passing an incidental exception. The reason filter itself lives in
-    ``PublicErrorDetails``; this function only decides whether the exception
-    is one we project at all.
+    by passing an incidental exception. Membership in the client-visible
+    closed set is checked by the frame builder, not here: this function
+    only decides whether the exception is one we project at all.
 
     This is not the only client-visible projection of this exception.
-    ``_raise_v1_connector_runtime_error`` (``web/api/v1/tasks.py``) projects it
-    for the SDK surface and ships ``to_public_error()["details"]`` whole,
-    ``connector_ref`` included. The two differ because their audiences do: that
-    one answers an API key held by a caller already authorized for the task,
-    while this one feeds ``broadcast_to_task``, which reaches every connection
-    under the task id including anonymous widget and share-link visitors.
-    Keep them as two projectors with one audience each; folding them into one
-    that takes the audience as an argument puts the width of the output behind
-    a caller-supplied flag, which fails open the first time it is passed wrong.
+    ``_raise_v1_connector_runtime_error`` (``web/api/v1/tasks.py``) projects
+    it for the SDK surface and ships ``to_public_error()["details"]``
+    whole, ``connector_ref`` included. The two differ because their
+    audiences do: that one answers an API key held by a caller already
+    authorized for the task, while this one feeds ``broadcast_to_task``,
+    which reaches every connection under the task id including anonymous
+    widget and share-link visitors. Keep them as two projectors with one
+    audience each.
     """
 
     if not isinstance(error, ConnectorRuntimeError):
         return None
-    details = error.details
-    if not isinstance(details, dict):
-        # ``__init__`` normalizes details to a dict, but it is a plain public
-        # attribute anything can reassign afterwards. This is the last step
-        # before the wire, so verify rather than assume: a payload of the wrong
-        # shape means the instance is not trustworthy, and the safe answer is
-        # to fall all the way back to the opaque failure rather than guess
-        # which half of it is still readable.
-        return None
-    return error.code, PublicErrorDetails(reason=details.get("reason"))
+    code = error.code
+    return code if isinstance(code, str) else None

@@ -44,14 +44,12 @@ type TaskControlState =
   | "completed"
   | "failed"
 
-// The structured half of a terminal task_error frame. ``details`` holds at
-// most ``reason``: the server projects the exception through a whitelist
-// before broadcasting, because this frame reaches every connection on the
-// task, anonymous widget and share-link visitors included. Nothing here is
-// connector-specific: the code is what decides whether a given frame is.
+// The structured half of a terminal task_error frame: the stable error code
+// the client renders and localizes. The frame carries nothing else
+// connector-specific -- its audience includes anonymous widget and
+// share-link visitors.
 type TaskErrorProjection = {
   code: string
-  details: { reason?: string }
 }
 
 type TaskControlEnvelope = {
@@ -929,9 +927,7 @@ const getWebSocketErrorCode = (message: WebSocketMessage) => {
 }
 
 // The frame deliberately carries nothing connector-specific beyond the code:
-// its audience includes anonymous widget and share-link visitors, and the
-// server's reason whitelist admits only fixed strings it controls -- never a
-// reason assembled from a key name the connector's owner declared. Which
+// its audience includes anonymous widget and share-link visitors. Which
 // connector, which key, and each key's declared type all come from the
 // per-task requirements endpoint, which selects on
 // `Task.id == task_id AND Task.user_id == current_user.id`.
@@ -941,14 +937,7 @@ const getTaskErrorProjection = (
   const root = message as unknown as Record<string, unknown>
   const data = isJsonRecord(message.data) ? message.data : null
   const code = getString(data?.code) || getString(root.code)
-  if (!code) return null
-  const details = isJsonRecord(data?.details)
-    ? data.details
-    : isJsonRecord(root.details)
-      ? root.details
-      : null
-  const reason = getString(details?.reason)
-  return { code, details: reason ? { reason } : {} }
+  return code ? { code } : null
 }
 
 const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | null => {
@@ -983,8 +972,8 @@ export type ErrorFrameDisplay = {
 // identity, the result flag, and the task status to dispatch. Each of those
 // needs a different subset of "is this terminal / is legacy prose trusted /
 // did a code survive / is there a state version", and deriving each subset at
-// its own use site is what let five separate defects land in this handler
-// across two review rounds. Pure on purpose: no dispatch, no refs, nothing
+// its own use site is what let five separate defects land in this handler.
+// Pure on purpose: no dispatch, no refs, nothing
 // outside its arguments, so every cell of that matrix is unit-testable
 // without rendering the provider -- the same shape extractTaskControlEnvelope
 // above already uses.
@@ -1007,7 +996,7 @@ export const projectErrorFrameForDisplay = (
   // branch, and websocket.py's legacy helper, which settles under
   // only_if_running=True and does not broadcast when that update matches
   // no row -- and task_error is also the only frame that carries the
-  // structured code/details pair. The root "error" type is a mixed
+  // structured code. The root "error" type is a mixed
   // channel: rejected chat messages, rejected pause and rejected resume
   // all arrive on it while the viewed task is still RUNNING or
   // WAITING_FOR_USER, and a rejection is not this turn's answer.

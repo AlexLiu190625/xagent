@@ -74,9 +74,8 @@ from .chat_history_service import (
 )
 from .client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
-    PublicErrorDetails,
+    connector_runtime_client_code,
     connector_runtime_client_message,
-    connector_runtime_public_error,
     required_mcp_unavailable_client_message,
 )
 from .db_runtime import (
@@ -1798,7 +1797,6 @@ def _schedule_bg(
         client_history_message_type = TASK_FAILURE_MESSAGE_TYPE
         broadcast_error_message: str | None = None
         broadcast_error_code: str | None = None
-        broadcast_error_details: PublicErrorDetails | None = None
         defer_settlement_to_ttl_recovery = False
         skip_delivery_reconciliation = False
         # Positive evidence for finalize's delivery target: once
@@ -1971,29 +1969,24 @@ def _schedule_bg(
                         # This exception's message is a curated public-safe
                         # sentence -- it says a runtime input is missing, not
                         # which one -- so the client gets it instead of the
-                        # opaque fallback. ``code`` rides along on the frame,
-                        # and so does ``reason`` when the whitelist admits it;
-                        # a reason assembled from a key name the connector's
-                        # owner declared is dropped at the projector, so this
-                        # branch's own reason reaches the frame for two of the
-                        # three missing-value codes and not for
-                        # missing_runtime_context.
+                        # opaque fallback, and ``code`` rides along on the
+                        # frame so the client can pick its own wording.
+                        # Nothing else from the exception reaches the frame:
+                        # the reason and the connector identity go to the
+                        # operator log below.
                         settlement_error = str(setup_or_run_err)
                         client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
                         broadcast_error_message = connector_runtime_client_message(
                             setup_or_run_err
                         )
-                        broadcast_error_code, broadcast_error_details = (
-                            connector_runtime_public_error(setup_or_run_err)
-                            or (None, None)
+                        broadcast_error_code = connector_runtime_client_code(
+                            setup_or_run_err
                         )
-                        # Operators read the raw details, not the projection:
-                        # the connector identity is useful here and does not
-                        # leave the server, while the broadcast frame carries
-                        # neither it nor any reason that was filtered out.
-                        # The projector two modules over checks the same
-                        # attribute for a different reason; checking here too
-                        # costs one line and removes the question.
+                        # Operators read the raw details: the connector
+                        # identity is useful here and does not leave the
+                        # server. ``details`` is a plain public attribute
+                        # anything can reassign, so verify the shape before
+                        # reading it.
                         raw_details = setup_or_run_err.details
                         if not isinstance(raw_details, dict):
                             raw_details = {}
@@ -2078,7 +2071,6 @@ def _schedule_bg(
                                         task_id,
                                         broadcast_error_message,
                                         code=broadcast_error_code,
-                                        details=broadcast_error_details,
                                     ),
                                     task_id,
                                 )
