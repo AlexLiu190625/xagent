@@ -3865,12 +3865,14 @@ CONNECTOR_RUNTIME_CODES = [
     "scheduled_secret_unavailable",
 ]
 
-# The reason a missing declared context key produces. It is deliberately not
-# public: the key half is a name the connector's owner chose, and the frame's
-# audience includes anonymous widget and share-link visitors.
+# The reason a missing declared context key produces, used to populate the
+# exception's own ``details`` below. The key half is a name the connector's
+# owner chose; nothing under ``details`` reaches the terminal frame at all,
+# so these fixtures exist to exercise the operator log, which still reads it.
 WITHHELD_KEY_REASON = "missing_context.auth_token"
-# A listed reason, so the assertions below can speak about a reason that does
-# reach the wire.
+# An arbitrary reason value with no significance of its own -- it lives only
+# in the exception's ``details``, which the frame never carries, so which
+# string this is does not affect any assertion below.
 PUBLIC_REASON = "not_provided"
 
 

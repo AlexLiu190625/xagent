@@ -60,7 +60,7 @@ def test_terminal_error_event_carries_a_valid_code() -> None:
 def test_unknown_code_is_dropped_and_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """``code`` passes the same closed set the /v1 surface pins against.
+    """``code`` is checked against ``CONNECTOR_RUNTIME_CLIENT_ERROR_CODES``.
 
     ``ConnectorRuntimeError`` types its code as a bare ``str`` and stores it
     without validation, so an unlisted value reaching the wire is a question
