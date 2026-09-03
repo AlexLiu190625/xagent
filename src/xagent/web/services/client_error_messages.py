@@ -158,6 +158,11 @@ CONNECTOR_RUNTIME_PUBLIC_REASONS = frozenset(
         # shape (runtime_task_identity_mismatch, runtime_owner_mismatch) are
         # deliberately absent for that reason -- see the class docstring below.
         "team_scope_resolution_failed",
+        # Same module, same shape: the generic-exception fallback arm of
+        # resolve_connector_access_or_raise() in connector_team_scope.py.
+        # It states that resolving connector access failed, not who owns the
+        # task or what the access check concluded.
+        "connector_access_resolution_failed",
         "team_env_resolution_failed",
         "runtime_view_resolution_failed",
         "custom_api_config_load_failed",
