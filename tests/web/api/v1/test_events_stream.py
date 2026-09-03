@@ -4276,7 +4276,7 @@ async def test_fast_path_task_not_found_closes_with_task_deleted_not_resync_requ
     this fast path, so a task deleted in that exact gap surfaces here as
     ``V1ApiError(TASK_NOT_FOUND)`` -- the same condition the warm-up read
     and the watchdog already report as ``task_deleted`` (see
-    ``test_warm_up_read_task_not_found_closes_with_task_deleted_not_resync_required``),
+    ``test_generates_own_task_not_found_reads_are_abortive_and_end_watchdog_coverage``),
     not ``resync_required``. Asking a client to ``steps()`` and reattach
     for a task that's gone would just 404 instead of resyncing anything.
 
