@@ -23,14 +23,21 @@ opening a hand-rolled connection. That helper reads
 
 Also covers the caller's own permission inputs being revoked by a second
 connection while the route holds the definition row locked: the
-``UserMCPServer`` link row deleted or stripped of ownership, and the
-caller's ``User.is_admin`` flag cleared. Those two values are what
-``_check_mcp_permission`` reads, and the route re-derives both after the
-lock rather than answering from what it read before the wait.
+``UserMCPServer`` link row deleted or stripped of ownership, the caller's
+``User`` row deleted outright, and the caller's ``User.is_admin`` flag
+cleared. Those values are what ``_check_mcp_permission`` reads, and the
+route re-derives them after the lock rather than answering from what it
+read before the wait.
+
+Finally, it reads back the SQL the engine actually executed, so the lock
+statement's rendered strength (``FOR NO KEY UPDATE``, not plain ``FOR
+UPDATE``) is pinned as text rather than inferred from the keyword argument
+that asks for it.
 """
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -225,12 +232,17 @@ def test_a_second_editor_blocks_until_the_first_editors_transaction_finishes(
             # on the database at this point. If the lock were not real (or
             # a no-op, as on SQLite), the second call would sail through
             # almost immediately and this would flip to True.
-            assert not second_finished.wait(timeout=1.0), (
-                "the second editor finished before the first one released "
-                "the row -- the lock did not actually block it"
-            )
-
-            release_lock.set()
+            try:
+                assert not second_finished.wait(timeout=1.0), (
+                    "the second editor finished before the first one released "
+                    "the row -- the lock did not actually block it"
+                )
+            finally:
+                # Released even when the assertion above fails: the first
+                # editor is parked on ``release_lock.wait(timeout=10)``, so
+                # a bare ``set()`` after the assert would make every failure
+                # of this test also spend that full timeout before reporting.
+                release_lock.set()
             first.result(timeout=10)
             second.result(timeout=10)
 
@@ -341,11 +353,15 @@ def test_the_second_editors_rename_reports_the_first_editors_committed_name_as_o
             )
 
             second = executor.submit(run_second)
-            assert not second_finished.wait(timeout=1.0), (
-                "the second editor finished before the first one released the row"
-            )
-
-            release_lock.set()
+            try:
+                assert not second_finished.wait(timeout=1.0), (
+                    "the second editor finished before the first one released the row"
+                )
+            finally:
+                # Same reason as the test above: release the parked first
+                # editor even on an assertion failure, so a failure reports
+                # immediately instead of after its 10-second wait.
+                release_lock.set()
             first.result(timeout=10)
             second.result(timeout=10)
 
@@ -1247,3 +1263,392 @@ def test_a_put_whose_admin_flag_is_revoked_after_the_lock_is_refused_with_no_sha
         assert row.name == "admin-revoke-target", (
             "the shared definition row must be untouched by a refused edit"
         )
+
+
+@contextlib.contextmanager
+def _captured_sql(session_factory):
+    """Every SQL statement the engine behind ``session_factory`` sends to
+    the server while this context is open, as the raw strings the driver
+    received.
+
+    The lock this suite exists for is one clause on one SELECT. Every
+    other test here infers it from behavior (a second writer blocks, a
+    serialization failure does or does not happen); this reads the clause
+    itself, which is the only way to tell ``FOR NO KEY UPDATE`` from the
+    plain ``FOR UPDATE`` that would block a concurrent connect.
+    """
+    engine = session_factory.kw["bind"]
+    statements: list[str] = []
+
+    def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    sa.event.listen(engine, "before_cursor_execute", record)
+    try:
+        yield statements
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", record)
+
+
+def _locking_reads(statements: list[str]) -> tuple[list[str], list[str]]:
+    """The captured statements that take a weak row lock, and those that
+    take the strong one -- ``FOR NO KEY UPDATE`` does not contain the
+    substring ``FOR UPDATE``, so the two lists never overlap."""
+    weak = [text for text in statements if "FOR NO KEY UPDATE" in text]
+    strong = [text for text in statements if "FOR UPDATE" in text]
+    return weak, strong
+
+
+def test_the_definition_row_read_renders_for_no_key_update(
+    session_factory, seeded
+) -> None:
+    """``with_for_update(key_share=True)`` must reach PostgreSQL as ``FOR NO
+    KEY UPDATE``.
+
+    That strength is load-bearing, not cosmetic: ``FOR KEY SHARE`` -- the
+    lock a concurrent ``UserMCPServer`` insert takes on the ``MCPServer``
+    row it references -- is compatible with ``FOR NO KEY UPDATE`` and not
+    with plain ``FOR UPDATE``, so rendering the stronger clause would make
+    an unrelated connect queue behind an edit. Dropping ``key_share=True``
+    turns this red.
+
+    The lock-free half of the same assertion is here too: a payload that
+    writes only the caller's own link row must send no locking clause at
+    all.
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    owner_id, server_id = seeded
+    current_user = SimpleNamespace(id=owner_id, is_admin=False)
+
+    with _captured_sql(session_factory) as statements:
+        with session_factory() as db:
+            mcp_api.update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="edited-under-a-captured-lock"),
+                current_user=current_user,
+                db=db,
+            )
+    weak, strong = _locking_reads(statements)
+    assert len(weak) == 1, (
+        "a definition-row edit must send exactly one FOR NO KEY UPDATE read "
+        f"-- saw {weak!r}"
+    )
+    assert "mcp_servers" in weak[0], (
+        f"the locking read must be the definition-row read -- saw {weak[0]!r}"
+    )
+    assert strong == [], (
+        "plain FOR UPDATE would block a concurrent connect or disconnect on "
+        f"this server -- saw {strong!r}"
+    )
+
+    with _captured_sql(session_factory) as statements:
+        with session_factory() as db:
+            mcp_api.update_mcp_server(
+                server_id,
+                MCPServerUpdate(is_active=False),
+                current_user=current_user,
+                db=db,
+            )
+    weak, strong = _locking_reads(statements)
+    assert weak == [] and strong == [], (
+        "a payload that writes only the caller's own link row must take no "
+        f"lock on the shared definition row -- saw {weak!r} {strong!r}"
+    )
+
+
+def test_a_non_owner_edit_naming_a_definition_field_locks_and_drops_it(
+    session_factory, seeded
+) -> None:
+    """A non-owner PUT that names a definition-row field takes the lock and
+    is answered by value: identical to what is stored, it is dropped and
+    the request succeeds; different, it is refused with 403. Either way the
+    shared row's own values are what they were.
+
+    The identical-value half is the path with no other coverage: it is the
+    only way to reach the full config rebuild as a caller who is not
+    allowed to change anything, because ``_global_config_tampered``
+    compares values and finds nothing changed. Removing the 403 raise turns
+    the second half red.
+
+    "The shared row's values are unchanged" is the claim here, not "no
+    UPDATE was emitted" -- the rebuild still runs on this path, and the
+    ``to_config_dict()`` flattening it goes through (#2088) remains
+    reachable for row shapes this seed does not carry.
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    _owner_id, server_id = seeded
+    with session_factory() as db:
+        db.execute(
+            sa.update(MCPServer)
+            .where(MCPServer.id == server_id)
+            .values(concurrent_tools=[])
+        )
+        guest = User(username="mcp-edit-lock-guest", password_hash="x", is_admin=False)
+        db.add(guest)
+        db.flush()
+        db.add(
+            UserMCPServer(
+                user_id=int(guest.id),
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        guest_id = int(guest.id)
+        stored = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        stored_values = (
+            stored.name,
+            stored.transport,
+            stored.description,
+            stored.command,
+            stored.env,
+        )
+    guest_user = SimpleNamespace(id=guest_id, is_admin=False)
+
+    def read_back_shared_values():
+        with session_factory() as fresh:
+            row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+            return (row.name, row.transport, row.description, row.command, row.env)
+
+    with _captured_sql(session_factory) as statements:
+        with session_factory() as db:
+            response = mcp_api.update_mcp_server(
+                server_id,
+                # Exactly what the row already stores, so nothing counts as
+                # tampered and the payload is dropped rather than refused.
+                MCPServerUpdate(config={"command": "true"}),
+                current_user=guest_user,
+                db=db,
+            )
+    assert response.can_edit_global is False
+    weak, strong = _locking_reads(statements)
+    assert len(weak) == 1 and strong == [], (
+        "naming a definition-row field puts the request on the locking path "
+        f"whatever its values are -- saw {weak!r} {strong!r}"
+    )
+    assert read_back_shared_values() == stored_values, (
+        "a non-owner's value-identical payload must leave the shared row as it was"
+    )
+
+    with session_factory() as db:
+        with pytest.raises(HTTPException) as raised:
+            mcp_api.update_mcp_server(
+                server_id,
+                MCPServerUpdate(config={"command": "hijacked"}),
+                current_user=guest_user,
+                db=db,
+            )
+    assert raised.value.status_code == 403
+    assert read_back_shared_values() == stored_values, (
+        "a refused non-owner payload must leave the shared row as it was"
+    )
+
+
+def test_a_put_whose_caller_account_is_deleted_after_the_lock_is_refused(
+    session_factory, seeded
+) -> None:
+    """The caller's own ``User`` row deleted inside the lock wait.
+
+    Reachable exactly here and nowhere earlier: deleting the user cascades
+    to that user's ``UserMCPServer`` rows, so the link re-read has to have
+    already run for this branch to see a link and no user. This test
+    commits the delete from a second connection at the moment the route
+    issues its admin re-read, which is the one statement between the two.
+
+    The answer must name the object that actually went missing -- the
+    caller's account, not the server, which is still there. Deleting the
+    ``current_admin_user is None`` branch turns this red: the next line
+    reads ``.is_admin`` off ``None`` and the route answers 500.
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    owner_id, server_id = seeded
+    db = session_factory()
+    real_query = db.query
+    deleted = threading.Event()
+
+    def delete_the_caller_when_the_admin_read_starts(*entities, **kwargs):
+        if entities == (User,) and not deleted.is_set():
+            deleted.set()
+            with session_factory() as other:
+                other.execute(sa.delete(User).where(User.id == owner_id))
+                other.commit()
+        return real_query(*entities, **kwargs)
+
+    db.query = delete_the_caller_when_the_admin_read_starts
+    try:
+        with pytest.raises(HTTPException) as raised:
+            mcp_api.update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="written-by-a-deleted-account"),
+                current_user=SimpleNamespace(id=owner_id, is_admin=False),
+                db=db,
+            )
+    finally:
+        db.close()
+
+    assert deleted.is_set(), "the caller's account was never deleted"
+    assert raised.value.status_code == 404
+    assert raised.value.detail == "Requesting user account no longer exists", (
+        "this 404 must name the caller's account, not the server -- the "
+        f"server row is still there; saw {raised.value.detail!r}"
+    )
+
+    with session_factory() as fresh:
+        row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert row.description is None, (
+            "a request refused after the lock must leave the shared row unwritten"
+        )
+
+
+def test_a_link_row_only_edit_is_not_refused_over_invalid_stored_shared_config(
+    session_factory, seeded
+) -> None:
+    """Runtime-config validation belongs to the definition-row write, not to
+    every PUT.
+
+    A stored ``runtime_bindings`` value can be invalid against the row's
+    own ``runtime_input_schema`` -- an earlier schema edit, an import, a
+    validator that has since grown a rule. While the route validated that
+    stored value on every payload, such a row could be neither used nor
+    switched off: activating or deactivating it, which writes only the
+    caller's own link row, was refused over shared configuration the
+    request does not touch. Both directions are pinned here, because the
+    fix is to move the validation, not to drop it: a payload that does
+    write the definition row is still refused.
+
+    Moving the validation call back outside ``if writes_definition_row:``
+    turns the first half red.
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    owner_id, server_id = seeded
+    current_user = SimpleNamespace(id=owner_id, is_admin=False)
+    # Declared nowhere in runtime_input_schema (which stays NULL), so the
+    # validator rejects it as an undeclared binding source.
+    invalid_bindings = [
+        {
+            "source": {"input_type": "context", "key": "undeclared"},
+            "target": {"target_type": "header", "key": "X-Undeclared"},
+        }
+    ]
+    with session_factory() as db:
+        db.execute(
+            sa.update(MCPServer)
+            .where(MCPServer.id == server_id)
+            .values(concurrent_tools=[], runtime_bindings=invalid_bindings)
+        )
+        db.commit()
+
+    with session_factory() as db:
+        response = mcp_api.update_mcp_server(
+            server_id,
+            MCPServerUpdate(is_active=False),
+            current_user=current_user,
+            db=db,
+        )
+    assert response.is_active is False, (
+        "deactivating a connector writes the caller's own link row; stored "
+        "shared configuration it does not touch must not refuse it"
+    )
+
+    with session_factory() as db:
+        with pytest.raises(HTTPException) as raised:
+            mcp_api.update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="edited-over-invalid-stored-config"),
+                current_user=current_user,
+                db=db,
+            )
+    assert raised.value.status_code == 400
+    assert "not declared" in str(raised.value.detail), (
+        "a payload that does write the definition row must still be "
+        f"validated -- saw {raised.value.detail!r}"
+    )
+
+    with session_factory() as fresh:
+        row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert row.description is None
+        assert (
+            fresh.query(UserMCPServer)
+            .filter(
+                UserMCPServer.mcpserver_id == server_id,
+                UserMCPServer.user_id == owner_id,
+            )
+            .one()
+            .is_active
+            is False
+        )
+
+
+def test_a_link_row_only_edit_reports_the_stored_restart_policy_of_an_internal_row(
+    session_factory,
+) -> None:
+    """The response body on the lock-free path reports the row as stored.
+
+    A ``managed="internal"`` row is the shape that makes this visible in
+    the response at all: ``to_config_dict()`` emits ``restart_policy`` only
+    for those rows, so an ``external`` row's overwritten value shows up in
+    the database and not in the JSON. Running the rebuild here rewrites
+    ``managed`` to ``"external"`` -- ``_build_server_config`` hardcodes that
+    value -- and ``to_config_dict()`` then stops emitting ``restart_policy``
+    at all, so the field disappears from the response entirely rather than
+    coming back with the config default. Removing the
+    ``if writes_definition_row:`` guard on the rebuild turns this red with
+    exactly that ``KeyError``.
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    with session_factory() as db:
+        owner = User(
+            username="mcp-internal-restart-owner", password_hash="x", is_admin=False
+        )
+        db.add(owner)
+        db.flush()
+        server = MCPServer(
+            name="internal-restart-target",
+            transport="stdio",
+            managed="internal",
+            command="true",
+            concurrent_tools=[],
+            restart_policy="always",
+        )
+        db.add(server)
+        db.flush()
+        db.add(
+            UserMCPServer(
+                user_id=int(owner.id),
+                mcpserver_id=int(server.id),
+                is_owner=True,
+                is_active=True,
+            )
+        )
+        db.commit()
+        owner_id, server_id = int(owner.id), int(server.id)
+
+    with session_factory() as db:
+        response = mcp_api.update_mcp_server(
+            server_id,
+            MCPServerUpdate(user_env={"MINE": "x"}),
+            current_user=SimpleNamespace(id=owner_id, is_admin=False),
+            db=db,
+        )
+
+    assert response.config["restart_policy"] == "always", (
+        "the response must report the stored restart_policy, not the config "
+        f"default the rebuild would substitute -- saw {response.config!r}"
+    )
+    assert response.config["managed"] == "internal"
+
+    with session_factory() as fresh:
+        row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert row.restart_policy == "always"
+        assert row.managed == "internal"
