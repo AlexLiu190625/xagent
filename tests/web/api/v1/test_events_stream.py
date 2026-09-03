@@ -3075,13 +3075,214 @@ async def test_oversized_non_dict_json_frame_is_ignored_without_counting():
     assert sink.queue.empty()
 
 
-# ===== staged messages are also bounded by cumulative text size, not
-# just count =====
+# ===== the warm-up staging buffer's two bounds, and the one quantity
+# that must never enter either: the task's own description stamp =====
 
 
-# ===== a frame that fails to project is dropped, not fatal -- neither
-# during finish_warm_up's replay nor on the live path, and never
-# double-counted between the two (see _project_and_queue) =====
+async def test_staged_messages_overflow_closes_with_resync_required():
+    """The staging list reuses the outbound queue's own count cap and
+    overflow policy (``resync_required`` then close) instead of a second
+    one -- this pins that reuse rather than assuming it."""
+    sink = _make_sink(task_id=43, warm=False)
+    for i in range(es.OUTBOUND_QUEUE_MAX_SIZE):
+        await sink.send_text(
+            _trace_event_frame(
+                "tool_execution_start",
+                task_id=43,
+                data={"tool_call_id": f"call-{i}", "tool_name": "x", "tool_args": {}},
+            )
+        )
+    assert sink.staged_message_count == es.OUTBOUND_QUEUE_MAX_SIZE
+    assert sink.closing is False
+
+    await sink.send_text(
+        _trace_event_frame(
+            "tool_execution_start",
+            task_id=43,
+            data={"tool_call_id": "overflow", "tool_name": "x", "tool_args": {}},
+        )
+    )
+
+    assert sink.closing is True
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is True
+    assert "resync_required" in frame_text
+
+
+async def test_staged_messages_byte_budget_overflow_closes_with_resync_required():
+    """``_staged_messages`` is bounded by cumulative character count on
+    top of its count cap -- a run of large-but-individually-legal
+    messages (each under ``MAX_RAW_FRAME_TEXT_CHARS``, so none is dropped
+    by the pre-check) can still overflow the cumulative budget well
+    before the count cap binds. Uses a payload just under the per-frame
+    raw-size limit so few enough messages are needed to keep the test
+    fast, and asserts the count cap did not bind instead."""
+    sink = _make_sink(task_id=95, warm=False)
+    near_cap_delta = "x" * (es.MAX_RAW_FRAME_TEXT_CHARS - 200)
+    messages_needed = (es.STAGED_MESSAGES_MAX_TEXT_CHARS // len(near_cap_delta)) + 2
+    assert messages_needed < es.OUTBOUND_QUEUE_MAX_SIZE, (
+        "fixture assumption: the byte budget must overflow before the "
+        "count cap does, or this test would re-pin the count cap instead"
+    )
+
+    for i in range(messages_needed):
+        await sink.send_text(
+            json.dumps(
+                {
+                    "type": "final_answer_delta",
+                    "message_id": f"final_answer_{i}",
+                    "task_id": 95,
+                    "delta": near_cap_delta,
+                }
+            )
+        )
+        if sink.closing:
+            break
+
+    assert sink.closing is True
+    assert sink.staged_message_count < es.OUTBOUND_QUEUE_MAX_SIZE
+    frame_text, is_close = sink.queue.get_nowait()
+    assert is_close is True
+    assert "resync_required" in frame_text
+
+
+async def test_one_task_info_frame_cannot_overflow_the_staging_budget():
+    """A ``task_info`` frame carries the task's ``description`` column
+    under ``data["description"]``, and that column is unbounded
+    (``Column(Text)``). Charged raw, one such frame crosses
+    ``STAGED_MESSAGES_MAX_TEXT_CHARS`` by itself and closes the attach
+    with ``resync_required`` -- and because the trigger is a property of
+    the task rather than the load on it, the re-attach the close asks for
+    fails at exactly the same frame, forever. The description is
+    therefore excluded from the charge, which leaves this frame costing
+    the few hundred characters its actual lifecycle fields occupy.
+
+    ``task_info`` is also the family with nothing to lose by it:
+    ``_feed_trace_event`` returns ``[]`` for it, so the description is
+    charged against a budget it could never spend.
+
+    The sink starts at ``status="pending"`` rather than the frame's own
+    ``"running"``: ``enqueue_status`` no-ops when a status repeats the
+    sink's last one, and a ``task_info`` frame's ``status`` would
+    otherwise be deduped away, leaving nothing to assert on the
+    lifecycle half below. ``"running"`` is not in
+    ``_EARLY_WAKE_STATUS_VALUES`` either way, so nothing about the
+    content half's handling changes."""
+    sink = _make_sink(task_id=105, status="pending", warm=False)
+    huge_description = "d" * (es.STAGED_MESSAGES_MAX_TEXT_CHARS + 1000)
+    raw = json.dumps(
+        {
+            "type": "trace_event",
+            "event_id": "ev-105",
+            "event_type": "task_info",
+            "task_id": 105,
+            "timestamp": 0,
+            "status": "running",
+            "data": {
+                "id": 105,
+                "title": "t",
+                "description": huge_description,
+                "status": "running",
+            },
+        }
+    )
+    assert len(raw) > es.STAGED_MESSAGES_MAX_TEXT_CHARS
+
+    await sink.send_text(raw)
+
+    assert sink.closing is False
+    assert sink.dropped_frame_count == 0
+    assert sink.staged_message_count == 1
+    assert sink._staged_text_chars < 1000
+    assert "description" not in sink._staged_messages[0]["data"]
+    # The lifecycle half still went out: task_info is a versioned task
+    # event, and its status is enqueued before the content branch runs.
+    frame_text, _ = sink.queue.get_nowait()
+    assert frame_text.startswith("event: task.status\n")
+
+
+async def test_a_long_task_description_cannot_overflow_the_staging_budget():
+    """The same defect on the ordinary path, which is the half a
+    ``task_info``-only fix does not reach.
+    ``ws_trace_handlers.py``'s converter stamps the same unbounded column
+    onto *every* trace event as ``data["task_description"]``, and a frame
+    at or under ``MAX_RAW_FRAME_TEXT_CHARS`` used to be charged its full
+    ``len(text)``. A description a little under that per-frame cap
+    therefore crossed the 4 MiB staging budget after ~17 frames of a
+    warm-up window, again identically on every re-attach.
+
+    Sends more frames than the old code survived and asserts the stream
+    is still open, then asserts the accumulated charge is the frames'
+    own content rather than the description repeated per frame."""
+    sink = _make_sink(task_id=106, status="running", warm=False)
+    description = "d" * (200 * 1024)
+    frames = 40
+
+    for i in range(frames):
+        await sink.send_text(
+            _trace_event_frame(
+                "tool_execution_start",
+                task_id=106,
+                step_id=f"step-{i}",
+                data={
+                    "tool_call_id": f"call-{i}",
+                    "tool_name": "search",
+                    "tool_args": {},
+                    "task_description": description,
+                },
+            )
+        )
+
+    assert sink.closing is False
+    assert sink.dropped_frame_count == 0
+    assert sink.staged_message_count == frames
+    assert sink._staged_text_chars < frames * 1000
+    assert all(
+        "task_description" not in staged["data"] for staged in sink._staged_messages
+    )
+
+
+async def test_the_raw_frame_drop_boundary_is_unchanged_by_the_description_exclusion():
+    """Excluding the description from the *measure* must not move the
+    per-frame drop boundary, which is a settled contract with tests on
+    both sides of it: pruning can only lower a frame's measured length,
+    and a frame already at or under the cap stays under it.
+
+    Near-duplicate of ``test_a_frame_still_over_the_cap_without_its_description_is_dropped``
+    (above): that test already pins the end-to-end drop for a frame
+    whose own content -- not its description -- is what pushes it over
+    the cap. What this test adds is a direct call into
+    ``_measured_content_frame`` that pins the *ordering* inside it --
+    prune, then compare -- rather than only the ``send_text``-level
+    outcome. The complementary mutation (the drop check reading the
+    *unpruned* length instead of the pruned one) is not caught here:
+    this frame is over the cap on its own tool arguments regardless of
+    pruning, so that mutation leaves this test green. It is caught by
+    the existing
+    ``test_a_huge_task_description_does_not_drop_a_small_content_frame``,
+    whose frame is under the cap without its description and over it
+    with -- the only shape that can tell the two checks apart."""
+    sink = _make_sink(task_id=107)
+    filler = "y" * (es.MAX_RAW_FRAME_TEXT_CHARS + 1000)
+    raw = _trace_event_frame(
+        "tool_execution_start",
+        task_id=107,
+        step_id="step-1",
+        data={
+            "tool_call_id": "call-1",
+            "tool_name": "search",
+            "tool_args": {"query": filler},
+            "task_description": "d" * (200 * 1024),
+        },
+    )
+    measured, pruned = es._measured_content_frame(raw, json.loads(raw))
+    assert "task_description" not in pruned["data"]
+    assert measured > es.MAX_RAW_FRAME_TEXT_CHARS
+
+    await sink.send_text(raw)
+
+    assert sink.dropped_frame_count == 1
+    assert sink.queue.empty()
 
 
 # ===== a frame that fails to project is dropped, not fatal, and never

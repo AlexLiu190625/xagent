@@ -76,7 +76,8 @@ values it deliberately leaves unbounded, in one place:
     string to cut (see ``_capped_step_data``).
   - One inbound broadcast frame, before it is projected at all:
     ``MAX_RAW_FRAME_TEXT_CHARS`` (256 KiB), measured excluding the
-    ``task_description`` stamp every converted trace event carries (see
+    task's own description column, which every converted trace event
+    and every ``task_info`` frame carries under one of two keys (see
     ``_measured_content_frame``). Over the cap is a silent drop --
     counted and logged, never a close, and never applied to a
     lifecycle frame.
@@ -272,8 +273,9 @@ MAX_FRAME_CONTENT_BYTES = 64 * 1024
 # is ~10 KiB against a 4 MiB budget.
 MAX_QUEUED_WIRE_BYTES = 64 * MAX_FRAME_CONTENT_BYTES
 # Check on a raw broadcast frame's text length -- measured excluding
-# the internal task-description stamp broadcast frames carry (see
-# ``_measured_content_frame``) -- run after ``json.loads`` parses it,
+# the task's own description column, which arrives under one of two
+# keys depending on the frame family (see ``_measured_content_frame``)
+# -- run after ``json.loads`` parses it,
 # gating only the call into the projection pass -- ``MAX_FRAME_CONTENT_BYTES`` only bounds the *projected*
 # content that ends up on the wire, so without this a multi-megabyte raw
 # frame still pays for a full ``serialize_trace_data`` walk + projection
@@ -301,14 +303,23 @@ MAX_RAW_FRAME_TEXT_CHARS = 4 * MAX_FRAME_CONTENT_BYTES
 # ``MAX_SNAPSHOT_WIRE_BYTES`` below, and carries the same magnitude:
 # giving one connection a 4 MiB queue budget and a larger staging budget
 # would be two different answers to the same question. The unit differs
-# and that is deliberate -- this counts the *raw* broadcast text a staged
-# message arrived in, before projection, because a staged message is not
+# and that is deliberate -- this counts the description-free measure of
+# a staged message, before projection, because a staged message is not
 # a frame yet, whereas the other two count wire bytes. Without this,
 # worst case under the raw pre-check alone is ``OUTBOUND_QUEUE_MAX_SIZE``
 # staged messages each just under ``MAX_RAW_FRAME_TEXT_CHARS``, so a
 # warm-up window full of near-cap (rather than over-cap) staged frames
 # could hold far more than the connection's own queue ever may.
 STAGED_MESSAGES_MAX_TEXT_CHARS = 64 * MAX_FRAME_CONTENT_BYTES
+# The two keys a task's own ``description`` column arrives under, per
+# frame family -- see ``_measured_content_frame``, which strips them
+# before this module measures or projects anything. Kept as two tuples
+# rather than one union so a content frame that legitimately carries a
+# ``data["description"]`` of its own keeps it: only ``task_info``, whose
+# projection output is empty by construction, has that key overwritten
+# by the task column.
+_TRACE_DESCRIPTION_STAMPS = ("task_description",)
+_TASK_INFO_DESCRIPTION_STAMPS = ("task_description", "description")
 # Upper bound on how many steps one attach puts on the wire in a single
 # burst, shared by the three producers that emit a batch of steps with
 # no pacing of their own: the two attach-time fast paths
@@ -1006,55 +1017,72 @@ def project_content_frames(
 def _measured_content_frame(
     text: str, message: dict[str, Any]
 ) -> tuple[int, dict[str, Any]]:
-    """Return ``(chars, frame)`` -- the length the drop check below
-    compares against the cap, and the frame projection should consume.
+    """Return ``(chars, frame)`` -- the frame's length with the task's
+    own description stamp removed, and the frame every consumer past
+    this point should use in place of the raw one.
 
+    The task's ``description`` column reaches a broadcast frame under
+    two different keys, from two different producers, and is unbounded
+    in both (``Column(Text)``, filled from the task's first user
+    message, which has no ``max_length`` of its own):
     ``ws_trace_handlers.py``'s ``_convert_trace_event_to_stream_event``
-    copies the task's ``description`` column onto
-    ``data["task_description"]`` for *every* trace event it converts,
-    with no event-type gate. That column has no length bound
-    (``Column(Text)``, filled from the task's first user message, which
-    has no ``max_length`` of its own), and it is re-stamped on each
-    frame -- so counting it would let one long description push every
-    subsequent ``step.*`` frame of that task past
-    ``MAX_RAW_FRAME_TEXT_CHARS`` and drop the task's whole content
-    stream for the life of the connection.
+    stamps it as ``data["task_description"]`` on *every* trace event it
+    converts, with no event-type gate, and every ``task_info`` producer
+    in ``websocket.py`` puts the same column on ``data["description"]``.
+    Both are re-stamped per frame, so counting either one would let one
+    long description spend a budget on a field that cannot reach the
+    wire -- pushing frames past ``MAX_RAW_FRAME_TEXT_CHARS`` (a silent
+    content drop for the life of the connection) or past
+    ``STAGED_MESSAGES_MAX_TEXT_CHARS`` (a ``resync_required`` close that
+    re-fails identically on every re-attach, since the trigger is a
+    property of the task rather than the load on it).
 
-    Excluding it costs the client nothing, because no content this
-    module puts on the wire can contain it: each of the four producers
-    builds its ``data`` from explicitly named keys (``_step_mapping``'s
-    ``_build_thinking_start`` / ``_build_tool_start`` /
-    ``_build_message_step`` and the ``extra_data_fn`` patches, then
-    ``message_delta_frame`` / ``message_completed_frame``), so the
-    description was consuming a budget it could never spend.
+    Excluding both costs the client nothing, because no content this
+    module puts on the wire can contain either: each of the four
+    producers builds its ``data`` from explicitly named keys
+    (``_step_mapping``'s ``_build_thinking_start`` /
+    ``_build_tool_start`` / ``_build_message_step`` and the
+    ``extra_data_fn`` patches, then ``message_delta_frame`` /
+    ``message_completed_frame``), and ``_feed_trace_event`` returns
+    ``[]`` for ``task_info`` outright.
 
-    An under-cap frame is returned unchanged, description and all --
-    the walk that projection pays over it is already bounded by the
-    cap. An over-cap frame carrying a description is pruned *before*
-    both measuring and projecting, not just before measuring: the raw
-    frame check was this field's only per-frame CPU bound (a
-    synchronous, unbounded ``clean_string`` walk during projection), so
-    a frame that survives the check must not still be paying for the
-    field the check just excused it from. Measured by re-serializing
-    the parsed frame without that one field rather than by subtracting
-    an estimate of the field's serialized length: an estimate would
-    have to reproduce the producer's separators and escaping, while a
-    re-dump is exact in the same character domain ``len(text)`` is
-    measured in (``broadcast_to_task`` serializes with a default
-    ``json.dumps``, and so does this). It runs only for a frame that is
-    both over the cap and carrying a description -- the frame that
-    would otherwise be dropped outright -- so an ordinary frame still
-    costs one ``len()``, and the re-dump's own cost scales with the
-    frame *without* the description, not with the description.
-    ``json.dumps`` cannot fail here: ``message`` came out of
-    ``json.loads`` in the caller.
+    Pruning is unconditional -- not, as it once was, only for a frame
+    already over the raw cap. Both of this value's consumers need the
+    description gone, not just the drop check: the staging buffer
+    accumulates it across frames. The drop check's own decision is
+    unaffected by the change (pruning can only lower the number, and a
+    frame already under the cap stays under it), so the boundary it
+    enforces is exactly the one it enforced before. Removing the field
+    before projection rather than after is what keeps a surviving
+    frame from paying the synchronous, unbounded ``clean_string`` walk
+    ``serialize_trace_data`` would otherwise run over it. That is a
+    clear saving when the description is the bulk of the frame; when
+    the payload is the bulk and the description is small, the extra
+    ``json.dumps`` this function adds costs on the order of 0.2 ms on a
+    200 KiB frame more than skipping it would. Accepted because one
+    number has to serve both the drop check and the staging budget
+    below, and the alternative -- two numbers kept in step by hand --
+    is the class of failure this function exists to close. Measured by
+    re-serializing the parsed frame without those keys rather than by
+    subtracting an estimate of their serialized length: an estimate
+    would have to reproduce the producer's separators and escaping,
+    while a re-dump is exact in the same character domain ``len(text)``
+    is measured in (``broadcast_to_task`` serializes with a default
+    ``json.dumps``, and so does this). ``json.dumps`` cannot fail here:
+    ``message`` came out of ``json.loads`` in the caller.
     """
-    if len(text) <= MAX_RAW_FRAME_TEXT_CHARS:
-        return len(text), message
     data = message.get("data")
-    if not isinstance(data, dict) or "task_description" not in data:
+    if not isinstance(data, dict):
         return len(text), message
-    pruned = {key: value for key, value in data.items() if key != "task_description"}
+    stamps = (
+        _TASK_INFO_DESCRIPTION_STAMPS
+        if message.get("event_type") == "task_info"
+        else _TRACE_DESCRIPTION_STAMPS
+    )
+    present = [key for key in stamps if key in data]
+    if not present:
+        return len(text), message
+    pruned = {key: value for key, value in data.items() if key not in present}
     frame = {**message, "data": pruned}
     return len(json.dumps(frame)), frame
 
@@ -1342,13 +1370,17 @@ class V1EventStreamSink:
         hitting it on the outbound queue means -- the client can't keep
         up (or something is broadcasting far faster than normal) and
         needs to resync. A second, cumulative bound on top of the count
-        cap: ``text_chars`` (the raw frame's own ``len(text)``, already
-        computed once by ``send_text``'s pre-check -- never
-        re-serialized here) is tracked against
+        cap: ``text_chars`` (the frame's length with the task's own
+        description stamp removed, already computed once by
+        ``send_text``'s pre-check via ``_measured_content_frame`` --
+        never re-serialized here) is tracked against
         ``STAGED_MESSAGES_MAX_TEXT_CHARS`` so a run of large-but-under-
         the-single-frame-cap messages during a slow warm-up read can't
         hold unbounded memory just because it stayed under the count
-        cap.
+        cap. Charging the description here instead would make this
+        overflow a property of the task rather than of the load on it:
+        one long description, re-stamped per frame, crosses the budget
+        on its own and closes every attach to that task identically.
         """
         if self._closing:
             return
@@ -1482,11 +1514,12 @@ class V1EventStreamSink:
         ``type`` is in ``_CONTENT_FRAME_TYPES``; dispatch into the
         projector is unchanged for that whole set regardless. What it
         compares against ``MAX_RAW_FRAME_TEXT_CHARS`` (256 KiB) is the
-        frame's own character count minus the ``task_description``
-        field the broadcast conversion stamps onto every trace event --
-        see ``_measured_content_frame`` for why that subtraction exists
-        and why it costs nothing on the ordinary path. Strictly greater
-        than the cap is a drop, exactly equal is kept. On a drop,
+        frame's own character count minus whichever key the task's own
+        description column arrived under -- see
+        ``_measured_content_frame`` for the two keys, why that
+        subtraction exists, and why it lowers rather than raises this
+        method's per-frame cost. Strictly greater than the cap is a
+        drop, exactly equal is kept. On a drop,
         ``dropped_frame_count`` is incremented, one ``logger.warning``
         fires, and the method returns -- no queued frame, no close, no
         ``stream.error``: a dropped frame is invisible to the client.
@@ -1515,23 +1548,29 @@ class V1EventStreamSink:
             an oversized ``task_info`` increments
             ``dropped_frame_count`` and logs a drop warning. It is not
             what protects ``task.status``/``completion_hint``
-            delivery. It is there because such a frame carries the
-            task description with no size bound of its own, so
-            counting it as a dropped content frame would be counting a
-            drop that had no content to lose.
+            delivery. It is there because ``_feed_trace_event`` returns
+            ``[]`` for ``task_info``: counting it as a dropped content
+            frame would be counting a drop that had no content to lose.
 
         The parse is not extra cost on the fan-out path:
         ``ConnectionManager.broadcast_to_task`` serializes the frame
         with ``json.dumps`` once per connection, inside its own send
-        loop, before this method is called at all. What happens to the
-        expensive half here -- ``serialize_trace_data`` plus the
-        projection fold -- depends on where the frame lands: a frame
-        under the cap pays it in full; a frame over the cap only
-        because of its task description is pruned by
-        ``_measured_content_frame`` before projection runs, not just
-        before the comparison, so it pays that cost against the frame
-        without the description instead; and a frame still over the
-        cap after pruning is dropped outright and pays none of it.
+        loop, before this method is called at all. Pruning is now
+        unconditional rather than only for a frame over the cap, so
+        the expensive half here -- ``serialize_trace_data`` plus the
+        projection fold -- never runs over the description at all, for
+        every frame this method admits. That is a clear net saving
+        when the description is the bulk of the frame (about −0.11 ms
+        at a 64 KiB description, −0.34 ms at 200 KiB); when the
+        payload is the bulk and the description is small, the extra
+        ``json.dumps`` ``_measured_content_frame`` now always pays
+        costs up to about +0.21 ms per frame on a 200 KiB frame,
+        roughly +38% of that frame's processing. Accepted because it
+        is what lets one number serve both the drop check and the
+        staging budget below; the alternative -- two numbers kept in
+        step by hand -- is the failure mode this fix exists to close.
+        A frame still over the cap after pruning is dropped outright
+        and pays none of it.
         """
         try:
             self._assert_owner_loop()
@@ -1566,21 +1605,21 @@ class V1EventStreamSink:
                         # read wouldn't have closed anyway.
                         self.completion_hint.set()
             if str(message.get("type") or "") in _CONTENT_FRAME_TYPES:
-                frame = message
-                measured_chars = len(text)
-                if message.get("event_type") != "task_info":
-                    measured_chars, frame = _measured_content_frame(text, message)
-                    if measured_chars > MAX_RAW_FRAME_TEXT_CHARS:
-                        self.dropped_frame_count += 1
-                        logger.warning(
-                            "v1 SSE sink dropped an oversized broadcast frame "
-                            "(%d chars, %d excluding the task description) for "
-                            "task %s before projecting it",
-                            len(text),
-                            measured_chars,
-                            self.task_id,
-                        )
-                        return
+                measured_chars, frame = _measured_content_frame(text, message)
+                if (
+                    message.get("event_type") != "task_info"
+                    and measured_chars > MAX_RAW_FRAME_TEXT_CHARS
+                ):
+                    self.dropped_frame_count += 1
+                    logger.warning(
+                        "v1 SSE sink dropped an oversized broadcast frame "
+                        "(%d chars, %d excluding the task description) for "
+                        "task %s before projecting it",
+                        len(text),
+                        measured_chars,
+                        self.task_id,
+                    )
+                    return
                 # The raw-size check runs before the warm/staged split, so
                 # a frame too large to project is dropped whether this
                 # sink is warm or not -- staging an oversized frame would
