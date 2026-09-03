@@ -1423,8 +1423,9 @@ async def stream_chat_task_events(
       ``message.delta``/``message.completed`` carries the shortened text
       itself plus ``truncated: true`` and no ``original_bytes``. A raw
       broadcast frame that runs past 256 KiB -- measured without the
-      internal task-description stamp such frames carry -- is dropped
-      whole instead of truncated (see Behavior below): no marker, no
+      task's own description column, which such frames carry under one
+      of two keys depending on the frame family -- is dropped whole
+      instead of truncated (see Behavior below): no marker, no
       content.
       This cap is specific to this stream -- ``GET .../steps`` applies
       no such cap and always returns a step's full, untruncated
@@ -1483,11 +1484,12 @@ async def stream_chat_task_events(
         so its content never reaches the per-field truncation cap
         described above and leaves no ``"truncated": true`` marker --
         this is a full drop, not a truncation. The size measured
-        excludes the task description that the broadcast conversion
-        stamps onto every trace event, so a task's description alone
-        can no longer blank out its step stream this way -- a frame is
-        only dropped here when its content, apart from that field, is
-        still over the cap. (4) a planning step can be left unresolved:
+        excludes the task's own description column -- which arrives
+        under one of two keys depending on the frame family -- so a
+        task's description alone can no longer blank out its step
+        stream this way -- a frame is only dropped here when its
+        content, apart from that column, is still over the cap. (4) a
+        planning step can be left unresolved:
         when a planning round ends without emitting its own terminal
         event (a plan-generation error escaping before it), the next
         round clears the pairing key that step was waiting on, so the
