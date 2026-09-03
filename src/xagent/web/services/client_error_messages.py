@@ -130,11 +130,7 @@ def required_mcp_unavailable_client_message(
     return fallback
 
 
-def connector_runtime_client_message(
-    error: BaseException,
-    *,
-    fallback: str = CLIENT_SAFE_TASK_FAILURE,
-) -> str:
+def connector_runtime_client_message(error: BaseException) -> str:
     """Adapt the curated connector-runtime failure without a generic escape.
 
     The runtime check keeps this boundary fail-closed even if a future caller
@@ -142,11 +138,11 @@ def connector_runtime_client_message(
     """
 
     if not isinstance(error, ConnectorRuntimeError):
-        return fallback
+        return CLIENT_SAFE_TASK_FAILURE
     message = error.safe_message
     if isinstance(message, str) and message.strip():
         return message
-    return fallback
+    return CLIENT_SAFE_TASK_FAILURE
 
 
 def connector_runtime_client_code(error: BaseException) -> str | None:
