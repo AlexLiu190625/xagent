@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest"
 
+import en from "@/i18n/locales/en"
 import {
+  CLIENT_ERROR_CODES,
   clientErrorFallback,
   clientErrorTranslationKey,
   readClientErrorCode,
@@ -44,5 +46,16 @@ describe("client error wire contract", () => {
   it("rejects unknown and non-string codes", () => {
     expect(readClientErrorCode("provider_secret")).toBeNull()
     expect(readClientErrorCode({ error_code: "upload_failed" })).toBeNull()
+  })
+
+  it("keeps the fallback strings identical to the English locale", () => {
+    for (const code of CLIENT_ERROR_CODES) {
+      const translationKey = clientErrorTranslationKey(code)
+      const localeKey = translationKey.replace(
+        /^clientErrors\./,
+        "",
+      ) as keyof typeof en.clientErrors
+      expect(clientErrorFallback(code)).toBe(en.clientErrors[localeKey])
+    }
   })
 })

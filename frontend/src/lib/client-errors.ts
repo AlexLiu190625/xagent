@@ -1,6 +1,6 @@
 import type { TranslationKey } from "@/i18n/translations"
 
-const CLIENT_ERROR_CODES = [
+export const CLIENT_ERROR_CODES = [
   "message_processing_failed",
   "task_execution_failed",
   "guidance_in_progress",

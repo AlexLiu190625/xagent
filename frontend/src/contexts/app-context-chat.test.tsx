@@ -6388,6 +6388,74 @@ describe("terminal error frames", () => {
       )
     })
   })
+
+  // A cancellation carries no code (external_task_cancel.py:404 passes only
+  // a message), so isTerminal alone -- not a code -- has to make this frame
+  // the turn's result and route it through ADD_MESSAGE's isResult branch,
+  // the one place trace events accumulated on state.traceEvents move onto
+  // the settling message and state.traceEvents is cleared.
+  it("drains accumulated trace events onto the cancellation bubble", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      getSessionControls().dispatch({
+        type: "ADD_TRACE_EVENT",
+        payload: {
+          event_id: "trace-1",
+          event_type: "agent_progress",
+          timestamp: "2026-05-27T05:00:01Z",
+          data: { message: "Reading the connector config" },
+        },
+      })
+      getSessionControls().dispatch({
+        type: "ADD_TRACE_EVENT",
+        payload: {
+          event_id: "trace-2",
+          event_type: "agent_progress",
+          timestamp: "2026-05-27T05:00:01.500Z",
+          data: { message: "Calling the tool" },
+        },
+      })
+    })
+    expect(getSessionControls().state.traceEvents).toHaveLength(2)
+
+    act(() => {
+      onMessage?.({
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "This response was interrupted.",
+        error: "This response was interrupted.",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "This response was interrupted."
+      )
+    })
+
+    expect(getSessionControls().state.traceEvents).toEqual([])
+    const bubble = getSessionControls().state.messages.find(
+      (message) =>
+        typeof message.content === "string" &&
+        message.content.includes("This response was interrupted.")
+    )
+    expect(bubble?.traceEvents?.map((event) => event.event_id)).toEqual([
+      "trace-1",
+      "trace-2",
+    ])
+  })
 })
 
 describe("error frame display projection", () => {
@@ -6439,6 +6507,36 @@ describe("error frame display projection", () => {
         // has no state version.
         occurrenceIdentity: undefined,
         bubbleContent: "agent.logs.event.messages.errorPrefix Task execution failed.",
+        isResult: true,
+      },
+    },
+    {
+      // A resume that settles the task before the caller can hand it a code:
+      // websocket.py's resume-settlement broadcast (:3038) carries error_code
+      // on the root, the same field the non-terminal rejection channel
+      // uses -- not the code field create_terminal_task_error_event writes.
+      // getWebSocketErrorCode reads it regardless of which channel it came
+      // from, so dedupText picks up the coded wording; the bubble still gets
+      // the generic prefix, because that only drops for a frame carrying a
+      // `code` field, which this one does not.
+      name: "a resume-settlement frame with a root error_code on a trusted transport",
+      frame: {
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Task execution failed.",
+        error: "Task execution failed.",
+        error_code: "task_execution_failed",
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: true,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed",
+        stopsProcessing: true,
+        dedupText: "clientErrors.taskExecutionFailed",
+        occurrenceIdentity: undefined,
+        bubbleContent: "agent.logs.event.messages.errorPrefix clientErrors.taskExecutionFailed",
         isResult: true,
       },
     },
