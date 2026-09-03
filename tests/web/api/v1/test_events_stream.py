@@ -1666,10 +1666,11 @@ async def test_watchdog_keeps_checking_authorization_across_an_ordinary_close(
 
     The warm-up replay hands its frames to the client directly, bypassing
     the outbound queue's closing guard, so a close that is not abortive
-    stops nothing on that path -- only ``abortive_close`` does, and only
-    ``watchdog_check_once`` ever sets it. A watchdog that stops at a
-    close therefore never observes a key revoked afterwards, and the
-    replay hands that key the task's persisted history.
+    stops nothing on that path -- only ``abortive_close`` does, set here
+    by ``watchdog_check_once`` (and, on a different path, by
+    ``_generate``'s own two pre-loop read failures). A watchdog that
+    stops at a close therefore never observes a key revoked afterwards,
+    and the replay hands that key the task's persisted history.
 
     The two legs differ in one variable, who claims the close, because
     the loop had two separate exits that both ended coverage: one on
@@ -1722,6 +1723,70 @@ async def test_watchdog_keeps_checking_authorization_across_an_ordinary_close(
         body = "".join(frames)
         assert "event: step.started" not in body
         assert frames[-1].startswith(expected_close_event)
+    finally:
+        await resp.body_iterator.aclose()
+
+
+async def test_watchdog_stops_once_the_warm_up_handoff_is_over():
+    """The warm-side mirror of the test above: once the warm-up handoff
+    is over, an ordinary close really does end watchdog coverage,
+    because every emission from that point on goes through
+    ``_put_or_overflow``'s closing guard -- there is no longer a direct
+    replay path left for the watchdog to keep guarding against.
+
+    Pulls frames until ``sink.warm`` is True. ``sink.warm`` flips inside
+    the generator, between the last replayed frame and whatever it
+    yields next, so the pull that observes it can block briefly on the
+    generator's own wait loop -- a short ``heartbeat_interval_seconds``
+    bounds that to one ``: ping`` cycle instead of the fixture's usual
+    minutes-long interval.
+
+    Then closes non-abortively and asserts the watchdog loop's actual
+    exit, not only the predicate flipping: ``_watchdog_coverage_done``
+    reading True proves nothing about whether the loop's own ``while``
+    re-checked it, so this awaits the watchdog task itself with a
+    timeout too -- a predicate that goes true without the task
+    finishing would still fail this test."""
+    task_id, principal = await _three_step_task()
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
+        watchdog_interval_seconds=0.05,
+        stream_max_duration_seconds=600.0,
+        heartbeat_interval_seconds=0.05,
+    )
+    try:
+        status = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert "event: task.status" in status
+        sink = next(
+            c
+            for c in es.manager.connections_for_task(task_id)
+            if isinstance(c, es.V1EventStreamSink)
+        )
+        assert sink.warm is False
+
+        watchdog_task = next(
+            t
+            for t in asyncio.all_tasks()
+            if t.get_coro().cr_code.co_name == "_watchdog_loop"
+        )
+
+        for _ in range(10):
+            if sink.warm:
+                break
+            await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert sink.warm is True
+
+        assert sink.enqueue_close(es.error_frame("resync_required")) is True
+        await _poll_until(lambda: es._watchdog_coverage_done(sink))
+        await asyncio.wait_for(watchdog_task, timeout=2)
+        assert watchdog_task.done()
     finally:
         await resp.body_iterator.aclose()
 
