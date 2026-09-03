@@ -3386,6 +3386,19 @@ def update_mcp_server(
         # lock is taken in a few cases that did not need it, and skipped in
         # none whose fields target that row.
         #
+        # One flag, three decisions, and they are the same decision on
+        # purpose: whether to take the row lock (the ``with_for_update``
+        # below), whether to re-derive the caller's write authority after
+        # that wait (the block right after the lock), and whether to
+        # rebuild, validate and write the definition row (the block
+        # further down). Moving a field into the exclusion set above
+        # therefore also drops that payload's post-lock re-authorization --
+        # the hazard ``custom_api.py``'s equivalent comment warns about --
+        # and drops its runtime-config validation with it. Change that set
+        # only with all three in view;
+        # ``tests/web/api/test_mcp_update_lock_partition.py`` fails on a
+        # field added to ``MCPServerUpdate`` without that decision.
+        #
         # This set is also exactly the set of payloads the block below
         # rebuilds and writes the definition row for: the whole rebuild --
         # building ``update_data``, validating it, and writing every
@@ -3433,6 +3446,13 @@ def update_mcp_server(
         # ``FOR UPDATE``. On MySQL, which has no such distinction,
         # ``key_share`` is accepted and ignored: SQLAlchemy renders plain
         # ``FOR UPDATE`` there either way.
+        #
+        # The weaker mode is not what leaves the residual window the
+        # re-reads after the lock cover: neither deleting a
+        # ``UserMCPServer`` row nor clearing a ``User.is_admin`` flag takes
+        # any lock on this row in either mode, so plain ``FOR UPDATE``
+        # would leave exactly the same window open. See the re-read block
+        # below for how it is handled instead.
         definition_query = (
             db.query(MCPServer).filter(MCPServer.id == server_id).populate_existing()
         )
@@ -3527,10 +3547,15 @@ def update_mcp_server(
                 db.query(User).filter(User.id == user_id).populate_existing().first()
             )
             if current_admin_user is None:
+                # Distinct wording from the two 404s above on purpose: the
+                # definition row and the caller's link to it were both still
+                # there when this branch is reached, and what vanished inside
+                # the lock wait is the caller's own account. Answering "MCP
+                # server not found" here would name the wrong missing object.
                 db.rollback()
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail="MCP server not found",
+                    detail="Requesting user account no longer exists",
                 )
             can_edit_global = _check_mcp_permission(
                 user_mcp, bool(current_admin_user.is_admin), require="edit"

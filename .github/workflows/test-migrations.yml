@@ -62,6 +62,7 @@ on:
       - 'src/xagent/web/models/custom_api.py'
       - 'tests/web/api/test_mcp_server_edit_lock_postgresql.py'
       - 'src/xagent/web/api/mcp.py'
+      - 'src/xagent/core/tools/core/mcp/model.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -160,6 +161,7 @@ jobs:
             src/xagent/web/models/custom_api.py
             tests/web/api/test_mcp_server_edit_lock_postgresql.py
             src/xagent/web/api/mcp.py
+            src/xagent/core/tools/core/mcp/model.py
           )
 
           case "$EVENT_NAME" in
