@@ -882,6 +882,192 @@ def test_normalize_args_by_schema_wraps_scalar_for_array_only_field():
     assert normalized["add_label_ids"] == ["TRASH"]
 
 
+def _google_analytics_run_report_mcp_tool() -> SimpleNamespace:
+    return SimpleNamespace(
+        name="google_analytics_run_report",
+        description="Run a GA4 report",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "property_id": {"type": "string"},
+                "dimensions": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "null"},
+                    ],
+                    "default": None,
+                },
+            },
+            "required": ["property_id"],
+        },
+    )
+
+
+def test_normalize_args_by_schema_parses_json_encoded_array_string():
+    """Regression test: an LLM sometimes double-encodes an array-only
+    argument as a JSON string (e.g. '["date"]' instead of ["date"]). Without
+    parsing it first, the naive scalar-wrap path used to produce
+    ['["date"]'] — a single list item containing the literal brackets and
+    quotes — which then reached the downstream API as a garbled field name.
+    """
+    adapter = MCPToolAdapter(
+        mcp_tool=_google_analytics_run_report_mcp_tool(),
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+
+    normalized = adapter._normalize_args_by_schema(
+        {"property_id": "550713710", "dimensions": '["date"]'}
+    )
+
+    assert normalized["dimensions"] == ["date"]
+
+
+def test_normalize_args_by_schema_parses_json_encoded_scalar_string():
+    """Same bug, one step removed: a single item double-encoded as a JSON
+    string (e.g. '"date"' instead of "date") must not fall through to the
+    raw wrap, which would keep the item's own quotes as ['"date"'].
+    """
+    adapter = MCPToolAdapter(
+        mcp_tool=_google_analytics_run_report_mcp_tool(),
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+
+    normalized = adapter._normalize_args_by_schema(
+        {"property_id": "550713710", "dimensions": '"date"'}
+    )
+
+    assert normalized["dimensions"] == ["date"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "TRASH",  # not valid JSON at all
+        '{"a": 1}',  # valid JSON, but neither a list nor a string
+        "null",  # valid JSON, decodes to None
+        "123",  # valid JSON, decodes to an int
+    ],
+)
+def test_normalize_args_by_schema_falls_back_to_raw_wrap_for_non_list_json(value):
+    """When the string isn't JSON, or is JSON that decodes to something
+    other than a list or a string, the field is wrapped as-is rather than
+    silently dropped or coerced into an unrelated shape."""
+    adapter = MCPToolAdapter(
+        mcp_tool=_google_analytics_run_report_mcp_tool(),
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+
+    normalized = adapter._normalize_args_by_schema(
+        {"property_id": "550713710", "dimensions": value}
+    )
+
+    assert normalized["dimensions"] == [value]
+
+
+def test_normalize_args_by_schema_falls_back_to_raw_wrap_on_recursion_error(
+    monkeypatch,
+):
+    """A pathologically deep bracket string makes json.loads raise
+    RecursionError rather than JSONDecodeError. That must be treated the
+    same as any other unparsable value (fall back to the raw wrap), not
+    propagate as an unhandled exception.
+
+    The nesting needed to actually trigger RecursionError (tens of
+    thousands of characters) is itself well past the recovery length cap,
+    so the cap is raised here — same as the digit-limit test below — to
+    reach json.loads at all and genuinely exercise the RecursionError
+    branch, rather than the length guard short-circuiting first.
+    """
+    monkeypatch.setattr(
+        MCPToolAdapter, "_ARRAY_ARG_JSON_RECOVERY_MAX_CHARS", 1_000_000, raising=True
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=_google_analytics_run_report_mcp_tool(),
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+    deeply_nested = "[" * 100_000 + "]" * 100_000
+    assert len(deeply_nested) <= adapter._ARRAY_ARG_JSON_RECOVERY_MAX_CHARS
+
+    normalized = adapter._normalize_args_by_schema(
+        {"property_id": "550713710", "dimensions": deeply_nested}
+    )
+
+    assert normalized["dimensions"] == [deeply_nested]
+
+
+def test_normalize_args_by_schema_falls_back_to_raw_wrap_on_oversized_json_string():
+    """A string longer than the recovery cap is never handed to json.loads
+    at all — even if it's valid JSON — and falls back to the raw wrap. This
+    also keeps a run of >4300 digits (which makes json.loads raise a plain
+    ValueError via CPython's int-string-conversion digit-limit guard, not
+    json.JSONDecodeError) from ever reaching the parser."""
+    adapter = MCPToolAdapter(
+        mcp_tool=_google_analytics_run_report_mcp_tool(),
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+    oversized_valid_array = "[" + ",".join(['"d"'] * 2000) + "]"
+    assert len(oversized_valid_array) > adapter._ARRAY_ARG_JSON_RECOVERY_MAX_CHARS
+
+    normalized = adapter._normalize_args_by_schema(
+        {"property_id": "550713710", "dimensions": oversized_valid_array}
+    )
+
+    assert normalized["dimensions"] == [oversized_valid_array]
+
+
+def test_normalize_args_by_schema_falls_back_to_raw_wrap_on_digit_limit_value_error(
+    monkeypatch,
+):
+    """Directly pins the ValueError-catching behavior in isolation from the
+    length guard above: a run of more digits than CPython's
+    sys.get_int_max_str_digits() limit (default 4300) makes json.loads raise
+    a plain ValueError that is NOT a json.JSONDecodeError. That must still
+    fall back to the raw wrap rather than propagate uncaught."""
+    monkeypatch.setattr(
+        MCPToolAdapter, "_ARRAY_ARG_JSON_RECOVERY_MAX_CHARS", 10_000, raising=True
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=_google_analytics_run_report_mcp_tool(),
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+    many_digits = "9" * 5000
+    assert len(many_digits) <= adapter._ARRAY_ARG_JSON_RECOVERY_MAX_CHARS
+
+    normalized = adapter._normalize_args_by_schema(
+        {"property_id": "550713710", "dimensions": many_digits}
+    )
+
+    assert normalized["dimensions"] == [many_digits]
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("[1, 2, 3]", [1, 2, 3]),  # non-string items pass through unchecked
+        ("[]", []),  # an explicit empty array stays empty
+        ('""', [""]),  # a decoded empty string is still "the one item meant"
+        ('["date", 5]', ["date", 5]),  # a mix of valid/invalid item types
+    ],
+)
+def test_normalize_args_by_schema_recovers_edge_case_shapes(value, expected):
+    """Pins the current, intentional behavior for shapes the recovery
+    doesn't specially validate: item types inside a recovered list aren't
+    checked against the schema's `items` type here (a real MCP tool call
+    still gets independently validated against its own typed arg model
+    downstream), and a decoded empty string is treated like any other
+    decoded scalar rather than being special-cased as "no value"."""
+    adapter = MCPToolAdapter(
+        mcp_tool=_google_analytics_run_report_mcp_tool(),
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+
+    normalized = adapter._normalize_args_by_schema(
+        {"property_id": "550713710", "dimensions": value}
+    )
+
+    assert normalized["dimensions"] == expected
+
+
 def test_normalize_args_by_schema_keeps_scalar_for_union_scalar_or_array_field():
     mcp_tool = SimpleNamespace(
         name="multi_shape_tool",
