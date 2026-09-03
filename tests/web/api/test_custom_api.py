@@ -892,14 +892,16 @@ def _route_ast(name: str) -> "ast.FunctionDef":
     ],
 )
 def test_the_definition_row_lock_statement_precedes_the_team_hook_call(route, hook):
-    """Both routes take the definition-row lock before they call into a
-    connector team hook.
+    """``delete_custom_api`` always takes the definition-row lock before it
+    calls into a connector team hook; ``update_custom_api`` takes that lock
+    only for a payload that writes the definition row, and takes it before
+    the hook when it does.
 
     Statement position is the thing under test, so it is read off the
     source rather than off executed SQL: SQLAlchemy renders no locking
     clause at all on SQLite, so a run against the suite's own engine
-    cannot tell this lock statement from a plain read and stays green
-    with the lock moved anywhere. That the clause really blocks a second
+    cannot tell this lock statement from a plain read. That the clause
+    really blocks a second
     writer is proved against a real server in
     test_custom_api_edit_lock_postgresql.py; what is proved here is the
     order the two routes share, which is what keeps a concurrent edit and
