@@ -183,10 +183,24 @@ def display_message_override(metadata: Any) -> str | None:
     return display.strip()
 
 
-def top_level_user_request(context: Any) -> TopLevelUserRequest:
-    """Return and persist the latest independent top-level user request."""
+def top_level_user_request(
+    context: Any,
+    *,
+    user_message_limit: int | None = None,
+) -> TopLevelUserRequest:
+    """Return and persist the latest independent top-level user request.
+
+    ``user_message_limit`` freezes selection to a checkpointed prefix when a
+    later waiting response has already been appended to the root context.
+    """
     has_pending_response = False
-    for message in reversed(getattr(context, "messages", []) or []):
+    messages = list(getattr(context, "messages", []) or [])
+    if user_message_limit is not None:
+        user_messages = [
+            message for message in messages if getattr(message, "role", None) == "user"
+        ]
+        messages = user_messages[: max(0, user_message_limit)]
+    for message in reversed(messages):
         if getattr(message, "role", None) != "user" or getattr(
             message, "hidden", False
         ):
@@ -302,8 +316,8 @@ def _lookup_relevant_memories_with_context(
     similarity_threshold: float | None,
     user_id: Any | None,
 ) -> list[dict[str, Any]]:
-    if user_id is not None:
-        try:
+    try:
+        if user_id is not None:
             token = current_user_id.set(user_id)
             try:
                 return lookup_relevant_memories(
@@ -316,18 +330,21 @@ def _lookup_relevant_memories_with_context(
                 )
             finally:
                 current_user_id.reset(token)
-        except Exception:
-            logger.exception("Failed to retrieve memories with user context")
-            return []
 
-    return lookup_relevant_memories(
-        memory_store,
-        query,
-        category,
-        include_general=include_general,
-        limit=limit,
-        similarity_threshold=similarity_threshold,
-    )
+        return lookup_relevant_memories(
+            memory_store,
+            query,
+            category,
+            include_general=include_general,
+            limit=limit,
+            similarity_threshold=similarity_threshold,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to retrieve memories%s",
+            " with user context" if user_id is not None else "",
+        )
+        return []
 
 
 def _current_user_id() -> Any | None:

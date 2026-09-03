@@ -1636,6 +1636,9 @@ async def test_runner_initial_user_message_preserves_display_metadata(
     assert first_user.content == execution_message
     assert first_user.metadata["display_message"] == "Read file"
     assert first_user.metadata["files"] == files
+    assert result["context"].current_user_request_text(prefer_display=True) == (
+        "Read file"
+    )
     turn_id = first_user.metadata.get("turn_id")
     assert isinstance(turn_id, str) and turn_id
     user_event = next(
