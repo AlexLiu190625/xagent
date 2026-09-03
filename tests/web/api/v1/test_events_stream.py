@@ -2816,6 +2816,7 @@ async def test_orphan_end_during_warm_up_is_rescued_by_staging():
     # What a real warm-up read would have produced: a projector that has
     # already replayed the matching start event from history.
     history_start_event = {
+        "id": 1,
         "task_id": 41,
         "event_id": "hist-1",
         "event_type": "tool_execution_start",
@@ -3832,7 +3833,7 @@ async def test_the_watermark_read_splits_task_deleted_from_every_other_failure(
     whose code is not ``TASK_NOT_FOUND``.
 
     ``_long_intervals()`` keeps the watchdog asleep for the whole test,
-    so the close frame either leg observes can only be the one this
+    so the close frame any leg observes can only be the one this
     handler queued -- not the watchdog independently discovering the
     same deleted row. Either way the warm-up block is skipped
     (``replay_watermark`` stays ``None``), so no history reaches the
@@ -4045,8 +4046,9 @@ def test_fast_path_step_snapshot_hits_the_steps_cache(monkeypatch):
 async def test_fast_path_step_read_failure_closes_with_resync_required_not_a_bare_disconnect():
     """Both attach-time fast paths now catch a snapshot-read failure and
     close with ``stream.error {resync_required}``, matching the
-    invariant ``_generate`` already enforces around its own warm-up read
-    (see ``test_warm_up_read_failure_closes_with_resync_required_not_a_bare_disconnect``)
+    invariant ``_generate`` already enforces around its own watermark
+    read (see
+    ``test_the_watermark_read_splits_task_deleted_from_every_other_failure``)
     -- not a bare exception out of the generator. That distinction
     matters here specifically because ``StreamingResponse`` sends the
     HTTP response start (200, headers) before ever pulling a chunk from
