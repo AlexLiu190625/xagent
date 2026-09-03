@@ -104,9 +104,9 @@ values it deliberately leaves unbounded, in one place:
     ``resync_required`` the same way the outbound queue's own overflow
     does. Sized off the same 4 MiB factor as the queue's byte budget and
     the snapshot budget below, but counted on a different unit: this
-    total is the *raw* broadcast text a staged message arrived in, before
-    projection, not serialized wire bytes -- a staged message is not a
-    frame yet.
+    total is the description-free measure of a staged message (see
+    ``_measured_content_frame``), before projection, not serialized wire
+    bytes -- a staged message is not a frame yet.
   - One attach-time batch of steps -- the two fast-path snapshots
     (``_fast_path_step_snapshot``) and the normal streaming path's
     warm-up replay (``_build_warm_up_frames``) alike:
@@ -1189,11 +1189,16 @@ class V1EventStreamSink:
         # overflow policy (``resync_required`` then close) rather than a
         # second one -- see ``_stage_content_message``.
         self._staged_messages: list[dict[str, Any]] = []
-        # Cumulative text length (``len(text)``, the same O(1) proxy the
-        # raw-frame pre-check in ``send_text`` uses) of everything
-        # currently in ``_staged_messages``, kept in lockstep with that
-        # list rather than recomputed by re-serializing it -- see
-        # ``STAGED_MESSAGES_MAX_TEXT_CHARS``.
+        # Cumulative text length of everything currently in
+        # ``_staged_messages`` -- the description-free measure
+        # ``_measured_content_frame`` returns, not a raw ``len(text)``,
+        # and the same value ``send_text``'s pre-check already
+        # computed, so nothing here is re-serialized a second time.
+        # Kept in lockstep with that list rather than recomputed -- see
+        # ``STAGED_MESSAGES_MAX_TEXT_CHARS``. Cheap (an O(1) ``len()``)
+        # only for a frame with no description key to prune; one that
+        # does carry one pays a ``json.dumps`` there, whose cost scales
+        # with the frame's own size.
         self._staged_text_chars = 0
         # Recorded at construction time (always inside the endpoint's own
         # request coroutine) so later state-mutating calls -- however they
@@ -1574,8 +1579,8 @@ class V1EventStreamSink:
         the expensive half here -- ``serialize_trace_data`` plus the
         projection fold -- never runs over the description at all, for
         every frame this method admits. That is a clear net saving
-        when the description is the bulk of the frame (about −0.11 ms
-        at a 64 KiB description, −0.34 ms at 200 KiB); when the
+        when the description is the bulk of the frame (about -0.11 ms
+        at a 64 KiB description, -0.34 ms at 200 KiB); when the
         payload is the bulk and the description is small, the extra
         ``json.dumps`` ``_measured_content_frame`` now always pays
         costs up to about +0.21 ms per frame on a 200 KiB frame,
@@ -1640,10 +1645,11 @@ class V1EventStreamSink:
                 # only defer the same drop to ``finish_warm_up`` while
                 # holding its bytes in the meantime. What gets staged is
                 # the same measured frame the warm path projects, counted
-                # in the same unit the check above used (characters
-                # excluding the task-description stamp), so the staging
-                # budget and the raw-frame cap measure one thing rather
-                # than two.
+                # in the same unit the check above used (the task's own
+                # description column excluded, whichever of the two keys
+                # it arrived under -- see ``_measured_content_frame``), so
+                # the staging budget and the raw-frame cap measure one
+                # thing rather than two.
                 if self._warm:
                     self._project_and_queue(frame)
                 else:
