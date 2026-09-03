@@ -1,14 +1,12 @@
 """Real-PostgreSQL coverage for the row lock ``update_mcp_server`` takes on
 the ``MCPServer`` definition row before building the new config -- and, for
 the payloads that must *not* take it: a PUT that sets only ``is_active``
-and/or ``user_env`` writes the caller's own ``UserMCPServer`` link row. On
-a server carrying no global ``env`` or ``auth`` the rebuild writes nothing
-back to the definition row, so it reads that row without locking it (a
-server with a global ``env`` or ``auth`` still gets its re-encrypted
-secret written back on this path -- pre-existing behavior, tracked in
-#1945). Under PostgreSQL REPEATABLE READ that distinction is the
-difference between HTTP 200 and a serialization failure surfacing as
-HTTP 500.
+and/or ``user_env`` writes the caller's own ``UserMCPServer`` link row and
+never runs the config rebuild at all, regardless of what the row it reads
+carries -- a server with a global ``env`` or ``auth`` gets no re-encrypted
+secret written back on this path either. Under PostgreSQL REPEATABLE READ,
+locking a row this payload never writes is the difference between HTTP 200
+and a serialization failure surfacing as HTTP 500.
 
 ``FOR UPDATE`` is a no-op on SQLite -- every other suite in this repo runs
 against SQLite, so nothing there can tell a genuine second-writer block
@@ -404,8 +402,10 @@ def test_a_row_that_vanishes_after_the_gate_but_before_the_lock_is_a_404_not_a_5
     db = session_factory()
     real_query = db.query
     deleted_already = threading.Event()
+    queried_entities: list[tuple] = []
 
     def delete_the_row_when_the_lock_query_starts(*entities, **kwargs):
+        queried_entities.append(entities)
         if entities == (MCPServer,) and not deleted_already.is_set():
             deleted_already.set()
             with session_factory() as other:
@@ -429,6 +429,12 @@ def test_a_row_that_vanishes_after_the_gate_but_before_the_lock_is_a_404_not_a_5
             )
         assert deleted_already.is_set(), "the concurrent delete never ran"
         assert exc.value.status_code == 404
+        assert queried_entities[:2] == [(UserMCPServer, MCPServer), (MCPServer,)], (
+            "the concurrent delete must land after the access read's own "
+            "read and before this route's definition read; otherwise this "
+            "404 could be the gate's rather than the lock query's own "
+            f"empty result -- saw {queried_entities!r}"
+        )
     finally:
         db.close()
 
@@ -508,6 +514,398 @@ def test_an_activation_only_edit_survives_a_concurrent_definition_commit_under_r
         assert (
             fresh.query(MCPServer).filter(MCPServer.id == server_id).one().description
             == "edited-by-the-concurrent-definition-editor"
+        )
+
+
+def test_a_user_env_only_edit_on_a_server_with_a_global_env_does_not_take_the_lock(
+    repeatable_read_sessions,
+) -> None:
+    """A payload that sets only ``user_env`` writes this caller's own
+    ``UserMCPServer`` link row, even when the shared server it targets
+    carries a global ``env``. Before the fix this route rebuilds, this row
+    shape is exactly the one the reviewer's finding was about: the config
+    rebuild decrypts the definition row's ``env``, then encrypts it again
+    on the way back out, and Fernet ciphertext differs on every call even
+    when the plaintext does not -- so the lock-free path still wrote this
+    row, unlocked. After the fix the rebuild does not run at all on this
+    path, so the stored ciphertext must come back byte-for-byte identical.
+
+    Proves the lock is not taken the same way the activation-only test
+    above does: a concurrent definition-row commit lands strictly between
+    this route's access read and its definition-row read, and under
+    REPEATABLE READ that commit is invisible to a plain read but forces a
+    locking read (``FOR ... UPDATE``) to fail with SQLSTATE 40001. This
+    request surviving with HTTP 200 is what shows no locking read ran --
+    the concurrent commit is itself a real definition-row write (to
+    ``description``, a column this test does not otherwise touch), so it
+    is expected to move the row's own ``updated_at``; the companion test
+    below covers that assertion for a request with no concurrent editor
+    to confuse it.
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.core.utils.encryption import encrypt_env_dict
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    default_factory, rr_factory = repeatable_read_sessions
+    stored_env = encrypt_env_dict({"K": "v"})
+    with default_factory() as db:
+        owner = User(username="mcp-env-only-owner", password_hash="x", is_admin=False)
+        db.add(owner)
+        db.flush()
+        server = MCPServer(
+            name="env-only-target",
+            transport="stdio",
+            managed="external",
+            command="true",
+            concurrent_tools=[],
+            env=stored_env,
+        )
+        db.add(server)
+        db.flush()
+        db.add(
+            UserMCPServer(
+                user_id=int(owner.id),
+                mcpserver_id=int(server.id),
+                is_owner=True,
+                is_active=True,
+            )
+        )
+        db.commit()
+        owner_id, server_id = int(owner.id), int(server.id)
+
+    db = rr_factory()
+    real_query = db.query
+    committed = threading.Event()
+
+    def commit_a_definition_edit_when_the_definition_query_starts(*entities, **kwargs):
+        if entities == (MCPServer,) and not committed.is_set():
+            committed.set()
+            with default_factory() as other:
+                other.execute(
+                    sa.update(MCPServer)
+                    .where(MCPServer.id == server_id)
+                    .values(description="edited-by-the-concurrent-definition-editor")
+                )
+                other.commit()
+        return real_query(*entities, **kwargs)
+
+    db.query = commit_a_definition_edit_when_the_definition_query_starts
+    try:
+        response = mcp_api.update_mcp_server(
+            server_id,
+            MCPServerUpdate(user_env={"MINE": "x"}),
+            current_user=SimpleNamespace(id=owner_id, is_admin=False),
+            db=db,
+        )
+    finally:
+        db.close()
+
+    assert committed.is_set(), "the concurrent definition edit never ran"
+    assert response is not None
+
+    with default_factory() as fresh:
+        row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert row.env == stored_env, (
+            "the shared definition row's env must be untouched byte-for-byte "
+            "by a request that only sets user_env -- a changed value here "
+            "means the config rebuild ran (and re-encrypted it) on a path "
+            "that must not run it at all"
+        )
+        assert row.description == "edited-by-the-concurrent-definition-editor", (
+            "the concurrent definition edit must have actually landed, or "
+            "this test proves nothing about interleaving"
+        )
+
+
+def test_a_user_env_only_edit_on_a_server_with_a_global_env_leaves_it_and_updated_at_untouched(
+    session_factory, seeded
+) -> None:
+    """The single-request counterpart to the concurrency test above, with
+    no concurrent editor to also move ``updated_at``: a payload that sets
+    only ``user_env`` on a server carrying a global ``env`` must leave that
+    ``env`` value AND the row's ``updated_at`` exactly as they were --
+    nothing in this request has any business touching either.
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.core.utils.encryption import encrypt_env_dict
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    owner_id, server_id = seeded
+    stored_env = encrypt_env_dict({"K": "v"})
+    with session_factory() as db:
+        db.execute(
+            sa.update(MCPServer)
+            .where(MCPServer.id == server_id)
+            .values(env=stored_env, concurrent_tools=[])
+        )
+        db.commit()
+        original_updated_at = (
+            db.query(MCPServer).filter(MCPServer.id == server_id).one().updated_at
+        )
+
+    with session_factory() as db:
+        response = mcp_api.update_mcp_server(
+            server_id,
+            MCPServerUpdate(user_env={"MINE": "x"}),
+            current_user=SimpleNamespace(id=owner_id, is_admin=False),
+            db=db,
+        )
+    assert response is not None
+
+    with session_factory() as fresh:
+        row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert row.env == stored_env, (
+            "env must be untouched byte-for-byte by a user_env-only request"
+        )
+        assert row.updated_at == original_updated_at, (
+            "a request that writes only the caller's own link row must not "
+            "move the shared definition row's updated_at"
+        )
+
+
+def test_an_is_active_only_edit_on_a_server_with_concurrent_tools_null_does_not_take_the_lock(
+    repeatable_read_sessions,
+) -> None:
+    """Same shape as the global-``env`` case above, for the other row shape
+    the reviewer's finding covers: a pre-migration row whose
+    ``concurrent_tools`` column is still ``NULL`` (the
+    ``20260624_add_mcp_concurrency_config`` migration added the column with
+    no ``server_default`` and no backfill). Before the fix, the config
+    rebuild normalizes a ``NULL`` ``concurrent_tools`` to ``[]`` and writes
+    it back even on the lock-free path; after the fix the rebuild does not
+    run, so the column must still read ``NULL``. See the companion test
+    below for the ``updated_at``-unchanged assertion this test's concurrent
+    editor (a real definition-row write of its own) would otherwise
+    confuse.
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    default_factory, rr_factory = repeatable_read_sessions
+    with default_factory() as db:
+        owner = User(
+            username="mcp-ctnull-only-owner", password_hash="x", is_admin=False
+        )
+        db.add(owner)
+        db.flush()
+        server = MCPServer(
+            name="ctnull-only-target",
+            transport="stdio",
+            managed="external",
+            command="true",
+        )
+        db.add(server)
+        db.flush()
+        assert server.concurrent_tools is None, (
+            "this test depends on a hand-built row leaving concurrent_tools "
+            "NULL, the way a pre-migration row does"
+        )
+        db.add(
+            UserMCPServer(
+                user_id=int(owner.id),
+                mcpserver_id=int(server.id),
+                is_owner=True,
+                is_active=True,
+            )
+        )
+        db.commit()
+        owner_id, server_id = int(owner.id), int(server.id)
+
+    db = rr_factory()
+    real_query = db.query
+    committed = threading.Event()
+
+    def commit_a_definition_edit_when_the_definition_query_starts(*entities, **kwargs):
+        if entities == (MCPServer,) and not committed.is_set():
+            committed.set()
+            with default_factory() as other:
+                other.execute(
+                    sa.update(MCPServer)
+                    .where(MCPServer.id == server_id)
+                    .values(description="edited-by-the-concurrent-definition-editor")
+                )
+                other.commit()
+        return real_query(*entities, **kwargs)
+
+    db.query = commit_a_definition_edit_when_the_definition_query_starts
+    try:
+        response = mcp_api.update_mcp_server(
+            server_id,
+            MCPServerUpdate(is_active=False),
+            current_user=SimpleNamespace(id=owner_id, is_admin=False),
+            db=db,
+        )
+    finally:
+        db.close()
+
+    assert committed.is_set(), "the concurrent definition edit never ran"
+    assert response.is_active is False
+
+    with default_factory() as fresh:
+        row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert row.concurrent_tools is None, (
+            "an is_active-only request must not normalize this row's NULL "
+            "concurrent_tools to [] -- that write means the config rebuild "
+            "ran on a path that must not run it at all"
+        )
+        assert row.description == "edited-by-the-concurrent-definition-editor", (
+            "the concurrent definition edit must have actually landed, or "
+            "this test proves nothing about interleaving"
+        )
+
+
+def test_an_is_active_only_edit_on_a_server_with_concurrent_tools_null_stays_null(
+    session_factory, seeded
+) -> None:
+    """The single-request counterpart to the concurrency test above: an
+    ``is_active``-only payload against a row whose ``concurrent_tools`` is
+    still ``NULL`` must leave it ``NULL``, not normalize it to ``[]``."""
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    owner_id, server_id = seeded
+    with session_factory() as db:
+        assert (
+            db.query(MCPServer).filter(MCPServer.id == server_id).one().concurrent_tools
+            is None
+        ), "the seeded fixture's row must leave concurrent_tools NULL"
+
+    with session_factory() as db:
+        response = mcp_api.update_mcp_server(
+            server_id,
+            MCPServerUpdate(is_active=False),
+            current_user=SimpleNamespace(id=owner_id, is_admin=False),
+            db=db,
+        )
+    assert response.is_active is False
+
+    with session_factory() as fresh:
+        row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert row.concurrent_tools is None, (
+            "an is_active-only request must not normalize a NULL concurrent_tools to []"
+        )
+
+
+def test_a_user_env_only_edit_on_a_server_with_restart_policy_always_does_not_take_the_lock(
+    repeatable_read_sessions,
+) -> None:
+    """Same shape again, for the third row form the reviewer's finding
+    covers: a ``restart_policy`` other than the config default. Before the
+    fix, ``_build_server_config``'s round trip through ``to_config_dict()``
+    only emits ``restart_policy`` for a ``managed="internal"`` row, so an
+    ``external`` row's real ``"always"`` reads back as the config default
+    ``"no"`` and gets written onto the row on the lock-free path -- silently
+    turning off a connector's configured auto-restart on an unrelated
+    per-user env edit. After the fix the rebuild does not run, so the
+    column must still read ``"always"``.
+    """
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    default_factory, rr_factory = repeatable_read_sessions
+    with default_factory() as db:
+        owner = User(
+            username="mcp-restart-only-owner", password_hash="x", is_admin=False
+        )
+        db.add(owner)
+        db.flush()
+        server = MCPServer(
+            name="restart-only-target",
+            transport="stdio",
+            managed="external",
+            command="true",
+            concurrent_tools=[],
+            restart_policy="always",
+        )
+        db.add(server)
+        db.flush()
+        db.add(
+            UserMCPServer(
+                user_id=int(owner.id),
+                mcpserver_id=int(server.id),
+                is_owner=True,
+                is_active=True,
+            )
+        )
+        db.commit()
+        owner_id, server_id = int(owner.id), int(server.id)
+
+    db = rr_factory()
+    real_query = db.query
+    committed = threading.Event()
+
+    def commit_a_definition_edit_when_the_definition_query_starts(*entities, **kwargs):
+        if entities == (MCPServer,) and not committed.is_set():
+            committed.set()
+            with default_factory() as other:
+                other.execute(
+                    sa.update(MCPServer)
+                    .where(MCPServer.id == server_id)
+                    .values(description="edited-by-the-concurrent-definition-editor")
+                )
+                other.commit()
+        return real_query(*entities, **kwargs)
+
+    db.query = commit_a_definition_edit_when_the_definition_query_starts
+    try:
+        response = mcp_api.update_mcp_server(
+            server_id,
+            MCPServerUpdate(user_env={"MINE": "x"}),
+            current_user=SimpleNamespace(id=owner_id, is_admin=False),
+            db=db,
+        )
+    finally:
+        db.close()
+
+    assert committed.is_set(), "the concurrent definition edit never ran"
+    assert response is not None
+
+    with default_factory() as fresh:
+        row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert row.restart_policy == "always", (
+            "a user_env-only request must not overwrite this row's "
+            "restart_policy with the config default -- that write means "
+            "the config rebuild ran on a path that must not run it at all"
+        )
+        assert row.description == "edited-by-the-concurrent-definition-editor", (
+            "the concurrent definition edit must have actually landed, or "
+            "this test proves nothing about interleaving"
+        )
+
+
+def test_a_user_env_only_edit_on_a_server_with_restart_policy_always_leaves_it_untouched(
+    session_factory, seeded
+) -> None:
+    """The single-request counterpart to the concurrency test above: a
+    ``user_env``-only payload against a row with ``restart_policy="always"``
+    must leave that value alone, not overwrite it with the config
+    default (``"no"``)."""
+    import xagent.web.api.mcp as mcp_api
+    from xagent.web.api.mcp import MCPServerUpdate
+
+    owner_id, server_id = seeded
+    with session_factory() as db:
+        db.execute(
+            sa.update(MCPServer)
+            .where(MCPServer.id == server_id)
+            .values(restart_policy="always", concurrent_tools=[])
+        )
+        db.commit()
+
+    with session_factory() as db:
+        response = mcp_api.update_mcp_server(
+            server_id,
+            MCPServerUpdate(user_env={"MINE": "x"}),
+            current_user=SimpleNamespace(id=owner_id, is_admin=False),
+            db=db,
+        )
+    assert response is not None
+
+    with session_factory() as fresh:
+        row = fresh.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert row.restart_policy == "always", (
+            "a user_env-only request must not overwrite restart_policy "
+            "with the config default"
         )
 
 

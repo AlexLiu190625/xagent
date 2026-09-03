@@ -3363,10 +3363,19 @@ def update_mcp_server(
         # definition row for a payload that carries only those two made an
         # activate/deactivate queue behind an unrelated edit of the same
         # connector -- and, under PostgreSQL REPEATABLE READ, made it fail
-        # outright: the lock statement follows the snapshot the joined read
-        # above already established, so a definition edit committed in between
-        # raises SQLSTATE 40001 and the route's generic handler answers 500
-        # with the requested activation state unwritten.
+        # outright: the lock statement follows the snapshot this session's
+        # first read in the request already established. In a real request
+        # that first read is ``get_current_user``'s own lookup of the caller
+        # (``_resolve_access_token_user``, ``auth_dependencies.py``), which
+        # FastAPI's dependency injection runs on this same session before
+        # this route body executes at all -- the join immediately below is
+        # not what pins the snapshot in production. It is what pins it in
+        # the PostgreSQL lock suite's tests, though: those call this
+        # function directly and skip the dependency chain, so for them the
+        # join below is the session's first statement. Either way, a
+        # definition edit committed in between raises SQLSTATE 40001 and the
+        # route's generic handler answers 500 with the requested activation
+        # state unwritten.
         #
         # ``model_fields_set`` decides this, not the values, because that is
         # what decides the writes themselves: an explicitly-null
@@ -3377,13 +3386,18 @@ def update_mcp_server(
         # lock is taken in a few cases that did not need it, and skipped in
         # none whose fields target that row.
         #
-        # One caveat: this set is not a superset of the writes that follow.
-        # ``_update_server_from_config`` below
-        # re-encrypts a global ``env`` or ``auth`` on every call and Fernet
-        # ciphertext differs each time, so on a server carrying one of those
-        # the rebuild still writes the definition row on this lock-free path.
-        # That write is the pre-existing behavior of this route, unchanged
-        # here; the isolation-level contract governing it is tracked in #1945.
+        # This set is also exactly the set of payloads the block below
+        # rebuilds and writes the definition row for: the whole rebuild --
+        # building ``update_data``, validating it, and writing every
+        # resulting field back onto ``server`` -- runs only when
+        # ``writes_definition_row`` is true. A lock-free payload therefore
+        # cannot produce a definition-row write: there is no code path left
+        # that would build one. (An earlier version of this route rebuilt
+        # the config unconditionally regardless of which row the lock
+        # covered, so a server carrying a global ``env`` or ``auth`` still
+        # got its value re-encrypted and written back with no lock held --
+        # this is why the two now share one flag instead of the write
+        # having its own, independently-derived guard.)
         fields_set = server_data.model_fields_set
         writes_definition_row = bool(fields_set - {"is_active", "user_env"})
 
@@ -3406,13 +3420,35 @@ def update_mcp_server(
         # dual-dialect fence ``acquire_runtime_key_transition_fence``
         # (services/api_keys.py) uses -- a no-op ``UPDATE`` that takes SQLite's
         # writer lock -- and is left to a change of its own.
+        #
+        # ``key_share=True`` asks PostgreSQL for ``FOR NO KEY UPDATE`` instead
+        # of plain ``FOR UPDATE``: this route never changes ``MCPServer.id``
+        # (the column any referencing foreign key cares about), only the
+        # other columns, so the weaker lock covers everything it writes.
+        # Plain ``FOR UPDATE`` would also block a concurrent connect or
+        # disconnect on the same server -- ``UserMCPServer`` inserts and
+        # deletes take a ``FOR KEY SHARE`` lock on the ``MCPServer`` row they
+        # reference, to verify that row still exists -- and ``FOR KEY SHARE``
+        # is compatible with ``FOR NO KEY UPDATE`` but not with plain
+        # ``FOR UPDATE``. On MySQL, which has no such distinction,
+        # ``key_share`` is accepted and ignored: SQLAlchemy renders plain
+        # ``FOR UPDATE`` there either way.
         definition_query = (
             db.query(MCPServer).filter(MCPServer.id == server_id).populate_existing()
         )
         if writes_definition_row:
-            definition_query = definition_query.with_for_update()
+            definition_query = definition_query.with_for_update(key_share=True)
         current_server = definition_query.first()
         if current_server is None:
+            # This statement holds a row lock on ``writes_definition_row``
+            # (see the comment on the query above), so it opened a
+            # transaction the outer ``except HTTPException: raise`` will not
+            # close: that handler re-raises without rolling back, unlike its
+            # ``except Exception`` sibling further down. Roll back explicitly
+            # -- matching the same-shaped 404 below and the two later
+            # branches that raise after a write -- so this 404 does not
+            # leave a transaction (and any lock it took) open.
+            db.rollback()
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
             )
@@ -3420,29 +3456,35 @@ def update_mcp_server(
 
         if writes_definition_row:
             # The join gate above ran before the lock statement, and the
-            # lock statement waits. Both things that read established --
+            # lock statement waits. Both inputs to ``can_edit_global`` --
             # that the caller still has a ``UserMCPServer`` link to this
-            # server, and whether that link owns it (``can_edit_global``)
-            # -- were fixed before a wait of unbounded length. A supported
-            # admin user deletion removes association rows and leaves
-            # every definition row standing, and an MCP disconnect removes
-            # the caller's own link while another user's link keeps the
-            # definition alive; either can commit inside the wait. The
-            # request would then write and commit the shared definition
-            # row on a revoked authority, and fail only afterwards, in
-            # ``db.refresh(user_mcp)`` below -- which runs after the
-            # commit, so the generic handler's rollback cannot take the
-            # shared write back and the caller sees a 500 over a durable
-            # change.
+            # server (link ownership), and whether the caller is a platform
+            # admin -- were read from that pre-wait state: the gate's join
+            # for the link, ``current_user`` (built once by the auth
+            # dependency before this route even started) for admin status.
+            # A supported admin user deletion removes association rows and
+            # leaves every definition row standing; a platform admin's own
+            # admin flag can itself be revoked by another admin; an MCP
+            # disconnect removes the caller's own link while another user's
+            # link keeps the definition alive. Any of these can commit
+            # inside the wait. The request would then write and commit the
+            # shared definition row on a revoked authority, and fail only
+            # afterwards, in ``db.refresh(user_mcp)`` below -- which runs
+            # after the commit, so the generic handler's rollback cannot
+            # take the shared write back and the caller sees a 500 over a
+            # durable change.
             #
             # ``populate_existing()`` on the definition query above
-            # refreshes that statement's row and nothing else, so the link
-            # row needs its own statement. This is a single-table read of
-            # it -- the gate above is a two-table join and cannot address
-            # this table alone -- and the row it returns replaces
-            # ``user_mcp`` and re-derives ``can_edit_global`` for the rest
-            # of the route: the per-user env write, the activation write,
-            # the refresh and the response all read it.
+            # refreshes that statement's row and nothing else, so both
+            # inputs need their own fresh single-table reads here -- the
+            # gate above is a two-table join and cannot address either
+            # table alone. The link read below replaces ``user_mcp``; the
+            # admin read further below replaces the value passed into
+            # ``_check_mcp_permission``. Together they re-derive
+            # ``can_edit_global`` for the rest of the route: the per-user
+            # env write, the activation write, the refresh and the response
+            # all read ``user_mcp``, and the owner-only guard below reads
+            # ``can_edit_global``.
             #
             # A gone link is this route's existing 404, matching the gate.
             # A link that is still there but no longer owns the server is
@@ -3461,13 +3503,37 @@ def update_mcp_server(
                 .first()
             )
             if current_user_mcp is None:
+                # Same reasoning as the definition-row 404 above: this read
+                # ran inside the transaction that held the lock, so an
+                # explicit rollback keeps this 404 from leaving that
+                # transaction open for the outer ``except HTTPException``
+                # handler to skip past.
+                db.rollback()
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="MCP server not found",
                 )
             user_mcp = current_user_mcp
+            # ``current_user.is_admin`` is the value the auth dependency's
+            # own read fixed before this route's wait for the lock, same as
+            # ``user_mcp``'s pre-lock read above -- and admin status is
+            # exactly as revocable during that wait as link ownership is
+            # (a supported admin action can strip it from another user
+            # mid-request). The link re-read above already guards its half
+            # of this permission check; this is the other half, re-read the
+            # same way: a fresh single-table lookup of the caller's own row,
+            # not the pre-wait object.
+            current_admin_user = (
+                db.query(User).filter(User.id == user_id).populate_existing().first()
+            )
+            if current_admin_user is None:
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="MCP server not found",
+                )
             can_edit_global = _check_mcp_permission(
-                user_mcp, getattr(current_user, "is_admin", False), require="edit"
+                user_mcp, bool(current_admin_user.is_admin), require="edit"
             )
 
         # Read from the fresh definition-row read above, not the pre-lock
@@ -3520,68 +3586,71 @@ def update_mcp_server(
                     detail=f"MCP server '{server_data.name}' already exists",
                 )
 
-        # Build update config - only include provided fields. Non-owners keep the
-        # existing global config untouched.
-        update_data = MCPServerCreate(
-            name=(server_data.name if can_edit_global else None) or server.name,
-            transport=(server_data.transport if can_edit_global else None)
-            or server.transport,
-            description=server_data.description
-            if can_edit_global and server_data.description is not None
-            else server.description,
-            config=incoming_config,
-            is_active=server_data.is_active
-            if server_data.is_active is not None
-            else user_mcp.is_active,
-        )
-
-        # Build and validate config
-        try:
-            config = _build_server_config(update_data, server)
-            runtime_input_schema = (
-                server_data.runtime_input_schema
-                if can_edit_global and "runtime_input_schema" in fields_set
-                else server.runtime_input_schema
-            )
-            runtime_bindings = (
-                server_data.runtime_bindings
-                if can_edit_global and "runtime_bindings" in fields_set
-                else server.runtime_bindings
-            )
-            allow_delegated_authorization = (
-                bool(server_data.allow_delegated_authorization)
-                if can_edit_global and "allow_delegated_authorization" in fields_set
-                else bool(server.allow_delegated_authorization)
-            )
-            _validate_mcp_runtime_config(
-                runtime_input_schema=runtime_input_schema,
-                runtime_bindings=runtime_bindings,
-                allow_delegated_authorization=allow_delegated_authorization,
-                static_headers=config.headers,
-            )
-        except ValueError as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid configuration: {str(e)}",
+        if writes_definition_row:
+            # Build update config - only include provided fields. Non-owners keep the
+            # existing global config untouched.
+            update_data = MCPServerCreate(
+                name=(server_data.name if can_edit_global else None) or server.name,
+                transport=(server_data.transport if can_edit_global else None)
+                or server.transport,
+                description=server_data.description
+                if can_edit_global and server_data.description is not None
+                else server.description,
+                config=incoming_config,
+                is_active=server_data.is_active
+                if server_data.is_active is not None
+                else user_mcp.is_active,
             )
 
-        # Update server fields (global config; no-op values for non-owners)
-        try:
-            _update_server_from_config(server, config)
-        except ValueError as exc:
-            db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid environment variables: {exc}",
-            ) from exc
-        if can_edit_global:
-            orm_server = cast(Any, server)
-            if "runtime_input_schema" in fields_set:
-                orm_server.runtime_input_schema = runtime_input_schema
-            if "runtime_bindings" in fields_set:
-                orm_server.runtime_bindings = runtime_bindings
-            if "allow_delegated_authorization" in fields_set:
-                orm_server.allow_delegated_authorization = allow_delegated_authorization
+            # Build and validate config
+            try:
+                config = _build_server_config(update_data, server)
+                runtime_input_schema = (
+                    server_data.runtime_input_schema
+                    if can_edit_global and "runtime_input_schema" in fields_set
+                    else server.runtime_input_schema
+                )
+                runtime_bindings = (
+                    server_data.runtime_bindings
+                    if can_edit_global and "runtime_bindings" in fields_set
+                    else server.runtime_bindings
+                )
+                allow_delegated_authorization = (
+                    bool(server_data.allow_delegated_authorization)
+                    if can_edit_global and "allow_delegated_authorization" in fields_set
+                    else bool(server.allow_delegated_authorization)
+                )
+                _validate_mcp_runtime_config(
+                    runtime_input_schema=runtime_input_schema,
+                    runtime_bindings=runtime_bindings,
+                    allow_delegated_authorization=allow_delegated_authorization,
+                    static_headers=config.headers,
+                )
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid configuration: {str(e)}",
+                )
+
+            # Update server fields (global config; no-op values for non-owners)
+            try:
+                _update_server_from_config(server, config)
+            except ValueError as exc:
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid environment variables: {exc}",
+                ) from exc
+            if can_edit_global:
+                orm_server = cast(Any, server)
+                if "runtime_input_schema" in fields_set:
+                    orm_server.runtime_input_schema = runtime_input_schema
+                if "runtime_bindings" in fields_set:
+                    orm_server.runtime_bindings = runtime_bindings
+                if "allow_delegated_authorization" in fields_set:
+                    orm_server.allow_delegated_authorization = (
+                        allow_delegated_authorization
+                    )
 
         # Store this user's per-user env override (masked values keep stored secrets)
         if server_data.user_env is not None:
