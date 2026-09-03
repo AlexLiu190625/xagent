@@ -3863,6 +3863,127 @@ async def test_the_watermark_read_splits_task_deleted_from_every_other_failure(
     assert "event: step.started" not in body
 
 
+async def test_absolute_deadline_stops_the_warm_up_replay_early():
+    """The warm-up replay loop re-checks the connection's own absolute
+    deadline before every yield, not only the main loop below it.
+
+    ``stream_max_duration_seconds`` is negative, so the deadline bound
+    at generator start (``monotonic() + stream_max_duration_seconds``)
+    is already in the past by the time the replay loop reaches its
+    first frame, regardless of how long the watermark read and the
+    history read themselves took. The task has three known steps
+    (``_three_step_task``), so a replay that ran to completion would
+    yield three ``step.started`` frames; this pins that none of them
+    make it out, and that the stream instead closes with
+    ``stream_expired`` once the main loop's own deadline check runs on
+    its very next pass -- the deadline break needs no close of its
+    own."""
+    task_id, principal = await _three_step_task()
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=v1_tasks._load_task_steps_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
+        **_long_intervals(stream_max_duration_seconds=-1.0),
+    )
+    try:
+        frames = []
+        async for chunk in asyncio_timeout_iter(resp.body_iterator, timeout=2):
+            frames.append(chunk)
+        body = "".join(frames)
+        assert "event: task.status" in body
+        assert "event: step.started" not in body
+        assert _parse_error_frame(body)["code"] == "stream_expired"
+        assert frames[-1].startswith("event: stream.error")
+    finally:
+        await resp.body_iterator.aclose()
+
+
+def _fail_the_history_read_because_the_task_is_gone(task_id_, principal_):
+    """The second, narrower ``TASK_NOT_FOUND`` race window
+    ``_build_warm_up_frames``'s own read covers -- the task is deleted
+    after the watermark read already succeeded, but before this read
+    runs. Distinct from ``_delete_the_task_then_read_the_watermark``
+    above, which covers the watermark read's own race instead."""
+    raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
+
+
+@pytest.mark.parametrize(
+    ("read_task_steps_version", "read_task_steps"),
+    [
+        pytest.param(
+            _delete_the_task_then_read_the_watermark,
+            v1_tasks._load_task_steps_snapshot,
+            id="watermark-read",
+        ),
+        pytest.param(
+            v1_tasks._load_task_steps_version_snapshot,
+            _fail_the_history_read_because_the_task_is_gone,
+            id="history-read",
+        ),
+    ],
+)
+async def test_generates_own_task_not_found_reads_are_abortive_and_end_watchdog_coverage(
+    read_task_steps_version, read_task_steps
+):
+    """Both of ``_generate``'s own pre-loop reads -- the replay
+    watermark and the warm-up history -- close ``task_deleted`` the
+    same way ``watchdog_check_once`` does when the task row is gone,
+    and on neither leg does the warm-up handoff ever run
+    (``sink.warm`` stays ``False``), so only ``abortive_close`` can end
+    the watchdog's own coverage on this path (see
+    ``_watchdog_coverage_done``). Pins the wire-level close code, pins
+    ``sink.abortive_close`` directly, and confirms the watchdog loop
+    actually exits on its own -- not just that the predicate flips --
+    by awaiting the watchdog task itself with a timeout. A short
+    ``watchdog_interval_seconds`` is what lets that task notice and
+    exit within the timeout, independent of the generator's own
+    teardown (which would cancel it regardless, masking a broken
+    ``abortive=True``)."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps=read_task_steps,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=read_task_steps_version,
+        **_long_intervals(watchdog_interval_seconds=0.05),
+    )
+    try:
+        first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert "event: task.status" in first
+        sink = next(
+            c
+            for c in es.manager.connections_for_task(task_id)
+            if isinstance(c, es.V1EventStreamSink)
+        )
+        watchdog_task = next(
+            t
+            for t in asyncio.all_tasks()
+            if t.get_coro().cr_code.co_name == "_watchdog_loop"
+        )
+
+        second = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        assert _parse_error_frame(second)["code"] == "task_deleted"
+        assert sink.abortive_close is True
+        assert sink.warm is False
+
+        await asyncio.wait_for(watchdog_task, timeout=2)
+        assert watchdog_task.done()
+    finally:
+        await resp.body_iterator.aclose()
+
+
 def test_fast_paths_without_a_steps_version_reader_is_a_call_error():
     """``read_task_steps_version`` is a required argument on all three
     attach-time fast-path entry points -- ``_terminal_snapshot_stream``,
