@@ -2080,9 +2080,19 @@ def test_widened_partition_still_rejects_a_row_failing_any_other_condition(
     }
     # No run tag by default: the row is otherwise a legitimate candidate
     # for the widened (untagged) partition. The "run_partition" case is
-    # the exception -- it tags the row with a *different* run on purpose,
-    # to prove a checkpoint genuinely written under another run is never
-    # swept into the widened partition just because widening exists.
+    # the one field whose mutation also flips the probe: tagging the row
+    # with a different run makes _task_has_run_tagged_checkpoint return
+    # True, so the reader resolves the narrow (run-bound) partition
+    # instead of the widened one. What this case actually proves is that
+    # a row tagged with a foreign run is rejected while the reader stays
+    # confined to its own run -- not that widening and a foreign-run-
+    # tagged pointer can coexist. Under one consistent snapshot they
+    # cannot: any run-tagged row on the task flips the probe before
+    # widening can engage. That combination is reachable only through a
+    # race between the probe and a concurrent tagged-checkpoint commit,
+    # pinned separately below by
+    # test_stale_widened_probe_retries_when_pointer_row_is_tagged and its
+    # non-race counterpart.
     _mutate_pk_anchor_field(field, row_kwargs, data, other_task_id)
 
     row = DatabaseTraceEvent(data=data, **row_kwargs)
@@ -2107,6 +2117,114 @@ def test_widened_partition_still_rejects_a_row_failing_any_other_condition(
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
                 )
+    finally:
+        db.close()
+
+
+def test_stale_widened_probe_retries_when_pointer_row_is_tagged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller can reach ``_load_pk_anchored_checkpoint`` with ``run_id``
+    resolved to ``None`` (widened) while the pointer names a row that
+    itself carries a run tag. A row and the task's run-tag flag are
+    written in the same transaction, so under one consistent snapshot this
+    cannot happen -- the probe that decided to widen would have found the
+    row. Simulate the state directly: the pointer row is already tagged
+    and committed when the anchored load runs with ``run_id=None``, as if
+    the widening decision had been made against an earlier, now-stale
+    snapshot. The fresh re-probe inside the helper sees the committed row
+    and must raise ``CheckpointUnavailableError`` (retryable), not
+    misclassify the timing artifact as ``CheckpointCorruptError``."""
+    SessionLocal, db, task = _create_trace_handler_test_task("stale-widened-probe")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+
+    row = _checkpoint_trace_row(
+        task_id=task_id,
+        event_id="tagged-checkpoint",
+        execution_id="shared-execution",
+        label="tagged",
+        timestamp=datetime.now(timezone.utc),
+        run_id="run-a",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    task.last_checkpoint_trace_event_id = row.id
+    db.commit()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    try:
+        with pytest.raises(CheckpointUnavailableError):
+            DatabaseTraceHandler(task_id)._load_pk_anchored_checkpoint(
+                db, None, "shared-execution"
+            )
+    finally:
+        db.close()
+
+
+def test_widened_probe_recheck_still_corrupt_when_no_tagged_row_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Counterpart to the race pin above. When the fresh re-probe still
+    finds no tagged row -- the database genuinely agrees with the
+    caller's widened resolution -- the mismatch between ``run_id=None``
+    and the pointer row's own run tag is not a timing artifact but a real
+    data inconsistency, and must still raise ``CheckpointCorruptError``
+    rather than being swallowed as retryable-unavailable."""
+    SessionLocal, db, task = _create_trace_handler_test_task(
+        "widened-probe-recheck-corrupt"
+    )
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+
+    row = _checkpoint_trace_row(
+        task_id=task_id,
+        event_id="tagged-checkpoint",
+        execution_id="shared-execution",
+        label="tagged",
+        timestamp=datetime.now(timezone.utc),
+        run_id="run-a",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    task.last_checkpoint_trace_event_id = row.id
+    db.commit()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+    monkeypatch.setattr(
+        DatabaseTraceHandler,
+        "_task_has_run_tagged_checkpoint",
+        lambda self, db: False,
+    )
+
+    try:
+        with pytest.raises(CheckpointCorruptError):
+            DatabaseTraceHandler(task_id)._load_pk_anchored_checkpoint(
+                db, None, "shared-execution"
+            )
     finally:
         db.close()
 

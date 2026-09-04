@@ -508,6 +508,13 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # bound run was just minted by a resume and the only checkpoint
             # on record predates partitioning. Widen to the legacy partition
             # so it stays readable instead of refusing on a technicality.
+            # The probe's answer is a point-in-time result under READ
+            # COMMITTED: it describes the task at the moment the probe ran,
+            # not a standing fact. If a concurrent writer commits this run's
+            # first tagged checkpoint right after, the pointer validation in
+            # _load_pk_anchored_checkpoint re-probes on a fresh snapshot and
+            # raises CheckpointUnavailableError (retryable) instead of
+            # misclassifying the now-stale widening as data corruption.
             increment_counter(COUNTER_CHECKPOINT_READ_PARTITION_WIDENED)
             logger.info(
                 "task %s: no run-tagged checkpoint on record; widening the "
@@ -641,6 +648,38 @@ class DatabaseTraceHandler(BaseTraceHandler):
         partition_matches = (
             run_field == run_id if run_id is not None else run_field is None
         )
+        if run_id is None and run_field is not None:
+            # The caller resolved the read partition to the widened
+            # (untagged) partition -- run_id is None -- yet the pointer
+            # names a row that itself carries a run tag. A row and the
+            # task's run-tag flag are written in the same transaction
+            # (stage_trace_event_row), so under one consistent snapshot
+            # this combination cannot occur: a tagged row on record means
+            # the probe that decided to widen would have found it. The
+            # only ways to reach this state are a probe snapshot that is
+            # now stale -- a concurrent writer committed the task's first
+            # tagged checkpoint after the partition was resolved but
+            # before this row was read -- or a genuine data
+            # inconsistency. This branch also fires for the pre-existing
+            # unleased path below (its own run_id is None too), so it
+            # covers that caller's identical window as well, not only the
+            # lease-bound widening this PR adds. Re-probe on a fresh
+            # snapshot to tell the two apart instead of guessing.
+            if self._task_has_run_tagged_checkpoint(db):
+                # The fresh probe now sees a tagged row: the partition
+                # decision was stale, not wrong. Surface it as
+                # unavailable so the caller retries against a partition
+                # resolved fresh, rather than misclassifying a timing
+                # artifact as corruption.
+                raise CheckpointUnavailableError(
+                    f"task {self.task_id}: checkpoint partition was "
+                    "widened against a stale snapshot; a run-tagged "
+                    "checkpoint now exists"
+                )
+            # The fresh probe still finds no tagged row: the mismatch is
+            # not a timing artifact. Fall through to the six-condition
+            # check below, which partition_matches (False here) already
+            # fails, and let it raise CheckpointCorruptError as usual.
         row_execution_id = checkpoint_execution_id(row_data)
         if (
             row.task_id != self.task_id
