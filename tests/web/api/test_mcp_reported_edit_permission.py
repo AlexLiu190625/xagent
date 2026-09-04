@@ -17,6 +17,8 @@ into suites that run after this one.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 import sqlalchemy as sa
 from fastapi import HTTPException
@@ -518,7 +520,7 @@ class TestReportedEditPermissionConsistencyMcp:
             ),
         ],
     )
-    async def test_can_edit_global_agrees_across_list_get_put_and_toggle(
+    def test_can_edit_global_agrees_across_list_get_put_and_toggle(
         self, db, population, access_answer, has_personal_row
     ):
         owner = _make_user(db, 10)
@@ -623,7 +625,7 @@ class TestLocalCanConfigureWidening:
             response = get_mcp_server(server_id, current_user=member, db=db)
         assert response.id == server_id
 
-    async def test_custom_api_stand_in_with_a_linked_but_not_editable_verdict_is_configurable(
+    def test_custom_api_stand_in_with_a_linked_but_not_editable_verdict_is_configurable(
         self, db
     ):
         owner = _make_user(db, 32)
@@ -708,9 +710,7 @@ class TestDenyingVerdictIsFalseEverywhere:
     verdict-gated shared config.
     """
 
-    async def test_a_denying_verdict_yields_false_in_the_list_get_and_put_response(
-        self, db
-    ):
+    def test_a_denying_verdict_yields_false_in_the_list_get_and_put_response(self, db):
         owner = _make_user(db, 50)
         member = _make_user(db, 51)
         server = _make_owned_server(db, owner.id, name="denied-everywhere")
@@ -1027,7 +1027,7 @@ class TestStandaloneParityWithNoHookInstalled:
                     await delete_mcp_server(server_id, current_user=caller, db=db)
                 assert exc.value.status_code == 403
 
-    async def test_a_complete_stranger_still_gets_404_with_no_hook(self, db):
+    def test_a_complete_stranger_still_gets_404_with_no_hook(self, db):
         """A caller with neither a personal row nor any team link cannot be
         constructed in the matrix above, which only builds callers that do
         have a personal row. The pre-change 404 for that caller is worth
@@ -1056,7 +1056,7 @@ class TestStandaloneParityWithNoHookInstalled:
     @pytest.mark.parametrize(
         "population", ["owner", "personal_non_owner"], ids=["A=owner", "B=personal"]
     )
-    async def test_the_apps_listing_can_configure_matches_pre_change_behavior(
+    def test_the_apps_listing_can_configure_matches_pre_change_behavior(
         self, db, population
     ):
         """Outside the numbered rows above but touched by this same work:
@@ -1113,7 +1113,7 @@ class TestStandaloneParityWithNoHookInstalled:
     @pytest.mark.parametrize(
         "population", ["owner", "personal_non_owner"], ids=["A=owner", "B=personal"]
     )
-    async def test_connecting_an_app_can_edit_global_matches_pre_change_behavior(
+    def test_connecting_an_app_can_edit_global_matches_pre_change_behavior(
         self, db, population
     ):
         """Outside the numbered rows above but touched by this same work:
@@ -1558,6 +1558,48 @@ class TestListMcpServersPerRowDegradation:
         entry = next(e for e in entries if e.id == server_id)
         assert entry.can_edit_global is False
 
+    def test_the_degraded_listing_log_names_the_failure_it_degraded_on(
+        self, db, caplog
+    ):
+        """The degrade arm keeps the response at 200, so this warning is the
+        only record of why a row lost its reported edit right. A hook that
+        raises ``ConnectorRuntimeError`` itself reaches this arm untouched --
+        the seam re-raises it without logging a traceback of its own -- so
+        the line here has to carry the code, or the failure has no identity
+        anywhere."""
+        owner = _make_user(db, 90)
+        member = _make_user(db, 91)
+        server = _make_owned_server(db, owner.id, name="servers-log-identity")
+        server_id = server.id
+
+        def typed_failure(_db, _user_id, _refs):
+            raise ConnectorRuntimeError(
+                "team_directory_unreachable",
+                "planted failure",
+                status_code=503,
+            )
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=typed_failure,
+                visibility=lambda _db, _uid: {
+                    "mcp": {server_id},
+                    "custom_api": set(),
+                },
+            )
+            with caplog.at_level(logging.WARNING, logger="xagent.web.api.mcp"):
+                entries = get_mcp_servers(current_user=member, db=db)
+
+        entry = next(e for e in entries if e.id == server_id)
+        assert entry.can_edit_global is False
+        degraded = [
+            record.getMessage()
+            for record in caplog.records
+            if "Connector access resolution failed" in record.getMessage()
+        ]
+        assert len(degraded) == 1
+        assert "team_directory_unreachable" in degraded[0]
+
 
 class TestSingleServerAccessResolutionFailure:
     """A single MCP server's verdict plays two different roles depending on
@@ -1675,7 +1717,7 @@ class TestAdminInspectingAnotherUsersListReportsPerKindSubject:
     not a statement that the current split is correct.
     """
 
-    async def test_admin_inspecting_another_users_list_reports_each_kind_from_its_own_subject(
+    def test_admin_inspecting_another_users_list_reports_each_kind_from_its_own_subject(
         self, db
     ):
         admin = _make_user(db, 800, is_admin=True)

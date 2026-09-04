@@ -616,7 +616,7 @@ class TestDecorationDegradesAfterTheWriteCommits:
     a hook failure there must degrade that field to False rather than fail
     a request whose write already landed."""
 
-    async def test_toggle_degrades_and_keeps_its_effect_when_the_hook_raises(
+    def test_toggle_degrades_and_keeps_its_effect_when_the_hook_raises(
         self, db, monkeypatch
     ):
         # A non-owner personal row, not the owner's: an owner's
@@ -1780,4 +1780,77 @@ def test_no_function_that_reaches_the_connector_seam_is_a_coroutine():
     assert offenders == [], (
         "these functions can reach an installed connector team hook while "
         f"running on the event loop thread: {sorted(offenders)}"
+    )
+
+
+# The arms that answer a failed access verdict with a warning instead of
+# re-raising it. Pinned as a count so the enumeration below cannot pass by
+# finding nothing, and so a sixth arm has to come here before it can skip the
+# invariant.
+_DEGRADING_CONNECTOR_RUNTIME_HANDLERS = 5
+
+
+def _connector_runtime_handlers_that_log() -> list[ast.ExceptHandler]:
+    """Every ``except ConnectorRuntimeError`` arm in this module that answers
+    the failure with a warning rather than re-raising it."""
+    module = importlib.import_module(_SEAM_MODULE)
+    tree = ast.parse(inspect.getsource(module))
+    handlers = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        if not (
+            isinstance(node.type, ast.Name) and node.type.id == "ConnectorRuntimeError"
+        ):
+            continue
+        if any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "warning"
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == "logger"
+            for child in ast.walk(node)
+        ):
+            handlers.append(node)
+    return handlers
+
+
+def test_the_degrading_handler_enumeration_is_not_vacuous():
+    """Pins the enumeration itself, so the assertion below cannot pass by
+    finding nothing."""
+    assert (
+        len(_connector_runtime_handlers_that_log())
+        == _DEGRADING_CONNECTOR_RUNTIME_HANDLERS
+    )
+
+
+def test_every_degrading_handler_logs_the_failure_it_degraded_on():
+    """An arm that answers a failed verdict with a warning leaves the response
+    at 200, so that warning is the only record of why the caller lost a
+    reported edit right. It has to name the failure, which means formatting
+    the caught ``ConnectorRuntimeError`` -- whose ``str`` is
+    ``"<code>: <safe message>"`` -- into the line.
+
+    Pinned in the source rather than only per route: the behavioural pin in
+    ``test_mcp_reported_edit_permission.py`` can exercise one arm per test,
+    and an arm added later would inherit neither that pin nor this reasoning.
+    """
+    offenders = []
+    for handler in _connector_runtime_handlers_that_log():
+        for call in [
+            child
+            for child in ast.walk(handler)
+            if isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "warning"
+        ]:
+            carries_the_exception = handler.name is not None and any(
+                isinstance(arg, ast.Name) and arg.id == handler.name
+                for arg in call.args
+            )
+            if not carries_the_exception:
+                offenders.append(f"line {call.lineno}")
+    assert offenders == [], (
+        "these degrade arms log a warning that never formats the caught "
+        f"ConnectorRuntimeError, so the failure has no identity: {offenders}"
     )
