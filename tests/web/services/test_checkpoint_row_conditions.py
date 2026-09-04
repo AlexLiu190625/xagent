@@ -139,6 +139,25 @@ def test_null_run_id_not_matched_by_present_run_field() -> None:
     assert _failed(_row(), data, run_id=None) == {CHECKPOINT_ROW_RUN_PARTITION}
 
 
+def test_non_string_run_field_matches_through_string_coercion() -> None:
+    """A run field stored as a non-string JSON scalar answers here the way it
+    answers in SQL, where ``checkpoint_run_partition_filter`` reads the same
+    field through ``.as_string()``. Nothing writes such a row today -- the
+    writer always stores a str -- so this pins the two forms agreeing, not a
+    shape in production."""
+
+    data = _data(**{TASK_RUN_ID_TRACE_FIELD: 7})
+    assert _failed(_row(), data, run_id="7") == frozenset()
+
+
+def test_non_string_run_field_with_wrong_value_still_fails_run_partition() -> None:
+    """The coercion above narrows nothing: a non-string run field that does
+    not name this run still fails the partition condition."""
+
+    data = _data(**{TASK_RUN_ID_TRACE_FIELD: 7})
+    assert _failed(_row(), data) == {CHECKPOINT_ROW_RUN_PARTITION}
+
+
 def test_two_conditions_can_fail_at_once() -> None:
     row = _row(task_id=_TASK_ID + 1)
     data = _data()
@@ -184,25 +203,54 @@ def test_explicit_json_null_run_field_reads_as_absent() -> None:
 
 
 _SHARED_PREDICATE = "failed_checkpoint_row_conditions"
-_BY_PK_RESOLVER_MODULES = (
-    "xagent/web/api/trace_handlers.py",
-    "xagent/web/services/task_interaction_anchor.py",
+_BY_PK_RESOLVERS = (
+    ("xagent/web/api/trace_handlers.py", "_load_pk_anchored_checkpoint"),
+    ("xagent/web/services/task_interaction_anchor.py", "resolve_interaction_anchor"),
 )
 
 
-def _imports_and_calls(source: str, name: str) -> tuple[bool, bool]:
-    imported = called = False
+def _imports(source: str, name: str) -> bool:
+    """Whether the module imports ``name`` anywhere -- at the top or inside a
+    function, since a caller may import through a function-level import to
+    avoid a module cycle."""
+
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and any(alias.name == name for alias in node.names)
+        for node in ast.walk(ast.parse(source))
+    )
+
+
+def _resolver_def(source: str, resolver: str) -> ast.AST:
+    """The ``def`` node for ``resolver``, wherever it sits -- module level or
+    inside a class body."""
+
     for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.ImportFrom):
-            if any(alias.name == name for alias in node.names):
-                imported = True
-        elif isinstance(node, ast.Call):
-            func = node.func
-            if isinstance(func, ast.Name) and func.id == name:
-                called = True
-            elif isinstance(func, ast.Attribute) and func.attr == name:
-                called = True
-    return imported, called
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == resolver
+        ):
+            return node
+    raise AssertionError(f"no def named {resolver} in this module")
+
+
+def _calls_within(node: ast.AST, name: str) -> bool:
+    """Whether ``name`` is called anywhere inside ``node``'s own subtree.
+
+    Scoped to the subtree on purpose: a call somewhere else in the same file
+    says nothing about whether *this* resolver still reads the shared
+    definition.
+    """
+
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        func = child.func
+        if isinstance(func, ast.Name) and func.id == name:
+            return True
+        if isinstance(func, ast.Attribute) and func.attr == name:
+            return True
+    return False
 
 
 def test_both_by_pk_resolvers_read_the_shared_predicate() -> None:
@@ -217,19 +265,26 @@ def test_both_by_pk_resolvers_read_the_shared_predicate() -> None:
     needs guarding is not that the copies agree but that no copy comes back,
     so this asserts reachability of the shared definition, not its text.
 
-    Deliberately not extended to lease recovery's own consumer
-    (``task_lease_service._candidate_row_failures``): it reads the predicate
-    through a function-level import to avoid a module cycle, which this
-    import-shaped check cannot see. Its behaviour is pinned by
-    ``test_task_lease_recovery.py`` instead.
+    The call check is scoped to each resolver's own ``def`` node rather than
+    to the file. File scope would pass on a module that inlines a private
+    disjunction inside the resolver while some unrelated call to the shared
+    predicate survives elsewhere in the same file -- which is the whole shape
+    this test exists to catch.
+
+    Not extended to lease recovery's own consumer
+    (``task_lease_service._candidate_row_failures``): its behaviour is pinned
+    directly by ``test_task_lease_recovery.py``, which is the stronger check
+    of the two where it is available.
     """
 
     root = Path(next(iter(xagent.__path__))).parent
-    for relative in _BY_PK_RESOLVER_MODULES:
+    for relative, resolver in _BY_PK_RESOLVERS:
         path = root / relative
         assert path.is_file(), path
-        imported, called = _imports_and_calls(
-            path.read_text(encoding="utf-8"), _SHARED_PREDICATE
+        source = path.read_text(encoding="utf-8")
+        assert _imports(source, _SHARED_PREDICATE), (
+            f"{relative} no longer imports {_SHARED_PREDICATE}"
         )
-        assert imported, f"{relative} no longer imports {_SHARED_PREDICATE}"
-        assert called, f"{relative} no longer calls {_SHARED_PREDICATE}"
+        assert _calls_within(_resolver_def(source, resolver), _SHARED_PREDICATE), (
+            f"{relative}::{resolver} no longer calls {_SHARED_PREDICATE}"
+        )

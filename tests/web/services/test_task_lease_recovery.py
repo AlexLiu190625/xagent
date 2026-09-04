@@ -942,6 +942,105 @@ def test_ambiguous_legacy_checkpoint_registers_a_degradation_signal(
         clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
 
 
+def test_pk_anchor_missing_run_partition_then_ambiguous_legacy_id_is_indeterminate(
+    db_session,
+) -> None:
+    """The two deferral conditions meeting at once: a pointer row missing only
+    its run-partition field defers to the legacy scan, and that scan finds the
+    legacy event_id on more than one row.
+
+    Pinned because it is a change of kind, not of degree. Before the pointer
+    row was reclassified, a field-less pointer row resolved NOT_RECOVERABLE on
+    the spot and the task was failed once. The same candidate now reaches the
+    legacy scan's ambiguity branch, so the verdict is INDETERMINATE: the task
+    and its lease are left untouched and every later sweep selects the
+    candidate again, with no terminal exit of its own. Leaving it untouched is
+    deliberate -- an ambiguity a later sweep may resolve must not fail a
+    readable checkpoint -- but the repetition is unbounded, which is why the
+    degradation signal asserted below has to fire. Whether an INDETERMINATE
+    candidate should reach a terminal state after a bounded number of sweeps
+    is tracked upstream, not decided here.
+
+    Both conditions are needed to reach this path. Either alone is already
+    covered: test_pk_anchor_missing_run_partition_defers_to_the_legacy_scan
+    has the deferral landing on a valid row, and
+    test_ambiguous_legacy_checkpoint_skips_the_candidate_for_the_next_sweep
+    reaches the ambiguity through a pointer that was never set.
+    """
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LEGACY_POINTER_AMBIGUOUS,
+        active_degradations,
+        clear_degradation,
+    )
+
+    user = _create_user(db_session, suffix="absent-partition-ambiguous")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="absent-partition-ambiguous",
+    )
+    legacy_event_id = "absent-partition-ambiguous-legacy"
+    pre_existing_anchor = TraceEvent(
+        task_id=task.id,
+        event_id="absent-partition-ambiguous-preexisting",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            # No TASK_RUN_ID_TRACE_FIELD at all -- absent, not wrong, so the
+            # pointer defers instead of failing the candidate on the spot.
+        },
+    )
+    duplicate_legacy_rows = [
+        TraceEvent(
+            task_id=task.id,
+            event_id=legacy_event_id,
+            event_type="system_update_general",
+            timestamp=utc_now(),
+            data={
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "snapshot": {"type": "checkpoint"},
+                TASK_RUN_ID_TRACE_FIELD: task.run_id,
+            },
+        )
+        for _ in range(2)
+    ]
+    db_session.add_all([pre_existing_anchor, *duplicate_legacy_rows])
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = pre_existing_anchor.id
+    task.last_checkpoint_event_id = legacy_event_id
+    db_session.commit()
+
+    clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
+    try:
+        candidate = _candidate_for_task(task)
+        assert (
+            resolve_checkpoint_recovery(db_session, candidate)
+            is CheckpointRecoveryVerdict.INDETERMINATE
+        )
+        assert CHECKPOINT_LEGACY_POINTER_AMBIGUOUS in active_degradations()
+
+        assert _recover_expired_task(db_session, task) is None
+
+        db_session.expire_all()
+        persisted = db_session.get(Task, int(task.id))
+        assert persisted.status == TaskStatus.RUNNING
+        assert persisted.runner_id is not None
+        assert persisted.lease_expires_at is not None
+
+        # No terminal exit: the candidate is still on the expired-lease scan,
+        # so the next sweep resolves the same two conditions the same way.
+        rescanned = get_expired_task_lease_candidates(
+            db_session,
+            cutoff=utc_now(),
+            limit=10,
+        )
+        assert any(c.task_id == int(task.id) for c in rescanned)
+    finally:
+        clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
+
+
 @pytest.mark.asyncio
 async def test_a_clean_recovery_sweep_clears_the_ambiguity_signal(
     db_session,

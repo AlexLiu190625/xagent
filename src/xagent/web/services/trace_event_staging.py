@@ -310,8 +310,17 @@ def failed_checkpoint_row_conditions(
     if row_data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES:
         failed.add(CHECKPOINT_ROW_CHECKPOINT_TYPE)
 
+    # ``str(run_field)`` rather than a bare comparison, so a stored run field
+    # that is not a string answers here the way it answers in SQL:
+    # ``checkpoint_run_partition_filter`` above coerces with ``.as_string()``,
+    # and the two are meant to agree on every row. Absence is checked before
+    # the coercion, never through it -- ``str(None)`` is the string "None",
+    # which would match a run id of that text.
     run_field = row_data.get(TASK_RUN_ID_TRACE_FIELD)
-    partition_matches = run_field == run_id if run_id is not None else run_field is None
+    if run_id is not None:
+        partition_matches = run_field is not None and str(run_field) == run_id
+    else:
+        partition_matches = run_field is None
     if not partition_matches:
         failed.add(CHECKPOINT_ROW_RUN_PARTITION)
 

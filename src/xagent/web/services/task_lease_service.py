@@ -475,12 +475,17 @@ def resolve_checkpoint_recovery(
     belongs to the expired run. New-run claims clear both pointer columns
     before execution starts.
 
-    The exact-row pointer is tried first when set: a hit is authoritative
-    (validated, never searched past). A pointer whose row is gone is not a
-    validation failure -- it is only reachable on a database upgraded
-    without this column's FK (a compatibility-window state, see the
-    migration) -- so it falls back to the legacy string resolution below
-    instead of failing the candidate outright.
+    The exact-row pointer is tried first when set. A hit that validates is
+    authoritative and a hit that fails any condition other than the run
+    partition is terminal; neither is searched past. One shape is searched
+    past: a hit whose only failed condition is the run partition, and only
+    because the row carries no run field at all, is a pointer that did not
+    answer rather than one that named a bad row, so it falls through to the
+    legacy scan below (the reasoning is at that branch). A pointer whose row
+    is gone is likewise not a validation failure -- it is only reachable on a
+    database upgraded without this column's FK (a compatibility-window state,
+    see the migration) -- so it too falls back to the legacy string
+    resolution instead of failing the candidate outright.
     """
 
     if candidate.last_checkpoint_trace_event_id is not None:

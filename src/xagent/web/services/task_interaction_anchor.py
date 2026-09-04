@@ -330,11 +330,17 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
     # checkpoint_type in READABLE_CHECKPOINT_TYPES (condition 4), which is
     # exactly {CHECKPOINT_TYPE} | LEGACY_CHECKPOINT_TYPES -- so the branch
     # below is exhaustive between steps 5 and 6, with nothing left over.
-    # A legacy-type row with no run-partition field never reaches here: the
-    # is_missing_run_partition_only branch above already returns for it.
-    # This branch is unreachable on a missing-partition row; it stays in
-    # place to cover a legacy-type row whose run-partition field is present
-    # (the field's presence, not its absence, is what routes a row here).
+    # No legacy-type row reaches this branch under the current write path.
+    # Getting here means all six conditions passed, which for a non-null task
+    # run id means the row carries a matching run-partition field -- and
+    # ``stage_trace_event_row`` (trace_event_staging.py) writes that field
+    # only for a current-type checkpoint, never for a legacy-type one. Every
+    # legacy-type row therefore leaves through the
+    # is_missing_run_partition_only branch above. The branch below is kept
+    # for exhaustiveness over READABLE_CHECKPOINT_TYPES, not because it
+    # covers a shape the writer produces: deleting it would make this
+    # function's exhaustiveness depend on the writer's current behavior
+    # rather than on the condition set it actually reads.
     checkpoint_type = row_data.get("checkpoint_type")
     if checkpoint_type in LEGACY_CHECKPOINT_TYPES:
         logger.info(
