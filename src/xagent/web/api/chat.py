@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, TypeVar, Union, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, or_, update
 from sqlalchemy.orm import Session
 
@@ -75,7 +76,10 @@ from ..sandbox_keys import (
     parse_user_sandbox_key,
 )
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
-from ..schemas.connector_runtime import ConnectorRuntimeRequirementsModel
+from ..schemas.connector_runtime import (
+    ConnectorRuntimeRequirementsModel,
+    ConnectorRuntimeValuesRequest,
+)
 from ..services.agent_access import list_accessible_published_agents
 from ..services.agent_team_scope import (
     get_agent_team_scope,
@@ -89,6 +93,7 @@ from ..services.chat_history_service import (
     persist_assistant_message_no_commit,
 )
 from ..services.connector_runtime import (
+    apply_task_connector_runtime_context_values,
     bind_connector_runtime_selection_snapshot,
     build_task_runtime_requirements,
     resolve_agent_runtime_requirements,
@@ -5293,6 +5298,32 @@ async def get_task_runtime_extensions(
     }
 
 
+def _connector_runtime_error_response(exc: ConnectorRuntimeError) -> JSONResponse:
+    """Render a connector-runtime failure in this endpoint's error envelope.
+
+    Mirrors the ``{"error": {"code", "message", "details"}}`` shape
+    ``_raise_v1_connector_runtime_error`` uses for the /v1 surface
+    (``api/v1/tasks.py``) -- only the envelope is shared, not ``V1ErrorCode``,
+    which is a separate SDK-facing contract this endpoint does not
+    participate in. The status code always comes from ``exc.status_code``,
+    never recomputed from ``exc.code`` via ``_status_for_code``: that helper
+    cannot produce 503, and both this endpoint's own conditional-update
+    failure and a team-scope resolution failure construct their
+    ``ConnectorRuntimeError`` with an explicit ``status_code=503``.
+    """
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.code,
+                "message": exc.safe_message,
+                "details": exc.to_public_error()["details"],
+            }
+        },
+    )
+
+
 @chat_router.get(
     "/agent/{agent_id}/connector-runtime-requirements",
     response_model=ConnectorRuntimeRequirementsModel,
@@ -5371,6 +5402,62 @@ async def get_task_connector_runtime_requirements(
         raise HTTPException(
             status_code=exc.status_code, detail=exc.safe_message
         ) from exc
+
+
+@chat_router.post(
+    "/task/{task_id}/connector-runtime-values",
+    response_model=ConnectorRuntimeRequirementsModel,
+)
+async def post_task_connector_runtime_values(
+    task_id: int,
+    request: ConnectorRuntimeValuesRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ConnectorRuntimeRequirementsModel | JSONResponse:
+    """Accept ``context`` values for a task's connectors, merged key by key.
+
+    A key not yet stored is written; one already stored with the identical
+    value is a no-op; one already stored with a different value fails the
+    whole request with no partial write (``runtime_context_immutable``,
+    409). There is no override switch: a stored value is never replaced.
+    ``secrets``/``auth_selector`` are out of scope this phase and rejected
+    at the request-shape level (``extra="forbid"``), not accepted and
+    ignored.
+
+    On success, the response is the same requirements report the read
+    endpoints return, reflecting exactly what was just written -- not the
+    request's own echo, and not whatever the read endpoints would have
+    said before this call. A 200 here means only that the submitted keys
+    were merged in; it says nothing about whether every required input is
+    now present, which is what the response's own ``satisfied`` fields
+    answer.
+
+    Every failure -- validation, a stored-value conflict, or a concurrent
+    write racing this one to the same row -- is rendered through
+    ``_connector_runtime_error_response`` rather than the plain-``detail``
+    ``HTTPException`` the two read endpoints above use, because a caller
+    needs the structured ``code``/``details.reason`` to decide how to
+    recover (retry, refresh and drop already-satisfied keys, or give up),
+    not just a status code.
+    """
+
+    task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    agent = (
+        db.query(Agent).filter(Agent.id == task.agent_id).first()
+        if task.agent_id is not None
+        else None
+    )
+    try:
+        requirements = apply_task_connector_runtime_context_values(
+            db=db, task=task, agent=agent, payload_items=request.items
+        )
+    except ConnectorRuntimeError as exc:
+        db.rollback()
+        return _connector_runtime_error_response(exc)
+    db.commit()
+    return requirements
 
 
 @chat_router.delete("/task/{task_id}")

@@ -12,8 +12,10 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.web.api.auth import auth_router, create_access_token
 from xagent.web.api.chat import AgentServiceManager, chat_router
 from xagent.web.api.public_chat_access import create_public_chat_access_token
@@ -29,6 +31,7 @@ from xagent.web.models.database import (
     Base,
     get_db,
     get_engine,
+    get_session_local,
 )
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -2252,5 +2255,1310 @@ def test_create_task_persists_same_selected_refs_as_legacy_snapshot(
 
 
 # ---------------------------------------------------------------------------
-# A4: POST /task/{task_id}/connector-runtime-values.
+# POST /task/{task_id}/connector-runtime-values.
 # ---------------------------------------------------------------------------
+
+
+def _values_url(task_id: int) -> str:
+    return f"/api/chat/task/{task_id}/connector-runtime-values"
+
+
+def _setup_context_task(
+    *,
+    required: bool = True,
+    key_type: str = "string",
+    server_name: str = "a4-server",
+) -> tuple[dict[str, str], int, int]:
+    """Owner-only setup shared by most of the values-endpoint tests below:
+    one MCP connector with a single declared ``context`` key, one task that
+    selected it. Returns (owner headers, task_id, server_id).
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = _mcp_server_with_context_schema(
+            db,
+            user,
+            name=server_name,
+            context_schema={"auth_token": {"type": key_type, "required": required}},
+        )
+        agent = _create_agent(
+            db, user, name=f"{server_name}-agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server)
+        agent_id = int(agent.id)
+        server_id = int(server.id)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": server_name, "description": "d", "agent_id": agent_id},
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+    return headers, task_id, server_id
+
+
+def test_values_endpoint_requires_task_ownership_by_caller(e2e_db: None) -> None:
+    """Three identities that must all see a uniform 404, matching the read
+    endpoints' ownership predicate -- including a non-owner whose request
+    body is itself oversized, so that the ownership check cannot be
+    inferred to run after the size check from a caller watching only the
+    status code (a non-owner would then get 400 for a huge body and 404 for
+    a small one, which leaks whether the task exists)."""
+    _, task_id, server_id = _setup_context_task()
+    db = _db_session()
+    try:
+        other = _create_user(db, "values-other-user")
+        db.commit()
+        other_headers = _auth_headers_for_user(other)
+    finally:
+        db.close()
+
+    body = {
+        "items": [
+            {
+                "connector_ref": {"connector_type": "mcp", "connector_id": server_id},
+                "context": {"auth_token": "x"},
+            }
+        ]
+    }
+
+    other_response = client.post(_values_url(task_id), headers=other_headers, json=body)
+    assert other_response.status_code == 404, other_response.text
+
+    oversized_body = {
+        "items": [
+            {
+                "connector_ref": {"connector_type": "mcp", "connector_id": server_id},
+                "context": {"auth_token": "x" * (64 * 1024 + 1)},
+            }
+        ]
+    }
+    oversized_other_response = client.post(
+        _values_url(task_id), headers=other_headers, json=oversized_body
+    )
+    assert oversized_other_response.status_code == 404, oversized_other_response.text
+
+    anon_response = client.post(_values_url(task_id), json=body)
+    assert anon_response.status_code == 403, anon_response.text
+
+    widget_token = create_public_chat_access_token(
+        {"guest_id": "values-anon-guest", "widget_agent_id": 1}
+    )
+    widget_response = client.post(
+        _values_url(task_id),
+        headers={"Authorization": f"Bearer {widget_token}"},
+        json=body,
+    )
+    assert widget_response.status_code == 401, widget_response.text
+    assert _context_row_count(task_id) == 0
+
+
+def test_values_endpoint_surfaces_team_scope_failure_as_typed_503(
+    e2e_db: None,
+) -> None:
+    """A team-scope resolution failure surfaces as 503 with
+    ``reason == "team_scope_resolution_failed"``, not a 400 -- setup must
+    install the team hook first (``_load_visible_runtime_connectors`` only
+    calls ``resolve_team_connector_ids_or_raise``, which is what raises
+    this, when the hook is installed; without it the branch that produces
+    this 503 is unreachable and the assertion below would be probing a
+    no-op setup instead of the endpoint).
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        agent = _create_agent(
+            db, user, name="Team Scope Failure Agent", tool_categories=["mcp"]
+        )
+        agent.team_id = 303
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "i10b task", "description": "d", "agent_id": agent_id},
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+
+    def _raising_hook(db: Session, *, team_id: int) -> dict[str, set[int]]:
+        raise RuntimeError("team-scope-hook-failure-must-not-leak")
+
+    connector_team_scope.set_connector_team_hooks(team_visibility=_raising_hook)
+    try:
+        response = client.post(
+            _values_url(task_id),
+            headers=headers,
+            json={
+                "items": [
+                    {
+                        "connector_ref": {"connector_type": "mcp", "connector_id": 1},
+                        "context": {"auth_token": "x"},
+                    }
+                ]
+            },
+        )
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+    assert response.status_code == 503, response.text
+    assert "team-scope-hook-failure-must-not-leak" not in response.text
+    body = response.json()
+    assert body["error"]["details"]["reason"] == "team_scope_resolution_failed"
+
+
+@pytest.mark.parametrize(
+    ("payload_builder", "expected_reason_prefix"),
+    [
+        (
+            lambda server_id: {"other_key": "x"},
+            "undeclared_context_key",
+        ),
+        (
+            lambda server_id: {"auth_token": {"nested": "object"}},
+            "type_mismatch.context.auth_token",
+        ),
+        (
+            lambda server_id: {"auth_token": 5},
+            "type_mismatch.context.auth_token",
+        ),
+    ],
+)
+def test_values_endpoint_rejects_invalid_values_and_writes_nothing(
+    e2e_db: None, payload_builder: Any, expected_reason_prefix: str
+) -> None:
+    """An undeclared key, a string-typed key given an object, and a
+    string-typed key given an int are each rejected, and each rejection
+    leaves zero rows behind."""
+    headers, task_id, server_id = _setup_context_task()
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": payload_builder(server_id),
+                }
+            ]
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["details"]["reason"] == expected_reason_prefix
+    assert _context_row_count(task_id) == 0
+
+
+def test_values_endpoint_rejects_object_key_given_wrong_shapes(e2e_db: None) -> None:
+    """An object-typed key given a string, then given an array, is rejected
+    both times."""
+    headers, task_id, server_id = _setup_context_task(key_type="object")
+    for bad_value in ("not-an-object", ["also", "not", "an", "object"]):
+        response = client.post(
+            _values_url(task_id),
+            headers=headers,
+            json={
+                "items": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": server_id,
+                        },
+                        "context": {"auth_token": bad_value},
+                    }
+                ]
+            },
+        )
+        assert response.status_code == 400, response.text
+        assert (
+            response.json()["error"]["details"]["reason"]
+            == "type_mismatch.context.auth_token"
+        )
+        assert _context_row_count(task_id) == 0
+
+
+def test_values_endpoint_rejects_malformed_key_name(e2e_db: None) -> None:
+    """A key name that fails ``validate_runtime_source_key`` (e.g.
+    containing a dot) is rejected."""
+    headers, task_id, server_id = _setup_context_task()
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"auth.token": "x"},
+                }
+            ]
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert _context_row_count(task_id) == 0
+
+
+def test_values_endpoint_rejects_oversized_single_key_and_batch(e2e_db: None) -> None:
+    """The two size-cap cases: a single key over 64KB, and a batch over
+    256KB in aggregate even though no single key trips the per-key cap.
+    Neither writes anything, and which key was oversized never
+    appears in the response ``reason`` -- only the fixed literal
+    ``payload_too_large``."""
+    headers, task_id, server_id = _setup_context_task()
+    oversized_value = "x" * (64 * 1024 + 1)
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"auth_token": oversized_value},
+                }
+            ]
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["details"]["reason"] == "payload_too_large"
+    assert _context_row_count(task_id) == 0
+
+    # A batch that trips the aggregate cap without any single key tripping
+    # the per-key cap: one connector declaring five keys, each just under
+    # 64KB (5 * ~64KB > 256KB in total).
+    headers2 = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        key_names = [f"key_{i}" for i in range(5)]
+        server2 = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="a4-batch-server",
+            context_schema={
+                key: {"type": "string", "required": False} for key in key_names
+            },
+        )
+        agent2 = _create_agent(db, user, name="a4-batch-agent", tool_categories=["mcp"])
+        db.commit()
+        db.refresh(agent2)
+        db.refresh(server2)
+        agent2_id = int(agent2.id)
+        server2_id = int(server2.id)
+    finally:
+        db.close()
+
+    create_response2 = client.post(
+        "/api/chat/task/create",
+        headers=headers2,
+        json={"title": "a4-batch-task", "description": "d", "agent_id": agent2_id},
+    )
+    assert create_response2.status_code == 200, create_response2.text
+    task_id2 = int(create_response2.json()["task_id"])
+
+    just_under_per_key_cap = "x" * (64 * 1024 - 200)
+    response2 = client.post(
+        _values_url(task_id2),
+        headers=headers2,
+        json={
+            "items": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server2_id,
+                    },
+                    "context": {key: just_under_per_key_cap for key in key_names},
+                },
+            ]
+        },
+    )
+    assert response2.status_code == 400, response2.text
+    assert response2.json()["error"]["details"]["reason"] == "payload_too_large"
+    assert _context_row_count(task_id2) == 0
+
+
+def test_values_endpoint_rejects_duplicate_ref_in_batch(e2e_db: None) -> None:
+    """The same connector ref submitted twice in one batch is rejected as a
+    duplicate."""
+    headers, task_id, server_id = _setup_context_task()
+    item = {
+        "connector_ref": {"connector_type": "mcp", "connector_id": server_id},
+        "context": {"auth_token": "x"},
+    }
+    response = client.post(
+        _values_url(task_id), headers=headers, json={"items": [item, item]}
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["details"]["reason"] == "duplicate_ref"
+    assert _context_row_count(task_id) == 0
+
+
+def _stored_context(task_id: int, server_id: int) -> dict[str, Any] | None:
+    db = _db_session()
+    try:
+        row = (
+            db.query(TaskConnectorRuntimeContext)
+            .filter(
+                TaskConnectorRuntimeContext.task_id == task_id,
+                TaskConnectorRuntimeContext.connector_type == "mcp",
+                TaskConnectorRuntimeContext.connector_id == server_id,
+            )
+            .one_or_none()
+        )
+        return dict(row.context) if row is not None else None
+    finally:
+        db.close()
+
+
+def test_values_endpoint_merges_keys_and_never_replaces_a_stored_value(
+    e2e_db: None,
+) -> None:
+    """Five requests against the same connector row, in sequence -- a
+    stored value is never replaced, a new key can be added, and the
+    response reflects the write it just made (not a stale pre-write read).
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="i12-server",
+            context_schema={
+                "a": {"type": "string", "required": False},
+                "b": {"type": "string", "required": False},
+                "c": {"type": "string", "required": False},
+            },
+        )
+        agent = _create_agent(db, user, name="i12-agent", tool_categories=["mcp"])
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server)
+        agent_id = int(agent.id)
+        server_id = int(server.id)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "i12 task", "description": "d", "agent_id": agent_id},
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+    ref = {"connector_type": "mcp", "connector_id": server_id}
+
+    def _post(context: dict[str, Any]) -> Any:
+        return client.post(
+            _values_url(task_id),
+            headers=headers,
+            json={"items": [{"connector_ref": ref, "context": context}]},
+        )
+
+    # (1) write "a", then resend the same value -- 200, one row, unchanged.
+    r1 = _post({"a": "1"})
+    assert r1.status_code == 200, r1.text
+    r1b = _post({"a": "1"})
+    assert r1b.status_code == 200, r1b.text
+    assert _stored_context(task_id, server_id) == {"a": "1"}
+    assert _context_row_count(task_id) == 1
+
+    # (2) resend "a" with a different value -- 409, unchanged.
+    r2 = _post({"a": "2"})
+    assert r2.status_code == 409, r2.text
+    assert r2.json()["error"]["details"]["reason"] == "conflict.context.a"
+    assert _stored_context(task_id, server_id) == {"a": "1"}
+
+    # (3) add "b" -- 200, merged, and this response's own inputs for both
+    # "a" and "b" already read satisfied=true: this response is assembled
+    # from the write it just made, not a stale pre-write read.
+    r3 = _post({"b": "2"})
+    assert r3.status_code == 200, r3.text
+    assert _stored_context(task_id, server_id) == {"a": "1", "b": "2"}
+    r3_inputs = {item["key"]: item for item in r3.json()["connectors"][0]["inputs"]}
+    assert r3_inputs["a"]["satisfied"] is True
+    assert r3_inputs["b"]["satisfied"] is True
+
+    # (4) add "c" alongside the already-stored "a" -- 200, all three present.
+    r4 = _post({"a": "1", "c": "3"})
+    assert r4.status_code == 200, r4.text
+    assert _stored_context(task_id, server_id) == {"a": "1", "b": "2", "c": "3"}
+
+    # (5) conflict on "a" again, this time alongside a currently-valid "c"
+    # -- the whole request still fails, not a byte written.
+    r5 = _post({"a": "2", "c": "3"})
+    assert r5.status_code == 409, r5.text
+    assert _stored_context(task_id, server_id) == {"a": "1", "b": "2", "c": "3"}
+
+
+@pytest.mark.parametrize("override_key", ["if_absent", "overwrite", "force"])
+def test_values_endpoint_rejects_any_override_switch(
+    e2e_db: None, override_key: str
+) -> None:
+    """No override switch is accepted at the request-shape level --
+    ``extra="forbid"`` turns any of them into 422 before the merge logic
+    ever runs."""
+    headers, task_id, server_id = _setup_context_task(required=False)
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"auth_token": "x"},
+                    override_key: True,
+                }
+            ]
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert _context_row_count(task_id) == 0
+
+
+def test_values_endpoint_conflict_details_carry_reason_and_connector_ref(
+    e2e_db: None,
+) -> None:
+    """A 409's ``details`` carries both ``reason`` and ``connector_ref`` --
+    the latter is a documented part of the contract, not an accidental leak
+    of ``ConnectorRuntimeError``'s internals."""
+    headers, task_id, server_id = _setup_context_task(required=False)
+    ref = {"connector_type": "mcp", "connector_id": server_id}
+    first = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={"items": [{"connector_ref": ref, "context": {"auth_token": "1"}}]},
+    )
+    assert first.status_code == 200, first.text
+    second = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={"items": [{"connector_ref": ref, "context": {"auth_token": "2"}}]},
+    )
+    assert second.status_code == 409, second.text
+    details = second.json()["error"]["details"]
+    assert details["reason"] == "conflict.context.auth_token"
+    assert details["connector_ref"] == ref
+
+
+def test_values_endpoint_first_item_atomic_when_second_item_fails_validation(
+    e2e_db: None,
+) -> None:
+    """Multi-item atomicity on the 400 path -- the first item alone would
+    have succeeded, but the whole batch fails together with the second, and
+    neither lands."""
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        good_server = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="i15-good-server",
+            context_schema={"auth_token": {"type": "string", "required": False}},
+        )
+        bad_server = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="i15-bad-server",
+            context_schema={"auth_token": {"type": "string", "required": False}},
+        )
+        agent = _create_agent(db, user, name="i15-agent", tool_categories=["mcp"])
+        db.commit()
+        db.refresh(agent)
+        db.refresh(good_server)
+        db.refresh(bad_server)
+        agent_id = int(agent.id)
+        good_id = int(good_server.id)
+        bad_id = int(bad_server.id)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "i15 task", "description": "d", "agent_id": agent_id},
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {
+                    "connector_ref": {"connector_type": "mcp", "connector_id": good_id},
+                    "context": {"auth_token": "ok"},
+                },
+                {
+                    "connector_ref": {"connector_type": "mcp", "connector_id": bad_id},
+                    "context": {"undeclared_key": "x"},
+                },
+            ]
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert _context_row_count(task_id) == 0
+
+
+def test_values_endpoint_first_item_atomic_when_second_item_conflicts(
+    e2e_db: None,
+) -> None:
+    """Multi-item atomicity on the 409 path. Ref A has no row yet; ref B
+    already has a different value stored under another session. One
+    request submitting A+B fails together (A gets zero residue too), then
+    resubmitting A alone (dropping B, the frontend rule after a 409)
+    succeeds."""
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server_a = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="i11ba-server-a",
+            context_schema={"auth_token": {"type": "string", "required": False}},
+        )
+        server_b = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="i11ba-server-b",
+            context_schema={"auth_token": {"type": "string", "required": False}},
+        )
+        agent = _create_agent(db, user, name="i11ba-agent", tool_categories=["mcp"])
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server_a)
+        db.refresh(server_b)
+        agent_id = int(agent.id)
+        a_id = int(server_a.id)
+        b_id = int(server_b.id)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "i11ba task", "description": "d", "agent_id": agent_id},
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+
+    ref_a = {"connector_type": "mcp", "connector_id": a_id}
+    ref_b = {"connector_type": "mcp", "connector_id": b_id}
+    pre_fill = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [{"connector_ref": ref_b, "context": {"auth_token": "original"}}]
+        },
+    )
+    assert pre_fill.status_code == 200, pre_fill.text
+
+    combined = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {"connector_ref": ref_a, "context": {"auth_token": "new-a"}},
+                {"connector_ref": ref_b, "context": {"auth_token": "conflicting"}},
+            ]
+        },
+    )
+    assert combined.status_code == 409, combined.text
+    assert (
+        combined.json()["error"]["details"]["reason"] == "conflict.context.auth_token"
+    )
+    assert _context_row_count(task_id) == 1  # only B's pre-fill row
+    assert _stored_context(task_id, a_id) is None
+
+    only_a = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={"items": [{"connector_ref": ref_a, "context": {"auth_token": "new-a"}}]},
+    )
+    assert only_a.status_code == 200, only_a.text
+    assert _stored_context(task_id, a_id) == {"auth_token": "new-a"}
+
+
+def test_values_endpoint_partial_fill_returns_200_and_persists(e2e_db: None) -> None:
+    """Partial fill is 200, not a rejection -- including when the
+    connector's declared schema grows a new required key between when the
+    caller last read the requirements and when it submits."""
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="i32b-server",
+            context_schema={
+                "a": {"type": "string", "required": True},
+                "b": {"type": "string", "required": True},
+            },
+        )
+        agent = _create_agent(db, user, name="i32b-agent", tool_categories=["mcp"])
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server)
+        agent_id = int(agent.id)
+        server_id = int(server.id)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "i32b task", "description": "d", "agent_id": agent_id},
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+    ref = {"connector_type": "mcp", "connector_id": server_id}
+
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={"items": [{"connector_ref": ref, "context": {"a": "1"}}]},
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["satisfied"] is False
+    inputs = {item["key"]: item for item in payload["connectors"][0]["inputs"]}
+    assert inputs["a"]["satisfied"] is True
+    assert inputs["b"]["satisfied"] is False
+    assert _stored_context(task_id, server_id) == {"a": "1"}
+
+    # Declaration grows a new required key after this read; the caller
+    # (having computed "only a was missing" from a stale read) submits
+    # exactly what it originally intended. Still 200; the new key is simply
+    # still unsatisfied afterward, not a rejection of this request.
+    db = _db_session()
+    try:
+        row = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        row.runtime_input_schema = {
+            "context": {
+                "a": {"type": "string", "required": True},
+                "b": {"type": "string", "required": True},
+                "d": {"type": "string", "required": True},
+            }
+        }
+        db.commit()
+    finally:
+        db.close()
+
+    response2 = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={"items": [{"connector_ref": ref, "context": {"b": "2"}}]},
+    )
+    assert response2.status_code == 200, response2.text
+    assert _stored_context(task_id, server_id) == {"a": "1", "b": "2"}
+
+
+def _count_context_table_writes(fn: Any) -> int:
+    """Run ``fn`` while counting INSERT/UPDATE/DELETE statements issued
+    against ``task_connector_runtime_contexts`` on the app's engine."""
+    from xagent.web.models.database import get_engine
+
+    engine = get_engine()
+    counted = {"n": 0}
+
+    def _listener(
+        conn: Any, cursor: Any, statement: str, *_args: Any, **_kwargs: Any
+    ) -> None:
+        upper = statement.upper()
+        if "TASK_CONNECTOR_RUNTIME_CONTEXTS" in upper and (
+            "INSERT" in upper or "UPDATE" in upper or "DELETE" in upper
+        ):
+            counted["n"] += 1
+
+    event.listen(engine, "before_cursor_execute", _listener)
+    try:
+        fn()
+    finally:
+        event.remove(engine, "before_cursor_execute", _listener)
+    return counted["n"]
+
+
+def test_values_endpoint_same_value_rewrite_issues_no_write_statement(
+    e2e_db: None,
+) -> None:
+    """Writing the same value twice issues zero INSERT/UPDATE statements on
+    the second request -- the short circuit at "same content already on the
+    row" actually skips the write, not just the response change it would
+    otherwise have caused."""
+    headers, task_id, server_id = _setup_context_task(required=False)
+    ref = {"connector_type": "mcp", "connector_id": server_id}
+    body = {"items": [{"connector_ref": ref, "context": {"auth_token": "same"}}]}
+
+    first = client.post(_values_url(task_id), headers=headers, json=body)
+    assert first.status_code == 200, first.text
+    assert _context_row_count(task_id) == 1
+
+    second_writes = _count_context_table_writes(
+        lambda: client.post(_values_url(task_id), headers=headers, json=body)
+    )
+    assert second_writes == 0
+    assert _context_row_count(task_id) == 1
+
+
+@pytest.mark.parametrize(
+    ("key_type", "context_value"),
+    [
+        ("string", "SENTINEL-CONTEXT-VALUE-DO-NOT-LOG"),
+        ("object", {"nested": "SENTINEL-CONTEXT-VALUE-DO-NOT-LOG"}),
+    ],
+    ids=["top_level_string", "nested_in_object"],
+)
+def test_values_endpoint_never_logs_submitted_values(
+    e2e_db: None,
+    caplog: pytest.LogCaptureFixture,
+    key_type: str,
+    context_value: Any,
+) -> None:
+    """A submitted value never reaches a log line, checked at DEBUG across
+    the whole request, both in the rendered message and in any
+    lazily-formatted ``%s`` args -- for a plain top-level string value and
+    for one nested inside an object."""
+    import logging
+
+    headers, task_id, server_id = _setup_context_task(required=False, key_type=key_type)
+    sentinel = "SENTINEL-CONTEXT-VALUE-DO-NOT-LOG"
+    ref = {"connector_type": "mcp", "connector_id": server_id}
+
+    with caplog.at_level(logging.DEBUG):
+        response = client.post(
+            _values_url(task_id),
+            headers=headers,
+            json={
+                "items": [
+                    {
+                        "connector_ref": ref,
+                        "context": {"auth_token": context_value},
+                    }
+                ]
+            },
+        )
+    assert response.status_code == 200, response.text
+    for record in caplog.records:
+        assert sentinel not in record.getMessage()
+        for arg in record.args or ():
+            assert sentinel not in str(arg)
+    # Positive half: a fill is still recorded, just without the value -- the
+    # key name alone shows up in the one log line the write path does emit.
+    assert any("auth_token" in record.getMessage() for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Values-endpoint concurrency: two sessions racing the write. Driven
+# below the HTTP layer, directly against
+# ``apply_task_connector_runtime_context_values``, because the race needs
+# precise control over when each session reads versus when the other
+# commits -- an ordinary sequential HTTP call cannot express "A read before
+# B committed, then B committed, then A wrote".
+# ---------------------------------------------------------------------------
+
+
+def _setup_concurrency_task(*, key_names: list[str]) -> tuple[int, int]:
+    """One connector declaring the given (all optional) context keys, one
+    task that selected it. Returns (task_id, server_id)."""
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = _mcp_server_with_context_schema(
+            db,
+            user,
+            name=f"conc-server-{'-'.join(key_names)}-{secrets.token_hex(4)}",
+            context_schema={
+                key: {"type": "string", "required": False} for key in key_names
+            },
+        )
+        agent = _create_agent(
+            db,
+            user,
+            name=f"conc-agent-{secrets.token_hex(4)}",
+            tool_categories=["mcp"],
+        )
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server)
+        agent_id = int(agent.id)
+        server_id = int(server.id)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "conc task", "description": "d", "agent_id": agent_id},
+    )
+    assert create_response.status_code == 200, create_response.text
+    return int(create_response.json()["task_id"]), server_id
+
+
+def _direct_apply(
+    session: Session, task_id: int, server_id: int, context: dict[str, Any]
+) -> Any:
+    from xagent.web.models.agent import Agent as AgentModel
+    from xagent.web.schemas.connector_runtime import ConnectorRuntimeValueItem
+    from xagent.web.services.connector_runtime import (
+        apply_task_connector_runtime_context_values,
+    )
+
+    task = session.query(Task).filter(Task.id == task_id).one()
+    agent = (
+        session.query(AgentModel).filter(AgentModel.id == task.agent_id).one()
+        if task.agent_id is not None
+        else None
+    )
+    item = ConnectorRuntimeValueItem(
+        connector_ref={"connector_type": "mcp", "connector_id": server_id},
+        context=context,
+    )
+    return apply_task_connector_runtime_context_values(
+        db=session, task=task, agent=agent, payload_items=[item]
+    )
+
+
+@pytest.mark.parametrize(
+    ("a_context", "b_context", "expect_conflict"),
+    [
+        ({"a": "1"}, {"b": "2"}, False),
+        ({"a": "1"}, {"a": "1"}, False),
+        ({"a": "1"}, {"a": "2"}, True),
+    ],
+)
+def test_concurrent_first_write_has_one_winner(
+    e2e_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    a_context: dict[str, str],
+    b_context: dict[str, str],
+    expect_conflict: bool,
+) -> None:
+    """Two sessions both find no row for a ref. B writes and commits
+    first; A -- still holding its stale "no row" read -- then attempts its
+    own insert, hits the real unique-constraint ``IntegrityError``, and
+    must recover: roll back, reread (now sees B's committed row), remerge,
+    and either succeed or conflict depending on whether the two writers'
+    keys collide. A's session must stay usable after the ``IntegrityError``
+    -- proven here by querying through it once the call returns.
+    """
+    task_id, server_id = _setup_concurrency_task(key_names=["a", "b"])
+
+    from xagent.web.services import connector_runtime as connector_runtime_service
+
+    real_read = connector_runtime_service._load_task_context_row_snapshots
+
+    session_a = get_session_local()()
+    try:
+        # B runs and commits first, through the real (unpatched) read --
+        # this is genuinely the first write for this ref, no simulation
+        # needed here.
+        session_b = get_session_local()()
+        try:
+            _direct_apply(session_b, task_id, server_id, b_context)
+            session_b.commit()
+        finally:
+            session_b.close()
+
+        # Now install the stale read for A's *first* attempt only: A is
+        # simulated as having looked before B committed, i.e. still empty,
+        # even though B's row already exists in the database by the time
+        # A's insert actually runs. The second attempt (the retry) uses
+        # the real reader, which does see B's row.
+        state = {"calls": 0}
+
+        def _stale_first_read(db: Session, *, task_id: int) -> dict[str, Any]:
+            state["calls"] += 1
+            if state["calls"] == 1:
+                return {}
+            return real_read(db, task_id=task_id)
+
+        monkeypatch.setattr(
+            connector_runtime_service,
+            "_load_task_context_row_snapshots",
+            _stale_first_read,
+        )
+
+        if expect_conflict:
+            with pytest.raises(ConnectorRuntimeError) as exc_info:
+                _direct_apply(session_a, task_id, server_id, a_context)
+            assert exc_info.value.code == "runtime_context_immutable"
+            session_a.rollback()
+        else:
+            result = _direct_apply(session_a, task_id, server_id, a_context)
+            merged_keys = {
+                item.key: item.satisfied
+                for connector in result.connectors
+                for item in connector.inputs
+            }
+            for key in {**a_context, **b_context}:
+                assert merged_keys[key] is True
+            session_a.commit()
+
+        # The session survived the IntegrityError-triggered rollback and
+        # retry -- prove it is not left in SQLAlchemy's
+        # ``PendingRollbackError`` state by issuing one more query on it.
+        assert session_a.query(Task).filter(Task.id == task_id).one() is not None
+    finally:
+        session_a.close()
+
+    assert _context_row_count(task_id) == 1
+
+
+def test_concurrent_first_write_retry_is_bounded(
+    e2e_db: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that keeps colliding does not retry forever -- exactly two
+    attempts, then 503."""
+    task_id, server_id = _setup_concurrency_task(key_names=["a"])
+
+    from xagent.web.services import connector_runtime as connector_runtime_service
+
+    # B commits a row for this ref up front, unconditionally.
+    session_b = get_session_local()()
+    try:
+        _direct_apply(session_b, task_id, server_id, {"a": "occupied"})
+        session_b.commit()
+    finally:
+        session_b.close()
+
+    calls = {"n": 0}
+
+    def _always_stale_read(db: Session, *, task_id: int) -> dict[str, Any]:
+        calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr(
+        connector_runtime_service,
+        "_load_task_context_row_snapshots",
+        _always_stale_read,
+    )
+
+    session_a = get_session_local()()
+    try:
+        with pytest.raises(ConnectorRuntimeError) as exc_info:
+            _direct_apply(session_a, task_id, server_id, {"a": "occupied"})
+        assert exc_info.value.status_code == 503
+        session_a.rollback()
+    finally:
+        session_a.close()
+
+    assert calls["n"] == 2
+
+
+@pytest.mark.parametrize(
+    ("a_context", "expect_conflict"),
+    [
+        ({"b": "2"}, False),
+        ({"x": "0"}, False),
+        ({"x": "9"}, True),
+    ],
+)
+def test_concurrent_overwrite_of_an_existing_row(
+    e2e_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    a_context: dict[str, str],
+    expect_conflict: bool,
+) -> None:
+    """SQLite half of this compare-and-swap proof; the PostgreSQL half runs
+    in the migration workflow, see
+    ``test_connector_runtime_values_postgresql.py``. A row already has
+    ``{"x": "0"}``. A read it before B committed a change to
+    the same row; B commits (adding "a"); A's conditional UPDATE, built on
+    the text it read before B's write, cannot match the row's current text
+    -- rowcount 0, not an error -- and must retry: reread, remerge, and
+    either succeed (A's own key doesn't collide with B's) or conflict
+    (A resubmits "x" with a different value than what's on the row now).
+    """
+    task_id, server_id = _setup_concurrency_task(key_names=["x", "a", "b"])
+    ref = {"connector_type": "mcp", "connector_id": server_id}
+    seed = client.post(
+        _values_url(task_id),
+        headers=_setup_admin_headers(),
+        json={"items": [{"connector_ref": ref, "context": {"x": "0"}}]},
+    )
+    assert seed.status_code == 200, seed.text
+
+    from xagent.web.services import connector_runtime as connector_runtime_service
+
+    real_read = connector_runtime_service._load_task_context_row_snapshots
+
+    session_a = get_session_local()()
+    try:
+        stale_snapshot = real_read(session_a, task_id=task_id)
+
+        session_b = get_session_local()()
+        try:
+            _direct_apply(session_b, task_id, server_id, {"a": "1"})
+            session_b.commit()
+        finally:
+            session_b.close()
+
+        state = {"calls": 0}
+        update_results: list[bool] = []
+        real_update = connector_runtime_service._update_context_row
+
+        def _stale_first_read(db: Session, *, task_id: int) -> dict[str, Any]:
+            state["calls"] += 1
+            if state["calls"] == 1:
+                return stale_snapshot
+            return real_read(db, task_id=task_id)
+
+        def _counting_update(*args: Any, **kwargs: Any) -> bool:
+            result = real_update(*args, **kwargs)
+            update_results.append(result)
+            return result
+
+        monkeypatch.setattr(
+            connector_runtime_service,
+            "_load_task_context_row_snapshots",
+            _stale_first_read,
+        )
+        monkeypatch.setattr(
+            connector_runtime_service, "_update_context_row", _counting_update
+        )
+
+        if expect_conflict:
+            with pytest.raises(ConnectorRuntimeError) as exc_info:
+                _direct_apply(session_a, task_id, server_id, a_context)
+            assert exc_info.value.details["reason"] == "conflict.context.x"
+            session_a.rollback()
+        else:
+            _direct_apply(session_a, task_id, server_id, a_context)
+            session_a.commit()
+            assert _stored_context(task_id, server_id)["x"] == "0"
+            for key, value in a_context.items():
+                assert _stored_context(task_id, server_id)[key] == value
+            # The counting format: a genuinely new key (the "b" case) has
+            # something to write against both the stale and the fresh
+            # view, so its first (stale-text) UPDATE attempt hits 0 rows
+            # and only the retry, built on a fresh read, succeeds.
+            # Resubmitting a value the row already has (the "x" case)
+            # merges to the *same* content under the stale view too, so
+            # tier 8's same-content skip fires before any UPDATE is even
+            # attempted -- zero calls, not one that fails and one that
+            # succeeds.
+            if "b" in a_context:
+                assert update_results == [False, True]
+            else:
+                assert update_results == []
+    finally:
+        session_a.close()
+
+    if expect_conflict:
+        # No byte moved: the row still shows only what existed before A's
+        # failed request, plus B's unrelated write.
+        assert _stored_context(task_id, server_id) == {"x": "0", "a": "1"}
+
+
+def _overwrite_context_row_text(task_id: int, server_id: int, raw_text: str) -> None:
+    """Write ``raw_text`` into a context row's ``context`` column via a bare
+    SQL UPDATE -- bypassing the JSON column's bind processor entirely, so
+    the row holds exactly ``raw_text``, byte for byte, whatever its
+    canonical form would have been.
+    """
+    from sqlalchemy import text as sa_text
+
+    db = _db_session()
+    try:
+        row = (
+            db.query(TaskConnectorRuntimeContext)
+            .filter(
+                TaskConnectorRuntimeContext.task_id == task_id,
+                TaskConnectorRuntimeContext.connector_type == "mcp",
+                TaskConnectorRuntimeContext.connector_id == server_id,
+            )
+            .one()
+        )
+        db.execute(
+            sa_text(
+                "UPDATE task_connector_runtime_contexts SET context = :t WHERE id = :i"
+            ),
+            {"t": raw_text, "i": row.id},
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        # Non-canonical rendering: different key order plus extra
+        # whitespace than SQLAlchemy's default `json.dumps` would produce.
+        '{"b": 1,   "a": 2}',
+        # Non-ASCII, unescaped -- `ensure_ascii=True` (json.dumps's
+        # default) would have turned this into \\uXXXX escapes.
+        '{"name": "会议室预订"}',
+    ],
+)
+def test_values_endpoint_expected_old_value_is_the_database_rendering(
+    e2e_db: None, raw_text: str
+) -> None:
+    """SQLite half of this compare-and-swap proof; the PostgreSQL half runs
+    in the migration workflow, see
+    ``test_connector_runtime_values_postgresql.py``. A row whose stored
+    text was never produced by this codebase's own
+    ``json.dumps`` call (a non-canonical rendering, or unescaped non-ASCII)
+    must still accept a new key. If the expected-old-value comparison ever
+    re-serializes the read value in Python instead of using the database's
+    own ``CAST(context AS TEXT)`` rendering, this row's CAS predicate can
+    never match -- every write to it fails forever, not just once.
+    """
+    headers, task_id, server_id = _setup_context_task(required=False)
+    db = _db_session()
+    try:
+        db.add(
+            TaskConnectorRuntimeContext(
+                task_id=task_id,
+                connector_type="mcp",
+                connector_id=server_id,
+                context={"placeholder": "will be overwritten"},
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+    _overwrite_context_row_text(task_id, server_id, raw_text)
+
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"auth_token": "new-value"},
+                }
+            ]
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert _stored_context(task_id, server_id)["auth_token"] == "new-value"
+
+
+def test_values_endpoint_accepts_team_shared_connector(e2e_db: None) -> None:
+    """The values-endpoint half of the team-visibility check: a connector
+    visible only through the agent's team is writable through the values
+    endpoint for a non-owning team member -- not a 404, which is what
+    happens if this
+    endpoint's own ``agent_team_id`` derivation is ever dropped back to
+    ``None``."""
+    db = _db_session()
+    try:
+        owner = _create_user(db, "values-team-owner")
+        member = _create_user(db, "values-team-member")
+        db.flush()
+        member_id = int(member.id)
+        server = MCPServer(
+            name="values-team-shared-server",
+            description="values-team-shared-server description",
+            managed="external",
+            transport="streamable_http",
+            url="https://example.com/mcp",
+            runtime_input_schema={
+                "context": {"auth_token": {"type": "string", "required": False}}
+            },
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "auth_token"},
+                    "target": {"target_type": "mcp_meta", "key": "auth_token"},
+                }
+            ],
+        )
+        db.add(server)
+        db.flush()
+        server_id = int(server.id)
+        agent = Agent(
+            user_id=owner.id,
+            name="Values Team Shared Agent",
+            instructions="i",
+            execution_mode="balanced",
+            status=AgentStatus.PUBLISHED,
+            tool_categories=["mcp"],
+            team_id=404,
+            visibility="team",
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+        member_headers = _auth_headers_for_user(member)
+    finally:
+        db.close()
+
+    set_agent_team_scope_hook(
+        lambda db, user_id: (
+            AgentTeamScope(team_id=404, is_team_admin=False)
+            if user_id == member_id
+            else None
+        )
+    )
+    connector_team_scope.set_connector_team_hooks(
+        team_visibility=lambda db, *, team_id: (
+            {"mcp": {server_id}, "custom_api": set()}
+            if team_id == 404
+            else {"mcp": set(), "custom_api": set()}
+        )
+    )
+    try:
+        create_response = client.post(
+            "/api/chat/task/create",
+            headers=member_headers,
+            json={
+                "title": "values team shared task",
+                "description": "d",
+                "agent_id": agent_id,
+            },
+        )
+        assert create_response.status_code == 200, create_response.text
+        task_id = int(create_response.json()["task_id"])
+
+        response = client.post(
+            _values_url(task_id),
+            headers=member_headers,
+            json={
+                "items": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": server_id,
+                        },
+                        "context": {"auth_token": "x"},
+                    }
+                ]
+            },
+        )
+        assert response.status_code == 200, response.text
+    finally:
+        set_agent_team_scope_hook(None)
+        connector_team_scope.set_connector_team_hooks()
