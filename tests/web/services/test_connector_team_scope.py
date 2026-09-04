@@ -1991,3 +1991,128 @@ def test_the_access_slot_lets_the_boundary_error_through_its_wrapper(db_session)
         connector_team_scope.resolve_connector_access_or_raise(
             db_session, 1, [("mcp", 1)], caller_holds_lock=True
         )
+
+
+@pytest.mark.parametrize("route_name", ["update_custom_api", "delete_custom_api"])
+def test_a_bare_call_site_lets_the_error_escape_unchanged(db_session, route_name):
+    """Neither custom_api call site sits inside a ``try`` of the route's
+    own: nothing there stands between the hook call and the route's
+    return. The boundary error reaches a direct caller of the route
+    exactly as raised, the same way it reaches the application's own
+    exception handler in production."""
+    from xagent.web.api.custom_api import (
+        CustomApiUpdate,
+        delete_custom_api,
+        update_custom_api,
+    )
+
+    owner = _create_user(db_session, f"bare-call-site-owner-{route_name}")
+    api = _create_custom_api(
+        db_session, f"bare-call-site-api-{route_name}", owner=owner
+    )
+    db_session.commit()
+    current_user = SimpleNamespace(id=owner.id, is_admin=False)
+
+    def deleted_hook(db, *_a, **_k):
+        db.rollback()
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    def renamed_hook(db, *_a, **_k):
+        db.rollback()
+
+    if route_name == "delete_custom_api":
+        connector_team_scope.set_connector_team_hooks(deleted=deleted_hook)
+        with pytest.raises(ConnectorHookSessionBoundaryError):
+            delete_custom_api(int(api.id), current_user=current_user, db=db_session)
+    else:
+        connector_team_scope.set_connector_team_hooks(renamed=renamed_hook)
+        payload = CustomApiUpdate(name=f"bare-call-site-api-{route_name}-renamed")
+        with pytest.raises(ConnectorHookSessionBoundaryError):
+            update_custom_api(
+                int(api.id), payload, current_user=current_user, db=db_session
+            )
+
+
+# ---------------------------------------------------------------------------
+# T-15: the call site table in the module docstring and the actual call
+# sites in the two route modules must agree, in both directions.
+# ---------------------------------------------------------------------------
+
+_HOOK_ENTRY_POINTS = {
+    "delete_team_connector",
+    "rename_team_connector",
+    "resolve_one_connector_access_or_raise",
+    "resolve_connector_access_or_raise",
+}
+
+
+def _declared_call_sites() -> dict[str, bool]:
+    """{"module.function": whether the call passes caller_holds_lock=True}.
+
+    Read off the source of both route modules. A call is attributed to the
+    nearest enclosing function definition, and both ``def`` and ``async def``
+    count -- two of the five call sites today sit in coroutines, and a scan
+    that only walks ``ast.FunctionDef`` silently misses them.
+    """
+    import ast
+    import inspect
+
+    found: dict[str, bool] = {}
+    for module_name in ("custom_api", "mcp"):
+        module = __import__(f"xagent.web.api.{module_name}", fromlist=[module_name])
+        tree = ast.parse(inspect.getsource(module))
+        parent: dict[ast.AST, ast.AST] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parent[child] = node
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id not in _HOOK_ENTRY_POINTS:
+                continue
+            enclosing = parent.get(node)
+            while enclosing is not None and not isinstance(
+                enclosing, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                enclosing = parent.get(enclosing)
+            assert enclosing is not None, "hook call outside any function"
+            declared = any(
+                kw.arg == "caller_holds_lock"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            )
+            key = f"{module_name}.{enclosing.name}"
+            assert key not in found, f"two hook calls attributed to {key}"
+            found[key] = declared
+    return found
+
+
+def _table_rows() -> dict[str, bool]:
+    """{"module.function": the declaration the module docstring states}."""
+    import re
+
+    rows: dict[str, bool] = {}
+    pattern = re.compile(r"^\|\s*``([\w.]+)``\s*\|.*\|\s*``(True|False)``\s*\|\s*$")
+    for line in (connector_team_scope.__doc__ or "").splitlines():
+        match = pattern.match(line.strip())
+        if match:
+            rows[match.group(1)] = match.group(2) == "True"
+    return rows
+
+
+def test_the_call_site_table_and_the_call_sites_agree():
+    table = _table_rows()
+    code = _declared_call_sites()
+    assert table, "the call site table in the module docstring did not parse"
+    # Direction one: nothing in the table may claim a declaration the call
+    # site does not make.
+    assert {k: v for k, v in table.items() if k in code} == {
+        k: v for k, v in code.items() if k in table
+    }
+    # Direction two: no hook call site may exist without a row. This is the
+    # half that catches a new lock-holding call site nobody registered --
+    # direction one is blind to it.
+    assert set(code) == set(table)

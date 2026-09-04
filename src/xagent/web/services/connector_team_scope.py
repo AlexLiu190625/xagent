@@ -3,6 +3,92 @@
 Standalone xagent keeps connectors user-owned. A multi-tenant application can
 install these hooks to overlay team visibility without teaching xagent about
 the application's team tables.
+
+Session contract
+----------------
+
+Every hook here is called with the endpoint's own live database session --
+the same object the route is using, mid-request, sometimes with row locks
+already taken. A hook that ends that transaction releases those locks, and
+the route finds out about none of it: it keeps running, writes, and commits
+believing it still holds them. Two concurrent edits of one connector can
+then interleave into a final row neither of them submitted.
+
+A hook must not:
+
+- call ``commit()`` on the session it was handed;
+- call ``rollback()`` on it;
+- call ``close()`` on it;
+- call a helper that conditionally does one of those three. This repository
+  ships one such helper: ``release_db_connection_if_clean``
+  (``models/database.py``), which rolls back and returns the connection when
+  the session has no pending writes -- which is exactly the state a hook is
+  usually called in, so a hook reusing it lands on the rollback branch.
+
+A hook may:
+
+- open a savepoint with ``begin_nested()`` and commit or roll back that
+  savepoint. This is the supported way for a hook to recover from a failure
+  of its own, and it does not end the caller's transaction;
+- raise. The seam restores the session and propagates the failure, and
+  raising is not a contract violation;
+- write on the session and ``flush()`` without ending the transaction. The
+  ``deleted`` and ``renamed`` slots exist so a hook can do exactly this;
+- open a ``Session`` of its own and do whatever it likes on that one.
+
+Call sites and what the caller holds
+------------------------------------
+
+Each row states what the caller's transaction is holding while the hook
+runs, whether the caller had already committed work of its own before
+asking, and whether the call declares ``caller_holds_lock``. A call site
+that declares it is checked; one that does not is not.
+
+| Call site | Caller holds while the hook runs | Committed before asking | ``caller_holds_lock`` |
+| --- | --- | --- | --- |
+| ``custom_api.update_custom_api`` | the ``custom_apis`` definition row, ``FOR UPDATE``, on the payloads that write that row | no | ``True`` |
+| ``custom_api.delete_custom_api`` | the ``custom_apis`` definition row, ``FOR UPDATE`` | no | ``True`` |
+| ``mcp.update_mcp_server`` | the ``mcp_servers`` definition row, ``FOR UPDATE ... KEY SHARE``, on the payloads that write that row | no | ``True`` |
+| ``mcp.teardown_mcp_app_server`` | three row locks: ``public_mcp_apps``, ``mcp_servers``, ``user_mcp_servers`` | no, within this function -- see the note below | ``True`` |
+| ``mcp.delete_mcp_server`` | no row lock, but an open transaction with nothing durable in it yet | no | ``True`` |
+
+``mcp.teardown_mcp_app_server`` is a helper, not a route: it has no route
+decorator and no caller in this repository outside tests. "Nothing committed
+before asking" therefore holds inside its own body only. A future caller that
+commits and then calls it would turn its declaration into a report of failure
+for work that already succeeded, and nothing here would notice -- the check
+that keeps this table honest compares declarations against call sites, not
+against a caller's commit history.
+
+While a hook runs at any of the row-locking call sites above, every
+concurrent request touching that connector is queued behind it. Keep the
+hook's work local to the database: blocking on an external network call there
+holds that queue open for as long as the call takes. xagent has no way to
+check this at run time, so it is stated here rather than enforced.
+
+The remaining slots declare nothing. Every ``visibility`` and
+``team_visibility`` call site is lock-free, and one of the ``team_visibility``
+paths runs on a lazily created session that may not be in a transaction at
+all. ``access`` has no call site in this repository; a caller that adds one
+while holding a lock owes this table a row and owes the call
+``caller_holds_lock=True``. One shape must never declare it: a call site that
+has already committed its own work before asking, because refusing there
+reports a failure for an operation that fully succeeded.
+
+What the check is not
+---------------------
+
+- The count lives in ``session.info``, which a hook can read and overwrite.
+  This detects a hook author who does not know the rule. It is not a barrier
+  against a hook deliberately working around it, and must not be cited as
+  one.
+- A failure of the check itself refuses the request. It is never caught and
+  read as a pass, and the session is restored before the refusal.
+- Restoring the session recovers a hook's uncommitted work only. Work a hook
+  already committed stays committed -- on the rename slot that commit carries
+  the route's own staged field writes with it, so the caller sees a failure
+  over a durable write. That is why ``commit()`` is forbidden outright rather
+  than treated as something the check cleans up after.
 """
 
 from __future__ import annotations
@@ -75,6 +161,8 @@ class ConnectorDeleteDecision:
     blocked_reason: str | None = None
 
 
+# Called with the endpoint's live session; see the session contract in this
+# module's docstring for what a hook may and may not do to it.
 ConnectorDeletedHook = Callable[[Any, int, ConnectorType, int], ConnectorDeleteDecision]
 
 
@@ -101,10 +189,14 @@ class ConnectorAccess:
 
 ConnectorRef = tuple[ConnectorType, int]
 
+# Called with the endpoint's live session; see the session contract in this
+# module's docstring for what a hook may and may not do to it.
 ConnectorAccessHook = Callable[
     [Any, int, "Collection[ConnectorRef]"], "dict[ConnectorRef, ConnectorAccess]"
 ]
 
+# Called with the endpoint's live session; see the session contract in this
+# module's docstring for what a hook may and may not do to it.
 ConnectorVisibilityHook = Callable[[Any, int], dict[str, set[int]]]
 
 
@@ -164,6 +256,9 @@ class TeamConnectorVisibilityHook(Protocol):
     on), for every runner, member or not. Sharing a custom API with a team
     means sharing whatever credential it holds with everyone who can run
     the team's agents.
+
+    Called with the endpoint's live session; see the session contract in
+    this module's docstring for what a hook may and may not do to it.
     """
 
     def __call__(self, db: Any, *, team_id: int) -> dict[str, set[int]]: ...
