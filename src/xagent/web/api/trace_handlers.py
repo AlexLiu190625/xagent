@@ -49,6 +49,7 @@ from ...web.services.task_lease_service import (
 )
 from ...web.services.trace_event_staging import (
     checkpoint_run_partition_filter,
+    failed_checkpoint_row_conditions,
     stage_trace_event_row,
 )
 from ...web.services.trace_message_storage import (
@@ -654,9 +655,6 @@ class DatabaseTraceHandler(BaseTraceHandler):
 
         row_data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
         run_field = row_data.get(TASK_RUN_ID_TRACE_FIELD)
-        partition_matches = (
-            run_field == run_id if run_id is not None else run_field is None
-        )
         if run_id is None and run_field is not None:
             # The caller resolved the read partition to the widened
             # (untagged) partition -- run_id is None -- yet the pointer
@@ -686,18 +684,25 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     "checkpoint now exists"
                 )
             # The fresh probe still finds no tagged row: the mismatch is
-            # not a timing artifact. Fall through to the six-condition
-            # check below, which partition_matches (False here) already
-            # fails, and let it raise CheckpointCorruptError as usual.
-        row_execution_id = checkpoint_execution_id(row_data)
-        if (
-            row.task_id != self.task_id
-            or row.event_type != "system_update_general"
-            or row.build_id is not None
-            or row_data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES
-            or not partition_matches
-            or (row_execution_id and row_execution_id != execution_id)
-        ):
+            # not a timing artifact. Fall through to the shared condition
+            # check below, which will fail CHECKPOINT_ROW_RUN_PARTITION
+            # (the row's run_field disagrees with this widened partition)
+            # and let it raise CheckpointCorruptError as usual.
+        failed = failed_checkpoint_row_conditions(
+            row,
+            row_data,
+            task_id=self.task_id,
+            run_id=run_id,
+            execution_id=execution_id,
+        )
+        if failed:
+            # A row missing only the run-partition field (a pre-existing row
+            # predating that column, not corruption -- see
+            # task_interaction_anchor.py's module docstring) still raises
+            # here, unchanged from this path's behavior before the shared
+            # predicate existed. The write-direction resolver reclassifies
+            # that shape as absence; this read path deliberately does not.
+            # Converging the two is tracked in #2023.
             raise CheckpointCorruptError(
                 f"task {self.task_id}: checkpoint pointer {pointer_id} does "
                 "not match the row it anchors"
