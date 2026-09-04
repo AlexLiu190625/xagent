@@ -14,7 +14,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -22,9 +22,14 @@ from sqlalchemy.pool import StaticPool
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.web.models import Base, MCPServer, Task, User, UserMCPServer
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
+from xagent.web.models.database import (
+    _ROOT_TXN_END_COUNT_KEY,
+    release_db_connection_if_clean,
+)
 from xagent.web.models.task import TaskStatus
 from xagent.web.services import agent_team_scope, connector_team_scope
 from xagent.web.services.connector_runtime import _load_visible_runtime_connectors
+from xagent.web.services.connector_team_scope import ConnectorHookSessionBoundaryError
 from xagent.web.tools.config import WebToolConfig, _load_custom_api_runtime_view_sync
 
 T1 = 101
@@ -1429,3 +1434,488 @@ def test_the_access_wrapper_restores_the_session_when_the_hook_raises(db_session
 
     # The session must be usable again immediately afterward.
     assert db_session.execute(select(1)).scalar() == 1
+
+
+# ---------------------------------------------------------------------------
+# The session boundary check on the hook gate: a hook must not end the
+# caller's own transaction on a call site that asked for the check, and
+# must be left alone entirely on one that did not.
+# ---------------------------------------------------------------------------
+
+
+def _open_transaction(db: Session) -> None:
+    """Put ``db`` in a root transaction without writing anything, so a test
+    controls whether the gate sees "already in a transaction" on entry
+    without that state depending on unrelated setup calls."""
+    db.execute(select(1))
+
+
+def test_a_hook_that_returns_the_connection_is_refused(db_session):
+    """``release_db_connection_if_clean`` (``models/database.py``) rolls
+    back and returns the connection whenever the session has no pending
+    writes -- exactly the state a hook is usually called in, since every
+    call site asks its hook before the route's own ``commit()``. A hook
+    that reuses it ends this session's own transaction just as surely as
+    one that calls ``rollback()`` directly."""
+    server = _create_mcp(db_session, "release-helper-probe")
+    db_session.commit()
+
+    def hook(db, *_a, **_k):
+        assert release_db_connection_if_clean(db) is True
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    with pytest.raises(ConnectorHookSessionBoundaryError):
+        connector_team_scope.delete_team_connector(
+            db_session, 1, "mcp", int(server.id), caller_holds_lock=True
+        )
+
+    refreshed = db_session.get(MCPServer, server.id)
+    assert refreshed is not None
+    assert refreshed.name == "release-helper-probe"
+
+
+@pytest.mark.parametrize(
+    "hook_body",
+    [
+        pytest.param(lambda db: db.rollback(), id="bare-rollback"),
+        pytest.param(
+            lambda db: (db.rollback(), db.execute(text("select 1"))),
+            id="rollback-then-a-text-statement",
+        ),
+        pytest.param(
+            lambda db: (
+                db.rollback(),
+                db.add(User(username="hook-own-write", password_hash="x")),
+                db.flush(),
+            ),
+            id="rollback-then-the-hooks-own-write",
+        ),
+        pytest.param(
+            lambda db: (db.rollback(), db.query(User).all()),
+            id="rollback-then-one-orm-read",
+        ),
+    ],
+)
+def test_every_way_of_ending_the_transaction_is_refused(db_session, hook_body):
+    """Four different ways for a hook to end this session's own root
+    transaction, all refused the same way. The last three rule out
+    inferring the violation from the existing write-flag
+    (``xagent_txn_may_have_written``) or from ``Session.in_transaction()``:
+    a rollback followed by a write or a text statement starts a fresh
+    transaction and can leave either signal looking clean, and a rollback
+    followed by a bare ORM read does the same to ``in_transaction()``."""
+    server = _create_mcp(db_session, "every-way-probe")
+    db_session.commit()
+
+    def hook(db, *_a, **_k):
+        hook_body(db)
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    with pytest.raises(ConnectorHookSessionBoundaryError):
+        connector_team_scope.delete_team_connector(
+            db_session, 1, "mcp", int(server.id), caller_holds_lock=True
+        )
+
+
+def test_a_savepoint_the_hook_commits_is_not_a_violation(db_session):
+    """A savepoint the hook opens and commits is the supported way for a
+    hook to recover from a failure of its own. It does not end the
+    caller's own transaction, so it must not be reported as a violation."""
+    server = _create_mcp(db_session, "savepoint-commit-probe")
+    db_session.commit()
+
+    def hook(db, *_a, **_k):
+        nested = db.begin_nested()
+        db.add(User(username="within-committed-savepoint", password_hash="x"))
+        db.flush()
+        nested.commit()
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    connector_team_scope.delete_team_connector(
+        db_session, 1, "mcp", int(server.id), caller_holds_lock=True
+    )
+    assert db_session.in_transaction()
+
+
+def test_a_savepoint_the_hook_rolls_back_is_not_a_violation(db_session):
+    """The rollback twin of the commit case above: opening and rolling
+    back a savepoint is also a hook recovering from its own failure, not
+    an end to the caller's own transaction."""
+    server = _create_mcp(db_session, "savepoint-rollback-probe")
+    db_session.commit()
+
+    def hook(db, *_a, **_k):
+        nested = db.begin_nested()
+        db.add(User(username="within-rolled-back-savepoint", password_hash="x"))
+        db.flush()
+        nested.rollback()
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    connector_team_scope.delete_team_connector(
+        db_session, 1, "mcp", int(server.id), caller_holds_lock=True
+    )
+    assert db_session.in_transaction()
+
+
+def test_a_hook_that_writes_and_flushes_is_not_a_violation(db_session):
+    """The ``deleted`` and ``renamed`` slots exist so a hook can write on
+    the caller's session and ``flush()`` without ending its transaction --
+    exactly this shape must pass."""
+    server = _create_mcp(db_session, "write-flush-probe")
+    db_session.commit()
+
+    def hook(db, *_a, **_k):
+        db.add(User(username="hook-flush-write", password_hash="x"))
+        db.flush()
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    connector_team_scope.delete_team_connector(
+        db_session, 1, "mcp", int(server.id), caller_holds_lock=True
+    )
+    assert db_session.in_transaction()
+
+
+def test_a_hook_that_raises_is_not_reported_as_a_boundary_violation(db_session):
+    """A hook that raises is not a contract violation -- the seam restores
+    the session and propagates the failure as-is. The restore itself is an
+    unconditional rollback and so moves the count on its own; comparing on
+    that path (rather than only on the success path) would read every
+    ordinary hook failure as a boundary violation instead of what it
+    actually is."""
+    server = _create_mcp(db_session, "raises-probe")
+    db_session.commit()
+    planted = ConnectorRuntimeError("planted_code", "planted failure", status_code=503)
+
+    def hook(db, *_a, **_k):
+        raise planted
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    with pytest.raises(ConnectorRuntimeError) as excinfo:
+        connector_team_scope.delete_team_connector(
+            db_session, 1, "mcp", int(server.id), caller_holds_lock=True
+        )
+    assert excinfo.value is planted
+
+
+def test_an_undeclared_call_site_is_not_checked(db_session):
+    """``caller_holds_lock`` defaults to ``False``. A call site that does
+    not pass it is not checked at all, even when the hook ends the
+    caller's own transaction."""
+    server = _create_mcp(db_session, "undeclared-probe")
+    db_session.commit()
+
+    def hook(db, *_a, **_k):
+        db.rollback()
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    result = connector_team_scope.delete_team_connector(
+        db_session, 1, "mcp", int(server.id)
+    )
+    assert result == connector_team_scope.ConnectorDeleteDecision()
+
+
+def test_a_reused_session_does_not_turn_the_second_undeclared_call_into_a_violation(
+    db_session,
+):
+    """Two undeclared calls on the same session, a loading query in
+    between -- the shape a cached hook-config session takes across two
+    requests. The second call must not become a violation just because
+    the session it was handed happens to already be in a transaction on
+    entry; the decision is per call site, not inferred from session state."""
+    first_server = _create_mcp(db_session, "reused-session-first")
+    second_server = _create_mcp(db_session, "reused-session-second")
+    db_session.commit()
+
+    calls: list[str] = []
+
+    def clean_hook(db, *_a, **_k):
+        calls.append("clean")
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    def ending_hook(db, *_a, **_k):
+        calls.append("ending")
+        db.rollback()
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    connector_team_scope.set_connector_team_hooks(deleted=clean_hook)
+    connector_team_scope.delete_team_connector(
+        db_session, 1, "mcp", int(first_server.id)
+    )
+
+    # A loading query between the two calls, same as the route work a real
+    # request does -- and what leaves the session already in a transaction
+    # by the time the second call is made.
+    db_session.query(MCPServer).filter(MCPServer.id == second_server.id).first()
+
+    connector_team_scope.set_connector_team_hooks(deleted=ending_hook)
+    connector_team_scope.delete_team_connector(
+        db_session, 1, "mcp", int(second_server.id)
+    )
+
+    assert calls == ["clean", "ending"]
+
+
+def test_a_declared_call_site_is_checked(db_session):
+    """The positive twin of the undeclared test above: the same
+    transaction-ending hook, on a call site that does pass
+    ``caller_holds_lock=True``, is refused."""
+    server = _create_mcp(db_session, "declared-probe")
+    db_session.commit()
+
+    def hook(db, *_a, **_k):
+        db.rollback()
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    with pytest.raises(ConnectorHookSessionBoundaryError):
+        connector_team_scope.delete_team_connector(
+            db_session, 1, "mcp", int(server.id), caller_holds_lock=True
+        )
+
+
+def test_a_duck_typed_session_skips_the_check_and_still_calls_the_hook():
+    """A duck-typed object with no ``.info`` cannot report a count at all
+    (``root_transaction_end_count`` returns ``None`` for it -- see
+    ``tests/web/test_release_db_connection.py``), so the gate has nothing
+    to compare and calls the hook exactly as it would with the check off,
+    rather than failing on an object it cannot inspect."""
+
+    class _DuckSession:
+        pass
+
+    duck = _DuckSession()
+    calls: list[object] = []
+
+    def hook(db, *_a, **_k):
+        calls.append(db)
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    result = connector_team_scope.delete_team_connector(
+        duck, 1, "mcp", 1, caller_holds_lock=True
+    )
+    assert calls == [duck]
+    assert result == connector_team_scope.ConnectorDeleteDecision()
+
+
+def test_a_check_that_raises_refuses_after_restoring_the_session(
+    db_session, monkeypatch
+):
+    """A hook that replaces ``.info`` with something that is not a mapping
+    at all makes the post-call read itself raise. That failure must still
+    refuse the request through the ordinary restore-then-reraise path, not
+    skip the restore because the failure came from the check rather than
+    from the hook."""
+    server = _create_mcp(db_session, "corrupt-info-probe")
+    db_session.commit()
+
+    restored: list[object] = []
+    original_restore = connector_team_scope._restore_session_after_hook_failure
+
+    def spy_restore(db):
+        restored.append(db)
+        original_restore(db)
+
+    monkeypatch.setattr(
+        connector_team_scope, "_restore_session_after_hook_failure", spy_restore
+    )
+
+    def hook(db, *_a, **_k):
+        db.info = "not-a-mapping"
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    with pytest.raises(AttributeError):
+        connector_team_scope.delete_team_connector(
+            db_session, 1, "mcp", int(server.id), caller_holds_lock=True
+        )
+    assert len(restored) == 1
+
+
+def test_a_refused_delete_leaves_both_rows_in_place(db_session):
+    """A refused delete must have zero effect on committed state: the
+    definition row and the caller's own ownership link both survive, the
+    same as if the hook had never been called at all."""
+    owner = _create_user(db_session, "delete-refusal-owner")
+    server = _create_mcp(db_session, "refused-delete-probe", owner=owner)
+    db_session.commit()
+
+    def hook(db, *_a, **_k):
+        db.rollback()
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    with pytest.raises(ConnectorHookSessionBoundaryError):
+        connector_team_scope.delete_team_connector(
+            db_session, int(owner.id), "mcp", int(server.id), caller_holds_lock=True
+        )
+
+    assert db_session.get(MCPServer, server.id) is not None
+    assert (
+        db_session.query(UserMCPServer)
+        .filter(UserMCPServer.mcpserver_id == server.id)
+        .first()
+        is not None
+    )
+
+
+def test_a_refusal_does_not_undo_what_the_hook_already_committed(db_session):
+    """Restoring the session recovers a hook's uncommitted work only. A
+    hook that ends the transaction by committing its own write first
+    leaves that write durable -- the refusal that follows cannot and must
+    not undo it. This is stated behavior, not a silent counterexample: it
+    is exactly why the contract forbids ``commit()`` outright rather than
+    treating it as something the check cleans up after."""
+    server = _create_mcp(db_session, "hook-committed-probe")
+    db_session.commit()
+
+    def hook(db, *_a, **_k):
+        db.add(User(username="hook-committed-row", password_hash="x"))
+        db.commit()
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    with pytest.raises(ConnectorHookSessionBoundaryError):
+        connector_team_scope.delete_team_connector(
+            db_session, 1, "mcp", int(server.id), caller_holds_lock=True
+        )
+
+    assert (
+        db_session.query(User).filter(User.username == "hook-committed-row").first()
+        is not None
+    )
+
+
+def test_two_hook_calls_in_one_request_are_compared_one_at_a_time(db_session):
+    """Two declared calls in the same request, the first clean and the
+    second a violation. The count is compared once per call, not against
+    a single value captured once for the whole request -- only the second
+    call is refused."""
+    first_server = _create_mcp(db_session, "two-calls-first")
+    second_server = _create_mcp(db_session, "two-calls-second")
+    db_session.commit()
+
+    def clean_hook(db, *_a, **_k):
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    def ending_hook(db, *_a, **_k):
+        db.rollback()
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=clean_hook)
+    connector_team_scope.delete_team_connector(
+        db_session, 1, "mcp", int(first_server.id), caller_holds_lock=True
+    )
+
+    connector_team_scope.set_connector_team_hooks(deleted=ending_hook)
+    with pytest.raises(ConnectorHookSessionBoundaryError):
+        connector_team_scope.delete_team_connector(
+            db_session, 1, "mcp", int(second_server.id), caller_holds_lock=True
+        )
+
+
+def test_a_non_count_written_after_the_transaction_ended_is_refused(db_session):
+    """A hook that ends the transaction and then leaves a non-count value
+    in the counter key must still be refused for ending the transaction --
+    the read that raises must not be mistaken for "nothing to compare"
+    and skipped."""
+    server = _create_mcp(db_session, "post-end-bad-value-probe")
+    db_session.commit()
+
+    def hook(db, *_a, **_k):
+        db.rollback()
+        db.info[_ROOT_TXN_END_COUNT_KEY] = True
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    with pytest.raises(TypeError):
+        connector_team_scope.delete_team_connector(
+            db_session, 1, "mcp", int(server.id), caller_holds_lock=True
+        )
+
+
+def test_a_non_count_already_in_the_key_refuses_before_the_hook_runs(db_session):
+    """A non-count value already sitting in the counter key before the
+    hook is ever called must refuse the request without calling the hook
+    at all -- there is nothing yet to restore, since the hook never ran."""
+    server = _create_mcp(db_session, "pre-existing-bad-value-probe")
+    db_session.commit()
+
+    calls: list[object] = []
+
+    def hook(db, *_a, **_k):
+        calls.append(db)
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    db_session.info[_ROOT_TXN_END_COUNT_KEY] = "garbage"
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    with pytest.raises(TypeError):
+        connector_team_scope.delete_team_connector(
+            db_session, 1, "mcp", int(server.id), caller_holds_lock=True
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        pytest.param(ValueError("plain hook failure"), id="plain-value-error"),
+        pytest.param(
+            ConnectorHookSessionBoundaryError("hook raised the boundary error itself"),
+            id="the-boundary-error-itself",
+        ),
+    ],
+)
+def test_the_session_is_restored_exactly_once_whatever_the_hook_raised(
+    db_session, monkeypatch, raised
+):
+    """The restore must run exactly once regardless of what the hook
+    raised, including when the hook raises this module's own boundary
+    error directly. Matching on the exception's type instead of tracking
+    whether a restore already ran would restore zero times for that
+    second case."""
+    server = _create_mcp(db_session, "restore-once-probe")
+    db_session.commit()
+
+    restore_calls: list[object] = []
+    original_restore = connector_team_scope._restore_session_after_hook_failure
+
+    def spy_restore(db):
+        restore_calls.append(db)
+        original_restore(db)
+
+    monkeypatch.setattr(
+        connector_team_scope, "_restore_session_after_hook_failure", spy_restore
+    )
+
+    def hook(db, *_a, **_k):
+        raise raised
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    with pytest.raises(type(raised)):
+        connector_team_scope.delete_team_connector(
+            db_session, 1, "mcp", int(server.id), caller_holds_lock=True
+        )
+
+    assert len(restore_calls) == 1
