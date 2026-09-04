@@ -69,7 +69,7 @@ def test_grounding_rule_covers_fact_carrying_tool_arguments() -> None:
     assert "report the gap instead. The same standard applies" in rule
 
 
-def test_grounding_rule_exempts_values_the_model_must_compose() -> None:
+def test_grounding_rule_exempts_the_wording_the_model_composes() -> None:
     """The prohibition must not reach arguments the model is meant to author.
 
     ReAct runs with ``tool_choice="required"``, and the answer it writes is
@@ -140,9 +140,6 @@ def test_grounding_rule_without_tools_omits_tool_argument_clause() -> None:
 
     assert "tool-call arguments that assert facts" not in rule
     assert "never guess one" not in rule
-    assert (
-        "This clause does not reach a default or inferred parameter value" not in rule
-    )
     assert "a default or inferred parameter value" not in rule
     # The compose exemption and the sourcing rule over composed text are
     # unconditional, so the no-tools variant still carries them.
