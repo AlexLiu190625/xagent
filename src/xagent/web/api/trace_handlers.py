@@ -97,6 +97,44 @@ class _AnchorFallback:
     generic_failure: bool = False
 
 
+@dataclass(frozen=True)
+class _ResolvedReadPartition:
+    """What ``_root_checkpoint_read_partition`` decided, and whether that
+    decision widened the read to the untagged partition.
+
+    ``run_id`` is the same value every consumer keyed off of before this
+    wrapper existed -- ``None`` meaning "read the untagged rows", a run id
+    meaning "read this run's tagged rows". A bare ``None`` could not tell
+    apart the two different reasons it can occur (see
+    ``_root_checkpoint_read_partition``'s docstring): a lease-bound reader
+    whose task has no run-tagged checkpoint yet, or a legacy unleased
+    reader's permanent untagged partition. ``widened`` makes that explicit
+    instead of leaving callers to re-infer it from a fetched row's shape.
+
+    ``widened`` is ``True`` for both of those ``None`` cases, not only the
+    lease-bound one: either can be invalidated by a concurrent writer
+    committing this task's first run-tagged checkpoint right after the
+    probe that decided to widen ran, so both need the same post-read
+    freshness check (see ``_raise_if_widening_went_stale``).
+
+    The boundary guard that reads ``widened`` only answers "has this
+    widening decision gone stale" -- it does not say what the *correct*
+    refusal would be once it has (the lease-bound case would resolve to
+    a retryable read; the legacy unleased case, once a tagged run
+    supersedes it, would resolve to a refusal instead, the way
+    ``_root_checkpoint_read_partition``'s other branch already does for a
+    non-widened legacy read). Both collapse to the same retryable
+    ``CheckpointUnavailableError`` here regardless. That is deliberate:
+    the caller's next read re-resolves the partition from scratch and
+    produces whichever error is actually correct by then, so ``widened``
+    can stay a plain boolean instead of carrying a third value just to
+    pick the exact refusal error one retry earlier.
+    """
+
+    run_id: str | None
+    widened: bool
+
+
 def _checkpoint_execution_id_predicate(execution_id: str) -> Any:
     """SQL mirror of ``checkpoint_execution_id()``: root wins, then the flat
     field, then the snapshot's own id -- so legacy rows that only set one of
@@ -202,6 +240,15 @@ class DatabaseTraceHandler(BaseTraceHandler):
         self,
         execution_id: str,
     ) -> Optional[Dict[str, Any]]:
+        """Resolve the read partition, then read through it.
+
+        This is the single boundary every widened read's result crosses
+        before reaching its caller. ``_sync_load_latest_checkpoint_unguarded``
+        below does the actual reading and knows nothing about staleness; this
+        function alone decides whether the partition it read under might
+        already be out of date, and if so, re-verifies the result before
+        returning or raising it -- see ``_raise_if_widening_went_stale``.
+        """
         try:
             db = next(get_db())
         except Exception as exc:
@@ -214,22 +261,10 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 "to read the checkpoint"
             ) from exc
         try:
-            query = db.query(DatabaseTraceEvent).filter(
-                DatabaseTraceEvent.task_id == self.task_id,
-                DatabaseTraceEvent.event_type == "system_update_general",
-                DatabaseTraceEvent.data["checkpoint_type"]
-                .as_string()
-                .in_(sorted(READABLE_CHECKPOINT_TYPES)),
-                # The page size below bounds this predicate's matching set,
-                # not an unfiltered row scan, so a page shorter than it
-                # proves the matching set exhausted (see the scan loop
-                # below), and a zero-row first page is authoritative.
-                _checkpoint_execution_id_predicate(str(execution_id)),
-            )
-            anchored_fallback = _AnchorFallback()
+            partition: _ResolvedReadPartition | None = None
             if self.build_id is None:
                 try:
-                    run_id = self._root_checkpoint_read_partition(db)
+                    partition = self._root_checkpoint_read_partition(db)
                 except CheckpointReadError:
                     # Already a partition verdict (refused, or the task row
                     # is missing); it carries its own classification.
@@ -248,170 +283,263 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         f"task {self.task_id}: could not resolve the "
                         "checkpoint read partition"
                     ) from exc
-                anchored = self._load_pk_anchored_checkpoint(
-                    db, run_id, str(execution_id)
-                )
-                if not isinstance(anchored, _AnchorFallback):
-                    return anchored
-                anchored_fallback = anchored
-                query = query.filter(
-                    DatabaseTraceEvent.build_id.is_(None),
-                    self._checkpoint_run_partition_filter(run_id),
-                )
-            else:
-                query = query.filter(DatabaseTraceEvent.build_id == self.build_id)
 
-            ordered_query = query.order_by(
-                DatabaseTraceEvent.timestamp.desc(),
-                DatabaseTraceEvent.id.desc(),
-            )
-
-            saw_generic_failure = anchored_fallback.generic_failure
-            saw_undecodable_row = anchored_fallback.undecodable
-            saw_any_row = (
-                anchored_fallback.undecodable or anchored_fallback.generic_failure
-            )
-            offset = 0
-            page_count = 0
-            while True:
-                page_count += 1
-                if page_count > CHECKPOINT_SCAN_MAX_PAGES:
-                    # The matching set is not proven exhausted, but scanning
-                    # further is not bounded work anymore -- treat it the
-                    # same as any other read that could not be completed.
-                    register_degradation(
-                        CHECKPOINT_LOAD_UNAVAILABLE,
-                        f"task {self.task_id}: checkpoint scan reached the "
-                        f"{CHECKPOINT_SCAN_MAX_PAGES}-page cap without "
-                        "resolving",
-                    )
-                    raise CheckpointUnavailableError(
-                        f"task {self.task_id}: checkpoint scan exceeded "
-                        f"{CHECKPOINT_SCAN_MAX_PAGES} pages without "
-                        "resolving"
-                    )
-                try:
-                    rows = (
-                        ordered_query.offset(offset)
-                        .limit(CHECKPOINT_ROW_SCAN_LIMIT)
-                        .all()
-                    )
-                except Exception as exc:
-                    register_degradation(
-                        CHECKPOINT_LOAD_UNAVAILABLE,
-                        f"task {self.task_id}: checkpoint query failed",
-                    )
-                    raise CheckpointUnavailableError(
-                        f"task {self.task_id}: checkpoint query failed"
-                    ) from exc
-                # This page succeeded -- whatever the decode loop below
-                # concludes about the rows it found, the read infrastructure
-                # is healthy again.
-                clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
-                if not rows:
-                    break
-                saw_any_row = True
-
-                for row in rows:
-                    data: Dict[str, Any] = (
-                        row.data if isinstance(row.data, dict) else {}
-                    )
-                    try:
-                        data = decode_trace_event_data(
-                            db,
-                            task_id=self.task_id,
-                            data=data,
-                            strict=True,
-                        )
-                    except CheckpointMessageDecodeError as exc:
-                        saw_undecodable_row = True
-                        logger.warning(
-                            "Skipping unreadable checkpoint trace event %s "
-                            "for task %s: %s",
-                            row.event_id,
-                            self.task_id,
-                            exc,
-                        )
-                        continue
-                    except Exception:
-                        # E.g. a transient DB error from the blob prefetch.
-                        # Fall back to an older readable checkpoint instead
-                        # of letting the error abort loading for the whole
-                        # task. Surface the degradation on /health so a
-                        # systemic decode failure is observable instead of
-                        # only a per-row warning log; the signal self-clears
-                        # on the next successful decode.
-                        saw_generic_failure = True
-                        register_degradation(
-                            CHECKPOINT_DECODE_FALLBACK,
-                            f"task {self.task_id}: checkpoint decode failed, "
-                            f"fell back past event {row.event_id}",
-                        )
-                        logger.warning(
-                            "Skipping checkpoint trace event %s for task %s "
-                            "after decode failure",
-                            row.event_id,
-                            self.task_id,
-                            exc_info=True,
-                        )
-                        continue
-                    clear_degradation(CHECKPOINT_DECODE_FALLBACK)
-                    snapshot = data.get("snapshot")
-                    if not isinstance(snapshot, dict):
-                        # The row claims to be a checkpoint but carries no
-                        # payload: a permanent failure for this row, the same
-                        # class as an undecodable one. Per-row failures never
-                        # abort the scan -- an older row may still carry a
-                        # usable checkpoint -- and the verdict for the whole
-                        # matching set is decided once, after exhaustion.
-                        saw_undecodable_row = True
-                        logger.warning(
-                            "Skipping checkpoint trace event %s for task %s: "
-                            "readable checkpoint_type but no snapshot",
-                            row.event_id,
-                            self.task_id,
-                        )
-                        continue
-                    return dict(snapshot)
-
-                if len(rows) < CHECKPOINT_ROW_SCAN_LIMIT:
-                    # A short page proves the matching set is exhausted --
-                    # no further rows exist beyond this one.
-                    break
-                # OFFSET paging over (timestamp DESC, id DESC): a row inserted
-                # mid-scan shifts later pages by one. Root reads are fenced to a
-                # single run partition, which excludes concurrent writers there;
-                # build-scoped histories are append-only per build.
-                offset += CHECKPOINT_ROW_SCAN_LIMIT
-
-            if not saw_any_row:
-                return None
-            # The matching set is exhausted and every candidate row failed.
-            # A generic (transient) failure anywhere in the scan is
-            # conservatively unavailable -- retryable. Only a fully scanned
-            # set that is exclusively permanent decode failures is corrupt.
-            if saw_generic_failure:
-                register_degradation(
-                    CHECKPOINT_LOAD_UNAVAILABLE,
-                    f"task {self.task_id}: checkpoint scan exhausted the "
-                    "matching set with a generic decode failure among the "
-                    "candidate rows",
+            # partition is None exactly when build_id is not None: a
+            # build-scoped read never calls the resolver above and never
+            # widens, so the recheck below is skipped for it too.
+            try:
+                result = self._sync_load_latest_checkpoint_unguarded(
+                    db, execution_id, partition
                 )
-                raise CheckpointUnavailableError(
-                    f"task {self.task_id}: checkpoint read could not be "
-                    "completed for all candidate rows"
-                )
-            if saw_undecodable_row:
-                raise CheckpointCorruptError(
-                    f"task {self.task_id}: all matching checkpoint rows are undecodable"
-                )
-            return None
+            except CheckpointCorruptError:
+                # A corrupt verdict is not exempt from staleness: the row
+                # that failed validation may have failed only because the
+                # widening it was read under has since gone stale (a
+                # concurrent writer tagged the task after the probe that
+                # decided to widen, before this verdict was reached). Ask
+                # the same question the success path asks below before
+                # letting a genuinely corrupt verdict through.
+                if partition is not None and partition.widened:
+                    self._raise_if_widening_went_stale(db)
+                raise
+            if partition is not None and partition.widened:
+                self._raise_if_widening_went_stale(db)
+            return result
         finally:
             db.close()
 
+    def _raise_if_widening_went_stale(self, db: Session) -> None:
+        """Re-probe for a run-tagged checkpoint after a widened read has
+        already produced its result -- a resolved snapshot (from either the
+        pointer or the scan), a scan that found nothing, or a scan's corrupt
+        verdict.
+
+        The widened partition resolved to "read the untagged rows" against a
+        point-in-time snapshot under READ COMMITTED (see
+        ``_root_checkpoint_read_partition``): it describes the task at the
+        moment the probe ran, not a standing fact. If a concurrent writer has
+        since committed this task's first run-tagged checkpoint, that
+        widening decision is now stale, and the result just produced must
+        not be handed back as if it were still current -- surfacing it as a
+        retryable unavailable read instead. There is no retry inside this
+        process: this raises, and it is up to whichever web entry point
+        called into the checkpoint load to turn it into something a later
+        attempt can retry against. Today that entry point either returns an
+        HTTP 503 for the client to retry (the A2A and task-reply reply
+        paths) or restores the task to a paused/waiting-for-user state so a
+        later resume reads a fresh partition (the WebSocket resume and
+        message-injection paths).
+
+        This is the one place every exit of a widened read passes through,
+        rather than each of them (the pointer path's snapshot, the scan's
+        snapshot, the scan's absence, and the scan's corrupt verdict)
+        carrying its own copy of this check.
+
+        No degradation signal is registered when this raises: a concurrent
+        writer racing the read is an expected outcome of widening, not an
+        infrastructure failure. The probe call below still registers
+        ``CHECKPOINT_LOAD_UNAVAILABLE`` itself if it fails for a genuine DB
+        reason -- that translation lives in
+        ``_task_has_run_tagged_checkpoint`` and is unchanged here.
+
+        Only called when the resolved partition widened -- a narrow
+        (run-bound or build-scoped) read never reaches here, so it costs
+        nothing beyond the widened read's existing single probe inside
+        ``_root_checkpoint_read_partition``.
+        """
+        if self._task_has_run_tagged_checkpoint(db):
+            raise CheckpointUnavailableError(
+                f"task {self.task_id}: checkpoint partition was "
+                "widened against a stale snapshot; a run-tagged "
+                "checkpoint now exists"
+            )
+
+    def _sync_load_latest_checkpoint_unguarded(
+        self,
+        db: Session,
+        execution_id: str,
+        partition: "_ResolvedReadPartition | None",
+    ) -> Optional[Dict[str, Any]]:
+        """Read the latest checkpoint given an already-resolved partition.
+
+        ``partition`` is ``None`` for a build-scoped read (``build_id`` is
+        not ``None``) and a ``_ResolvedReadPartition`` for every root read;
+        the caller (``_sync_load_latest_checkpoint``) guarantees the two
+        stay in lockstep. This function has no notion of staleness -- it
+        reads once under the partition it is handed and returns or raises
+        whatever that read produces. Whether the result is trustworthy as-is
+        (a narrow partition) or needs a fresh recheck before being handed
+        back (``partition.widened``) is decided by the caller alone, after
+        this function returns.
+        """
+        query = db.query(DatabaseTraceEvent).filter(
+            DatabaseTraceEvent.task_id == self.task_id,
+            DatabaseTraceEvent.event_type == "system_update_general",
+            DatabaseTraceEvent.data["checkpoint_type"]
+            .as_string()
+            .in_(sorted(READABLE_CHECKPOINT_TYPES)),
+            # The page size below bounds this predicate's matching set,
+            # not an unfiltered row scan, so a page shorter than it
+            # proves the matching set exhausted (see the scan loop
+            # below), and a zero-row first page is authoritative.
+            _checkpoint_execution_id_predicate(str(execution_id)),
+        )
+        anchored_fallback = _AnchorFallback()
+        if partition is not None:
+            run_id = partition.run_id
+            anchored = self._load_pk_anchored_checkpoint(db, run_id, str(execution_id))
+            if not isinstance(anchored, _AnchorFallback):
+                return anchored
+            anchored_fallback = anchored
+            query = query.filter(
+                DatabaseTraceEvent.build_id.is_(None),
+                self._checkpoint_run_partition_filter(run_id),
+            )
+        else:
+            query = query.filter(DatabaseTraceEvent.build_id == self.build_id)
+
+        ordered_query = query.order_by(
+            DatabaseTraceEvent.timestamp.desc(),
+            DatabaseTraceEvent.id.desc(),
+        )
+
+        saw_generic_failure = anchored_fallback.generic_failure
+        saw_undecodable_row = anchored_fallback.undecodable
+        saw_any_row = anchored_fallback.undecodable or anchored_fallback.generic_failure
+        offset = 0
+        page_count = 0
+        while True:
+            page_count += 1
+            if page_count > CHECKPOINT_SCAN_MAX_PAGES:
+                # The matching set is not proven exhausted, but scanning
+                # further is not bounded work anymore -- treat it the
+                # same as any other read that could not be completed.
+                register_degradation(
+                    CHECKPOINT_LOAD_UNAVAILABLE,
+                    f"task {self.task_id}: checkpoint scan reached the "
+                    f"{CHECKPOINT_SCAN_MAX_PAGES}-page cap without "
+                    "resolving",
+                )
+                raise CheckpointUnavailableError(
+                    f"task {self.task_id}: checkpoint scan exceeded "
+                    f"{CHECKPOINT_SCAN_MAX_PAGES} pages without "
+                    "resolving"
+                )
+            try:
+                rows = (
+                    ordered_query.offset(offset).limit(CHECKPOINT_ROW_SCAN_LIMIT).all()
+                )
+            except Exception as exc:
+                register_degradation(
+                    CHECKPOINT_LOAD_UNAVAILABLE,
+                    f"task {self.task_id}: checkpoint query failed",
+                )
+                raise CheckpointUnavailableError(
+                    f"task {self.task_id}: checkpoint query failed"
+                ) from exc
+            # This page succeeded -- whatever the decode loop below
+            # concludes about the rows it found, the read infrastructure
+            # is healthy again.
+            clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+            if not rows:
+                break
+            saw_any_row = True
+
+            for row in rows:
+                data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
+                try:
+                    data = decode_trace_event_data(
+                        db,
+                        task_id=self.task_id,
+                        data=data,
+                        strict=True,
+                    )
+                except CheckpointMessageDecodeError as exc:
+                    saw_undecodable_row = True
+                    logger.warning(
+                        "Skipping unreadable checkpoint trace event %s for task %s: %s",
+                        row.event_id,
+                        self.task_id,
+                        exc,
+                    )
+                    continue
+                except Exception:
+                    # E.g. a transient DB error from the blob prefetch.
+                    # Fall back to an older readable checkpoint instead
+                    # of letting the error abort loading for the whole
+                    # task. Surface the degradation on /health so a
+                    # systemic decode failure is observable instead of
+                    # only a per-row warning log; the signal self-clears
+                    # on the next successful decode.
+                    saw_generic_failure = True
+                    register_degradation(
+                        CHECKPOINT_DECODE_FALLBACK,
+                        f"task {self.task_id}: checkpoint decode failed, "
+                        f"fell back past event {row.event_id}",
+                    )
+                    logger.warning(
+                        "Skipping checkpoint trace event %s for task %s "
+                        "after decode failure",
+                        row.event_id,
+                        self.task_id,
+                        exc_info=True,
+                    )
+                    continue
+                clear_degradation(CHECKPOINT_DECODE_FALLBACK)
+                snapshot = data.get("snapshot")
+                if not isinstance(snapshot, dict):
+                    # The row claims to be a checkpoint but carries no
+                    # payload: a permanent failure for this row, the same
+                    # class as an undecodable one. Per-row failures never
+                    # abort the scan -- an older row may still carry a
+                    # usable checkpoint -- and the verdict for the whole
+                    # matching set is decided once, after exhaustion.
+                    saw_undecodable_row = True
+                    logger.warning(
+                        "Skipping checkpoint trace event %s for task %s: "
+                        "readable checkpoint_type but no snapshot",
+                        row.event_id,
+                        self.task_id,
+                    )
+                    continue
+                return dict(snapshot)
+
+            if len(rows) < CHECKPOINT_ROW_SCAN_LIMIT:
+                # A short page proves the matching set is exhausted --
+                # no further rows exist beyond this one.
+                break
+            # OFFSET paging over (timestamp DESC, id DESC): a row inserted
+            # mid-scan shifts later pages by one. Root reads are fenced to a
+            # single run partition, which excludes concurrent writers there;
+            # build-scoped histories are append-only per build.
+            offset += CHECKPOINT_ROW_SCAN_LIMIT
+
+        if not saw_any_row:
+            return None
+        # The matching set is exhausted and every candidate row failed.
+        # A generic (transient) failure anywhere in the scan is
+        # conservatively unavailable -- retryable. Only a fully scanned
+        # set that is exclusively permanent decode failures is corrupt.
+        if saw_generic_failure:
+            register_degradation(
+                CHECKPOINT_LOAD_UNAVAILABLE,
+                f"task {self.task_id}: checkpoint scan exhausted the "
+                "matching set with a generic decode failure among the "
+                "candidate rows",
+            )
+            raise CheckpointUnavailableError(
+                f"task {self.task_id}: checkpoint read could not be "
+                "completed for all candidate rows"
+            )
+        if saw_undecodable_row:
+            raise CheckpointCorruptError(
+                f"task {self.task_id}: all matching checkpoint rows are undecodable"
+            )
+        return None
+
     def _task_has_run_tagged_checkpoint(self, db: Session) -> bool:
         """Probe whether any readable checkpoint row for this task carries
-        the run-tag field (``_task_run_id`` is not null).
+        the run-tag field (``TASK_RUN_ID_TRACE_FIELD`` is not null).
 
         A DB failure while probing must not collapse into "no tagged row
         found" -- that would silently widen the read partition instead of
@@ -469,7 +597,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
     def _root_checkpoint_read_partition(
         self,
         db: Session,
-    ) -> str | None:
+    ) -> _ResolvedReadPartition:
         """Resolve the run partition this reader may read, or refuse.
 
         Exact executions bound to a lease read the partition tagged with
@@ -494,6 +622,12 @@ class DatabaseTraceHandler(BaseTraceHandler):
         completed and found nothing. A failure to determine any of the
         above (the tag probe raising) is distinct from both: it means the
         partition could not be resolved at all.
+
+        Returns a ``_ResolvedReadPartition`` rather than a bare ``str |
+        None``: the caller (``_sync_load_latest_checkpoint``) needs to know
+        not just which partition to read, but whether that decision widened
+        -- see that dataclass's own docstring for why a bare ``None`` could
+        not carry both meanings ``None`` needs to carry here.
         """
 
         lease = current_task_lease()
@@ -504,7 +638,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     reason="lease_mismatch",
                 )
             if self._task_has_run_tagged_checkpoint(db):
-                return lease.run_id
+                return _ResolvedReadPartition(lease.run_id, widened=False)
             # This task has no run-tagged checkpoint yet -- most likely the
             # bound run was just minted by a resume and the only checkpoint
             # on record predates partitioning. Widen to the legacy partition
@@ -512,17 +646,18 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # The probe's answer is a point-in-time result under READ
             # COMMITTED: it describes the task at the moment the probe ran,
             # not a standing fact. If a concurrent writer commits this run's
-            # first tagged checkpoint right after, the pointer validation in
-            # _load_pk_anchored_checkpoint re-probes on a fresh snapshot and
-            # raises CheckpointUnavailableError (retryable) instead of
-            # misclassifying the now-stale widening as data corruption.
+            # first tagged checkpoint right after, the caller re-probes on a
+            # fresh snapshot once the read finishes (see
+            # ``_raise_if_widening_went_stale``) and raises
+            # ``CheckpointUnavailableError`` (retryable) instead of handing
+            # back a result that is no longer current.
             increment_counter(COUNTER_CHECKPOINT_READ_PARTITION_WIDENED)
             logger.info(
                 "task %s: no run-tagged checkpoint on record; widening the "
                 "checkpoint read partition to the untagged rows",
                 self.task_id,
             )
-            return None
+            return _ResolvedReadPartition(None, widened=True)
 
         task_run = db.query(Task.run_id).filter(Task.id == self.task_id).one_or_none()
         if task_run is None:
@@ -549,7 +684,11 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 "legacy checkpoints",
                 reason="superseded_legacy",
             )
-        return None
+        # This legacy (unleased) partition can go stale exactly like the
+        # lease-bound widening above: a concurrent resume can mint a run and
+        # commit its first tagged checkpoint right after this probe runs, so
+        # it is marked widened too and gets the same post-read recheck.
+        return _ResolvedReadPartition(None, widened=True)
 
     @staticmethod
     def _checkpoint_run_partition_filter(run_id: str | None) -> Any:
@@ -581,14 +720,20 @@ class DatabaseTraceHandler(BaseTraceHandler):
         and a scan that then finds nothing must not report "no checkpoint"
         for a checkpoint that exists and is unreadable.
 
-        One validation mismatch does not raise ``CheckpointCorruptError``.
-        When the caller resolved the widened (untagged) partition and the
-        pointer row nonetheless carries a run tag, a fresh probe decides
-        between the two possible causes: a tagged row found now means the
-        partition was resolved against a snapshot that has since gone
-        stale, which raises ``CheckpointUnavailableError`` so the caller
-        retries; still finding none means the mismatch is real and the
-        usual corrupt classification applies.
+        A row that fails the shared validity conditions -- including a
+        pointer that names a row carrying a run tag while the caller
+        resolved the widened (untagged) partition -- always raises
+        ``CheckpointCorruptError`` here; this function does not itself
+        distinguish a genuine mismatch from one caused by a partition
+        decision that has since gone stale. That distinction is made once,
+        at the read's boundary, not here: the caller
+        (``_sync_load_latest_checkpoint``) re-probes after any widened read
+        produces a result -- including this raise -- and reclassifies it as
+        a retryable ``CheckpointUnavailableError`` if the reprobe finds the
+        partition is now stale (see ``_raise_if_widening_went_stale``).
+        Handling it at the boundary instead of here also covers the legacy
+        scan path's identical exposure to the same race, which this
+        function's own re-probe could not reach.
 
         The execution-identity check here is verification, not the legacy
         scan's filtering: that scan excludes non-matching rows from its
@@ -654,40 +799,6 @@ class DatabaseTraceHandler(BaseTraceHandler):
             return _AnchorFallback()
 
         row_data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
-        run_field = row_data.get(TASK_RUN_ID_TRACE_FIELD)
-        if run_id is None and run_field is not None:
-            # The caller resolved the read partition to the widened
-            # (untagged) partition -- run_id is None -- yet the pointer
-            # names a row that itself carries a run tag. A row and the
-            # task's run-tag flag are written in the same transaction
-            # (stage_trace_event_row), so under one consistent snapshot
-            # this combination cannot occur: a tagged row on record means
-            # the probe that decided to widen would have found it. The
-            # only ways to reach this state are a probe snapshot that is
-            # now stale -- a concurrent writer committed the task's first
-            # tagged checkpoint after the partition was resolved but
-            # before this row was read -- or a genuine data
-            # inconsistency. This branch also fires for the pre-existing
-            # unleased path below (its own run_id is None too), so it
-            # covers that caller's identical window as well, not only the
-            # lease-bound widening this PR adds. Re-probe on a fresh
-            # snapshot to tell the two apart instead of guessing.
-            if self._task_has_run_tagged_checkpoint(db):
-                # The fresh probe now sees a tagged row: the partition
-                # decision was stale, not wrong. Surface it as
-                # unavailable so the caller retries against a partition
-                # resolved fresh, rather than misclassifying a timing
-                # artifact as corruption.
-                raise CheckpointUnavailableError(
-                    f"task {self.task_id}: checkpoint partition was "
-                    "widened against a stale snapshot; a run-tagged "
-                    "checkpoint now exists"
-                )
-            # The fresh probe still finds no tagged row: the mismatch is
-            # not a timing artifact. Fall through to the shared condition
-            # check below, which will fail CHECKPOINT_ROW_RUN_PARTITION
-            # (the row's run_field disagrees with this widened partition)
-            # and let it raise CheckpointCorruptError as usual.
         failed = failed_checkpoint_row_conditions(
             row,
             row_data,

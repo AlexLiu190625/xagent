@@ -186,6 +186,13 @@ COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION = "anchor.absent_missing_run_partiti
 # It is also monotonic (never reset) and process-local (see
 # counters_snapshot()'s own docstring), so it can only be read as a rate
 # over a deploy's lifetime, never inspected for "has it reached zero."
+# It deliberately covers a narrower set than the read path's own
+# ``_ResolvedReadPartition.widened`` flag: that flag is also set for the
+# legacy unleased branch's permanent untagged partition
+# (``trace_handlers.py``'s own docstring for it), which this counter does
+# not increment. The two are not meant to agree -- this counter answers
+# "how often does the lease-bound compatibility widening this PR added
+# engage", not "how often does any read widen".
 COUNTER_CHECKPOINT_READ_PARTITION_WIDENED = "checkpoint.read_partition_widened"
 
 # Two constants below are actively incremented, both from

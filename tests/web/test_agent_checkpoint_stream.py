@@ -2225,7 +2225,7 @@ def test_widened_partition_is_confirmed_before_rejecting_a_row_failing_any_other
     try:
         with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
             assert (
-                DatabaseTraceHandler(task_id)._root_checkpoint_read_partition(db)
+                DatabaseTraceHandler(task_id)._root_checkpoint_read_partition(db).run_id
                 == expected_partition
             )
             with pytest.raises(CheckpointCorruptError):
@@ -2236,39 +2236,210 @@ def test_widened_partition_is_confirmed_before_rejecting_a_row_failing_any_other
         db.close()
 
 
-def test_stale_widened_probe_retries_when_pointer_row_is_tagged(
+@pytest.mark.parametrize(
+    "shape",
+    ["pointer_snapshot", "scan_snapshot", "scan_absence", "scan_corrupt"],
+)
+def test_widened_read_never_returns_without_a_fresh_recheck(
     monkeypatch: pytest.MonkeyPatch,
+    shape: str,
 ) -> None:
-    """A caller can reach ``_load_pk_anchored_checkpoint`` with ``run_id``
-    resolved to ``None`` (widened) while the pointer names a row that
-    itself carries a run tag. A row and the task's run-tag flag are
-    written in the same transaction, so under one consistent snapshot this
-    cannot happen -- the probe that decided to widen would have found the
-    row. Simulate the state directly: the pointer row is already tagged
-    and committed when the anchored load runs with ``run_id=None``, as if
-    the widening decision had been made against an earlier, now-stale
-    snapshot. The fresh re-probe inside the helper sees the committed row
-    and must raise ``CheckpointUnavailableError`` (retryable), not
-    misclassify the timing artifact as ``CheckpointCorruptError``."""
-    SessionLocal, db, task = _create_trace_handler_test_task("stale-widened-probe")
+    """A widened read's result -- whichever of its four raw shapes it takes
+    -- must never reach the caller without first being re-verified against
+    a fresh probe.
+
+    ``shape`` seeds the DB so the widened read, run alone, would naturally
+    produce that raw outcome:
+
+    * ``pointer_snapshot`` -- an untagged legacy row anchored by the
+      pointer; ``_load_pk_anchored_checkpoint`` returns it directly. A
+      pointer naming an *untagged* row is the shape a guard keyed on the
+      pointer row's own tag cannot see at all, which is why the check
+      lives at the boundary instead.
+    * ``scan_snapshot`` -- the same row, but with no pointer set, so the
+      legacy scan finds and returns it.
+    * ``scan_absence`` -- no checkpoint row at all; the scan finds nothing
+      and returns ``None``.
+    * ``scan_corrupt`` -- an untagged row whose ``checkpoint_type`` is
+      readable but which carries no ``snapshot`` payload; the scan
+      exhausts the matching set with only that verdict and raises
+      ``CheckpointCorruptError``.
+
+    After the widened read finishes but before its result reaches the
+    caller, a concurrent writer commits this run's first run-tagged
+    checkpoint -- the same race is reachable through the scan path and
+    through the pointer path alike. Every one of the four shapes must be
+    discarded in favor of ``CheckpointUnavailableError`` once that commit
+    lands -- not handed back as though the widening were still current.
+
+    The injection wraps the real ``_sync_load_latest_checkpoint_unguarded``
+    so the writer's commit lands strictly after the raw read completes and
+    strictly before ``_sync_load_latest_checkpoint``'s own boundary check
+    runs -- it does not shortcut around any production code path to
+    manufacture the race."""
+    SessionLocal, db, task = _create_trace_handler_test_task(f"widened-recheck-{shape}")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
 
-    row = _checkpoint_trace_row(
-        task_id=task_id,
-        event_id="tagged-checkpoint",
-        execution_id="shared-execution",
-        label="tagged",
-        timestamp=datetime.now(timezone.utc),
-        run_id="run-a",
+    if shape in ("pointer_snapshot", "scan_snapshot"):
+        row = _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="legacy-checkpoint",
+            execution_id="shared-execution",
+            label="legacy",
+            timestamp=datetime.now(timezone.utc),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        if shape == "pointer_snapshot":
+            task.last_checkpoint_trace_event_id = row.id
+            db.commit()
+    elif shape == "scan_corrupt":
+        row = DatabaseTraceEvent(
+            task_id=task_id,
+            build_id=None,
+            event_id="payloadless-checkpoint",
+            event_type="system_update_general",
+            timestamp=datetime.now(timezone.utc),
+            data={
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "execution_id": "shared-execution",
+                # No "snapshot" key: a readable checkpoint_type with no
+                # payload, the scan's undecodable-row shape.
+            },
+        )
+        db.add(row)
+        db.commit()
+    # scan_absence: no checkpoint row seeded at all.
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    real_unguarded = DatabaseTraceHandler._sync_load_latest_checkpoint_unguarded
+
+    def commit_first_tagged_checkpoint_after_the_raw_read(
+        self: DatabaseTraceHandler,
+        db: Session,
+        execution_id: str,
+        partition: Any,
+    ) -> Any:
+        # try/finally, not a plain call-then-commit: the raw read can raise
+        # (the scan_corrupt shape does), and the injected commit must still
+        # land before that exception reaches the boundary guard -- the race
+        # this simulates is "the writer commits strictly after the raw read
+        # concludes", not "only when the raw read happens to succeed".
+        try:
+            return real_unguarded(self, db, execution_id, partition)
+        finally:
+            writer = SessionLocal()
+            try:
+                writer.add(
+                    _checkpoint_trace_row(
+                        task_id=task_id,
+                        event_id="run-a-first-checkpoint",
+                        execution_id="shared-execution",
+                        label="new",
+                        timestamp=datetime.now(timezone.utc),
+                        run_id="run-a",
+                    )
+                )
+                writer.commit()
+            finally:
+                writer.close()
+
+    monkeypatch.setattr(
+        DatabaseTraceHandler,
+        "_sync_load_latest_checkpoint_unguarded",
+        commit_first_tagged_checkpoint_after_the_raw_read,
     )
-    db.add(row)
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            with pytest.raises(CheckpointUnavailableError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "shared-execution"
+                )
+    finally:
+        db.close()
+
+
+def test_widened_read_is_not_flagged_stale_when_nothing_concurrent_happens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Counterpart to the parametrized race pin above, proving the recheck
+    is not an unconditional trap: a widened read with no concurrent writer
+    at all -- the ordinary, overwhelmingly common case -- must still return
+    its result normally. Task has no checkpoint row whatsoever, so this
+    also covers the "no checkpoint task" shape without a race."""
+    SessionLocal, db, task = _create_trace_handler_test_task("widened-recheck-no-race")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
     db.commit()
-    db.refresh(row)
-    task.last_checkpoint_trace_event_id = row.id
+    task_id = int(task.id)
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            assert (
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "shared-execution"
+                )
+                is None
+            )
+    finally:
+        db.close()
+
+
+def test_unleased_widened_read_is_guarded_against_a_concurrent_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy unleased branch of ``_root_checkpoint_read_partition``
+    (no lease bound; the task has never had an active run) marks its
+    result ``widened=True`` too, not only the lease-bound compatibility
+    branch -- see ``_ResolvedReadPartition``'s own docstring for why both
+    share the same point-in-time exposure. Without this, an unleased
+    read's result would skip the boundary recheck entirely and could hand
+    back a stale snapshot the same way a lease-bound read could before
+    this fix.
+
+    Two assertions, since either alone is not enough to pin it: (a) the
+    resolver itself reports ``widened is True`` for an unleased read with
+    no run-tagged checkpoint on record; (b) end to end, a concurrent
+    writer committing this task's first run-tagged checkpoint between the
+    raw read and the boundary check must turn an unleased read into
+    ``CheckpointUnavailableError``, not a stale snapshot."""
+    SessionLocal, db, task = _create_trace_handler_test_task("unleased-widened-guard")
+    task_id = int(task.id)
+    assert task.run_id is None
+
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="legacy-checkpoint",
+            execution_id="shared-execution",
+            label="legacy",
+            timestamp=datetime.now(timezone.utc),
+        )
+    )
     db.commit()
 
     def get_test_db() -> Iterator[Session]:
@@ -2279,46 +2450,82 @@ def test_stale_widened_probe_retries_when_pointer_row_is_tagged(
             session.close()
 
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    # (a) the resolver itself, called directly with no lease bound.
+    partition = DatabaseTraceHandler(task_id)._root_checkpoint_read_partition(db)
+    assert partition.run_id is None
+    assert partition.widened is True
+
+    # (b) end to end: a writer commits the concurrent tag strictly after
+    # the raw read completes and strictly before the boundary recheck
+    # runs -- same injection technique as the parametrized race test
+    # above, just without a bound lease.
+    real_unguarded = DatabaseTraceHandler._sync_load_latest_checkpoint_unguarded
+
+    def commit_first_tagged_checkpoint_after_the_raw_read(
+        self: DatabaseTraceHandler,
+        db: Session,
+        execution_id: str,
+        partition: Any,
+    ) -> Any:
+        try:
+            return real_unguarded(self, db, execution_id, partition)
+        finally:
+            writer = SessionLocal()
+            try:
+                writer.add(
+                    _checkpoint_trace_row(
+                        task_id=task_id,
+                        event_id="concurrent-first-checkpoint",
+                        execution_id="shared-execution",
+                        label="new",
+                        timestamp=datetime.now(timezone.utc),
+                        run_id="run-a",
+                    )
+                )
+                writer.commit()
+            finally:
+                writer.close()
+
+    monkeypatch.setattr(
+        DatabaseTraceHandler,
+        "_sync_load_latest_checkpoint_unguarded",
+        commit_first_tagged_checkpoint_after_the_raw_read,
+    )
 
     try:
         with pytest.raises(CheckpointUnavailableError):
-            DatabaseTraceHandler(task_id)._load_pk_anchored_checkpoint(
-                db, None, "shared-execution"
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "shared-execution"
             )
     finally:
         db.close()
 
 
-def test_widened_probe_recheck_still_corrupt_when_no_tagged_row_exists(
+def test_recheck_probe_failure_surfaces_as_unavailable_not_a_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Counterpart to the race pin above. When the fresh re-probe still
-    finds no tagged row -- the database genuinely agrees with the
-    caller's widened resolution -- the mismatch between ``run_id=None``
-    and the pointer row's own run tag is not a timing artifact but a real
-    data inconsistency, and must still raise ``CheckpointCorruptError``
-    rather than being swallowed as retryable-unavailable."""
-    SessionLocal, db, task = _create_trace_handler_test_task(
-        "widened-probe-recheck-corrupt"
-    )
+    """The freshness recheck's own probe can fail for a genuine DB reason,
+    distinct from the initial probe inside
+    ``_root_checkpoint_read_partition`` that decided to widen in the first
+    place. That failure must surface as ``CheckpointUnavailableError``, not
+    be swallowed by the boundary and let the (unverified) widened result
+    through as if it had passed the recheck."""
+    SessionLocal, db, task = _create_trace_handler_test_task("recheck-probe-failure")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
     task.run_id = "run-a"
     db.commit()
     task_id = int(task.id)
-
-    row = _checkpoint_trace_row(
-        task_id=task_id,
-        event_id="tagged-checkpoint",
-        execution_id="shared-execution",
-        label="tagged",
-        timestamp=datetime.now(timezone.utc),
-        run_id="run-a",
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="legacy-checkpoint",
+            execution_id="shared-execution",
+            label="legacy",
+            timestamp=datetime.now(timezone.utc),
+        )
     )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    task.last_checkpoint_trace_event_id = row.id
     db.commit()
 
     def get_test_db() -> Iterator[Session]:
@@ -2329,19 +2536,120 @@ def test_widened_probe_recheck_still_corrupt_when_no_tagged_row_exists(
             session.close()
 
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    real_probe = DatabaseTraceHandler._task_has_run_tagged_checkpoint
+    calls = {"n": 0}
+
+    def probe_ok_once_then_fails(self: DatabaseTraceHandler, db: Session) -> bool:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The initial probe inside _root_checkpoint_read_partition:
+            # let it run for real so the partition genuinely widens.
+            return real_probe(self, db)
+        # The boundary's own recheck probe: fails for a DB reason, exactly
+        # as _task_has_run_tagged_checkpoint's own except arm would raise.
+        raise CheckpointUnavailableError(
+            f"task {self.task_id}: could not determine whether a "
+            "run-tagged checkpoint exists"
+        )
+
     monkeypatch.setattr(
         DatabaseTraceHandler,
         "_task_has_run_tagged_checkpoint",
-        lambda self, db: False,
+        probe_ok_once_then_fails,
     )
 
     try:
-        with pytest.raises(CheckpointCorruptError):
-            DatabaseTraceHandler(task_id)._load_pk_anchored_checkpoint(
-                db, None, "shared-execution"
-            )
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            with pytest.raises(CheckpointUnavailableError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "shared-execution"
+                )
+        assert calls["n"] == 2
     finally:
         db.close()
+
+
+def test_run_bound_read_issues_no_extra_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read that resolves to its own run's narrow partition (the task
+    already has a run-tagged checkpoint, so ``_root_checkpoint_read_partition``
+    never widens) must not pay for the boundary's freshness recheck at all:
+    exactly the one probe call ``_root_checkpoint_read_partition`` itself
+    issues, and no more."""
+    SessionLocal, db, task = _create_trace_handler_test_task("run-bound-no-extra-probe")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="tagged-checkpoint",
+            execution_id="shared-execution",
+            label="tagged",
+            timestamp=datetime.now(timezone.utc),
+            run_id="run-a",
+        )
+    )
+    db.commit()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    real_probe = DatabaseTraceHandler._task_has_run_tagged_checkpoint
+    calls = {"n": 0}
+
+    def counting_probe(self: DatabaseTraceHandler, db: Session) -> bool:
+        calls["n"] += 1
+        return real_probe(self, db)
+
+    monkeypatch.setattr(
+        DatabaseTraceHandler, "_task_has_run_tagged_checkpoint", counting_probe
+    )
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "shared-execution"
+            ) == {"label": "tagged"}
+        assert calls["n"] == 1
+    finally:
+        db.close()
+
+
+def test_checkpoint_read_exit_count_has_not_drifted() -> None:
+    """The boundary guard in ``_sync_load_latest_checkpoint`` covers every
+    exit of ``_sync_load_latest_checkpoint_unguarded`` that can hand back a
+    result read under a partition that might have gone stale -- by wrapping
+    the call once, not by being copied to each exit. That is only true as
+    long as this count matches the function's actual ``return``/``raise``
+    statements: this assertion makes adding a ninth exit (or removing one
+    of the eight) a deliberate act, not a silent gap in what the boundary
+    covers. Counted by AST rather than by hand, per this repo's own rule
+    against unenumerated exit sets."""
+    import ast
+    import inspect
+    import textwrap
+
+    source = inspect.getsource(
+        DatabaseTraceHandler._sync_load_latest_checkpoint_unguarded
+    )
+    tree = ast.parse(textwrap.dedent(source))
+    func = tree.body[0]
+    assert isinstance(func, ast.FunctionDef)
+    exits = [
+        node for node in ast.walk(func) if isinstance(node, (ast.Return, ast.Raise))
+    ]
+    assert len(exits) == 8
 
 
 def test_probe_db_failure_raises_unavailable_and_registers_signal() -> None:
@@ -2498,12 +2806,13 @@ def test_widening_self_extinguishes_after_the_first_tagged_checkpoint(
     try:
         with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
             # Before this run has tagged anything, the partition itself is
-            # widened (None) -- not merely serving stale content that could
+            # widened -- not merely serving stale content that could
             # coincidentally match a narrower partition.
-            assert (
-                DatabaseTraceHandler(task_id)._root_checkpoint_read_partition(db)
-                is None
+            partition = DatabaseTraceHandler(task_id)._root_checkpoint_read_partition(
+                db
             )
+            assert partition.run_id is None
+            assert partition.widened is True
             # Before this run has tagged anything, the widened partition
             # still serves the pre-existing legacy checkpoint.
             assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
@@ -2527,10 +2836,11 @@ def test_widening_self_extinguishes_after_the_first_tagged_checkpoint(
             # The task now has a tagged checkpoint on record: the partition
             # itself narrows back to the run id, not just the content that
             # happens to be read.
-            assert (
-                DatabaseTraceHandler(task_id)._root_checkpoint_read_partition(db)
-                == "run-a"
+            partition = DatabaseTraceHandler(task_id)._root_checkpoint_read_partition(
+                db
             )
+            assert partition.run_id == "run-a"
+            assert partition.widened is False
             # The run now has a tagged checkpoint of its own: the reader is
             # confined back to the run partition and reads that one, not
             # the untagged row that answered the first read.
