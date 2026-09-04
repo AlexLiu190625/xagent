@@ -8,6 +8,7 @@ surrounding tests in this file only exercise MCP.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from decimal import Decimal
@@ -18,6 +19,7 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
+from starlette.requests import Request
 
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.web.models import Base, MCPServer, Task, User, UserMCPServer
@@ -29,7 +31,10 @@ from xagent.web.models.database import (
 from xagent.web.models.task import TaskStatus
 from xagent.web.services import agent_team_scope, connector_team_scope
 from xagent.web.services.connector_runtime import _load_visible_runtime_connectors
-from xagent.web.services.connector_team_scope import ConnectorHookSessionBoundaryError
+from xagent.web.services.connector_team_scope import (
+    ConnectorHookSessionBoundaryError,
+    connector_hook_session_boundary_error_handler,
+)
 from xagent.web.tools.config import WebToolConfig, _load_custom_api_runtime_view_sync
 
 T1 = 101
@@ -1919,3 +1924,70 @@ def test_the_session_is_restored_exactly_once_whatever_the_hook_raised(
         )
 
     assert len(restore_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# The application-level handler for the new error, and the access slot's
+# pass-through arm.
+# ---------------------------------------------------------------------------
+
+
+def _http_request(path: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "DELETE",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "headers": [],
+            "scheme": "http",
+            "server": ("testserver", 80),
+        }
+    )
+
+
+def test_the_boundary_handler_is_registered():
+    from xagent.web.app import app
+
+    assert app.exception_handlers[ConnectorHookSessionBoundaryError] is (
+        connector_hook_session_boundary_error_handler
+    )
+
+
+async def test_the_boundary_handler_answers_500_and_one_detail():
+    """500, not 503: 503 announces a transient outage and invites a retry,
+    which a hook that ends the caller's transaction is not. The body
+    names nothing about the hook -- the operator reads the log line, the
+    caller does not."""
+    response = await connector_hook_session_boundary_error_handler(
+        _http_request("/api/custom-apis/7"),
+        ConnectorHookSessionBoundaryError("hook 'leaky_hook' ended the transaction"),
+    )
+    assert response.status_code == 500
+    body = json.loads(response.body)
+    assert body == {"detail": "Connector team integration is unavailable."}
+    # The hook's name is in the log line, not in what the caller reads.
+    assert b"leaky_hook" not in response.body
+
+
+def test_the_access_slot_lets_the_boundary_error_through_its_wrapper(db_session):
+    """``access`` has no call site in this repository today, so this is
+    constructed directly against the wrapper rather than through a route.
+    The seam's own transient-outage error gets folded into
+    ``ConnectorRuntimeError`` by the surrounding ``except Exception``; this
+    one must not -- a permanent defect in the installing application's
+    code is a different failure than an outage, and folding it in would
+    also give this slot a different answer than every other checked slot
+    for the same failure."""
+
+    def hook(db, user_id, refs):
+        db.rollback()
+        return {}
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(access=hook)
+    with pytest.raises(ConnectorHookSessionBoundaryError):
+        connector_team_scope.resolve_connector_access_or_raise(
+            db_session, 1, [("mcp", 1)], caller_holds_lock=True
+        )
