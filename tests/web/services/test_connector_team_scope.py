@@ -1696,7 +1696,7 @@ def test_a_declared_call_site_is_checked(db_session):
 def test_the_violation_log_line_names_the_slot(db_session, caplog):
     """The violation branch's log line names which of the five slots the
     call belongs to, not only the hook's own name: an operator reading it
-    should not have to guess which call site the offending hook was
+    should not have to guess which slot the offending hook was
     installed on."""
     server = _create_mcp(db_session, "slot-in-log-probe")
     db_session.commit()
@@ -1712,7 +1712,7 @@ def test_the_violation_log_line_names_the_slot(db_session, caplog):
             connector_team_scope.delete_team_connector(
                 db_session, 1, "mcp", int(server.id), caller_holds_lock=True
             )
-    assert "deleted" in caplog.text
+    assert "for the deleted slot" in caplog.text
 
 
 def test_a_duck_typed_session_skips_the_check_and_still_calls_the_hook(caplog):

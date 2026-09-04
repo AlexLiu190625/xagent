@@ -145,6 +145,10 @@ async def connector_hook_session_boundary_error_handler(
 
 ConnectorType = Literal["mcp", "custom_api"]
 
+ConnectorHookSlot = Literal[
+    "visibility", "team_visibility", "access", "deleted", "renamed"
+]
+
 # Called with the endpoint's live session; see the session contract in this
 # module's docstring for what a hook may and may not do to it.
 ConnectorRenamedHook = Callable[[Any, int, ConnectorType, int, str, str], None]
@@ -707,7 +711,7 @@ def _call_connector_hook_gate(
     db: Any,
     hook: "Callable[..., _HookResult]",
     *args: Any,
-    slot: str,
+    slot: ConnectorHookSlot,
     validate: "Callable[[Any], _HookResult] | None" = None,
     session_boundary_checked: bool = False,
     **kwargs: Any,
