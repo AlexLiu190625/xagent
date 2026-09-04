@@ -2204,6 +2204,89 @@ async def test_connect_app_creates_server_and_association_then_starts_dcr_flow(
 
 
 @pytest.mark.asyncio
+async def test_trusted_connect_app_normalizes_resource_owner(db_session, monkeypatch):
+    db, user, _ = db_session
+    _add_remote_oauth_catalog_app(db)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+
+    async def register_client(*_args, **_kwargs):
+        return SimpleNamespace(
+            client_id="dynamic-client-123",
+            token_endpoint_auth_method="none",
+        )
+
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", register_client)
+
+    response = await mcp_api.connect_mcp_oauth_app_for_owner(
+        "remote-notes",
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+        resource_owner_key="  toby:slack:workspace:alice  ",
+        accept="application/json",
+    )
+
+    assert response.status_code == 200
+    flow_state = db.query(MCPOAuthFlowState).one()
+    assert flow_state.resource_owner_key == "toby:slack:workspace:alice"
+
+
+@pytest.mark.asyncio
+async def test_trusted_connect_rejects_default_resource_owner(db_session):
+    db, user, _ = db_session
+
+    with pytest.raises(HTTPException) as exc:
+        await mcp_api.connect_mcp_oauth_app_for_owner(
+            "remote-notes",
+            MCPOAuthConnectRequest(),
+            user,
+            db,
+            resource_owner_key=f"xagent:user:{user.id}",
+        )
+
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_trusted_connect_app_can_roll_back_all_local_state(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    _add_remote_oauth_catalog_app(db)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    async def register_client(*_args, **_kwargs):
+        return SimpleNamespace(
+            client_id="dynamic-client-123",
+            token_endpoint_auth_method="none",
+        )
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", register_client)
+
+    await mcp_api.connect_mcp_oauth_app_for_owner(
+        "remote-notes",
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+        resource_owner_key="toby:slack:workspace:alice",
+        accept="application/json",
+    )
+    db.rollback()
+
+    assert db.query(MCPServer).filter(MCPServer.name == "remote-notes").count() == 0
+    assert db.query(UserMCPServer).filter(UserMCPServer.user_id == user.id).count() == 0
+    assert db.query(MCPOAuthClient).count() == 0
+    assert db.query(MCPOAuthFlowState).count() == 0
+
+
+@pytest.mark.asyncio
 async def test_connect_app_is_idempotent_across_repeated_connects(
     db_session, monkeypatch
 ):
@@ -4322,6 +4405,168 @@ async def test_status_and_delete_are_scoped_to_default_owner(db_session):
 
     status_response = await get_mcp_oauth_status(server.id, user, db)
     assert status_response.grants == []
+
+
+@pytest.mark.asyncio
+async def test_trusted_revoke_removes_only_exact_resource_owner(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(db, server)
+    grants = [
+        MCPOAuthGrant(
+            mcp_server_id=server.id,
+            user_id=user.id,
+            mcp_oauth_client_id=client.id,
+            resource_owner_key=owner,
+            issuer="https://auth.example.com",
+            resource="https://mcp.example.com/mcp",
+            scope="records.read",
+            access_token=encrypt_value(f"{owner}-token"),
+        )
+        for owner in (
+            f"xagent:user:{user.id}",
+            "toby:slack:workspace:alice",
+            "toby:slack:workspace:bob",
+        )
+    ]
+    db.add_all(grants)
+    db.flush()
+    flows = [
+        MCPOAuthFlowState(
+            state=f"pending-{owner.rsplit(':', 1)[-1]}",
+            mcp_server_id=server.id,
+            user_id=user.id,
+            mcp_oauth_client_id=client.id,
+            resource_owner_key=owner,
+            issuer="https://auth.example.com",
+            resource="https://mcp.example.com/mcp",
+            scope="records.read",
+            code_verifier=encrypt_value("verifier"),
+            expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+        )
+        for owner in (
+            "toby:slack:workspace:alice",
+            "toby:slack:workspace:bob",
+        )
+    ]
+    flows[0].consumed_at = mcp_api._utc_now()
+    db.add_all(flows)
+    association = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    association.is_active = False
+    db.commit()
+
+    revocation = await mcp_api.revoke_mcp_oauth_grants_for_owner(
+        server.id,
+        user,
+        db,
+        resource_owner_key="  toby:slack:workspace:alice  ",
+    )
+
+    assert revocation.grant_count == 1
+    db.expire_all()
+    assert [grant.status for grant in grants] == ["active", "revoked", "active"]
+    assert [row.resource_owner_key for row in db.query(MCPOAuthFlowState).all()] == [
+        "toby:slack:workspace:bob"
+    ]
+
+    db.rollback()
+    db.expire_all()
+    assert [grant.status for grant in grants] == ["active", "active", "active"]
+    assert [row.resource_owner_key for row in db.query(MCPOAuthFlowState).all()] == [
+        "toby:slack:workspace:alice",
+        "toby:slack:workspace:bob",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["commit", "rollback"])
+async def test_trusted_revoke_defers_provider_work(db_session, monkeypatch, outcome):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(
+        db,
+        server,
+        metadata_json={"revocation_endpoint": "https://auth.example.com/revoke"},
+    )
+    grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key="toby:slack:workspace:alice",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token=encrypt_value("access-token"),
+        refresh_token=encrypt_value("refresh-token"),
+    )
+    db.add(grant)
+    db.commit()
+    db.refresh(grant)
+    revoked_grants: list[int] = []
+
+    async def record_revoke(snapshot):
+        revoked_grants.append(snapshot.grant_id)
+
+    monkeypatch.setattr(
+        mcp_api, "_revoke_mcp_oauth_grant_snapshot_externally", record_revoke
+    )
+
+    revocation = await mcp_api.revoke_mcp_oauth_grants_for_owner(
+        server.id,
+        user,
+        db,
+        resource_owner_key="toby:slack:workspace:alice",
+    )
+
+    assert revocation.grant_count == 1
+    assert revoked_grants == []
+    if outcome == "commit":
+        db.commit()
+        await revocation.revoke_tokens()
+        assert revoked_grants == [grant.id]
+        return
+
+    db.rollback()
+    assert revoked_grants == []
+    assert db.get(MCPOAuthGrant, grant.id).status == "active"
+
+
+@pytest.mark.asyncio
+async def test_trusted_revoke_rejects_blank_resource_owner(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+
+    with pytest.raises(HTTPException) as exc:
+        await mcp_api.revoke_mcp_oauth_grants_for_owner(
+            server.id,
+            user,
+            db,
+            resource_owner_key=" \t ",
+        )
+
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_trusted_revoke_rejects_default_resource_owner(db_session):
+    db, user, _ = db_session
+
+    with pytest.raises(HTTPException) as exc:
+        await mcp_api.revoke_mcp_oauth_grants_for_owner(
+            1,
+            user,
+            db,
+            resource_owner_key=f"xagent:user:{user.id}",
+        )
+
+    assert exc.value.status_code == 400
 
 
 @pytest.mark.asyncio
