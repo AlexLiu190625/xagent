@@ -30,11 +30,13 @@ from xagent.web.models.database import (
     get_db,
     get_engine,
 )
+from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.task import Task, TaskConnectorRuntimeContext, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.user_channel import UserChannel
+from xagent.web.models.workforce import Workforce
 from xagent.web.services import connector_team_scope
 from xagent.web.services.agent_team_scope import (
     AgentTeamScope,
@@ -1841,5 +1843,414 @@ def test_read_endpoints_reject_anonymous_and_widget_credentials(
 
 
 # ---------------------------------------------------------------------------
-# A3: connector_runtime_requirements on the task-create response.
+# The connector_runtime_requirements field on the task-create response.
+# ---------------------------------------------------------------------------
+
+
+def test_create_task_reports_missing_context_requirement(e2e_db: None) -> None:
+    """An agent with an unmet required ``context`` key reports it on the
+    create response without writing anything, and the task starts PENDING.
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="a3-context-server",
+            context_schema={"auth_token": {"type": "string", "required": True}},
+        )
+        agent = _create_agent(
+            db, user, name="Context Requirement Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "a3 context task", "description": "d", "agent_id": agent_id},
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    requirements = payload["connector_runtime_requirements"]
+    assert requirements["satisfied"] is False
+    keys = {
+        item["key"]
+        for connector in requirements["connectors"]
+        for item in connector["inputs"]
+    }
+    assert "auth_token" in keys
+    task_id = int(payload["task_id"])
+    assert _context_row_count(task_id) == 0
+    assert _task(task_id).status == TaskStatus.PENDING
+
+
+def test_create_task_reports_missing_secret_requirement_without_reading_any_column(
+    e2e_db: None,
+) -> None:
+    """A required ``secrets`` key makes the top-level ``satisfied`` false
+    purely from the phase-2 constant, with no secret store or column read
+    anywhere in this phase.
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = MCPServer(
+            name="a3-secret-server",
+            description="a3-secret-server description",
+            managed="external",
+            transport="streamable_http",
+            url="https://example.com/mcp",
+            runtime_input_schema={
+                "secrets": {"authorization": {"type": "string", "required": True}}
+            },
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "secrets", "key": "authorization"},
+                    "target": {
+                        "target_type": "transport_headers",
+                        "key": "Authorization",
+                    },
+                }
+            ],
+        )
+        db.add(server)
+        db.flush()
+        db.add(
+            UserMCPServer(
+                user_id=user.id,
+                mcpserver_id=server.id,
+                is_owner=True,
+                can_edit=True,
+                can_delete=True,
+                is_active=True,
+            )
+        )
+        agent = _create_agent(
+            db, user, name="Secret Requirement Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "a3 secret task", "description": "d", "agent_id": agent_id},
+    )
+    assert response.status_code == 200, response.text
+    requirements = response.json()["connector_runtime_requirements"]
+    assert requirements["satisfied"] is False
+    secret_input = next(
+        item
+        for connector in requirements["connectors"]
+        for item in connector["inputs"]
+        if item["section"] == "secrets"
+    )
+    assert secret_input["satisfied"] is False
+    assert requirements["secrets_expires_at"] is None
+
+
+def test_create_task_reports_empty_requirements_when_nothing_is_declared(
+    e2e_db: None,
+) -> None:
+    """On the logged-in web chat create path, the field always appears, and
+    with no declared connectors it is the empty, always-satisfied report --
+    never absent, never ``null`` (``null`` is reserved for the public/share
+    paths, which never evaluate this at all; see the public-path tests
+    below).
+    """
+    headers = _setup_admin_headers()
+    response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "a3 empty task", "description": "d"},
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert "connector_runtime_requirements" in payload
+    assert payload["connector_runtime_requirements"] == {
+        "satisfied": True,
+        "secrets_expires_at": None,
+        "connectors": [],
+    }
+
+
+def _create_workforce_with_deployment(
+    db: Session,
+    user: User,
+    *,
+    name: str,
+    widget_enabled: bool = False,
+    share_enabled: bool = False,
+) -> tuple[Workforce, Deployment]:
+    """A minimal published workforce with a deployment row, for the two
+    workforce-backed public create paths (widget and share). The workforce's
+    own manager agent is a bystander here -- only its FK needs to resolve --
+    so it is created with no runtime declarations of its own."""
+    manager = _create_agent(db, user, name=f"{name} Manager", tool_categories=[])
+    workforce = Workforce(
+        owner_user_id=user.id,
+        scope_type="user",
+        scope_id=str(user.id),
+        name=name,
+        manager_agent_id=manager.id,
+        status="active",
+    )
+    db.add(workforce)
+    db.flush()
+    deployment = Deployment(
+        owner_type=DeploymentOwnerType.WORKFORCE.value,
+        owner_id=workforce.id,
+        widget_enabled=widget_enabled,
+        widget_key=f"wfwk-{secrets.token_urlsafe(24)}" if widget_enabled else None,
+        share_enabled=share_enabled,
+        share_token=f"wfst-{secrets.token_urlsafe(24)}" if share_enabled else None,
+    )
+    db.add(deployment)
+    db.flush()
+    return workforce, deployment
+
+
+@pytest.mark.parametrize(
+    "producer",
+    ["widget_agent", "workforce_widget", "share_agent", "workforce_share"],
+)
+def test_public_create_paths_all_report_null_requirements(
+    e2e_db: None, monkeypatch: pytest.MonkeyPatch, producer: str
+) -> None:
+    """Every ``TaskCreateResponse`` producer in ``public_chat_access.py``
+    that serves an anonymous widget or share guest sets
+    ``connector_runtime_requirements`` to ``None``, never a real report: the
+    widget-agent, workforce-widget, share-agent and workforce-share paths
+    are four separate call sites with four separate explicit ``None``
+    literals, all guarding the same decision that a guest never sees a
+    connector's declared key names.
+
+    The two workforce producers are reached through the real auth and route
+    layers; only ``create_workforce_run`` -- the heavy collaborator that
+    snapshots agent config and starts the first turn -- is stubbed to return
+    an already-created task, which is all a response-shape assertion needs.
+    """
+    is_widget = producer in ("widget_agent", "workforce_widget")
+    is_workforce = producer in ("workforce_widget", "workforce_share")
+
+    _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        if not is_workforce:
+            owner_agent = _create_agent(
+                db,
+                user,
+                name=f"Null {producer} Agent",
+                tool_categories=["mcp"],
+                widget_enabled=is_widget,
+                share_enabled=not is_widget,
+                share_token=(
+                    None if is_widget else f"null-share-{secrets.token_urlsafe(16)}"
+                ),
+            )
+            db.commit()
+            db.refresh(owner_agent)
+            credential = (
+                owner_agent.widget_key if is_widget else owner_agent.share_token
+            )
+        else:
+            _workforce, deployment = _create_workforce_with_deployment(
+                db,
+                user,
+                name=f"Null {producer} Workforce",
+                widget_enabled=is_widget,
+                share_enabled=not is_widget,
+            )
+            db.commit()
+            db.refresh(deployment)
+            credential = deployment.widget_key if is_widget else deployment.share_token
+
+            stub_task = Task(
+                user_id=user.id,
+                title="stub workforce task",
+                status=TaskStatus.PENDING,
+                source="widget" if is_widget else "shared_link",
+            )
+            db.add(stub_task)
+            db.commit()
+            db.refresh(stub_task)
+
+            from xagent.web.api import public_chat_access as public_chat_access_module
+
+            async def _fake_create_workforce_run(*_args: Any, **_kwargs: Any) -> Any:
+                return SimpleNamespace(task=stub_task)
+
+            monkeypatch.setattr(
+                public_chat_access_module,
+                "create_workforce_run",
+                _fake_create_workforce_run,
+            )
+    finally:
+        db.close()
+
+    if is_widget:
+        auth_response = client.post(
+            "/api/widget/auth",
+            json={"guest_id": f"null-{producer}-guest", "widget_key": credential},
+        )
+        assert auth_response.status_code == 200, auth_response.text
+        guest_token = auth_response.json()["access_token"]
+        create_response = client.post(
+            "/api/widget/chat/task/create",
+            headers={"Authorization": f"Bearer {guest_token}"},
+            json={"title": f"null {producer} task", "description": "d"},
+        )
+    else:
+        auth_response = client.post("/api/share/auth", json={"share_token": credential})
+        assert auth_response.status_code == 200, auth_response.text
+        guest_token = auth_response.json()["access_token"]
+        create_response = client.post(
+            "/api/share/chat/task/create",
+            headers={"Authorization": f"Bearer {guest_token}"},
+            json={"title": f"null {producer} task", "description": "d"},
+        )
+
+    assert create_response.status_code == 200, create_response.text
+    payload = create_response.json()
+    assert "connector_runtime_requirements" in payload
+    assert payload["connector_runtime_requirements"] is None
+
+
+def test_create_task_calls_connector_resolution_exactly_once(
+    e2e_db: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The create response's requirements report costs no extra query --
+    ``resolve_agent_selected_connectors`` is called exactly once per task
+    creation, not once for the snapshot and again for the report.
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="a3-call-count-server",
+            context_schema={"auth_token": {"type": "string", "required": False}},
+        )
+        agent = _create_agent(
+            db, user, name="Call Count Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+
+    from xagent.web.services import connector_runtime as connector_runtime_service
+
+    original = connector_runtime_service.resolve_agent_selected_connectors
+    calls: list[int] = []
+
+    def _counting_resolver(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        connector_runtime_service,
+        "resolve_agent_selected_connectors",
+        _counting_resolver,
+    )
+
+    response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={
+            "title": "a3 call count task",
+            "description": "d",
+            "agent_id": agent_id,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert len(calls) == 1
+
+
+def test_create_task_persists_same_selected_refs_as_legacy_snapshot(
+    e2e_db: None,
+) -> None:
+    """The persisted ``Task.connector_runtime_selected_refs`` column -- which
+    the per-turn gate, the values endpoint's selection check, and
+    ``load_connector_runtime_view`` all read -- is unchanged in content and
+    order by task creation's switch to ``resolve_agent_runtime_requirements``.
+    Compared against the legacy ``prepare_connector_runtime_selection_snapshot``
+    (the column's pre-existing source of truth) on the same agent, with
+    list equality (not set equality) so a reordering would fail this too.
+    """
+    from xagent.web.services.connector_runtime import (
+        prepare_connector_runtime_selection_snapshot,
+    )
+
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        declared_one = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="a3-refs-declared-1",
+            context_schema={"account_id": {"type": "string", "required": False}},
+        )
+        declared_two = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="a3-refs-declared-2",
+            context_schema={"account_id": {"type": "string", "required": False}},
+        )
+        undeclared = _create_mcp_server(
+            db, user, name="a3-refs-undeclared", with_runtime_declaration=False
+        )
+        agent = _create_agent(
+            db, user, name="Refs Order Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        db.refresh(declared_one)
+        db.refresh(declared_two)
+        db.refresh(undeclared)
+        agent_id = int(agent.id)
+        agent_row = db.query(Agent).filter(Agent.id == agent_id).one()
+        expected_refs = list(
+            prepare_connector_runtime_selection_snapshot(
+                db=db, agent=agent_row, connector_user_id=int(user.id)
+            )
+        )
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={
+            "title": "a3 refs order task",
+            "description": "d",
+            "agent_id": agent_id,
+        },
+    )
+    assert response.status_code == 200, response.text
+    task_id = int(response.json()["task_id"])
+    persisted_refs = _task(task_id).connector_runtime_selected_refs
+    expected_wire = [ref.to_wire() for ref in expected_refs]
+    assert persisted_refs == expected_wire
+
+
+# ---------------------------------------------------------------------------
+# A4: POST /task/{task_id}/connector-runtime-values.
 # ---------------------------------------------------------------------------

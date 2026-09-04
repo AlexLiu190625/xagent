@@ -91,7 +91,6 @@ from ..services.chat_history_service import (
 from ..services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
     build_task_runtime_requirements,
-    prepare_connector_runtime_selection_snapshot,
     resolve_agent_runtime_requirements,
 )
 from ..services.db_runtime import (
@@ -4491,10 +4490,12 @@ async def create_task(
             agent_id=request.agent_id,  # Set agent_id if provided
             is_visible=False if request.is_preview else request.is_visible,
         )
-        selected_refs = prepare_connector_runtime_selection_snapshot(
-            db=db,
-            agent=selected_agent,
-            connector_user_id=int(user.id),
+        selected_refs, connector_runtime_requirements = (
+            resolve_agent_runtime_requirements(
+                db=db,
+                agent=selected_agent,
+                connector_user_id=int(user.id),
+            )
         )
         bind_connector_runtime_selection_snapshot(
             task=task, selected_refs=selected_refs
@@ -4671,6 +4672,7 @@ async def create_task(
             runtime_extensions=runtime_extensions,
             runtime_extensions_status=runtime_extensions_status,
             runtime_extensions_omitted=runtime_extensions_omitted,
+            connector_runtime_requirements=connector_runtime_requirements,
         )
 
     except HTTPException:
@@ -4697,7 +4699,7 @@ async def create_task(
         #
         # The asymmetry with the ConnectorRuntimeError arm above is real
         # and deliberate: that arm has a live producer inside this endpoint
-        # (``prepare_connector_runtime_selection_snapshot``), this one has
+        # (``resolve_agent_runtime_requirements``), this one has
         # none. It is kept because what the two arms share is the
         # failure-path contract, not the producer: both errors carry their
         # own status and a caller-safe message, and the blanket handler

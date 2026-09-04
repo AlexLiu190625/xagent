@@ -1036,6 +1036,10 @@ async def _create_workforce_widget_chat_task(
         else None,
         channel_id=task.channel_id,
         channel_name=task.channel_name,
+        # This path never resolves connector-runtime requirements for
+        # its caller: the widget/share guest never sees connector key
+        # names.
+        connector_runtime_requirements=None,
     )
 
 
@@ -1140,6 +1144,10 @@ async def create_public_chat_task(
         else None,
         channel_id=task.channel_id,
         channel_name=task.channel_name,
+        # This path never resolves connector-runtime requirements for
+        # its caller: the widget/share guest never sees connector key
+        # names.
+        connector_runtime_requirements=None,
     )
 
 
@@ -1209,6 +1217,10 @@ async def _create_workforce_share_chat_task(
         else None,
         channel_id=task.channel_id,
         channel_name=task.channel_name,
+        # This path never resolves connector-runtime requirements for
+        # its caller: the widget/share guest never sees connector key
+        # names.
+        connector_runtime_requirements=None,
     )
 
 
@@ -1297,6 +1309,10 @@ async def create_share_chat_task(
         else None,
         channel_id=task.channel_id,
         channel_name=task.channel_name,
+        # This path never resolves connector-runtime requirements for
+        # its caller: the widget/share guest never sees connector key
+        # names.
+        connector_runtime_requirements=None,
     )
 
 
