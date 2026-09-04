@@ -959,7 +959,7 @@ def test_pk_anchor_missing_run_partition_then_ambiguous_legacy_id_is_indetermina
     readable checkpoint -- but the repetition is unbounded, which is why the
     degradation signal asserted below has to fire. Whether an INDETERMINATE
     candidate should reach a terminal state after a bounded number of sweeps
-    is tracked upstream, not decided here.
+    is #2118, not decided here.
 
     Both conditions are needed to reach this path. Either alone is already
     covered: test_pk_anchor_missing_run_partition_defers_to_the_legacy_scan
