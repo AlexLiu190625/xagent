@@ -1568,6 +1568,71 @@ def test_database_trace_handler_load_pk_anchor_single_fault_raises_corrupt(
         db.close()
 
 
+def test_database_trace_handler_load_pk_anchor_absent_run_field_still_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pointer row missing the run-partition field entirely -- the shape
+    the 20260804 backfill produces from a trace_events row written before
+    that field existed -- is a pre-existing row, not a corrupt one by the
+    write-direction resolver's judgment (task_interaction_anchor.py). This
+    read path deliberately does not adopt that verdict: it still raises
+    CheckpointCorruptError for the same row shape, unchanged from its
+    behavior before the shared predicate existed. That divergence between
+    the two by-primary-key consumers of failed_checkpoint_row_conditions is
+    intentional -- see task_interaction_anchor.py's module docstring and
+    #2023, which tracks converging them. This cell pins the read side of
+    that divergence; test_task_interaction_anchor.py's counterpart pins the
+    write side. Pairs with the "run_partition" case of
+    test_database_trace_handler_load_pk_anchor_single_fault_raises_corrupt,
+    which covers the opposite: a run-partition field that is present and
+    wrong.
+    """
+    SessionLocal, db, task = _create_trace_handler_test_task(
+        "pk-anchor-absent-run-field"
+    )
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+
+    row = DatabaseTraceEvent(
+        task_id=task_id,
+        build_id=None,
+        event_id="pk-anchor-absent-run-field",
+        event_type="system_update_general",
+        timestamp=datetime.now(timezone.utc),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "execution_id": "shared-execution",
+            "snapshot": {"label": "absent-run-field"},
+        },
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    task.last_checkpoint_trace_event_id = row.id
+    db.commit()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            with pytest.raises(CheckpointCorruptError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "shared-execution"
+                )
+    finally:
+        db.close()
+
+
 def test_database_trace_handler_load_pk_anchor_without_execution_identity_loads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
