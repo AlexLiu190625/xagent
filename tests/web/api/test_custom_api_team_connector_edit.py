@@ -74,11 +74,11 @@ def _make_owned_api(db, owner_id: int, *, name: str = "shared-api") -> CustomApi
     return api
 
 
-async def _get(api_id, current_user, db):
+def _get(api_id, current_user, db):
     return get_custom_api(api_id, current_user=current_user, db=db)
 
 
-async def _put(api_id, payload, current_user, db):
+def _put(api_id, payload, current_user, db):
     return update_custom_api(api_id, payload, current_user=current_user, db=db)
 
 
@@ -108,10 +108,7 @@ def _sequenced_access_hook(*answers):
 
 
 class TestGateHelperOnGetAndPut:
-    @pytest.mark.asyncio
-    async def test_get_404s_for_an_unrelated_user_with_no_link_and_no_team_access(
-        self, db
-    ):
+    def test_get_404s_for_an_unrelated_user_with_no_link_and_no_team_access(self, db):
         owner = _make_user(db, 1)
         stranger = _make_user(db, 2)
         api = _make_owned_api(db, owner.id)
@@ -119,13 +116,10 @@ class TestGateHelperOnGetAndPut:
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=lambda db, user_id, refs: {})
             with pytest.raises(HTTPException) as exc:
-                await _get(api.id, stranger, db)
+                _get(api.id, stranger, db)
         assert exc.value.status_code == 404
 
-    @pytest.mark.asyncio
-    async def test_get_returns_the_stand_in_for_a_team_member_with_no_personal_row(
-        self, db
-    ):
+    def test_get_returns_the_stand_in_for_a_team_member_with_no_personal_row(self, db):
         owner = _make_user(db, 1)
         member = _make_user(db, 2)
         api = _make_owned_api(db, owner.id)
@@ -136,27 +130,25 @@ class TestGateHelperOnGetAndPut:
                     ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
                 }
             )
-            response = await _get(api.id, member, db)
+            response = _get(api.id, member, db)
 
         assert response.id == api.id
         assert response.user_id == member.id
 
-    @pytest.mark.asyncio
-    async def test_get_owner_behaviour_is_unchanged_with_no_hook_installed(self, db):
+    def test_get_owner_behaviour_is_unchanged_with_no_hook_installed(self, db):
         owner = _make_user(db, 1)
         api = _make_owned_api(db, owner.id)
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks()
-            response = await _get(api.id, owner, db)
+            response = _get(api.id, owner, db)
 
         assert response.id == api.id
         assert response.user_id == owner.id
 
 
 class TestPutWiringForATeamEditor:
-    @pytest.mark.asyncio
-    async def test_team_editor_edit_is_durable_and_creates_no_association_row(self, db):
+    def test_team_editor_edit_is_durable_and_creates_no_association_row(self, db):
         owner = _make_user(db, 1)
         editor = _make_user(db, 2)
         api = _make_owned_api(db, owner.id)
@@ -168,7 +160,7 @@ class TestPutWiringForATeamEditor:
                     ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
                 }
             )
-            response = await _put(
+            response = _put(
                 api_id,
                 CustomApiUpdate(description="edited by the team"),
                 editor,
@@ -191,10 +183,7 @@ class TestPutWiringForATeamEditor:
             is None
         )
 
-    @pytest.mark.asyncio
-    async def test_a_member_with_a_personal_row_edits_the_shared_config_durably(
-        self, db
-    ):
+    def test_a_member_with_a_personal_row_edits_the_shared_config_durably(self, db):
         """A caller whose own personal row does not grant edit, widened by a
         granting team verdict. ``can_edit=False`` on the personal row is the
         point -- it is what keeps ``_resolve_custom_api_for_request``'s
@@ -221,7 +210,7 @@ class TestPutWiringForATeamEditor:
                     ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
                 }
             )
-            response = await _put(
+            response = _put(
                 api_id,
                 CustomApiUpdate(description="widened-by-the-team"),
                 member,
@@ -243,8 +232,7 @@ class TestPutWiringForATeamEditor:
             == 1
         )
 
-    @pytest.mark.asyncio
-    async def test_view_only_team_member_cannot_tamper_the_shared_config(self, db):
+    def test_view_only_team_member_cannot_tamper_the_shared_config(self, db):
         owner = _make_user(db, 1)
         member = _make_user(db, 2)
         api = _make_owned_api(db, owner.id)
@@ -257,7 +245,7 @@ class TestPutWiringForATeamEditor:
                 }
             )
             with pytest.raises(HTTPException) as exc:
-                await _put(
+                _put(
                     api.id,
                     CustomApiUpdate(description="should not land"),
                     member,
@@ -266,8 +254,7 @@ class TestPutWiringForATeamEditor:
         assert exc.value.status_code == 403
 
 
-@pytest.mark.asyncio
-async def test_a_denying_verdict_stand_in_is_403_on_an_empty_payload_too(db):
+def test_a_denying_verdict_stand_in_is_403_on_an_empty_payload_too(db):
     """The route's edit gate has no payload-shape carve-out: it requires the
     edit right for every payload, including one that sets no field at all, so
     a caller with no personal row whose team verdict denies edit is refused
@@ -292,7 +279,7 @@ async def test_a_denying_verdict_stand_in_is_403_on_an_empty_payload_too(db):
             }
         )
         with pytest.raises(HTTPException) as exc:
-            await _put(api_id, CustomApiUpdate(), member, db)
+            _put(api_id, CustomApiUpdate(), member, db)
     assert exc.value.status_code == 403
 
     db.rollback()
@@ -305,8 +292,7 @@ async def test_a_denying_verdict_stand_in_is_403_on_an_empty_payload_too(db):
 
 
 class TestIsActiveRejectionForAStandIn:
-    @pytest.mark.asyncio
-    async def test_is_active_from_a_caller_with_no_personal_row_is_400_not_a_silent_drop(
+    def test_is_active_from_a_caller_with_no_personal_row_is_400_not_a_silent_drop(
         self, db
     ):
         owner = _make_user(db, 1)
@@ -321,7 +307,7 @@ class TestIsActiveRejectionForAStandIn:
                 }
             )
             with pytest.raises(HTTPException) as exc:
-                await _put(
+                _put(
                     api_id,
                     CustomApiUpdate(is_active=False),
                     editor,
@@ -357,8 +343,7 @@ class TestTypedErrorArm:
     an owner's row; that population is pinned separately, below, in
     ``TestOwnerIsImmuneToAHookFailure``."""
 
-    @pytest.mark.asyncio
-    async def test_get_surfaces_a_raising_hooks_declared_status(self, db):
+    def test_get_surfaces_a_raising_hooks_declared_status(self, db):
         owner = _make_user(db, 1)
         member = _make_user(db, 2)
         api = _make_owned_api(db, owner.id)
@@ -369,12 +354,11 @@ class TestTypedErrorArm:
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=boom)
             with pytest.raises(HTTPException) as exc:
-                await _get(api.id, member, db)
+                _get(api.id, member, db)
 
         assert exc.value.status_code == 503
 
-    @pytest.mark.asyncio
-    async def test_put_surfaces_a_raising_hooks_declared_status_and_leaves_the_row_unchanged(
+    def test_put_surfaces_a_raising_hooks_declared_status_and_leaves_the_row_unchanged(
         self, db
     ):
         owner = _make_user(db, 1)
@@ -388,7 +372,7 @@ class TestTypedErrorArm:
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=boom)
             with pytest.raises(HTTPException) as exc:
-                await _put(
+                _put(
                     api_id,
                     CustomApiUpdate(name="should-not-land"),
                     member,
@@ -401,8 +385,7 @@ class TestTypedErrorArm:
         refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
         assert refreshed.name == "pristine"
 
-    @pytest.mark.asyncio
-    async def test_put_passes_through_a_planted_connector_runtime_error_by_its_own_status(
+    def test_put_passes_through_a_planted_connector_runtime_error_by_its_own_status(
         self, db
     ):
         owner = _make_user(db, 1)
@@ -415,7 +398,7 @@ class TestTypedErrorArm:
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=boom)
             with pytest.raises(HTTPException) as exc:
-                await _put(
+                _put(
                     api.id,
                     CustomApiUpdate(description="irrelevant"),
                     member,
@@ -425,10 +408,7 @@ class TestTypedErrorArm:
         assert exc.value.status_code == 409
         assert exc.value.detail == "planted failure"
 
-    @pytest.mark.asyncio
-    async def test_a_raising_rename_hook_surfaces_its_declared_status_not_a_500(
-        self, db
-    ):
+    def test_a_raising_rename_hook_surfaces_its_declared_status_not_a_500(self, db):
         """The rename hook runs after the definition row has already been
         rewritten in the session. Its typed failure must reach the client as
         the status the seam declares, not as a generic 500, and the staged
@@ -471,8 +451,7 @@ class TestOwnerIsImmuneToAHookFailure:
     return their normal success status, unaffected by whatever the hook
     would have done."""
 
-    @pytest.mark.asyncio
-    async def test_get_and_put_succeed_for_an_owner_even_though_the_hook_would_raise(
+    def test_get_and_put_succeed_for_an_owner_even_though_the_hook_would_raise(
         self, db
     ):
         owner = _make_user(db, 1)
@@ -484,8 +463,8 @@ class TestOwnerIsImmuneToAHookFailure:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=boom)
-            get_response = await _get(api_id, owner, db)
-            put_response = await _put(
+            get_response = _get(api_id, owner, db)
+            put_response = _put(
                 api_id,
                 CustomApiUpdate(description="edited by the owner"),
                 owner,
@@ -505,7 +484,7 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
     verdict under it before committing.
     """
 
-    async def _run(self, db, *, hook):
+    def _run(self, db, *, hook):
         owner = _make_user(db, 1)
         member = _make_user(db, 2)
         api = _make_owned_api(db, owner.id, name="revalidated-under-lock")
@@ -524,7 +503,7 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
             set_connector_team_hooks(access=hook)
             result = {}
             try:
-                result["response"] = await _put(
+                result["response"] = _put(
                     api_id,
                     CustomApiUpdate(description="edited-while-in-flight"),
                     member,
@@ -534,12 +513,11 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
                 result["error"] = exc
             return api, api_id, result, original_name, original_description
 
-    @pytest.mark.asyncio
-    async def test_revoked_between_resolution_and_lock_is_refused(self, db):
+    def test_revoked_between_resolution_and_lock_is_refused(self, db):
         hook = _sequenced_access_hook(
             ConnectorAccess(team_owned=True, can_edit=True), None
         )
-        _api, api_id, result, original_name, original_description = await self._run(
+        _api, api_id, result, original_name, original_description = self._run(
             db, hook=hook
         )
 
@@ -550,15 +528,14 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
         assert refreshed.description == original_description
         assert db.query(UserCustomApi).filter(UserCustomApi.user_id == 2).count() == 0
 
-    @pytest.mark.asyncio
-    async def test_downgraded_to_not_editable_between_resolution_and_lock_is_refused(
+    def test_downgraded_to_not_editable_between_resolution_and_lock_is_refused(
         self, db
     ):
         hook = _sequenced_access_hook(
             ConnectorAccess(team_owned=True, can_edit=True),
             ConnectorAccess(team_owned=True, can_edit=False),
         )
-        _api, api_id, result, original_name, original_description = await self._run(
+        _api, api_id, result, original_name, original_description = self._run(
             db, hook=hook
         )
 
@@ -569,8 +546,7 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
         assert refreshed.description == original_description
         assert db.query(UserCustomApi).filter(UserCustomApi.user_id == 2).count() == 0
 
-    @pytest.mark.asyncio
-    async def test_still_granted_on_recheck_commits_durably(self, db):
+    def test_still_granted_on_recheck_commits_durably(self, db):
         hook = _sequenced_access_hook(
             ConnectorAccess(team_owned=True, can_edit=True),
             ConnectorAccess(team_owned=True, can_edit=True),
@@ -581,7 +557,7 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
             result,
             _original_name,
             _original_description,
-        ) = await self._run(db, hook=hook)
+        ) = self._run(db, hook=hook)
 
         assert "error" not in result
         assert result["response"].description == "edited-while-in-flight"
@@ -590,15 +566,14 @@ class TestTheVerdictIsRevalidatedUnderTheDefinitionLock:
         refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
         assert refreshed.description == "edited-while-in-flight"
 
-    @pytest.mark.asyncio
-    async def test_recheck_that_raises_surfaces_the_hooks_own_status_with_zero_side_effects(
+    def test_recheck_that_raises_surfaces_the_hooks_own_status_with_zero_side_effects(
         self, db
     ):
         hook = _sequenced_access_hook(
             ConnectorAccess(team_owned=True, can_edit=True),
             ValueError("hook exploded during recheck"),
         )
-        _api, api_id, result, original_name, original_description = await self._run(
+        _api, api_id, result, original_name, original_description = self._run(
             db, hook=hook
         )
 
@@ -616,10 +591,7 @@ class TestTheRecheckCostsExactlyOneExtraHookCall:
     more under the lock; a caller whose own link row already grants edit
     pays none at all."""
 
-    @pytest.mark.asyncio
-    async def test_a_granting_stand_in_editing_the_shared_config_pays_two_calls(
-        self, db
-    ):
+    def test_a_granting_stand_in_editing_the_shared_config_pays_two_calls(self, db):
         owner = _make_user(db, 1)
         member = _make_user(db, 2)
         api = _make_owned_api(db, owner.id, name="cost-stand-in-shared")
@@ -628,12 +600,11 @@ class TestTheRecheckCostsExactlyOneExtraHookCall:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=hook)
-            await _put(api_id, CustomApiUpdate(description="shared-edit"), member, db)
+            _put(api_id, CustomApiUpdate(description="shared-edit"), member, db)
 
         assert len(hook.calls) == 2
 
-    @pytest.mark.asyncio
-    async def test_an_owner_pays_zero_calls(self, db):
+    def test_an_owner_pays_zero_calls(self, db):
         owner = _make_user(db, 1)
         api = _make_owned_api(db, owner.id, name="cost-owner")
         api_id = api.id
@@ -641,6 +612,6 @@ class TestTheRecheckCostsExactlyOneExtraHookCall:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=hook)
-            await _put(api_id, CustomApiUpdate(description="owner-edit"), owner, db)
+            _put(api_id, CustomApiUpdate(description="owner-edit"), owner, db)
 
         assert len(hook.calls) == 0
