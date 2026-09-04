@@ -332,8 +332,7 @@ async def test_create_custom_api_rejects_runtime_static_header_conflict():
     assert "Invalid runtime configuration" in str(exc_info.value.detail)
 
 
-@pytest.mark.asyncio
-async def test_get_custom_api():
+def test_get_custom_api():
     db = MagicMock(spec=Session)
     user = User(id=1)
 
@@ -355,8 +354,7 @@ async def test_get_custom_api():
     assert res.name == "test_api"
 
 
-@pytest.mark.asyncio
-async def test_get_custom_api_not_found():
+def test_get_custom_api_not_found():
     db = MagicMock(spec=Session)
     user = User(id=1)
     db.query().filter().first.return_value = None

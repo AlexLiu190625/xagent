@@ -54,7 +54,9 @@ class CustomApiCreate(BaseModel):
     allow_delegated_authorization: bool = Field(
         False, description="Allow runtime Authorization header binding"
     )
-    is_active: bool = Field(True, description="Whether the API is active")
+    is_active: bool = Field(
+        True, description="Whether this caller's own link row to the API is active"
+    )
 
 
 class CustomApiUpdate(BaseModel):
@@ -82,7 +84,9 @@ class CustomApiUpdate(BaseModel):
     allow_delegated_authorization: Optional[bool] = Field(
         None, description="Allow runtime Authorization header binding"
     )
-    is_active: Optional[bool] = Field(None, description="Whether the API is active")
+    is_active: Optional[bool] = Field(
+        None, description="Whether this caller's own link row to the API is active"
+    )
 
 
 class CustomApiResponse(BaseModel):
@@ -100,8 +104,25 @@ class CustomApiResponse(BaseModel):
     runtime_input_schema: Optional[Dict[str, Any]]
     runtime_bindings: Optional[List[Dict[str, Any]]]
     allow_delegated_authorization: bool
-    is_active: bool
-    is_default: bool
+    is_active: bool = Field(
+        ...,
+        description=(
+            "Whether this caller's own link row to the API is active. A "
+            "caller who has no personal link row -- a team member reaching "
+            "a connector their team links -- has no row to hold this, and "
+            "receives the stand-in association's constant instead of a "
+            "stored value."
+        ),
+    )
+    is_default: bool = Field(
+        ...,
+        description=(
+            "Whether this caller's own link row marks the API as their "
+            "default. Carries the same caveat as ``is_active``: with no "
+            "personal link row the value is the stand-in association's "
+            "constant, not a stored one."
+        ),
+    )
     created_at: str
     updated_at: str
 
@@ -118,7 +139,16 @@ def _db_api_to_response(
     api: CustomApi,
     user_api: "UserCustomApi | _TeamOwnedUserApi",
 ) -> CustomApiResponse:
-    """Convert database CustomApi to response model with masked env values."""
+    """Convert database CustomApi to response model with masked env values.
+
+    ``is_active`` and ``is_default`` are read off ``user_api``, which is the
+    caller's own link row when one exists and the ``_TeamOwnedUserApi``
+    stand-in when the caller has no usable one. The stand-in holds class
+    constants rather than stored columns, so for such a caller these two
+    fields report those constants -- the same constants the aggregate
+    connector list carries for that caller whenever it lists the connector
+    at all, since it builds its response from the same stand-in.
+    """
 
     # Mask env values for frontend
     masked_env = None

@@ -25,6 +25,7 @@ from xagent.web.api.custom_api import (
     get_custom_api,
     update_custom_api,
 )
+from xagent.web.api.mcp import _custom_api_to_mcp_response, _TeamOwnedUserApi
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
@@ -291,6 +292,56 @@ def test_a_denying_verdict_stand_in_is_403_on_an_empty_payload_too(db):
     )
 
 
+def test_a_granting_verdict_stand_in_succeeds_on_an_empty_payload_without_a_recheck(
+    db,
+):
+    """The granting counterpart of the test above, and the one path that
+    reaches a 200 while skipping both the definition row's lock and the
+    post-lock re-authorization: an empty payload writes no field of the
+    shared definition row, so it takes no lock, and having taken no lock it
+    has no unbounded wait to re-establish the gate's decision across.
+
+    The hook is sequenced to grant on its first answer and to deny on every
+    later one. If the route ever re-resolved the verdict on this payload, the
+    second answer would refuse the request with a 403; the request returning
+    normally, together with the single recorded hook call, is what pins the
+    skip.
+    """
+    owner = _make_user(db, 1)
+    member = _make_user(db, 2)
+    api = _make_owned_api(db, owner.id, name="granting-stand-in-target")
+    api_id = api.id
+    original_name = str(api.name)
+    original_description = str(api.description) if api.description is not None else None
+
+    hook = _sequenced_access_hook(
+        ConnectorAccess(team_owned=True, can_edit=True),
+        None,
+    )
+    with snapshot_connector_team_hooks():
+        set_connector_team_hooks(access=hook)
+        response = _put(api_id, CustomApiUpdate(), member, db)
+
+    # 1. one resolution, not two: the post-lock re-authorization never ran.
+    assert len(hook.calls) == 1
+
+    # 2. the shared definition row is untouched -- read back from the
+    # database after a rollback rather than off the in-session object.
+    db.rollback()
+    refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
+    assert refreshed.name == original_name
+    assert refreshed.description == original_description
+
+    # 3. no personal link row was created for a caller who had none.
+    assert (
+        db.query(UserCustomApi).filter(UserCustomApi.user_id == member.id).count() == 0
+    )
+
+    # 4. the response is the stand-in's own view of the connector.
+    assert response.id == api_id
+    assert response.user_id == member.id
+
+
 class TestIsActiveRejectionForAStandIn:
     def test_is_active_from_a_caller_with_no_personal_row_is_400_not_a_silent_drop(
         self, db
@@ -332,6 +383,45 @@ class TestIsActiveRejectionForAStandIn:
         # left the route carrying an ``is_active`` value nothing wrote.
         refreshed = db.query(CustomApi).filter(CustomApi.id == api_id).one()
         assert refreshed.name == "unchanged-name"
+
+
+class TestStandInFlagsAgreeAcrossBothResponseSurfaces:
+    def test_a_stand_in_caller_gets_the_same_two_flags_from_both_surfaces(self, db):
+        """``is_active`` and ``is_default`` live on the caller's own link row.
+        A caller with no such row is answered from a stand-in association
+        holding class constants, and two separate response constructors read
+        it: the single-connector ``GET`` here, and the aggregate connector
+        list's ``_custom_api_to_mcp_response``. Whatever those constants are,
+        both surfaces must report the same pair for the same caller -- pinned
+        as an equality rather than as literal ``True``/``False`` so that
+        changing what a stand-in reports stays a one-line change in one place
+        instead of a test failure that reads like a regression.
+        """
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        api = _make_owned_api(db, owner.id, name="two-surface-target")
+        api_id = api.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=False)
+                    for ref in refs
+                }
+            )
+            detail = _get(api_id, member, db)
+
+        definition = db.query(CustomApi).filter(CustomApi.id == api_id).one()
+        aggregate = _custom_api_to_mcp_response(
+            definition, _TeamOwnedUserApi(int(member.id))
+        )
+
+        assert (
+            db.query(UserCustomApi).filter(UserCustomApi.user_id == member.id).first()
+            is None
+        ), "the caller under test must have no personal link row"
+        assert detail.is_active == aggregate.is_active
+        assert detail.is_default == aggregate.is_default
 
 
 class TestTypedErrorArm:
