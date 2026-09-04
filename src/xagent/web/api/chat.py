@@ -75,6 +75,7 @@ from ..sandbox_keys import (
     parse_user_sandbox_key,
 )
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
+from ..schemas.connector_runtime import ConnectorRuntimeRequirementsModel
 from ..services.agent_access import list_accessible_published_agents
 from ..services.agent_team_scope import (
     get_agent_team_scope,
@@ -89,7 +90,9 @@ from ..services.chat_history_service import (
 )
 from ..services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
+    build_task_runtime_requirements,
     prepare_connector_runtime_selection_snapshot,
+    resolve_agent_runtime_requirements,
 )
 from ..services.db_runtime import (
     drain_async_task_cancellation_safe,
@@ -5286,6 +5289,86 @@ async def get_task_runtime_extensions(
         "runtime_extensions_status": metadata_result.status,
         "runtime_extensions_omitted": list(metadata_result.omitted_extensions),
     }
+
+
+@chat_router.get(
+    "/agent/{agent_id}/connector-runtime-requirements",
+    response_model=ConnectorRuntimeRequirementsModel,
+)
+async def get_agent_connector_runtime_requirements(
+    agent_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ConnectorRuntimeRequirementsModel:
+    """Report the runtime inputs a prospective task would need, before one
+    exists.
+
+    Reuses the same predicate ``POST /task/create`` applies to an agent id
+    (``_load_agent_for_task_create``) rather than a second authorization
+    path for the same resource, so a caller who could create a task with
+    this agent sees exactly the same "not found" boundary here that they
+    would hit on that call. Lives on the chat router, next to the
+    task-keyed sibling below and the existing task-keyed
+    ``/task/{task_id}/runtime-extensions``, rather than under
+    ``/api/agents`` -- this endpoint has no consumer outside chat.
+
+    There is no task yet, so every reported input is unsatisfied and the
+    connector team scope is whatever ``resolve_agent_selected_connectors``
+    derives from the agent's own team, never a value this endpoint passes
+    in itself.
+    """
+
+    agent = _load_agent_for_task_create(db, user, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found or access denied")
+    try:
+        _refs, requirements = resolve_agent_runtime_requirements(
+            db=db, agent=agent, connector_user_id=int(user.id)
+        )
+    except ConnectorRuntimeError as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
+    return requirements
+
+
+@chat_router.get(
+    "/task/{task_id}/connector-runtime-requirements",
+    response_model=ConnectorRuntimeRequirementsModel,
+)
+async def get_task_connector_runtime_requirements(
+    task_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ConnectorRuntimeRequirementsModel:
+    """Report which of a task's declared connector runtime inputs already
+    have a value.
+
+    Access is plain task ownership -- ``Task.user_id == current_user.id`` in
+    the same query that loads the task, unlike
+    ``/task/{task_id}/runtime-extensions`` above, which additionally lets an
+    admin read any task; this endpoint does not extend that exception.
+    A task that does not exist or is not the caller's own is a uniform 404.
+
+    Pure read: never writes, and never asserts that a required value is
+    present -- that assertion belongs to the per-turn gate that runs later,
+    not to this report.
+    """
+
+    task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    agent = (
+        db.query(Agent).filter(Agent.id == task.agent_id).first()
+        if task.agent_id is not None
+        else None
+    )
+    try:
+        return build_task_runtime_requirements(db=db, task=task, agent=agent)
+    except ConnectorRuntimeError as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
 
 
 @chat_router.delete("/task/{task_id}")

@@ -14,15 +14,16 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from xagent.web.api.auth import auth_router
+from xagent.web.api.auth import auth_router, create_access_token
 from xagent.web.api.chat import AgentServiceManager, chat_router
+from xagent.web.api.public_chat_access import create_public_chat_access_token
 from xagent.web.api.share import share_router
 from xagent.web.api.websocket import handle_chat_message
 from xagent.web.api.widget import widget_router
 from xagent.web.channels.feishu.bot import FeishuBotInstance
 from xagent.web.channels.telegram import bot as telegram_bot_module
 from xagent.web.channels.telegram.bot import TelegramBotInstance
-from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import (
     Base,
@@ -34,6 +35,11 @@ from xagent.web.models.task import Task, TaskConnectorRuntimeContext, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.user_channel import UserChannel
+from xagent.web.services import connector_team_scope
+from xagent.web.services.agent_team_scope import (
+    AgentTeamScope,
+    set_agent_team_scope_hook,
+)
 
 
 def _override_get_db() -> Iterator[Session]:
@@ -154,6 +160,63 @@ def _create_mcp_server(
         transport="streamable_http",
         url=f"https://example.com/{name}/mcp",
         **kwargs,
+    )
+    db.add(server)
+    db.flush()
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            can_edit=True,
+            can_delete=True,
+            is_active=True,
+        )
+    )
+    db.flush()
+    return server
+
+
+def _create_user(db: Session, username: str) -> User:
+    user = User(username=username, password_hash="hash", is_admin=False)
+    db.add(user)
+    db.flush()
+    return user
+
+
+def _auth_headers_for_user(user: User) -> dict[str, str]:
+    """Mint an access token for an already-created user, bypassing the
+    HTTP login round trip. Drives the same ``get_current_user`` dependency
+    every endpoint under test uses -- only the token minting is shortcut.
+    """
+    token = create_access_token(
+        data={"sub": str(user.username), "user_id": int(user.id)}
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _mcp_server_with_context_schema(
+    db: Session,
+    user: User,
+    *,
+    name: str,
+    context_schema: dict[str, Any],
+    url: str = "https://example.com/mcp",
+) -> MCPServer:
+    server = MCPServer(
+        name=name,
+        description=f"{name} description",
+        managed="external",
+        transport="streamable_http",
+        url=url,
+        runtime_input_schema={"context": context_schema},
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": key},
+                "target": {"target_type": "mcp_meta", "key": key},
+            }
+            for key in context_schema
+        ],
     )
     db.add(server)
     db.flush()
@@ -1227,3 +1290,556 @@ async def test_telegram_voice_is_transcribed_as_prompt_and_kept_as_input_file(
         assert user_message.attachments == expected_attachments
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Connector-runtime-requirements read endpoints
+# (GET /agent/{agent_id}/connector-runtime-requirements,
+#  GET /task/{task_id}/connector-runtime-requirements).
+# ---------------------------------------------------------------------------
+
+
+def test_agent_requirements_hides_connection_config_and_normalizes_type(
+    e2e_db: None,
+) -> None:
+    """The agent-keyed report never leaks a connector's transport or
+    authentication configuration, a declared ``type`` other than the raw
+    string ``"object"`` normalizes to ``"string"``, and the report is
+    untouched by any task's stored values -- not even a task created
+    against the same agent and connector.
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = MCPServer(
+            name="leaky-server",
+            description="leaky-server description",
+            managed="external",
+            transport="streamable_http",
+            url="https://leak.example/probe",
+            headers={"Authorization": "Bearer leak-header-secret"},
+            env={"SECRET": "leak-env-secret"},
+            auth={"type": "oauth", "client_secret": "leak-auth-secret"},
+            runtime_input_schema={
+                "context": {
+                    "auth_token": {"type": "string", "required": True},
+                    "profile": {"type": {"$ref": "leak"}, "required": False},
+                }
+            },
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "auth_token"},
+                    "target": {"target_type": "mcp_meta", "key": "auth_token"},
+                },
+                {
+                    "source": {"input_type": "context", "key": "profile"},
+                    "target": {"target_type": "mcp_meta", "key": "profile"},
+                },
+            ],
+        )
+        db.add(server)
+        db.flush()
+        db.add(
+            UserMCPServer(
+                user_id=user.id,
+                mcpserver_id=server.id,
+                is_owner=True,
+                can_edit=True,
+                can_delete=True,
+                is_active=True,
+            )
+        )
+        agent = _create_agent(
+            db, user, name="Leaky Requirements Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server)
+        agent_id = int(agent.id)
+        server_id = int(server.id)
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/chat/agent/{agent_id}/connector-runtime-requirements",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    for leaked in (
+        "leak.example",
+        "leak-header-secret",
+        "leak-env-secret",
+        "leak-auth-secret",
+    ):
+        assert leaked not in response.text
+
+    payload = response.json()
+    assert payload["secrets_expires_at"] is None
+    connectors = payload["connectors"]
+    assert len(connectors) == 1
+    inputs_by_key = {item["key"]: item for item in connectors[0]["inputs"]}
+    assert inputs_by_key["auth_token"]["type"] == "string"
+    # Declared as {"$ref": "leak"}, not the literal string "object" -- must
+    # normalize to "string", not pass through unnormalized.
+    assert inputs_by_key["profile"]["type"] == "string"
+    assert inputs_by_key["auth_token"]["satisfied"] is False
+
+    # A task created from this same agent, with this same connector's
+    # required key filled directly in storage, must not move this report's
+    # numbers: it has no task in scope.
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={
+            "title": "leak isolation task",
+            "description": "d",
+            "agent_id": agent_id,
+        },
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+    db = _db_session()
+    try:
+        db.add(
+            TaskConnectorRuntimeContext(
+                task_id=task_id,
+                connector_type="mcp",
+                connector_id=server_id,
+                context={"auth_token": "filled"},
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    second_response = client.get(
+        f"/api/chat/agent/{agent_id}/connector-runtime-requirements",
+        headers=headers,
+    )
+    assert second_response.status_code == 200, second_response.text
+    second_payload = second_response.json()
+    assert second_payload["secrets_expires_at"] is None
+    second_inputs = {
+        item["key"]: item for item in second_payload["connectors"][0]["inputs"]
+    }
+    assert second_inputs["auth_token"]["satisfied"] is False
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "different_user",
+        "admins_only_team",
+        "unpublished_other_user",
+        "workforce_manager_owned",
+    ],
+)
+def test_agent_requirements_hides_non_visible_agents(
+    e2e_db: None, scenario: str
+) -> None:
+    """Four identities that must all see a uniform 404, with the agent's
+    name absent from the response body.
+    """
+    team_hook_installed = False
+    db = _db_session()
+    try:
+        owner = _create_user(db, "agent-owner")
+        caller = _create_user(db, "agent-caller")
+        db.flush()
+        caller_id = int(caller.id)
+
+        if scenario == "different_user":
+            agent = Agent(
+                user_id=owner.id,
+                name="Secret Agent",
+                instructions="i",
+                execution_mode="balanced",
+                status=AgentStatus.DRAFT,
+                tool_categories=[],
+            )
+        elif scenario == "admins_only_team":
+            agent = Agent(
+                user_id=owner.id,
+                name="Secret Agent",
+                instructions="i",
+                execution_mode="balanced",
+                status=AgentStatus.PUBLISHED,
+                tool_categories=[],
+                team_id=101,
+                visibility="admins",
+            )
+            set_agent_team_scope_hook(
+                lambda db, user_id: (
+                    AgentTeamScope(team_id=101, is_team_admin=False)
+                    if user_id == caller_id
+                    else None
+                )
+            )
+            team_hook_installed = True
+        elif scenario == "unpublished_other_user":
+            agent = Agent(
+                user_id=owner.id,
+                name="Secret Agent",
+                instructions="i",
+                execution_mode="balanced",
+                status=AgentStatus.DRAFT,
+                tool_categories=[],
+            )
+        elif scenario == "workforce_manager_owned":
+            # Owned by the caller: proves the workforce-manager check runs
+            # before -- not as part of -- the ownership check.
+            agent = Agent(
+                user_id=caller.id,
+                name="Secret Agent",
+                instructions="i",
+                execution_mode="balanced",
+                status=AgentStatus.PUBLISHED,
+                tool_categories=[],
+                origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            )
+        else:
+            raise AssertionError(scenario)
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+        caller_headers = _auth_headers_for_user(caller)
+    finally:
+        db.close()
+
+    try:
+        response = client.get(
+            f"/api/chat/agent/{agent_id}/connector-runtime-requirements",
+            headers=caller_headers,
+        )
+        assert response.status_code == 404, response.text
+        assert "Secret Agent" not in response.text
+    finally:
+        if team_hook_installed:
+            set_agent_team_scope_hook(None)
+
+
+def test_team_shared_connector_visible_across_read_endpoints(e2e_db: None) -> None:
+    """A connector shared only through the agent's team is listed by both
+    read endpoints for a non-owning team member, and the task-keyed read
+    endpoint returns 200
+    (not 400) while the connector's one required key is still unfilled.
+    Reversing the connector-team hook to withhold sharing removes it from
+    both endpoints for the same caller and agent.
+    """
+    db = _db_session()
+    try:
+        owner = _create_user(db, "team-connector-owner")
+        member = _create_user(db, "team-connector-member")
+        db.flush()
+        member_id = int(member.id)
+
+        server = MCPServer(
+            name="team-shared-server",
+            description="team-shared-server description",
+            managed="external",
+            transport="streamable_http",
+            url="https://example.com/mcp",
+            runtime_input_schema={
+                "context": {"auth_token": {"type": "string", "required": True}}
+            },
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "auth_token"},
+                    "target": {"target_type": "mcp_meta", "key": "auth_token"},
+                }
+            ],
+        )
+        db.add(server)
+        db.flush()
+        # No UserMCPServer link for `member` at all -- reachable only
+        # through the team hook below.
+        server_id = int(server.id)
+
+        agent = Agent(
+            user_id=owner.id,
+            name="Team Shared Agent",
+            instructions="i",
+            execution_mode="balanced",
+            status=AgentStatus.PUBLISHED,
+            tool_categories=["mcp"],
+            team_id=101,
+            visibility="team",
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+        member_headers = _auth_headers_for_user(member)
+    finally:
+        db.close()
+
+    def _connector_ids_for_team(shared: bool):
+        def _hook(db: Session, *, team_id: int) -> dict[str, set[int]]:
+            if shared and team_id == 101:
+                return {"mcp": {server_id}, "custom_api": set()}
+            return {"mcp": set(), "custom_api": set()}
+
+        return _hook
+
+    set_agent_team_scope_hook(
+        lambda db, user_id: (
+            AgentTeamScope(team_id=101, is_team_admin=False)
+            if user_id == member_id
+            else None
+        )
+    )
+    connector_team_scope.set_connector_team_hooks(
+        team_visibility=_connector_ids_for_team(shared=True)
+    )
+    try:
+        agent_response = client.get(
+            f"/api/chat/agent/{agent_id}/connector-runtime-requirements",
+            headers=member_headers,
+        )
+        assert agent_response.status_code == 200, agent_response.text
+        agent_refs = [
+            item["connector_ref"] for item in agent_response.json()["connectors"]
+        ]
+        assert {"connector_type": "mcp", "connector_id": server_id} in agent_refs
+
+        create_response = client.post(
+            "/api/chat/task/create",
+            headers=member_headers,
+            json={
+                "title": "team shared task",
+                "description": "d",
+                "agent_id": agent_id,
+            },
+        )
+        assert create_response.status_code == 200, create_response.text
+        task_id = int(create_response.json()["task_id"])
+
+        task_response = client.get(
+            f"/api/chat/task/{task_id}/connector-runtime-requirements",
+            headers=member_headers,
+        )
+        assert task_response.status_code == 200, task_response.text
+        task_payload = task_response.json()
+        assert task_payload["satisfied"] is False
+        task_refs = [item["connector_ref"] for item in task_payload["connectors"]]
+        assert {"connector_type": "mcp", "connector_id": server_id} in task_refs
+    finally:
+        set_agent_team_scope_hook(None)
+        connector_team_scope.set_connector_team_hooks()
+
+    # Reverse: withhold team sharing for the same agent/caller pair. Uses a
+    # fresh task (the earlier one already persisted its selected refs) so
+    # this is purely a visibility check on the read endpoints.
+    set_agent_team_scope_hook(
+        lambda db, user_id: (
+            AgentTeamScope(team_id=101, is_team_admin=False)
+            if user_id == member_id
+            else None
+        )
+    )
+    connector_team_scope.set_connector_team_hooks(
+        team_visibility=_connector_ids_for_team(shared=False)
+    )
+    try:
+        agent_response = client.get(
+            f"/api/chat/agent/{agent_id}/connector-runtime-requirements",
+            headers=member_headers,
+        )
+        assert agent_response.status_code == 200, agent_response.text
+        assert agent_response.json()["connectors"] == []
+
+        create_response = client.post(
+            "/api/chat/task/create",
+            headers=member_headers,
+            json={
+                "title": "team unshared task",
+                "description": "d",
+                "agent_id": agent_id,
+            },
+        )
+        assert create_response.status_code == 200, create_response.text
+        task_id = int(create_response.json()["task_id"])
+        task_response = client.get(
+            f"/api/chat/task/{task_id}/connector-runtime-requirements",
+            headers=member_headers,
+        )
+        assert task_response.status_code == 200, task_response.text
+        assert task_response.json()["connectors"] == []
+    finally:
+        set_agent_team_scope_hook(None)
+        connector_team_scope.set_connector_team_hooks()
+
+
+def test_agent_requirements_endpoint_bypassing_team_resolver_hides_shared_connector(
+    e2e_db: None,
+) -> None:
+    """If the agent-keyed endpoint ever bypasses
+    ``resolve_agent_selected_connectors`` and loads visible connectors with
+    ``agent_team_id=None`` instead of the value that resolver derives from
+    the agent, a team-shared-only connector silently disappears from the
+    report. This test pins the *correct* behavior (the connector is
+    listed); the mutation itself has no test-visible seam to monkeypatch
+    without changing which production code path runs, so it is applied and
+    reverted directly against ``resolve_agent_runtime_requirements`` in the
+    execution report's mutation table rather than parametrized here.
+    """
+    db = _db_session()
+    try:
+        owner = _create_user(db, "team-connector-owner-2")
+        member = _create_user(db, "team-connector-member-2")
+        db.flush()
+        member_id = int(member.id)
+        server = MCPServer(
+            name="team-shared-server-2",
+            description="team-shared-server-2 description",
+            managed="external",
+            transport="streamable_http",
+            url="https://example.com/mcp",
+            runtime_input_schema={
+                "context": {"auth_token": {"type": "string", "required": True}}
+            },
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "auth_token"},
+                    "target": {"target_type": "mcp_meta", "key": "auth_token"},
+                }
+            ],
+        )
+        db.add(server)
+        db.flush()
+        server_id = int(server.id)
+        agent = Agent(
+            user_id=owner.id,
+            name="Team Shared Agent 2",
+            instructions="i",
+            execution_mode="balanced",
+            status=AgentStatus.PUBLISHED,
+            tool_categories=["mcp"],
+            team_id=202,
+            visibility="team",
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+        member_headers = _auth_headers_for_user(member)
+    finally:
+        db.close()
+
+    set_agent_team_scope_hook(
+        lambda db, user_id: (
+            AgentTeamScope(team_id=202, is_team_admin=False)
+            if user_id == member_id
+            else None
+        )
+    )
+    connector_team_scope.set_connector_team_hooks(
+        team_visibility=lambda db, *, team_id: (
+            {"mcp": {server_id}, "custom_api": set()}
+            if team_id == 202
+            else {"mcp": set(), "custom_api": set()}
+        )
+    )
+    try:
+        response = client.get(
+            f"/api/chat/agent/{agent_id}/connector-runtime-requirements",
+            headers=member_headers,
+        )
+        assert response.status_code == 200, response.text
+        refs = [item["connector_ref"] for item in response.json()["connectors"]]
+        assert {"connector_type": "mcp", "connector_id": server_id} in refs
+    finally:
+        set_agent_team_scope_hook(None)
+        connector_team_scope.set_connector_team_hooks()
+
+
+def test_task_requirements_endpoint_requires_task_ownership_by_caller(
+    e2e_db: None,
+) -> None:
+    """A task belonging to another logged-in user is a uniform 404 on the
+    task-keyed read endpoint, matching the values endpoint's ownership
+    predicate.
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        owner = _admin_user(db)
+        other = _create_user(db, "task-requirements-other")
+        agent = _create_agent(
+            db, owner, name="Task Owner Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+        other_headers = _auth_headers_for_user(other)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "owner only task", "description": "d", "agent_id": agent_id},
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+
+    response = client.get(
+        f"/api/chat/task/{task_id}/connector-runtime-requirements",
+        headers=other_headers,
+    )
+    assert response.status_code == 404, response.text
+
+
+@pytest.mark.parametrize("endpoint_kind", ["agent", "task"])
+def test_read_endpoints_reject_anonymous_and_widget_credentials(
+    e2e_db: None, endpoint_kind: str
+) -> None:
+    """No ``Authorization`` header is a bare 403
+    (``HTTPBearer`` itself, ``auto_error=True``), and a well-formed widget
+    guest token is a 401 ``"Invalid token type"`` -- the same two doors
+    every other authenticated-only endpoint in this module is gated by
+    (``get_current_user``'s ``type: "access"`` check, ``auth_dependencies.py``).
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        agent = _create_agent(
+            db, user, name="Anon Guard Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+
+    if endpoint_kind == "agent":
+        url = f"/api/chat/agent/{agent_id}/connector-runtime-requirements"
+    else:
+        create_response = client.post(
+            "/api/chat/task/create",
+            headers=headers,
+            json={"title": "anon guard task", "description": "d", "agent_id": agent_id},
+        )
+        assert create_response.status_code == 200, create_response.text
+        task_id = int(create_response.json()["task_id"])
+        url = f"/api/chat/task/{task_id}/connector-runtime-requirements"
+
+    no_auth_response = client.get(url)
+    assert no_auth_response.status_code == 403, no_auth_response.text
+
+    widget_token = create_public_chat_access_token(
+        {"guest_id": "anon-guard-guest", "widget_agent_id": agent_id}
+    )
+    widget_response = client.get(
+        url, headers={"Authorization": f"Bearer {widget_token}"}
+    )
+    assert widget_response.status_code == 401, widget_response.text
+    assert widget_response.json()["detail"] == "Invalid token type"
+
+
+# ---------------------------------------------------------------------------
+# A3: connector_runtime_requirements on the task-create response.
+# ---------------------------------------------------------------------------
