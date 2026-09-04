@@ -23,6 +23,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -51,6 +52,7 @@ from ..models.mcp_oauth import (
     mcp_oauth_client_registration_lookup_hash,
     mcp_oauth_grant_lookup_hash,
 )
+from ..models.public_mcp import PublicMCPApp
 from ..models.user import User
 from ..services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
@@ -4177,6 +4179,302 @@ def _catalog_server_has_platform_key(db: Session, server: MCPServer) -> bool:
             required = (app.get("launch_config") or {}).get("required_env") or []
             return _env_covers_required(env, required)
     return False
+
+
+def _lock_catalog_for_app_teardown(db: Session) -> None:
+    """Serialize catalog ownership reads before an app-scoped teardown."""
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        # A row lock on the expected app cannot exclude a different row being
+        # renamed into a legacy server's name. SHARE conflicts with catalog
+        # INSERT/UPDATE/DELETE while still allowing concurrent readers.
+        db.execute(text("LOCK TABLE public_mcp_apps IN SHARE MODE"))
+    elif dialect == "sqlite":
+        # SQLite ignores FOR UPDATE. Reuse the producer fence's owned
+        # BEGIN IMMEDIATE transaction so no catalog or lifecycle writer can
+        # pass identity validation before the destructive work commits.
+        _begin_sqlite_oauth_persistence(db)
+
+
+def _locked_catalog_app_for_server(
+    db: Session,
+    *,
+    server: MCPServer,
+    expected_app: PublicMCPApp,
+) -> PublicMCPApp | None:
+    """Return the locked catalog row only when it still owns ``server``."""
+    app_id = str(expected_app.app_id)
+    if str(server.transport or "").lower() != "oauth":
+        # Catalog provisioning names non-OAuth rows by exact app id. Their
+        # caller-authored auth mapping is not trusted as ownership evidence.
+        return expected_app if str(server.name or "") == app_id else None
+
+    auth = server.auth
+    if isinstance(auth, dict) and "app_id" in auth:
+        return expected_app if auth.get("app_id") == app_id else None
+
+    # Legacy builtin OAuth rows may use app id or mutable display name. The
+    # catalog table lock keeps this ownership set stable through commit.
+    server_name = str(server.name or "")
+    owners = {
+        str(candidate.app_id)
+        for candidate in db.query(PublicMCPApp)
+        .filter(
+            (PublicMCPApp.app_id == server_name) | (PublicMCPApp.name == server_name)
+        )
+        .all()
+    }
+    return expected_app if owners == {app_id} else None
+
+
+async def teardown_mcp_app_server(
+    server_id: int,
+    *,
+    app_id: str,
+    expected_provider_name: str | None,
+    expected_catalog_generation: UUID,
+    expected_association_generation: UUID,
+    current_user: User,
+    db: Session,
+) -> None:
+    """Atomically disconnect one exact catalog-app association lifecycle.
+
+    The caller pins both generations during preflight. This function owns the
+    local transaction, revalidates every destructive identity while locked,
+    commits local cleanup once, and only then performs best-effort provider
+    revocation without ORM access or database locks.
+    """
+    revocations: list[_MCPOAuthGrantRevocationSnapshot] = []
+    try:
+        with db.no_autoflush:
+            user_id = int(current_user.id)
+            current_user_is_admin = bool(getattr(current_user, "is_admin", False))
+        if (
+            not isinstance(server_id, int)
+            or isinstance(server_id, bool)
+            or not isinstance(app_id, str)
+            or not app_id
+            or app_id != app_id.strip()
+            or (
+                expected_provider_name is not None
+                and not isinstance(expected_provider_name, str)
+            )
+            or not isinstance(expected_catalog_generation, UUID)
+            or not isinstance(expected_association_generation, UUID)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="MCP app teardown identity could not be verified",
+            )
+
+        _lock_catalog_for_app_teardown(db)
+        # Preflight may have populated the identity map before another session
+        # committed. Locks serialize future writes; expiration makes these
+        # reads observe the state that existed when serialization was won.
+        db.expire_all()
+        with db.no_autoflush:
+            expected_app = (
+                db.query(PublicMCPApp)
+                .filter(
+                    PublicMCPApp.generation == expected_catalog_generation,
+                    PublicMCPApp.app_id == app_id,
+                    PublicMCPApp.provider_name == expected_provider_name,
+                )
+                .with_for_update()
+                .one_or_none()
+            )
+            if expected_app is None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="MCP app teardown owner changed",
+                )
+
+            # Match the producer fence's lock order after the teardown-only
+            # catalog fence: server, exact association generation, artifacts.
+            server = (
+                db.query(MCPServer)
+                .filter(MCPServer.id == server_id)
+                .with_for_update()
+                .one_or_none()
+            )
+            if server is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="MCP server not found",
+                )
+            user_mcp = (
+                db.query(UserMCPServer)
+                .filter(
+                    UserMCPServer.user_id == user_id,
+                    UserMCPServer.mcpserver_id == server_id,
+                    UserMCPServer.lifecycle_generation
+                    == expected_association_generation,
+                )
+                .with_for_update()
+                .one_or_none()
+            )
+            if user_mcp is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="MCP server not found",
+                )
+            if (
+                _locked_catalog_app_for_server(
+                    db, server=server, expected_app=expected_app
+                )
+                is None
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="MCP app teardown owner changed",
+                )
+
+        if not _check_mcp_permission(user_mcp, current_user_is_admin, require="delete"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to delete this MCP server",
+            )
+
+        from ..services.connector_team_scope import delete_team_connector
+
+        team_delete = delete_team_connector(db, user_id, "mcp", server_id)
+        if team_delete.blocked_reason:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=team_delete.blocked_reason,
+            )
+        if team_delete.team_owned and not team_delete.authorized:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only a team admin can delete a team MCP server",
+            )
+
+        if str(server.transport or "").lower() == "oauth":
+            provider = expected_app.provider_name
+            providers_to_delete = restrict_to_app_scoped_oauth_grant(
+                app_id, [provider, app_id]
+            )
+            if providers_to_delete:
+                delete_scoped_user_oauth_accounts(
+                    db,
+                    user_id=user_id,
+                    resource_owner_key=None,
+                    providers=providers_to_delete,
+                )
+            if provider and provider not in providers_to_delete:
+                other_servers = (
+                    db.query(MCPServer)
+                    .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+                    .filter(
+                        UserMCPServer.user_id == user_id,
+                        MCPServer.id != server_id,
+                    )
+                    .all()
+                )
+                normalized_provider = _normalize_app_key(provider)
+                sibling_still_connected = any(
+                    (sibling_app := get_app_for_mcp_server(db, other_server))
+                    and _normalize_app_key(sibling_app.get("provider"))
+                    == normalized_provider
+                    for other_server in other_servers
+                )
+                if not sibling_still_connected:
+                    delete_scoped_user_oauth_accounts(
+                        db,
+                        user_id=user_id,
+                        resource_owner_key=None,
+                        providers=[provider],
+                    )
+
+        for grant in (
+            db.query(MCPOAuthGrant)
+            .filter(
+                MCPOAuthGrant.mcp_server_id == server_id,
+                MCPOAuthGrant.user_id == user_id,
+            )
+            .with_for_update()
+            .all()
+        ):
+            if str(grant.status) == "active" and isinstance(
+                grant.oauth_client, MCPOAuthClient
+            ):
+                revocations.append(
+                    _mcp_oauth_grant_revocation_snapshot(
+                        client=grant.oauth_client, grant=grant
+                    )
+                )
+            db.delete(grant)
+
+        db.query(MCPOAuthFlowState).filter(
+            MCPOAuthFlowState.mcp_server_id == server_id,
+            MCPOAuthFlowState.user_id == user_id,
+        ).delete(synchronize_session=False)
+        db.delete(user_mcp)
+        db.flush()
+
+        other_user = (
+            db.query(UserMCPServer)
+            .filter(UserMCPServer.mcpserver_id == server_id)
+            .with_for_update()
+            .first()
+        )
+        if other_user is None:
+            if team_delete.team_owned and not team_delete.delete_definition:
+                logger.info(
+                    "Kept team-owned MCP server %s after app teardown", server_id
+                )
+            elif _catalog_server_has_platform_key(db, server):
+                logger.info(
+                    "Kept platform-key MCP server %s after app teardown", server_id
+                )
+            else:
+                # FK cascades delete clients, client secrets, and any remaining
+                # server-scoped artifacts in this same local transaction.
+                db.delete(server)
+
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except _SQLiteOAuthPersistenceTransactionError:
+        # The write-intent helper has not changed caller state on this path.
+        logger.error(
+            "App-scoped MCP teardown requires an owned SQLite transaction "
+            "for app %r, server %s",
+            app_id,
+            server_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete MCP server",
+        ) from None
+    except Exception:
+        db.rollback()
+        logger.error(
+            "App-scoped MCP teardown failed for app %r, server %s",
+            app_id,
+            server_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete MCP server",
+        ) from None
+
+    # No provider call may run until the local commit releases every lock.
+    for revocation in revocations:
+        try:
+            await _revoke_mcp_oauth_grant_snapshot_externally(revocation)
+        except Exception:
+            logger.warning(
+                "MCP OAuth token revocation failed after teardown for grant %s",
+                revocation.grant_id,
+            )
+    logger.info(
+        "Completed app-scoped MCP teardown for app %r, server %s, user %s",
+        app_id,
+        server_id,
+        user_id,
+    )
 
 
 @mcp_router.delete("/servers/{server_id}", status_code=status.HTTP_204_NO_CONTENT)

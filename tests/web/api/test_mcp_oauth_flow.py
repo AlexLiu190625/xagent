@@ -46,6 +46,7 @@ from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import mcp_oauth_client_registration_lookup_hash
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import connector_team_scope
 from xagent.web.services import mcp_oauth as mcp_oauth_service
 from xagent.web.services.mcp_oauth import (
@@ -4494,3 +4495,404 @@ async def test_status_reports_discovered_grant_without_configured_selectors(db_s
     status_response = await get_mcp_oauth_status(server.id, user, db)
 
     assert [item.id for item in status_response.grants] == [grant.id]
+
+
+def _teardown_app(
+    db, *, app_id: str, transport: str, provider: str | None = None, **launch
+) -> PublicMCPApp:
+    app = PublicMCPApp(
+        app_id=app_id,
+        name=app_id.replace("-", " ").title(),
+        transport=transport,
+        provider_name=provider,
+        launch_config=launch or None,
+    )
+    db.add(app)
+    db.commit()
+    return app
+
+
+def _teardown_association(db, user: User, server: MCPServer) -> UserMCPServer:
+    association = UserMCPServer(
+        user_id=user.id,
+        mcpserver_id=server.id,
+        is_owner=True,
+        can_delete=True,
+        is_active=True,
+    )
+    db.add(association)
+    db.commit()
+    return association
+
+
+@pytest.mark.asyncio
+async def test_app_teardown_builtin_uses_exact_catalog_credential(db_session):
+    db, user, _ = db_session
+    app = _teardown_app(
+        db, app_id="calendar", transport="oauth", provider="calendar-provider"
+    )
+    server = MCPServer.from_config(
+        {
+            "name": "calendar",
+            "managed": "external",
+            "transport": "oauth",
+            "auth": {"app_id": "calendar", "provider": "calendar-provider"},
+        }
+    )
+    db.add(server)
+    db.flush()
+    association = _teardown_association(db, user, server)
+    db.add_all(
+        [
+            UserOAuth(
+                user_id=user.id,
+                provider="calendar-provider",
+                access_token=encrypt_value("delete-me"),
+            ),
+            UserOAuth(
+                user_id=user.id,
+                provider="unrelated",
+                access_token=encrypt_value("keep-me"),
+            ),
+        ]
+    )
+    db.commit()
+
+    await mcp_api.teardown_mcp_app_server(
+        int(server.id),
+        app_id="calendar",
+        expected_provider_name="calendar-provider",
+        expected_catalog_generation=app.generation,
+        expected_association_generation=association.lifecycle_generation,
+        current_user=user,
+        db=db,
+    )
+
+    assert db.get(MCPServer, server.id) is None
+    assert {row.provider for row in db.query(UserOAuth).all()} == {"unrelated"}
+
+
+@pytest.mark.asyncio
+async def test_app_teardown_rolls_back_then_commits_once_before_safe_revoke(
+    db_session, monkeypatch, caplog
+):
+    db, user, _ = db_session
+    db.connection().exec_driver_sql("PRAGMA foreign_keys=ON")
+    db.rollback()
+    app = _teardown_app(db, app_id="remote-notes", transport="streamable_http")
+    server = _add_mcp_oauth_server(db, user, name="remote-notes")
+    server.auth = {**server.auth, "app_id": "remote-notes"}
+    association = (
+        db.query(UserMCPServer).filter_by(user_id=user.id, mcpserver_id=server.id).one()
+    )
+    association.can_delete = True
+    client = _add_oauth_client(
+        db,
+        server,
+        metadata_json={"revocation_endpoint": "https://auth.example/revoke"},
+    )
+    for state in ("active", "revoked", "inactive"):
+        db.add(
+            MCPOAuthGrant(
+                mcp_server_id=server.id,
+                user_id=user.id,
+                mcp_oauth_client_id=client.id,
+                resource_owner_key=f"owner-{state}",
+                issuer="https://auth.example",
+                resource="https://mcp.example",
+                scope=state,
+                access_token=encrypt_value(f"{state}-secret"),
+                status=state,
+            )
+        )
+    db.add(
+        MCPOAuthFlowState(
+            state="delete-flow",
+            mcp_server_id=server.id,
+            user_id=user.id,
+            association_lifecycle_generation=association.lifecycle_generation,
+            mcp_oauth_client_id=client.id,
+            resource_owner_key="owner-flow",
+            issuer="https://auth.example",
+            resource="https://mcp.example",
+            scope="notes.read",
+            code_verifier=encrypt_value("flow-secret"),
+            expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+        )
+    )
+    db.commit()
+    ids = int(server.id), int(client.id)
+    fail = {"once": True}
+    commits: list[None] = []
+    revoked_grants: list[int] = []
+
+    @event.listens_for(MCPServer, "before_delete")
+    def fail_first_delete(_mapper, _connection, target):
+        if target.id == ids[0] and fail.pop("once", False):
+            raise RuntimeError("local-secret-detail")
+
+    @event.listens_for(db, "after_commit")
+    def record_commit(_session):
+        commits.append(None)
+
+    kwargs = dict(
+        app_id="remote-notes",
+        expected_provider_name=None,
+        expected_catalog_generation=app.generation,
+        expected_association_generation=association.lifecycle_generation,
+        current_user=user,
+        db=db,
+    )
+    try:
+        with pytest.raises(HTTPException) as exc:
+            await mcp_api.teardown_mcp_app_server(ids[0], **kwargs)
+        assert exc.value.status_code == 500
+        assert db.get(MCPServer, ids[0]) is not None
+        assert db.get(MCPOAuthClient, ids[1]) is not None
+        assert db.query(MCPOAuthGrant).count() == 3
+        assert db.query(MCPOAuthFlowState).count() == 1
+
+        async def fail_revoke(snapshot):
+            assert not db.in_transaction()
+            revoked_grants.append(snapshot.grant_id)
+            raise RuntimeError("remote-secret-detail")
+
+        monkeypatch.setattr(
+            mcp_api, "_revoke_mcp_oauth_grant_snapshot_externally", fail_revoke
+        )
+        await mcp_api.teardown_mcp_app_server(ids[0], **kwargs)
+    finally:
+        event.remove(MCPServer, "before_delete", fail_first_delete)
+        event.remove(db, "after_commit", record_commit)
+
+    assert len(commits) == 1
+    assert db.get(MCPServer, ids[0]) is None
+    assert db.get(MCPOAuthClient, ids[1]) is None
+    assert db.query(MCPOAuthGrant).count() == 0
+    assert db.query(MCPOAuthFlowState).count() == 0
+    assert len(revoked_grants) == 1
+    assert "local-secret-detail" not in caplog.text
+    assert "remote-secret-detail" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("retention", "expected_server", "refused"),
+    [
+        ("plain", False, False),
+        ("shared", True, False),
+        ("team", True, False),
+        ("team-refused", True, True),
+        ("platform", True, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_app_teardown_preserves_only_governed_non_oauth_servers(
+    db_session, monkeypatch, retention, expected_server, refused
+):
+    db, user, other_user = db_session
+    launch = {"command": "notes", "required_env": ["API_KEY"]}
+    app = _teardown_app(db, app_id="local-notes", transport="stdio", **launch)
+    server = MCPServer.from_config(
+        {
+            "name": "local-notes",
+            "managed": "external",
+            "transport": "stdio",
+            "command": "notes",
+            "env": {"API_KEY": "platform"} if retention == "platform" else None,
+        }
+    )
+    db.add(server)
+    db.flush()
+    association = _teardown_association(db, user, server)
+    if retention == "shared":
+        db.add(
+            UserMCPServer(user_id=other_user.id, mcpserver_id=server.id, is_active=True)
+        )
+        db.commit()
+    if retention.startswith("team"):
+        monkeypatch.setattr(
+            connector_team_scope,
+            "delete_team_connector",
+            lambda *args: SimpleNamespace(
+                blocked_reason=None,
+                team_owned=True,
+                authorized=not refused,
+                delete_definition=False,
+            ),
+        )
+
+    call = mcp_api.teardown_mcp_app_server(
+        int(server.id),
+        app_id="local-notes",
+        expected_provider_name=None,
+        expected_catalog_generation=app.generation,
+        expected_association_generation=association.lifecycle_generation,
+        current_user=user,
+        db=db,
+    )
+    if refused:
+        with pytest.raises(HTTPException) as exc:
+            await call
+        assert exc.value.status_code == 403
+    else:
+        await call
+
+    assert (db.get(MCPServer, server.id) is not None) is expected_server
+    assert (db.get(UserMCPServer, association.id) is not None) is refused
+
+
+@pytest.mark.parametrize("replaced", ["catalog", "association", "provider", "server"])
+@pytest.mark.asyncio
+async def test_app_teardown_rejects_replacement_generation(db_session, replaced):
+    db, user, other_user = db_session
+    app = _teardown_app(db, app_id="replace-me", transport="streamable_http")
+    server = _add_mcp_oauth_server(db, user, name="replace-me")
+    association = (
+        db.query(UserMCPServer).filter_by(user_id=user.id, mcpserver_id=server.id).one()
+    )
+    association.can_delete = True
+    db.add(UserMCPServer(user_id=other_user.id, mcpserver_id=server.id, is_active=True))
+    db.commit()
+    catalog_generation = app.generation
+    association_generation = association.lifecycle_generation
+    if replaced == "catalog":
+        db.delete(app)
+        db.commit()
+        replacement = _teardown_app(
+            db, app_id="replace-me", transport="streamable_http"
+        )
+        assert replacement.generation != catalog_generation
+    elif replaced == "association":
+        db.delete(association)
+        db.commit()
+        replacement = _teardown_association(db, user, server)
+        assert replacement.lifecycle_generation != association_generation
+    elif replaced == "provider":
+        app.provider_name = "replacement-provider"
+        db.commit()
+        replacement = app
+    else:
+        db.delete(server)
+        db.commit()
+        replacement = None
+
+    with pytest.raises(HTTPException) as exc:
+        await mcp_api.teardown_mcp_app_server(
+            int(server.id),
+            app_id="replace-me",
+            expected_provider_name=None,
+            expected_catalog_generation=catalog_generation,
+            expected_association_generation=association_generation,
+            current_user=user,
+            db=db,
+        )
+
+    assert exc.value.status_code == (
+        404 if replaced in {"association", "server"} else 403
+    )
+    assert (db.get(MCPServer, server.id) is not None) is (replaced != "server")
+    if replacement is not None:
+        db.refresh(replacement)
+
+
+@pytest.mark.parametrize("replaced", ["catalog", "association"])
+def test_app_teardown_serializes_later_sqlite_replacement(
+    db_session, monkeypatch, replaced
+):
+    db, user, other_user = db_session
+    app = _teardown_app(db, app_id="serialize-me", transport="streamable_http")
+    server = _add_mcp_oauth_server(db, user, name="serialize-me")
+    association = (
+        db.query(UserMCPServer).filter_by(user_id=user.id, mcpserver_id=server.id).one()
+    )
+    association.can_delete = True
+    db.add(UserMCPServer(user_id=other_user.id, mcpserver_id=server.id, is_active=True))
+    db.commit()
+    ids = int(user.id), int(server.id)
+    generations = app.generation, association.lifecycle_generation
+    factory = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    identity_locked = threading.Event()
+    release_teardown = threading.Event()
+    mutation_sent = threading.Event()
+    mutation_done = threading.Event()
+    mutation_thread_id: list[int] = []
+    replacement_generation: list[object] = []
+    real_owner_check = mcp_api._locked_catalog_app_for_server
+
+    def hold_identity(*args, **kwargs):
+        result = real_owner_check(*args, **kwargs)
+        identity_locked.set()
+        assert release_teardown.wait(timeout=5)
+        return result
+
+    def observe_mutation(_conn, _cursor, statement, _params, _context, _many):
+        if (
+            mutation_thread_id
+            and threading.get_ident() == mutation_thread_id[0]
+            and statement.lstrip().startswith("DELETE FROM")
+        ):
+            mutation_sent.set()
+
+    monkeypatch.setattr(mcp_api, "_locked_catalog_app_for_server", hold_identity)
+    event.listen(db.get_bind(), "before_cursor_execute", observe_mutation)
+
+    def teardown():
+        with factory() as teardown_db:
+            asyncio.run(
+                mcp_api.teardown_mcp_app_server(
+                    ids[1],
+                    app_id="serialize-me",
+                    expected_provider_name=None,
+                    expected_catalog_generation=generations[0],
+                    expected_association_generation=generations[1],
+                    current_user=teardown_db.get(User, ids[0]),
+                    db=teardown_db,
+                )
+            )
+
+    def replace():
+        mutation_thread_id.append(threading.get_ident())
+        with factory() as mutation_db:
+            if replaced == "catalog":
+                mutation_db.query(PublicMCPApp).filter_by(
+                    app_id="serialize-me"
+                ).delete()
+                replacement = PublicMCPApp(
+                    app_id="serialize-me",
+                    name="Serialize Me",
+                    transport="streamable_http",
+                )
+            else:
+                mutation_db.query(UserMCPServer).filter_by(
+                    user_id=ids[0], mcpserver_id=ids[1]
+                ).delete()
+                replacement = UserMCPServer(
+                    user_id=ids[0], mcpserver_id=ids[1], is_active=True
+                )
+            mutation_db.add(replacement)
+            mutation_db.commit()
+            replacement_generation.append(
+                replacement.generation
+                if replaced == "catalog"
+                else replacement.lifecycle_generation
+            )
+        mutation_done.set()
+
+    teardown_thread = threading.Thread(target=teardown)
+    mutation_thread = threading.Thread(target=replace)
+    try:
+        teardown_thread.start()
+        assert identity_locked.wait(timeout=5)
+        mutation_thread.start()
+        assert mutation_sent.wait(timeout=5)
+        assert not mutation_done.wait(timeout=0.2)
+        release_teardown.set()
+        teardown_thread.join(timeout=5)
+        mutation_thread.join(timeout=5)
+    finally:
+        release_teardown.set()
+        event.remove(db.get_bind(), "before_cursor_execute", observe_mutation)
+
+    assert not teardown_thread.is_alive() and not mutation_thread.is_alive()
+    expected_index = 0 if replaced == "catalog" else 1
+    assert replacement_generation[0] != generations[expected_index]
