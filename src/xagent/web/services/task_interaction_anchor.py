@@ -182,8 +182,17 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
        belongs to another run. Checked in Python against the fetched row's
        own data, not via ``trace_event_staging.checkpoint_run_partition_filter``
        (that predicate compiles to SQL for a query's ``WHERE`` clause; this
-       function already has the one candidate row in hand), but the same
-       equality semantics.
+       function already has the one candidate row in hand), but the two
+       sides no longer share the same equality semantics. This resolver
+       compares the row's run field against ``task.run_id`` directly. The
+       checkpoint read path instead compares it against the partition
+       ``DatabaseTraceHandler._root_checkpoint_read_partition`` resolved
+       (``trace_handlers.py``), which since #2091 can be ``None`` -- the
+       untagged partition -- while ``task.run_id`` is non-null, for a task
+       that has never written a run-tagged checkpoint. In that state the
+       read path accepts an untagged row that this resolver classifies as
+       corrupt. Aligning the two is #NNN2; this resolver has no production
+       callers today, so the divergence has no live impact yet.
     6. ``row_execution_id and row_execution_id != execution_id`` --
        execution identity mismatch. An empty ``row_execution_id`` (a legacy
        row with no identity field) short-circuits past this condition on

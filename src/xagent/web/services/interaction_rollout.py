@@ -173,6 +173,13 @@ COUNTER_ANCHOR_ABSENT_NO_RUN = "anchor.absent_no_run"
 COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER = "anchor.unavailable_dangling_pointer"
 COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE = "anchor.absent_legacy_checkpoint_type"
 
+# Incremented by DatabaseTraceHandler._root_checkpoint_read_partition
+# (web/api/trace_handlers.py) each time a lease-bound read widens to the
+# untagged partition because the task has no run-tagged checkpoint yet.
+# The widening is a self-extinguishing compatibility window: this count
+# going to zero and staying there is the evidence that removing it is safe.
+COUNTER_CHECKPOINT_READ_PARTITION_WIDENED = "checkpoint.read_partition_widened"
+
 # Two constants below are actively incremented, both from
 # task_interaction_service.py: COUNTER_COMPAT_READ_FALLBACK by the
 # compatibility view, COUNTER_LIFECYCLE_RESPONSE_CONFLICT by respond().

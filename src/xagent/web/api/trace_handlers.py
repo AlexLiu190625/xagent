@@ -30,6 +30,10 @@ from ...web.models.task import Task, TaskStatus
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.task_interaction import TaskInteractionRequest
 from ...web.models.tool_config import ToolUsage
+from ...web.services.interaction_rollout import (
+    COUNTER_CHECKPOINT_READ_PARTITION_WIDENED,
+    increment_counter,
+)
 from ...web.services.ops_signals import (
     CHECKPOINT_DECODE_FALLBACK,
     CHECKPOINT_LOAD_UNAVAILABLE,
@@ -413,6 +417,16 @@ class DatabaseTraceHandler(BaseTraceHandler):
         surfacing the read as incomplete. Callers rely on this raising
         ``CheckpointUnavailableError`` rather than returning a false
         negative.
+
+        The probe is deliberately scoped to the task and carries no
+        execution-identity filter, while the read it feeds is
+        execution-scoped. Narrowing it to the execution would reopen
+        cross-run isolation: a task whose execution A already carries a
+        tagged checkpoint would widen execution B's partition too, and let
+        one run's checkpoint be served to another. It is safe today because
+        the web path pins ``execution_id`` to the task id (the same fact
+        ``_load_pk_anchored_checkpoint``'s docstring already states), and
+        build-scoped readers never reach this helper.
         """
         try:
             return (
@@ -432,6 +446,20 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 is not None
             )
         except Exception as exc:
+            # This helper translates the driver failure itself, so the
+            # caller's raw-exception arm -- which registers this signal for
+            # every other partition-resolution failure -- is never reached.
+            # Register here so the failure stays visible on /health.
+            register_degradation(
+                CHECKPOINT_LOAD_UNAVAILABLE,
+                f"task {self.task_id}: checkpoint partition probe failed",
+            )
+            logger.error(
+                "task %s: run-tag probe failed while resolving the checkpoint "
+                "read partition",
+                self.task_id,
+                exc_info=True,
+            )
             raise CheckpointUnavailableError(
                 f"task {self.task_id}: could not determine whether a "
                 "run-tagged checkpoint exists"
@@ -452,8 +480,8 @@ class DatabaseTraceHandler(BaseTraceHandler):
         resume read the checkpoint that was written before partitioning
         existed, under the task's previous (unminted) run. The widening is
         self-extinguishing -- the first checkpoint written under the newly
-        minted run tags the task, and the probe below starts returning
-        ``True`` for this task from then on.
+        minted run tags the task, and ``_task_has_run_tagged_checkpoint``
+        starts returning ``True`` for this task from then on.
 
         Legacy (unleased) callers can read only untagged rows, and only
         while the task has no active run and no run has ever been tagged.
@@ -480,6 +508,12 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # bound run was just minted by a resume and the only checkpoint
             # on record predates partitioning. Widen to the legacy partition
             # so it stays readable instead of refusing on a technicality.
+            increment_counter(COUNTER_CHECKPOINT_READ_PARTITION_WIDENED)
+            logger.info(
+                "task %s: no run-tagged checkpoint on record; widening the "
+                "checkpoint read partition to the untagged rows",
+                self.task_id,
+            )
             return None
 
         task_run = db.query(Task.run_id).filter(Task.id == self.task_id).one_or_none()

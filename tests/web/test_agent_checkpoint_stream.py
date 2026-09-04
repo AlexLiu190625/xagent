@@ -1972,9 +1972,12 @@ def test_read_partition_keeps_bound_run_when_a_tagged_checkpoint_exists(
 
 
 def test_readable_checkpoint_type_count_has_not_drifted() -> None:
-    """Guards the parametrization below: if this ever changes, the
-    parametrized case count for every readable checkpoint type must be
-    revisited alongside it."""
+    """The parametrization below derives from
+    ``sorted(READABLE_CHECKPOINT_TYPES)``, so a newly added readable type
+    already produces its own case automatically -- this assertion cannot
+    catch a silently skipped one. Its job is to make adding a readable type
+    a deliberate act: whoever changes this set must come here and confirm
+    the widening's coupling to it still holds."""
     assert len(READABLE_CHECKPOINT_TYPES) == 2
 
 
@@ -2031,17 +2034,7 @@ def test_legacy_checkpoint_is_read_after_a_run_id_is_minted(
         db.close()
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
-        "task_id",
-        "event_type",
-        "build_id",
-        "checkpoint_type",
-        "run_partition",
-        "execution_id",
-    ],
-)
+@pytest.mark.parametrize("field", _PK_ANCHOR_SINGLE_FAULT_FIELDS)
 def test_widened_partition_still_rejects_a_row_failing_any_other_condition(
     monkeypatch: pytest.MonkeyPatch,
     field: str,
@@ -2118,18 +2111,79 @@ def test_widened_partition_still_rejects_a_row_failing_any_other_condition(
         db.close()
 
 
-def test_read_partition_probe_failure_is_unavailable_not_absence(
+def test_probe_db_failure_raises_unavailable_and_registers_signal() -> None:
+    """``_task_has_run_tagged_checkpoint`` must translate its own driver
+    failure into ``CheckpointUnavailableError`` -- with the message only its
+    own except arm produces, distinguishing it from the caller's raw-
+    exception arm, which raises the same error type for every other
+    partition-resolution failure -- and must register
+    ``CHECKPOINT_LOAD_UNAVAILABLE`` itself, since the caller's arm that
+    normally does so is never reached. Calls the helper directly with a stub
+    session, so nothing in the DB layer is patched."""
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    class _BrokenFirstQuery:
+        def filter(self, *args: Any, **kwargs: Any) -> "_BrokenFirstQuery":
+            return self
+
+        def first(self) -> Any:
+            raise OperationalError("boom", {}, Exception("boom"))
+
+    class _StubSession:
+        def query(self, *args: Any, **kwargs: Any) -> _BrokenFirstQuery:
+            return _BrokenFirstQuery()
+
+    clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    try:
+        with pytest.raises(CheckpointUnavailableError) as exc_info:
+            DatabaseTraceHandler(1)._task_has_run_tagged_checkpoint(
+                _StubSession()  # type: ignore[arg-type]
+            )
+        assert "could not determine whether a run-tagged checkpoint exists" in str(
+            exc_info.value
+        )
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+
+
+@pytest.mark.parametrize("leased", [True, False])
+def test_probe_failure_registers_signal_from_both_callers(
     monkeypatch: pytest.MonkeyPatch,
+    leased: bool,
 ) -> None:
-    """A DB failure while probing for a tagged checkpoint must not collapse
-    into "no tagged row, widen the partition" -- that would turn a failed
-    read into a silent, possibly wrong, partition decision. It must surface
-    as the read being unavailable."""
-    SessionLocal, db, task = _create_trace_handler_test_task("probe-failure")
-    task.status = TaskStatus.RUNNING
-    task.runner_id = "runner-a"
-    task.run_id = "run-a"
-    db.commit()
+    """The signal the probe registers on its own DB failure must reach
+    /health from both of its call sites: a lease-bound reader (which reaches
+    it directly) and a legacy unleased reader (which reaches it only after
+    the task has no active run). Patches ``Query.first`` selectively -- only
+    for the probe's own query, which is the only one in the read path
+    selecting ``DatabaseTraceEvent.id`` alone -- so this fails loudly if the
+    probe stops issuing that query instead of passing for the wrong
+    reason."""
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal, db, task = _create_trace_handler_test_task(
+        f"probe-failure-signal-{'leased' if leased else 'unleased'}"
+    )
+    if leased:
+        task.status = TaskStatus.RUNNING
+        task.runner_id = "runner-a"
+        task.run_id = "run-a"
+        db.commit()
+    else:
+        # No lease bound below, and the task must carry no active run --
+        # otherwise _root_checkpoint_read_partition refuses on "active_run"
+        # before ever calling the probe. Task.run_id defaults to None.
+        assert task.run_id is None
+
     task_id = int(task.id)
 
     def get_test_db() -> Iterator[Session]:
@@ -2141,18 +2195,36 @@ def test_read_partition_probe_failure_is_unavailable_not_absence(
 
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
-    def broken_first(self: Query) -> Any:
-        raise OperationalError("boom", {}, Exception("boom"))
+    original_first = Query.first
 
-    monkeypatch.setattr(Query, "first", broken_first)
+    def selective_first(self: Query) -> Any:
+        # Raise only for the run-tag probe's query -- it is the only one
+        # selecting DatabaseTraceEvent.id alone. Every other .first() in the
+        # read path runs normally, so this test fails loudly if the probe
+        # stops issuing that query instead of passing for the wrong reason.
+        descriptions = [d.get("name") for d in self.column_descriptions]
+        if descriptions == ["id"]:
+            raise OperationalError("boom", {}, Exception("boom"))
+        return original_first(self)
 
+    monkeypatch.setattr(Query, "first", selective_first)
+
+    clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
     try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+        if leased:
+            with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+                with pytest.raises(CheckpointUnavailableError):
+                    DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                        "shared-execution"
+                    )
+        else:
             with pytest.raises(CheckpointUnavailableError):
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
                 )
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
     finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
         db.close()
 
 
@@ -2236,13 +2308,131 @@ def test_widening_self_extinguishes_after_the_first_tagged_checkpoint(
         db.close()
 
 
-def test_two_concurrent_readers_both_resolve_the_same_legacy_checkpoint(
+def test_widening_increments_its_counter_only_when_it_engages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two independent readers racing to resolve the same widened partition
-    must not disagree -- both are answering the same query against the same
-    committed rows, so both must resolve to the one legacy checkpoint on
-    record, never to ``None`` for either of them."""
+    """``COUNTER_CHECKPOINT_READ_PARTITION_WIDENED`` must move exactly when
+    the lease-bound branch actually widens the read partition: once for a
+    read that widens, not again once the run's own tagged checkpoint
+    narrows the partition back, and not for an unleased reader resolving to
+    the untagged partition through its own pre-existing branch -- that
+    branch is legacy behaviour this PR does not change, not the widening it
+    adds. Uses ``counters_snapshot()`` deltas, never absolute values: the
+    counter is process-global and other tests in the same process increment
+    it too."""
+    from xagent.web.services.interaction_rollout import (
+        COUNTER_CHECKPOINT_READ_PARTITION_WIDENED,
+        counters_snapshot,
+    )
+
+    def widened_count() -> int:
+        return counters_snapshot().get(COUNTER_CHECKPOINT_READ_PARTITION_WIDENED, 0)
+
+    SessionLocal, db, task = _create_trace_handler_test_task("widening-counter")
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="legacy-checkpoint",
+            execution_id="shared-execution",
+            label="legacy",
+            timestamp=datetime.now(timezone.utc),
+        )
+    )
+    db.commit()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            # 1. No run-tagged checkpoint yet: the lease-bound read widens,
+            # and the counter moves by exactly one.
+            before = widened_count()
+            assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "shared-execution"
+            ) == {"label": "legacy"}
+            assert widened_count() - before == 1
+
+            DatabaseTraceHandler(task_id)._save_trace_event(
+                db,
+                TraceEvent(
+                    CHECKPOINT_EVENT_TYPE,
+                    task_id=str(task_id),
+                    data={
+                        "checkpoint_type": CHECKPOINT_TYPE,
+                        "execution_id": "shared-execution",
+                        "snapshot": {"label": "new"},
+                    },
+                ),
+            )
+            db.commit()
+
+            # 2. The run now has a tagged checkpoint of its own: the
+            # partition narrows back, so this read does not widen -- the
+            # counter must not move again.
+            before = widened_count()
+            assert DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "shared-execution"
+            ) == {"label": "new"}
+            assert widened_count() - before == 0
+    finally:
+        db.close()
+
+    # 3. An unleased reader with no active run and no tagged row resolves
+    # to the untagged partition through the unleased branch's own
+    # pre-existing return None, not the lease-bound widening this PR adds
+    # -- the counter must not move.
+    SessionLocal2, db2, task2 = _create_trace_handler_test_task(
+        "widening-counter-unleased"
+    )
+    task2_id = int(task2.id)
+    db2.add(
+        _checkpoint_trace_row(
+            task_id=task2_id,
+            event_id="legacy-checkpoint",
+            execution_id="shared-execution",
+            label="legacy",
+            timestamp=datetime.now(timezone.utc),
+        )
+    )
+    db2.commit()
+
+    def get_test_db2() -> Iterator[Session]:
+        session = SessionLocal2()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db2)
+
+    try:
+        before = widened_count()
+        assert DatabaseTraceHandler(task2_id)._sync_load_latest_checkpoint(
+            "shared-execution"
+        ) == {"label": "legacy"}
+        assert widened_count() - before == 0
+    finally:
+        db2.close()
+
+
+def test_repeated_widened_partition_reads_return_the_same_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two sequential reads on one thread, under one lease context, over
+    unchanged committed rows, must both resolve the widened partition to the
+    same legacy checkpoint rather than one of them returning ``None``."""
     SessionLocal, db, task = _create_trace_handler_test_task("concurrent-readers")
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
