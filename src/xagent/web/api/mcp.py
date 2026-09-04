@@ -1592,9 +1592,9 @@ def _resolve_mcp_server_for_request(
     if server is not None and not already_decided:
         try:
             access = resolve_one_connector_access_or_raise(
-                db, int(user_id), ("mcp", int(server.id))
+                db, user_id, ("mcp", int(server.id))
             )
-        except ConnectorRuntimeError:
+        except ConnectorRuntimeError as exc:
             # Degrade only when the caller's own personal row already got
             # them past the gate. With no personal row the verdict *is*
             # the gate, and degrading it to None would answer "does not
@@ -1602,11 +1602,12 @@ def _resolve_mcp_server_for_request(
             if user_mcp is None or on_resolution_failure == "raise":
                 raise
             logger.warning(
-                "Connector access resolution failed for MCP server %s "
+                "Connector access resolution failed (%s) for MCP server %s "
                 "while reading it for user %s; reporting "
                 "can_edit_global=False",
-                int(server_id),
-                int(user_id),
+                exc,
+                server_id,
+                user_id,
             )
             access = None
 
@@ -2677,11 +2678,12 @@ def list_mcp_apps(
                 verdicts = resolve_connector_access_or_raise(
                     db, user_id_for_log, access_refs
                 )
-            except ConnectorRuntimeError:
+            except ConnectorRuntimeError as exc:
                 logger.warning(
-                    "Connector access resolution failed while listing %s "
+                    "Connector access resolution failed (%s) while listing %s "
                     "local connectors for user %s; reporting "
                     "can_configure=False for those rows",
+                    exc,
                     len(access_refs),
                     user_id_for_log,
                 )
@@ -2947,11 +2949,12 @@ def get_mcp_servers(
                 verdicts = resolve_connector_access_or_raise(
                     db, effective_user_id, access_refs
                 )
-            except ConnectorRuntimeError:
+            except ConnectorRuntimeError as exc:
                 logger.warning(
-                    "Connector access resolution failed while listing %s "
+                    "Connector access resolution failed (%s) while listing %s "
                     "connectors for user %s; reporting can_edit_global=False "
                     "for those rows",
+                    exc,
                     len(access_refs),
                     effective_user_id,
                 )
@@ -3610,10 +3613,11 @@ def connect_mcp_app(
         team_access = resolve_one_connector_access_or_raise(
             db, user_id_for_log, ("mcp", server_id_for_log)
         )
-    except ConnectorRuntimeError:
+    except ConnectorRuntimeError as exc:
         logger.warning(
-            "Connector access resolution failed for MCP server %s after "
+            "Connector access resolution failed (%s) for MCP server %s after "
             "connecting it for user %s; reporting can_edit_global=False",
+            exc,
             server_id_for_log,
             user_id_for_log,
         )
@@ -4308,6 +4312,12 @@ def update_mcp_server(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid user environment variables: {exc}",
                 ) from exc
+            # ``Any`` rather than ``UserMCPServer``: what mypy rejects is
+            # assigning through a ``Column[...]``-typed attribute, so a
+            # concrete cast fails here with "expression has type
+            # ``dict[Any, Any] | None``, variable has type ``Column[Any]``".
+            # Four sibling call sites in this module take the same escape
+            # hatch for the same reason.
             cast(Any, user_mcp).env = encrypt_env_dict(merged_user_env) or None
 
         # Update user association if needed
@@ -4644,10 +4654,11 @@ def toggle_mcp_server(
             team_access = resolve_one_connector_access_or_raise(
                 db, user_id_for_log, ("mcp", server_id_for_log)
             )
-        except ConnectorRuntimeError:
+        except ConnectorRuntimeError as exc:
             logger.warning(
-                "Connector access resolution failed for MCP server %s after "
+                "Connector access resolution failed (%s) for MCP server %s after "
                 "toggling it for user %s; reporting can_edit_global=False",
+                exc,
                 server_id_for_log,
                 user_id_for_log,
             )
