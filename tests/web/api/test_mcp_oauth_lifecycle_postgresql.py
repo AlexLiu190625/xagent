@@ -8,9 +8,10 @@ import time
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import event, text
 from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
@@ -122,6 +123,20 @@ def _seed_lifecycle(factory, *, flow_consumed: bool = True):
             "catalog_id": int(app.id),
             "other_catalog_id": int(other_app.id),
         }
+
+
+def _discovery():
+    return SimpleNamespace(
+        resource="https://mcp.example.com/mcp",
+        scopes=("records.read",),
+        authorization_server=SimpleNamespace(
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+            registration_endpoint="https://auth.example.com/register",
+            raw={},
+        ),
+    )
 
 
 def _callback_request(state: str) -> Request:
@@ -672,3 +687,190 @@ def test_real_callback_producer_blocks_disconnect_until_grant_commit(
             .count()
             == 1
         )
+
+
+def test_connect_rejects_delete_during_discovery(
+    postgresql_engine, monkeypatch
+) -> None:
+    factory = sessionmaker(bind=postgresql_engine, autoflush=False, autocommit=False)
+    seed = _seed_lifecycle(factory, flow_consumed=False)
+    delete_locked = threading.Event()
+    allow_delete = threading.Event()
+    connect_lock_attempted = threading.Event()
+    connect_finished = threading.Event()
+    connect_results: list[Any] = []
+    connect_errors: list[BaseException] = []
+    delete_errors: list[BaseException] = []
+
+    async def discover(*args, **kwargs):
+        return _discovery()
+
+    async def register(*args, **kwargs):
+        return SimpleNamespace(
+            client_id="postgres-dynamic-client",
+            token_endpoint_auth_method="none",
+        )
+
+    def gated_team_delete(*args):
+        delete_locked.set()
+        assert allow_delete.wait(timeout=5)
+        return SimpleNamespace(
+            blocked_reason=None,
+            team_owned=False,
+            authorized=False,
+            delete_definition=False,
+        )
+
+    original_lock = mcp_api._lock_active_mcp_oauth_lifecycle
+
+    def record_connect_lock(*args, **kwargs):
+        if threading.current_thread().name == "postgres-connect":
+            connect_lock_attempted.set()
+        return original_lock(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_api, "_discover_mcp_oauth_for_server", discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", register)
+    monkeypatch.setattr(
+        mcp_api,
+        "_lock_active_mcp_oauth_lifecycle",
+        record_connect_lock,
+    )
+    monkeypatch.setattr(
+        connector_team_scope,
+        "delete_team_connector",
+        gated_team_delete,
+    )
+
+    def delete() -> None:
+        try:
+            with factory() as delete_db:
+                asyncio.run(
+                    mcp_api.delete_mcp_server(
+                        seed["server_id"],
+                        current_user=delete_db.get(User, seed["user_id"]),
+                        db=delete_db,
+                    )
+                )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            delete_errors.append(exc)
+
+    def connect() -> None:
+        try:
+            with factory() as connect_db:
+                connect_results.append(
+                    asyncio.run(
+                        mcp_api.connect_mcp_oauth(
+                            seed["server_id"],
+                            mcp_api.MCPOAuthConnectRequest(
+                                redirect_after="/settings/mcp"
+                            ),
+                            current_user=connect_db.get(User, seed["user_id"]),
+                            db=connect_db,
+                            accept="application/json",
+                        )
+                    )
+                )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            connect_errors.append(exc)
+        finally:
+            connect_finished.set()
+
+    delete_thread = threading.Thread(target=delete, name="postgres-delete")
+    delete_thread.start()
+    assert delete_locked.wait(timeout=5)
+    connect_thread = threading.Thread(target=connect, name="postgres-connect")
+    connect_thread.start()
+    assert connect_lock_attempted.wait(timeout=5)
+    assert not connect_finished.wait(timeout=0.2)
+    allow_delete.set()
+    delete_thread.join(timeout=5)
+    connect_thread.join(timeout=5)
+
+    assert not delete_thread.is_alive()
+    assert not connect_thread.is_alive()
+    assert delete_errors == []
+    assert connect_results == []
+    assert len(connect_errors) == 1
+    assert isinstance(connect_errors[0], HTTPException)
+    assert connect_errors[0].status_code == 409
+    with factory() as verify_db:
+        assert (
+            verify_db.query(MCPOAuthFlowState)
+            .filter(MCPOAuthFlowState.user_id == seed["user_id"])
+            .count()
+            == 0
+        )
+        assert (
+            verify_db.query(UserMCPServer)
+            .filter(UserMCPServer.mcpserver_id == seed["server_id"])
+            .count()
+            == 1
+        )
+
+
+def test_callback_rejects_deactivation_during_exchange(
+    postgresql_engine, monkeypatch
+) -> None:
+    factory = sessionmaker(bind=postgresql_engine, autoflush=False, autocommit=False)
+    seed = _seed_lifecycle(factory, flow_consumed=False)
+    exchange_started = threading.Event()
+    allow_exchange = threading.Event()
+    callback_results: list[Any] = []
+    callback_errors: list[BaseException] = []
+
+    async def exchange_code(**kwargs):
+        exchange_started.set()
+        assert allow_exchange.wait(timeout=5)
+        return {
+            "access_token": "deactivated-callback-token",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", exchange_code)
+
+    def callback() -> None:
+        try:
+            with factory() as callback_db:
+                callback_results.append(
+                    asyncio.run(
+                        mcp_api.mcp_oauth_callback(
+                            _callback_request("postgres-flow-state"), callback_db
+                        )
+                    )
+                )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            callback_errors.append(exc)
+
+    callback_thread = threading.Thread(target=callback, name="postgres-callback")
+    callback_thread.start()
+    assert exchange_started.wait(timeout=5)
+    with factory() as deactivate_db:
+        response = mcp_api.update_mcp_server(
+            seed["server_id"],
+            mcp_api.MCPServerUpdate(is_active=False),
+            current_user=deactivate_db.get(User, seed["user_id"]),
+            db=deactivate_db,
+        )
+        assert response.is_active is False
+    allow_exchange.set()
+    callback_thread.join(timeout=5)
+
+    assert not callback_thread.is_alive()
+    assert callback_errors == []
+    assert len(callback_results) == 1
+    callback_response = callback_results[0]
+    assert callback_response.status_code == 307
+    callback_query = parse_qs(urlparse(callback_response.headers["location"]).query)
+    assert callback_query["mcp_oauth_error"] == ["invalid_state"]
+    with factory() as verify_db:
+        assert verify_db.query(MCPOAuthGrant).count() == 0
+        association = (
+            verify_db.query(UserMCPServer)
+            .filter(
+                UserMCPServer.user_id == seed["user_id"],
+                UserMCPServer.mcpserver_id == seed["server_id"],
+            )
+            .one()
+        )
+        assert association.is_active is False

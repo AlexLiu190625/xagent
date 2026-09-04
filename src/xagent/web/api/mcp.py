@@ -558,6 +558,40 @@ def _default_resource_owner_key(user_id: int) -> str:
     return f"xagent:user:{user_id}"
 
 
+def _has_actor_owned_mcp_oauth_state(
+    db: Session,
+    *,
+    server_id: int,
+    user_id: int,
+) -> bool:
+    """Whether generic deletion would cross an actor ownership boundary."""
+    default_owner = _default_resource_owner_key(user_id)
+    actor_grant = (
+        db.query(MCPOAuthGrant.id)
+        .filter(
+            MCPOAuthGrant.mcp_server_id == server_id,
+            MCPOAuthGrant.user_id == user_id,
+            MCPOAuthGrant.resource_owner_key != default_owner,
+            MCPOAuthGrant.status == "active",
+        )
+        .first()
+    )
+    if actor_grant is not None:
+        return True
+
+    return (
+        db.query(MCPOAuthFlowState.id)
+        .filter(
+            MCPOAuthFlowState.mcp_server_id == server_id,
+            MCPOAuthFlowState.user_id == user_id,
+            MCPOAuthFlowState.resource_owner_key != default_owner,
+            MCPOAuthFlowState.expires_at > _utc_now(),
+        )
+        .first()
+        is not None
+    )
+
+
 def _oauth_authorization_url(endpoint: str, params: dict[str, str]) -> str:
     parts = urlsplit(endpoint)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
@@ -928,6 +962,8 @@ def _sweep_expired_mcp_oauth_flow_states(db: Session) -> None:
                 MCPOAuthFlowState.expires_at
                 < _utc_now() - MCP_OAUTH_FLOW_STATE_RETENTION
             )
+            .order_by(MCPOAuthFlowState.id)
+            .with_for_update(skip_locked=True)
             .limit(MCP_OAUTH_FLOW_STATE_SWEEP_BATCH)
             .scalar_subquery()
         )
@@ -4531,6 +4567,16 @@ async def delete_mcp_server(
                 detail="You do not have permission to delete this MCP server",
             )
 
+        if _has_actor_owned_mcp_oauth_state(
+            db,
+            server_id=server_id,
+            user_id=int(user_id),
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="MCP server has actor-owned OAuth connections",
+            )
+
         server_name = str(server.name)
 
         from ..services.connector_team_scope import delete_team_connector
@@ -5472,6 +5518,7 @@ async def get_mcp_oauth_status(
         server_id=server_id,
         user_id=user_id,
         auth_config=auth_config if isinstance(auth_config, dict) else {},
+        resource_owner_key=_default_resource_owner_key(user_id),
     )
     return MCPOAuthStatusResponse(
         server_id=server_id,
@@ -5504,6 +5551,7 @@ async def delete_mcp_oauth_grant(
             MCPOAuthGrant.id == grant_id,
             MCPOAuthGrant.mcp_server_id == server_id,
             MCPOAuthGrant.user_id == user_id,
+            MCPOAuthGrant.resource_owner_key == _default_resource_owner_key(user_id),
         )
         .first()
     )

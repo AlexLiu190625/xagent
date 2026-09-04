@@ -233,7 +233,7 @@ def _add_callback_client_and_state(
         user_id=user.id,
         association_lifecycle_generation=association_generation,
         mcp_oauth_client_id=client.id,
-        resource_owner_key="resource-owner-a",
+        resource_owner_key=mcp_api._default_resource_owner_key(user.id),
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
         scope="records.read",
@@ -2803,6 +2803,125 @@ async def test_local_mcp_oauth_listing_omits_auth_type_when_deactivated(db_sessi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("actor_state", ["grant", "flow"])
+async def test_delete_mcp_server_rejects_actor_owned_oauth_state(
+    db_session, actor_state
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(db, server)
+    default_owner = mcp_api._default_resource_owner_key(user.id)
+    actor_owner = "toby:slack:workspace:alice"
+    state_rows: list[MCPOAuthGrant | MCPOAuthFlowState] = [
+        MCPOAuthGrant(
+            mcp_server_id=server.id,
+            user_id=user.id,
+            mcp_oauth_client_id=client.id,
+            resource_owner_key=default_owner,
+            issuer="https://auth.example.com",
+            resource="https://mcp.example.com/mcp",
+            scope="records.read",
+            access_token=encrypt_value("default-access-token"),
+        )
+    ]
+    if actor_state == "grant":
+        state_rows.append(
+            MCPOAuthGrant(
+                mcp_server_id=server.id,
+                user_id=user.id,
+                mcp_oauth_client_id=client.id,
+                resource_owner_key=actor_owner,
+                issuer="https://auth.example.com",
+                resource="https://mcp.example.com/mcp",
+                scope="records.read",
+                access_token=encrypt_value("actor-access-token"),
+            )
+        )
+    else:
+        state_rows.append(
+            MCPOAuthFlowState(
+                state="actor-flow",
+                mcp_server_id=server.id,
+                user_id=user.id,
+                mcp_oauth_client_id=client.id,
+                resource_owner_key=actor_owner,
+                issuer="https://auth.example.com",
+                resource="https://mcp.example.com/mcp",
+                scope="records.read",
+                code_verifier=encrypt_value("verifier"),
+                expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+            )
+        )
+    db.add_all(state_rows)
+    db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await delete_mcp_server(server.id, current_user=user, db=db)
+
+    assert exc.value.status_code == 409
+    assert db.query(MCPOAuthGrant).count() == (2 if actor_state == "grant" else 1)
+    assert db.query(MCPOAuthFlowState).count() == (1 if actor_state == "flow" else 0)
+    assert (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one_or_none()
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_mcp_server_ignores_terminal_actor_oauth_state(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(db, server)
+    actor_owner = "toby:slack:workspace:alice"
+    db.add_all(
+        [
+            MCPOAuthGrant(
+                mcp_server_id=server.id,
+                user_id=user.id,
+                mcp_oauth_client_id=client.id,
+                resource_owner_key=actor_owner,
+                issuer="https://auth.example.com",
+                resource="https://mcp.example.com/mcp",
+                scope="records.read",
+                access_token=encrypt_value("actor-access-token"),
+                status="revoked",
+            ),
+            MCPOAuthFlowState(
+                state="expired-actor-flow",
+                mcp_server_id=server.id,
+                user_id=user.id,
+                mcp_oauth_client_id=client.id,
+                resource_owner_key=actor_owner,
+                issuer="https://auth.example.com",
+                resource="https://mcp.example.com/mcp",
+                scope="records.read",
+                code_verifier=encrypt_value("verifier"),
+                expires_at=mcp_api._utc_now() - timedelta(minutes=1),
+            ),
+        ]
+    )
+    db.commit()
+    server_id = int(server.id)
+
+    await delete_mcp_server(server_id, current_user=user, db=db)
+
+    assert (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server_id,
+        )
+        .one_or_none()
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_delete_mcp_server_revokes_only_the_disconnecting_users_grant(
     db_session, monkeypatch
 ):
@@ -3769,7 +3888,7 @@ async def test_callback_without_expires_in_clears_existing_grant_expiry(
         mcp_server_id=server.id,
         user_id=user.id,
         mcp_oauth_client_id=client.id,
-        resource_owner_key="resource-owner-a",
+        resource_owner_key=mcp_api._default_resource_owner_key(user.id),
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
         scope="records.read",
@@ -4146,7 +4265,7 @@ async def test_callback_reports_token_exchange_failure(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_status_and_delete_are_scoped_to_current_user(db_session):
+async def test_status_and_delete_are_scoped_to_default_owner(db_session):
     db, user, other_user = db_session
     server = _add_mcp_oauth_server(db, user)
     client = _add_oauth_client(db, server)
@@ -4154,25 +4273,36 @@ async def test_status_and_delete_are_scoped_to_current_user(db_session):
         mcp_server_id=server.id,
         user_id=user.id,
         mcp_oauth_client_id=client.id,
-        resource_owner_key="resource-owner-a",
+        resource_owner_key=mcp_api._default_resource_owner_key(user.id),
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
         scope="records.read",
         access_token=mcp_api.encrypt_value("own-access-token"),
     )
+    actor_grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key="toby:slack:workspace:alice",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token=mcp_api.encrypt_value("actor-access-token"),
+    )
     other_grant = MCPOAuthGrant(
         mcp_server_id=server.id,
         user_id=other_user.id,
         mcp_oauth_client_id=client.id,
-        resource_owner_key="resource-owner-b",
+        resource_owner_key=mcp_api._default_resource_owner_key(other_user.id),
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
         scope="records.read",
         access_token=mcp_api.encrypt_value("other-access-token"),
     )
-    db.add_all([own_grant, other_grant])
+    db.add_all([own_grant, actor_grant, other_grant])
     db.commit()
     db.refresh(own_grant)
+    db.refresh(actor_grant)
     db.refresh(other_grant)
 
     status_response = await get_mcp_oauth_status(server.id, user, db)
@@ -4180,9 +4310,10 @@ async def test_status_and_delete_are_scoped_to_current_user(db_session):
     assert isinstance(status_response, MCPOAuthStatusResponse)
     assert [grant.id for grant in status_response.grants] == [own_grant.id]
 
-    with pytest.raises(mcp_api.HTTPException) as exc:
-        await delete_mcp_oauth_grant(server.id, other_grant.id, user, db)
-    assert exc.value.status_code == 404
+    for foreign_grant in (actor_grant, other_grant):
+        with pytest.raises(mcp_api.HTTPException) as exc:
+            await delete_mcp_oauth_grant(server.id, foreign_grant.id, user, db)
+        assert exc.value.status_code == 404
 
     await delete_mcp_oauth_grant(server.id, own_grant.id, user, db)
     db.refresh(own_grant)
@@ -4446,7 +4577,7 @@ async def test_status_only_reports_grants_matching_current_oauth_config(db_sessi
         mcp_server_id=server.id,
         user_id=user.id,
         mcp_oauth_client_id=stale_client.id,
-        resource_owner_key="resource-owner-a",
+        resource_owner_key=mcp_api._default_resource_owner_key(user.id),
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
         scope="records.read",
@@ -4456,7 +4587,7 @@ async def test_status_only_reports_grants_matching_current_oauth_config(db_sessi
         mcp_server_id=server.id,
         user_id=user.id,
         mcp_oauth_client_id=current_client.id,
-        resource_owner_key="resource-owner-b",
+        resource_owner_key=mcp_api._default_resource_owner_key(user.id),
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
         scope="records.write records.read",
