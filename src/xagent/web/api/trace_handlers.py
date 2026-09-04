@@ -580,6 +580,15 @@ class DatabaseTraceHandler(BaseTraceHandler):
         and a scan that then finds nothing must not report "no checkpoint"
         for a checkpoint that exists and is unreadable.
 
+        One validation mismatch does not raise ``CheckpointCorruptError``.
+        When the caller resolved the widened (untagged) partition and the
+        pointer row nonetheless carries a run tag, a fresh probe decides
+        between the two possible causes: a tagged row found now means the
+        partition was resolved against a snapshot that has since gone
+        stale, which raises ``CheckpointUnavailableError`` so the caller
+        retries; still finding none means the mismatch is real and the
+        usual corrupt classification applies.
+
         The execution-identity check here is verification, not the legacy
         scan's filtering: that scan excludes non-matching rows from its
         candidate set via ``_checkpoint_execution_id_predicate`` before it

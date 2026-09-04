@@ -191,7 +191,13 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
        untagged partition -- while ``task.run_id`` is non-null, for a task
        that has never written a run-tagged checkpoint. In that state the
        read path accepts an untagged row that this resolver classifies as
-       corrupt. Aligning the two is #NNN2; this resolver has no production
+       corrupt. The two also diverge in the opposite direction: when the
+       read path holds the widened partition and the row it examines does
+       carry a run tag, it re-probes and raises a retryable "unavailable"
+       rather than corrupt, because a row and its tag are written together
+       and that combination therefore means its partition decision went
+       stale, not that the data is inconsistent. This resolver has no such
+       step. Aligning the two is #2122; this resolver has no production
        callers today, so the divergence has no live impact yet.
     6. ``row_execution_id and row_execution_id != execution_id`` --
        execution identity mismatch. An empty ``row_execution_id`` (a legacy
