@@ -117,6 +117,7 @@ from ..services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ..services.external_task_cancel import (
+    EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS,
     EXTERNAL_COMMAND_SCOPE,
     cancel_external_task_unserialized,
     external_cancel_exhausted_message,
@@ -9765,6 +9766,13 @@ async def _broadcast_terminal_command_error(
     # variable would drop this site out of its view entirely.
     if is_external_cancel_command(kind=command.kind.value, scope=scope):
         task_status = await _load_terminal_command_task_status(command.task_id)
+        if task_status is TaskStatus.COMPLETED:
+            # Every wording this branch can pick asserts the turn did not
+            # finish cleanly, which is false here - the run completed and
+            # its own completion frame already answered the audience. The
+            # persisted terminal-event draft keeps its audit classification;
+            # nothing renders it to a client.
+            return
         await manager.broadcast_to_task(
             {
                 "type": "agent_error",
@@ -9890,22 +9898,35 @@ async def execute_durable_task_command(
         # Rejections come from handlers that already expose their durable
         # domain-level outcome. The dispatcher makes them terminal immediately.
         _command_origins.discard_command(command.command_id, command.task_id)
+        scope = _command_scope(command)
+        # Two external-scope commands answer an audience with no channel of
+        # its own, so their terminal rejections broadcast here. First-party
+        # rejections keep their handler-owned notifications and are
+        # deliberately not re-broadcast.
+        #
+        # MESSAGE: the external audience's answer travels through the seam
+        # executor, which reports outcomes only as these exceptions. Without
+        # a broadcast, a deferred answer that is later terminally rejected
+        # (revoked principal, stale request, spent id, quota) vanishes
+        # silently — the task stays parked and nobody is told
+        # (xorbitsai/xagent-saas#952 B2).
+        #
+        # CANCEL: per-reason policy (#2009). ``stale_run`` is the one
+        # rejection the widget's stop press can reach — the target's
+        # run/version moved between the producer's read and this dispatch —
+        # and silence there leaves the press doing nothing while the
+        # unwanted run keeps producing. The reason set and the rationale
+        # for what stays silent live with the wording constants in
+        # ``external_task_cancel.py``.
         if (
-            command.kind == TaskCommandKind.MESSAGE
-            and _command_scope(command) == EXTERNAL_COMMAND_SCOPE
+            command.kind == TaskCommandKind.MESSAGE and scope == EXTERNAL_COMMAND_SCOPE
+        ) or (
+            is_external_cancel_command(kind=command.kind.value, scope=scope)
+            and exc.reason in EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS
         ):
-            # The one command whose handler has no channel of its own: the
-            # external audience's answer travels through the seam executor,
-            # which reports outcomes only as these exceptions. Without a
-            # broadcast, a deferred answer that is later terminally rejected
-            # (revoked principal, stale request, spent id, quota) vanishes
-            # silently — the task stays parked and nobody is told
-            # (xorbitsai/xagent-saas#952 B2). First-party rejections keep
-            # their handler-owned notifications and are deliberately not
-            # re-broadcast here. An executor-bound presentation draft is
-            # preserved; the standard one is derived only when none was
-            # bound, so the persisted terminal event is classified either
-            # way.
+            # An executor-bound presentation draft is preserved; the
+            # standard one is derived only when none was bound, so the
+            # persisted terminal event is classified either way.
             if terminal_event_draft_for_error(exc) is None:
                 bind_terminal_event_draft(
                     exc,
@@ -9920,9 +9941,10 @@ async def execute_durable_task_command(
                 # broadcast in external_task_cancel.py keeps the same rule).
                 # Exception, never BaseException: cancellation propagates.
                 logger.warning(
-                    "task %s external input rejection is terminal but its "
+                    "task %s external %s rejection is terminal but its "
                     "broadcast failed",
                     command.task_id,
+                    command.kind.value,
                     exc_info=True,
                 )
         raise
