@@ -2127,7 +2127,7 @@ def test_legacy_checkpoint_is_read_after_a_run_id_is_minted(
 
 
 @pytest.mark.parametrize("field", _PK_ANCHOR_SINGLE_FAULT_FIELDS)
-def test_widened_partition_still_rejects_a_row_failing_any_other_condition(
+def test_widened_partition_is_confirmed_before_rejecting_a_row_failing_any_other_condition(
     monkeypatch: pytest.MonkeyPatch,
     field: str,
 ) -> None:
@@ -2137,7 +2137,19 @@ def test_widened_partition_still_rejects_a_row_failing_any_other_condition(
     way must still be rejected as corrupt, for each of those conditions
     independently (mirrors
     test_database_trace_handler_load_pk_anchor_single_fault_raises_corrupt,
-    under a widened rather than a tagged partition)."""
+    under a widened rather than a tagged partition).
+
+    Asserting only ``CheckpointCorruptError`` here would not require
+    widening to work at all: an untagged row also fails
+    ``CHECKPOINT_ROW_RUN_PARTITION`` under a *narrow* partition, so the
+    same raise fires whether or not the lease-bound branch ever widens --
+    reverting widening entirely still leaves 5 of these 6 cases green, for
+    the wrong reason. Each case therefore first pins what
+    ``_root_checkpoint_read_partition`` actually resolved to -- ``None``
+    (widened) for every field except ``"run_partition"``, which resolves
+    ``"run-a"`` (narrow) instead, per the note below -- so a reverted
+    widening branch fails on that assertion, not silently on the
+    unrelated field mutation."""
     SessionLocal, db, task = _create_trace_handler_test_task(
         f"widened-single-fault-{field}"
     )
@@ -2203,8 +2215,19 @@ def test_widened_partition_still_rejects_a_row_failing_any_other_condition(
 
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
+    # Every field except "run_partition" leaves the row untagged, so the
+    # probe finds no run-tagged checkpoint for this task and the reader
+    # genuinely widens. "run_partition" tags the row itself (with a
+    # foreign run), which flips the probe true and keeps the reader on
+    # its own narrow partition instead -- see the comment above.
+    expected_partition = "run-a" if field == "run_partition" else None
+
     try:
         with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            assert (
+                DatabaseTraceHandler(task_id)._root_checkpoint_read_partition(db)
+                == expected_partition
+            )
             with pytest.raises(CheckpointCorruptError):
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"

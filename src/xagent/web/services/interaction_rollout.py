@@ -180,8 +180,12 @@ COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION = "anchor.absent_missing_run_partiti
 # Incremented by DatabaseTraceHandler._root_checkpoint_read_partition
 # (web/api/trace_handlers.py) each time a lease-bound read widens to the
 # untagged partition because the task has no run-tagged checkpoint yet.
-# The widening is a self-extinguishing compatibility window: this count
-# going to zero and staying there is the evidence that removing it is safe.
+# That condition also holds for a task with no checkpoint at all, so this
+# is not a clean count of genuine legacy (pre-partitioning) reads -- it
+# mixes them with ordinary tasks that simply have not checkpointed yet.
+# It is also monotonic (never reset) and process-local (see
+# counters_snapshot()'s own docstring), so it can only be read as a rate
+# over a deploy's lifetime, never inspected for "has it reached zero."
 COUNTER_CHECKPOINT_READ_PARTITION_WIDENED = "checkpoint.read_partition_widened"
 
 # Two constants below are actively incremented, both from
