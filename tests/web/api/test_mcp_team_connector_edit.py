@@ -1651,6 +1651,15 @@ _SEAM_MODULE = "xagent.web.api.mcp"
 _SEAM_REACHING_FUNCTIONS = {
     "_local_mcp_can_attach",
     "_resolve_mcp_server_for_request",
+    # The coroutine that owns app-scoped teardown, ``teardown_mcp_app_server``,
+    # is absent on purpose: it hands this helper to ``asyncio.to_thread``
+    # instead of calling it, so the seam runs in a worker thread and the
+    # coroutine reaches it on no thread of its own. The discovery below follows
+    # plain-name calls, which is exactly the distinction that matters here --
+    # turning that dispatch back into a direct call would put the seam back on
+    # the event loop, and would also put the coroutine back in this set and in
+    # the offender list.
+    "_teardown_mcp_app_server_locally",
     "connect_mcp_app",
     "delete_mcp_server",
     "get_mcp_server",
