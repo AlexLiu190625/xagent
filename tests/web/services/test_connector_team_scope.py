@@ -9,6 +9,7 @@ surrounding tests in this file only exercise MCP.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from decimal import Decimal
@@ -1692,12 +1693,36 @@ def test_a_declared_call_site_is_checked(db_session):
         )
 
 
-def test_a_duck_typed_session_skips_the_check_and_still_calls_the_hook():
+def test_the_violation_log_line_names_the_slot(db_session, caplog):
+    """The violation branch's log line names which of the five slots the
+    call belongs to, not only the hook's own name: an operator reading it
+    should not have to guess which call site the offending hook was
+    installed on."""
+    server = _create_mcp(db_session, "slot-in-log-probe")
+    db_session.commit()
+
+    def hook(db, *_a, **_k):
+        db.rollback()
+        return connector_team_scope.ConnectorDeleteDecision()
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(deleted=hook)
+    with caplog.at_level(logging.ERROR, logger=connector_team_scope.__name__):
+        with pytest.raises(ConnectorHookSessionBoundaryError):
+            connector_team_scope.delete_team_connector(
+                db_session, 1, "mcp", int(server.id), caller_holds_lock=True
+            )
+    assert "deleted" in caplog.text
+
+
+def test_a_duck_typed_session_skips_the_check_and_still_calls_the_hook(caplog):
     """A duck-typed object with no ``.info`` cannot report a count at all
     (``root_transaction_end_count`` returns ``None`` for it -- see
     ``tests/web/test_release_db_connection.py``), so the gate has nothing
     to compare and calls the hook exactly as it would with the check off,
-    rather than failing on an object it cannot inspect."""
+    rather than failing on an object it cannot inspect. The skip is not
+    silent: a skipped check and a passed check would otherwise look
+    identical to whoever is operating this, so the gate logs it."""
 
     class _DuckSession:
         pass
@@ -1710,11 +1735,13 @@ def test_a_duck_typed_session_skips_the_check_and_still_calls_the_hook():
         return connector_team_scope.ConnectorDeleteDecision()
 
     connector_team_scope.set_connector_team_hooks(deleted=hook)
-    result = connector_team_scope.delete_team_connector(
-        duck, 1, "mcp", 1, caller_holds_lock=True
-    )
+    with caplog.at_level(logging.DEBUG, logger=connector_team_scope.__name__):
+        result = connector_team_scope.delete_team_connector(
+            duck, 1, "mcp", 1, caller_holds_lock=True
+        )
     assert calls == [duck]
     assert result == connector_team_scope.ConnectorDeleteDecision()
+    assert "session boundary check skipped" in caplog.text
 
 
 def test_a_check_that_raises_refuses_after_restoring_the_session(
@@ -1752,13 +1779,28 @@ def test_a_check_that_raises_refuses_after_restoring_the_session(
     assert len(restored) == 1
 
 
-def test_a_refused_delete_leaves_both_rows_in_place(db_session):
+def test_a_refused_delete_leaves_both_rows_in_place(db_session, monkeypatch):
     """A refused delete must have zero effect on committed state: the
     definition row and the caller's own ownership link both survive, the
-    same as if the hook had never been called at all."""
+    same as if the hook had never been called at all. That survival alone
+    does not prove the violation branch restored the session -- this
+    hook's own ``rollback()`` already leaves the session clean, so the two
+    rows would still be there even if the branch skipped its restore. The
+    spy below pins that restore down directly."""
     owner = _create_user(db_session, "delete-refusal-owner")
     server = _create_mcp(db_session, "refused-delete-probe", owner=owner)
     db_session.commit()
+
+    restored: list[object] = []
+    original_restore = connector_team_scope._restore_session_after_hook_failure
+
+    def spy_restore(db):
+        restored.append(db)
+        original_restore(db)
+
+    monkeypatch.setattr(
+        connector_team_scope, "_restore_session_after_hook_failure", spy_restore
+    )
 
     def hook(db, *_a, **_k):
         db.rollback()
@@ -1771,6 +1813,9 @@ def test_a_refused_delete_leaves_both_rows_in_place(db_session):
             db_session, int(owner.id), "mcp", int(server.id), caller_holds_lock=True
         )
 
+    # The refusal restores the session before it raises: without this the
+    # violation branch's restore can be deleted and nothing goes red.
+    assert len(restored) == 1
     assert db_session.get(MCPServer, server.id) is not None
     assert (
         db_session.query(UserMCPServer)
@@ -1806,6 +1851,32 @@ def test_a_refusal_does_not_undo_what_the_hook_already_committed(db_session):
         db_session.query(User).filter(User.username == "hook-committed-row").first()
         is not None
     )
+
+
+def test_a_hook_that_ends_the_transaction_and_answers_a_rejected_shape_is_a_validation_failure(
+    db_session,
+):
+    """A hook can both end the caller's transaction and answer a shape the
+    validator rejects. ``validate`` runs right after the hook call, above
+    the boundary comparison, so this is refused as the rejected answer --
+    ``ConnectorRuntimeError`` -- not as ``ConnectorHookSessionBoundaryError``.
+    Reordering the two checks would turn this into a boundary violation
+    instead."""
+
+    def hook(db, *_a, **_k):
+        db.rollback()
+        return None  # not a dict -- the access answer validator rejects this
+
+    _open_transaction(db_session)
+    connector_team_scope.set_connector_team_hooks(access=hook)
+    with pytest.raises(ConnectorRuntimeError) as excinfo:
+        connector_team_scope.resolve_connector_access_or_raise(
+            db_session, 1, [("mcp", 1)], caller_holds_lock=True
+        )
+    assert excinfo.value.details == {"reason": "connector_access_resolution_failed"}
+
+    # The session must be usable again immediately afterward.
+    assert db_session.execute(select(1)).scalar() == 1
 
 
 def test_two_hook_calls_in_one_request_are_compared_one_at_a_time(db_session):

@@ -317,7 +317,9 @@ def visible_team_connector_ids(db: Any, user_id: int) -> dict[str, set[int]]:
     """
     if _connector_visibility_hook is None:
         return {"mcp": set(), "custom_api": set()}
-    return _call_connector_hook_gate(db, _connector_visibility_hook, db, int(user_id))
+    return _call_connector_hook_gate(
+        db, _connector_visibility_hook, db, int(user_id), slot="visibility"
+    )
 
 
 def _validate_team_connector_answer(answer: Any) -> dict[str, set[int]]:
@@ -382,6 +384,7 @@ def team_connector_ids(db: Any, *, team_id: int | None) -> dict[str, set[int]]:
         _team_connector_visibility_hook,
         db,
         team_id=int(team_id),
+        slot="team_visibility",
         validate=_validate_team_connector_answer,
     )
 
@@ -585,6 +588,7 @@ def _resolve_normalized_connector_access(
         db,
         int(user_id),
         requested,
+        slot="access",
         validate=lambda answer: _validate_connector_access_answer(answer, requested),
         session_boundary_checked=caller_holds_lock,
     )
@@ -703,6 +707,7 @@ def _call_connector_hook_gate(
     db: Any,
     hook: "Callable[..., _HookResult]",
     *args: Any,
+    slot: str,
     validate: "Callable[[Any], _HookResult] | None" = None,
     session_boundary_checked: bool = False,
     **kwargs: Any,
@@ -758,6 +763,11 @@ def _call_connector_hook_gate(
     Which call sites declare it, and why, is the table in this module's
     docstring. The cost of that default is stated there too: a new
     lock-holding call site that forgets to declare is not checked.
+
+    ``slot`` names which of this module's five slots the call belongs to
+    (``visibility``, ``team_visibility``, ``access``, ``deleted``,
+    ``renamed``). It appears only in the log lines below, never in an
+    exception message or a response body.
     """
     # Read before the ``try`` on purpose. The hook has not run yet, so a
     # counter this session cannot report -- a value that is present but is
@@ -768,6 +778,16 @@ def _call_connector_hook_gate(
     end_count_before = (
         root_transaction_end_count(db) if session_boundary_checked else None
     )
+    if session_boundary_checked and end_count_before is None:
+        # A duck-typed session -- ``web/tools/config.py`` documents that
+        # those reach this seam -- cannot report the count, so this call
+        # site's declaration buys it nothing. Say so rather than skipping
+        # silently: a skipped check and a passed check look identical.
+        logger.debug(
+            "Connector hook session boundary check skipped: %s cannot report "
+            "a root transaction end count",
+            type(db).__name__,
+        )
     already_restored = False
     try:
         answer = hook(*args, **kwargs)
@@ -778,13 +798,15 @@ def _call_connector_hook_gate(
             if end_count_after is not None and end_count_after > end_count_before:
                 _restore_session_after_hook_failure(db)
                 already_restored = True
-                # The hook's identity goes in the log line, not in the
-                # exception message: one route converts a stray exception
-                # into a response body carrying ``str(exc)``, so anything
-                # put here can reach a caller.
+                # The hook's identity and its slot go in the log line, not
+                # in the exception message: one route converts a stray
+                # exception into a response body carrying ``str(exc)``, so
+                # anything put here can reach a caller.
                 logger.error(
-                    "Connector hook %r ended the caller's database transaction",
+                    "Connector hook %r for the %s slot ended the caller's "
+                    "database transaction",
                     getattr(hook, "__name__", type(hook).__name__),
+                    slot,
                 )
                 raise ConnectorHookSessionBoundaryError(
                     "An installed connector hook ended the caller's "
@@ -1155,6 +1177,7 @@ def delete_team_connector(
         user_id,
         connector_type,
         connector_id,
+        slot="deleted",
         session_boundary_checked=caller_holds_lock,
     )
 
@@ -1189,5 +1212,6 @@ def rename_team_connector(
             connector_id,
             old_name,
             new_name,
+            slot="renamed",
             session_boundary_checked=caller_holds_lock,
         )
