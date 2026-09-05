@@ -20,6 +20,7 @@ from .system_setting import SystemSetting
 from .task import DAGExecution, Task, TaskConnectorRuntimeContext
 from .task_command import TaskExecutionCommand
 from .task_command_terminal_event import TaskCommandTerminalEvent
+from .task_execution_event import TaskExecutionEvent
 from .task_interaction import TaskInteractionRequest
 from .template_stats import TemplateStats, UserTemplateRelation
 from .tool_config import ToolConfig, ToolUsage
@@ -67,6 +68,7 @@ __all__ = [
     "Task",
     "TaskExecutionCommand",
     "TaskCommandTerminalEvent",
+    "TaskExecutionEvent",
     "TaskInteractionRequest",
     "TaskConnectorRuntimeContext",
     "DAGExecution",
