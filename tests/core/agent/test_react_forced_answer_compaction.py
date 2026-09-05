@@ -464,17 +464,38 @@ async def test_stale_completion_guidance_survives_a_drop_window() -> None:
     )
 
 
-@pytest.mark.asyncio
+# Sentinels for the reload table below.
+_DROP_KEY = object()  # the checkpoint has no such key at all
+_UNCHANGED = object()  # the stored value survives the round trip as written
+
+
 @pytest.mark.parametrize(
-    "reason_shape", ["missing_key", "none", "valid_member", "invalid_string"]
-)
-@pytest.mark.parametrize("counter_shape", ["present", "missing_key", "non_integer"])
-@pytest.mark.parametrize(
-    "followup_shape",
-    ["missing_key", "none", "refetched", "no_evidence", "invalid_string"],
+    ("key", "stored", "expected"),
+    [
+        ("forced_answer_reason", _DROP_KEY, None),
+        ("forced_answer_reason", None, None),
+        ("forced_answer_reason", "some_future_reason", None),
+        ("forced_answer_reason", FORCED_ANSWER_REASON_EMPTY_FINAL_ANSWER, _UNCHANGED),
+        ("forced_answer_compaction_recoveries", _DROP_KEY, 0),
+        ("forced_answer_compaction_recoveries", "1", FORCED_ANSWER_RECOVERY_BUDGET),
+        ("forced_answer_compaction_recoveries", 1, _UNCHANGED),
+        ("forced_answer_recovery_followup", _DROP_KEY, None),
+        ("forced_answer_recovery_followup", None, None),
+        ("forced_answer_recovery_followup", ["refetched"], None),
+        (
+            "forced_answer_recovery_followup",
+            FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE,
+            _UNCHANGED,
+        ),
+        (
+            "forced_answer_recovery_followup",
+            FORCED_ANSWER_FOLLOWUP_REFETCHED,
+            _UNCHANGED,
+        ),
+    ],
 )
 def test_forced_answer_recovery_state_round_trips_through_checkpoint(
-    reason_shape: str, counter_shape: str, followup_shape: str
+    key: str, stored: Any, expected: Any
 ) -> None:
     """Reload defaults differ per key, and each direction is deliberate.
 
@@ -482,62 +503,35 @@ def test_forced_answer_recovery_state_round_trips_through_checkpoint(
     safe. The recovery counter is the opposite: treating a missing counter as
     spent would permanently close the recovery path for every run checkpointed
     before the counter existed, and that path is itself the safety net.
+
+    Each case reshapes one key and asserts all three, because the keys are
+    normalized independently and crossing them yields no further behaviour.
     """
+    expected_attributes: dict[str, Any] = {
+        "forced_answer_reason": FORCED_ANSWER_REASON_EMPTY_FINAL_ANSWER,
+        "forced_answer_compaction_recoveries": 1,
+        "forced_answer_recovery_followup": FORCED_ANSWER_FOLLOWUP_REFETCHED,
+    }
+
     source = ReActPattern(max_iterations=6)
     source.forced_answer_reason = FORCED_ANSWER_REASON_EMPTY_FINAL_ANSWER
     source.forced_answer_compaction_recoveries = 1
     source.forced_answer_recovery_followup = FORCED_ANSWER_FOLLOWUP_REFETCHED
     state = source.get_state()
 
-    assert "forced_answer_reason" in state
-    assert "forced_answer_compaction_recoveries" in state
-    assert "forced_answer_recovery_followup" in state
-    assert state["forced_answer_reason"] == FORCED_ANSWER_REASON_EMPTY_FINAL_ANSWER
-    assert state["forced_answer_compaction_recoveries"] == 1
-    assert state["forced_answer_recovery_followup"] == FORCED_ANSWER_FOLLOWUP_REFETCHED
+    assert {name: state[name] for name in expected_attributes} == expected_attributes
 
-    if reason_shape == "missing_key":
-        del state["forced_answer_reason"]
-        expected_reason = None
-    elif reason_shape == "none":
-        state["forced_answer_reason"] = None
-        expected_reason = None
-    elif reason_shape == "invalid_string":
-        state["forced_answer_reason"] = "some_future_reason"
-        expected_reason = None
+    expected_attributes[key] = stored if expected is _UNCHANGED else expected
+    if stored is _DROP_KEY:
+        del state[key]
     else:
-        expected_reason = FORCED_ANSWER_REASON_EMPTY_FINAL_ANSWER
-
-    if counter_shape == "missing_key":
-        del state["forced_answer_compaction_recoveries"]
-        expected_counter = 0
-    elif counter_shape == "non_integer":
-        state["forced_answer_compaction_recoveries"] = "1"
-        expected_counter = FORCED_ANSWER_RECOVERY_BUDGET
-    else:
-        expected_counter = 1
-
-    if followup_shape == "missing_key":
-        del state["forced_answer_recovery_followup"]
-        expected_followup = None
-    elif followup_shape == "none":
-        state["forced_answer_recovery_followup"] = None
-        expected_followup = None
-    elif followup_shape == "invalid_string":
-        state["forced_answer_recovery_followup"] = ["refetched"]
-        expected_followup = None
-    elif followup_shape == "no_evidence":
-        state["forced_answer_recovery_followup"] = FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
-        expected_followup = FORCED_ANSWER_FOLLOWUP_NO_EVIDENCE
-    else:
-        expected_followup = FORCED_ANSWER_FOLLOWUP_REFETCHED
+        state[key] = stored
 
     restored = ReActPattern(max_iterations=6)
     restored.load_state(state)
 
-    assert restored.forced_answer_reason == expected_reason
-    assert restored.forced_answer_compaction_recoveries == expected_counter
-    assert restored.forced_answer_recovery_followup == expected_followup
+    for attribute, value in expected_attributes.items():
+        assert getattr(restored, attribute) == value
 
 
 def test_a_forcing_reason_can_outlive_the_flag_that_carried_it() -> None:
