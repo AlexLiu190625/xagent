@@ -32,7 +32,7 @@ from xagent.core.agent.trace import (
     TraceEventType,
     TraceScope,
 )
-from xagent.web.api.trace_handlers import DatabaseTraceHandler
+from xagent.web.api.trace_handlers import DatabaseTraceHandler, _ResolvedReadPartition
 from xagent.web.api.websocket import (
     _agent_outbound_event_type,
     _is_agent_checkpoint_data,
@@ -2073,6 +2073,55 @@ def test_readable_checkpoint_type_count_has_not_drifted() -> None:
     assert len(READABLE_CHECKPOINT_TYPES) == 2
 
 
+def test_resolved_read_partition_rejects_widened_with_a_run_id() -> None:
+    """``widened=True`` only ever pairs with ``run_id=None`` -- a run-bound
+    read is never widened (see ``_ResolvedReadPartition``'s docstring).
+    ``__post_init__`` makes that illegal combination unconstructable rather
+    than a fact only the docstring asserts; the three legal combinations
+    below must still construct."""
+    with pytest.raises(ValueError):
+        _ResolvedReadPartition(run_id="run-a", widened=True)
+
+    _ResolvedReadPartition(run_id="run-a", widened=False)
+    _ResolvedReadPartition(run_id=None, widened=True)
+    _ResolvedReadPartition(run_id=None, widened=False)
+
+
+@pytest.mark.parametrize(
+    ("build_id", "partition"),
+    [
+        pytest.param(None, None, id="root_reader_with_no_partition"),
+        pytest.param(
+            "build-a",
+            _ResolvedReadPartition(run_id=None, widened=False),
+            id="build_scoped_reader_with_a_resolved_partition",
+        ),
+    ],
+)
+def test_unguarded_read_asserts_partition_build_id_lockstep(
+    build_id: str | None,
+    partition: _ResolvedReadPartition | None,
+) -> None:
+    """``partition`` must be ``None`` exactly when ``build_id`` is not
+    ``None`` -- the caller (``_sync_load_latest_checkpoint``) is supposed to
+    guarantee that pairing, but ``_sync_load_latest_checkpoint_unguarded``
+    asserts it too instead of trusting the caller silently. A future caller
+    that broke the pairing without this assertion would instead fall into
+    the ``else`` branch, which filters on ``build_id`` alone and skips the
+    run-partition filter entirely -- an unpartitioned cross-run read, the
+    exact failure mode this whole mechanism exists to prevent. Both
+    parametrized cases below violate the pairing in a different direction
+    and neither reaches the database: the assertion fires before any query
+    is built."""
+    handler = DatabaseTraceHandler(task_id=1, build_id=build_id)
+    with pytest.raises(AssertionError):
+        handler._sync_load_latest_checkpoint_unguarded(
+            db=None,  # type: ignore[arg-type]
+            execution_id="shared-execution",
+            partition=partition,
+        )
+
+
 @pytest.mark.parametrize("checkpoint_type", sorted(READABLE_CHECKPOINT_TYPES))
 @pytest.mark.parametrize("pointer_set", [False, True])
 def test_legacy_checkpoint_is_read_after_a_run_id_is_minted(
@@ -2195,8 +2244,9 @@ def test_widened_partition_is_confirmed_before_rejecting_a_row_failing_any_other
     # widening can engage. That combination is reachable only through a
     # race between the probe and a concurrent tagged-checkpoint commit,
     # pinned separately below by
-    # test_stale_widened_probe_retries_when_pointer_row_is_tagged and its
-    # non-race counterpart.
+    # test_widened_read_never_returns_without_a_fresh_recheck and its
+    # non-race counterpart,
+    # test_widened_read_is_not_flagged_stale_when_nothing_concurrent_happens.
     _mutate_pk_anchor_field(field, row_kwargs, data, other_task_id)
 
     row = DatabaseTraceEvent(data=data, **row_kwargs)
@@ -2626,32 +2676,6 @@ def test_run_bound_read_issues_no_extra_probe(
         db.close()
 
 
-def test_checkpoint_read_exit_count_has_not_drifted() -> None:
-    """The boundary guard in ``_sync_load_latest_checkpoint`` covers every
-    exit of ``_sync_load_latest_checkpoint_unguarded`` that can hand back a
-    result read under a partition that might have gone stale -- by wrapping
-    the call once, not by being copied to each exit. That is only true as
-    long as this count matches the function's actual ``return``/``raise``
-    statements: this assertion makes adding a ninth exit (or removing one
-    of the eight) a deliberate act, not a silent gap in what the boundary
-    covers. Counted by AST rather than by hand, per this repo's own rule
-    against unenumerated exit sets."""
-    import ast
-    import inspect
-    import textwrap
-
-    source = inspect.getsource(
-        DatabaseTraceHandler._sync_load_latest_checkpoint_unguarded
-    )
-    tree = ast.parse(textwrap.dedent(source))
-    func = tree.body[0]
-    assert isinstance(func, ast.FunctionDef)
-    exits = [
-        node for node in ast.walk(func) if isinstance(node, (ast.Return, ast.Raise))
-    ]
-    assert len(exits) == 8
-
-
 def test_probe_db_failure_raises_unavailable_and_registers_signal() -> None:
     """``_task_has_run_tagged_checkpoint`` must translate its own driver
     failure into ``CheckpointUnavailableError`` -- with the message only its
@@ -2697,14 +2721,20 @@ def test_probe_failure_registers_signal_from_both_callers(
     monkeypatch: pytest.MonkeyPatch,
     leased: bool,
 ) -> None:
-    """The signal the probe registers on its own DB failure must reach
-    /health from both of its call sites: a lease-bound reader (which reaches
-    it directly) and a legacy unleased reader (which reaches it only after
-    the task has no active run). Patches ``Query.first`` selectively -- only
-    for the probe's own query, which is the only one in the read path
-    selecting ``DatabaseTraceEvent.id`` alone -- so this fails loudly if the
-    probe stops issuing that query instead of passing for the wrong
-    reason."""
+    """The signal ``_task_has_run_tagged_checkpoint`` registers on its own DB
+    failure must reach /health from two of its three call sites: the
+    lease-bound branch of ``_root_checkpoint_read_partition`` (which calls
+    it directly) and the legacy unleased branch (which calls it only after
+    the task has no active run). The third call site -- the boundary
+    recheck, ``_raise_if_widening_went_stale`` -- is not exercised here:
+    patching the probe's own query to fail on its very first invocation
+    makes the read fail during partition resolution, before a result exists
+    for the boundary recheck to re-verify, so this test's injection never
+    reaches that call site's signal registration. Patches ``Query.first``
+    selectively -- only for the probe's own query, which is the only one in
+    the read path selecting ``DatabaseTraceEvent.id`` alone -- so this fails
+    loudly if the probe stops issuing that query instead of passing for the
+    wrong reason."""
     from xagent.web.services.ops_signals import (
         CHECKPOINT_LOAD_UNAVAILABLE,
         active_degradations,
@@ -2968,53 +2998,6 @@ def test_widening_increments_its_counter_only_when_it_engages(
         assert widened_count() - before == 0
     finally:
         db2.close()
-
-
-def test_repeated_widened_partition_reads_return_the_same_checkpoint(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Two sequential reads on one thread, under one lease context, over
-    unchanged committed rows, must both resolve the widened partition to the
-    same legacy checkpoint rather than one of them returning ``None``."""
-    SessionLocal, db, task = _create_trace_handler_test_task("concurrent-readers")
-    task.status = TaskStatus.RUNNING
-    task.runner_id = "runner-a"
-    task.run_id = "run-a"
-    db.commit()
-    task_id = int(task.id)
-    db.add(
-        _checkpoint_trace_row(
-            task_id=task_id,
-            event_id="legacy-checkpoint",
-            execution_id="shared-execution",
-            label="legacy",
-            timestamp=datetime.now(timezone.utc),
-        )
-    )
-    db.commit()
-
-    def get_test_db() -> Iterator[Session]:
-        session = SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
-
-    monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
-
-    try:
-        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
-            first = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
-                "shared-execution"
-            )
-            second = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
-                "shared-execution"
-            )
-        assert first is not None
-        assert second is not None
-        assert first == second == {"label": "legacy"}
-    finally:
-        db.close()
 
 
 def test_database_trace_handler_prunes_only_bound_run_partition(

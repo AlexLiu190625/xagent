@@ -111,6 +111,11 @@ class _ResolvedReadPartition:
     reader's permanent untagged partition. ``widened`` makes that explicit
     instead of leaving callers to re-infer it from a fetched row's shape.
 
+    ``widened=True`` only ever pairs with ``run_id=None`` -- a run-bound
+    read is never widened, so the two fields cannot both carry information
+    at once. ``__post_init__`` makes that pairing an enforced invariant
+    rather than a fact only this docstring asserts.
+
     ``widened`` is ``True`` for both of those ``None`` cases, not only the
     lease-bound one: either can be invalidated by a concurrent writer
     committing this task's first run-tagged checkpoint right after the
@@ -133,6 +138,13 @@ class _ResolvedReadPartition:
 
     run_id: str | None
     widened: bool
+
+    def __post_init__(self) -> None:
+        if self.widened and self.run_id is not None:
+            raise ValueError(
+                "_ResolvedReadPartition: widened=True is only valid when "
+                "run_id is None -- a run-bound read is never widened"
+            )
 
 
 def _checkpoint_execution_id_predicate(execution_id: str) -> Any:
@@ -299,6 +311,18 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 # decided to widen, before this verdict was reached). Ask
                 # the same question the success path asks below before
                 # letting a genuinely corrupt verdict through.
+                #
+                # If that question itself cannot be answered -- the probe
+                # inside _raise_if_widening_went_stale fails for a genuine
+                # DB reason -- it raises its own CheckpointUnavailableError,
+                # which replaces this CheckpointCorruptError outright: the
+                # `raise` below never runs, and the corrupt verdict survives
+                # only as the new error's __context__. This is deliberate,
+                # not a bug: when the staleness check cannot run, handing
+                # down a terminal corrupt verdict anyway would be wrong just
+                # the same way a stale one would be. A retry re-reads the
+                # row from scratch, and a genuinely corrupt row surfaces the
+                # same CheckpointCorruptError again there.
                 if partition is not None and partition.widened:
                     self._raise_if_widening_went_stale(db)
                 raise
@@ -317,18 +341,39 @@ class DatabaseTraceHandler(BaseTraceHandler):
         The widened partition resolved to "read the untagged rows" against a
         point-in-time snapshot under READ COMMITTED (see
         ``_root_checkpoint_read_partition``): it describes the task at the
-        moment the probe ran, not a standing fact. If a concurrent writer has
-        since committed this task's first run-tagged checkpoint, that
-        widening decision is now stale, and the result just produced must
-        not be handed back as if it were still current -- surfacing it as a
-        retryable unavailable read instead. There is no retry inside this
-        process: this raises, and it is up to whichever web entry point
-        called into the checkpoint load to turn it into something a later
-        attempt can retry against. Today that entry point either returns an
-        HTTP 503 for the client to retry (the A2A and task-reply reply
-        paths) or restores the task to a paused/waiting-for-user state so a
-        later resume reads a fresh partition (the WebSocket resume and
-        message-injection paths).
+        moment the probe ran, not a standing fact. Two probes taken this way
+        a moment apart are only guaranteed to see different snapshots
+        because the session's isolation level is READ COMMITTED; under a
+        stricter level (e.g. REPEATABLE READ) the second probe could reuse
+        the first's snapshot and this recheck would silently never fire.
+        That dependency is pinned by two existing tests outside this module,
+        not by anything in this file:
+        ``test_configure_db_sets_no_isolation_level_on_either_engine``
+        (``tests/web/services/test_interaction_staging.py``) statically
+        asserts that neither of this codebase's two engine-construction
+        paths ever sets an isolation level, and
+        ``test_server_default_isolation_level_is_read_committed``
+        (``tests/web/services/test_interaction_staging_postgresql.py``)
+        confirms a bare PostgreSQL connection defaults to READ COMMITTED.
+        If a concurrent writer has since committed this task's first
+        run-tagged checkpoint, that widening decision is now stale, and the
+        result just produced must not be handed back as if it were still
+        current -- surfacing it as a retryable unavailable read instead.
+        There is no retry inside this process: this raises, and it is up to
+        whichever web entry point called into the checkpoint load to turn it
+        into something a later attempt can retry against. Today that entry
+        point either returns an HTTP 503 for the client to retry (the A2A
+        and task-reply reply paths), or, on the WebSocket resume and
+        message-injection paths, restores the task to a paused/waiting-for-
+        user state so a later resume reads a fresh partition -- but only
+        when that was already the task's status before this resume attempt
+        claimed the lease. A prior status of RUNNING (an abandoned lease
+        this attempt stole via TTL expiry) is never a restore target on the
+        WebSocket path; it instead settles to a terminal FAILED regardless
+        of this guard, an existing rule that predates it (see the restore
+        branch's own comment in ``websocket.py``, and
+        ``release_task_lease_no_commit``'s refusal to release a lease back
+        to RUNNING).
 
         This is the one place every exit of a widened read passes through,
         rather than each of them (the pointer path's snapshot, the scan's
@@ -365,13 +410,37 @@ class DatabaseTraceHandler(BaseTraceHandler):
         ``partition`` is ``None`` for a build-scoped read (``build_id`` is
         not ``None``) and a ``_ResolvedReadPartition`` for every root read;
         the caller (``_sync_load_latest_checkpoint``) guarantees the two
-        stay in lockstep. This function has no notion of staleness -- it
-        reads once under the partition it is handed and returns or raises
-        whatever that read produces. Whether the result is trustworthy as-is
-        (a narrow partition) or needs a fresh recheck before being handed
-        back (``partition.widened``) is decided by the caller alone, after
-        this function returns.
+        stay in lockstep, and the assertion just below enforces that
+        pairing here too rather than trusting the caller silently: a future
+        caller that violated it would otherwise fall into the ``else``
+        branch below, which filters on ``self.build_id`` alone and skips
+        the run-partition filter entirely -- an unpartitioned cross-run
+        read, the exact failure mode this whole mechanism exists to
+        prevent. This function has no notion of staleness -- it reads once
+        under the partition it is handed and returns or raises whatever
+        that read produces. Whether the result is trustworthy as-is (a
+        narrow partition) or needs a fresh recheck before being handed back
+        (``partition.widened``) is decided by the caller alone, after this
+        function returns.
+
+        Of this function's eight ``return``/``raise`` exits, five may hand
+        back a result read under a partition that could have gone stale by
+        the time it returns -- the PK-anchor's resolved snapshot, the
+        scan's resolved snapshot, the scan's genuine absence (no matching
+        row seen at all), the scan's corrupt verdict, and the scan's
+        post-loop empty return -- and all five are covered by the caller's
+        staleness recheck (see ``_raise_if_widening_went_stale``). The
+        other three raise ``CheckpointUnavailableError`` for a scan that
+        could not be completed at all (the page-count cap, a page query
+        failure, or an exhausted scan whose failures included a generic
+        decode error): these are retryable regardless of whether the
+        partition was widened, so the recheck does not need to cover them
+        separately.
         """
+        assert (partition is None) == (self.build_id is not None), (
+            f"task {self.task_id}: partition/build_id fell out of lockstep -- "
+            "partition must be None exactly when build_id is not None"
+        )
         query = db.query(DatabaseTraceEvent).filter(
             DatabaseTraceEvent.task_id == self.task_id,
             DatabaseTraceEvent.event_type == "system_update_general",
@@ -575,17 +644,24 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 is not None
             )
         except Exception as exc:
-            # This helper translates the driver failure itself, so the
-            # caller's raw-exception arm -- which registers this signal for
-            # every other partition-resolution failure -- is never reached.
-            # Register here so the failure stays visible on /health.
+            # This helper translates the driver failure itself, so none of
+            # its three callers' own raw-exception handling ever sees it:
+            # the lease-bound and unleased branches of
+            # _root_checkpoint_read_partition are each wrapped by
+            # _sync_load_latest_checkpoint's generic partition-resolution
+            # arm, and the boundary recheck (_raise_if_widening_went_stale)
+            # calls this with no wrapping arm at all. Register here so the
+            # failure stays visible on /health regardless of which caller
+            # this is. The log message below is deliberately phase-neutral
+            # rather than naming partition resolution: from the boundary
+            # recheck, the partition was already resolved before this probe
+            # ran.
             register_degradation(
                 CHECKPOINT_LOAD_UNAVAILABLE,
                 f"task {self.task_id}: checkpoint partition probe failed",
             )
             logger.error(
-                "task %s: run-tag probe failed while resolving the checkpoint "
-                "read partition",
+                "task %s: run-tagged checkpoint probe failed",
                 self.task_id,
                 exc_info=True,
             )
