@@ -2142,9 +2142,14 @@ def _actor_oauth_cookie_name(nonce: str) -> str:
 
 
 def is_actor_oauth_cookie_header(value: str) -> bool:
-    """Accept only a Set-Cookie header for an actor OAuth flow."""
-    name, separator, _rest = value.partition("=")
-    return separator == "=" and name.strip().startswith(_ACTOR_OAUTH_COOKIE_PREFIX)
+    """Accept only a non-empty Set-Cookie header for an actor OAuth flow."""
+    name, separator, rest = value.partition("=")
+    cookie_value = rest.partition(";")[0].strip()
+    return (
+        separator == "="
+        and name.strip().startswith(_ACTOR_OAUTH_COOKIE_PREFIX)
+        and bool(cookie_value)
+    )
 
 
 def _actor_oauth_cookie_scope(provider: str, db_provider: Any) -> tuple[bool, str]:
