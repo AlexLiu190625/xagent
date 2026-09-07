@@ -106,11 +106,12 @@ the right verdict for it depends on the ordering defect tracked in
 #2023. #2023 converges the three; this module and lease recovery do not
 wait on it.
 
-Why the write side does not widen step 5 to accept an absent run field the
-way the read side's boundary re-probe does is itself worth writing down,
-not just the fact that the two disagree. The anchor this function stages
-carries ``resume_run_partition=str(task.run_id)`` -- the task's ``run_id``,
-never the checkpoint row's own run field. The interaction table's
+Why step 4's reclassification treats a missing run-partition field as
+absence rather than widening it into a resolved anchor is itself worth
+writing down, not just the fact that this function stops there. The
+anchor this function stages carries
+``resume_run_partition=str(task.run_id)`` -- the task's ``run_id``, never
+the checkpoint row's own run field. The interaction table's
 ``resume_run_partition`` column is ``nullable=False`` and carries a
 ``<> ''`` CHECK (``ck_task_interaction_requests_resume_run_partition_nonempty``,
 ``models/task_interaction.py``), so every row this function stages persists
@@ -119,12 +120,12 @@ that value non-null. The read direction, ``_resolve_read_direction_anchor``
 against the trace row's *own* run field; a row with no run field at all has
 nothing to compare against but ``None``, which never equals a non-null
 stored value, so the read side classifies that row ``anchor_dangling``.
-Widening step 5 here would therefore not make that class of task
-answerable: every anchor it staged for such a row would read back
-``anchor_dangling``, land in the unanswerable tier, and project the
-question text without its response controls -- the task would move from
-resolving through the legacy transcript path today to displaying a
-question nobody can answer.
+Staging an anchor for this row shape instead of treating it as absence
+would therefore not make that class of task answerable: every anchor
+staged for such a row would read back ``anchor_dangling``, land in the
+unanswerable tier, and project the question text without its response
+controls -- the task would move from resolving through the legacy
+transcript path today to displaying a question nobody can answer.
 
 Today, a row missing the run-partition field classifies as absence, not
 corrupt (step 4's reclassification above), incrementing
@@ -138,12 +139,12 @@ has a real cost, not none: a waiting task whose only checkpoint predates
 the run-partition field is never materialized into a structured
 interaction through this path. Materializing that class of task is a
 separate matter (#1078), not this one. Making both sides agree on the same
-row would require changing both at once: the read side's own comparison
-(which is against the non-null value stored on the interaction row, not
-against a task's possibly-null ``run_id``) and the boundary re-probe step
-it runs that this function has no equivalent of -- changing only one side
-always leaves some rows this function stages unresolvable on the other's
-next read.
+row would require changing the read side's own comparison too, not this
+function alone -- it is against the non-null value stored on the
+interaction row, not against a task's possibly-null ``run_id``. Staging a
+wider anchor here without also changing that comparison always leaves
+some rows this function stages unresolvable on the read side's next
+read.
 
 ``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED`` (``ops_signals.py``) is a
 signal owned by ``interaction_handoff``, not by this function: it is
