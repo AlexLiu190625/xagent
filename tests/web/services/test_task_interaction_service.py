@@ -145,13 +145,18 @@ from xagent.web.models.user import User
 from xagent.web.services import task_interaction_service as svc
 from xagent.web.services.ops_signals import (
     CHECKPOINT_PK_ANCHOR_DANGLING,
+    INTERACTION_HANDOFF_DEGRADED,
     INTERACTION_READ_PAYLOAD_UNREADABLE,
     INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
     active_degradations,
     clear_degradation,
 )
 from xagent.web.services.task_clarification_draft import CLARIFICATION_REQUEST_TTL
-from xagent.web.services.task_interaction_staging import InteractionAnchor
+from xagent.web.services.task_interaction_staging import (
+    InteractionAnchor,
+    InteractionAttemptMismatch,
+    InteractionOriginUnknown,
+)
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD, TaskLease
 
 
@@ -5794,28 +5799,48 @@ def test_degraded_as_subclass_maps_to_the_parents_outcome(
     assert _db.query(TaskInteractionRequest).count() == 0
 
 
+@pytest.mark.parametrize(
+    "unmapped_exc",
+    [
+        pytest.param(InteractionOriginUnknown, id="origin_unknown"),
+        pytest.param(InteractionAttemptMismatch, id="attempt_mismatch"),
+    ],
+)
 def test_unmapped_degraded_as_maps_to_the_unclassified_outcome(
-    _db: Session, _system_call_ctx: dict[str, Any]
+    _db: Session,
+    _system_call_ctx: dict[str, Any],
+    unmapped_exc: type[Exception],
 ) -> None:
     """An unrecognized degradation gets its own reason word, not the
-    real-conflict one. InteractionOriginUnknown is one of the two swallowed
-    exceptions _DEGRADED_AS_OUTCOME does not map, so it exercises the
-    default classification, which now reports
-    handoff_degraded_unclassified rather than reusing slot_taken.
+    real-conflict one. InteractionOriginUnknown and
+    InteractionAttemptMismatch are exactly the two swallowed exceptions
+    _DEGRADED_AS_OUTCOME does not map, so both exercise the default
+    classification, which now reports handoff_degraded_unclassified rather
+    than reusing slot_taken. Both are covered because the default is the
+    only place either type's outcome is decided -- neither is reachable
+    from a wired caller (see _DEGRADED_AS_OUTCOME's own comment), so this
+    test is the only statement of what create() reports for them.
+
+    The registered degradation is asserted, not just the outcome: an
+    unset degraded_as -- which is what a stage_interaction_request that
+    the patch below silently failed to intercept would leave behind --
+    reports the same reason word by design, so the outcome alone cannot
+    tell "the swallow happened and fell through" from "no swallow
+    happened at all". The signal's detail is registered only from
+    interaction_handoff's except clause and names the exception type that
+    fired, so checking it pins both facts.
 
     Mutation: reverting the default classification's reason back to
     `CreateConflict(reason="slot_taken")` turns this red."""
 
     from xagent.web.services import task_interaction_staging as staging_module
-    from xagent.web.services.task_interaction_staging import (
-        InteractionOriginUnknown,
-    )
 
     ctx = _system_call_ctx
     real_stage = staging_module.stage_interaction_request
+    forced_message = f"forced for test_unmapped_degraded_as ({unmapped_exc.__name__})"
 
     def _raise_unmapped(*args: Any, **kwargs: Any) -> Any:
-        raise InteractionOriginUnknown("forced for test_unmapped_degraded_as")
+        raise unmapped_exc(forced_message)
 
     with mock.patch.object(
         staging_module, "stage_interaction_request", side_effect=_raise_unmapped
@@ -5825,6 +5850,10 @@ def test_unmapped_degraded_as_maps_to_the_unclassified_outcome(
     assert outcome == svc.CreateConflict(reason="handoff_degraded_unclassified")
     assert real_stage is staging_module.stage_interaction_request
     assert _db.query(TaskInteractionRequest).count() == 0
+
+    detail = active_degradations()[INTERACTION_HANDOFF_DEGRADED]
+    assert unmapped_exc.__name__ in detail
+    assert forced_message in detail
 
 
 def test_swallowed_exception_types_are_mutually_unrelated() -> None:
