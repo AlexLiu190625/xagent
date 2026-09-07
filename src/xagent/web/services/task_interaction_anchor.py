@@ -220,11 +220,8 @@ run identity changed between resolution and staging.
 
 Zero production callers as of this module's introduction: a static test
 (``tests/web/services/test_task_interaction_anchor.py``) asserts that no
-production module calls ``resolve_interaction_anchor``, mirroring the
-existing gate for ``task_interaction_staging.py``'s two entry points
-without extending that gate itself -- this module is not one of the two
-names it scans for. See that test's own docstring for the removal
-condition.
+production module calls ``resolve_interaction_anchor``. See that test's
+own docstring for the removal condition.
 
 Two kinds of pre-existing row are missing the run-partition field and so
 fail the run-partition self-consistency check, though neither one
