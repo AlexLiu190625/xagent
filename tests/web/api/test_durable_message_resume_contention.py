@@ -296,10 +296,11 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
         # A stub that is truthy but not `is POSTED_FRESH` would let the
         # dispatch above still report success while silently skipping the
         # legacy-interaction close below it -- truthiness alone cannot tell
-        # the two apart. `wraps=` keeps the real close running (so its own
-        # behavior is unchanged) and only counts how often it ran, making a
-        # stub that regresses to a truthy-but-wrong-identity value fail
-        # here instead of passing unnoticed.
+        # the two apart. Patching with a spy lets us assert
+        # `close_spy.call_count == 1`, which fails if that regression
+        # silently skips the close; `wraps=` is added separately so the
+        # real close still executes for its own side effects (the DB
+        # write), keeping the rest of the test's assertions valid.
         with patch.object(
             websocket_api,
             "close_legacy_resume_interaction_sync",
@@ -311,6 +312,11 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
             )
             await asyncio.sleep(0)
         assert close_spy.call_count == 1
+        # The call site swallows any internal failure into a warning
+        # (`except Exception: logger.warning(...)`), so call_count alone
+        # cannot tell a successful close from one that raised and was
+        # silently caught. Assert the warning is absent to catch that case.
+        assert "legacy resume interaction close failed" not in caplog.text
 
     db_session.expire_all()
     stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
