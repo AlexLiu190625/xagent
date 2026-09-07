@@ -225,6 +225,7 @@ from .ops_signals import INTERACTION_ANCHOR_CORRUPT, register_degradation
 from .task_interaction_staging import InteractionAnchor
 from .trace_event_staging import (
     failed_checkpoint_row_conditions,
+    is_mismatched_run_partition_only,
     is_missing_run_partition_only,
 )
 
@@ -349,6 +350,16 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
         execution_id=execution_id,
     )
     if failed:
+        # A narrower question is asked before falling through to the
+        # generic corrupt verdict: is the run-partition match the only
+        # failed condition, and if so, did it fail because the field is
+        # absent (a pre-existing row) or because it names a different run
+        # (a checkpoint written under another run)? The two predicates are
+        # mutually exclusive by construction (see each one's own
+        # docstring, trace_event_staging.py), so this is not a priority
+        # order between competing answers -- but the mismatched-partition
+        # branch must still run before the final generic-corrupt fallback,
+        # or its dedicated reason would never be reached.
         if is_missing_run_partition_only(failed, row_data):
             row_checkpoint_type = row_data.get("checkpoint_type")
             if row_checkpoint_type in LEGACY_CHECKPOINT_TYPES:
@@ -371,6 +382,20 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
                     pointer_id,
                 )
                 increment_counter(COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION)
+            return None
+        if is_mismatched_run_partition_only(failed, row_data):
+            register_degradation(
+                INTERACTION_ANCHOR_CORRUPT,
+                f"task {task.id}: checkpoint pointer {pointer_id} names a "
+                "checkpoint written under a different run than this "
+                "task's current run",
+            )
+            logger.error(
+                "task %s's checkpoint pointer %s names a checkpoint from "
+                "another run; no interaction anchor to resolve",
+                task.id,
+                pointer_id,
+            )
             return None
         register_degradation(
             INTERACTION_ANCHOR_CORRUPT,
