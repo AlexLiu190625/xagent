@@ -14,13 +14,22 @@ not an implementation detail (see the corrupt-before-legacy note below):
 3. the pointer names no live ``trace_events`` row -> unavailable, reported
    to the caller as absence (see below for why).
 4. the row exists but fails any of six self-consistency conditions ->
-   corrupt, unless the only condition it fails is the run-partition match
-   and its run field is absent entirely rather than merely mismatched --
-   that shape reclassifies as absence, not corrupt. That check is not a
-   second copy of the conditions: it reads the set of failed condition
-   names this table's own predicate returns, and asks whether that set is
-   exactly {run partition} and the field is absent
-   (``is_missing_run_partition_only``, ``trace_event_staging.py``).
+   corrupt, with two narrower questions asked first. If the only
+   condition it fails is the run-partition match and its run field is
+   absent entirely rather than merely mismatched, that shape reclassifies
+   as absence, not corrupt
+   (``is_missing_run_partition_only``, ``trace_event_staging.py``). If
+   the only condition it fails is the run-partition match and its run
+   field instead names a *different* run, that shape still reports no
+   anchor, but with its own reason -- a checkpoint written under another
+   run -- rather than the generic corrupt reason
+   (``is_mismatched_run_partition_only``, ``trace_event_staging.py``).
+   Neither check is a second copy of the conditions: both read the set of
+   failed condition names this table's own predicate returns and ask
+   whether that set is exactly {run partition}, differing only in
+   whether the field reads as absent or as present with the wrong value.
+   Any other failure, alone or in combination, reports the generic
+   corrupt reason.
 5. the row passes all six conditions but its ``checkpoint_type`` is a
    legacy type -> absence, not corrupt.
 6. the row passes all six conditions and its ``checkpoint_type`` is the
@@ -145,6 +154,55 @@ interaction row, not against a task's possibly-null ``run_id``. Staging a
 wider anchor here without also changing that comparison always leaves
 some rows this function stages unresolvable on the read side's next
 read.
+
+A row whose only failed condition is the run-partition match, but whose
+run field names a *different* run rather than reading as absent, is not
+the same pre-existing shape described above. Its outcome is still "no
+anchor, nothing published this round" -- the same ``None`` this
+function returns for every other failure -- only the reported reason
+changes: ``is_mismatched_run_partition_only``
+(``trace_event_staging.py``) answers this narrower question the way
+``is_missing_run_partition_only`` answers the absent-field one, and step
+4's true-corrupt path still registers ``INTERACTION_ANCHOR_CORRUPT`` for
+it, carrying its own detail string and its own log line rather than the
+generic one. This changes the classification, not the retryability:
+nothing this function reports comes with a "retry" outcome to attach it
+to.
+
+This resolver does not adopt the read direction's re-probe for that
+shape, because the re-probe answers a question this resolver never
+asks. The read side's re-probe runs only while a read holds a *widened*
+partition (``DatabaseTraceHandler._root_checkpoint_read_partition`` can
+be ``None``, ``trace_handlers.py``), and it asks whether the snapshot
+that widening decision was based on has since gone stale. This resolver
+never resolves a partition and never holds a widened one, so that
+question has no subject here; and its own contract has nowhere for a
+retryable outcome to go, since returning ``None`` already means the
+caller publishes nothing this round.
+
+Keeping an alarm for a mismatched run tag is deliberate, not merely
+cautious. The single statement that writes a checkpoint pointer carries
+a ``Task.run_id`` equality condition, and the row's run tag is stamped
+from the same lease (``stage_trace_event_row``,
+``trace_event_staging.py``), so pointer and tag agree at the moment the
+pointer is written; every writer that mints a different non-null run id
+clears both pointer columns in the same statement. What can still reach
+this branch is a pointer into another task's row (which fails ownership
+too, and reports the generic reason instead), a hand-edited or
+mis-migrated row, or a future checkpoint writer that bypasses
+``stage_trace_event_row`` -- each of those is genuinely inconsistent
+data, not a timing artifact, which is why this reports an alarm with a
+specific reason rather than a quiet retry.
+
+Reporting a specific alarm here instead of a retryable outcome rests on
+one precondition this function does not itself enforce: callers must
+hold a lock on the task row they pass in, so the run identity read at
+step 4 cannot change out from under the comparison. A caller that does
+not hold that lock could be comparing against a run identity that has
+already moved on, which would make the "genuinely inconsistent" reading
+above unsound for it. This is written as a precondition rather than an
+observed fact because this resolver has no production caller yet to
+check it against.
 
 ``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED`` (``ops_signals.py``) is a
 signal owned by ``interaction_handoff``, not by this function: it is
@@ -273,8 +331,15 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
        checkpoint now exists, because a row and its tag are written
        together and that combination therefore means its partition
        decision went stale, not that the data is inconsistent. This
-       resolver has no such step. Aligning the two is #2122; this resolver
-       has no production callers today, so the divergence has no live
+       resolver has no such step, and neither divergence is reconciled:
+       the two sides do not share partition semantics, and that is
+       deliberate for the reasons the module docstring's own paragraphs
+       on this resolver's partition judgment give. A row whose run field
+       names a different run than ``task.run_id`` reports its own reason
+       rather than the generic corrupt one; a row whose run field is
+       absent reports absence; every other failed condition, alone or
+       combined, still reports the generic corrupt reason. This resolver
+       has no production callers today, so neither divergence has a live
        impact yet.
     6. ``row_execution_id and row_execution_id != execution_id`` --
        execution identity mismatch. An empty ``row_execution_id`` (a legacy
@@ -303,14 +368,23 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
     (``ck_task_interaction_requests_resume_execution_id_nonempty``,
     ``models/task_interaction.py``) that must never be empty.
 
-    When any condition fails, the body asks a narrower question before
-    deciding the row is corrupt: is the run-partition match the only failed
-    condition, and did it fail because the row's run field is absent rather
-    than wrong? ``is_missing_run_partition_only`` (``trace_event_staging.py``)
-    answers it from the same failure set. A row of that shape is a
-    pre-existing row whose checkpoint predates the run-partition field (see
-    the module docstring's paragraph on the two kinds), not a corrupt one,
-    and is reclassified as absence instead.
+    When any condition fails, the body asks two narrower questions before
+    falling through to the generic corrupt verdict, both answered from the
+    same failure set. First: is the run-partition match the only failed
+    condition, and did it fail because the row's run field is absent
+    rather than wrong? ``is_missing_run_partition_only``
+    (``trace_event_staging.py``) answers it. A row of that shape is a
+    pre-existing row whose checkpoint predates the run-partition field
+    (see the module docstring's paragraph on the two kinds), not a corrupt
+    one, and is reclassified as absence instead. Second, only reached when
+    the first answers no: is the run-partition match still the only
+    failed condition, but this time because the field names a *different*
+    run? ``is_mismatched_run_partition_only`` (``trace_event_staging.py``)
+    answers it. A row of that shape still reports no anchor, but with its
+    own reason rather than the generic corrupt one (see the module
+    docstring's paragraph on why that reason is kept, and why it is not
+    treated as retryable the way the read direction's re-probe treats a
+    stale widening decision).
     """
 
     if task.run_id is None:
