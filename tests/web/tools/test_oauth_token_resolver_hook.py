@@ -1653,6 +1653,37 @@ async def test_hook_failure_does_not_fallback_and_later_servers_still_build(
 
 
 @pytest.mark.asyncio
+async def test_hook_failure_warning_includes_failure_code(
+    db_session,
+    caplog,
+):
+    """The warning logged for a resolver failure must carry the classified
+    failure code (e.g. 'oauth_token_required'), not just the exception's
+    class name -- the class name alone tells an on-call engineer nothing
+    about whether this is a routine reconnect-required case versus an
+    unexpected resolver bug."""
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    _add_oauth_server(db, user, launch_config=_launch_config())
+    _add_user_oauth(db, user, provider="google", access_token="user-token")
+
+    class ReauthorizationRequired(RuntimeError):
+        oauth_token_resolver_failure_code = "oauth_token_required"
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise ReauthorizationRequired("secret-reauth-detail")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["config"]["failure_code"] == "oauth_token_required"
+    assert "oauth_token_required" in caplog.text
+    assert "secret-reauth-detail" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_hook_connector_runtime_error_propagates(db_session):
     db, user = db_session
     _add_oauth_server(db, user, launch_config=_launch_config())

@@ -3628,9 +3628,12 @@ class WebToolConfig(BaseToolConfig):
         )
         self._mcp_oauth_diagnostics.append(diagnostic)
         logger.warning(
-            "OAuth token resolver failed for MCP server '%s' with %s",
+            "OAuth token resolver failed for MCP server '%s' with %s "
+            "(failure_code=%s, resource=%s)",
             getattr(server, "name", "<unknown>"),
             error.exception_type,
+            error.failure_code,
+            error.resource,
         )
         return self._build_unavailable_mcp_config(
             server=server,

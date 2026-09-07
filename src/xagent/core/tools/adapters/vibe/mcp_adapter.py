@@ -28,6 +28,7 @@ from typing import (
     Union,
     cast,
 )
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from mcp.types import Tool as MCPTool
@@ -228,6 +229,18 @@ logger = logging.getLogger(__name__)
 _RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
 _OAUTH_TOKEN_RESOLVER_REFRESH_KEY = "_oauth_token_resolver_refresh"
 _RESOLVER_HTTP_401_NODE_LIMIT = 64
+# Caps the exception message logged when an MCP tool call fails, so a server
+# that echoes a large payload back in its error (or an SDK that dumps a full
+# request) can't blow up log volume. This bound applies to everything this
+# module emits about the failure -- no traceback is attached alongside it,
+# so this cap is what actually reaches the log. The message returned to the
+# caller ("Error executing MCP tool.") never carries it.
+_MCP_TOOL_ERROR_LOG_MAX_CHARS = 500
+# Caps how many related exceptions of a failed call get their own log line:
+# the leaves of a (possibly nested) BaseExceptionGroup and the exceptions on
+# their __cause__/__context__ chains. A fan-out call (e.g. concurrent
+# sub-requests) can otherwise raise a group with dozens of members.
+_MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS = 5
 _HTTP_401_TEXT_RE = re.compile(
     r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response|code)\s*[:=]?\s*401\b|"
     r"\b401\s+unauthorized\b",
@@ -642,6 +655,54 @@ def _bounded_exception_nodes(
         if isinstance(current.__context__, BaseException):
             linked.append(current.__context__)
         pending.extend((node, False) for node in reversed(linked))
+
+
+_URL_TOKEN_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+
+
+def _redact_urls_in_text(text: str) -> str:
+    """Return ``text`` with every ``scheme://...`` URL replaced by a copy
+    that has its query string and userinfo stripped.
+
+    Exception messages that legitimately need to name the server sometimes
+    embed the full request URL -- e.g. ``httpx.HTTPStatusError``'s message
+    is "... for url '<url>'" and an unfollowed redirect's message names the
+    ``Location`` response header. Connector URLs commonly carry secrets
+    (API keys, tokens) in the query string or in ``user:pass@host``
+    userinfo, so those parts are dropped before the message is logged, and
+    so is the fragment (it never reaches a server and carries no diagnostic
+    value). The scheme, host, port, and path are kept so the log line still
+    says which server failed. A token that fails to parse as a URL is
+    replaced wholesale with ``<url redacted>`` rather than risking a partial
+    leak.
+    """
+
+    def _redact(match: "re.Match[str]") -> str:
+        token = match.group(0)
+        try:
+            parts = urlsplit(token)
+            # Keep the authority verbatim minus userinfo: re-assembling it
+            # from ``hostname``/``port`` would drop IPv6 brackets and lower
+            # the case, and reading ``port`` raises on out-of-range values.
+            netloc = parts.netloc.rsplit("@", 1)[-1]
+            return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+        except (ValueError, UnicodeError):
+            return "<url redacted>"
+
+    return _URL_TOKEN_RE.sub(_redact, text)
+
+
+def _truncated_error_message(exc: BaseException) -> str:
+    """Return ``str(exc)`` with any embedded URLs stripped of their query
+    string and userinfo, bounded to ``_MCP_TOOL_ERROR_LOG_MAX_CHARS`` for
+    logging. It is otherwise just the exception's own message (e.g. a
+    JSON-RPC error string or an HTTP status line) -- it must never be
+    additionally handed tool_args, tool_meta, or connection headers, none of
+    which are exception messages to begin with."""
+    text = _redact_urls_in_text(str(exc))
+    if len(text) <= _MCP_TOOL_ERROR_LOG_MAX_CHARS:
+        return text
+    return text[: _MCP_TOOL_ERROR_LOG_MAX_CHARS - 1].rstrip() + "…"
 
 
 def _strict_http_401_responses(
@@ -1416,10 +1477,24 @@ class MCPToolAdapter(AbstractBaseTool):
 
         except BaseExceptionGroup as e:
             logger.error(
-                "MCP tool %s execution failed with exception group %s",
+                "MCP tool %s execution failed with exception group %s: %s",
                 self.mcp_tool.name,
                 type(e).__name__,
+                _truncated_error_message(e),
             )
+            leaf_count = 0
+            for node in _bounded_exception_nodes(e):
+                if node is e or isinstance(node, BaseExceptionGroup):
+                    continue
+                if leaf_count >= _MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS:
+                    break
+                leaf_count += 1
+                logger.error(
+                    "MCP tool %s execution failed with related exception %s: %s",
+                    self.mcp_tool.name,
+                    type(node).__name__,
+                    _truncated_error_message(node),
+                )
             return {
                 "content": [{"text": "Error executing MCP tool."}],
                 "is_error": True,
@@ -1427,9 +1502,10 @@ class MCPToolAdapter(AbstractBaseTool):
 
         except Exception as e:
             logger.error(
-                "MCP tool %s execution failed with %s",
+                "MCP tool %s execution failed with %s: %s",
                 self.mcp_tool.name,
                 type(e).__name__,
+                _truncated_error_message(e),
             )
             return {
                 "content": [{"text": "Error executing MCP tool."}],
@@ -1623,7 +1699,16 @@ class MCPToolAdapter(AbstractBaseTool):
             if target.get("target_type") != TARGET_TOOL_ARGUMENTS:
                 continue
             target_key = target.get("key")
-            if not isinstance(target_key, str) or target_key not in properties:
+            if not isinstance(target_key, str):
+                continue
+            if target_key not in properties:
+                logger.warning(
+                    "Skipping runtime MCP tool argument binding for %s on "
+                    "tool %s: the tool's input schema does not declare "
+                    "this argument",
+                    target_key,
+                    self.mcp_tool.name,
+                )
                 continue
             value = binding_source_value(
                 binding,

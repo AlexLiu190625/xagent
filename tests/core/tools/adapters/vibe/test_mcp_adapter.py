@@ -1255,6 +1255,118 @@ def test_mcp_runtime_tool_argument_missing_source_warns(caplog):
     assert "list_clients" in caplog.text
 
 
+def test_mcp_runtime_tool_argument_undeclared_target_warns_and_is_skipped(caplog):
+    """A runtime binding can name a tool argument the connector author
+    thinks exists. If the tool's actual input schema (from tools/list)
+    doesn't declare that argument, the binding must be dropped loudly, not
+    silently -- the previous silent `continue` gave no signal that the
+    connector's runtime_bindings and the tool's real schema had drifted
+    apart."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": [],
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {
+                        "target_type": "tool_arguments",
+                        "key": "account_id",
+                    },
+                },
+            ],
+            "connector_runtime": {
+                "context": {"account_id": "6185"},
+                "secrets": {},
+                "auth_selector": {},
+            },
+        },
+    )
+
+    caplog.set_level("WARNING")
+    assert adapter._runtime_tool_arguments() == {}
+    assert (
+        "does not declare this argument" in caplog.text
+        or "input schema does not declare" in caplog.text
+    )
+    assert "account_id" in caplog.text
+    assert "list_clients" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_call_proceeds_when_runtime_binding_target_is_undeclared(
+    monkeypatch,
+):
+    """Even though the runtime binding above can't be applied, the tool call
+    itself must still go through -- an undeclared binding target degrades to
+    'this one argument isn't injected', not 'the tool call fails'."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": [],
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {
+                        "target_type": "tool_arguments",
+                        "key": "account_id",
+                    },
+                },
+            ],
+            "connector_runtime": {
+                "context": {"account_id": "6185"},
+                "secrets": {},
+                "auth_selector": {},
+            },
+        },
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured["name"] = name
+            captured["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+
+    result = await adapter.run_json_async({"query": "active"})
+
+    assert result["is_error"] is False
+    assert captured["arguments"] == {"query": "active"}
+
+
 def _resolver_retry_adapter(connection):
     return MCPToolAdapter(
         mcp_tool=SimpleNamespace(
@@ -2208,6 +2320,201 @@ async def test_mcp_tool_execution_error_does_not_echo_raw_exception(monkeypatch)
     assert result["is_error"] is True
     assert result["content"][0]["text"] == "Error executing MCP tool."
     assert "runtime-token" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_logs_truncated_message(monkeypatch, caplog):
+    """The generic-exception handler must log the server's actual error
+    message (bounded), not just the exception's class name, so an on-call
+    engineer reading the log can see what the server actually said."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+    overlong_detail = "server-said-this-and-nothing-else-" + "z" * 600
+
+    class _FakeSession:
+        async def initialize(self):
+            raise RuntimeError(overlong_detail)
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    # No traceback is attached to this log record: attaching one would print
+    # the exception's raw, unbounded message a second time (Python's own
+    # traceback formatting bypasses the truncation below), defeating the
+    # bound. So the untruncated payload must not appear anywhere in the
+    # emitted log, not just outside the formatted message field.
+    assert "RuntimeError" in caplog.text
+    assert "server-said-this-and-nothing-else-" in caplog.text
+    assert overlong_detail not in caplog.text
+    assert caplog.records[-1].exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_redacts_url_query_and_userinfo(
+    monkeypatch, caplog
+):
+    """httpx.HTTPStatusError formats its own message as "... for url
+    '<url>'". Connector URLs commonly carry secrets (API keys, tokens) in
+    the query string, so the logged message must have the query string
+    dropped while still naming the host and status so the log stays
+    useful."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+    request = httpx.Request(
+        "POST",
+        "https://mcp.example.test/mcp?api_key=SECRET-abc123&tenant=acme",
+    )
+    response = httpx.Response(403, request=request)
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        response.raise_for_status()
+    status_error = exc_info.value
+
+    class _FakeSession:
+        async def initialize(self):
+            raise status_error
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert "SECRET-abc123" not in caplog.text
+    assert "tenant=acme" not in caplog.text
+    assert "403" in caplog.text
+    assert "mcp.example.test" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_redacts_url_userinfo(monkeypatch, caplog):
+    """A message that embeds a URL with userinfo (``user:pass@host``) must
+    have both the credentials and the query string stripped before
+    logging."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            raise RuntimeError(
+                "upstream refused connection to https://user:pw@host/path?x=1"
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert "pw" not in caplog.text
+    assert "x=1" not in caplog.text
+    assert "host" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_group_logs_each_sub_exception(
+    monkeypatch, caplog
+):
+    """The exception-group handler must log each leaf exception's own class
+    and message (bounded), not just the group's class name -- a fan-out MCP
+    call raises one group per failed leg (and the MCP client's own two
+    nested task groups can wrap that again), and a group itself carries no
+    detail about which leg failed or why. Nested groups must be expanded to
+    their leaves rather than logged as an opaque inner ExceptionGroup."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            raise BaseExceptionGroup(
+                "outer",
+                [
+                    BaseExceptionGroup("inner", [RuntimeError("first-leg-failed")]),
+                    ValueError("second-leg"),
+                ],
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert "RuntimeError" in caplog.text
+    assert "first-leg-failed" in caplog.text
+    assert "ValueError" in caplog.text
+    assert "second-leg" in caplog.text
+    assert "related exception ExceptionGroup" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -3332,3 +3639,26 @@ def test_only_read_only_is_a_safe_reading():
         MCPWriteHint.DESTRUCTIVE,
         MCPWriteHint.UNDECLARED,
     }
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("HTTPS://H.EXAMPLE/P?K=SECRET", "https://H.EXAMPLE/P"),
+        ("https://cb.example/done#access_token=TOKEN&t=b", "https://cb.example/done"),
+        ("https://[::1]:8080/x?y=1 done", "https://[::1]:8080/x done"),
+        ("https://user:pw@Host.Example:8443/p?x=1", "https://Host.Example:8443/p"),
+        ("https://[::1/x?y=1 done", "<url redacted> done"),
+    ],
+    ids=[
+        "uppercase-scheme",
+        "fragment-dropped",
+        "ipv6-brackets-kept",
+        "userinfo-and-case",
+        "unparsable",
+    ],
+)
+def test_redact_urls_in_text_edge_shapes(text, expected):
+    from xagent.core.tools.adapters.vibe.mcp_adapter import _redact_urls_in_text
+
+    assert _redact_urls_in_text(text) == expected
