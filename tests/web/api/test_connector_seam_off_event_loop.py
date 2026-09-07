@@ -27,6 +27,9 @@ _SEAM_MODULES = ("xagent.web.api.custom_api", "xagent.web.api.mcp")
 # cannot pass by finding nothing. Keyed by ``module.function`` or
 # ``module.Class.method``.
 _SEAM_REACHING_FUNCTIONS = {
+    "custom_api._recheck_team_access_under_definition_lock",
+    "custom_api._resolve_custom_api_for_request",
+    "custom_api.get_custom_api",
     "custom_api.update_custom_api",
     "custom_api.delete_custom_api",
     "mcp._local_mcp_can_attach",
