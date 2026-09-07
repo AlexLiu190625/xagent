@@ -53,10 +53,10 @@ that declares it is checked; one that does not is not.
 | ``mcp.delete_mcp_server`` | two row locks: ``mcp_servers`` and ``user_mcpservers``, taken by ``_lock_active_mcp_oauth_lifecycle`` before this call | no | ``True`` |
 
 ``mcp._teardown_mcp_app_server_locally`` is a helper, not a route: it has no
-route decorator and no caller in this repository outside tests (the async
-``teardown_mcp_app_server`` route only dispatches to it with
+route decorator, and its only caller in this repository outside tests is the
+async ``teardown_mcp_app_server`` wrapper, which dispatches to it with
 ``asyncio.to_thread`` and, after it returns, runs the external revocation that
-must not itself hold any of the three row locks). "Nothing committed before
+must not itself hold any of the three row locks. "Nothing committed before
 asking" therefore holds inside its own body only. A future caller that commits
 and then calls it would turn its declaration into a report of failure for work
 that already succeeded, and nothing here would notice -- the check that keeps

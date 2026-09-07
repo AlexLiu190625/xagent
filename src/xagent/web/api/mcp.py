@@ -4704,9 +4704,20 @@ async def teardown_mcp_app_server(
     ``_teardown_mcp_app_server_locally``, and runs in a worker thread rather
     than here, because an installed team hook may be slow and this coroutine
     runs on the event loop thread that serves every other request. The same
-    session is handed to that thread and back, which is what an ``async``
-    route already does with a session ``get_db`` opened in a worker thread; the
-    ``await`` below means only one thread ever uses it at a time.
+    session is handed to that thread and back; the engine allows this across
+    threads (``check_same_thread=False`` and ``NullPool`` in
+    ``models/database.py``), and ``triggers.py`` already hands its own
+    request-scoped session to a worker thread the same way.
+
+    That does not by itself make the handoff safe against cancellation:
+    ``asyncio.to_thread`` does not stop the worker when the awaiting coroutine
+    is cancelled. A caller that hands this function a request-scoped session
+    (such as one ``get_db`` opened for that route) could have a client
+    disconnect trigger request cleanup and close that session while the
+    worker is still committing on it. This function has no such caller in
+    this repository today. Before wiring one in, route the call through
+    ``run_db_io_cancellation_safe`` instead and have the worker function open
+    and close its own session.
 
     What remains here is the best-effort provider revocation, the one step that
     genuinely needs to await. It needs no ORM access and holds no database
