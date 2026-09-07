@@ -1598,6 +1598,121 @@ def test_custom_api_requirements_report_lists_context_only(e2e_db: None) -> None
     assert tenant_id_input["required"] is True
 
 
+def test_mcp_auth_selector_key_is_listed_as_its_own_section(e2e_db: None) -> None:
+    """The mirror of the custom_api case above: on an MCP connector the
+    declared ``auth_selector`` key is listed, under its own section, and is
+    unsatisfied because no store holds such a value at this phase -- so a
+    required one keeps the whole report unsatisfied. The key carries no
+    runtime binding: binding an ``auth_selector`` key to a connector target
+    is rejected at declaration time, unlike a ``context`` key.
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = MCPServer(
+            name="auth-selector-server",
+            description="auth-selector-server description",
+            managed="external",
+            transport="streamable_http",
+            url="https://example.com/auth-selector/mcp",
+            runtime_input_schema={
+                "context": {"account_id": {"type": "string", "required": False}},
+                "auth_selector": {
+                    "resource_owner_key": {"type": "string", "required": True}
+                },
+            },
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {"target_type": "mcp_meta", "key": "account_id"},
+                }
+            ],
+        )
+        db.add(server)
+        db.flush()
+        db.add(
+            UserMCPServer(
+                user_id=user.id,
+                mcpserver_id=server.id,
+                is_owner=True,
+                can_edit=True,
+                can_delete=True,
+                is_active=True,
+            )
+        )
+        agent = _create_agent(
+            db, user, name="Auth Selector Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/chat/agent/{agent_id}/connector-runtime-requirements",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert len(payload["connectors"]) == 1
+    inputs = payload["connectors"][0]["inputs"]
+    assert {(item["section"], item["key"]) for item in inputs} == {
+        ("context", "account_id"),
+        ("auth_selector", "resource_owner_key"),
+    }
+    auth_selector_input = next(
+        item for item in inputs if item["section"] == "auth_selector"
+    )
+    assert auth_selector_input["key"] == "resource_owner_key"
+    assert auth_selector_input["type"] == "string"
+    assert auth_selector_input["required"] is True
+    assert auth_selector_input["satisfied"] is False
+    assert auth_selector_input["expired"] is False
+    assert payload["satisfied"] is False
+
+
+def test_agent_requirements_are_satisfied_when_every_declared_key_is_optional(
+    e2e_db: None,
+) -> None:
+    """A non-vacuous top-level ``satisfied: true`` on the agent-keyed
+    report: the agent does select a connector that declares a runtime
+    input, the input is listed and unsatisfied -- that report can store no
+    value -- and the flag still reads true, because it answers "would a
+    task created from this agent right now need anything else" and nothing
+    declared is required.
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        _create_mcp_server(
+            db, user, name="optional-only-server", with_runtime_declaration=True
+        )
+        agent = _create_agent(
+            db, user, name="Optional Only Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/chat/agent/{agent_id}/connector-runtime-requirements",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert len(payload["connectors"]) == 1
+    inputs = payload["connectors"][0]["inputs"]
+    assert [item["key"] for item in inputs] == ["account_id"]
+    assert inputs[0]["required"] is False
+    assert inputs[0]["satisfied"] is False
+    assert payload["satisfied"] is True
+
+
 def test_team_shared_connector_visible_across_read_endpoints(e2e_db: None) -> None:
     """A connector shared only through the agent's team is listed by both
     read endpoints for a non-owning team member, and the task-keyed read
@@ -2080,6 +2195,181 @@ def test_task_requirements_reports_unfillable_declared_key_as_unsatisfied(
     assert inputs_by_key["bad.key"]["satisfied"] is False
     assert inputs_by_key["auth_token"]["satisfied"] is True
     assert payload["satisfied"] is False
+
+
+def test_optional_unfillable_declared_key_holds_report_unsatisfied(
+    e2e_db: None,
+) -> None:
+    """A malformed declared key holds the top-level ``satisfied`` at false
+    even when nothing the connector declares is required. The per-turn gate
+    validates the syntax of every declared key before it looks at
+    ``required``, so this task cannot run; a report that read only the
+    ``required`` keys would call it ready. The key stays listed, its own
+    ``satisfied`` is false, and the read still answers 200 -- reporting the
+    problem is this endpoint's job, raising on it is the gate's.
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="optional-malformed-key-server",
+            context_schema={
+                "account_id": {"type": "string", "required": False},
+                "bad.key": {"type": "string", "required": False},
+            },
+            url="https://example.com/optional-malformed/mcp",
+        )
+        agent = _create_agent(
+            db, user, name="Optional Malformed Key Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server)
+        agent_id = int(agent.id)
+        server_id = int(server.id)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={
+            "title": "optional malformed key task",
+            "description": "d",
+            "agent_id": agent_id,
+        },
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+
+    db = _db_session()
+    try:
+        db.add(
+            TaskConnectorRuntimeContext(
+                task_id=task_id,
+                connector_type="mcp",
+                connector_id=server_id,
+                context={"account_id": "stored"},
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/chat/task/{task_id}/connector-runtime-requirements",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    inputs_by_key = {
+        item["key"]: item
+        for connector in payload["connectors"]
+        for item in connector["inputs"]
+    }
+    assert set(inputs_by_key) == {"account_id", "bad.key"}
+    assert inputs_by_key["bad.key"]["required"] is False
+    assert inputs_by_key["bad.key"]["satisfied"] is False
+    assert inputs_by_key["account_id"]["required"] is False
+    assert inputs_by_key["account_id"]["satisfied"] is True
+    assert payload["satisfied"] is False
+
+
+def test_task_requirements_reports_empty_for_a_task_with_no_agent(
+    e2e_db: None,
+) -> None:
+    """A task created with no agent has no connector selection to report:
+    the agent-keyed producer that fills the task's selection snapshot was
+    called with no agent, so the snapshot is empty, and the task-keyed read
+    resolves the same absent agent and answers 200 with an empty,
+    satisfied report rather than failing on the missing row.
+    """
+    headers = _setup_admin_headers()
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "agentless task", "description": "d"},
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+    assert _task(task_id).agent_id is None
+
+    response = client.get(
+        f"/api/chat/task/{task_id}/connector-runtime-requirements",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "satisfied": True,
+        "secrets_expires_at": None,
+        "connectors": [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("endpoint_kind", "expected_detail"),
+    [
+        ("agent", "Agent not found or access denied"),
+        ("task", "Task not found"),
+    ],
+)
+def test_read_endpoints_report_an_unknown_id_as_not_found(
+    e2e_db: None, endpoint_kind: str, expected_detail: str
+) -> None:
+    """An id that exists on neither endpoint is a 404 on both -- the same
+    answer each gives for an id the caller may not read, so neither
+    endpoint tells an unauthorized caller that the id exists.
+    """
+    headers = _setup_admin_headers()
+    response = client.get(
+        f"/api/chat/{endpoint_kind}/987654321/connector-runtime-requirements",
+        headers=headers,
+    )
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"] == expected_detail
+
+
+def test_task_requirements_endpoint_gives_an_admin_no_read_of_another_task(
+    e2e_db: None,
+) -> None:
+    """Being an admin buys no read of another user's task here: the
+    task-keyed read filters on the caller's own user id with no admin
+    exception, unlike ``/task/{task_id}/runtime-extensions``. The owner's
+    own read of the same task answers 200, so the admin's 404 is about the
+    caller, not about the id.
+    """
+    admin_headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        owner = _create_user(db, "task-requirements-owner")
+        agent = _create_agent(
+            db, owner, name="Owner Only Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+        owner_headers = _auth_headers_for_user(owner)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=owner_headers,
+        json={"title": "owner task", "description": "d", "agent_id": agent_id},
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+
+    url = f"/api/chat/task/{task_id}/connector-runtime-requirements"
+    owner_response = client.get(url, headers=owner_headers)
+    assert owner_response.status_code == 200, owner_response.text
+
+    admin_response = client.get(url, headers=admin_headers)
+    assert admin_response.status_code == 404, admin_response.text
+    assert admin_response.json()["detail"] == "Task not found"
 
 
 def test_task_requirements_endpoint_requires_task_ownership_by_caller(

@@ -17,6 +17,8 @@ move that would touch every existing importer.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel
 
 
@@ -44,13 +46,17 @@ class ConnectorRuntimeInputModel(BaseModel):
     and can be, while in ``secrets`` and ``auth_selector`` it means no
     value can be supplied at this phase at all. One ``context`` key is
     also always ``False``: a key whose name the per-turn gate rejects as
-    malformed, which is reported so a required key of that kind cannot
-    let the report read as met.
+    malformed, which is reported so that no key of that kind, required or
+    not, can let the report read as met.
+
+    ``section`` and ``type`` are closed sets, and a client may switch on
+    them exhaustively: the server emits no other value in either field,
+    and adding one would be a wire change.
     """
 
-    section: str
+    section: Literal["context", "secrets", "auth_selector"]
     key: str
-    type: str
+    type: Literal["string", "object"]
     required: bool
     satisfied: bool
     expired: bool = False
@@ -82,10 +88,20 @@ class ConnectorRuntimeRequirementsModel(BaseModel):
     called. The agent-keyed report has no task, so no value can be stored
     against it: there ``satisfied`` answers "a task created from this agent
     right now would need no further input", i.e. nothing required is
-    declared at all. The task-keyed report and the task-create response
-    answer "every required input of this task already has a value". The
-    per-input ``satisfied`` follows the same split: always ``False`` on the
-    agent-keyed report, and a real per-key answer on the other two.
+    declared at all. The task-create response answers that same question:
+    it is computed from the agent, before the new task is persisted and so
+    before any value could have been stored against it. Only the
+    task-keyed report consults stored values, and only there does
+    ``satisfied`` answer "every required input of this task already has a
+    value". The per-input ``satisfied`` follows the same split: always
+    ``False`` on the agent-keyed report and on the task-create response,
+    and a real per-key answer on the task-keyed report.
+
+    ``satisfied`` is also ``False``, on every endpoint and whatever the
+    per-input flags say, while any listed key's name is one the per-turn
+    gate rejects as malformed -- required or not, because that gate
+    refuses the whole turn over such a key rather than only over a
+    required one.
     """
 
     satisfied: bool

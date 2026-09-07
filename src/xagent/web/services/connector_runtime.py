@@ -443,8 +443,9 @@ def resolve_agent_runtime_requirements(
 
     The report has no task to consult, so every input's ``satisfied`` is
     ``False`` and the top-level ``satisfied`` answers "would a task created
-    from this agent right now need nothing else" -- i.e. it has no required
-    input at all. Never queries any task's stored values: doing so would
+    from this agent right now need nothing else" -- i.e. no required input
+    is declared, and no declared key carries a name the per-turn gate would
+    reject. Never queries any task's stored values: doing so would
     make the answer depend on which task happened to be looked up, and this
     endpoint has none in scope.
 
@@ -915,11 +916,15 @@ def _build_connector_report(
                 # No value can ever be stored under this key's syntax --
                 # the per-turn gate rejects it with a 400, required or
                 # not. It is still listed, unconditionally unsatisfied
-                # even with a stored value under that name, so a required
-                # one holds the top-level ``satisfied`` at false; dropping
-                # the key would let that flag read true instead. This
-                # report still never raises: the real fix is validating
-                # key syntax at connector create/update time, not here.
+                # even with a stored value under that name; dropping the
+                # key would hide from a caller the one thing that will
+                # fail the turn. The top-level flag is held at false by
+                # ``_all_required_inputs_satisfied``, which re-checks the
+                # syntax of every listed key rather than reading these
+                # per-key flags alone, because a key of this kind fails
+                # the turn whether or not it is required. This report
+                # still never raises: the real fix is validating key
+                # syntax at connector create/update time, not here.
                 satisfied = False
             else:
                 satisfied = (
@@ -951,15 +956,37 @@ def _all_required_inputs_satisfied(
 ) -> bool:
     """Top-level ``satisfied``: every required input, across every
     reported connector and every section including ``secrets``, is
-    satisfied. ``all()`` over an empty sequence is ``True``, so no
-    connectors (or no required inputs) reports satisfied.
+    satisfied, and no reported connector declares a key whose name the
+    per-turn gate rejects. An empty report is therefore satisfied: no
+    connectors, or none with a required input and none with a malformed
+    key, reports satisfied.
+
+    The malformed-key rule ignores ``required`` on purpose. The per-turn
+    gate (``_require_context_values``, ``_require_ephemeral_values``)
+    validates the syntax of every declared key and raises before it looks
+    at ``required`` at all, so a connector declaring ``{"bad.key":
+    {"required": false}}`` fails every turn while nothing about it is
+    required. Reading only the per-key ``satisfied`` flags of required
+    inputs would report such a task as ready to run.
     """
     return all(
-        input_item.satisfied
+        _key_syntax_is_accepted(input_item.key)
+        and (input_item.satisfied or not input_item.required)
         for connector in connectors
         for input_item in connector.inputs
-        if input_item.required
     )
+
+
+def _key_syntax_is_accepted(key: str) -> bool:
+    """Whether the per-turn gate would accept this declared key's name,
+    asked without raising. Same predicate the gate applies, via the same
+    validator, so the two cannot drift apart.
+    """
+    try:
+        validate_runtime_source_key(key)
+    except ValueError:
+        return False
+    return True
 
 
 def _build_task_requirements_model(

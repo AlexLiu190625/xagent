@@ -198,15 +198,20 @@ class TaskCreateResponse(BaseModel):
     connector_runtime_requirements: ConnectorRuntimeRequirementsModel | None = Field(
         ...,
         description=(
-            "Which runtime inputs this task's connectors still need, and "
-            "which of them already have a value. Always present in the "
-            "response body -- a client must not treat its absence as "
-            "meaning anything. Never includes a stored value itself, only "
-            "whether one exists. Present with a report on the web chat "
-            "create path (`POST /api/chat/task/create`); `null` on the "
-            "public chat and share-link create paths, meaning the "
-            "requirements were not evaluated there -- those visitors never "
-            "receive connector key names."
+            "Which runtime inputs the new task's connectors declare. "
+            "Computed from the agent before the task is persisted, so no "
+            "value can have been stored against the task yet and every "
+            "input reads unsatisfied: it answers what a task created from "
+            "this agent needs, not what this task still misses. Read "
+            "`GET /api/chat/task/{task_id}/connector-runtime-requirements` "
+            "for the second question. Always present in the response body "
+            "-- a client must not treat its absence as meaning anything. "
+            "Never includes a stored value itself, only whether one "
+            "exists. Present with a report on the web chat create path "
+            "(`POST /api/chat/task/create`); `null` on the public chat and "
+            "share-link create paths, meaning the requirements were not "
+            "evaluated there -- those visitors never receive connector key "
+            "names."
         ),
     )
 
