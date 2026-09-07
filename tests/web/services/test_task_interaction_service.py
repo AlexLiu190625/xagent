@@ -227,15 +227,15 @@ def test_respond_outcome_union_has_exactly_the_eight_known_variants() -> None:
     }
 
 
-def test_create_outcome_reason_word_list_has_exactly_12_words() -> None:
-    assert len(svc.CREATE_OUTCOME_REASON_WORDS) == 12
+def test_create_outcome_reason_word_list_has_exactly_13_words() -> None:
+    assert len(svc.CREATE_OUTCOME_REASON_WORDS) == 13
 
 
-def test_create_outcome_producible_pairs_are_exactly_9() -> None:
+def test_create_outcome_producible_pairs_are_exactly_10() -> None:
     total = sum(
         len(reasons) for reasons in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS.values()
     )
-    assert total == 9
+    assert total == 10
 
 
 def test_create_outcome_producible_reasons_are_a_subset_of_the_full_word_list() -> None:
@@ -5768,7 +5768,7 @@ def test_degraded_as_subclass_maps_to_the_parents_outcome(
     exact-type lookup's failure is visible in the outcome itself.
 
     Mutation: restoring `_DEGRADED_AS_OUTCOME.get(handoff.degraded_as)`
-    turns this red with CreateConflict(slot_taken)."""
+    turns this red with CreateConflict(handoff_degraded_unclassified)."""
 
     from xagent.web.services import task_interaction_staging as staging_module
     from xagent.web.services.task_interaction_staging import (
@@ -5790,6 +5790,39 @@ def test_degraded_as_subclass_maps_to_the_parents_outcome(
         outcome = _system_create(_db, ctx, request_idempotency_key="sys-key-subclass")
 
     assert outcome == svc.CreateStale(reason="anchor_run_mismatch")
+    assert real_stage is staging_module.stage_interaction_request
+    assert _db.query(TaskInteractionRequest).count() == 0
+
+
+def test_unmapped_degraded_as_maps_to_the_unclassified_outcome(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """An unrecognized degradation gets its own reason word, not the
+    real-conflict one. InteractionOriginUnknown is one of the two swallowed
+    exceptions _DEGRADED_AS_OUTCOME does not map, so it exercises the
+    default classification, which now reports
+    handoff_degraded_unclassified rather than reusing slot_taken.
+
+    Mutation: reverting the default classification's reason back to
+    `CreateConflict(reason="slot_taken")` turns this red."""
+
+    from xagent.web.services import task_interaction_staging as staging_module
+    from xagent.web.services.task_interaction_staging import (
+        InteractionOriginUnknown,
+    )
+
+    ctx = _system_call_ctx
+    real_stage = staging_module.stage_interaction_request
+
+    def _raise_unmapped(*args: Any, **kwargs: Any) -> Any:
+        raise InteractionOriginUnknown("forced for test_unmapped_degraded_as")
+
+    with mock.patch.object(
+        staging_module, "stage_interaction_request", side_effect=_raise_unmapped
+    ):
+        outcome = _system_create(_db, ctx, request_idempotency_key="sys-key-unmapped")
+
+    assert outcome == svc.CreateConflict(reason="handoff_degraded_unclassified")
     assert real_stage is staging_module.stage_interaction_request
     assert _db.query(TaskInteractionRequest).count() == 0
 
@@ -5898,13 +5931,21 @@ def test_handoff_degraded_as_is_set_directly_on_a_slot_taken_swallow(
 ) -> None:
     """Unlike the outcome-level test above, this checks
     InteractionHandoff.degraded_as itself, at the staging primitive's own
-    layer -- discriminating power the outcome-level test lacks for this one
-    exception, since CreateConflict(slot_taken) is also this function's
-    fallback for an unset/unrecognized degraded_as, so an outcome-only
-    check cannot tell "correctly mapped" from "fell through to the
-    default". Deleting the `handoff.degraded_as = type(exc)` assignment in
-    interaction_handoff's except block turns this test red without
-    changing the outcome-level test's result at all."""
+    layer, pinning the `handoff.degraded_as = type(exc)` assignment
+    directly rather than through create()'s downstream mapping. Before the
+    default classification got its own reason word
+    (handoff_degraded_unclassified), CreateConflict(slot_taken) was also
+    this function's fallback for an unset/unrecognized degraded_as, so the
+    outcome alone could not tell "correctly mapped" from "fell through to
+    the default" for this one exception -- only this primitive-level check
+    could. That degeneracy is gone now that the default reports a
+    different word, so the outcome-level test above has the same
+    discriminating power for this exception today. Deleting the
+    `handoff.degraded_as = type(exc)` assignment in interaction_handoff's
+    except block turns both this test and the outcome-level test red
+    (verified; every other test that exercises a mapped swallowed
+    exception turns red too, since the same assignment backs all of
+    them)."""
 
     from xagent.web.services.task_interaction_staging import InteractionSlotTaken
 
