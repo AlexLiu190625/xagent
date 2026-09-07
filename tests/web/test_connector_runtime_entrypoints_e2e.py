@@ -2975,6 +2975,71 @@ def test_values_endpoint_requires_task_ownership_by_caller(e2e_db: None) -> None
     assert _context_row_count(task_id) == 0
 
 
+def test_values_endpoint_gives_an_admin_no_write_to_another_task(
+    e2e_db: None,
+) -> None:
+    """Being an admin buys no write to another user's task here either:
+    this endpoint filters on the caller's own user id with no admin
+    exception, and answers the same "Task not found" 404 the task-keyed
+    read endpoint answers for the same caller. The owner's own write of
+    the same body answers 200, so the admin's 404 is about the caller, not
+    about the id or the body.
+    """
+    admin_headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        owner = _create_user(db, "values-admin-probe-owner")
+        db.flush()
+        server = _mcp_server_with_context_schema(
+            db,
+            owner,
+            name="values-admin-probe-server",
+            context_schema={"auth_token": {"type": "string", "required": True}},
+            url="https://example.com/values-admin-probe/mcp",
+        )
+        agent = _create_agent(
+            db, owner, name="Values Admin Probe Agent", tool_categories=["mcp"]
+        )
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server)
+        agent_id = int(agent.id)
+        server_id = int(server.id)
+        owner_headers = _auth_headers_for_user(owner)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=owner_headers,
+        json={
+            "title": "values admin probe task",
+            "description": "d",
+            "agent_id": agent_id,
+        },
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+
+    body = {
+        "items": [
+            {
+                "connector_ref": {"connector_type": "mcp", "connector_id": server_id},
+                "context": {"auth_token": "x"},
+            }
+        ]
+    }
+
+    admin_response = client.post(_values_url(task_id), headers=admin_headers, json=body)
+    assert admin_response.status_code == 404, admin_response.text
+    assert admin_response.json()["detail"] == "Task not found"
+    assert _context_row_count(task_id) == 0
+
+    owner_response = client.post(_values_url(task_id), headers=owner_headers, json=body)
+    assert owner_response.status_code == 200, owner_response.text
+    assert _context_row_count(task_id) == 1
+
+
 def test_values_endpoint_surfaces_team_scope_failure_as_typed_503(
     e2e_db: None,
 ) -> None:
@@ -3127,6 +3192,85 @@ def test_values_endpoint_rejects_malformed_key_name(e2e_db: None) -> None:
     )
     assert response.status_code == 400, response.text
     assert _context_row_count(task_id) == 0
+
+
+def test_values_endpoint_response_stays_unsatisfied_for_a_malformed_declared_key(
+    e2e_db: None,
+) -> None:
+    """A successful write does not make the response's top-level
+    ``satisfied`` true while the connector still declares a key whose name
+    the per-turn gate rejects -- even an optional one. The write itself
+    succeeds and the key it wrote reads satisfied, but the malformed key
+    stays listed and unsatisfied and holds the top-level flag at false, so
+    a caller cannot read a 200 here as "this task can now run".
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="values-malformed-declaration-server",
+            context_schema={
+                "auth_token": {"type": "string", "required": True},
+                "bad.key": {"type": "string", "required": False},
+            },
+            url="https://example.com/values-malformed-declaration/mcp",
+        )
+        agent = _create_agent(
+            db,
+            user,
+            name="Values Malformed Declaration Agent",
+            tool_categories=["mcp"],
+        )
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server)
+        agent_id = int(agent.id)
+        server_id = int(server.id)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={
+            "title": "values malformed declaration task",
+            "description": "d",
+            "agent_id": agent_id,
+        },
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"auth_token": "x"},
+                }
+            ]
+        },
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    inputs_by_key = {
+        item["key"]: item
+        for connector in payload["connectors"]
+        for item in connector["inputs"]
+    }
+    assert set(inputs_by_key) == {"auth_token", "bad.key"}
+    assert inputs_by_key["auth_token"]["satisfied"] is True
+    assert inputs_by_key["bad.key"]["required"] is False
+    assert inputs_by_key["bad.key"]["satisfied"] is False
+    assert payload["satisfied"] is False
 
 
 def test_values_endpoint_rejects_oversized_single_key_and_batch(e2e_db: None) -> None:
@@ -3309,9 +3453,18 @@ def test_values_endpoint_merges_keys_and_never_replaces_a_stored_value(
     r3 = _post({"b": "2"})
     assert r3.status_code == 200, r3.text
     assert _stored_context(task_id, server_id) == {"a": "1", "b": "2"}
-    r3_inputs = {item["key"]: item for item in r3.json()["connectors"][0]["inputs"]}
+    r3_body = r3.json()
+    r3_inputs = {item["key"]: item for item in r3_body["connectors"][0]["inputs"]}
     assert r3_inputs["a"]["satisfied"] is True
     assert r3_inputs["b"]["satisfied"] is True
+    # The wire fields this phase emits as constants, pinned on the 200 body
+    # of the third producer of this model: `expired` is false for every
+    # input and `secrets_expires_at` is null, because no expiry-bearing
+    # value can be stored yet, and every input a `context`-only connector
+    # declares lands in the `context` section.
+    assert all(item["expired"] is False for item in r3_inputs.values())
+    assert all(item["section"] == "context" for item in r3_inputs.values())
+    assert r3_body["secrets_expires_at"] is None
 
     # (4) add "c" alongside the already-stored "a" -- 200, all three present.
     r4 = _post({"a": "1", "c": "3"})
@@ -3345,6 +3498,37 @@ def test_values_endpoint_rejects_any_override_switch(
                     },
                     "context": {"auth_token": "x"},
                     override_key: True,
+                }
+            ]
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert _context_row_count(task_id) == 0
+
+
+@pytest.mark.parametrize(
+    ("section", "payload"),
+    [("secrets", {"api_key": "x"}), ("auth_selector", {"choice": "a"})],
+)
+def test_values_endpoint_rejects_secret_bearing_sections(
+    e2e_db: None, section: str, payload: dict[str, str]
+) -> None:
+    """``secrets`` and ``auth_selector`` are deliberately absent from the
+    request shape at this phase, so an item carrying either section is
+    422 before the merge logic runs and nothing is stored."""
+    headers, task_id, server_id = _setup_context_task(required=False)
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"auth_token": "x"},
+                    section: payload,
                 }
             ]
         },
@@ -4177,3 +4361,141 @@ def test_values_endpoint_accepts_team_shared_connector(e2e_db: None) -> None:
     finally:
         set_agent_team_scope_hook(None)
         connector_team_scope.set_connector_team_hooks()
+
+
+def test_values_endpoint_uses_runtime_agent_resolution_for_team_scope(
+    e2e_db: None,
+) -> None:
+    """The values-endpoint half of the runtime agent resolution: a task
+    whose agent is a workforce-generated manager agent, but for which no
+    matching ``WorkforceRun`` exists, gets its connector scope from
+    ``_load_agent_for_task_runtime`` returning ``None`` -- the same outcome
+    a turn would get -- so a connector reachable only through the agent's
+    team is neither writable here nor listed in the response, while a
+    personally linked connector is both. Resolving the agent from
+    ``task.agent_id`` directly would open this endpoint to a connector the
+    turn itself will never resolve, and make its report disagree with the
+    task-keyed read endpoint's for the same task.
+
+    The task is built directly for the same reason the read endpoint's
+    counterpart is: ``POST /task/create`` 404s for a workforce-generated
+    manager agent, so a task with this agent can only exist as a row the
+    workforce side creates.
+    """
+    db = _db_session()
+    try:
+        caller = _create_user(db, "wf-values-owner")
+        db.flush()
+        personal = _mcp_server_with_context_schema(
+            db,
+            caller,
+            name="wf-values-personal-server",
+            context_schema={"auth_token": {"type": "string", "required": True}},
+            url="https://example.com/wf-values-personal/mcp",
+        )
+        team_shared = MCPServer(
+            name="wf-values-team-shared-server",
+            description="wf-values-team-shared-server description",
+            managed="external",
+            transport="streamable_http",
+            url="https://example.com/wf-values-team/mcp",
+            runtime_input_schema={
+                "context": {"auth_token": {"type": "string", "required": True}}
+            },
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "auth_token"},
+                    "target": {"target_type": "mcp_meta", "key": "auth_token"},
+                }
+            ],
+        )
+        db.add(team_shared)
+        db.flush()
+        # No UserMCPServer link for `caller` at all -- reachable only
+        # through the team hook below.
+        personal_id = int(personal.id)
+        team_shared_id = int(team_shared.id)
+        agent = Agent(
+            user_id=caller.id,
+            name="WF Values Manager Agent",
+            instructions="i",
+            execution_mode="balanced",
+            status=AgentStatus.PUBLISHED,
+            tool_categories=["mcp"],
+            team_id=505,
+            origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+        )
+        db.add(agent)
+        db.flush()
+        agent_id = int(agent.id)
+        ordered_ids = sorted([personal_id, team_shared_id])
+        task = Task(
+            user_id=caller.id,
+            agent_id=agent_id,
+            title="workforce manager values task",
+            description="d",
+            status=TaskStatus.PENDING,
+            connector_runtime_selected_refs=[
+                {"connector_type": "mcp", "connector_id": ref_id}
+                for ref_id in ordered_ids
+            ],
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        caller_headers = _auth_headers_for_user(caller)
+    finally:
+        db.close()
+
+    def _hook(db: Session, *, team_id: int) -> dict[str, set[int]]:
+        if team_id == 505:
+            return {"mcp": {team_shared_id}, "custom_api": set()}
+        return {"mcp": set(), "custom_api": set()}
+
+    connector_team_scope.set_connector_team_hooks(team_visibility=_hook)
+    try:
+        personal_response = client.post(
+            _values_url(task_id),
+            headers=caller_headers,
+            json={
+                "items": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": personal_id,
+                        },
+                        "context": {"auth_token": "x"},
+                    }
+                ]
+            },
+        )
+        team_response = client.post(
+            _values_url(task_id),
+            headers=caller_headers,
+            json={
+                "items": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": team_shared_id,
+                        },
+                        "context": {"auth_token": "x"},
+                    }
+                ]
+            },
+        )
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+    assert personal_response.status_code == 200, personal_response.text
+    refs_seen = [
+        item["connector_ref"] for item in personal_response.json()["connectors"]
+    ]
+    assert refs_seen == [{"connector_type": "mcp", "connector_id": personal_id}]
+
+    # The team-shared connector is outside the scope a turn would resolve,
+    # so it is not writable here either -- the same uniform "not found"
+    # the endpoint answers for any ref the caller cannot see.
+    assert team_response.status_code == 404, team_response.text
+    assert _context_row_count(task_id) == 1

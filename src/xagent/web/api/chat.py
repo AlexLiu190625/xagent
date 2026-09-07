@@ -5438,6 +5438,11 @@ async def post_task_connector_runtime_values(
     at the request-shape level (``extra="forbid"``), not accepted and
     ignored.
 
+    Access is the same plain task ownership the task-keyed read endpoint
+    applies -- ``Task.user_id == current_user.id`` in the query that loads
+    the task, with no admin exception -- so a task that does not exist and
+    one that is not the caller's own answer the same 404.
+
     On success, the response is the same requirements report the read
     endpoints return, reflecting exactly what was just written -- not the
     request's own echo, and not whatever the read endpoints would have
@@ -5458,11 +5463,21 @@ async def post_task_connector_runtime_values(
     task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    agent = (
-        db.query(Agent).filter(Agent.id == task.agent_id).first()
-        if task.agent_id is not None
-        else None
-    )
+    # The connector scope this endpoint writes into, and reports on, must
+    # be the scope a turn would actually run under, so the agent is
+    # resolved by the same two calls the per-turn tool build makes for
+    # this task, in the same order -- the identical pair the task-keyed
+    # read endpoint above uses, so neither endpoint can answer with a
+    # connector set the other would not. Reading the agent row directly
+    # would key team-shared connectors on the raw row's team even where
+    # the runtime resolves the agent to None, and resolving with no
+    # workforce runtime would drop the team of a workforce manager agent
+    # whose run the runtime does find. Here the scope decides not only
+    # what the response lists but which connectors the caller may write
+    # to at all, so neither the over-report nor the under-report is
+    # acceptable.
+    workforce_runtime = resolve_workforce_task_runtime(db, task)
+    agent = _load_agent_for_task_runtime(db, task, workforce_runtime)
     try:
         requirements = apply_task_connector_runtime_context_values(
             db=db, task=task, agent=agent, payload_items=request.items

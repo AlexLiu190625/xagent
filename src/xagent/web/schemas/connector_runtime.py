@@ -1,18 +1,18 @@
 """Connector runtime requirements: shared response shape and the values
 request body.
 
-Three producers share the response shape: the agent-keyed and task-keyed
-read endpoints, and the values endpoint's 200 response. All three describe
-a requirements report -- which runtime inputs a task's (or a prospective
-task's) connectors declare, and whether each one already has a value --
-never a stored value itself, and never a connector's transport or
-authentication configuration -- the same shape from both, with one field,
-``satisfied``, answering a different question on each; see
+Four producers share the response shape: the agent-keyed and task-keyed
+read endpoints, the task-create response, and the values endpoint's 200
+response. All four describe a requirements report -- which runtime inputs
+a task's (or a prospective task's) connectors declare, and whether each
+one already has a value -- never a stored value itself, and never a
+connector's transport or authentication configuration. One field,
+``satisfied``, answers a different question depending on the producer; see
 ``ConnectorRuntimeRequirementsModel``.
 
 Placed in its own module rather than ``schemas/chat.py`` or ``schemas/v1.py``
-because it has three audiences, not one: folding it into either of those
-modules would couple that module's own audience to the other two.
+because it has more than one audience: folding it into either of those
+modules would couple that module's own audience to the others.
 """
 
 from __future__ import annotations
