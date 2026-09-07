@@ -181,10 +181,10 @@ def _clean_degradation_registry():
 # CreateOutcome's vocabulary guards (two pinned numbers, still plain dicts
 # in the source -- do not recompute them here):
 #
-#   - CreateOutcome reason word list: 12 words total (seam_not_wired was
+#   - CreateOutcome reason word list: 13 words total (seam_not_wired was
 #     deleted along with CreateNotWired once this seam's call body landed).
 #   - CreateOutcome pairs this function body has a code path that returns:
-#     9. Producible here means exactly that -- a code path exists in
+#     10. Producible here means exactly that -- a code path exists in
 #     create()'s own body -- not that the path is reachable from any wired
 #     production caller (see CREATE_OUTCOME_PRODUCIBLE_REASONS's own
 #     docstring for the two entries that stay in this set despite being
