@@ -2249,6 +2249,21 @@ def _resolve_read_direction_anchor(
     ``CHECKPOINT_PK_ANCHOR_DANGLING`` -- that constant's registration in
     this module describes only the read direction; the two sides do not
     share a signal budget any more than they share a resolver.
+
+    The same divergence has a second half, on a row missing its run field
+    entirely rather than merely carrying a different one. The partition
+    comparison noted above already reads the stored, always non-null
+    ``resume_run_partition`` against the trace row's own run field, not a
+    task's possibly-null ``run_id``; when that field is absent altogether
+    the comparison still runs, and an absent field never equals a non-null
+    stored value, so this resolver reports ``anchor_dangling`` for every
+    such row. This is exactly why the write-direction resolver
+    (``resolve_interaction_anchor``, ``task_interaction_anchor.py``)
+    deliberately does not widen its own judgment of the same row shape:
+    doing so would only stage anchors this resolver then rejects on the
+    next read as ``anchor_dangling``, not anchors it could resolve.
+    Unifying the two would require changing both sides together, not one
+    alone -- see that resolver's own docstring for the full account.
     """
 
     if row.resume_trace_event_id is None:

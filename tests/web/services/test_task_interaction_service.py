@@ -1522,23 +1522,29 @@ def _make_trace_event(
     db: Session,
     *,
     task_id: int,
-    run_partition: str = "run-a",
+    run_partition: str | None = "run-a",
     execution_id: str = "exec-1",
     event_type: str = str(CHECKPOINT_EVENT_TYPE),
     checkpoint_type: str = "agent_execution_checkpoint",
     build_id: str | None = None,
 ) -> int:
+    # ``run_partition=None`` omits the run-field key entirely rather than
+    # writing it as ``None`` -- the two are equivalent under
+    # ``row_data.get(TASK_RUN_ID_TRACE_FIELD)``, but an absent key is the
+    # actual shape a pre-run-partition-field checkpoint row carries.
+    data: dict[str, Any] = {
+        "checkpoint_type": checkpoint_type,
+        "execution_id": execution_id,
+    }
+    if run_partition is not None:
+        data[TASK_RUN_ID_TRACE_FIELD] = run_partition
     event = TraceEvent(
         task_id=task_id,
         event_id=f"trace-event-{task_id}",
         event_type=event_type,
         timestamp=_now(),
         build_id=build_id,
-        data={
-            TASK_RUN_ID_TRACE_FIELD: run_partition,
-            "checkpoint_type": checkpoint_type,
-            "execution_id": execution_id,
-        },
+        data=data,
     )
     db.add(event)
     db.commit()
@@ -2046,6 +2052,30 @@ def test_t3_prime_anchor_dangling_for_each_remaining_validity_condition(
         resume_event_id=resume_event_id,
     )
 
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "unanswerable"
+    assert view.reason == "anchor_dangling"
+    assert CHECKPOINT_PK_ANCHOR_DANGLING in active_degradations()
+
+
+def test_t3_prime_anchor_dangling_when_the_trace_row_has_no_run_field(
+    _db: Session, _seeded_task: int
+) -> None:
+    """A trace row with no run field at all -- not merely a different one,
+    the shape above already covers that -- paired with the interaction
+    row's stored ``resume_run_partition``, which is non-null by construction
+    (the column is ``nullable=False`` with a ``<> ''`` CHECK). A missing
+    run field never equals a non-null stored value, so this comparison
+    always fails for this shape. This is the concrete row the write
+    direction's resolver (``resolve_interaction_anchor``,
+    ``task_interaction_anchor.py``) does not widen its own judgment to
+    accept: doing so would only stage anchors that read back
+    ``anchor_dangling`` here, not anchors this reader could resolve."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task, run_partition=None)
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
     view = svc.materialize_compatibility_view(_db, _seeded_task)
     assert view.tier == "unanswerable"
     assert view.reason == "anchor_dangling"
