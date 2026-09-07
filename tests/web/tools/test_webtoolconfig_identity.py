@@ -106,6 +106,31 @@ async def test_mcp_config_builders_require_an_explicit_user_identity(
             )
 
 
+def test_unavailable_mcp_config_does_not_scope_allow_users() -> None:
+    """The placeholder config for an unavailable server must not carry
+    ``allow_users``. The placeholder tool built from this config is meant to
+    explain the outage to whichever caller invokes it; scoping it to a single
+    user id caused the placeholder to deny its own caller in a normal server
+    process, where no per-request user id is bound to the environment."""
+    cfg = WebToolConfig(db=None, request=None, user_id=42)
+    server = SimpleNamespace(
+        id=1,
+        name="Example",
+        description=None,
+        transport="unsupported-test-transport",
+        managed="external",
+        concurrency_safe=False,
+        concurrent_tools=[],
+    )
+
+    config = cfg._build_unavailable_mcp_config(
+        server=server, reason="config_load_failed"
+    )
+
+    assert config["user_id"] == "42"
+    assert "allow_users" not in config
+
+
 @pytest.mark.asyncio
 async def test_identity_free_mcp_load_returns_before_cache_or_database(
     monkeypatch: pytest.MonkeyPatch,

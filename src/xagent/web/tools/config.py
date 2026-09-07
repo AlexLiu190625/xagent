@@ -3595,7 +3595,6 @@ class WebToolConfig(BaseToolConfig):
             "description": getattr(server, "description", None),
             "config": inner_config,
             "user_id": serialized_user_id,
-            "allow_users": [serialized_user_id],
         }
 
     def _build_oauth_mcp_stdio_transport_config(

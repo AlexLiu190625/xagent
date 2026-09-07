@@ -288,7 +288,7 @@ def _assert_unavailable_mcp_config(
         assert "failure_code" not in config["config"]
     expected_user_id = str(server.user_mcpservers[0].user_id)
     assert config["user_id"] == expected_user_id
-    assert config["allow_users"] == [expected_user_id]
+    assert "allow_users" not in config
     assert "runtime_input_schema" not in config
     assert "runtime_bindings" not in config
     assert "allow_delegated_authorization" not in config
@@ -3090,7 +3090,7 @@ async def test_remote_hook_refresh_classification_reaches_tool_failure_trace(
             inputSchema={"type": "object", "properties": {}},
         ),
         connection=connection,
-        allow_users=configs[0]["allow_users"],
+        allow_users=None,
     )
     request = httpx.Request("POST", "https://mcp.example/api")
     response = httpx.Response(
