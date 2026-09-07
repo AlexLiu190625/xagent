@@ -2554,6 +2554,153 @@ def test_answer_fence_predicate_guest_branch_adds_a_json_lookup_term() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The write point re-verifies three of the six ownership terms the read
+# point checks; the other three are read-point-only. The next two tests
+# pin that split so it cannot drift silently, either by widening (someone
+# assuming all six are re-verified at write time) or narrowing (someone
+# quietly dropping one of the three that already are).
+#
+# The fact, stated by `_answer_fence_task_predicate`'s own docstring: "A
+# successful answer therefore proves the three terms above held at write
+# time and that the other three held at read time, not that all six held
+# at write time."
+#
+# The window this leaves open: a guest passes all six checks at the read
+# point (`task_is_owned_by_public_principal`); between the read and the
+# write, an administrator tightens the agent's `auth_mode`, or changes the
+# entity binding, or the channel binding -- none of which the write point
+# re-checks -- and the answer still lands.
+#
+# Why accepted rather than closed: closing it means folding the guest's
+# JSON-lookup terms into the write point's WHERE clause, and the two
+# backends read a JSON key differently there (PostgreSQL's `->>` versus
+# SQLite's `json_extract`, per the same production docstring), so closing
+# it costs either an extra read or an extra Python re-check. The
+# production docstring leaves that policy decision to whichever change
+# wires the first production caller of `respond()`; this pair of tests is
+# where accepting the window, for now, is recorded.
+#
+# Why unreachable today: `respond()` has zero production callers,
+# enforced by `test_no_production_module_calls_create_or_respond` in
+# `test_task_interaction_service_create_gate.py`.
+#
+# What the next two tests catch and do not catch: they catch the write
+# point's WHERE clause silently gaining one of the three read-point-only
+# terms, or silently losing one of the three it already re-verifies. They
+# do not narrow the window itself -- a grant already revoked between the
+# read and the write still lets an answer land through this path.
+# ---------------------------------------------------------------------------
+
+
+def test_answer_fence_write_point_reasserts_exactly_three_terms() -> None:
+    """The predicate the write point compiles into its WHERE clause
+    carries all three re-verified terms: task status, task ownership, and
+    (for a guest) the ``guest_id`` match. Uses a guest principal because
+    only the guest branch carries all three terms at once.
+
+    Also asserts the term counts directly (three for a guest, two for a
+    plain user): the existing relative assertion in
+    ``test_answer_fence_predicate_guest_branch_adds_a_json_lookup_term``
+    only checks "guest has one more term than a plain user", which stays
+    green even if both counts were quietly reduced by one together.
+    """
+    guest_principal = svc.InteractionPrincipal(
+        kind="guest",
+        user_id=1,
+        is_admin=False,
+        auth_mode="widget",
+        guest_id="guest-1",
+    )
+    terms = svc._answer_fence_task_predicate(guest_principal)
+    assert len(terms) == 3
+    assert len(svc._answer_fence_task_predicate(_owning_principal(1))) == 2
+
+    stmt = sa.select(TaskInteractionRequest).where(
+        TaskInteractionRequest.id == 1,
+        TaskInteractionRequest.task_id == 1,
+        Task.id == 1,
+        *svc._active_native_row_criteria(),
+        *terms,
+    )
+    import sqlalchemy.dialects.sqlite
+
+    compiled = str(
+        stmt.compile(
+            dialect=sqlalchemy.dialects.sqlite.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert "WAITING_FOR_USER" in compiled
+    assert "tasks.user_id" in compiled
+    assert "guest_id" in compiled
+
+
+def test_answer_fence_write_point_omits_the_read_time_only_terms() -> None:
+    """The write point's full UPDATE statement -- not just the predicate
+    helper -- never carries ``auth_mode``, any of the four entity-binding
+    keys, or the channel binding. It compiles the WHERE clause of the
+    statement built by ``_answer_fence_stmt`` (rather than only
+    ``_answer_fence_task_predicate``'s output, as the previous test does):
+    a future change could add one of these terms directly to
+    ``_answer_fence_stmt``'s own ``where(...)`` without ever touching the
+    predicate helper, and only a check against the full statement's WHERE
+    clause would catch that.
+
+    This does not assert these three terms go unchecked anywhere -- they
+    are evaluated once in Python at the read point
+    (``task_is_owned_by_public_principal``) before ``respond()`` reaches
+    this statement. It asserts only that they are absent here.
+    """
+    guest_principal = svc.InteractionPrincipal(
+        kind="guest",
+        user_id=1,
+        is_admin=False,
+        auth_mode="widget",
+        guest_id="guest-1",
+    )
+    stmt = svc._answer_fence_stmt(
+        interaction_id=1,
+        task_id=1,
+        principal=guest_principal,
+        response_payload={"ok": True},
+        now=datetime.now(timezone.utc),
+        responder_user_id=None,
+        responder_identity="guest:guest-1",
+    )
+    import sqlalchemy.dialects.sqlite
+
+    # ``literal_binds=True`` cannot compile the whole statement: its
+    # ``VALUES`` clause carries ``response_payload``, a JSON column, and
+    # SQLAlchemy's JSON type has no ``literal_processor`` on any dialect,
+    # so that raises ``sqlalchemy.exc.CompileError: No literal value
+    # renderer is available ... with datatype JSON``. Compiling the WHERE
+    # clause alone avoids the VALUES clause while still covering every
+    # term the statement carries, including one added directly to
+    # ``_answer_fence_stmt``'s own ``where(...)`` rather than through the
+    # predicate helper. With literal binds, a JSON path lookup renders its
+    # key inline (``JSON_EXTRACT(tasks.agent_config, '$."auth_mode"')``)
+    # instead of hiding it in a bind parameter. The two bindings that
+    # compare a row-level column instead of a JSON key are matched by
+    # that column's own name: the widget-agent direction compares
+    # ``Task.agent_id``, so ``tasks.agent_id`` is this loop's marker.
+    compiled = str(
+        stmt.whereclause.compile(
+            dialect=sqlalchemy.dialects.sqlite.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    for marker in (
+        "auth_mode",
+        "widget_workforce_id",
+        "share_agent_id",
+        "share_workforce_id",
+        "tasks.agent_id",
+        "tasks.channel_id",
+    ):
+        assert marker not in compiled
+
+
+# ---------------------------------------------------------------------------
 # Structural guards: raw SQL.
 # ---------------------------------------------------------------------------
 
