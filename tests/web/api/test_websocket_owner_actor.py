@@ -25,10 +25,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from tests.shared.execution_scope import register_scope_resolver
+from tests.web.services.active_interaction_read_shared import _PRE_CHANGE_EQUIVALENT
 from tests.web.services.task_lease_shared import (
     live_task_lease as live_task_lease_fixture,
 )
-from tests.web.services.test_task_interaction_close import _PRE_CHANGE_EQUIVALENT
 from xagent.core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,

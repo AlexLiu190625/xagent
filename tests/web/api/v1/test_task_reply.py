@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from tests.web.services.test_task_interaction_close import _PRE_CHANGE_EQUIVALENT
+from tests.web.services.active_interaction_read_shared import _PRE_CHANGE_EQUIVALENT
 from xagent.core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,

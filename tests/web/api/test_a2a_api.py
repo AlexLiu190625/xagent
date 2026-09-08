@@ -18,7 +18,7 @@ from tests.web.pool_contention_shared import (
     gated_pool_checkout,
     wait_for_ticks,
 )
-from tests.web.services.test_task_interaction_close import _PRE_CHANGE_EQUIVALENT
+from tests.web.services.active_interaction_read_shared import _PRE_CHANGE_EQUIVALENT
 from xagent.core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,

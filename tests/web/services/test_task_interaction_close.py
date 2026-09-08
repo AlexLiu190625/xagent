@@ -24,6 +24,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy import Select, event
 
+from tests.web.services.active_interaction_read_shared import _PRE_CHANGE_EQUIVALENT
 from tests.web.services.interaction_static_scan_shared import _scan_root
 from tests.web.services.task_interaction_schema_shared import (
     make_row,
@@ -1028,8 +1029,10 @@ def test_active_interaction_id_sync_issues_only_the_marker_read_under_a_null_mar
 #      test_active_interaction_id_sync_reports_unavailable_when_the_marker_
 #      column_is_missing).
 #   2. Which int | None value each state corresponds to in the shape this
-#      reader returned before it became three-state -- pinned once, here,
-#      by _PRE_CHANGE_EQUIVALENT and the test below.
+#      reader returned before it became three-state -- pinned once by
+#      _PRE_CHANGE_EQUIVALENT, written in
+#      tests/web/services/active_interaction_read_shared.py because the
+#      layer-3 tests read it too, and by the test below.
 #   3. That every call site really applies that same projection -- pinned
 #      by the parameterized order tests in tests/web/api/test_a2a_api.py,
 #      tests/web/api/v1/test_task_reply.py and
@@ -1043,21 +1046,15 @@ def test_active_interaction_id_sync_issues_only_the_marker_read_under_a_null_mar
 # layer 2.
 # --------------------------------------------------------------------------
 
-_PRE_CHANGE_EQUIVALENT: list[tuple[object, int | None]] = [
-    (ActiveInteractionFound(4321), 4321),
-    (ActiveInteractionAbsent(), None),
-    (ActiveInteractionUnavailable("session_unavailable"), None),
-    (ActiveInteractionUnavailable("lookup_failed"), None),
-]
-
 
 def test_the_pre_change_equivalent_table_covers_every_state() -> None:
     """``_PRE_CHANGE_EQUIVALENT`` is what every production call site's
-    translation is checked against (imported directly by the parameterized
-    order tests in the three close sites' own test files); this pins the
-    table itself as exhaustive, so a state or a reason word added later
-    without a corresponding row here fails loudly instead of silently
-    narrowing what those other tests cover.
+    translation is checked against (the parameterized order tests in the
+    three close sites' own test files read the same table out of
+    active_interaction_read_shared.py); this pins the table itself as
+    exhaustive, so a state or a reason word added later without a
+    corresponding row here fails loudly instead of silently narrowing what
+    those other tests cover.
 
     Mutation: add a fourth member to ``ActiveInteractionRead`` without
     adding a row for it here, or add a third word to
