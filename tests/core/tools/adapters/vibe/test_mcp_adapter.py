@@ -3659,6 +3659,6 @@ def test_only_read_only_is_a_safe_reading():
     ],
 )
 def test_redact_urls_in_text_edge_shapes(text, expected):
-    from xagent.core.tools.adapters.vibe.mcp_adapter import _redact_urls_in_text
+    from xagent.core.tools.adapters.vibe.mcp_adapter import redact_urls_in_text
 
-    assert _redact_urls_in_text(text) == expected
+    assert redact_urls_in_text(text) == expected

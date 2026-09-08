@@ -63,6 +63,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     runtime_bindings_from_config,
 )
 from ...core.tools.adapters.vibe.db_session import tool_session_scope
+from ...core.tools.adapters.vibe.mcp_adapter import redact_urls_in_text
 from ..services.actor_mcp_runtime import (
     ActorMCPStdioSessionIdentity,
     resolve_actor_mcp_stdio_configs,
@@ -3633,7 +3634,9 @@ class WebToolConfig(BaseToolConfig):
             getattr(server, "name", "<unknown>"),
             error.exception_type,
             error.failure_code,
-            error.resource,
+            _bounded_oauth_metadata(redact_urls_in_text(error.resource))
+            if error.resource
+            else None,
         )
         return self._build_unavailable_mcp_config(
             server=server,

@@ -13,7 +13,10 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
-from xagent.core.tools.adapters.vibe.mcp_adapter import MCPToolAdapter
+from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    MCPToolAdapter,
+    redact_urls_in_text,
+)
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -1681,6 +1684,74 @@ async def test_hook_failure_warning_includes_failure_code(
     assert configs[0]["config"]["failure_code"] == "oauth_token_required"
     assert "oauth_token_required" in caplog.text
     assert "secret-reauth-detail" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_redacts_and_bounds_resource(
+    db_session,
+    caplog,
+):
+    """The resource logged on a resolver failure can fall back to a
+    self-hosted MCP server's own URL, and custom connectors commonly carry
+    an API key or other secret in that URL's query string or userinfo. The
+    warning must strip those before logging, and it must still bound the
+    result the way every other field logged here already is."""
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = (
+        "https://user:pw@mcp.example.com/oauth/"
+        + "r" * 160
+        + "?api_key=SECRET-abc123&tenant=acme"
+    )
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    expected = web_tools_config._bounded_oauth_metadata(redact_urls_in_text(resource))
+    assert "SECRET-abc123" not in caplog.text
+    assert "tenant=acme" not in caplog.text
+    assert "user:pw@" not in caplog.text
+    assert "mcp.example.com" in caplog.text
+    assert f"resource={expected}" in caplog.text
+    assert expected.endswith("...")
+    assert len(expected) == 128
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_redacts_short_resource_query_string(
+    db_session,
+    caplog,
+):
+    """A resource short enough to survive the 128-character bound intact must
+    still lose its query string. Without this case the bound alone satisfies
+    the secret-absence assertions on the long resource above, so redaction
+    could regress without turning any test red."""
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://mcp.example.test/oauth?api_key=SECRET-abc123&tenant=acme"
+    assert len(resource) < 128
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert "SECRET-abc123" not in caplog.text
+    assert "tenant=acme" not in caplog.text
+    assert "mcp.example.test" in caplog.text
+    assert "resource=https://mcp.example.test/oauth" in caplog.text
 
 
 @pytest.mark.asyncio

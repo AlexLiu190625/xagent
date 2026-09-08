@@ -660,7 +660,7 @@ def _bounded_exception_nodes(
 _URL_TOKEN_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 
 
-def _redact_urls_in_text(text: str) -> str:
+def redact_urls_in_text(text: str) -> str:
     """Return ``text`` with every ``scheme://...`` URL replaced by a copy
     that has its query string and userinfo stripped.
 
@@ -699,7 +699,7 @@ def _truncated_error_message(exc: BaseException) -> str:
     JSON-RPC error string or an HTTP status line) -- it must never be
     additionally handed tool_args, tool_meta, or connection headers, none of
     which are exception messages to begin with."""
-    text = _redact_urls_in_text(str(exc))
+    text = redact_urls_in_text(str(exc))
     if len(text) <= _MCP_TOOL_ERROR_LOG_MAX_CHARS:
         return text
     return text[: _MCP_TOOL_ERROR_LOG_MAX_CHARS - 1].rstrip() + "…"
