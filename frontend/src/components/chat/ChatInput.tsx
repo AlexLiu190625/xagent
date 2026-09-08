@@ -690,12 +690,21 @@ export function ChatInput({
   const stopHintId = `${reactId}-stop-hint`;
   // The stop control lives only in the compact toolbar, and it steps aside for
   // the send button whenever there is a draft — the same rule the pause button
-  // already follows above. The timeout hint explains that control, so it is
-  // gated on exactly the same condition; a hint with no visible control on
-  // screen would have nothing to refer to.
+  // already follows above. The not-sent and timed-out hints both explain that
+  // control, so each is gated on exactly the same condition; a hint with no
+  // visible control on screen would have nothing to refer to.
   const showStopButton = compact && !!onStop && !hasDraft;
   const isStopInFlight = stopState === "stopping";
-  const showStopTimedOutHint = showStopButton && stopState === "timed_out";
+  // Two outcomes, two sentences: "timed_out" means the request went out and
+  // was never confirmed; "not_sent" means the socket refused it and nobody
+  // received it.
+  const stopHintKey =
+    stopState === "timed_out"
+      ? "widgetSession.stopTimedOut"
+      : stopState === "not_sent"
+        ? "widgetSession.stopNotSent"
+        : null;
+  const showStopHint = showStopButton && stopHintKey !== null;
   const stopButtonLabel = isStopInFlight
     ? t("widgetSession.stoppingResponse")
     : t("widgetSession.stopResponse");
@@ -1002,13 +1011,13 @@ export function ChatInput({
 
   return (
     <div className="space-y-3">
-      {showStopTimedOutHint && (
+      {showStopButton && stopHintKey !== null && (
         <p
           id={stopHintId}
           role="status"
           className="text-xs text-muted-foreground"
         >
-          {t("widgetSession.stopTimedOut")}
+          {t(stopHintKey)}
         </p>
       )}
       {/* Input area */}
@@ -1112,7 +1121,7 @@ export function ChatInput({
               }}
               role="textbox"
               aria-multiline="true"
-              aria-describedby={showStopTimedOutHint ? stopHintId : undefined}
+              aria-describedby={showStopHint ? stopHintId : undefined}
             />
             {!message && (
               <div className="pointer-events-none absolute left-4 top-3 text-[14px] text-muted-foreground/60">

@@ -576,6 +576,7 @@ Build when you need.`,
     stopResponse: "Stop response",
     stoppingResponse: "Stopping...",
     stopTimedOut: "The stop request could not be confirmed.",
+    stopNotSent: "The stop request was not sent. Please try again.",
     expired: {
       title: "Chat session expired",
       description: "Refresh the page to start a new chat session.",

@@ -576,6 +576,7 @@ const zh = {
     stopResponse: "停止回答",
     stoppingResponse: "正在停止…",
     stopTimedOut: "无法确认停止请求是否生效。",
+    stopNotSent: "停止请求未发出，请重试。",
     expired: {
       title: "聊天会话已过期",
       description: "请刷新页面以开始新的聊天会话。",

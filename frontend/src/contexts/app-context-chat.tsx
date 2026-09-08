@@ -125,10 +125,12 @@ type SessionConversationState =
   | { phase: "replacement_awaiting_task"; connectionIdentity: string; taskId: null }
   | { phase: "reload_required"; connectionIdentity: string | null; taskId: null }
 
-// The stop control's own state. The server never answers a stop frame, so the
-// only two exits from "stopping" are this task's terminal frame and the local
-// timeout above.
-export type SessionStopState = "idle" | "stopping" | "timed_out"
+// The stop control's own state. The server sends no acknowledgement frame
+// for a stop, but a stop it cannot execute is answered by a codeless
+// agent_error on this channel. The exits from "stopping" remain this task's
+// terminal frame and the local timeout above -- the rejection clears the
+// intent, deliberately not this state.
+export type SessionStopState = "idle" | "stopping" | "timed_out" | "not_sent"
 
 type SessionConversationAction =
   | { type: "SESSION_TASK_INFO"; connectionIdentity: string; taskId: number }
@@ -1943,7 +1945,6 @@ interface AppContextType {
   agentCardsEnabled: boolean
   voiceInputEnabled: boolean
   taskControlsEnabled: boolean
-  taskStopEnabled: boolean
   sendMessage: (message: string, config?: any, files?: File[]) => Promise<void>
   executeTask: (description: string) => void
   pauseTask: () => void
@@ -2223,8 +2224,9 @@ export function AppProvider({
   const stopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Per task, not per connection: "the visitor asked to stop task N" stays
   // true across a token-refresh reconnect and across an isProcessing dip, and
-  // is cleared only by that task's own terminal frame or by this connection
-  // binding a different task.
+  // is cleared only by that task's own terminal frame, by this connection
+  // binding a different task, or by a codeless agent_error for that task (the
+  // server's stop-rejection notice).
   const stopIntentTaskIdRef = useRef<number | null>(null)
   const previousBoundSessionTaskIdRef = useRef<number | null>(null)
 
@@ -5879,6 +5881,28 @@ export function AppProvider({
             status: "failed",
           },
         })
+        // A stop the server could not apply is answered on this channel, not
+        // on the terminal one: the external cancel's rejection is broadcast as
+        // an agent_error that deliberately carries no error_code, because the
+        // anonymous audience is shown nothing it cannot act on. The absence of
+        // the code is what this reads. The sentence is not usable: a transport
+        // that marks legacy prose untrusted replaces it before it can be read,
+        // and the same rejection picks a different sentence when the target
+        // settled on its own. Another codeless agent_error for this task would
+        // also retire the intent, which is the safe direction -- a stop whose
+        // answer is uncertain renders the next failure as a failure, never as
+        // a stopped turn. The absence-of-error_code condition is an interim
+        // inference for exactly that reason: it is not a marker the server
+        // chose to mean "stop rejected", it is read from what the frame
+        // happens to omit. A structured marker is tracked in
+        // xorbitsai/xagent#2247.
+        if (
+          !getWebSocketErrorCodeField(message).present
+          && stopIntentTaskIdRef.current !== null
+          && controlEnvelope.taskId === stopIntentTaskIdRef.current
+        ) {
+          stopIntentTaskIdRef.current = null
+        }
         break
 
       case "error":
@@ -5924,9 +5948,12 @@ export function AppProvider({
               ? {
                   id: generateMessageId("msg-stopped"),
                   role: "assistant",
-                  // The server's own sentence, no prefix: a reload replays the
-                  // persisted transcript row with this same text, so a
-                  // live-only prefix would make the two views disagree.
+                  // The server's own sentence, no prefix: the persisted
+                  // transcript row a reload replays carries this same text, so
+                  // a live-only prefix would make the two views disagree. On a
+                  // transport that marks legacy prose untrusted the live text
+                  // is currently a constant instead of that sentence, so the
+                  // two views do not yet agree there (xorbitsai/xagent#1958).
                   // dedupText, not bubbleContent, is that sentence:
                   // bubbleContent is the prefixed or connector-runtime wording
                   // this branch exists to suppress.
@@ -6874,6 +6901,10 @@ export function AppProvider({
   ])
 
   const stopTask = useCallback(() => {
+    // Same belt as the phase guard below, on the other half of the rule: a
+    // caller that does not come from the button must not send a stop frame on
+    // a transport that never declared the capability.
+    if (!taskStopEnabled) return
     const lifecycle = sessionConversationRef.current
     // Guard duplicated on purpose with the caller-side visibility rule: a
     // caller that does not come from the button (a future keyboard shortcut, a
@@ -6888,10 +6919,9 @@ export function AppProvider({
     // startNewConversation wraps its send because its catch escalates to
     // requireSessionReload; a failed stop must not lock the visitor out.
     if (sendRawMessage({ type: "stop" }) !== "sent") {
-      // The frame never left the socket, so nobody received the request.
-      // Recording an intent or making the visitor wait out the timeout would
-      // both describe something that did not happen.
-      setStopState("timed_out")
+      // The frame never left the socket, so nobody received the request, so
+      // the hint says so rather than reusing the unconfirmed-timeout wording.
+      setStopState("not_sent")
       return
     }
     stopIntentTaskIdRef.current = boundTaskId
@@ -6900,7 +6930,7 @@ export function AppProvider({
       stopTimeoutRef.current = null
       setStopState("timed_out")
     }, SESSION_STOP_TIMEOUT_MS)
-  }, [clearStopTimeout, sendRawMessage])
+  }, [clearStopTimeout, sendRawMessage, taskStopEnabled])
 
   // Initialize the replay scheduler function
   const initializeReplayScheduler = useCallback(() => {
@@ -7088,7 +7118,6 @@ export function AppProvider({
           agentCardsEnabled,
           voiceInputEnabled,
           taskControlsEnabled,
-          taskStopEnabled,
           sendMessage,
           executeTask,
           pauseTask,

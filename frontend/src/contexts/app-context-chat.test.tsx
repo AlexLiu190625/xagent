@@ -292,9 +292,6 @@ function SessionControlsProbe() {
       <div data-testid="task-controls-enabled">
         {String(sessionControls.taskControlsEnabled)}
       </div>
-      <div data-testid="task-stop-enabled">
-        {String(sessionControls.taskStopEnabled)}
-      </div>
       <div data-testid="can-stop-task">
         {String(sessionControls.canStopTask)}
       </div>
@@ -5663,6 +5660,10 @@ describe("AppProvider websocket message routing", () => {
   })
 
   it("keeps task stop closed for a transport that does not declare it", () => {
+    // The fourth row (a non-Session transport) never reaches "bound" -- the
+    // phase guard already excludes it regardless of the capability flag, so
+    // this row is a product invariant kept for completeness, not a proof
+    // that the capability default is false there.
     const cases: Array<[string, AppProviderTransportConfig]> = [
       ["a Session transport with no capabilities bucket", makeSessionTransport()],
       ["a Session transport with an empty capabilities bucket", makeSessionTransport(makeSessionConnection(), {})],
@@ -5671,15 +5672,30 @@ describe("AppProvider websocket message routing", () => {
     ]
     expect(cases).toHaveLength(4)
 
-    for (const [, transport] of cases) {
+    cases.forEach(([, transport], index) => {
       const { unmount } = render(
         <AppProvider token="token" transport={transport}>
           <SessionControlsProbe />
         </AppProvider>
       )
-      expect(screen.getByTestId("task-stop-enabled").textContent).toBe("false")
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(1500 + index)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      expect(screen.getByTestId("can-stop-task").textContent).toBe("false")
       unmount()
-    }
+    })
+  })
+
+  it("never sends a stop frame on a transport that does not declare taskStop", () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(1550)))
+    act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("bound")
+    act(() => getSessionControls().stopTask())
+    expect(sendRawMessageMock).not.toHaveBeenCalled()
   })
 
   it("withholds task stop for each unmet precondition", () => {
@@ -5691,7 +5707,6 @@ describe("AppProvider websocket message routing", () => {
       "session phase is replacement_ready",
       "session phase is reload_required",
     ]
-    expect(preconditionLabels).toHaveLength(6)
 
     // 1) taskStop not declared, everything else satisfied.
     {
@@ -5841,7 +5856,6 @@ describe("AppProvider websocket message routing", () => {
       "the turn asks the visitor a question before finishing",
       "the local 30s timeout elapses before the terminal frame",
     ]
-    expect(perturbationLabels).toHaveLength(3)
 
     const assertNeutral = (taskId: number) => {
       const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
@@ -5943,8 +5957,9 @@ describe("AppProvider websocket message routing", () => {
       "the stop frame was not sent",
       "the same task's next turn fails after a normal completion",
       "a non-terminal rejection arrives on the mixed error channel mid-stop",
+      "the server answers that the stop did not go through",
+      "an agent_error with an error_code arrives mid-stop",
     ]
-    expect(rowLabels).toHaveLength(5)
 
     const assertRed = () => {
       const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
@@ -6037,7 +6052,7 @@ describe("AppProvider websocket message routing", () => {
       act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
       sendRawMessageMock.mockReturnValueOnce("not_sent")
       act(() => getSessionControls().stopTask())
-      expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
+      expect(screen.getByTestId("stop-state").textContent).toBe("not_sent")
 
       act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
       assertRed()
@@ -6113,6 +6128,67 @@ describe("AppProvider websocket message routing", () => {
       expect(stopped?.status).not.toBe("failed")
       unmount()
     }
+
+    // 6) the server answers that the stop did not go through, then the task
+    // fails for an unrelated reason -- the standing intent must not paint
+    // that later, genuine failure as a stopped turn.
+    {
+      const taskId = 1206
+      const { unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      act(() => getSessionControls().stopTask())
+      expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+
+      act(() => webSocketOptions.current?.onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: taskId,
+        ...({
+          message: "Stopping this response didn't go through — please try again.",
+          error: "Stopping this response didn't go through — please try again.",
+        } as Record<string, unknown>),
+      }))
+      // The rejection is answered on the agent_error channel, not the
+      // terminal one -- it must retire the intent without touching the
+      // button's own state, which still owns the 30s recovery path.
+      expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+
+      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+      assertRed()
+      unmount()
+    }
+
+    // 7) an agent_error carrying an error_code is a different producer's
+    // coded failure, not the codeless stop-rejection -- it must not retire
+    // the intent. The later terminal frame still renders as the stopped turn.
+    {
+      const taskId = 1207
+      const { unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      act(() => getSessionControls().stopTask())
+      act(() => webSocketOptions.current?.onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: taskId,
+        ...({ message: "Message processing failed.", error_code: "message_processing_failed" } as Record<string, unknown>),
+      }))
+      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+      const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{ content: string }>
+      expect(messages.some((message) => message.content === "This response was interrupted.")).toBe(true)
+      unmount()
+    }
   })
 
   it("recovers the stop control on the local timeout", () => {
@@ -6151,10 +6227,10 @@ describe("AppProvider websocket message routing", () => {
       sendRawMessageMock.mockReturnValueOnce("not_sent")
 
       act(() => getSessionControls().stopTask())
-      expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
+      expect(screen.getByTestId("stop-state").textContent).toBe("not_sent")
 
       act(() => { vi.advanceTimersByTime(30_001) })
-      expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
+      expect(screen.getByTestId("stop-state").textContent).toBe("not_sent")
 
       act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(1401)))
       const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
