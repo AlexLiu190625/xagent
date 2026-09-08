@@ -40,7 +40,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, assert_never
 from uuid import uuid4
 
 from sqlalchemy import func
@@ -544,8 +544,7 @@ async def reply_to_task(
             active_interaction_id = active_interaction_read.interaction_id
         elif isinstance(active_interaction_read, ActiveInteractionAbsent):
             active_interaction_id = None
-        else:
-            assert isinstance(active_interaction_read, ActiveInteractionUnavailable)
+        elif isinstance(active_interaction_read, ActiveInteractionUnavailable):
             active_interaction_id = None
             logger.info(
                 "active interaction read unavailable (reason=%s) for "
@@ -553,6 +552,8 @@ async def reply_to_task(
                 active_interaction_read.reason,
                 task_id,
             )
+        else:
+            assert_never(active_interaction_read)
 
         async def inject_user_message() -> tuple[Any, bool]:
             from .. import chat

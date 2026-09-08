@@ -5,7 +5,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from time import monotonic
-from typing import Any, Mapping
+from typing import Any, Mapping, assert_never
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
@@ -523,8 +523,7 @@ async def _resume_input_required_a2a_task(
             active_interaction_id = active_interaction_read.interaction_id
         elif isinstance(active_interaction_read, ActiveInteractionAbsent):
             active_interaction_id = None
-        else:
-            assert isinstance(active_interaction_read, ActiveInteractionUnavailable)
+        elif isinstance(active_interaction_read, ActiveInteractionUnavailable):
             active_interaction_id = None
             logger.info(
                 "active interaction read unavailable (reason=%s) for "
@@ -532,6 +531,8 @@ async def _resume_input_required_a2a_task(
                 active_interaction_read.reason,
                 task_id,
             )
+        else:
+            assert_never(active_interaction_read)
 
         async def inject_user_message() -> tuple[Any, UserMessageInjectionOutcome]:
             from .chat import get_agent_manager

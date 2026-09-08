@@ -23,6 +23,7 @@ from typing import (
     Literal,
     Optional,
     Union,
+    assert_never,
     cast,
     overload,
 )
@@ -6791,10 +6792,9 @@ async def _handle_chat_message_unserialized(
                         active_interaction_id = active_interaction_read.interaction_id
                     elif isinstance(active_interaction_read, ActiveInteractionAbsent):
                         active_interaction_id = None
-                    else:
-                        assert isinstance(
-                            active_interaction_read, ActiveInteractionUnavailable
-                        )
+                    elif isinstance(
+                        active_interaction_read, ActiveInteractionUnavailable
+                    ):
                         active_interaction_id = None
                         logger.info(
                             "active interaction read unavailable (reason=%s) "
@@ -6803,6 +6803,8 @@ async def _handle_chat_message_unserialized(
                             active_interaction_read.reason,
                             task_id,
                         )
+                    else:
+                        assert_never(active_interaction_read)
 
                     posted = UserMessageInjectionOutcome.NOT_POSTED
                     if live_task_lease is not None:
@@ -9122,8 +9124,12 @@ async def _handle_resume_task_unserialized(
                 task_id,
                 task_fields.run_id,
             )
+        elif isinstance(active_interaction_read, ActiveInteractionAbsent):
+            # Nothing to do: no native interaction row is waiting on an
+            # answer, so this gate lets the resume through.
+            pass
         else:
-            assert isinstance(active_interaction_read, ActiveInteractionAbsent)
+            assert_never(active_interaction_read)
 
         attempt_count = message_data.get("_durable_attempt_count")
 
