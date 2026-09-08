@@ -256,10 +256,15 @@ def _acquire_reply_prelease_sync(
         # cleared, that read path's by-primary-key anchor has nothing to
         # anchor on and falls back to its own legacy scan, which is keyed
         # on task/checkpoint-type/execution-id and partition rather than on
-        # either cleared column, so it can still find the row the pointer
-        # used to name. Whether to keep clearing unconditionally has not
-        # been re-decided under the corrected premise; this comment records
-        # the premise correctly rather than standing on the retired one.
+        # either cleared column. That scan reaches the row the pointer used
+        # to name only when the row carries an execution identity of its
+        # own: the scan filters on one, while the pointer path names a row
+        # unconditionally and is deliberately the more permissive of the
+        # two (see ``_load_pk_anchored_checkpoint``'s own docstring). For a
+        # row predating that field, the cleared pointer was the only way to
+        # reach it. Whether to keep clearing unconditionally has not been
+        # re-decided under the corrected premise; this comment records the
+        # premise correctly rather than standing on the retired one.
         task_lease = acquire_task_lease_no_commit(
             db,
             task_id,
