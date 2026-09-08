@@ -375,6 +375,47 @@ def test_ta14_any_other_failed_condition_keeps_the_generic_corrupt_reason(
 
 
 # ---------------------------------------------------------------------------
+# Step 4 (the six self-consistency conditions, including the run-partition
+# match) must run before step 5 (the legacy-checkpoint-type check) even
+# when the row's only failure is the mismatched run tag, not just when it
+# is the missing-field shape -- the module docstring's ordering note
+# ("Step 4 must run before step 5") does not carve out an exception for
+# legacy-type rows on this side either. This cell is the mismatched-run-tag
+# counterpart of that ordering pin.
+# ---------------------------------------------------------------------------
+
+
+def test_ta13b_legacy_checkpoint_type_with_mismatched_run_tag_still_reports_mismatch(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(
+        logging.ERROR, logger="xagent.web.services.task_interaction_anchor"
+    )
+    engine = _engine(tmp_path)
+    db = _session_factory(engine)()
+    legacy_type = next(iter(LEGACY_CHECKPOINT_TYPES))
+    task, _row = _build_scenario(db, checkpoint_type=legacy_type, run_partition="run-b")
+
+    result = resolve_interaction_anchor(db, task)
+
+    assert result is None
+    assert ops_signals.INTERACTION_ANCHOR_CORRUPT in ops_signals.active_degradations()
+    # The legacy-type absence path (step 5) increments a counter; the
+    # mismatched-run-tag path (step 4) does not. If step 5 ran first, this
+    # would read {ir.COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE: 1} instead.
+    assert ir.counters_snapshot() == {}
+    detail = ops_signals.active_degradations()[ops_signals.INTERACTION_ANCHOR_CORRUPT]
+    assert "a different run" in detail
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, caplog.records
+    assert errors[0].msg == (
+        "task %s's checkpoint pointer %s names a checkpoint from "
+        "another run; no interaction anchor to resolve"
+    )
+    db.close()
+
+
+# ---------------------------------------------------------------------------
 # The row's data column holds something other than a dict -- the shape
 # resolve_interaction_anchor's isinstance(row.data, dict) guard exists to
 # handle without raising. A list payload coerces to an empty dict inside
