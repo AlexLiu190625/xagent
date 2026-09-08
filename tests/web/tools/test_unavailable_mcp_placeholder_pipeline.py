@@ -33,42 +33,6 @@ from xagent.web.tools.config import WebToolConfig
 OWNER_USER_ID = 42
 
 
-def _unavailable_server() -> SimpleNamespace:
-    """A server whose config cannot be built, matching the shape the builder reads."""
-    return SimpleNamespace(
-        id=1,
-        name="Example",
-        description=None,
-        transport="unsupported-test-transport",
-        managed="external",
-        concurrency_safe=False,
-        concurrent_tools=[],
-    )
-
-
-def _stdio_server() -> SimpleNamespace:
-    """A server whose config builds fine, so the failure happens at load time."""
-    return SimpleNamespace(
-        id=5,
-        name="Test Stdio Server",
-        transport="stdio",
-        description="",
-        command="python",
-        args=["-m", "xagent.web.tools.mcp.aws"],
-        env={"FOO": "bar"},
-        cwd=None,
-        managed="external",
-        docker_url=None,
-        docker_image=None,
-        docker_environment=None,
-        docker_working_dir=None,
-        volumes=None,
-        bind_ports=None,
-        restart_policy=None,
-        auto_start=None,
-    )
-
-
 def _assert_reports_outage(result: Any, *, expected_message: str) -> None:
     """The placeholder answered with its outage, not with a denial.
 
@@ -85,6 +49,7 @@ def _assert_reports_outage(result: Any, *, expected_message: str) -> None:
 @pytest.mark.asyncio
 async def test_config_load_failure_placeholder_reports_outage_without_a_caller_id(
     monkeypatch: pytest.MonkeyPatch,
+    unavailable_mcp_server: SimpleNamespace,
 ) -> None:
     """Real ``_build_unavailable_mcp_config`` output -> factory -> invocation.
 
@@ -95,7 +60,7 @@ async def test_config_load_failure_placeholder_reports_outage_without_a_caller_i
 
     cfg = WebToolConfig(db=None, request=None, user_id=OWNER_USER_ID)
     config = cfg._build_unavailable_mcp_config(
-        server=_unavailable_server(), reason="config_load_failed"
+        server=unavailable_mcp_server, reason="config_load_failed"
     )
 
     tools = await ToolFactory._create_mcp_tools_from_configs([config])
@@ -111,6 +76,7 @@ async def test_config_load_failure_placeholder_reports_outage_without_a_caller_i
 @pytest.mark.asyncio
 async def test_handshake_failure_placeholder_reports_outage_without_a_caller_id(
     monkeypatch: pytest.MonkeyPatch,
+    stdio_mcp_server: SimpleNamespace,
 ) -> None:
     """Real executable config -> failed handshake -> factory -> invocation.
 
@@ -126,7 +92,7 @@ async def test_handshake_failure_placeholder_reports_outage_without_a_caller_id(
 
     cfg = WebToolConfig(db=None, request=None, user_id=OWNER_USER_ID)
     config = await cfg._build_mcp_server_config(
-        server=_stdio_server(),
+        server=stdio_mcp_server,
         user_env_by_id={},
         shared_env_by_id={},
         env_source_by_id={},

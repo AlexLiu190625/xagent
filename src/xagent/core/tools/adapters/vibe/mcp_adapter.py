@@ -1649,9 +1649,13 @@ class UnavailableMCPTool(AbstractBaseTool):
 
     The tool exists to explain an outage, so it always reports that outage to
     whoever invokes it: it carries no allow-list and performs no caller check.
-    Its result holds only a constant message plus an allowlisted ``reason`` and
-    ``failure_code``, and the server name it is built from is already exposed in
-    the tool listing, so there is nothing here to withhold from a caller.
+    Its result holds only a constant message plus a ``reason`` and a
+    ``failure_code``. ``failure_code`` is normalized against the public failure
+    allowlist here and dropped when it is not on it; ``reason`` is stored as
+    given, so an allowlisted value is a guarantee callers make, enforced where
+    the unavailable config is built. The server name it is built from is
+    already exposed in the tool listing, so there is nothing here to withhold
+    from a caller.
     """
 
     read_only = True

@@ -80,17 +80,10 @@ def test_identity_free_config_ignores_request_authentication(monkeypatch) -> Non
 @pytest.mark.parametrize("builder", ["unavailable", "executable"])
 async def test_mcp_config_builders_require_an_explicit_user_identity(
     builder: str,
+    unavailable_mcp_server: SimpleNamespace,
 ) -> None:
     cfg = WebToolConfig(db=None, request=None, user_id=None)
-    server = SimpleNamespace(
-        id=1,
-        name="Example",
-        description=None,
-        transport="unsupported-test-transport",
-        managed="external",
-        concurrency_safe=False,
-        concurrent_tools=[],
-    )
+    server = unavailable_mcp_server
 
     with pytest.raises(RuntimeError, match="require a user identity"):
         if builder == "unavailable":
@@ -106,25 +99,18 @@ async def test_mcp_config_builders_require_an_explicit_user_identity(
             )
 
 
-def test_unavailable_mcp_config_does_not_scope_allow_users() -> None:
+def test_unavailable_mcp_config_does_not_scope_allow_users(
+    unavailable_mcp_server: SimpleNamespace,
+) -> None:
     """The placeholder config for an unavailable server must not carry
     ``allow_users``. The placeholder tool built from this config is meant to
     explain the outage to whichever caller invokes it; scoping it to a single
     user id caused the placeholder to deny its own caller in a normal server
     process, where no per-request user id is bound to the environment."""
     cfg = WebToolConfig(db=None, request=None, user_id=42)
-    server = SimpleNamespace(
-        id=1,
-        name="Example",
-        description=None,
-        transport="unsupported-test-transport",
-        managed="external",
-        concurrency_safe=False,
-        concurrent_tools=[],
-    )
 
     config = cfg._build_unavailable_mcp_config(
-        server=server, reason="config_load_failed"
+        server=unavailable_mcp_server, reason="config_load_failed"
     )
 
     assert config["user_id"] == "42"
@@ -132,7 +118,9 @@ def test_unavailable_mcp_config_does_not_scope_allow_users() -> None:
 
 
 @pytest.mark.asyncio
-async def test_executable_mcp_config_does_not_carry_allow_users() -> None:
+async def test_executable_mcp_config_does_not_carry_allow_users(
+    stdio_mcp_server: SimpleNamespace,
+) -> None:
     """The config for a server that loads must not carry ``allow_users`` either.
 
     Nothing reads the key any more: the MCP tool adapter's allow-list is only
@@ -141,28 +129,9 @@ async def test_executable_mcp_config_does_not_carry_allow_users() -> None:
     all. The owning identity stays on the config as ``user_id``.
     """
     cfg = WebToolConfig(db=None, request=None, user_id=42)
-    server = SimpleNamespace(
-        id=5,
-        name="Test Stdio Server",
-        transport="stdio",
-        description="",
-        command="python",
-        args=["-m", "xagent.web.tools.mcp.aws"],
-        env={"FOO": "bar"},
-        cwd=None,
-        managed="external",
-        docker_url=None,
-        docker_image=None,
-        docker_environment=None,
-        docker_working_dir=None,
-        volumes=None,
-        bind_ports=None,
-        restart_policy=None,
-        auto_start=None,
-    )
 
     config = await cfg._build_mcp_server_config(
-        server=server,
+        server=stdio_mcp_server,
         user_env_by_id={},
         shared_env_by_id={},
         env_source_by_id={},
