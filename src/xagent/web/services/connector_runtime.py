@@ -546,7 +546,8 @@ def apply_task_connector_runtime_context_values(
        whole.
     4. No ref repeated within the batch.
     5. Every ref is currently visible and was selected for this task
-       (``_validate_payload_refs``, reused unchanged).
+       (``_validate_payload_refs``, shared with the create and append
+       paths).
     6. Every key is declared and syntactically valid
        (``_validate_values_against_schema``, reused unchanged).
     7. Every value matches its declared, normalized type and carries
@@ -618,16 +619,7 @@ def apply_task_connector_runtime_context_values(
         db, user_id=connector_user_id, agent_team_id=agent_team_id
     )
     selected_refs = _load_task_selected_refs(task)
-    _validate_payload_refs(
-        {
-            ref: ConnectorRuntimePayload(
-                ref=ref, context=context, secrets={}, auth_selector={}
-            )
-            for ref, context in payload_by_ref.items()
-        },
-        visible=visible,
-        selected_refs=selected_refs,
-    )
+    _validate_payload_refs(payload_by_ref, visible=visible, selected_refs=selected_refs)
     for ref, context in payload_by_ref.items():
         connector = visible[ref]
         _validate_values_against_schema(ref, connector, context, {}, {})
@@ -679,34 +671,16 @@ def apply_task_connector_runtime_context_values(
             written_keys_by_ref[ref] = sorted(set(merged) - set(stored_row.context))
 
         if conflict:
-            db.rollback()
-            if attempt == 1:
-                raise ConnectorRuntimeError(
-                    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
-                    "Connector runtime context is unavailable.",
-                    status_code=503,
-                )
-            # db.rollback() expires every ORM object loaded before it,
-            # including the connector rows in `visible` -- refetch rather
-            # than let the retry (and the final response assembly below)
-            # trigger a per-object lazy-refresh query apiece.
-            visible = _load_visible_runtime_connectors(
-                db, user_id=connector_user_id, agent_team_id=agent_team_id
+            visible = _retry_or_503(
+                db, attempt=attempt, user_id=connector_user_id, team_id=agent_team_id
             )
             continue
 
         try:
             db.flush()
         except IntegrityError:
-            db.rollback()
-            if attempt == 1:
-                raise ConnectorRuntimeError(
-                    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
-                    "Connector runtime context is unavailable.",
-                    status_code=503,
-                )
-            visible = _load_visible_runtime_connectors(
-                db, user_id=connector_user_id, agent_team_id=agent_team_id
+            visible = _retry_or_503(
+                db, attempt=attempt, user_id=connector_user_id, team_id=agent_team_id
             )
             continue
         break
@@ -1051,13 +1025,18 @@ def _has_runtime_declaration(connector: Any) -> bool:
 
 
 def _validate_payload_refs(
-    payload_by_ref: dict[ConnectorRef, ConnectorRuntimePayload],
+    refs: Iterable[ConnectorRef],
     *,
     visible: dict[ConnectorRef, Any],
     selected_refs: tuple[ConnectorRef, ...],
 ) -> None:
+    """Every ref must be visible to the caller now and have been selected
+    by the task. Takes the refs alone: nothing here reads a submitted
+    value, so a caller holding only refs does not have to build payload
+    objects to call it. A mapping keyed by ref satisfies this as it is.
+    """
     selected = set(selected_refs)
-    for ref in payload_by_ref:
+    for ref in refs:
         if ref not in visible:
             _raise_runtime_error(ERROR_CONNECTOR_NOT_FOUND, ref)
         if ref not in selected:
@@ -1456,6 +1435,35 @@ def _update_context_row(
     )
     result = cast(CursorResult, db.execute(stmt))
     return int(result.rowcount) == 1
+
+
+def _retry_or_503(
+    db: Session, *, attempt: int, user_id: int, team_id: int | None
+) -> dict[ConnectorRef, Any]:
+    """Recover a lost write inside the values endpoint's bounded retry
+    loop, or give up on it.
+
+    A write is lost two ways -- a conditional update that matched no row,
+    and an ``IntegrityError`` on a first-ever row for a ref -- and both are
+    answered identically, so both branches come here. On the second
+    attempt there is no third: the request ends as a 503 the caller may
+    retry, with no named reason, which is what tells that caller this was a
+    collision rather than something underneath failing. Otherwise the
+    transaction is rolled back and a freshly loaded visible-connector set
+    is handed back, because ``db.rollback()`` expires every ORM object
+    loaded before it, including the connector rows in ``visible`` --
+    refetching once here is cheaper than letting the retry (and the
+    response assembly after it) trigger a per-object lazy-refresh query
+    apiece.
+    """
+    db.rollback()
+    if attempt == 1:
+        raise ConnectorRuntimeError(
+            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+            "Connector runtime context is unavailable.",
+            status_code=503,
+        )
+    return _load_visible_runtime_connectors(db, user_id=user_id, agent_team_id=team_id)
 
 
 def _validate_values_against_schema(
