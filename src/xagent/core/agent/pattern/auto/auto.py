@@ -1289,7 +1289,7 @@ class AutoPattern(AgentPattern):
             "tool arguments. "
             f"When writing that answer field: {grounding_rule(can_call_tools=False)} "
             "If the answer would need any value the rule above forbids you to "
-            f"supply -- {VALUE_KINDS} that no source here supports -- set "
+            f"supply -- {VALUE_KINDS} -- that no source here supports, set "
             "existing_context_sufficient=false and choose react, so the agent "
             "can obtain it with tools.\n\n"
             f"{final_deliverable_file_reference_instructions(can_lookup=False)}\n\n"

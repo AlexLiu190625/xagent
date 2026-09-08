@@ -21,7 +21,10 @@ from xagent.core.agent.context.enrichment import (
     _lookup_relevant_memories_with_context,
     enrich_context_with_memory,
 )
-from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
+from xagent.core.agent.context.execution import (
+    CLOCK_TIMEZONE_METADATA_KEY,
+    COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+)
 from xagent.core.agent.grounding import VALUE_KINDS
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
@@ -1043,13 +1046,16 @@ def test_compact_truncate_preserves_tool_call_pair_boundary() -> None:
     assert ctx.messages[2].tool_call_id == "call-2"
 
 
-def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> None:
-    class CompactLLM:
-        model_name = "compact-test"
+def _ctx_with_one_dropped_tool_result(user_message: str) -> ExecutionContext:
+    """Return a context holding exactly one compactable tool observation.
 
+    The threshold of 1 makes the next compaction fire, and the single
+    ``read_file`` result is the only evidence it drops, so both the summary
+    trailer and the compaction prompt can be read off the same setup.
+    """
     ctx = ExecutionContext()
     ctx.compact_config.threshold = 1
-    ctx.add_user_message("current request")
+    ctx.add_user_message(user_message)
     ctx.add_assistant_message(
         "",
         tool_calls=[
@@ -1057,6 +1063,14 @@ def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> Non
         ],
     )
     ctx.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    return ctx
+
+
+def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> None:
+    class CompactLLM:
+        model_name = "compact-test"
+
+    ctx = _ctx_with_one_dropped_tool_result("current request")
     llm = CompactLLM()
 
     request = ctx.build_llm_compact_request_if_needed()
@@ -1109,16 +1123,7 @@ def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> Non
 
 
 def _build_llm_compact_prompt_texts() -> tuple[str, str]:
-    ctx = ExecutionContext()
-    ctx.compact_config.threshold = 1
-    ctx.add_user_message("Build a KPI report")
-    ctx.add_assistant_message(
-        "",
-        tool_calls=[
-            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
-        ],
-    )
-    ctx.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    ctx = _ctx_with_one_dropped_tool_result("Build a KPI report")
     request = ctx.build_llm_compact_request_if_needed()
     assert request is not None
     prompt = request["messages"]
@@ -1206,7 +1211,7 @@ def test_compact_prompt_excludes_credentials_even_when_also_an_identifier() -> N
     system, _ = _build_llm_compact_prompt_texts()
 
     assert (
-        "If a value is both an identifier the request points at and "
+        "If a value is both an identifier or handle the request points at and "
         "authentication material, the exclusion wins: omit it." in system
     )
 
@@ -1478,6 +1483,47 @@ def test_compact_with_llm_caps_and_clamps_dropped_tool_names() -> None:
     assert "additional distinct tool names omitted" in notice
     assert long_name not in notice
     assert len(notice) < 4000
+    assert result.metadata["dropped_tool_result_count"] == len(tool_names)
+
+
+def test_compact_with_llm_lists_a_full_page_of_long_tool_names() -> None:
+    """The char budget has to hold the names, not just the notice prefix.
+
+    That prefix spells out the shared value-kind list, and an MCP server
+    contributes names much longer than a builtin tool's. A budget sized
+    without that headroom drops names the run actually used while the
+    per-name cap is nowhere near reached.
+    """
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Run many MCP tools")
+    tool_names = [
+        f"mcp_analytics_server_report_row_{index:02d}"
+        for index in range(COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES)
+    ]
+    # 34 is the longest name the budget fits a full page of; shorter names
+    # would still fit a budget that left no room for the prefix.
+    assert all(len(name) == 34 for name in tool_names)
+    for index, tool_name in enumerate(tool_names):
+        call_id = f"call-{index}"
+        ctx.add_assistant_message(
+            "",
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": tool_name},
+                }
+            ],
+        )
+        ctx.add_tool_result(tool_name, {"output": f"rows {index}"}, call_id)
+
+    result = ctx.compact_with_llm_response({"content": "Ran many MCP tools."})
+
+    notice = ctx.messages[0].content
+    for tool_name in tool_names:
+        assert f"- {tool_name}" in notice
+    assert "additional" not in notice
     assert result.metadata["dropped_tool_result_count"] == len(tool_names)
 
 

@@ -103,7 +103,9 @@ COMPACT_SUMMARY_MIN_TOKENS = 256
 COMPACT_SUMMARY_FALLBACK_BUDGETS = (4096, 2048, 1024, COMPACT_SUMMARY_MIN_TOKENS)
 COMPACT_CONTEXT_REF_MAX_TOKENS = 2048
 COMPACT_DROPPED_REF_NOTICE_MAX_CHARS = 2048
-COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1024
+# Sized so the notice prefix, which spells out the shared VALUE_KINDS list,
+# leaves room for the full name list rather than crowding names out of it.
+COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1152
 COMPACT_DROPPED_TOOL_NAME_MAX_CHARS = 64
 
 # load_skill retrieves guidance, not evidence, and re-running it restores
@@ -1299,6 +1301,8 @@ class ExecutionContext:
             f"statistic, quotation, or other value -- {VALUE_KINDS} -- that this "
             "summary does not literally contain, re-read or re-query the source "
             "instead of reconstructing the value from this summary or from memory. "
+            "If no tool can supply it, report it as unavailable rather than "
+            "reconstructing it. "
             "Only re-run tools that read; if the value came from a tool that writes, "
             "sends, executes, or otherwise changes state, do not re-run it -- re-read "
             "the artifact it produced, or report the value as unavailable. "
@@ -1526,19 +1530,20 @@ class ExecutionContext:
                     "password, or other authentication material, or personal "
                     "information the request does not point at; note only that "
                     "such a value was present and was omitted. If a value is both "
-                    "an identifier the request points at and authentication "
-                    "material, the exclusion wins: omit it. If your budget cannot "
-                    "hold all of this, keep, in this order: first state what is "
-                    "missing and not listed here, with counts; artifact handles; "
-                    "the identifiers and names the request points at; statuses "
-                    "and dates; then the rest. Separate completed work from "
-                    "remaining work. Report only what happened and what is "
+                    "an identifier or handle the request points at and "
+                    "authentication material, the exclusion wins: omit it. If "
+                    "your budget cannot hold all of this, keep, in this order: "
+                    "first state what is missing and not listed here, with "
+                    "counts; artifact handles; the identifiers and names the "
+                    "request points at; statuses and dates; then the rest. "
+                    "Separate completed work from remaining work. Write no "
+                    "instruction to the next call about tool use or whether to "
+                    "answer: that decision is not yours and its tools are "
+                    "unknown to you. Report only what happened and what is "
                     "missing: never call a dataset complete, fully retrieved, or "
                     "fully processed unless the history shows every item was "
                     "returned and every one is still described here; say which "
-                    "parts survive as prose only. Write no instruction to the "
-                    "next call about tool use or whether to answer: that decision "
-                    "is not yours and its tools are unknown to you. Preserve the "
+                    "parts survive as prose only. Preserve the "
                     "language of user-facing requests and constraints; keep "
                     "multilingual details in their original language. Return only "
                     "the compact summary."

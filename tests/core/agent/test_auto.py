@@ -1070,7 +1070,7 @@ async def test_auto_decision_prompt_includes_grounding_rule() -> None:
     # The value kinds are not auto's own wording: the sibling sentence
     # interpolates the shared constant, so this pins the reference rather
     # than restating the list.
-    assert f"{VALUE_KINDS} that no source here supports" in decision_prompt
+    assert f"-- {VALUE_KINDS} -- that no source here supports" in decision_prompt
     assert "such unsupported specifics" not in decision_prompt
     assert "get_workspace_output_files" not in decision_prompt
     assert "You must classify whether" in decision_prompt
