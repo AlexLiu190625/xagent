@@ -1268,6 +1268,17 @@ def _reject_oversized_context_payload(
     goes to the log only -- never into the response ``reason`` -- and the
     log line never carries the value itself, only the key name, the
     connector ref, and a byte count.
+
+    Both caps measure the value in its stored form. ``json.dumps`` defaults
+    to ``ensure_ascii=True``, so a character outside ASCII counts as the
+    six-character escape sequence JSON writes it as -- which is exactly
+    what SQLAlchemy's JSON column puts in the row, and exactly the text the
+    conditional update in ``_update_context_row`` compares against.
+    Measuring the raw UTF-8 length instead would admit a value two to three
+    times the size of the column the caps exist to bound. A caller whose
+    text is CJK or emoji therefore reaches a cap at roughly half, or a
+    third, of the character count an ASCII caller does; that is the cap's
+    intended meaning, not an oversight.
     """
     total_bytes = 0
     for ref, context in items:
