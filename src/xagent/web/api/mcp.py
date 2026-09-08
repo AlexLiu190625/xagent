@@ -2427,6 +2427,35 @@ def _catalog_reserved_keys(db: Session) -> "set[str]":
     return {key for app in get_all_mcp_apps(db) for key in _catalog_app_keys(app)}
 
 
+def _definition_row_has_an_owner(db: Session, server: MCPServer) -> bool:
+    """Whether any user's association row claims ``is_owner`` on this row.
+
+    Three provisioning paths write ``is_owner=True``: ``create_mcp_server``
+    for a connector a user built themselves, and the builtin-OAuth connect in
+    ``auth.py`` for the row it provisions. Both catalog-connect paths write
+    ``is_owner=False`` instead, and the catalog provisioning helpers create
+    the shared row with no association at all -- which is why
+    ``_reject_user_owned_catalog_squat`` can refuse to adopt an owned row as
+    a catalog row. So "no owner" is the shape of a platform-provisioned row,
+    and of a row whose creator's account has since been deleted (association
+    rows cascade with the user), and of nothing a team built.
+
+    Same query as ``_reject_user_owned_catalog_squat`` asks on the connect
+    paths, deliberately written out a second time rather than shared: that
+    function is on the connect path, which this change does not otherwise
+    touch and which carries no regression coverage of its own.
+    """
+    return (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.mcpserver_id == server.id,
+            UserMCPServer.is_owner.is_(True),
+        )
+        .first()
+        is not None
+    )
+
+
 def _team_access_for_shared_row(
     db: Session,
     server: MCPServer,
@@ -2479,16 +2508,42 @@ def _team_access_for_shared_row(
     stored "who created this definition" fact the schema does not carry today;
     until it does, this is the side the ambiguity is resolved on, on purpose.
 
-    The test runs only for a verdict that already grants edit -- the one case
-    where it can change an answer -- so a deployment with no access hook
-    installed resolves ``None`` for every row and issues no additional query
-    at all.
+    A second, independent reason to withhold the edit: the row has no owner
+    at all. A catalog app's shared row is provisioned without any association
+    (``_reject_user_owned_catalog_squat``'s docstring states this), and both
+    catalog-connect paths write ``is_owner=False``, so a platform row stays
+    ownerless for its whole life -- while every connector a user built
+    themselves has an ``is_owner=True`` row from the moment it is created.
+    The catalog-key test above cannot see a platform row an administrator
+    renamed away from its key, because for a non-``oauth`` row that key IS
+    the current name and this same route can change it; the ownership test
+    does not depend on any field this route can write. The two are
+    complementary, not redundant: a renamed builtin-OAuth row is still
+    matched by its ``auth.app_id`` and does carry an owner, while a renamed
+    key-based, keyless or remote-MCP-OAuth row is caught only by the
+    ownership test.
+
+    What this deliberately also withholds: a connector whose creator's
+    account was deleted. Association rows cascade with the user, so such a
+    row becomes ownerless and stops being team-editable. That is the
+    conservative direction -- a wrong answer here refuses an edit rather than
+    granting one -- and it is the side the ambiguity is resolved on until the
+    schema carries a durable "this row came from the catalog" fact.
+
+    Both tests run only for a verdict that already grants edit -- the one
+    case where either can change an answer -- so a deployment with no access
+    hook installed resolves ``None`` for every row and issues no additional
+    query at all. Ordering matters for the same reason: the ownership lookup
+    sits after the catalog test, so a row the catalog already claims costs
+    nothing extra.
     """
     if access is None or not access.can_edit:
         return access
-    if not _catalog_reserved_keys(db).intersection(_server_catalog_keys(server)):
-        return access
-    return replace(access, can_edit=False)
+    if _catalog_reserved_keys(db).intersection(_server_catalog_keys(server)):
+        return replace(access, can_edit=False)
+    if not _definition_row_has_an_owner(db, server):
+        return replace(access, can_edit=False)
+    return access
 
 
 def _oauth_account_can_connect(oauth_account: object) -> bool:

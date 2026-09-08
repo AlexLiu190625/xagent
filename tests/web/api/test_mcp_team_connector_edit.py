@@ -1054,6 +1054,175 @@ class TestCatalogRowsAreNeverTeamEditable:
         assert response.can_edit_global is True
 
 
+class TestOwnershipWithholdsTheTeamEditRightFromAnOwnerlessRow:
+    """A team verdict that grants edit is also downgraded when the
+    definition row it names has no ``is_owner=True`` association at all --
+    independent of, and in addition to, the catalog-key test above. The
+    catalog-key test alone cannot see a non-``oauth`` row an administrator
+    renamed away from its key, because for that row the key IS the current
+    name and this same route can change it. The ownership test does not
+    depend on any field this route can write, so it still catches such a
+    row after the rename.
+    """
+
+    @pytest.mark.parametrize(
+        "catalog_app, catalog_row, tamper_payload, unchanged_field",
+        [
+            (
+                lambda db: _make_catalog_app_with_display_name(
+                    db, "billing-api", "Billing API"
+                ),
+                lambda db: _make_catalog_server_row(
+                    db,
+                    name="billing-api",
+                    transport="stdio",
+                    command="python",
+                    args=["-m", "xagent.web.tools.mcp.billing_api"],
+                ),
+                MCPServerUpdate(config={"command": "evil", "args": []}),
+                "command",
+            ),
+            (
+                lambda db: _make_catalog_app_with_display_name(
+                    db, "browser-tool", "Browser Tool"
+                ),
+                lambda db: _make_catalog_server_row(
+                    db,
+                    name="browser-tool",
+                    transport="stdio",
+                    command="npx",
+                    args=["-y", "@browser/tool"],
+                ),
+                MCPServerUpdate(config={"command": "evil", "args": []}),
+                "command",
+            ),
+            (
+                lambda db: _make_catalog_app_with_display_name(
+                    db,
+                    "docs-oauth",
+                    "Docs OAuth",
+                    transport="streamable_http",
+                    launch_config={
+                        "url": "https://mcp.docs.example/mcp",
+                        "auth": {"type": "mcp_oauth"},
+                    },
+                ),
+                lambda db: _make_catalog_server_row(
+                    db,
+                    name="docs-oauth",
+                    transport="streamable_http",
+                    command=None,
+                    url="https://mcp.docs.example/mcp",
+                    auth={"type": "mcp_oauth"},
+                ),
+                MCPServerUpdate(config={"url": "https://evil.example/mcp"}),
+                "url",
+            ),
+        ],
+        ids=["api_key", "keyless", "mcp_oauth"],
+    )
+    def test_a_renamed_catalog_row_with_no_owner_is_not_team_editable(
+        self, db, catalog_app, catalog_row, tamper_payload, unchanged_field
+    ):
+        catalog_app(db)
+        admin = _make_user(db, 1, is_admin=True)
+        member = _make_user(db, 2)
+        server = catalog_row(db)
+        server_id = server.id
+        # Production shape: no association row at all, not even the
+        # administrator's -- nobody has connected to this catalog row yet.
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
+            )
+            update_mcp_server(
+                server_id,
+                MCPServerUpdate(name="renamed-away-from-the-catalog-key"),
+                current_user=admin,
+                db=db,
+            )
+
+            original_value = getattr(
+                db.query(MCPServer).filter(MCPServer.id == server_id).one(),
+                unchanged_field,
+            )
+            with pytest.raises(HTTPException) as exc:
+                update_mcp_server(server_id, tamper_payload, current_user=member, db=db)
+
+        assert exc.value.status_code == 403
+        assert "You do not have permission to edit this MCP server" in exc.value.detail
+
+        db.rollback()
+        refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert getattr(refreshed, unchanged_field) == original_value
+
+    def test_a_row_whose_owner_is_gone_is_not_team_editable(self, db):
+        """A definition row with no owner and no catalog-key collision
+        either -- the shape left behind once a connector's creator account
+        has been deleted, since association rows cascade with the user.
+        This is the conservative direction stated in the docstring: a
+        wrong answer here refuses the edit rather than granting one."""
+        member = _make_user(db, 2)
+        server = MCPServer(
+            name="orphaned-connector",
+            transport="stdio",
+            managed="external",
+            command="true",
+        )
+        db.add(server)
+        db.commit()
+        server_id = server.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
+            )
+            with pytest.raises(HTTPException) as exc:
+                update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(description="should not land"),
+                    current_user=member,
+                    db=db,
+                )
+
+        assert exc.value.status_code == 403
+        assert "You do not have permission to edit this MCP server" in exc.value.detail
+
+    def test_an_owned_row_still_gets_the_team_edit_right(self, db):
+        """Reverse anchor, guarding against an over-broad fix: a row that
+        does have an owner -- not a catalog row -- must keep its team edit
+        right. Written so a change that downgrades every row
+        unconditionally, not only ownerless ones, cannot pass by refusing
+        everything."""
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_owned_server(db, owner.id, name="owned-row-still-editable")
+        server_id = server.id
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
+            )
+            response = update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="edited by the team"),
+                current_user=member,
+                db=db,
+            )
+
+        assert response.can_edit_global is True
+        db.rollback()
+        refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert refreshed.description == "edited by the team"
+
+
 _SEAM_MODULE = "xagent.web.api.mcp"
 
 # The arms that answer a failed access verdict with a warning instead of
