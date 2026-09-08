@@ -4474,9 +4474,10 @@ def _teardown_mcp_app_server_locally(
     every other request the process is serving instead of occupying one
     worker.
 
-    Returns the acting user id alongside the revocation snapshots, so the
-    caller can log the completed teardown without reading an ORM attribute that
-    this function's commit has expired.
+    Returns the acting user id alongside the revocation snapshots because this
+    function is the half of a split teardown that has ``current_user`` in
+    scope: the caller, ``teardown_mcp_app_server``, logs the completed
+    teardown after this function returns and needs the id to do it.
     """
     revocations: list[_MCPOAuthGrantRevocationSnapshot] = []
     try:
@@ -4723,10 +4724,13 @@ async def teardown_mcp_app_server(
     ``_teardown_mcp_app_server_locally``, and runs in a worker thread rather
     than here, because an installed team hook may be slow and this coroutine
     runs on the event loop thread that serves every other request. The same
-    session is handed to that thread and back; the engine allows this across
-    threads (``check_same_thread=False`` and ``NullPool`` in
-    ``models/database.py``), and ``triggers.py`` already hands its own
-    request-scoped session to a worker thread the same way.
+    session is handed to that thread and back: SQLAlchemy's ``Session`` is
+    not bound to a single thread, it is only unsafe for two threads to use
+    it at once, so handing it to the worker and awaiting that call before
+    touching the session again is safe on its own terms -- this does not
+    depend on the SQLite-only engine options in ``models/database.py``
+    (``check_same_thread=False``, ``NullPool``); production runs a different
+    dialect through ``QueuePool``.
 
     That does not by itself make the handoff safe against cancellation:
     ``asyncio.to_thread`` does not stop the worker when the awaiting coroutine

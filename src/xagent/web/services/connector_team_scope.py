@@ -58,8 +58,10 @@ that declares it is checked; one that does not is not.
 route decorator, and its only caller in this repository outside tests is the
 async ``teardown_mcp_app_server`` wrapper, which dispatches to it with
 ``asyncio.to_thread`` and, after it returns, runs the external revocation that
-must not itself hold any of the three row locks. "Nothing committed before
-asking" therefore holds inside its own body only. A future caller that commits
+must not itself hold any of the three row locks. That wrapper itself has no
+production caller in this repository today -- both functions are exercised
+only from tests. "Nothing committed before asking" therefore holds inside its
+own body only. A future caller that commits
 and then calls it would turn its declaration into a report of failure for work
 that already succeeded, and nothing here would notice -- the check that keeps
 this table honest compares declarations against call sites, not against a
