@@ -74,6 +74,7 @@ from xagent.web.services.task_command_transport import (
     TaskCommandRejected,
 )
 from xagent.web.services.task_execution_controller import StaleTaskRunError
+from xagent.web.services.task_interaction_close import ActiveInteractionFound
 from xagent.web.services.task_lease_service import (
     TaskLease,
     current_task_lease,
@@ -2064,9 +2065,9 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
 
     order: list[str] = []
 
-    def record_read(_task_id: int) -> int:
+    def record_read(_task_id: int) -> ActiveInteractionFound:
         order.append("read")
-        return 4321
+        return ActiveInteractionFound(4321)
 
     async def record_injection(
         *_args: object, **_kwargs: object

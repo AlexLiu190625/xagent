@@ -61,6 +61,9 @@ from ...services.db_runtime import (
 from ...services.llm_utils import AutoModelUnavailableError
 from ...services.task_execution_controller import TaskControlState
 from ...services.task_interaction_close import (
+    ActiveInteractionAbsent,
+    ActiveInteractionFound,
+    ActiveInteractionUnavailable,
     active_interaction_id_sync,
     clear_interaction_marker_if_unpaired,
     close_legacy_resume_interaction,
@@ -523,9 +526,33 @@ async def reply_to_task(
         # Read before the injection below, not inside
         # _update_reply_input_sync, whose session opens only afterwards.
         # See task_interaction_close's module docstring for why.
-        active_interaction_id = await run_db_io_cancellation_safe(
+        active_interaction_read = await run_db_io_cancellation_safe(
             lambda: active_interaction_id_sync(task_id)
         )
+        # Translate the three-state read into the `int | None` this site's
+        # close call takes. Absent and Unavailable both become `None` here
+        # -- but that is not folding Unavailable into Absent, it is this
+        # call's own contract: `None` means "bind the close to no primary
+        # key, so it matches zero rows and the active row and marker both
+        # survive" (see active_interaction_id_sync's docstring), which is
+        # the safe outcome for a read that could not be made, not a claim
+        # that nothing was ever active. Written as three branches, not
+        # `interaction_id if isinstance(..., ActiveInteractionFound) else
+        # None`, so a reader (and mypy) sees Unavailable handled on its own
+        # line rather than merged into Absent's.
+        if isinstance(active_interaction_read, ActiveInteractionFound):
+            active_interaction_id = active_interaction_read.interaction_id
+        elif isinstance(active_interaction_read, ActiveInteractionAbsent):
+            active_interaction_id = None
+        else:
+            assert isinstance(active_interaction_read, ActiveInteractionUnavailable)
+            active_interaction_id = None
+            logger.info(
+                "active interaction read unavailable (reason=%s) for "
+                "task_id=%s; the legacy resume close will match no row",
+                active_interaction_read.reason,
+                task_id,
+            )
 
         async def inject_user_message() -> tuple[Any, bool]:
             from .. import chat

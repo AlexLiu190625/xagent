@@ -48,6 +48,7 @@ from xagent.web.services.task_command_transport import (
     max_command_defers,
 )
 from xagent.web.services.task_execution_controller import TaskControlState
+from xagent.web.services.task_interaction_close import ActiveInteractionFound
 from xagent.web.services.task_lease_service import TaskLease, current_task_lease
 from xagent.web.services.task_orchestrator import (
     TaskTurnError,
@@ -1100,9 +1101,9 @@ def test_message_send_reads_the_interaction_row_before_injecting() -> None:
 
     order: list[str] = []
 
-    def record_read(_task_id: int) -> int:
+    def record_read(_task_id: int) -> ActiveInteractionFound:
         order.append("read")
-        return _OBSERVED_INTERACTION_ID
+        return ActiveInteractionFound(_OBSERVED_INTERACTION_ID)
 
     async def record_injection(
         *_args: object, **_kwargs: object

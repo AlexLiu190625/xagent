@@ -42,6 +42,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import ops_signals
+from xagent.web.services.task_interaction_close import ActiveInteractionUnavailable
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -785,12 +786,130 @@ async def test_stale_run_active_row_does_not_trip_the_seam(
     assert resume_scheduled.is_set()
 
 
-# active_interaction_id_sync's own four fail-open branches (no database
-# configured yet, a session that fails to open, the interaction table not
-# existing yet, the row lookup itself raising) used to be pinned here,
-# against websocket.py's own _active_native_interaction_id_sync. That
-# function is gone -- the seam now reads through the same
-# task_interaction_close.active_interaction_id_sync the four legacy-resume
-# injection sites use -- and its four fail-open branches are pinned in
-# tests/web/services/test_task_interaction_close.py instead, alongside the
+@pytest.mark.asyncio
+async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, _seeded_task: int
+) -> None:
+    """``ActiveInteractionUnavailable`` takes its own branch at this gate,
+    distinct from ``ActiveInteractionAbsent``, but today's action on that
+    branch is the same as ``ActiveInteractionAbsent``'s: the resume
+    proceeds. Nothing in ``src/`` writes
+    ``tasks.interaction_protocol_version`` to anything but ``NULL``, so a
+    read that could not be made cannot be hiding a live native interaction
+    row -- refusing here would only cost a refused resume on tasks that
+    provably carry no question. Turning this branch into a refusal is the
+    job of the change that first writes that marker to ``1``; that change
+    edits this one branch's action, and this test is what will need to
+    flip when it does.
+
+    Patches ``active_interaction_id_sync`` directly rather than seeding a
+    real row and breaking the database under it: the production code path
+    this exercises is entirely on the caller's side of that function (the
+    three-way branch and what each arm does), not inside the function
+    itself -- its own failure branches are pinned in
+    tests/web/services/test_task_interaction_close.py.
+    """
+
+    monkeypatch.setattr(
+        websocket_api,
+        "active_interaction_id_sync",
+        lambda task_id: ActiveInteractionUnavailable("lookup_failed"),
+    )
+
+    snapshot = _snapshot(task_id=_seeded_task)
+    connection_manager = _connection_manager()
+    background_manager = MagicMock()
+    background_manager.running_tasks = {}
+    background_manager.resume_admission_state.return_value = None
+    background_manager.try_reserve_resume.return_value = (
+        websocket_api.ResumeReservationOutcome.RESERVED
+    )
+    transition = AsyncMock(
+        return_value=SimpleNamespace(run_id=RUN_ID, status=TaskStatus.WAITING_FOR_USER)
+    )
+    agent_service = MagicMock()
+    agent_service.supports_live_control = MagicMock(return_value=True)
+
+    resume_scheduled = asyncio.Event()
+
+    async def _stub_execute_resume_background(**kwargs: object) -> None:
+        resume_scheduled.set()
+
+    from xagent.web.services import task_setup_snapshot as snapshot_module
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                snapshot_module, "load_task_setup_snapshot_sync", return_value=snapshot
+            )
+        )
+        stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
+        stack.enter_context(
+            patch.object(
+                websocket_api.task_execution_controller, "transition", new=transition
+            )
+        )
+        stack.enter_context(
+            patch.object(websocket_api, "background_task_manager", background_manager)
+        )
+        # The handler asks the DB whether another process still holds a live
+        # lease before it schedules; these suites drive the handler without a
+        # task row, so answer "no foreign owner" explicitly.
+        stack.enter_context(
+            patch.object(
+                websocket_api, "task_has_live_foreign_runner", return_value=False
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                websocket_api,
+                "execute_resume_background",
+                side_effect=_stub_execute_resume_background,
+            )
+        )
+        agent_manager = MagicMock()
+        agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+        stack.enter_context(
+            patch.object(chat_api, "get_agent_manager", lambda: agent_manager)
+        )
+
+        result = await websocket_api._handle_resume_task_unserialized(
+            MagicMock(),
+            _seeded_task,
+            {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
+        )
+
+        agent_manager.get_agent_for_task.assert_awaited()
+        await asyncio.wait_for(resume_scheduled.wait(), timeout=1)
+
+    assert resume_scheduled.is_set()
+    transition.assert_awaited()
+    errors = [
+        call.args[0]
+        for call in connection_manager.send_personal_message.await_args_list
+        if isinstance(call.args[0], dict) and call.args[0].get("type") == "error"
+    ]
+    assert errors == []
+    assert (
+        ops_signals.INTERACTION_LEGACY_RESUME_SHIM
+        not in ops_signals.active_degradations()
+    )
+    assert result.outcome is not websocket_api.ResumeCommandOutcome.REJECTED
+
+
+# active_interaction_id_sync's own four branches (no database configured
+# yet, a session that fails to open, the interaction table not existing
+# yet, the row lookup itself raising) used to be pinned here, against
+# websocket.py's own _active_native_interaction_id_sync, back when all
+# four were fail-open. That function is gone -- the seam now reads through
+# the same task_interaction_close.active_interaction_id_sync the four
+# legacy-resume injection sites use, and the fail-open behavior of all four
+# branches is unchanged: what changed is only that the reader now reports
+# them as one of three states instead of collapsing all of them into the
+# same None, and this gate handles each state on its own branch (see
+# test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
+# unavailable above for the ActiveInteractionUnavailable branch, and
+# test_legacy_resume_is_not_refused_when_the_task_marker_is_null above for
+# ActiveInteractionAbsent). All four branches of the read itself are pinned
+# in tests/web/services/test_task_interaction_close.py, alongside the
 # marker gate that reader adds ahead of them.

@@ -199,6 +199,9 @@ from ..services.task_execution_controller import (
     task_execution_controller,
 )
 from ..services.task_interaction_close import (
+    ActiveInteractionAbsent,
+    ActiveInteractionFound,
+    ActiveInteractionUnavailable,
     active_interaction_id_sync,
     clear_interaction_marker_if_unpaired,
     close_legacy_resume_interaction_sync,
@@ -6764,9 +6767,42 @@ async def _handle_chat_message_unserialized(
                     # local, posted false hands the same value to
                     # execute_resume_background through pending_user_message,
                     # so one observation only ever serves one close.
-                    active_interaction_id = await run_db_io_cancellation_safe(
+                    active_interaction_read = await run_db_io_cancellation_safe(
                         lambda: active_interaction_id_sync(task_id)
                     )
+                    # Translated here, on the read side, for both branches at
+                    # once: the deferred path (posted false) does not re-read
+                    # -- it carries whatever this site puts in
+                    # pending_user_message["interaction_id"] and is pinned by
+                    # tests/web/api/test_websocket_owner_actor.py not to call
+                    # active_interaction_id_sync itself -- so translating the
+                    # three-state read anywhere past this point would leave
+                    # that path with a three-state value it has no way to
+                    # judge (it never re-reads, so it cannot tell Unavailable
+                    # apart from a fresh Absent). Absent and Unavailable both
+                    # become `None` for the same reason as the other two
+                    # close sites: `None` binds the close to no primary key,
+                    # which matches zero rows and leaves the active row and
+                    # marker both in place -- the safe outcome for a read
+                    # that could not be made, not a claim that nothing was
+                    # ever active. Three branches, not a two-way isinstance
+                    # fold, so Unavailable stays visible on its own line.
+                    if isinstance(active_interaction_read, ActiveInteractionFound):
+                        active_interaction_id = active_interaction_read.interaction_id
+                    elif isinstance(active_interaction_read, ActiveInteractionAbsent):
+                        active_interaction_id = None
+                    else:
+                        assert isinstance(
+                            active_interaction_read, ActiveInteractionUnavailable
+                        )
+                        active_interaction_id = None
+                        logger.info(
+                            "active interaction read unavailable (reason=%s) "
+                            "for task_id=%s; the legacy resume close will "
+                            "match no row",
+                            active_interaction_read.reason,
+                            task_id,
+                        )
 
                     posted = UserMessageInjectionOutcome.NOT_POSTED
                     if live_task_lease is not None:
@@ -8989,10 +9025,10 @@ async def _handle_resume_task_unserialized(
         # append to or replan around an unanswered question. This runs
         # before agent_service is built (below) so a refused request never
         # pays for constructing one. Gated on tasks.interaction_protocol_
-        # version first, though: under a NULL marker the read below returns
-        # None regardless of whether an active row exists, so this refusal
-        # never fires for that state -- deliberately, matching what the
-        # read surface would show for the same task (see
+        # version first, though: under a NULL marker the read below reports
+        # ActiveInteractionAbsent regardless of whether an active row
+        # exists, so this refusal never fires for that state -- deliberately,
+        # matching what the read surface would show for the same task (see
         # active_interaction_id_sync's own docstring).
         #
         # Residual window, named here rather than closed here: this lookup
@@ -9005,10 +9041,11 @@ async def _handle_resume_task_unserialized(
         # The read itself is task_interaction_close.active_interaction_id_sync
         # -- the same reader the three legacy-resume injection sites use, so
         # this gate and the close cannot disagree about which row is live.
-        active_interaction_id = await run_db_io_cancellation_safe(
+        active_interaction_read = await run_db_io_cancellation_safe(
             lambda: active_interaction_id_sync(task_id)
         )
-        if active_interaction_id is not None:
+        if isinstance(active_interaction_read, ActiveInteractionFound):
+            active_interaction_id = active_interaction_read.interaction_id
             receipt_interaction_id = message_data.get("interaction_id")
             receipt_responder_identity = message_data.get("responder_identity")
             # isinstance before comparing, the same shape the cancel
@@ -9060,6 +9097,33 @@ async def _handle_resume_task_unserialized(
                     reason,
                     reason_code="interaction_pending",
                 )
+        elif isinstance(active_interaction_read, ActiveInteractionUnavailable):
+            # Same action as the ActiveInteractionAbsent branch below -- the
+            # resume proceeds -- but deliberately its own branch rather than
+            # a shared one. This is the arm that turns into a refusal, and
+            # refusing here is wired by the change that first writes
+            # tasks.interaction_protocol_version = 1. Until that marker can
+            # be 1, nothing in src/ having written it to anything but NULL,
+            # a read that could not be made cannot be hiding a live native
+            # interaction row: refusing today would cost a refused resume on
+            # every waiting task, including the ones that provably carry no
+            # question at all. Keeping the branch separate is what lets that
+            # later change edit one branch's action and touch neither of the
+            # other two.
+            #
+            # Logged at info, not warning: the read itself already logs one
+            # warning for this same incident (see
+            # active_interaction_id_sync), and a second warning-level line
+            # would double-count one read failure.
+            logger.info(
+                "the active interaction read was unavailable (reason=%s) for "
+                "task_id=%s run_id=%s; the resume proceeds",
+                active_interaction_read.reason,
+                task_id,
+                task_fields.run_id,
+            )
+        else:
+            assert isinstance(active_interaction_read, ActiveInteractionAbsent)
 
         attempt_count = message_data.get("_durable_attempt_count")
 

@@ -30,6 +30,7 @@ from xagent.web.schemas.v1 import ReplyRequest
 from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_execution_controller import TaskControlState
+from xagent.web.services.task_interaction_close import ActiveInteractionFound
 from xagent.web.services.task_lease_service import TaskLease, current_task_lease
 
 from ..conftest import _admin_headers, _direct_db_session, client
@@ -640,9 +641,9 @@ def test_reply_reads_the_interaction_row_before_injecting(mock_start_task):
 
     order: list[str] = []
 
-    def record_read(_task_id: int) -> int:
+    def record_read(_task_id: int) -> ActiveInteractionFound:
         order.append("read")
-        return _OBSERVED_INTERACTION_ID
+        return ActiveInteractionFound(_OBSERVED_INTERACTION_ID)
 
     async def record_injection(
         *_args: object, **_kwargs: object
