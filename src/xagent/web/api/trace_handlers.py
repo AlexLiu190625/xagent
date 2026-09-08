@@ -29,7 +29,6 @@ from ...web.models.database import get_db
 from ...web.models.task import Task, TaskStatus
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.task_interaction import TaskInteractionRequest
-from ...web.models.tool_config import ToolUsage
 from ...web.services.interaction_rollout import (
     COUNTER_CHECKPOINT_READ_PARTITION_WIDENED,
     increment_counter,
@@ -1104,38 +1103,6 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         f"Task {self.task_id} lease changed before checkpoint "
                         f"{event.id} could be persisted"
                     )
-
-            # Update tool usage statistics if this is a tool execution event
-            if event_type_str == "tool_execution_end":
-                tool_name = data.get("tool_name") if isinstance(data, dict) else None
-                if tool_name:
-                    try:
-                        tool_usage: Any = (
-                            db.query(ToolUsage)
-                            .filter(ToolUsage.tool_name == tool_name)
-                            .first()
-                        )
-                        if not tool_usage:
-                            tool_usage = ToolUsage(
-                                tool_name=tool_name,
-                                usage_count=0,
-                                success_count=0,
-                                error_count=0,
-                            )
-                            db.add(tool_usage)
-
-                        tool_usage.usage_count += 1
-                        # We assume success for tool_execution_end events as errors are typically handled separately
-                        # and react pattern emits this event on success
-                        if isinstance(data, dict) and data.get("success", True):
-                            tool_usage.success_count += 1
-                        else:
-                            tool_usage.error_count += 1
-
-                        tool_usage.last_used_at = timestamp
-                        logger.debug(f"Updated usage stats for tool {tool_name}")
-                    except Exception as e:
-                        logger.error(f"Failed to update tool usage stats: {e}")
 
             db.commit()
 
