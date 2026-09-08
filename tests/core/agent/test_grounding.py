@@ -65,6 +65,12 @@ def test_grounding_rule_covers_fact_carrying_tool_arguments() -> None:
         "omit it when the tool allows",
     ):
         assert phrase in rule
+    # A page size the model picks is not a claim about the world, so pausing
+    # for it would be the over-asking failure the exemption exists to prevent.
+    assert (
+        "does not reach a default or inferred parameter value such as a page "
+        "size or result limit" in rule
+    )
     # Pin the concatenation onto the answer rules that precede it.
     assert "report the gap instead. The same standard applies" in rule
 
@@ -131,6 +137,9 @@ def test_grounding_rule_keeps_literal_facts_inside_composed_text_sourced() -> No
             "still subject to the sourcing rule above: the text you compose "
             "is yours" in rule
         )
+        # The list is set off before "is not" so the qualifier reads against
+        # the whole list, not against its last member alone.
+        assert f"a value you place inside it -- {VALUE_KINDS} -- is not" in rule
         assert rule.count(VALUE_KINDS) == 2
 
 
@@ -213,8 +222,9 @@ def test_grounding_rule_exception_requires_an_explicit_current_request() -> None
     for rule in (grounding_rule(), grounding_rule(can_call_tools=False)):
         assert (
             "The only case in which content that no source supports may "
-            "appear in the answer is a current user request that explicitly "
-            "asks" in rule
+            "appear -- in the answer, or inside document text or other "
+            "content the request asks you to write and hand to a tool -- is "
+            "a current user request that explicitly asks" in rule
         )
         assert (
             "Outside that case a caveat does not make an invented value "
@@ -225,10 +235,39 @@ def test_grounding_rule_exception_requires_an_explicit_current_request() -> None
 def test_grounding_rule_states_sample_nature_before_presenting_it() -> None:
     """On the exception path, the disclosure must precede the content."""
     for rule in (grounding_rule(), grounding_rule(can_call_tools=False)):
-        assert "before any of that content appears in the answer, state" in rule
-        assert rule.index("before any of that content appears") < rule.index(
-            "keep such content to what the request asked for"
+        assert "before any of that content appears, state in your reply" in rule
+
+
+def test_grounding_rule_exception_reaches_content_bound_for_a_tool_argument() -> None:
+    """A sample the user asked for is often written into a file, not the answer.
+
+    "Write a sample invoice and save it to sample-invoice.md" delivers the
+    requested content through a tool argument. An exception scoped to the
+    answer alone would leave the request unanswerable: the compose exemption
+    hands every fact inside that content back to the sourcing rule, so the
+    exception has to reach the same destination the content goes to.
+    """
+    for rule in (grounding_rule(), grounding_rule(can_call_tools=False)):
+        assert (
+            "may appear -- in the answer, or inside document text or other "
+            "content the request asks you to write and hand to a tool --" in rule
         )
+
+
+def test_grounding_rule_exception_trigger_qualifies_what_a_sample_means() -> None:
+    """The trigger must say what a sample is, not offer a third alternative.
+
+    As a third alternative it could never constrain the second: a request
+    classified as "a sample" satisfied the trigger before that phrase was
+    read, so "make me a sample table of last quarter's real refunds" opened
+    the exception.
+    """
+    for rule in (grounding_rule(), grounding_rule(can_call_tools=False)):
+        assert (
+            "write a template or a sample, meaning content that is not meant "
+            "to be real" in rule
+        )
+        assert "a sample, or content that is not meant to be real" not in rule
 
 
 def test_grounding_rule_rejects_caveat_as_a_substitute_for_omission() -> None:
@@ -269,6 +308,9 @@ def test_grounding_module_docstring_states_the_default_as_a_prohibition() -> Non
     doc = grounding.__doc__ or ""
     assert "instructed default" not in doc
     normalized_doc = " ".join(doc.split())
+    # A denial of one phrasing is evaded by any synonym, so pin the claim
+    # the docstring must positively make.
+    assert "makes reporting the gap the instructed response" in normalized_doc
     assert (
         "Proposals B (evidence-preserving compaction) and C (provenance "
         "tracking and a data-source gate) remain open." in normalized_doc

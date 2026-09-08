@@ -48,7 +48,8 @@ def grounding_rule(*, can_call_tools: bool = True) -> str:
         forbids supplying a fact-carrying tool-call argument that no source
         provides, while leaving arguments the model is expected to compose
         untouched -- except for a fact value written literally inside composed
-        code or document text, which the sourcing requirement still covers.
+        code or document text, which the sourcing requirement still covers
+        unless the request explicitly asked for a template or a sample.
     """
     insufficient_context_rule = (
         "If available context is insufficient, say so or use an appropriate "
@@ -95,14 +96,16 @@ def grounding_rule(*, can_call_tools: bool = True) -> str:
         "restricts every fact asserted inside that wording. A fact value "
         "written literally inside such composed code or text is still "
         "subject to the sourcing rule above: the text you compose is yours; "
-        f"{VALUE_KINDS} that you place inside it is not. The only case in "
-        "which content that no source supports may appear in the answer is a "
-        "current user request that explicitly asks you to write a template, "
-        "a sample, or content that is not meant to be real; in that case, "
-        "before any of that content appears in the answer, state that the "
-        "request asked for content that is not real and that none of it "
-        "comes from a data source, and keep such content to what the request "
-        "asked for. Outside that case a caveat does not make an invented "
+        f"a value you place inside it -- {VALUE_KINDS} -- is not. The only "
+        "case in which content that no source supports may appear -- in the "
+        "answer, or inside document text or other content the request asks "
+        "you to write and hand to a tool -- is a current user request that "
+        "explicitly asks you to write a template or a sample, meaning "
+        "content that is not meant to be real; in that case, before any of "
+        "that content appears, state in your reply that the request asked "
+        "for content that is not real and that none of it comes from a data "
+        "source, and keep such content to what the request asked for. "
+        "Outside that case a caveat does not make an invented "
         "value acceptable: if you find yourself about to add a note "
         "explaining that some values are not real, remove those values and "
         "report the gap instead."
