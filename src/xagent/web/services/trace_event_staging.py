@@ -397,6 +397,12 @@ def is_mismatched_run_partition_only(
     the "absent" half above is not the negation of "wrong", because a row
     failing some *other* condition as well is neither.
 
+    ``is not None`` also counts a falsy-but-present value (``""``, ``0``,
+    ``False``) as mismatched rather than absent, the same way the sibling
+    predicate's ``is None`` would not catch one either. No live writer
+    stores one of those in this field today, so that reading is untested
+    here rather than defended against.
+
     Same pairing requirement as the predicate above: ``failed`` must be the
     result of ``failed_checkpoint_row_conditions`` called on this same
     ``row_data``.

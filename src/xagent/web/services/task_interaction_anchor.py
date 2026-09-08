@@ -41,7 +41,9 @@ Three of the six outcomes above increment a counter
 ``COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE`` for step 5;
 ``interaction_rollout.py``). Step 4's true-corrupt path has no counter; it
 registers ``INTERACTION_ANCHOR_CORRUPT``, an ops degradation signal rather
-than a rate metric -- see that signal's own paragraph below. Step 4's
+than a rate metric, now covering two distinct reasons under the same
+signal name -- the generic corrupt verdict and the narrower
+mismatched-run-tag one -- see that signal's own paragraph below. Step 4's
 other path, the missing-run-partition reclassification described above,
 does increment a counter: the same ``COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE``
 step 5 uses when the row's ``checkpoint_type`` is a legacy one (both
@@ -185,24 +187,47 @@ cautious. The single statement that writes a checkpoint pointer carries
 a ``Task.run_id`` equality condition, and the row's run tag is stamped
 from the same lease (``stage_trace_event_row``,
 ``trace_event_staging.py``), so pointer and tag agree at the moment the
-pointer is written; every writer that mints a different non-null run id
-clears both pointer columns in the same statement. What can still reach
-this branch is a pointer into another task's row (which fails ownership
-too, and reports the generic reason instead), a hand-edited or
-mis-migrated row, or a future checkpoint writer that bypasses
-``stage_trace_event_row`` -- each of those is genuinely inconsistent
-data, not a timing artifact, which is why this reports an alarm with a
-specific reason rather than a quiet retry.
+pointer is written. Not every writer that later mints a new run id
+clears both pointer columns in that same statement, though:
+``apply_task_control_transition`` (``task_execution_controller.py``)
+mints a fresh ``run_id`` whenever the task's current one reads
+``None`` -- reached from resume handling in both
+``task_interaction_service.py`` and ``websocket.py`` -- without
+touching either pointer column at all. ``websocket.py``'s own resume
+call site leaves the pointer in place on purpose there, because it is
+the anchor the resume means to read from; what changes underneath it
+is the run id the pointer is now compared against. What can reach this
+branch, then, is not only a hand-edited or mis-migrated row: it is
+also that ordinary resume; the 2026-08 migration's backfill UPDATE
+(``src/xagent/migrations/versions/20260804_add_task_checkpoint_trace_event_anchor.py``),
+which fills ``last_checkpoint_trace_event_id`` from a task's legacy
+event-id column with no run-partition condition of its own; a pointer
+into another task's row (which fails ownership too, and reports the
+generic reason instead); a hand-edited row; or a future checkpoint
+writer that bypasses ``stage_trace_event_row``.
+
+This still reports an alarm rather than a quiet retry, because none of
+those paths make the row itself wrong: the row is self-consistent, it
+simply names a run other than the task's current one, and this
+resolver has no re-probe to defer that verdict to. The read
+direction's own boundary re-probe (described above) only re-checks a
+verdict reached while holding a *widened* partition; this resolver
+never resolves or holds one, so there is no stale widening decision
+here to wait out. Registering the alarm rather than retrying also
+surfaces how often this path is actually taken:
+``INTERACTION_ANCHOR_CORRUPT`` is an ops degradation signal, not a
+rate metric, precisely so a nonzero rate here is visible on
+``/health`` instead of disappearing into a retry loop.
 
 Reporting a specific alarm here instead of a retryable outcome rests on
 one precondition this function does not itself enforce: callers must
 hold a lock on the task row they pass in, so the run identity read at
 step 4 cannot change out from under the comparison. A caller that does
 not hold that lock could be comparing against a run identity that has
-already moved on, which would make the "genuinely inconsistent" reading
-above unsound for it. This is written as a precondition rather than an
-observed fact because this resolver has no production caller yet to
-check it against.
+already moved on, which would make the "self-consistent, wrong run"
+reading above stale rather than sound. This is written as a
+precondition rather than an observed fact because this resolver has no
+production caller yet to check it against.
 
 ``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED`` (``ops_signals.py``) is a
 signal owned by ``interaction_handoff``, not by this function: it is

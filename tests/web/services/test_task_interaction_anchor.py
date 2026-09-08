@@ -880,10 +880,14 @@ def _anchor_production_uses(source: str) -> bool:
 
 
 def test_ta11_resolve_interaction_anchor_has_zero_production_callers() -> None:
-    """This is a fresh assertion, not an extension of
-    ``test_interaction_staging_production_gate.py``'s gate: that gate scans
-    only for ``stage_interaction_request`` and ``interaction_handoff`` by
-    name (``GATED_NAMES``), and this function is not one of them.
+    """This is a fresh assertion, not an extension of an existing
+    ``GATED_NAMES``-style production-caller gate: both
+    ``test_task_interaction_service_create_gate.py`` and
+    ``test_clarification_publication_gate.py`` scan for their own
+    module's names only (``create``/``respond`` on
+    ``task_interaction_service``, and the clarification-draft
+    primitives, respectively), and ``resolve_interaction_anchor`` is not
+    one of them.
 
     The zero here is scoped to this module's introduction, not a permanent
     invariant to preserve by construction: the change that wires the first
