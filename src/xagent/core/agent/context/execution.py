@@ -25,6 +25,7 @@ from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
 )
+from ..grounding import VALUE_KINDS
 from ..language import (
     effective_output_language,
     render_dag_step_language_reference,
@@ -1295,7 +1296,7 @@ class ExecutionContext:
             "explicitly asks to restart, revise, or regenerate them, or the detail "
             "you need was lost in compaction. This summary is a lossy paraphrase of "
             "the raw history, not the history itself: when the answer needs an exact "
-            "value, figure, statistic, table row, quotation, or identifier that this "
+            f"statistic, quotation, or other value -- {VALUE_KINDS} -- that this "
             "summary does not literally contain, re-read or re-query the source "
             "instead of reconstructing the value from this summary or from memory. "
             "Only re-run tools that read; if the value came from a tool that writes, "
@@ -1453,7 +1454,7 @@ class ExecutionContext:
         """Describe the tool observations this compaction removes from context.
 
         Without this, the summary silently replaces every retrieved value and
-        the agent cannot tell a remembered figure from an invented one.
+        the agent cannot tell a remembered value from an invented one.
         """
         if not counts:
             return ""
@@ -1462,9 +1463,9 @@ class ExecutionContext:
         prefix = (
             f"Raw observations from {total} tool {call_label} dropped by this "
             "compaction. Their exact values are no longer in context; only the "
-            "summary above describes them. Treat any figure not literally present in "
-            "that summary as unavailable rather than recalled. Tools whose results "
-            "were dropped:\n"
+            "summary above describes them. Treat any value not literally present in "
+            f"that summary -- {VALUE_KINDS} -- as unavailable rather than recalled. "
+            "Tools whose results were dropped:\n"
         )
         # Tool names can come from dynamic MCP server config, so bound both the
         # per-name length and the total notice size the way the sibling

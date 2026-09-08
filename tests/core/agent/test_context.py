@@ -22,6 +22,7 @@ from xagent.core.agent.context.enrichment import (
     enrich_context_with_memory,
 )
 from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
+from xagent.core.agent.grounding import VALUE_KINDS
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     detect_prose_script_mismatch,
@@ -1092,6 +1093,13 @@ def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> Non
     assert "current execution state" in ctx.messages[0].content
     assert "do not repeat completed tool calls" in ctx.messages[0].content
     assert "lost in compaction" in ctx.messages[0].content
+    # The trailer's own value-kind scope has to be the rule's, not a
+    # narrower list of its own: this is the text the next call reads when
+    # deciding whether to re-fetch a value or recall it.
+    assert (
+        f"exact statistic, quotation, or other value -- {VALUE_KINDS} --"
+        in ctx.messages[0].content
+    )
     assert "re-read or re-query the source" in ctx.messages[0].content
     assert "Only re-run tools that read" in ctx.messages[0].content
     assert "- read_file" in ctx.messages[0].content
@@ -1252,13 +1260,16 @@ def test_compact_prompt_ranks_what_to_keep_when_the_budget_is_short() -> None:
     assert positions == sorted(positions)
 
 
-def test_compact_prompt_stays_within_the_smallest_budget() -> None:
-    """The prompt itself must not be longer than the smallest summary it asks for.
+def test_compact_prompt_does_not_grow_past_its_measured_ceiling() -> None:
+    """The prompt must not grow a sentence at a time without an explicit trade.
 
-    ``COMPACT_SUMMARY_MIN_TOKENS`` is 256 tokens, roughly 190 English words;
-    310 words already left zero margin for the next required addition, so
-    the cap is 330 -- room for one more sentence before the next change must
-    make an explicit trade-off instead of silently growing the prompt.
+    330 is a growth ceiling, not a derived limit: the prompt measured 327
+    words when the cap was set, and the cap sits three words above that,
+    deliberately less than one sentence, so the next sentence added here
+    hits the cap and has to drop something to fit. Nothing enforces a
+    prompt length at runtime. ``COMPACT_SUMMARY_MIN_TOKENS`` does not: it
+    bounds the summary the model writes (``_llm_compact_max_tokens`` passes
+    it as ``max_tokens``), never the length of the prompt asking for it.
     """
     system, _ = _build_llm_compact_prompt_texts()
 
@@ -1297,6 +1308,10 @@ def test_compact_with_llm_reports_dropped_tool_results_by_name() -> None:
     assert "4 tool calls were dropped" in notice
     assert "- web_search x3" in notice
     assert "- read_file" in notice
+    assert (
+        f"Treat any value not literally present in that summary -- {VALUE_KINDS} --"
+        in notice
+    )
     assert "unavailable rather than recalled" in notice
     assert result.metadata["dropped_tool_result_count"] == 4
     assert result.metadata["dropped_tool_results_by_name"] == {
