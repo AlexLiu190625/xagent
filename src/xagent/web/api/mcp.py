@@ -2137,19 +2137,23 @@ def _resolve_mcp_server_for_request(
     below draw on the same object.
 
     ``on_resolution_failure`` decides what a hook failure means for this
-    call, and only the caller can know which: ``"raise"`` (the default)
-    lets ``ConnectorRuntimeError`` propagate to the caller's own
-    HTTPException translation, appropriate whenever this verdict is a
-    gate (``PUT`` -- the verdict decides whether the request is even
-    authorized). ``"degrade"`` reports ``can_edit_global=False`` instead
-    and lets the request succeed, appropriate only when this verdict is
-    pure decoration on a field the caller can already read regardless
-    (``GET`` -- the caller already has a personal row or their team
-    already cleared the gate above). Degrading without a personal row
-    would answer "does not exist" for a connector this call merely failed
-    to ask about, which is why the degrade branch below still raises when
-    ``user_mcp is None``: the verdict *is* the gate in that case, not a
-    decoration on top of one.
+    call. It is the CALLER's population, not the caller's HTTP method, that
+    settles it. ``"degrade"`` reports ``can_edit_global=False`` and lets the
+    request proceed; both routes pass it, because on both of them a caller
+    who reached this point holding a personal row was admitted by that row
+    and not by the verdict -- an owner and a platform administrator each
+    decide the edit branch before a verdict is read at all, and a non-owner
+    member writing only their own association fields writes nothing the
+    verdict governs. Refusing them because an optional integration is down
+    would make an outage of that integration the answer to a request whose
+    authority never came from it.
+
+    That choice never reaches the population the verdict IS the gate for.
+    The degrade branch below still raises when ``user_mcp is None``,
+    unconditionally: with no personal row, degrading the verdict to ``None``
+    would answer "does not exist" for a connector this call merely failed to
+    ask about. ``"raise"`` stays the default so a future call site that has
+    not made this decision fails closed rather than degrading by accident.
     """
     from ..services.connector_team_scope import resolve_one_connector_access_or_raise
 
@@ -2185,7 +2189,7 @@ def _resolve_mcp_server_for_request(
                 raise
             logger.warning(
                 "Connector access resolution failed (%s) for MCP server %s "
-                "while reading it for user %s; reporting "
+                "while resolving it for user %s; reporting "
                 "can_edit_global=False",
                 exc,
                 server_id,
@@ -4303,8 +4307,18 @@ def update_mcp_server(
 
         # Check user has access to this server: a personal row, or a team
         # access verdict for a connector the caller has none for.
+        #
+        # A caller who already holds a personal row got past the gate on that
+        # row, not on the verdict: an owner and a platform administrator each
+        # decide the edit branch without one being read at all, and a plain
+        # non-owner member writing only their own fields writes nothing the
+        # verdict governs. For all of them a resolution failure degrades to
+        # can_edit_global=False and the write proceeds. A caller with NO
+        # personal row is the population the verdict is the gate for, and the
+        # helper keeps failing closed for it regardless of what is passed
+        # here.
         user_mcp, server, team_access = _resolve_mcp_server_for_request(
-            db, int(user_id), server_id
+            db, int(user_id), server_id, on_resolution_failure="degrade"
         )
         is_stand_in = isinstance(user_mcp, _TeamOwnedUserMCP)
         can_edit_global = _check_mcp_permission(

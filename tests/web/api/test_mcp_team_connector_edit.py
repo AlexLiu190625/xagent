@@ -584,6 +584,95 @@ class TestTypedErrorArm:
         assert exc.value.detail == "planted failure"
 
 
+class TestAnAlreadyAssociatedCallersEditSurvivesAHookOutage:
+    """A caller who already holds a personal association row was admitted
+    onto this route by that row, not by the team verdict -- an owner and a
+    platform administrator each decide the edit branch before a verdict is
+    ever read, and a non-owner member writing only their own association
+    fields writes nothing the verdict governs. For all of them a hook
+    failure degrades the reported edit right rather than answering the
+    whole request with the hook's own outage; see
+    ``TestTypedErrorArm`` above for the population the verdict genuinely
+    gates, which still fails closed.
+    """
+
+    def test_an_admin_with_a_non_owner_row_still_writes_when_the_hook_fails(self, db):
+        owner = _make_user(db, 1)
+        admin = _make_user(db, 2, is_admin=True)
+        server = _make_owned_server(db, owner.id, name="admin-writes-through-outage")
+        server_id = server.id
+        db.add(
+            UserMCPServer(
+                user_id=admin.id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+
+        def boom(*_a, **_k):
+            raise ConnectorRuntimeError("planted", "planted failure", status_code=503)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=boom)
+            response = update_mcp_server(
+                server_id,
+                MCPServerUpdate(description="admin edits the shared row"),
+                current_user=admin,
+                db=db,
+            )
+
+        assert response.description == "admin edits the shared row"
+
+        db.rollback()
+        refreshed = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert refreshed.description == "admin edits the shared row"
+
+    def test_a_member_setting_only_their_own_user_env_still_writes_when_the_hook_fails(
+        self, db
+    ):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        member_id = member.id
+        server = _make_owned_server(db, owner.id, name="member-writes-through-outage")
+        server_id = server.id
+        db.add(
+            UserMCPServer(
+                user_id=member.id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+
+        def boom(*_a, **_k):
+            raise ConnectorRuntimeError("planted", "planted failure", status_code=503)
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(access=boom)
+            response = update_mcp_server(
+                server_id,
+                MCPServerUpdate(user_env={"API_KEY": "widened-by-a-member"}),
+                current_user=member,
+                db=db,
+            )
+
+        assert response.can_edit_global is False
+
+        db.commit()
+        stored = (
+            db.query(UserMCPServer)
+            .filter(
+                UserMCPServer.user_id == member_id,
+                UserMCPServer.mcpserver_id == server_id,
+            )
+            .one()
+        )
+        assert stored.env is not None
+
+
 class TestOwnerIsImmuneToAHookFailure:
     """An owner's row already decides the edit answer on its own -- the
     edit branch returns True on ``is_owner`` without ever consulting a

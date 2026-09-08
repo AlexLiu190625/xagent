@@ -1,8 +1,9 @@
 """The single-server ``GET``/``PUT`` gate surfaces a raising hook's declared
 status rather than a 500, and restores the session afterward. A ``GET``
 whose verdict resolution fails degrades ``can_edit_global`` to False rather
-than failing the read; a ``PUT`` that depends on the same verdict as its
-own gate fails closed with a typed 503 instead.
+than failing the read; a ``PUT`` fails closed with a typed 503 only for the
+caller the verdict is the gate for -- one with no personal association row;
+a caller who already holds one degrades the same way ``GET`` does.
 
 The four MCP OAuth routes, the rename call's scope, and every route's
 no-hook-installed shape are all unchanged by threading that verdict through.
@@ -337,14 +338,16 @@ class TestSessionRecoveryAfterHookFailure:
 
 class TestSingleServerAccessResolutionFailure:
     """A single MCP server's verdict plays two different roles depending on
-    the route: ``GET`` uses it as decoration on a row the caller can
-    already read (a personal row, or a team gate that already passed), so
-    a resolution failure there degrades ``can_edit_global`` to False and
-    the read still succeeds. ``PUT`` uses the same verdict as the gate
-    itself for a non-owner caller, so a resolution failure there must
-    still fail closed with a typed 503 -- never a silent 200 or a 404 that
-    would misreport "does not exist" for a connector the caller merely
-    could not be asked about."""
+    the caller's population, on both ``GET`` and ``PUT``: for a caller who
+    already holds a personal row -- an owner, a platform administrator, or a
+    non-owner member writing only their own association fields -- the
+    verdict is decoration on something the route can already answer without
+    it, so a resolution failure there degrades ``can_edit_global`` to False
+    and the request still succeeds. For a caller with no personal row the
+    verdict *is* the gate, so a resolution failure there must still fail
+    closed with a typed 503 -- never a silent 200 or a 404 that would
+    misreport "does not exist" for a connector the caller merely could not
+    be asked about."""
 
     def test_reading_one_server_survives_a_failing_hook_when_a_personal_row_exists(
         self, db
@@ -398,11 +401,12 @@ class TestSingleServerAccessResolutionFailure:
         # not 200 (which would be the door itself failing open).
         assert exc.value.status_code == 503
 
-    def test_updating_one_server_still_fails_closed_on_a_personal_only_payload(
+    def test_updating_one_server_degrades_for_a_caller_who_holds_a_personal_row(
         self, db
     ):
         owner = _make_user(db, 106)
         member = _make_user(db, 107)
+        member_id = member.id
         server = _make_owned_server(db, owner.id, name="write-gate-target")
         db.add(
             UserMCPServer(
@@ -420,15 +424,27 @@ class TestSingleServerAccessResolutionFailure:
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(access=raising_access)
-            with pytest.raises(HTTPException) as exc:
-                update_mcp_server(
-                    server_id,
-                    MCPServerUpdate(is_active=False),
-                    current_user=member,
-                    db=db,
-                )
+            response = update_mcp_server(
+                server_id,
+                MCPServerUpdate(is_active=False),
+                current_user=member,
+                db=db,
+            )
 
-        # PUT never degrades, even for a payload that only touches the
-        # caller's own personal fields: the verdict is the gate that
-        # decides whether this caller may write at all.
-        assert exc.value.status_code == 503
+        # This caller was admitted by their own association row, not by the
+        # verdict: they are a non-owner writing only a field that lives on
+        # that row, so no verdict governs the write. An outage of the
+        # optional team lookup therefore degrades the reported edit right
+        # and lets the write land, rather than becoming the answer.
+        assert response.can_edit_global is False
+
+        db.commit()
+        stored = (
+            db.query(UserMCPServer)
+            .filter(
+                UserMCPServer.user_id == member_id,
+                UserMCPServer.mcpserver_id == server_id,
+            )
+            .one()
+        )
+        assert stored.is_active is False
