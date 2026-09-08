@@ -58,10 +58,16 @@ class CheckpointReadError(RuntimeError):
 class CheckpointUnavailableError(CheckpointReadError):
     """Raised when a checkpoint read could not be completed.
 
-    Covers infrastructure failures only: session checkout, query
+    Two kinds of cause, both retryable, which is why they share this
+    class. The first is infrastructure failure: session checkout, query
     execution, and generic per-row decode errors such as a failed blob
-    prefetch. Rows that decode as permanently unreadable are classified
-    by the corrupt error once the matching set is exhausted.
+    prefetch. The second is not a failure at all -- a read whose partition
+    decision was invalidated between resolving that partition and
+    producing a result declines to hand back an answer it can no longer
+    vouch for, and reports it here (see the root-checkpoint read path's
+    re-probe at its own boundary). Rows that decode as permanently
+    unreadable are classified by the corrupt error instead, once the
+    matching set is exhausted.
     """
 
 
