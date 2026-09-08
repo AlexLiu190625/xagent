@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -619,19 +618,24 @@ def connector_auth_type(server: Any) -> str | None:
     ``"none"`` when the connector declares no authentication (``auth`` absent,
     JSON null, an empty object, ``{"type": null}``, or an explicit
     ``{"type": "none"}``); the declared ``type`` string otherwise; ``None``
-    when the shape is not recognisable (non-mapping ``auth``, or a ``type``
+    when the shape is not recognisable (non-``dict`` ``auth``, or a ``type``
     that is a non-string or the empty string). Callers must treat ``None`` as
     unknown, not as "no credential".
 
+    ``"none"`` means only that the connector declares no ``auth`` JSON; it does
+    not mean the connector carries no credential, because static ``headers``
+    (e.g. ``Authorization``) are sent regardless and are not inspected here.
+
     Reads the raw (encrypted-at-rest) ``auth`` JSON rather than the decrypted
     form used by ``_is_mcp_oauth_http_server`` above: ``type`` is not one of
-    the sensitive fields encryption touches (see ``SENSITIVE_AUTH_FIELDS``),
-    so no decryption is needed to classify it.
+    the sensitive fields encryption touches (see ``SENSITIVE_AUTH_FIELDS`` in
+    ``xagent.core.tools.core.mcp.model``), so no decryption is needed to
+    classify it.
     """
     auth = getattr(server, "auth", None)
     if auth is None:
         return "none"
-    if not isinstance(auth, Mapping):
+    if not isinstance(auth, dict):
         return None
     raw = auth.get("type")
     if raw is None:

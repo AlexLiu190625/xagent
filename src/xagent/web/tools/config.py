@@ -134,7 +134,10 @@ class TokenRequest:
     ``"oauth2"``, ``"mcp_oauth"``); it is the literal string ``"builtin_oauth"``
     for catalog apps whose OAuth is implied by ``transport == "oauth"``; and it
     is ``None`` when the type cannot be determined, which a resolver should
-    treat as "unknown", never as "no credential needed".
+    treat as "unknown", never as "no credential needed". ``"none"`` means only
+    that the connector declares no ``auth`` JSON; it does not mean the
+    connector carries no credential, because static ``headers`` (e.g.
+    ``Authorization``) are sent regardless and are not inspected there.
     """
 
     provider: str
@@ -3287,7 +3290,7 @@ class WebToolConfig(BaseToolConfig):
         providers: list[str],
         resource: str | None,
         resolver: TokenResolver | None = None,
-        auth_type: str | None = None,
+        auth_type: str | None,
     ) -> _ResolvedHookToken | None:
         if resolver is None:
             resolver, _ = _get_oauth_token_resolver_hook()

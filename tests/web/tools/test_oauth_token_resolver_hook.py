@@ -31,10 +31,11 @@ from xagent.web.tools.config import (
 )
 
 
-def test_token_request_refresh_defaults_to_none():
+def test_token_request_refresh_and_auth_type_default_to_none():
     request = TokenRequest(provider="google", user_id=1)
 
     assert request.refresh is None
+    assert request.auth_type is None
 
 
 def test_resolver_contract_repr_hides_token_and_generation():
@@ -1894,6 +1895,7 @@ async def test_hook_preserves_valid_generation_during_normalization(
     resolved = await _tool_config(db, user)._resolve_oauth_token_from_hook(
         providers=["google"],
         resource=None,
+        auth_type=None,
     )
 
     assert resolved is not None
@@ -1969,6 +1971,7 @@ async def test_hook_is_skipped_when_user_id_is_none(db_session):
     resolved = await cfg._resolve_oauth_token_from_hook(
         providers=["google"],
         resource=None,
+        auth_type=None,
     )
 
     assert resolved is None
@@ -2691,12 +2694,23 @@ async def test_remote_hook_failure_code_property_error_is_sanitized(db_session):
     assert "resolver-internal-secret" not in public_output
 
 
+@pytest.mark.parametrize(
+    ("auth", "expected_auth_type"),
+    [
+        (None, "none"),
+        ({"type": "mcp_oauth", "resource": "https://mcp.example/api"}, "mcp_oauth"),
+    ],
+    ids=["auth-none", "auth-mcp-oauth"],
+)
 @pytest.mark.asyncio
-async def test_remote_hook_consecutive_refreshes_advance_failed_generation(db_session):
+async def test_remote_hook_consecutive_refreshes_advance_failed_generation(
+    db_session, auth, expected_auth_type
+):
     db, user = db_session
     server = _add_remote_server(
         db,
         user,
+        auth=auth,
         headers={"X-Static": "static", "Authorization": "Bearer static-token"},
     )
     requests: list[TokenRequest] = []
@@ -2717,7 +2731,7 @@ async def test_remote_hook_consecutive_refreshes_advance_failed_generation(db_se
 
     assert requests[1].provider == requests[0].provider == "records"
     assert requests[1].resource == requests[0].resource == server.url
-    assert requests[1].auth_type == requests[0].auth_type == "none"
+    assert requests[1].auth_type == requests[0].auth_type == expected_auth_type
     assert requests[1].refresh == web_tools_config.OAuthRefreshContext(
         reason="invalid_token",
         resource_metadata_url=(

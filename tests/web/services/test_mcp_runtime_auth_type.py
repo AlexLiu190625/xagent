@@ -53,7 +53,7 @@ def test_connector_auth_type_classifies_declared_shapes(auth, expected):
 
 
 def test_connector_auth_type_non_mapping_mock_auth_is_unrecognisable():
-    # A Mock is not a Mapping, so this must fall into "unknown", not "none".
+    # A Mock is not a dict, so this must fall into "unknown", not "none".
     server = SimpleNamespace(auth=MagicMock())
     assert connector_auth_type(server) is None
 
@@ -95,6 +95,8 @@ def test_connector_auth_type_agrees_with_http_oauth_classifier(auth):
 
     # Build the second argument the way the production caller does, in
     # build_mcp_runtime_connection: decrypt the raw auth before classifying.
+    # This expression mirrors the call site in mcp_runtime.py's
+    # build_mcp_runtime_connection and must be kept in sync with it.
     auth_config = MCPServer._decrypt_auth_config(getattr(server, "auth", None))
 
     is_mcp_oauth = _is_mcp_oauth_http_server(server, auth_config)
