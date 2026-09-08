@@ -510,6 +510,87 @@ class TestARowThatVanishesUnderTheLockIsTheGatesOwn404:
         assert refreshed.name == "shared-server"
 
 
+class TestADeniedStandInIsRefusedAfterTheLock:
+    """The lock-side counterpart of
+    ``TestADenyingStandInIsRefusedRatherThanReportedSuccessful``: a caller
+    admitted on a real non-owner association row, holding a verdict that
+    links the connector but denies edit, whose row is then deleted while
+    this request waits for the definition-row lock. That caller reaches the
+    lock as a stand-in whose re-derived answer is still "no" -- refused
+    before the name is read, before the tamper check, and before anything
+    is rebuilt or committed, the same way the gate would have refused a
+    stand-in with a denying verdict from the start.
+    """
+
+    @pytest.mark.parametrize(
+        "make_payload",
+        [
+            lambda server: MCPServerUpdate(config={"env": {"K": "v"}}),
+            lambda server: MCPServerUpdate(description=server.description),
+        ],
+        ids=["secrets-only-payload", "resubmit-current-value-payload"],
+    )
+    def test_a_denied_stand_in_after_the_lock_is_refused_before_anything_is_written(
+        self, db, make_payload
+    ):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        member_id = member.id
+        server = _make_owned_server(db, owner.id, name="denied-stand-in-after-the-lock")
+        server.description = "the connector's current description"
+        server_id = server.id
+        db.add(
+            UserMCPServer(
+                user_id=member_id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        payload = make_payload(server)
+
+        real_query = db.query
+        fired = False
+
+        def query_and_delete_on_first_recheck(*entities, **kwargs):
+            nonlocal fired
+            if entities == (UserMCPServer,) and not fired:
+                fired = True
+                db.execute(
+                    sa.delete(UserMCPServer).where(
+                        UserMCPServer.user_id == member_id,
+                        UserMCPServer.mcpserver_id == server_id,
+                    )
+                )
+                db.commit()
+            return real_query(*entities, **kwargs)
+
+        db.query = query_and_delete_on_first_recheck
+        try:
+            with snapshot_connector_team_hooks():
+                set_connector_team_hooks(
+                    access=lambda db, user_id, refs: {
+                        ref: ConnectorAccess(team_owned=True, can_edit=False)
+                        for ref in refs
+                    }
+                )
+                with pytest.raises(HTTPException) as exc:
+                    update_mcp_server(server_id, payload, current_user=member, db=db)
+        finally:
+            db.query = real_query
+
+        assert fired
+        assert exc.value.status_code == 404
+        assert exc.value.detail == "MCP server not found"
+
+        db.rollback()
+        refreshed = real_query(MCPServer).filter(MCPServer.id == server_id).one()
+        # A legacy NULL, still unnormalized: the rebuild that would turn it
+        # into ``[]`` never ran.
+        assert refreshed.concurrent_tools is None
+
+
 class TestTypedErrorArm:
     """A raising hook still surfaces its declared status for a caller whose
     own personal row does not already decide the answer -- the verdict is

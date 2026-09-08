@@ -4638,6 +4638,40 @@ def update_mcp_server(
                 team_access=team_access,
             )
 
+            # The lock-side counterpart of the stand-in refusal above the
+            # lock. That one runs before the wait and cannot see a personal
+            # row deleted during it: a caller admitted on a real non-owner
+            # row, holding a verdict that links the connector but denies the
+            # edit, reaches this point as a stand-in whose re-derived answer
+            # is still "no". Without this, a payload the tamper check cannot
+            # compare -- an unchanged one, or one carrying only secrets --
+            # would go on to rebuild and commit the definition row, which
+            # normalizes any shared column still holding a legacy NULL, and
+            # answer 200.
+            #
+            # 404 rather than the 403 the gate answers: this caller holds no
+            # row on this connector any more, and "not found" discloses less
+            # about a connector they no longer have any link to. It is also
+            # the answer ``custom_api.py``'s own post-lock cascade gives the
+            # same state, and the answer the follow-up's re-resolution gives
+            # it once that lands, so the three agree rather than drifting.
+            #
+            # Ordered after the personal-field guard above, mirroring the
+            # gate's own order: for a payload carrying only ``user_env`` or
+            # ``is_active``, "there is no personal connection to configure
+            # this on" is the more precise answer.
+            #
+            # Placed before the name read below and before the tamper check,
+            # the rebuild, the rename hook and the commit, so the refusal has
+            # nothing to undo; the rollback ends the transaction and releases
+            # the definition row's lock.
+            if is_stand_in and not can_edit_global:
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="MCP server not found",
+                )
+
         # Read from the fresh definition-row read above, not the pre-lock
         # read further up: rename_team_connector's "old" argument must be
         # the name that read actually returned. On the path that writes
