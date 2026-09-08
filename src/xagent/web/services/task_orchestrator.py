@@ -111,10 +111,12 @@ from .task_lease_service import (
     acquire_task_lease_no_commit,
     fail_and_release_task_lease_no_commit,
     get_runner_id,
+    lock_task_lease_no_commit,
     release_task_lease,
     run_task_lease_heartbeat,
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
+    task_lease_attempt_predicate,
     validate_preacquired_task_lease_isolated,
 )
 from .task_runtime import mcp_runtime_authorization_policy_required
@@ -1180,6 +1182,7 @@ def _claim_turn_no_commit(
                 Task.id == task_id,
                 Task.status == TaskStatus.RUNNING,
                 Task.runner_id == task_lease.runner_id,
+                task_lease_attempt_predicate(task_lease),
                 Task.run_id == task_lease.run_id,
             )
             .one()
@@ -1291,6 +1294,7 @@ def _reconcile_claimed_turn_after_commit_ack_failure(
                     Task.status == TaskStatus.RUNNING,
                     Task.run_id == claimed.run_id,
                     Task.runner_id == claimed.task_lease.runner_id,
+                    task_lease_attempt_predicate(claimed.task_lease),
                 )
                 .first()
             )
@@ -1561,8 +1565,10 @@ def finish_turn(
                 task_id,
             )
             return False
+        lock_task_lease_no_commit(bg_db, task_lease)
         query = query.filter(
             Task.runner_id == task_lease.runner_id,
+            task_lease_attempt_predicate(task_lease),
             Task.run_id == task_lease.run_id,
         )
         # PostgreSQL locks the exact owned row until release_task_lease commits;
