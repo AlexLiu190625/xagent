@@ -65,6 +65,7 @@ from datetime import timezone
 from enum import Enum
 from typing import Any, cast
 
+from ....context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
 from ....file_ref import (
     WORKSPACE_OUTPUT_FILES_TOOL_NAME,
     final_deliverable_file_reference_instructions,
@@ -110,6 +111,11 @@ from ...runtime import (
 )
 from ..base import AgentPattern, PatternResult, truncate_prompt_preview
 from ..final_answer_stream import ReActFinalAnswerStreamer
+from .duplicate_write_guard import (
+    DUPLICATE_WRITE_SUPPRESSED_KEY,
+    build_suppression_envelope,
+    tool_requires_duplicate_write_guard,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +159,10 @@ class ToolCallRecord:
     status: str
     result: Any = None
     error: str | None = None
+    # The durable turn the call ran in (see _with_runtime_turn_id). None when
+    # the embedding provides no turn tracking, and for records restored from
+    # checkpoints written before the field existed.
+    turn_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -163,6 +173,7 @@ class ToolCallRecord:
             "status": self.status,
             "result": self.result,
             "error": self.error,
+            "turn_id": self.turn_id,
         }
 
     @classmethod
@@ -175,6 +186,7 @@ class ToolCallRecord:
             status=str(data.get("status", "pending")),
             result=data.get("result"),
             error=data.get("error"),
+            turn_id=str(data["turn_id"]) if data.get("turn_id") else None,
         )
 
 
@@ -3677,6 +3689,86 @@ class ReActPattern(AgentPattern):
             },
         ).to_dict()
 
+    def _suppressed_duplicate_write_result(
+        self,
+        tool_call: dict[str, Any],
+        tools: list[Any],
+    ) -> dict[str, Any] | None:
+        """Return the suppression envelope when this call repeats a completed write.
+
+        The comparison key is (turn_id, tool_name, args_hash), each side
+        computed from the same post-transform ``tool_call`` that
+        ``_record_tool_call`` hashes and ``_execute_tool`` executes — so two
+        calls compare equal exactly when their executions would be identical.
+        The turn_id equality is what makes the guard strictly per-turn: the
+        runner stamps a fresh turn_id on every user message (initial and
+        injected), and ``active_turn_id`` is re-resolved from the latest user
+        message at each pattern start — so an explicit repeat requested in a
+        later turn always executes, while an intra-turn resume of the
+        checkpointed ledger keeps suppressing the replay. A call with no
+        stamped turn_id is never guarded: without a turn to scope to,
+        suppression could outlive a turn, so an unknowable turn fails open.
+
+        Serial execution makes the check-then-record window safe for guarded
+        tools: they are non-idempotent by declaration, so
+        ``_tool_is_concurrency_safe`` keeps them out of concurrent batches
+        unless configuration marks a non-idempotent tool concurrency-safe
+        (for MCP tools that flag is connection-level operator config), which
+        contradicts the flag's documented idempotency meaning.
+        """
+        try:
+            tool = self._find_tool(tool_call["name"], tools)
+        except Exception:  # noqa: BLE001 - unknown tool fails in _execute_tool
+            return None
+        if not tool_requires_duplicate_write_guard(tool):
+            return None
+
+        turn_id = self._tool_call_turn_id(tool_call)
+        if turn_id is None:
+            return None
+
+        tool_name = str(tool_call["name"])
+        args_hash = self._args_hash(self._tool_call_args_dict(tool_call))
+        # The caller runs this scan before recording anything for the current
+        # call, so every ledger entry — including one under this call's own
+        # id, which a provider may have reused — belongs to an earlier call.
+        for record in self.tool_ledger.values():
+            if record.status != "completed":
+                continue
+            if record.turn_id != turn_id:
+                continue
+            if record.tool_name != tool_name or record.args_hash != args_hash:
+                continue
+            if isinstance(record.result, dict) and record.result.get(
+                DUPLICATE_WRITE_SUPPRESSED_KEY
+            ):
+                # A prior suppression envelope: keep scanning so the model
+                # always gets the genuine execution's result attached. An
+                # envelope CAN precede its genuine record here — load_state
+                # rebuilds the ledger in the checkpoint's stored order, and
+                # _reorder_ledger_for_batch re-appends a batch's records at
+                # the tail, moving a genuine record behind an envelope when a
+                # provider reused its id inside a concurrent batch.
+                continue
+            # The ledger stores the raw execution return, which may still
+            # carry reserved transport keys. add_tool_result only splits
+            # those at the top level, so drop them here — unconditionally,
+            # not via the split helpers, whose scope validation could raise —
+            # or they reach the model as noise nested inside the envelope.
+            prior_result = record.result
+            if isinstance(prior_result, dict):
+                prior_result = {
+                    key: value
+                    for key, value in prior_result.items()
+                    if key not in (CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY)
+                }
+            return build_suppression_envelope(
+                tool_name=tool_name,
+                prior_tool_call_id=record.tool_call_id,
+                prior_result=prior_result,
+            )
+        return None
+
     async def _execute_tool_safely(
         self,
         tool_call: dict[str, Any],
@@ -3707,6 +3799,25 @@ class ReActPattern(AgentPattern):
         is_control = tool_call["name"] in CONTROL_TOOL_NAMES
         if not is_control:
             tool_call = self._with_trace_safe_tool_args(tool_call, tools)
+            # The duplicate-write scan runs before this call writes any ledger
+            # record: provider-supplied tool_call ids are not guaranteed
+            # unique (see _run_concurrent_batch), so recording "running" first
+            # would clobber the completed record that is the duplicate's own
+            # evidence when the model reuses the prior call's id. The scan and
+            # the envelope record are synchronous, preserving the
+            # distinct-fallback-id invariant for concurrent batch members.
+            suppressed = self._suppressed_duplicate_write_result(tool_call, tools)
+            if suppressed is not None:
+                # Never overwrite the matched genuine record with the
+                # envelope: on provider id reuse the genuine result must stay
+                # in the ledger so later duplicates still find it.
+                if str(tool_call["id"]) not in self.tool_ledger:
+                    self._record_tool_call(
+                        tool_call, status="completed", result=suppressed
+                    )
+                await runtime.on_tool_start(tool_call=tool_call)
+                await runtime.on_tool_end(tool_call=tool_call, result=suppressed)
+                return suppressed
         self._record_tool_call(tool_call, status="running")
         recorded_terminal = False
         try:
@@ -3919,7 +4030,13 @@ class ReActPattern(AgentPattern):
             status=status,
             result=result,
             error=error,
+            turn_id=self._tool_call_turn_id(tool_call),
         )
+
+    @staticmethod
+    def _tool_call_turn_id(tool_call: dict[str, Any]) -> str | None:
+        raw_turn_id = tool_call.get("turn_id")
+        return str(raw_turn_id) if raw_turn_id else None
 
     def _args_hash(self, args: dict[str, Any]) -> str:
         try:

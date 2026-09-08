@@ -185,6 +185,20 @@ class _AutoChildRuntime:
     def active_turn_id(self) -> str | None:
         return self.parent.active_turn_id
 
+    def _dag_turn_id(self, context: Any) -> str | None:
+        """Forward the parent's turn resolution for nested DAG steps.
+
+        ``_DAGStepRuntime.active_turn_id`` resolves per access by calling
+        ``parent._dag_turn_id(root_context)``, and under ``auto`` the DAG's
+        parent is this adapter rather than ``PatternRuntime``. Without this
+        forward that call raises ``AttributeError``, which the caller's
+        ``getattr(runtime, "active_turn_id", None)`` silently turns into an
+        unstamped tool call -- costing every auto->DAG step both its trace
+        turn attribution and the same-turn duplicate-write guard, which
+        only fires for calls carrying a turn_id.
+        """
+        return self.parent._dag_turn_id(context)
+
     async def should_interrupt(self) -> bool:
         return await self.parent.should_interrupt()
 

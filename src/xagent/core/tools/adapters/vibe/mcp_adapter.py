@@ -111,6 +111,7 @@ class MCPWriteHint(Enum):
 # spells them (camelCase is the protocol's, not this codebase's).
 _READ_ONLY_HINT = "readOnlyHint"
 _DESTRUCTIVE_HINT = "destructiveHint"
+_IDEMPOTENT_HINT = "idempotentHint"
 
 
 def classify_write_hint(raw_annotations: object) -> MCPWriteHint:
@@ -152,6 +153,52 @@ def classify_write_hint(raw_annotations: object) -> MCPWriteHint:
     if raw_annotations.get(_READ_ONLY_HINT) is True:
         return MCPWriteHint.READ_ONLY
     return MCPWriteHint.UNDECLARED
+
+
+def classify_non_idempotent_write(raw_annotations: object) -> bool:
+    """Whether a tool's *raw* wire annotations declare a non-idempotent write.
+
+    The consumer is the same-turn duplicate-write guard, whose enrollment
+    question is not "may this destroy data" but "does repeating this call
+    with identical arguments produce an additional effect". Per the MCP
+    schema that is ``idempotentHint`` (``false`` = repeats have additional
+    effect), not ``destructiveHint`` (``false`` = only additive updates) — a
+    well-annotated create tool is additive and non-idempotent, i.e.
+    ``destructiveHint: false, idempotentHint: false``.
+
+    Reads the wire mapping for the same reason ``classify_write_hint`` does:
+    only an exact boolean is a declaration. True exactly when
+    ``readOnlyHint`` is not exactly ``true`` and either
+
+    * ``idempotentHint`` is exactly ``false`` — the explicit declaration
+      that identical repeats compound, or
+    * ``destructiveHint`` is exactly ``true`` without an exact
+      ``idempotentHint: true`` — an explicit write whose idempotency the
+      server left unstated.
+
+    Everything else is False. An absent hint is never read through its
+    spec default: ``idempotentHint``'s default of false does not enroll an
+    unannotated tool, and ``destructiveHint``'s default of true does not
+    either, so enrollment always needs at least one exact boolean from the
+    server and legitimate identical-args poll loops stay unguarded. Within
+    an explicit ``destructiveHint: true``, though, a *missing*
+    ``idempotentHint`` does enroll: the server declared a write and said
+    nothing about repeats, which is the same reading the previous
+    destructive-only enrollment used. Unlike confirmation-style
+    consumers, deduplication fails OPEN: a contradictory or malformed claim
+    (e.g. read-only plus non-idempotent) reads as "do not enroll", because
+    the harmless failure mode here is executing, not suppressing.
+    """
+    if not isinstance(raw_annotations, Mapping):
+        return False
+    if raw_annotations.get(_READ_ONLY_HINT) is True:
+        return False
+    if raw_annotations.get(_IDEMPOTENT_HINT) is False:
+        return True
+    return (
+        raw_annotations.get(_DESTRUCTIVE_HINT) is True
+        and raw_annotations.get(_IDEMPOTENT_HINT) is not True
+    )
 
 
 @dataclass(frozen=True)
@@ -966,6 +1013,18 @@ class MCPToolAdapter(AbstractBaseTool):
         input never reads as the permissive answer.
         """
         return classify_write_hint(self._raw_annotations)
+
+    @property
+    def non_idempotent_write(self) -> bool:
+        """Whether the server's annotations declare a non-idempotent write.
+
+        Consumed (via ``ToolMetadata.mcp_non_idempotent_write``) by the
+        same-turn duplicate-write guard. Same wire-evidence discipline and
+        trust caveats as ``write_hint``; see
+        ``classify_non_idempotent_write`` for the enrollment predicate and
+        why it fails open.
+        """
+        return classify_non_idempotent_write(self._raw_annotations)
 
     @property
     def tags(self) -> List[str]:
