@@ -129,6 +129,15 @@ class TokenRequest:
     without canonicalization. ``scope`` is the current execution scope from
     ``WebToolConfig.get_execution_scope()`` when present; it is typed as
     Optional[Any] to avoid importing the core scope type into this config layer.
+    ``auth_type`` is the connector's declared authentication type as classified
+    by ``connector_auth_type()`` (e.g. ``"none"``, ``"bearer"``, ``"api_key"``,
+    ``"oauth2"``, ``"mcp_oauth"``); it is the literal string ``"builtin_oauth"``
+    for catalog apps whose OAuth is implied by ``transport == "oauth"``; and it
+    is ``None`` when the type cannot be determined, which a resolver should
+    treat as "unknown", never as "no credential needed". ``"none"`` means only
+    that the connector declares no ``auth`` JSON; it does not mean the
+    connector carries no credential, because static ``headers`` (e.g.
+    ``Authorization``) are sent regardless and are not inspected there.
     """
 
     provider: str
@@ -136,6 +145,7 @@ class TokenRequest:
     scope: Optional[Any] = None
     resource: str | None = None
     refresh: OAuthRefreshContext | None = None
+    auth_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3280,6 +3290,7 @@ class WebToolConfig(BaseToolConfig):
         providers: list[str],
         resource: str | None,
         resolver: TokenResolver | None = None,
+        auth_type: str | None,
     ) -> _ResolvedHookToken | None:
         if resolver is None:
             resolver, _ = _get_oauth_token_resolver_hook()
@@ -3292,6 +3303,7 @@ class WebToolConfig(BaseToolConfig):
                 user_id=int(self._user_id),
                 scope=self.get_execution_scope(),
                 resource=resource,
+                auth_type=auth_type,
             )
             try:
                 resolved = await _maybe_await_oauth_token_resolver_result(
@@ -3332,6 +3344,7 @@ class WebToolConfig(BaseToolConfig):
         resource: str | None,
         failed_generation: str | None,
         non_auth_connection: dict[str, Any],
+        auth_type: str | None,
     ) -> dict[str, Any] | ClassifiedToolFailure | None:
         from ...web.services.mcp_oauth import MCPAuthorizationChallenge
 
@@ -3356,6 +3369,7 @@ class WebToolConfig(BaseToolConfig):
                 challenge_scope=challenge.scope,
                 failed_generation=failed_generation,
             ),
+            auth_type=auth_type,
         )
         try:
             resolved = await _maybe_await_oauth_token_resolver_result(resolver(request))
@@ -3397,6 +3411,7 @@ class WebToolConfig(BaseToolConfig):
             scope=scope,
             resource=resource,
             non_auth_connection=non_auth_connection,
+            auth_type=auth_type,
         )
 
     def _build_resolver_owned_mcp_connection(
@@ -3410,6 +3425,7 @@ class WebToolConfig(BaseToolConfig):
         scope: Any,
         resource: str | None,
         non_auth_connection: dict[str, Any],
+        auth_type: str | None,
     ) -> dict[str, Any]:
         from ...web.services.mcp_runtime import connection_with_bearer_authorization
 
@@ -3427,6 +3443,7 @@ class WebToolConfig(BaseToolConfig):
                 resource=resource,
                 failed_generation=resolved.generation,
                 non_auth_connection=non_auth_connection,
+                auth_type=auth_type,
             )
 
         connection = connection_with_bearer_authorization(
@@ -4088,6 +4105,7 @@ class WebToolConfig(BaseToolConfig):
                     hook_token = await self._resolve_oauth_token_from_hook(
                         providers=providers_to_resolve,
                         resource=configured_resource,
+                        auth_type="builtin_oauth",
                     )
                 except _OAuthTokenResolverFailed as error:
                     return self._resolver_failure_config(
@@ -4219,6 +4237,7 @@ class WebToolConfig(BaseToolConfig):
             from ...web.services.mcp_runtime import (
                 build_mcp_runtime_connection,
                 connection_to_transport_config,
+                connector_auth_type,
                 effective_mcp_oauth_resource,
             )
 
@@ -4294,6 +4313,7 @@ class WebToolConfig(BaseToolConfig):
             remote_providers_to_resolve: list[str] = []
             remote_configured_resource: str | None = None
             remote_hook_token: _ResolvedHookToken | None = None
+            remote_auth_type: str | None = None
             if resolver is not None and not actor_remote_oauth:
                 remote_providers_to_resolve = (
                     _oauth_token_provider_candidates(app_info)
@@ -4304,12 +4324,14 @@ class WebToolConfig(BaseToolConfig):
                     server,
                     mcp_auth_context=auth_context,
                 )
+                remote_auth_type = connector_auth_type(server)
                 if remote_providers_to_resolve:
                     try:
                         remote_hook_token = await self._resolve_oauth_token_from_hook(
                             providers=remote_providers_to_resolve,
                             resource=remote_configured_resource,
                             resolver=resolver,
+                            auth_type=remote_auth_type,
                         )
                     except _OAuthTokenResolverFailed as error:
                         return self._resolver_failure_config(
@@ -4332,6 +4354,7 @@ class WebToolConfig(BaseToolConfig):
                         runtime_values=runtime_values,
                         runtime_bindings=runtime_bindings,
                     ),
+                    auth_type=remote_auth_type,
                 )
                 transport_config.update(
                     connection_to_transport_config(resolver_connection)
