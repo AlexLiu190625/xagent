@@ -32,9 +32,12 @@ flag never changes observable results, only latency:
   A batch that arrives here from a fresh LLM response carries no final_answer
   alongside a work tool: response normalization removes it first, because its
   answer text was written before those tools ran. That holds for fresh
-  responses only - pending_tool_calls restored from a checkpoint are replayed
-  without re-normalization, so a batch written by an earlier build can still
-  reach this loop carrying one, and takes the branches above unchanged.
+  responses only - pending_tool_calls restored from an interrupt checkpoint
+  are replayed without re-normalization, so a batch written by an earlier
+  build can still reach this loop carrying one, and takes the branches above
+  unchanged. A waiting_for_user resume is the exception: it cancels any
+  restored pending calls before the loop (legacy pre-#2216 checkpoints), so
+  the resumed turn replans instead of replaying.
 - I5 (interrupt / resume): an interrupt during a concurrent batch preserves
   calls that already completed and leaves only interrupted calls pending. A
   cancelled call may still have committed externally before cancellation was
@@ -1722,6 +1725,26 @@ class ReActPattern(AgentPattern):
             response=response or "",
             tools=tools,
         )
+        if self.pending_tool_calls:
+            # Waiting checkpoints written before the pause path discarded the
+            # plan pre-checkpoint still carry the parked batch's unexecuted
+            # siblings (#2216). Pause-time semantics already discarded them in
+            # memory, so cancel them here too: the resumed turn must replan
+            # from the user's answer, never replay a stale call.
+            logger.warning(
+                "ReAct cancelling %d stale pending tool call(s) restored from a "
+                "legacy waiting_for_user checkpoint (#2216): %s",
+                len(self.pending_tool_calls),
+                [call.get("name") for call in self.pending_tool_calls],
+            )
+            self._discard_pending_tool_plan_after_pause(
+                context,
+                reason=(
+                    "Discarded stale tool plan restored from a checkpoint "
+                    "written before user input arrived; the agent replans "
+                    "from the user's response."
+                ),
+            )
         waiting_task = self.waiting_for_user_request.get("task_text")
         if waiting_task and self.task_text is None:
             self.task_text = str(waiting_task)
@@ -2676,7 +2699,9 @@ class ReActPattern(AgentPattern):
         )
         self._forget_tool_call_content(tool_call)
 
-    def _discard_pending_tool_plan_after_pause(self, context: Any) -> None:
+    def _discard_pending_tool_plan_after_pause(
+        self, context: Any, *, reason: str | None = None
+    ) -> None:
         """Close unexecuted calls so resume always starts with a fresh LLM plan."""
 
         discarded_calls = self.pending_tool_calls
@@ -2686,7 +2711,8 @@ class ReActPattern(AgentPattern):
         self._cancel_tool_calls(
             discarded_calls,
             context,
-            reason=(
+            reason=reason
+            or (
                 "Discarded because an earlier tool requires user input; "
                 "the agent will replan after the user responds."
             ),
@@ -3015,6 +3041,43 @@ class ReActPattern(AgentPattern):
                 )
                 self.pending_tool_calls = self.pending_tool_calls[1:]
                 self._forget_tool_call_content(tool_call)
+                control_waits_for_user = (
+                    control_result is not None
+                    and control_result.get("status") == "waiting_for_user"
+                )
+                if control_waits_for_user:
+                    # Discard before the checkpoint below persists this state:
+                    # a resume restores pending_tool_calls verbatim, and a
+                    # sibling left in it replays without a fresh LLM plan --
+                    # a stale bundled final_answer even completes the resumed
+                    # turn with zero iterations (#2216). The cancellations
+                    # append tool results, so refresh the waiting request's
+                    # message watermark the way the tool-pause path snapshots
+                    # it after cancelling, keeping an answer-less resume
+                    # parked.
+                    self._discard_pending_tool_plan_after_pause(context)
+                    if self.waiting_for_user_request is not None:
+                        # Rebind rather than mutate: get_state() hands this
+                        # dict out by reference, so a fresh dict keeps any
+                        # state captured earlier from aliasing this update.
+                        self.waiting_for_user_request = {
+                            **self.waiting_for_user_request,
+                            "message_count": len(getattr(context, "messages", [])),
+                        }
+                        if control_result is not None:
+                            # The draft returned by _handle_control_tool was
+                            # built from the pre-discard message count; rebuild
+                            # it so turn_marker matches what an answer-less
+                            # resume re-derives from the persisted request
+                            # (clarification.py documents turn_marker as
+                            # stable for the lifetime of the waiting turn).
+                            control_result["clarification_draft"] = (
+                                draft_from_waiting_request(
+                                    self.waiting_for_user_request,
+                                    execution_id=getattr(context, "execution_id", None),
+                                    step_id=None,
+                                )
+                            )
                 await runtime.checkpoint(
                     str(control_result.get("status", "control_tool"))
                     if control_result is not None
@@ -3027,8 +3090,7 @@ class ReActPattern(AgentPattern):
                     if control_result.get("status") == "completed":
                         self.pending_tool_calls = []
                         return control_result
-                    if control_result.get("status") == "waiting_for_user":
-                        self._discard_pending_tool_plan_after_pause(context)
+                    if control_waits_for_user:
                         return control_result
                 continue
 
