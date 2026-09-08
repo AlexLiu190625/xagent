@@ -132,6 +132,47 @@ def test_unavailable_mcp_config_does_not_scope_allow_users() -> None:
 
 
 @pytest.mark.asyncio
+async def test_executable_mcp_config_does_not_carry_allow_users() -> None:
+    """The config for a server that loads must not carry ``allow_users`` either.
+
+    Nothing reads the key any more: the MCP tool adapter's allow-list is only
+    ever set through ``load_mcp_tools_as_agent_tools(allow_users=...)``, which
+    no caller passes, and the placeholder tool no longer has an allow-list at
+    all. The owning identity stays on the config as ``user_id``.
+    """
+    cfg = WebToolConfig(db=None, request=None, user_id=42)
+    server = SimpleNamespace(
+        id=5,
+        name="Test Stdio Server",
+        transport="stdio",
+        description="",
+        command="python",
+        args=["-m", "xagent.web.tools.mcp.aws"],
+        env={"FOO": "bar"},
+        cwd=None,
+        managed="external",
+        docker_url=None,
+        docker_image=None,
+        docker_environment=None,
+        docker_working_dir=None,
+        volumes=None,
+        bind_ports=None,
+        restart_policy=None,
+        auto_start=None,
+    )
+
+    config = await cfg._build_mcp_server_config(
+        server=server,
+        user_env_by_id={},
+        shared_env_by_id={},
+        env_source_by_id={},
+    )
+
+    assert config["user_id"] == "42"
+    assert "allow_users" not in config
+
+
+@pytest.mark.asyncio
 async def test_identity_free_mcp_load_returns_before_cache_or_database(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

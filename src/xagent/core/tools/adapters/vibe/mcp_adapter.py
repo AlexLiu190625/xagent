@@ -1645,7 +1645,14 @@ class _UnavailableMCPToolResult(BaseModel):
 
 
 class UnavailableMCPTool(AbstractBaseTool):
-    """Server-level MCP tool returned when a selected server is unavailable."""
+    """Server-level MCP tool returned when a selected server is unavailable.
+
+    The tool exists to explain an outage, so it always reports that outage to
+    whoever invokes it: it carries no allow-list and performs no caller check.
+    Its result holds only a constant message plus an allowlisted ``reason`` and
+    ``failure_code``, and the server name it is built from is already exposed in
+    the tool listing, so there is nothing here to withhold from a caller.
+    """
 
     read_only = True
     concurrency_safe = True
@@ -1655,7 +1662,6 @@ class UnavailableMCPTool(AbstractBaseTool):
         *,
         server_name: str,
         server_id: Any | None,
-        allow_users: Optional[List[str]] = None,
         failure_code: str | None = None,
         reason: str | None = None,
         message: str = _DEFAULT_UNAVAILABLE_MCP_MESSAGE,
@@ -1666,7 +1672,6 @@ class UnavailableMCPTool(AbstractBaseTool):
 
         self._server_name = server_name
         self._server_id = server_id
-        self._allow_users = allow_users
         self._failure_code = normalize_tool_failure_code(failure_code)
         self._reason = reason
         self._message = message
@@ -1706,9 +1711,6 @@ class UnavailableMCPTool(AbstractBaseTool):
         return None
 
     def _run_unavailable(self) -> Dict[str, Any]:
-        current_user_id = _get_current_mcp_user_id()
-        if not _is_mcp_user_allowed(current_user_id, self._allow_users):
-            return _mcp_access_denied_result(current_user_id, self.name)
         content_message = self._message
         if self._message == _DEFAULT_UNAVAILABLE_MCP_MESSAGE:
             content_message = (
