@@ -3872,6 +3872,123 @@ def test_values_endpoint_never_logs_submitted_values(
     assert any("auth_token" in record.getMessage() for record in caplog.records)
 
 
+@pytest.mark.parametrize("blank_value", ["", "   ", "\t\n"])
+def test_values_endpoint_rejects_a_blank_string_value(
+    e2e_db: None, blank_value: str
+) -> None:
+    """A required key submitted empty, or with nothing but whitespace, is
+    rejected before anything is written. Accepting it would mark the key
+    filled forever -- a stored value is never replaced -- while carrying
+    nothing a connector can use."""
+    headers, task_id, server_id = _setup_context_task()
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"auth_token": blank_value},
+                }
+            ]
+        },
+    )
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error"]["code"] == "invalid_runtime_context"
+    assert body["error"]["details"]["reason"] == "empty_value.context.auth_token"
+    assert _context_row_count(task_id) == 0
+
+
+def test_values_endpoint_rejects_a_blank_value_for_an_optional_key(
+    e2e_db: None,
+) -> None:
+    """The blank rule ignores ``required``: an optional key's value is just
+    as permanent once stored, so a blank one is refused there too."""
+    headers, task_id, server_id = _setup_context_task(required=False)
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"auth_token": ""},
+                }
+            ]
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert (
+        response.json()["error"]["details"]["reason"]
+        == "empty_value.context.auth_token"
+    )
+    assert _context_row_count(task_id) == 0
+
+
+def test_values_endpoint_rejects_an_empty_object_value(e2e_db: None) -> None:
+    """An object-typed key given ``{}`` passes the type check and is still
+    refused: an empty object is a value with no content, and ``{}`` is not
+    "a value" for the purpose of satisfying the key."""
+    headers, task_id, server_id = _setup_context_task(key_type="object")
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"auth_token": {}},
+                }
+            ]
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert (
+        response.json()["error"]["details"]["reason"]
+        == "empty_value.context.auth_token"
+    )
+    assert _context_row_count(task_id) == 0
+
+
+def test_values_endpoint_accepts_a_real_value_after_a_blank_one_was_refused(
+    e2e_db: None,
+) -> None:
+    """The refusal writes nothing, so the caller can simply submit again --
+    this is the whole point of refusing at the door rather than storing a
+    blank that could never be replaced."""
+    headers, task_id, server_id = _setup_context_task()
+    ref = {"connector_type": "mcp", "connector_id": server_id}
+
+    refused = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={"items": [{"connector_ref": ref, "context": {"auth_token": ""}}]},
+    )
+    assert refused.status_code == 400, refused.text
+    assert _stored_context(task_id, server_id) is None
+
+    accepted = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [{"connector_ref": ref, "context": {"auth_token": "real-token"}}]
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["satisfied"] is True
+    assert _stored_context(task_id, server_id) == {"auth_token": "real-token"}
+
+
 # ---------------------------------------------------------------------------
 # Values-endpoint concurrency: two sessions racing the write. Driven
 # below the HTTP layer, directly against

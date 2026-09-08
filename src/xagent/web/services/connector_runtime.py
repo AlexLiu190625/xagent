@@ -549,7 +549,9 @@ def apply_task_connector_runtime_context_values(
        (``_validate_payload_refs``, reused unchanged).
     6. Every key is declared and syntactically valid
        (``_validate_values_against_schema``, reused unchanged).
-    7. Every value matches its declared, normalized type.
+    7. Every value matches its declared, normalized type and carries
+       content -- an empty or whitespace-only string, and an empty
+       object, are rejected for optional keys as well as required ones.
     7b. (encryption-key-configuration gate -- a later phase's tier; this
         phase's request shape has no ``secrets`` field, so there is
         nothing for it to check yet. See the note below tier 8.)
@@ -1333,7 +1335,16 @@ def _reject_duplicate_context_refs(
 def _validate_context_value_types(
     ref: ConnectorRef, connector: Any, context: dict[str, Any]
 ) -> None:
-    """Tier 7: every value matches its declaration's normalized type.
+    """Tier 7: every value matches its declaration's normalized type and
+    carries content.
+
+    Two rules, in this order. The type first: a key declared ``object``
+    takes a mapping, every other key takes a string. Then content: a
+    string that is empty or strips to nothing, and an empty mapping, are
+    both rejected. That holds whether or not the key is required -- a
+    stored value is never replaced, so a blank one that got in would mark
+    its key filled forever while carrying nothing a connector can use, and
+    the only way out would be a new task.
 
     Must run after tier 6 (``_validate_values_against_schema``): the ``key``
     formatted into ``reason`` here is only safe to reflect back to the
@@ -1355,6 +1366,13 @@ def _validate_context_value_types(
                 ERROR_INVALID_RUNTIME_CONTEXT,
                 ref,
                 reason=f"type_mismatch.{RUNTIME_INPUT_CONTEXT}.{key}",
+            )
+        blank = not value if declared_type == "object" else not value.strip()
+        if blank:
+            _raise_runtime_error(
+                ERROR_INVALID_RUNTIME_CONTEXT,
+                ref,
+                reason=f"empty_value.{RUNTIME_INPUT_CONTEXT}.{key}",
             )
 
 
