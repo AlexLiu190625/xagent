@@ -2434,15 +2434,17 @@ def _catalog_reserved_keys(db: Session) -> "set[str]":
 def _definition_row_has_an_owner(db: Session, server: MCPServer) -> bool:
     """Whether any user's association row claims ``is_owner`` on this row.
 
-    Three provisioning paths write ``is_owner=True``: ``create_mcp_server``
+    Two provisioning paths write ``is_owner=True``: ``create_mcp_server``
     for a connector a user built themselves, and the builtin-OAuth connect in
-    ``auth.py`` for the row it provisions. Both catalog-connect paths write
-    ``is_owner=False`` instead, and the catalog provisioning helpers create
-    the shared row with no association at all -- which is why
-    ``_reject_user_owned_catalog_squat`` can refuse to adopt an owned row as
-    a catalog row. So "no owner" is the shape of a platform-provisioned row,
-    and of a row whose creator's account has since been deleted (association
-    rows cascade with the user), and of nothing a team built.
+    ``auth.py`` for the row it provisions. Three call sites write
+    ``is_owner=False`` instead -- the two in this module and the
+    builtin-OAuth visibility path in ``mcp_apps.py`` -- and the catalog
+    provisioning helpers create the shared row with no association at all --
+    which is why ``_reject_user_owned_catalog_squat`` can refuse to adopt an
+    owned row as a catalog row. So "no owner" is the shape of a
+    platform-provisioned row, and of a row whose creator's account has since
+    been deleted (association rows cascade with the user), and of nothing a
+    team built.
 
     Same query as ``_reject_user_owned_catalog_squat`` asks on the connect
     paths, deliberately written out a second time rather than shared: that

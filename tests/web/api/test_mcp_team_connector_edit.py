@@ -7,9 +7,11 @@ raising hook surfaces as its declared status rather than a 500, a
 stand-in whose verdict denies edit is refused outright rather than
 reported as an empty success, and a personal row that vanishes while this
 request waits for the definition row's lock is answered with the gate's
-own 404, for a platform admin as well.
+own 404 -- an admin with neither a personal row nor a verdict included,
+though an admin who does hold a verdict is a separate case this module
+does not cover.
 
-Every test installs the access hook through
+Every test that installs the access hook does so through
 ``snapshot_connector_team_hooks`` so no hook state leaks between tests or
 into suites that run after this one.
 """
@@ -517,6 +519,75 @@ class TestAnExplicitNullPersonalFieldIsRefused:
                 set_connector_team_hooks(
                     access=lambda db, user_id, refs: {
                         ref: ConnectorAccess(team_owned=True, can_edit=True)
+                        for ref in refs
+                    }
+                )
+                with pytest.raises(HTTPException) as exc:
+                    update_mcp_server(server_id, payload, current_user=member, db=db)
+        finally:
+            db.query = real_query
+
+        assert fired
+        assert exc.value.status_code == 400
+        assert exc.value.detail == (
+            "No personal connection exists to configure user_env or "
+            "is_active for this server"
+        )
+
+        db.rollback()
+        refreshed = real_query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert refreshed.description == "original"
+
+    def test_a_denied_stand_in_with_an_explicit_null_still_gets_the_personal_field_400(
+        self, db
+    ):
+        """The lock-side personal-field 400 fires before the lock-side
+        denied-stand-in 404 does, even for a caller whose re-derived verdict
+        denies edit outright. Both guards would refuse this request, so only
+        running the mutation that swaps their order (moving the 404 ahead of
+        the 400) can tell whether the ordering the docstring above the 404
+        guard promises is real rather than untested."""
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        member_id = member.id
+        server = _make_owned_server(db, owner.id, name="explicit-null-denied-post-lock")
+        server.description = "original"
+        server_id = server.id
+        db.add(
+            UserMCPServer(
+                user_id=member_id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        payload = MCPServerUpdate.model_validate(
+            {"is_active": None, "description": "should-not-land"}
+        )
+
+        real_query = db.query
+        fired = False
+
+        def query_and_delete_on_first_recheck(*entities, **kwargs):
+            nonlocal fired
+            if entities == (UserMCPServer,) and not fired:
+                fired = True
+                db.execute(
+                    sa.delete(UserMCPServer).where(
+                        UserMCPServer.user_id == member_id,
+                        UserMCPServer.mcpserver_id == server_id,
+                    )
+                )
+                db.commit()
+            return real_query(*entities, **kwargs)
+
+        db.query = query_and_delete_on_first_recheck
+        try:
+            with snapshot_connector_team_hooks():
+                set_connector_team_hooks(
+                    access=lambda db, user_id, refs: {
+                        ref: ConnectorAccess(team_owned=True, can_edit=False)
                         for ref in refs
                     }
                 )
@@ -1398,8 +1469,18 @@ class TestOwnershipWithholdsTheTeamEditRightFromAnOwnerlessRow:
         member = _make_user(db, 2)
         server = catalog_row(db)
         server_id = server.id
-        # Production shape: no association row at all, not even the
-        # administrator's -- nobody has connected to this catalog row yet.
+        # Production shape: the administrator who connected this catalog row
+        # holds an ordinary non-owner association -- connect never marks one
+        # is_owner=True, so this row has an association but no owner.
+        db.add(
+            UserMCPServer(
+                user_id=admin.id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
 
         with snapshot_connector_team_hooks():
             set_connector_team_hooks(
