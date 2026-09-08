@@ -3989,6 +3989,42 @@ def test_values_endpoint_accepts_a_real_value_after_a_blank_one_was_refused(
     assert _stored_context(task_id, server_id) == {"auth_token": "real-token"}
 
 
+def test_values_endpoint_treats_a_json_reshaped_value_as_a_conflict(
+    e2e_db: None,
+) -> None:
+    """``{"a": 1}`` already stored, then ``{"a": 1.0}`` or ``{"a": true}``
+    submitted: Python calls those equal, but they store different JSON, so
+    the immutability rule must fire rather than answering 200 and writing
+    nothing. Resubmitting the identical value is still the no-op it was,
+    with no write statement at all."""
+    headers, task_id, server_id = _setup_context_task(key_type="object")
+    ref = {"connector_type": "mcp", "connector_id": server_id}
+
+    def _post(value: Any) -> Any:
+        return client.post(
+            _values_url(task_id),
+            headers=headers,
+            json={"items": [{"connector_ref": ref, "context": {"auth_token": value}}]},
+        )
+
+    first = _post({"a": 1})
+    assert first.status_code == 200, first.text
+    assert _stored_context(task_id, server_id) == {"auth_token": {"a": 1}}
+
+    for reshaped in ({"a": 1.0}, {"a": True}):
+        conflict = _post(reshaped)
+        assert conflict.status_code == 409, conflict.text
+        assert (
+            conflict.json()["error"]["details"]["reason"]
+            == "conflict.context.auth_token"
+        )
+        assert _stored_context(task_id, server_id) == {"auth_token": {"a": 1}}
+
+    writes = _count_context_table_writes(lambda: _post({"a": 1}))
+    assert writes == 0
+    assert _stored_context(task_id, server_id) == {"auth_token": {"a": 1}}
+
+
 # ---------------------------------------------------------------------------
 # Values-endpoint concurrency: two sessions racing the write. Driven
 # below the HTTP layer, directly against

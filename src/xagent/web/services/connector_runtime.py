@@ -664,7 +664,7 @@ def apply_task_connector_runtime_context_values(
                 )
                 written_keys_by_ref[ref] = sorted(merged)
                 continue
-            if _canonical_json(merged) == _canonical_json(stored_row.context):
+            if _canonical_json_text(merged) == _canonical_json_text(stored_row.context):
                 # Same content already on the row: no write statement at
                 # all, not even a same-value UPDATE.
                 continue
@@ -1382,11 +1382,16 @@ def _merge_context_values(
     """Tier 8: per-key merge. A key not yet stored is added; one stored
     with the same value is a no-op; one stored with a different value
     fails the whole batch immediately, before anything is written.
+
+    "The same value" means the same canonical JSON text, not two objects
+    Python's ``==`` calls equal: a resubmission that differs only in JSON
+    form -- ``1`` against ``1.0``, or ``1`` against ``true`` -- would store
+    something different and so is a conflict, not a no-op.
     """
     merged = dict(stored)
     for key, value in incoming.items():
         if key in stored:
-            if _canonical_json(stored[key]) != _canonical_json(value):
+            if _canonical_json_text(stored[key]) != _canonical_json_text(value):
                 _raise_runtime_error(
                     ERROR_RUNTIME_CONTEXT_IMMUTABLE,
                     ref,
@@ -1653,8 +1658,20 @@ def _is_required(declaration: Any) -> bool:
     return isinstance(declaration, dict) and bool(declaration.get("required"))
 
 
+def _canonical_json_text(value: Any) -> str:
+    """The value's canonical JSON text: keys sorted, no incidental
+    whitespace. Two values render the same text only when they would store
+    the same JSON, which comparing the decoded objects does not answer --
+    Python reads ``1``, ``1.0`` and ``True`` as equal to each other, while
+    the JSON they store (``1``, ``1.0``, ``true``) differs. Compare values
+    through this whenever the question is "would storing this change what
+    is already there".
+    """
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
 def _canonical_json(value: Any) -> Any:
-    return json.loads(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    return json.loads(_canonical_json_text(value))
 
 
 def _canonical_json_value(value: dict[str, Any]) -> dict[str, Any]:
