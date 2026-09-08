@@ -5422,7 +5422,7 @@ async def get_task_connector_runtime_requirements(
     "/task/{task_id}/connector-runtime-values",
     response_model=ConnectorRuntimeRequirementsModel,
 )
-async def post_task_connector_runtime_values(
+def post_task_connector_runtime_values(
     task_id: int,
     request: ConnectorRuntimeValuesRequest,
     db: Session = Depends(get_db),
