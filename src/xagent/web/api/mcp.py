@@ -4340,8 +4340,19 @@ def update_mcp_server(
         # personal row here can lose it during the wait for the definition
         # lock, so a second copy runs again below, after that wait, on the
         # row a fresh read then finds.
+        #
+        # Presence, not value: ``MCPServerUpdate`` accepts an explicit null
+        # for both fields and Pydantic records it in ``model_fields_set``, so
+        # ``{"user_env": null}`` carries the field and must be refused the
+        # same as any other value would be. Testing the value instead let
+        # that payload through to a 200 that stored nothing -- and, mixed
+        # with a shared field, to a 200 that applied the shared half while
+        # silently dropping the personal one. This is the same test
+        # ``writes_definition_row`` below makes, and the same one
+        # ``custom_api.py``'s own stand-in guard makes.
         if is_stand_in and (
-            server_data.user_env is not None or server_data.is_active is not None
+            "user_env" in server_data.model_fields_set
+            or "is_active" in server_data.model_fields_set
         ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -4619,8 +4630,11 @@ def update_mcp_server(
             # neither a personal row nor a verdict (in
             # ``_resolve_mcp_server_for_request``) before it ever reaches its
             # own personal-field 400.
+            #
+            # Same presence test as the guard above, for the same reason.
             if is_stand_in and (
-                server_data.user_env is not None or server_data.is_active is not None
+                "user_env" in server_data.model_fields_set
+                or "is_active" in server_data.model_fields_set
             ):
                 db.rollback()
                 raise HTTPException(

@@ -438,6 +438,105 @@ class TestUserEnvAndIsActiveRejectionForAStandIn:
         )
 
 
+class TestAnExplicitNullPersonalFieldIsRefused:
+    """``MCPServerUpdate`` accepts an explicit ``null`` for ``user_env`` and
+    ``is_active`` the same as it accepts any other value, and Pydantic
+    records that in ``model_fields_set`` -- so ``{"user_env": null}`` carries
+    the field and must be refused the same way any other value is, on both
+    sides of the definition-row lock. Testing the value instead of presence
+    let such a payload through to a 200 that stored nothing, and -- mixed
+    with a shared field -- to a 200 that applied the shared half while
+    silently dropping the personal one.
+    """
+
+    @pytest.mark.parametrize("field", ["user_env", "is_active"])
+    def test_an_explicit_null_personal_field_is_refused(self, db, field):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        server = _make_owned_server(db, owner.id, name="explicit-null-pre-lock")
+        server_id = server.id
+        payload = MCPServerUpdate.model_validate({field: None})
+
+        with snapshot_connector_team_hooks():
+            set_connector_team_hooks(
+                access=lambda db, user_id, refs: {
+                    ref: ConnectorAccess(team_owned=True, can_edit=True) for ref in refs
+                }
+            )
+            with pytest.raises(HTTPException) as exc:
+                update_mcp_server(server_id, payload, current_user=member, db=db)
+
+        assert exc.value.status_code == 400
+        assert exc.value.detail == (
+            "No personal connection exists to configure user_env or "
+            "is_active for this server"
+        )
+
+    @pytest.mark.parametrize("field", ["user_env", "is_active"])
+    def test_an_explicit_null_personal_field_is_refused_after_the_lock_too(
+        self, db, field
+    ):
+        owner = _make_user(db, 1)
+        member = _make_user(db, 2)
+        member_id = member.id
+        server = _make_owned_server(db, owner.id, name="explicit-null-post-lock")
+        server.description = "original"
+        server_id = server.id
+        db.add(
+            UserMCPServer(
+                user_id=member_id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+        payload = MCPServerUpdate.model_validate(
+            {field: None, "description": "should-not-land"}
+        )
+
+        real_query = db.query
+        fired = False
+
+        def query_and_delete_on_first_recheck(*entities, **kwargs):
+            nonlocal fired
+            if entities == (UserMCPServer,) and not fired:
+                fired = True
+                db.execute(
+                    sa.delete(UserMCPServer).where(
+                        UserMCPServer.user_id == member_id,
+                        UserMCPServer.mcpserver_id == server_id,
+                    )
+                )
+                db.commit()
+            return real_query(*entities, **kwargs)
+
+        db.query = query_and_delete_on_first_recheck
+        try:
+            with snapshot_connector_team_hooks():
+                set_connector_team_hooks(
+                    access=lambda db, user_id, refs: {
+                        ref: ConnectorAccess(team_owned=True, can_edit=True)
+                        for ref in refs
+                    }
+                )
+                with pytest.raises(HTTPException) as exc:
+                    update_mcp_server(server_id, payload, current_user=member, db=db)
+        finally:
+            db.query = real_query
+
+        assert fired
+        assert exc.value.status_code == 400
+        assert exc.value.detail == (
+            "No personal connection exists to configure user_env or "
+            "is_active for this server"
+        )
+
+        db.rollback()
+        refreshed = real_query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert refreshed.description == "original"
+
+
 class TestARowThatVanishesUnderTheLockIsTheGatesOwn404:
     """A caller whose personal association row is deleted while this request
     waits for the definition-row lock is answered the same way a caller who
