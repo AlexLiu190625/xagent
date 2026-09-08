@@ -15,6 +15,7 @@ tests/web/api/test_a2a_api.py.
 
 from __future__ import annotations
 
+import ast
 import logging
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy import Select, event
 
+from tests.web.services.interaction_static_scan_shared import _scan_root
 from tests.web.services.task_interaction_schema_shared import (
     make_row,
     make_task,
@@ -862,6 +864,75 @@ def test_active_interaction_unavailable_reasons_is_exactly_two_words() -> None:
         "session_unavailable",
         "lookup_failed",
     }
+
+
+# --------------------------------------------------------------------------
+# Static gate: every production module that calls active_interaction_id_sync
+# must also name ActiveInteractionUnavailable. This does not check that a
+# caller's Unavailable branch does anything sensible -- a branch reduced to
+# `pass` still satisfies it -- only that the three-state return cannot be
+# quietly narrowed back to a two-state one by a caller that pattern-matches
+# on ActiveInteractionFound and treats everything else as absent. AST-based
+# rather than a substring grep, following the same shape as this package's
+# other zero-caller / production-use gates
+# (test_task_interaction_service_create_gate.py,
+# test_interaction_handoff_production_surface.py,
+# test_task_interaction_anchor.py's _anchor_production_uses): a plain-text
+# search would also match the name inside a docstring or comment, which
+# proves nothing about whether the module's code actually handles the
+# third state.
+# --------------------------------------------------------------------------
+
+_READER_NAME = "active_interaction_id_sync"
+_UNAVAILABLE_NAME = "ActiveInteractionUnavailable"
+_CLOSE_MODULE_STEM = "task_interaction_close"
+
+
+def _references_name(tree: ast.AST, name: str) -> bool:
+    """Whether ``name`` appears as a real reference in ``tree`` -- an
+    import, a bare identifier, or an attribute access -- as opposed to
+    merely appearing inside a string (a docstring or comment mentioning the
+    name proves nothing about whether the module's code handles it)."""
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if any(alias.name == name for alias in node.names):
+                return True
+        elif isinstance(node, ast.Name) and node.id == name:
+            return True
+        elif isinstance(node, ast.Attribute) and node.attr == name:
+            return True
+    return False
+
+
+def test_every_call_site_of_active_interaction_id_sync_names_unavailable() -> None:
+    """Every production module that calls ``active_interaction_id_sync``
+    must also reference ``ActiveInteractionUnavailable`` somewhere in the
+    same module. ``task_interaction_close.py`` itself is excluded from the
+    scan: it defines both names but is not one of this function's callers.
+
+    What this does not catch, by design: a caller that imports
+    ``ActiveInteractionUnavailable`` and then does nothing with it (e.g. an
+    ``isinstance`` branch reduced to ``pass``) still passes. That is a
+    known, disclosed gap -- the behavioral pin for what the ``Unavailable``
+    branch must actually do lives in test_resume_interaction_seam.py (the
+    refusal gate) and in test_close_keeps_the_marker_when_the_pre_injection_
+    read_failed above (the close sites). This gate only catches the most
+    common regression shape: a fifth call site added later that pattern-
+    matches on ``ActiveInteractionFound`` and folds everything else into
+    "absent" without ever mentioning ``ActiveInteractionUnavailable`` at
+    all.
+    """
+
+    offenders: list[str] = []
+    for path in _scan_root(_CLOSE_MODULE_STEM):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        if _references_name(tree, _READER_NAME) and not _references_name(
+            tree, _UNAVAILABLE_NAME
+        ):
+            offenders.append(str(path))
+    assert offenders == []
 
 
 # --------------------------------------------------------------------------

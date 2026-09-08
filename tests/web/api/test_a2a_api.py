@@ -18,6 +18,7 @@ from tests.web.pool_contention_shared import (
     gated_pool_checkout,
     wait_for_ticks,
 )
+from tests.web.services.test_task_interaction_close import _PRE_CHANGE_EQUIVALENT
 from xagent.core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
@@ -48,7 +49,7 @@ from xagent.web.services.task_command_transport import (
     max_command_defers,
 )
 from xagent.web.services.task_execution_controller import TaskControlState
-from xagent.web.services.task_interaction_close import ActiveInteractionFound
+from xagent.web.services.task_interaction_close import ActiveInteractionRead
 from xagent.web.services.task_lease_service import TaskLease, current_task_lease
 from xagent.web.services.task_orchestrator import (
     TaskTurnError,
@@ -1053,18 +1054,33 @@ def test_message_send_skips_the_close_on_a_replayed_injection() -> None:
 # A fabricated id, not the seeded row's -- test_message_send_reads_the_
 # interaction_row_before_injecting hands this to the close instead of the
 # real row id, so a site that re-read the row at close time would hand the
-# close the real id and fail there instead.
+# close the real id and fail there instead. Matches the Found row in
+# _PRE_CHANGE_EQUIVALENT (test_task_interaction_close.py), which this test
+# parametrizes over.
 _OBSERVED_INTERACTION_ID = 4321
 
 
-def test_message_send_reads_the_interaction_row_before_injecting() -> None:
+@pytest.mark.parametrize(
+    "active_interaction_read,expected_interaction_id", _PRE_CHANGE_EQUIVALENT
+)
+def test_message_send_reads_the_interaction_row_before_injecting(
+    active_interaction_read: ActiveInteractionRead, expected_interaction_id: int | None
+) -> None:
     """The close is keyed on the row observed *before* the injection,
     and only the ordering makes that true -- see task_interaction_close's
     module docstring. Moving the read after the injection leaves the whole
     change doing nothing while the row-level assertions in the test above
-    stay green. The observed value is a fabricated id, not the seeded row's,
-    so a site that re-read the row at close time would hand the close the
-    real id and fail here."""
+    stay green. The Found case's observed value is a fabricated id, not the
+    seeded row's, so a site that re-read the row at close time would hand
+    the close the real id and fail here.
+
+    Parametrized over every state _PRE_CHANGE_EQUIVALENT enumerates
+    (Found, Absent, and both Unavailable reasons): this site's translation
+    to the ``int | None`` the close call takes must produce the same
+    result for all three states that it did before this became a
+    three-state read, regardless of which reason an unavailable read
+    carries.
+    """
 
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()
@@ -1101,9 +1117,9 @@ def test_message_send_reads_the_interaction_row_before_injecting() -> None:
 
     order: list[str] = []
 
-    def record_read(_task_id: int) -> ActiveInteractionFound:
+    def record_read(_task_id: int) -> ActiveInteractionRead:
         order.append("read")
-        return ActiveInteractionFound(_OBSERVED_INTERACTION_ID)
+        return active_interaction_read
 
     async def record_injection(
         *_args: object, **_kwargs: object
@@ -1146,7 +1162,7 @@ def test_message_send_reads_the_interaction_row_before_injecting() -> None:
     close_mock.assert_called_once()
     assert close_mock.call_args.kwargs["task_id"] == task_id
     assert close_mock.call_args.kwargs["run_id"] == "run-close-order"
-    assert close_mock.call_args.kwargs["interaction_id"] == _OBSERVED_INTERACTION_ID
+    assert close_mock.call_args.kwargs["interaction_id"] == expected_interaction_id
 
 
 @pytest.mark.asyncio

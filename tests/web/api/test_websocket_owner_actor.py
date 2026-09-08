@@ -28,6 +28,7 @@ from tests.shared.execution_scope import register_scope_resolver
 from tests.web.services.task_lease_shared import (
     live_task_lease as live_task_lease_fixture,
 )
+from tests.web.services.test_task_interaction_close import _PRE_CHANGE_EQUIVALENT
 from xagent.core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
@@ -74,7 +75,7 @@ from xagent.web.services.task_command_transport import (
     TaskCommandRejected,
 )
 from xagent.web.services.task_execution_controller import StaleTaskRunError
-from xagent.web.services.task_interaction_close import ActiveInteractionFound
+from xagent.web.services.task_interaction_close import ActiveInteractionRead
 from xagent.web.services.task_lease_service import (
     TaskLease,
     current_task_lease,
@@ -2043,15 +2044,27 @@ async def test_live_marker_failure_after_registered_handoff_is_still_accepted(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "active_interaction_read,expected_interaction_id", _PRE_CHANGE_EQUIVALENT
+)
 async def test_live_resume_reads_the_interaction_row_before_injecting(
     live_task_lease,
     db_session,
+    active_interaction_read: ActiveInteractionRead,
+    expected_interaction_id: int | None,
 ) -> None:
     """The close is keyed on the row observed *before* the injection, and
     only the ordering makes that true -- see task_interaction_close's
     module docstring. The read also sits before the ``posted`` fork, so the
     deferred branch carries the same observation instead of taking one of
-    its own even later."""
+    its own even later.
+
+    Parametrized over every state _PRE_CHANGE_EQUIVALENT enumerates (Found,
+    Absent, and both Unavailable reasons): this site's translation to the
+    ``int | None`` the close call takes must produce the same result for
+    all three states that it did before this became a three-state read,
+    regardless of which reason an unavailable read carries.
+    """
 
     owner = _user(db_session, "close-order-owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
@@ -2065,9 +2078,9 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
 
     order: list[str] = []
 
-    def record_read(_task_id: int) -> ActiveInteractionFound:
+    def record_read(_task_id: int) -> ActiveInteractionRead:
         order.append("read")
-        return ActiveInteractionFound(4321)
+        return active_interaction_read
 
     async def record_injection(
         *_args: object, **_kwargs: object
@@ -2114,7 +2127,9 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
 
     assert order == ["read", "inject"]
     close_mock.assert_called_once_with(
-        task_id=int(task.id), run_id="close-order-run", interaction_id=4321
+        task_id=int(task.id),
+        run_id="close-order-run",
+        interaction_id=expected_interaction_id,
     )
 
 
