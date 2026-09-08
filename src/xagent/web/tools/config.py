@@ -3632,7 +3632,6 @@ class WebToolConfig(BaseToolConfig):
             "description": getattr(server, "description", None),
             "config": inner_config,
             "user_id": serialized_user_id,
-            "allow_users": [serialized_user_id],
         }
 
     def _build_oauth_mcp_stdio_transport_config(
@@ -4487,9 +4486,7 @@ class WebToolConfig(BaseToolConfig):
         config["config"] = transport_config
 
         # Add user context for MCP tool isolation
-        serialized_user_id = self._serialize_mcp_user_id()
-        config["user_id"] = serialized_user_id
-        config["allow_users"] = [serialized_user_id]  # Only allow current user
+        config["user_id"] = self._serialize_mcp_user_id()
 
         logger.debug(f"Loaded MCP server config: {server.name} ({server.transport})")
         return config
