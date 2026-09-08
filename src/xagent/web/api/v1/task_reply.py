@@ -245,9 +245,21 @@ def _acquire_reply_prelease_sync(
         # last_checkpoint_trace_event_id) as part of the same UPDATE. If
         # this reply later fails closed, releasing the lease back to
         # waiting_for_user does not restore those two columns -- they stay
-        # cleared. This is not a behavior change worth guarding against:
-        # a row with no run_id never had a run-fenced checkpoint to
-        # recover in the first place, so nothing resumable is lost.
+        # cleared. The premise that used to justify this as costless -- "a
+        # row with no run_id never had a run-fenced checkpoint to recover in
+        # the first place" -- no longer holds: the root-checkpoint read path
+        # can resolve an untagged partition and read a checkpoint row
+        # written before the run-partition field existed, so such a row can
+        # have something resumable to lose. What survives of the original
+        # reasoning is narrower and is about where the resume looks rather
+        # than whether anything is there: with both pointer columns
+        # cleared, that read path's by-primary-key anchor has nothing to
+        # anchor on and falls back to its own legacy scan, which is keyed
+        # on task/checkpoint-type/execution-id and partition rather than on
+        # either cleared column, so it can still find the row the pointer
+        # used to name. Whether to keep clearing unconditionally has not
+        # been re-decided under the corrected premise; this comment records
+        # the premise correctly rather than standing on the retired one.
         task_lease = acquire_task_lease_no_commit(
             db,
             task_id,
