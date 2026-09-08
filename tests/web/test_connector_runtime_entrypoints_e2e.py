@@ -4025,6 +4025,172 @@ def test_values_endpoint_treats_a_json_reshaped_value_as_a_conflict(
     assert _stored_context(task_id, server_id) == {"auth_token": {"a": 1}}
 
 
+def test_values_endpoint_reports_satisfied_once_every_required_key_is_filled(
+    e2e_db: None,
+) -> None:
+    """The endpoint exists to turn this flag true, so one test asserts it
+    does -- on the write response itself, and again on the task-keyed read
+    endpoint afterwards."""
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        server = _mcp_server_with_context_schema(
+            db,
+            user,
+            name="satisfied-server",
+            context_schema={
+                "a": {"type": "string", "required": True},
+                "b": {"type": "string", "required": True},
+            },
+        )
+        agent = _create_agent(db, user, name="satisfied-agent", tool_categories=["mcp"])
+        db.commit()
+        db.refresh(agent)
+        db.refresh(server)
+        agent_id = int(agent.id)
+        server_id = int(server.id)
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "satisfied task", "description": "d", "agent_id": agent_id},
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+    ref = {"connector_type": "mcp", "connector_id": server_id}
+
+    partial = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={"items": [{"connector_ref": ref, "context": {"a": "1"}}]},
+    )
+    assert partial.status_code == 200, partial.text
+    assert partial.json()["satisfied"] is False
+
+    final = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={"items": [{"connector_ref": ref, "context": {"b": "2"}}]},
+    )
+    assert final.status_code == 200, final.text
+    final_body = final.json()
+    assert final_body["satisfied"] is True
+    final_inputs = {item["key"]: item for item in final_body["connectors"][0]["inputs"]}
+    assert final_inputs["a"]["satisfied"] is True
+    assert final_inputs["b"]["satisfied"] is True
+
+    report = client.get(
+        f"/api/chat/task/{task_id}/connector-runtime-requirements", headers=headers
+    )
+    assert report.status_code == 200, report.text
+    assert report.json()["satisfied"] is True
+
+
+def test_values_endpoint_returns_503_when_the_conditional_update_keeps_missing(
+    e2e_db: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retry exhaustion on the conditional-update branch, asserted at the
+    HTTP layer: exactly two attempts, then the typed 503 whose ``details``
+    carry no reason -- the shape that tells a caller this was a collision
+    with another writer and is safe to retry. Driven by forcing every
+    conditional update to match no row, which is what a lost race looks
+    like from inside this request."""
+    task_id, server_id = _setup_concurrency_task(key_names=["a", "b"])
+    headers = _setup_admin_headers()
+    ref = {"connector_type": "mcp", "connector_id": server_id}
+
+    seed = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={"items": [{"connector_ref": ref, "context": {"a": "1"}}]},
+    )
+    assert seed.status_code == 200, seed.text
+
+    from xagent.web.services import connector_runtime as connector_runtime_service
+
+    calls = {"n": 0}
+
+    def _always_missing_update(
+        db: Session, *, row_id: int, context_text_as_read: str, merged: dict[str, Any]
+    ) -> bool:
+        calls["n"] += 1
+        return False
+
+    monkeypatch.setattr(
+        connector_runtime_service, "_update_context_row", _always_missing_update
+    )
+
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={"items": [{"connector_ref": ref, "context": {"b": "2"}}]},
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json() == {
+        "error": {
+            "code": "connector_runtime_unavailable",
+            "message": "Connector runtime context is unavailable.",
+            "details": {},
+        }
+    }
+    assert calls["n"] == 2
+    assert _stored_context(task_id, server_id) == {"a": "1"}
+
+
+def test_values_endpoint_returns_503_when_the_insert_keeps_colliding(
+    e2e_db: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sibling branch, same assertion at the same layer: a snapshot
+    read that never sees the row already in the table sends this request
+    down the insert path twice, and the second ``IntegrityError`` ends it
+    as the same typed 503 with the same empty ``details``."""
+    task_id, server_id = _setup_concurrency_task(key_names=["a", "b"])
+    headers = _setup_admin_headers()
+    ref = {"connector_type": "mcp", "connector_id": server_id}
+
+    seed = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={"items": [{"connector_ref": ref, "context": {"a": "1"}}]},
+    )
+    assert seed.status_code == 200, seed.text
+
+    from xagent.web.services import connector_runtime as connector_runtime_service
+
+    calls = {"n": 0}
+
+    def _always_stale_read(db: Session, *, task_id: int) -> dict[str, Any]:
+        calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr(
+        connector_runtime_service,
+        "_load_task_context_row_snapshots",
+        _always_stale_read,
+    )
+
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={"items": [{"connector_ref": ref, "context": {"b": "2"}}]},
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json() == {
+        "error": {
+            "code": "connector_runtime_unavailable",
+            "message": "Connector runtime context is unavailable.",
+            "details": {},
+        }
+    }
+    assert calls["n"] == 2
+    assert _stored_context(task_id, server_id) == {"a": "1"}
+
+
 # ---------------------------------------------------------------------------
 # Values-endpoint concurrency: two sessions racing the write. Driven
 # below the HTTP layer, directly against
