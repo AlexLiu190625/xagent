@@ -54,6 +54,7 @@ from ...core.tools.adapters.vibe.selection_spec import (
     with_mcp_tools,
 )
 from ...core.tools.core.knowledge_base_scope import KnowledgeBaseScopeError
+from ...core.utils.setup_metrics import agent_setup
 from ...sandbox import SandboxMountIntent
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
@@ -2189,6 +2190,7 @@ class AgentServiceManager:
             else None,
         )
 
+    @agent_setup.measure()
     async def get_agent_for_task(
         self,
         task_id: int,
