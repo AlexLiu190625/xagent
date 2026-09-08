@@ -419,9 +419,9 @@ def test_dag_completion_assessment_prompt_includes_grounding_rule() -> None:
     # the rule no longer uses.
     assert "name that missing data in reason" in system_prompt
     assert "illustrative" not in system_prompt
-    # A forward marker, not a regression guard: this phrasing was the first
-    # design draft's remedy wording and was replaced, so it has never been
-    # in the prompt. It goes red if someone reaches for it again.
+    # A forward marker, not a regression guard: this phrasing has never been
+    # in the prompt. It goes red if someone reaches for "report as
+    # unavailable" instead of naming the missing data in reason.
     assert "report that value as unavailable" not in system_prompt
 
     answer_description = pattern._completion_assessment_tool_schema()["function"][
