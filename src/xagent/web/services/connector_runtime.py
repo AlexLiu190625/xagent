@@ -577,10 +577,15 @@ def apply_task_connector_runtime_context_values(
     ``validate_runtime_source_key`` and is declared by the connector --
     never an arbitrary string the caller wrote.
 
-    Cross-ref ordering within the batch follows the order ``payload_items``
-    arrives in; nothing sorts it globally. That is not a leak: an invisible
-    ref answers a uniform 404 regardless of position, and a visible-but-
-    unselected ref answers 400 for something the caller can already see.
+    Cross-ref ordering splits in two. Validation walks the batch in the
+    order ``payload_items`` arrives in, so which of several bad refs is
+    reported is the caller's own ordering; that is not a leak, because an
+    invisible ref answers a uniform 404 regardless of position and a
+    visible-but-unselected ref answers 400 for something the caller can
+    already see. The write, in contrast, is issued in canonical ref order
+    (``_sort_connector_refs``) no matter how the batch arrived, so two
+    concurrent requests naming the same rows in opposite order still take
+    those rows' locks in the same order and cannot deadlock each other.
 
     The write is a compare-and-swap on the text the database itself
     rendered for a row's previous content, retried once after a full
@@ -630,6 +635,13 @@ def apply_task_connector_runtime_context_values(
         # no trigger condition here -- do not add a placeholder branch.
 
     task_id = int(task.id)
+    # Every statement this batch issues against a row goes out in canonical
+    # ref order, never the order the caller happened to list the refs in:
+    # two requests that touch the same two rows in opposite order would
+    # otherwise be able to take the same two row locks in opposite order
+    # and deadlock on PostgreSQL. The same ordering the task's selection
+    # snapshot is written in (`bind_connector_runtime_selection_snapshot`).
+    write_order = _sort_connector_refs(payload_by_ref)
     rows: dict[ConnectorRef, _ContextRowSnapshot] = {}
     merged_by_ref: dict[ConnectorRef, dict[str, Any]] = {}
     written_keys_by_ref: dict[ConnectorRef, list[str]] = {}
@@ -643,7 +655,8 @@ def apply_task_connector_runtime_context_values(
 
         conflict = False
         written_keys_by_ref = {}
-        for ref, merged in merged_by_ref.items():
+        for ref in write_order:
+            merged = merged_by_ref[ref]
             stored_row = rows.get(ref)
             if stored_row is None:
                 db.add(

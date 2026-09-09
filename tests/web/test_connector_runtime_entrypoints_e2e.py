@@ -4231,6 +4231,127 @@ def test_values_endpoint_rolls_back_when_the_commit_itself_fails(
     assert _context_row_count(task_id) == 0
 
 
+def _setup_two_connector_context_task() -> tuple[dict[str, str], int, int, int]:
+    """One task whose agent selects two MCP connectors, each declaring the
+    same two optional context keys. Returns (owner headers, task_id, and
+    the two connector ids in canonical order -- ascending, which is what
+    ``_sort_connector_refs`` produces for two refs of the same type).
+    """
+    headers = _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        schema = {
+            "a": {"type": "string", "required": False},
+            "b": {"type": "string", "required": False},
+        }
+        first = _mcp_server_with_context_schema(
+            db, user, name="order-server-1", context_schema=schema
+        )
+        second = _mcp_server_with_context_schema(
+            db, user, name="order-server-2", context_schema=schema
+        )
+        agent = _create_agent(db, user, name="order-agent", tool_categories=["mcp"])
+        db.commit()
+        db.refresh(agent)
+        db.refresh(first)
+        db.refresh(second)
+        agent_id = int(agent.id)
+        server_ids = sorted([int(first.id), int(second.id)])
+    finally:
+        db.close()
+
+    create_response = client.post(
+        "/api/chat/task/create",
+        headers=headers,
+        json={"title": "order task", "description": "d", "agent_id": agent_id},
+    )
+    assert create_response.status_code == 200, create_response.text
+    task_id = int(create_response.json()["task_id"])
+    return headers, task_id, server_ids[0], server_ids[1]
+
+
+def test_values_endpoint_updates_rows_in_canonical_ref_order(
+    e2e_db: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch naming two connectors in reverse canonical order still
+    updates their rows in canonical order. Two concurrent requests listing
+    the same rows in opposite order would otherwise be able to take those
+    rows' locks in opposite order and deadlock on PostgreSQL, so the
+    request's own ordering must not reach the write.
+    """
+    headers, task_id, low_id, high_id = _setup_two_connector_context_task()
+    low_ref = {"connector_type": "mcp", "connector_id": low_id}
+    high_ref = {"connector_type": "mcp", "connector_id": high_id}
+
+    # Both rows must already exist, so the second request drives every ref
+    # down the conditional-update branch rather than the insert branch.
+    seed = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {"connector_ref": low_ref, "context": {"a": "1"}},
+                {"connector_ref": high_ref, "context": {"a": "1"}},
+            ]
+        },
+    )
+    assert seed.status_code == 200, seed.text
+
+    db = _db_session()
+    try:
+        row_id_by_connector = {
+            int(row.connector_id): int(row.id)
+            for row in db.query(TaskConnectorRuntimeContext)
+            .filter(TaskConnectorRuntimeContext.task_id == task_id)
+            .all()
+        }
+    finally:
+        db.close()
+    assert set(row_id_by_connector) == {low_id, high_id}
+
+    from xagent.web.services import connector_runtime as connector_runtime_service
+
+    real_update = connector_runtime_service._update_context_row
+    updated_row_ids: list[int] = []
+
+    def _recording_update(
+        db: Session, *, row_id: int, context_text_as_read: str, merged: dict[str, Any]
+    ) -> bool:
+        updated_row_ids.append(row_id)
+        return bool(
+            real_update(
+                db,
+                row_id=row_id,
+                context_text_as_read=context_text_as_read,
+                merged=merged,
+            )
+        )
+
+    monkeypatch.setattr(
+        connector_runtime_service, "_update_context_row", _recording_update
+    )
+
+    response = client.post(
+        _values_url(task_id),
+        headers=headers,
+        json={
+            "items": [
+                {"connector_ref": high_ref, "context": {"b": "2"}},
+                {"connector_ref": low_ref, "context": {"b": "2"}},
+            ]
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert updated_row_ids == [
+        row_id_by_connector[low_id],
+        row_id_by_connector[high_id],
+    ]
+    assert _stored_context(task_id, low_id) == {"a": "1", "b": "2"}
+    assert _stored_context(task_id, high_id) == {"a": "1", "b": "2"}
+
+
 # ---------------------------------------------------------------------------
 # Values-endpoint concurrency: two sessions racing the write. Driven
 # below the HTTP layer, directly against
