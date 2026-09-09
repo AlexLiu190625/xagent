@@ -61,18 +61,15 @@ Caller obligations, because none of them happen here:
   already committed in this transaction.
 
 One production caller today: ``task_interaction_service.create`` enters
-``interaction_handoff`` and calls ``stage()`` on the system principal's
-write path. The all-or-nothing zero-caller gate that used to guard these
-two entry points was retired together with the change that filled that
-call body; three static guards
+``interaction_handoff`` and calls ``stage()``. ``create()`` itself still
+has zero production callers, held there by a live gate
+(``tests/web/services/test_task_interaction_service_create_gate.py``), so
+the chain is not reachable in production yet. The old zero-caller gate on
+this module's two entry points was replaced by three static guards
 (``tests/web/services/test_interaction_handoff_production_surface.py``)
-took its place and assert the shape of that one caller instead of the
-absence of every caller: the production use points of
-``interaction_handoff`` are exactly ``{task_interaction_service}``,
-validation always runs before the handoff is entered, and the set of
-modules importing anything from this module is exactly the three that
-need to. See that file's own docstring for what each guard covers and
-why the replacement is not a weakening.
+asserting: the only production use of ``interaction_handoff`` is
+``task_interaction_service``, validation always runs before it is
+entered, and only the three modules that need it import from this one.
 
 Every rejection the database's 23 CHECK constraints could raise on the
 INSERT is rejected in plain Python first, inside

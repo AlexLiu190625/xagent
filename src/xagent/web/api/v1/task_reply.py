@@ -263,8 +263,9 @@ def _acquire_reply_prelease_sync(
         # two (see ``_load_pk_anchored_checkpoint``'s own docstring). For a
         # row predating that field, the cleared pointer was the only way to
         # reach it. Whether to keep clearing unconditionally has not been
-        # re-decided under the corrected premise; this comment records the
-        # premise correctly rather than standing on the retired one.
+        # re-decided under the corrected premise (see #2024); this comment
+        # records the premise correctly rather than standing on the retired
+        # one.
         task_lease = acquire_task_lease_no_commit(
             db,
             task_id,
