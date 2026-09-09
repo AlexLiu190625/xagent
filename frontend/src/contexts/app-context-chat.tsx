@@ -440,7 +440,6 @@ const dispatchAutoOpenPreview = (
   })
 }
 
-const OPTIMISTIC_USER_MESSAGE_PREFIX = "msg-user-optimistic"
 const USER_TURN_MESSAGE_PREFIX = "msg-user-turn"
 const USER_EVENT_MESSAGE_PREFIX = "msg-user-event"
 const USER_MESSAGE_REPLACE_WINDOW_MS = 30000
@@ -487,11 +486,29 @@ const normalizeMessageContent = (content: string | React.ReactNode): string => {
   return ''
 }
 
+// A user message id minted from a stable per-turn identity: the wire's
+// `turn_id` / `event_id` (stableUserMessageId) or the sender's own
+// client_message_id (userTurnMessageId), which the backend echoes back as
+// that turn's id.
+const hasStableUserTurnIdentity = (id: string): boolean =>
+  id.startsWith(`${USER_TURN_MESSAGE_PREFIX}-`) ||
+  id.startsWith(`${USER_EVENT_MESSAGE_PREFIX}-`)
+
 const findOptimisticUserMessageIndex = (
   messages: Message[],
   incomingMessage: Message,
 ): number => {
   if (incomingMessage.role !== "user") {
+    return -1
+  }
+
+  // Identity beats text: a message carrying one is reconciled by
+  // ADD_MESSAGE's id branch alone. Merging by text instead can drop a turn
+  // from the transcript with no error, and repeated text is routine here -
+  // a clarification form with no free-text field serializes to a fixed
+  // string. Only identity-less legacy events still need text. See the commit
+  // for which same-turn pairs this gives up on, and why they are unreachable.
+  if (hasStableUserTurnIdentity(incomingMessage.id)) {
     return -1
   }
 
@@ -504,14 +521,7 @@ const findOptimisticUserMessageIndex = (
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const existingMessage = messages[index]
-    if (
-      existingMessage.role !== "user" ||
-      typeof existingMessage.id !== "string" ||
-      (
-        !existingMessage.isOptimistic &&
-        !existingMessage.id.startsWith(OPTIMISTIC_USER_MESSAGE_PREFIX)
-      )
-    ) {
+    if (existingMessage.role !== "user" || !existingMessage.isOptimistic) {
       continue
     }
 
@@ -6133,9 +6143,14 @@ export function AppProvider({
       )
     }
 
-    const clientMessageId = typeof config?.clientMessageId === 'string'
-      ? config.clientMessageId
-      : generateClientMessageId()
+    // Mirrors stableUserMessageId's trim guard. `config` is untyped, so a
+    // blank id would reach userTurnMessageId and mint a bare
+    // `msg-user-turn-` that every other blank-id turn collides on.
+    const requestedClientMessageId =
+      typeof config?.clientMessageId === 'string'
+        ? config.clientMessageId.trim()
+        : ''
+    const clientMessageId = requestedClientMessageId || generateClientMessageId()
     const requestId = typeof config?.metadata?.request_id === 'string'
       ? config.metadata.request_id
       : undefined

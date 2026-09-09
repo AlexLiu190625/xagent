@@ -488,19 +488,25 @@ function SeedExistingTask() {
   return null
 }
 
-function SendMessageProbe() {
+function SendMessageProbe({
+  label = "Send message",
+  message = "Optimistic round trip",
+  clientMessageId = "turn-optimistic",
+}: {
+  label?: string
+  message?: string
+  clientMessageId?: string
+}) {
   const { sendMessage } = useApp()
 
   return (
     <button
       type="button"
       onClick={() => {
-        void sendMessage("Optimistic round trip", {
-          clientMessageId: "turn-optimistic",
-        })
+        void sendMessage(message, { clientMessageId })
       }}
     >
-      Send message
+      {label}
     </button>
   )
 }
@@ -844,6 +850,365 @@ describe("AppProvider websocket message routing", () => {
           content: "Optimistic round trip",
           isOptimistic: false,
         }),
+      ])
+    })
+  })
+
+  it("keeps a second user turn whose text repeats an unreconciled optimistic turn", async () => {
+    // Two replies to the same fixed-string form: same text, different turns.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SendMessageProbe
+          label="Send repeated turn"
+          message="Confirmed"
+          clientMessageId="turn-first"
+        />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    // The first turn's live user_message never arrives - a run refused before
+    // it starts emits none (see sendMessage's own note on the quota gate) -
+    // so its bubble stays optimistic and remains a merge candidate.
+    fireEvent.click(screen.getByRole("button", { name: "Send repeated turn" }))
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({ content: "Confirmed", isOptimistic: true }),
+      ])
+    })
+
+    // Inside USER_MESSAGE_REPLACE_WINDOW_MS of the optimistic bubble, which
+    // is what makes the two turns candidates for a content merge at all.
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: new Date().toISOString(),
+        data: {
+          event_id: "user-event-second",
+          event_type: "user_message",
+          data: { message: "Confirmed", turn_id: "turn-second" },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; content: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({
+          id: "msg-user-turn-turn-first",
+          content: "Confirmed",
+          isOptimistic: true,
+        }),
+        expect.objectContaining({
+          id: "msg-user-turn-turn-second",
+          content: "Confirmed",
+          isOptimistic: false,
+        }),
+      ])
+    })
+  })
+
+  it("keeps two optimistic sends that repeat the same text", async () => {
+    // Both ids come from a client_message_id, so neither has been near the wire.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SendMessageProbe
+          label="Send first"
+          message="Confirmed"
+          clientMessageId="turn-first"
+        />
+        <SendMessageProbe
+          label="Send second"
+          message="Confirmed"
+          clientMessageId="turn-second"
+        />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Send first" }))
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<unknown>
+      expect(messages).toHaveLength(1)
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Send second" }))
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({
+          id: "msg-user-turn-turn-first",
+          content: "Confirmed",
+          isOptimistic: true,
+        }),
+        expect.objectContaining({
+          id: "msg-user-turn-turn-second",
+          content: "Confirmed",
+          isOptimistic: true,
+        }),
+      ])
+    })
+  })
+
+  it("renders both repeated clarification replies on a Session transport", async () => {
+    // The incident surface: history is "none", so a collapsed turn never returns.
+    const transport = makeSessionTransport()
+    render(
+      <AppProvider token="token" transport={transport}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    act(() => webSocketOptions.current?.onConnect?.())
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(1))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id").textContent).toBe("1")
+    })
+
+    // First reply: its live user_message never arrives, so the bubble stays
+    // optimistic and remains a merge candidate.
+    await act(async () => {
+      await getSessionControls().sendMessage("Confirmed", {
+        clientMessageId: "session-turn-1",
+      })
+    })
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: new Date().toISOString(),
+        task_id: 1,
+        data: {
+          event_id: "session-user-event-2",
+          event_type: "user_message",
+          data: { message: "Confirmed", turn_id: "session-turn-2" },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; content: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({
+          id: "msg-user-turn-session-turn-1",
+          content: "Confirmed",
+          isOptimistic: true,
+        }),
+        expect.objectContaining({
+          id: "msg-user-turn-session-turn-2",
+          content: "Confirmed",
+          isOptimistic: false,
+        }),
+      ])
+    })
+  })
+
+  it("shows one turn twice when its persisted id disagrees with the sender's", async () => {
+    // The accepted cost of reconciling by identity alone; see the commit.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SendMessageProbe
+          label="Send repeated turn"
+          message="Confirmed"
+          clientMessageId="turn-first"
+        />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Send repeated turn" }))
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<unknown>
+      expect(messages).toHaveLength(1)
+    })
+
+    // Same turn, server-minted id.
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: new Date().toISOString(),
+        data: {
+          event_id: "user-event-server-minted",
+          event_type: "user_message",
+          data: { message: "Confirmed", turn_id: "server-minted-uuid" },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string }>
+      expect(messages).toEqual([
+        expect.objectContaining({ id: "msg-user-turn-turn-first" }),
+        expect.objectContaining({ id: "msg-user-turn-server-minted-uuid" }),
+      ])
+    })
+  })
+
+  it("keeps a repeated turn identified only by event_id", async () => {
+    // The msg-user-event- half of the identity test: a row whose turn_id is
+    // NULL replays carrying only an event_id, and is still its own turn.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SendMessageProbe
+          label="Send repeated turn"
+          message="Confirmed"
+          clientMessageId="turn-first"
+        />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Send repeated turn" }))
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<unknown>
+      expect(messages).toHaveLength(1)
+    })
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: new Date().toISOString(),
+        data: {
+          event_id: "user-event-no-turn",
+          event_type: "user_message",
+          data: { message: "Confirmed" },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({
+          id: "msg-user-turn-turn-first",
+          isOptimistic: true,
+        }),
+        expect.objectContaining({
+          id: "msg-user-event-user-event-no-turn",
+          isOptimistic: false,
+        }),
+      ])
+    })
+  })
+
+  it("does not let blank client message ids collide into one bubble", async () => {
+    // `config` is untyped, so a blank id would otherwise mint a bare
+    // `msg-user-turn-` that every other blank-id turn reconciles onto.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SendMessageProbe label="Send blank one" message="First" clientMessageId="  " />
+        <SendMessageProbe label="Send blank two" message="Second" clientMessageId="  " />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Send blank one" }))
+    fireEvent.click(screen.getByRole("button", { name: "Send blank two" }))
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ id: string; content: string }>
+      expect(messages.map((message) => message.content)).toEqual(["First", "Second"])
+      expect(messages[0].id).not.toBe(messages[1].id)
+      expect(messages.some((message) => message.id === "msg-user-turn-")).toBe(false)
+    })
+  })
+
+  it("still reconciles a repeated user turn that carries no stable identity", async () => {
+    // No turn_id and no event_id: text is the only reconciliation available.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SendMessageProbe
+          label="Send repeated turn"
+          message="Confirmed"
+          clientMessageId="turn-first"
+        />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Send repeated turn" }))
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({ content: "Confirmed", isOptimistic: true }),
+      ])
+    })
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: new Date().toISOString(),
+        data: {
+          event_type: "user_message",
+          data: { message: "Confirmed" },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({ content: "Confirmed", isOptimistic: false }),
       ])
     })
   })
