@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from threading import Event, get_ident
@@ -18,6 +19,7 @@ from tests.web.pool_contention_shared import (
     gated_pool_checkout,
     wait_for_ticks,
 )
+from tests.web.services.active_interaction_read_shared import PRE_CHANGE_EQUIVALENT
 from xagent.core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
@@ -48,6 +50,10 @@ from xagent.web.services.task_command_transport import (
     max_command_defers,
 )
 from xagent.web.services.task_execution_controller import TaskControlState
+from xagent.web.services.task_interaction_close import (
+    ActiveInteractionRead,
+    ActiveInteractionUnavailable,
+)
 from xagent.web.services.task_lease_service import TaskLease, current_task_lease
 from xagent.web.services.task_orchestrator import (
     TaskTurnError,
@@ -1049,21 +1055,35 @@ def test_message_send_skips_the_close_on_a_replayed_injection() -> None:
     close_mock.assert_not_called()
 
 
-# A fabricated id, not the seeded row's -- test_message_send_reads_the_
-# interaction_row_before_injecting hands this to the close instead of the
-# real row id, so a site that re-read the row at close time would hand the
-# close the real id and fail there instead.
-_OBSERVED_INTERACTION_ID = 4321
-
-
-def test_message_send_reads_the_interaction_row_before_injecting() -> None:
+@pytest.mark.parametrize(
+    "active_interaction_read,expected_interaction_id", PRE_CHANGE_EQUIVALENT
+)
+def test_message_send_reads_the_interaction_row_before_injecting(
+    active_interaction_read: ActiveInteractionRead,
+    expected_interaction_id: int | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """The close is keyed on the row observed *before* the injection,
     and only the ordering makes that true -- see task_interaction_close's
     module docstring. Moving the read after the injection leaves the whole
     change doing nothing while the row-level assertions in the test above
-    stay green. The observed value is a fabricated id, not the seeded row's,
-    so a site that re-read the row at close time would hand the close the
-    real id and fail here."""
+    stay green. The Found case's observed value is a fabricated id, not the
+    seeded row's, so a site that re-read the row at close time would hand
+    the close the real id and fail here.
+
+    Parametrized over every state PRE_CHANGE_EQUIVALENT enumerates
+    (Found, Absent, and both Unavailable reasons): this site's translation
+    to the ``int | None`` the close call takes must produce the same
+    result for all three states that it did before this became a
+    three-state read, regardless of which reason an unavailable read
+    carries.
+
+    That equivalence alone would also hold for a two-way ``Found``
+    versus everything-else fold, so the cells also assert the log line
+    this site emits on -- and only on -- the ``ActiveInteractionUnavailable``
+    branch, carrying that state's own reason word. A fold that dropped
+    the third branch leaves both unavailable cells without their line.
+    """
 
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()
@@ -1085,10 +1105,10 @@ def test_message_send_reads_the_interaction_row_before_injecting() -> None:
         db.commit()
         db.refresh(task)
         task_id = int(task.id)
-        # Kept real and distinct from _OBSERVED_INTERACTION_ID: a site that
-        # re-read the row at close time (instead of using the id observed
-        # before injection) would hand the close this real id and fail the
-        # assertion below.
+        # Kept real and distinct from the fabricated id the Found row in
+        # PRE_CHANGE_EQUIVALENT carries: a site that re-read the row at
+        # close time (instead of using the id observed before injection)
+        # would hand the close this real id and fail the assertion below.
         _seed_active_interaction_row(
             db,
             task_id=task_id,
@@ -1100,9 +1120,9 @@ def test_message_send_reads_the_interaction_row_before_injecting() -> None:
 
     order: list[str] = []
 
-    def record_read(_task_id: int) -> int:
+    def record_read(_task_id: int) -> ActiveInteractionRead:
         order.append("read")
-        return _OBSERVED_INTERACTION_ID
+        return active_interaction_read
 
     async def record_injection(
         *_args: object, **_kwargs: object
@@ -1125,6 +1145,7 @@ def test_message_send_reads_the_interaction_row_before_injecting() -> None:
         patch(
             "xagent.web.api.a2a.close_legacy_resume_interaction", return_value=1
         ) as close_mock,
+        caplog.at_level(logging.INFO, logger="xagent.web.api.a2a"),
     ):
         response = client.post(
             f"/api/a2a/agents/{agent_id}/message:send",
@@ -1145,7 +1166,21 @@ def test_message_send_reads_the_interaction_row_before_injecting() -> None:
     close_mock.assert_called_once()
     assert close_mock.call_args.kwargs["task_id"] == task_id
     assert close_mock.call_args.kwargs["run_id"] == "run-close-order"
-    assert close_mock.call_args.kwargs["interaction_id"] == _OBSERVED_INTERACTION_ID
+    assert close_mock.call_args.kwargs["interaction_id"] == expected_interaction_id
+
+    unavailable_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "active interaction read unavailable" in record.getMessage()
+    ]
+    if isinstance(active_interaction_read, ActiveInteractionUnavailable):
+        assert unavailable_lines == [
+            "active interaction read unavailable "
+            f"(reason={active_interaction_read.reason}) for task_id={task_id}; "
+            "the legacy resume close will match no row"
+        ]
+    else:
+        assert unavailable_lines == []
 
 
 @pytest.mark.asyncio
