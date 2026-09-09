@@ -10,6 +10,7 @@ isolation; here we exercise the handlers end to end).
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -25,7 +26,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from tests.shared.execution_scope import register_scope_resolver
-from tests.web.services.active_interaction_read_shared import _PRE_CHANGE_EQUIVALENT
+from tests.web.services.active_interaction_read_shared import PRE_CHANGE_EQUIVALENT
 from tests.web.services.task_lease_shared import (
     live_task_lease as live_task_lease_fixture,
 )
@@ -75,7 +76,10 @@ from xagent.web.services.task_command_transport import (
     TaskCommandRejected,
 )
 from xagent.web.services.task_execution_controller import StaleTaskRunError
-from xagent.web.services.task_interaction_close import ActiveInteractionRead
+from xagent.web.services.task_interaction_close import (
+    ActiveInteractionRead,
+    ActiveInteractionUnavailable,
+)
 from xagent.web.services.task_lease_service import (
     TaskLease,
     current_task_lease,
@@ -2045,13 +2049,14 @@ async def test_live_marker_failure_after_registered_handoff_is_still_accepted(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "active_interaction_read,expected_interaction_id", _PRE_CHANGE_EQUIVALENT
+    "active_interaction_read,expected_interaction_id", PRE_CHANGE_EQUIVALENT
 )
 async def test_live_resume_reads_the_interaction_row_before_injecting(
     live_task_lease,
     db_session,
     active_interaction_read: ActiveInteractionRead,
     expected_interaction_id: int | None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The close is keyed on the row observed *before* the injection, and
     only the ordering makes that true -- see task_interaction_close's
@@ -2059,11 +2064,17 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
     deferred branch carries the same observation instead of taking one of
     its own even later.
 
-    Parametrized over every state _PRE_CHANGE_EQUIVALENT enumerates (Found,
+    Parametrized over every state PRE_CHANGE_EQUIVALENT enumerates (Found,
     Absent, and both Unavailable reasons): this site's translation to the
     ``int | None`` the close call takes must produce the same result for
     all three states that it did before this became a three-state read,
     regardless of which reason an unavailable read carries.
+
+    That equivalence alone would also hold for a two-way ``Found`` versus
+    everything-else fold, so the cells also assert the log line this site
+    emits on -- and only on -- the ``ActiveInteractionUnavailable``
+    branch, carrying that state's own reason word. A fold that dropped the
+    third branch leaves both unavailable cells without their line.
     """
 
     owner = _user(db_session, "close-order-owner")
@@ -2113,6 +2124,7 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
             "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
             return_value=1,
         ) as close_mock,
+        caplog.at_level(logging.INFO, logger="xagent.web.api.websocket"),
     ):
         await _handle_chat_message_unserialized(
             MagicMock(),
@@ -2131,6 +2143,20 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
         run_id="close-order-run",
         interaction_id=expected_interaction_id,
     )
+
+    unavailable_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "active interaction read unavailable" in record.getMessage()
+    ]
+    if isinstance(active_interaction_read, ActiveInteractionUnavailable):
+        assert unavailable_lines == [
+            "active interaction read unavailable "
+            f"(reason={active_interaction_read.reason}) for task_id={int(task.id)}; "
+            "the legacy resume close will match no row"
+        ]
+    else:
+        assert unavailable_lines == []
 
 
 @pytest.mark.asyncio

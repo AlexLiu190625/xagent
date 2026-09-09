@@ -19,12 +19,13 @@ import ast
 import logging
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from typing import get_args
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy import Select, event
 
-from tests.web.services.active_interaction_read_shared import _PRE_CHANGE_EQUIVALENT
+from tests.web.services.active_interaction_read_shared import PRE_CHANGE_EQUIVALENT
 from tests.web.services.interaction_static_scan_shared import _scan_root
 from tests.web.services.task_interaction_schema_shared import (
     make_row,
@@ -53,6 +54,7 @@ from xagent.web.services.task_interaction_close import (
     ACTIVE_INTERACTION_UNAVAILABLE_REASONS,
     ActiveInteractionAbsent,
     ActiveInteractionFound,
+    ActiveInteractionRead,
     ActiveInteractionUnavailable,
     _classify_close_rowcount,
     active_interaction_id_sync,
@@ -834,8 +836,14 @@ def test_close_keeps_the_marker_when_the_pre_injection_read_failed(
         "session_unavailable"
     )
 
-    # The same three-branch translation every production call site performs
-    # (see e.g. a2a.py's): Found -> its id, Absent or Unavailable -> None.
+    # The value every production call site's translation produces for this
+    # state, reached here by a two-branch stand-in rather than a copy of
+    # the three branches themselves: what this test is about is the close
+    # being handed `None`, not the shape of the translation. Whether each
+    # site really keeps Unavailable on its own branch -- and logs it -- is
+    # pinned at the sites, in the parameterized order tests in
+    # tests/web/api/test_a2a_api.py, tests/web/api/v1/test_task_reply.py
+    # and tests/web/api/test_websocket_owner_actor.py.
     if isinstance(active_interaction_read, ActiveInteractionFound):
         observed_id = active_interaction_read.interaction_id
     else:
@@ -851,8 +859,9 @@ def test_close_keeps_the_marker_when_the_pre_injection_read_failed(
 
 
 # --------------------------------------------------------------------------
-# ACTIVE_INTERACTION_UNAVAILABLE_REASONS -- the closed two-word vocabulary
-# the two logger.warning call sites above are keyed to. A future change
+# ACTIVE_INTERACTION_UNAVAILABLE_REASONS -- the two-word reason
+# vocabulary the two logger.warning call sites above are keyed to, and
+# the table every caller-side test parametrizes over. A future change
 # that merges those two log messages back into one would, if it also
 # collapsed the reason vocabulary, slip past every assertion above (each
 # only checks one reason string at a time); this pins the vocabulary's
@@ -1030,7 +1039,7 @@ def test_active_interaction_id_sync_issues_only_the_marker_read_under_a_null_mar
 #      column_is_missing).
 #   2. Which int | None value each state corresponds to in the shape this
 #      reader returned before it became three-state -- pinned once by
-#      _PRE_CHANGE_EQUIVALENT, written in
+#      PRE_CHANGE_EQUIVALENT, written in
 #      tests/web/services/active_interaction_read_shared.py because the
 #      layer-3 tests read it too, and by the test below.
 #   3. That every call site really applies that same projection -- pinned
@@ -1048,7 +1057,7 @@ def test_active_interaction_id_sync_issues_only_the_marker_read_under_a_null_mar
 
 
 def test_the_pre_change_equivalent_table_covers_every_state() -> None:
-    """``_PRE_CHANGE_EQUIVALENT`` is what every production call site's
+    """``PRE_CHANGE_EQUIVALENT`` is what every production call site's
     translation is checked against (the parameterized order tests in the
     three close sites' own test files read the same table out of
     active_interaction_read_shared.py); this pins the table itself as
@@ -1060,15 +1069,19 @@ def test_the_pre_change_equivalent_table_covers_every_state() -> None:
     adding a row for it here, or add a third word to
     ``ACTIVE_INTERACTION_UNAVAILABLE_REASONS`` without adding a row for it
     here, and one of the two assertions below goes red.
+
+    The first assertion reads the union's members out of the union itself
+    (``typing.get_args``) rather than repeating the three class names: a
+    hand-written literal set would have to be edited by the same change
+    that adds a fourth member, so it would go green again on exactly the
+    change this test exists to catch.
     """
-    assert {type(state) for state, _ in _PRE_CHANGE_EQUIVALENT} == {
-        ActiveInteractionFound,
-        ActiveInteractionAbsent,
-        ActiveInteractionUnavailable,
-    }
+    assert {type(state) for state, _ in PRE_CHANGE_EQUIVALENT} == set(
+        get_args(ActiveInteractionRead)
+    )
     assert {
         state.reason
-        for state, _ in _PRE_CHANGE_EQUIVALENT
+        for state, _ in PRE_CHANGE_EQUIVALENT
         if isinstance(state, ActiveInteractionUnavailable)
     } == ACTIVE_INTERACTION_UNAVAILABLE_REASONS
 

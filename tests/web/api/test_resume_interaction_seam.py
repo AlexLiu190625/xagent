@@ -21,6 +21,7 @@ has real data to answer against.
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -42,7 +43,10 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import ops_signals
-from xagent.web.services.task_interaction_close import ActiveInteractionUnavailable
+from xagent.web.services.task_interaction_close import (
+    ACTIVE_INTERACTION_UNAVAILABLE_REASONS,
+    ActiveInteractionUnavailable,
+)
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -787,8 +791,12 @@ async def test_stale_run_active_row_does_not_trip_the_seam(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reason", sorted(ACTIVE_INTERACTION_UNAVAILABLE_REASONS))
 async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_unavailable(
-    monkeypatch: pytest.MonkeyPatch, _seeded_task: int
+    monkeypatch: pytest.MonkeyPatch,
+    _seeded_task: int,
+    reason: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """``ActiveInteractionUnavailable`` takes its own branch at this gate,
     distinct from ``ActiveInteractionAbsent``, but today's action on that
@@ -808,12 +816,20 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
     three-way branch and what each arm does), not inside the function
     itself -- its own failure branches are pinned in
     tests/web/services/test_task_interaction_close.py.
+
+    Parametrized over the whole reason vocabulary
+    (``ACTIVE_INTERACTION_UNAVAILABLE_REASONS``) rather than one word:
+    this gate must not start keying on which reason an unavailable read
+    carries, and a reason word added later gains its cell here without
+    anyone remembering to add one. The log line this branch emits is
+    asserted too -- it is the only trace this arm leaves, since the gate's
+    action here is to do nothing.
     """
 
     monkeypatch.setattr(
         websocket_api,
         "active_interaction_id_sync",
-        lambda task_id: ActiveInteractionUnavailable("lookup_failed"),
+        lambda task_id: ActiveInteractionUnavailable(reason),
     )
 
     snapshot = _snapshot(task_id=_seeded_task)
@@ -872,6 +888,9 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
         stack.enter_context(
             patch.object(chat_api, "get_agent_manager", lambda: agent_manager)
         )
+        stack.enter_context(
+            caplog.at_level(logging.INFO, logger="xagent.web.api.websocket")
+        )
 
         result = await websocket_api._handle_resume_task_unserialized(
             MagicMock(),
@@ -895,6 +914,14 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
         not in ops_signals.active_degradations()
     )
     assert result.outcome is not websocket_api.ResumeCommandOutcome.REJECTED
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if "the active interaction read was unavailable" in record.getMessage()
+    ] == [
+        f"the active interaction read was unavailable (reason={reason}) for "
+        f"task_id={_seeded_task} run_id={RUN_ID}; the resume proceeds"
+    ]
 
 
 # active_interaction_id_sync's own four branches (no database configured

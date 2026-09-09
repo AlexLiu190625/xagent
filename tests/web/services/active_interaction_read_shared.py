@@ -26,10 +26,17 @@ from __future__ import annotations
 from xagent.web.services.task_interaction_close import (
     ActiveInteractionAbsent,
     ActiveInteractionFound,
+    ActiveInteractionRead,
     ActiveInteractionUnavailable,
 )
 
-_PRE_CHANGE_EQUIVALENT: list[tuple[object, int | None]] = [
+# Annotated with the union itself rather than ``object``: a row carrying
+# something that is not an ``ActiveInteractionRead`` is a type error at the
+# table, not a mystery failure in whichever call site's parameterized test
+# reads it. ``tests/`` is outside this repo's mypy scope, so the annotation
+# only pays off for a reader and for an editor's checker -- which is still
+# more than ``object`` offers either.
+PRE_CHANGE_EQUIVALENT: list[tuple[ActiveInteractionRead, int | None]] = [
     (ActiveInteractionFound(4321), 4321),
     (ActiveInteractionAbsent(), None),
     (ActiveInteractionUnavailable("session_unavailable"), None),
