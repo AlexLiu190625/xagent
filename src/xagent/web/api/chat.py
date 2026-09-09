@@ -5451,13 +5451,22 @@ def post_task_connector_runtime_values(
     now present, which is what the response's own ``satisfied`` fields
     answer.
 
-    Every failure -- validation, a stored-value conflict, or a concurrent
-    write racing this one to the same row -- is rendered through
-    ``_connector_runtime_error_response`` rather than the plain-``detail``
-    ``HTTPException`` the two read endpoints above use, because a caller
-    needs the structured ``code``/``details.reason`` to decide how to
-    recover (retry, refresh and drop already-satisfied keys, or give up),
-    not just a status code.
+    Every ``ConnectorRuntimeError`` raised anywhere on this request path --
+    validation, a stored-value conflict, a concurrent write racing this one
+    to the same row, and the agent/workforce resolution that runs before
+    the write -- is rendered through ``_connector_runtime_error_response``
+    rather than the plain-``detail`` ``HTTPException`` the two read
+    endpoints above use, because a caller needs the structured
+    ``code``/``details.reason`` to decide how to recover (retry, refresh
+    and drop already-satisfied keys, or give up), not just a status code.
+
+    Anything else -- a resolver raising on a malformed workforce snapshot,
+    a driver error mid-write, a failing ``db.commit()`` -- is rolled back
+    and re-raised unchanged, so it ends as a bare 500. Such a failure is
+    deliberately not dressed up in this envelope: the envelope's ``code``
+    is a contract about a condition the caller can act on, and an
+    unclassified fault is not one. What the rollback guarantees either way
+    is that no partial batch survives the request.
     """
 
     task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
@@ -5476,16 +5485,24 @@ def post_task_connector_runtime_values(
     # what the response lists but which connectors the caller may write
     # to at all, so neither the over-report nor the under-report is
     # acceptable.
-    workforce_runtime = resolve_workforce_task_runtime(db, task)
-    agent = _load_agent_for_task_runtime(db, task, workforce_runtime)
     try:
+        workforce_runtime = resolve_workforce_task_runtime(db, task)
+        agent = _load_agent_for_task_runtime(db, task, workforce_runtime)
         requirements = apply_task_connector_runtime_context_values(
             db=db, task=task, agent=agent, payload_items=request.items
         )
+        db.commit()
     except ConnectorRuntimeError as exc:
         db.rollback()
         return _connector_runtime_error_response(exc)
-    db.commit()
+    except Exception:
+        # Not a fallback: the exception keeps travelling and this request
+        # still ends as a bare 500. The rollback is the whole point --
+        # a commit that raises leaves the session's transaction open with
+        # this batch's rows already flushed into it, and every other
+        # failure past the flush leaves the same thing behind.
+        db.rollback()
+        raise
     return requirements
 
 

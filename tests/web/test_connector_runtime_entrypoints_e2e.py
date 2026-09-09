@@ -4191,6 +4191,46 @@ def test_values_endpoint_returns_503_when_the_insert_keeps_colliding(
     assert _stored_context(task_id, server_id) == {"a": "1"}
 
 
+def test_values_endpoint_rolls_back_when_the_commit_itself_fails(
+    e2e_db: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``db.commit()`` that raises is rolled back explicitly and the
+    exception is left to travel: a bare 500, not the typed envelope, and
+    nothing of the batch in the table. The envelope is reserved for a
+    ``ConnectorRuntimeError``, whose ``code`` promises the caller a
+    condition they can act on; an unclassified commit fault is not one.
+
+    ``Session.commit``/``Session.rollback`` are patched only for the
+    duration of the request, so the setup above and the table read below
+    both run against the real methods.
+    """
+    headers, task_id, server_id = _setup_context_task(required=False)
+    ref = {"connector_type": "mcp", "connector_id": server_id}
+    body = {"items": [{"connector_ref": ref, "context": {"auth_token": "v"}}]}
+
+    real_rollback = Session.rollback
+    rollbacks = {"n": 0}
+
+    def _failing_commit(self: Session) -> None:
+        raise RuntimeError("commit-failure-must-not-leak")
+
+    def _counting_rollback(self: Session) -> None:
+        rollbacks["n"] += 1
+        real_rollback(self)
+
+    monkeypatch.setattr(Session, "commit", _failing_commit)
+    monkeypatch.setattr(Session, "rollback", _counting_rollback)
+    try:
+        response = client.post(_values_url(task_id), headers=headers, json=body)
+    finally:
+        monkeypatch.undo()
+
+    assert response.status_code == 500, response.text
+    assert "commit-failure-must-not-leak" not in response.text
+    assert rollbacks["n"] == 1
+    assert _context_row_count(task_id) == 0
+
+
 # ---------------------------------------------------------------------------
 # Values-endpoint concurrency: two sessions racing the write. Driven
 # below the HTTP layer, directly against
