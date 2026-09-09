@@ -264,6 +264,21 @@ def serialize_trace_data(data: Dict[str, Any]) -> Dict[str, Any]:
     broadcasting -- this function never reads ``self``, so lifting it
     out of ``WebSocketTraceHandler`` changes nothing about its
     behavior for the existing caller below.
+
+    Truncation, field pruning, or any wholesale replacement of the
+    payload added here changes how this pass relates to the two agent
+    checkpoint checks in ``_convert_trace_event_to_stream_event``: one
+    runs on the raw payload and one on this function's output, and they
+    agree only while this pass either preserves the checked fields or
+    replaces the payload outright. The fallback below already does the
+    latter, which is why the raw check exists. Any change to what this
+    function may return must be reviewed together with both checks, and
+    with the same reuse in ``v1/_events_stream.py``.
+
+    The mechanical guard for this is the parametrized case in
+    ``test_raw_and_serialized_checkpoint_checks_drop_the_same_set`` that
+    feeds a checkpoint payload this pass cannot serialize: it asserts the
+    raw check catches it before this fallback runs.
     """
     import json
     from datetime import datetime
@@ -355,6 +370,19 @@ class WebSocketTraceHandler(TraceHandler):
     async def handle_event(self, event: TraceEvent) -> None:
         """Send trace event to WebSocket clients using unified stream format."""
         try:
+            # Nothing is attached to this task, so every frame this method
+            # could build would be discarded by ``broadcast_to_task``'s own
+            # audience check at the end. Ask that same question first and
+            # skip the serialization and the two database reads between
+            # here and there. ``ConnectionManager`` is the single registry
+            # for every audience -- browser sockets and v1 SSE sinks alike
+            # register there -- so an empty registry means no reader exists.
+            # A client that attaches later replays this task's history from
+            # ``trace_events``, which ``DatabaseTraceHandler`` has already
+            # committed by the time this handler runs.
+            if not manager.has_connections_for_task(self.task_id):
+                return
+
             # Debug: Log the event being handled (reduced verbosity)
             logger.debug(
                 f"WebSocketTraceHandler handling event: {event.event_type.value} for task {self.task_id}"
@@ -445,7 +473,9 @@ class WebSocketTraceHandler(TraceHandler):
              RCA payload (raw LLM messages / response) that must not
              leak to clients.
           2. Agent checkpoint data -- internal runtime state the
-             frontend doesn't render (checked after serialization).
+             frontend doesn't render (checked on the raw payload first,
+             then again after serialization; see the comment there for
+             why both checks are kept).
         """
         # Server-only audit traces: drop early so we don't waste effort
         # serializing payloads we're about to discard.
@@ -460,6 +490,30 @@ class WebSocketTraceHandler(TraceHandler):
         logger.debug(
             f"Converting trace event to stream event: {event_type_str} for task {self.task_id}"
         )
+
+        # Checkpoints never reach a client, so decide that on the raw
+        # payload instead of after a full recursive serialization pass.
+        # Both checks stay, because neither one subsumes the other:
+        #   * a payload that is not a checkpoint here can become one
+        #     below, because ``serialize_trace_data`` turns objects
+        #     exposing ``model_dump`` / ``to_dict`` into plain dicts. No
+        #     producer on the standard execution path emits that shape
+        #     today -- ``TraceCheckpointStore`` nests the legacy payload
+        #     under ``snapshot`` -- and no stored rows of that shape were
+        #     found when this was audited. The check stays so this copy
+        #     of the predicate agrees with the other copy, which
+        #     historical replay also calls;
+        #   * a payload that IS a checkpoint here can stop looking like
+        #     one below, because a payload ``json.dumps`` rejects is
+        #     replaced wholesale by a three-key ``_serialization_error``
+        #     placeholder that carries none of the checked fields.
+        # The second case is the one behavioral difference this check
+        # introduces: an unserializable checkpoint used to reach clients
+        # as a content-free error placeholder and no longer does. The
+        # ``DatabaseTraceHandler`` copy of the same serialization pass
+        # still logs that failure on the same payload.
+        if is_agent_checkpoint_data(event.data):
+            return None
 
         # Make a deep copy of data and serialize non-JSON-serializable objects
         data = self._serialize_data(event.data)

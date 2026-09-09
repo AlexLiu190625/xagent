@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
@@ -29,10 +30,15 @@ from xagent.core.agent.trace import (
     TraceCategory,
     TraceEvent,
     TraceEventType,
+    Tracer,
     TraceScope,
+)
+from xagent.core.tools.adapters.vibe.agent_tool import (
+    _DelegatedAgentWebSocketTraceHandler,
 )
 from xagent.web.api.trace_handlers import DatabaseTraceHandler, _ResolvedReadPartition
 from xagent.web.api.websocket import (
+    ConnectionManager,
     _agent_outbound_event_type,
     _is_agent_checkpoint_data,
     _is_duplicate_user_message_turn,
@@ -45,6 +51,7 @@ from xagent.web.api.websocket import (
 from xagent.web.api.ws_trace_handlers import (
     WebSocketTraceHandler,
     get_event_type_mapping,
+    serialize_trace_data,
 )
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
@@ -3790,6 +3797,1122 @@ def test_websocket_trace_handler_dedupes_prior_user_message_turn_id(
     )
     assert not handler._has_prior_user_message_turn(
         "user_message", {"turn_id": "turn-2"}, "second-event"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests for skipping WebSocket trace work when a task has no audience, and
+# for dropping agent checkpoint data before serializing it rather than
+# after. These land in this file because it is already the landing spot for
+# WebSocketTraceHandler / checkpoint-stream coverage.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case_id, event_type, step_id, data",
+    [
+        (
+            "checkpoint",
+            CHECKPOINT_EVENT_TYPE,
+            None,
+            {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "execution_id": "exec-i1",
+                "snapshot": {"label": "before_llm"},
+            },
+        ),
+        (
+            "llm_call_start",
+            TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.LLM),
+            "step-1",
+            {"model": "gpt-test"},
+        ),
+        (
+            "user_message",
+            TraceEventType(TraceScope.TASK, TraceAction.START, TraceCategory.MESSAGE),
+            None,
+            {"message": "hi", "turn_id": "turn-i1"},
+        ),
+        (
+            "data_not_a_dict",
+            CHECKPOINT_EVENT_TYPE,
+            None,
+            ["not", "a", "dict"],
+        ),
+    ],
+)
+async def test_handle_event_does_no_work_without_an_attached_audience(
+    case_id, event_type, step_id, data, monkeypatch
+) -> None:
+    """No audience means no work.
+
+    Every frame ``handle_event`` could build for an unattached task would be
+    discarded by ``broadcast_to_task``'s own audience check anyway, so the
+    audience check at the top of ``handle_event`` must make the whole call a
+    no-op -- no serialization, no thread-pool submission, no broadcast --
+    regardless of the event's shape. Covers a checkpoint event, an ordinary
+    event, a ``user_message`` event (the one type that would otherwise
+    trigger an extra database read via ``asyncio.to_thread`` inside
+    ``_has_prior_user_message_turn``), and a non-dict payload.
+    """
+    task_id = 90101
+    local_manager = ConnectionManager()
+    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+
+    serialize_calls: list[object] = []
+    monkeypatch.setattr(
+        "xagent.web.api.ws_trace_handlers.serialize_trace_data",
+        lambda payload: serialize_calls.append(payload) or payload,
+    )
+
+    to_thread_calls: list[object] = []
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        to_thread_calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "xagent.web.api.ws_trace_handlers.asyncio.to_thread", fake_to_thread
+    )
+
+    broadcast_calls: list[object] = []
+
+    async def fake_broadcast(message, task_id_arg):
+        broadcast_calls.append((message, task_id_arg))
+
+    monkeypatch.setattr(local_manager, "broadcast_to_task", fake_broadcast)
+
+    handler = WebSocketTraceHandler(task_id)
+    event = TraceEvent(
+        event_type,
+        task_id=str(task_id),
+        step_id=step_id,
+        data=data,
+        timestamp=1_700_000_000.0,
+    )
+
+    await handler.handle_event(event)
+
+    assert serialize_calls == []
+    assert to_thread_calls == []
+    assert broadcast_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        "llm_call_start",
+        "tool_execution_end",
+        "user_message_first_turn",
+        "user_message_duplicate_turn",
+    ],
+)
+async def test_broadcast_payload_is_unchanged_for_an_attached_audience(
+    case_id, monkeypatch
+) -> None:
+    """The payload handed to ``broadcast_to_task`` is unchanged for an
+    attached audience.
+
+    Captures at ``broadcast_to_task``'s own input, not at ``send_text`` --
+    the ``run_id`` / ``state_version`` stamping
+    ``_with_current_task_control_state`` adds happens strictly after this
+    point and depends on database state that would make a hardcoded
+    expectation flaky. ``task_description`` is set directly on the handler
+    (not read from the database) on purpose: that keeps the expected
+    payload pinnable without depending on ``_load_task_description``'s own
+    read path, which
+    ``test_task_description_load_is_deferred_until_an_audience_attaches``
+    covers, not this one.
+
+    Deliberately excludes the three event families
+    ``normalize_public_trace_event`` rebuilds from a field whitelist --
+    ``GENERAL_ERROR_EVENT_TYPES``, a failed ``PATTERN_END_EVENT_TYPES``
+    event, and a ``task_update_general`` carrying a delegation summary.
+    None of those whitelists carry ``task_description``, so adding one of
+    those events to this parametrization without a different expected
+    payload would fail for a reason that has nothing to do with this
+    change. The ``tool_execution_end`` case is still routed through
+    ``redact_runtime_sensitive_payload`` (every ``tool_execution_*`` event
+    is); its payload here uses only non-sensitive key names so the redirect
+    is a no-op and the hardcoded expectation still matches.
+    """
+    SessionLocal, db, task = _create_trace_handler_test_task("i2-audience")
+    task_id = int(task.id)
+    if case_id == "user_message_duplicate_turn":
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="i2-earlier-turn",
+                event_type="user_message",
+                timestamp=task.created_at,
+                data={"message": "first", "turn_id": "turn-i2-dup"},
+            )
+        )
+        db.commit()
+    db.close()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+
+    local_manager = ConnectionManager()
+    local_manager.register_connection(object(), task_id)
+    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+
+    broadcast_calls: list[tuple[dict, int]] = []
+
+    async def fake_broadcast(message, task_id_arg):
+        broadcast_calls.append((message, task_id_arg))
+
+    monkeypatch.setattr(local_manager, "broadcast_to_task", fake_broadcast)
+
+    handler = WebSocketTraceHandler(task_id)
+    handler._task_description = "Task chat description"
+    handler._task_description_loaded = True
+
+    fixed_timestamp = 1_700_000_123.0
+    expected_event_type: str | None
+    expected_data: dict | None
+
+    if case_id == "llm_call_start":
+        event_type = TraceEventType(
+            TraceScope.ACTION, TraceAction.START, TraceCategory.LLM
+        )
+        step_id = "step-llm"
+        data = {"model": "gpt-test", "prompt": "hello"}
+        expected_event_type = "llm_call_start"
+        expected_data = {
+            "model": "gpt-test",
+            "prompt": "hello",
+            "task_description": "Task chat description",
+        }
+    elif case_id == "tool_execution_end":
+        event_type = TraceEventType(
+            TraceScope.ACTION, TraceAction.END, TraceCategory.TOOL
+        )
+        step_id = "step-tool"
+        data = {"tool_name": "search", "output": "result text"}
+        expected_event_type = "tool_execution_end"
+        expected_data = {
+            "tool_name": "search",
+            "output": "result text",
+            "task_description": "Task chat description",
+        }
+    elif case_id == "user_message_first_turn":
+        event_type = TraceEventType(
+            TraceScope.TASK, TraceAction.START, TraceCategory.MESSAGE
+        )
+        step_id = None
+        data = {"message": "hello there", "turn_id": "turn-i2-fresh"}
+        expected_event_type = "user_message"
+        expected_data = {
+            "message": "hello there",
+            "turn_id": "turn-i2-fresh",
+            "task_description": "Task chat description",
+        }
+    else:
+        event_type = TraceEventType(
+            TraceScope.TASK, TraceAction.START, TraceCategory.MESSAGE
+        )
+        step_id = None
+        data = {"message": "repeat", "turn_id": "turn-i2-dup"}
+        expected_event_type = None
+        expected_data = None
+
+    event = TraceEvent(
+        event_type,
+        task_id=str(task_id),
+        step_id=step_id,
+        data=data,
+        timestamp=fixed_timestamp,
+    )
+
+    await handler.handle_event(event)
+
+    if case_id == "user_message_duplicate_turn":
+        assert broadcast_calls == []
+        return
+
+    assert len(broadcast_calls) == 1
+    message, broadcast_task_id = broadcast_calls[0]
+    assert broadcast_task_id == task_id
+    assert message["type"] == "trace_event"
+    assert message["event_type"] == expected_event_type
+    assert message["task_id"] == task_id
+    assert message["timestamp"] == fixed_timestamp
+    assert isinstance(message["event_id"], str) and message["event_id"]
+    assert message["data"] == expected_data
+    if step_id is not None:
+        assert message["step_id"] == step_id
+    else:
+        assert "step_id" not in message
+    assert "parent_id" not in message
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        "current_shape_checkpoint",
+        "legacy_shape_both_dicts",
+        "legacy_shape_pattern_state_none",
+        "legacy_shape_context_none",
+        "legacy_shape_pattern_state_model_dump_object",
+        "legacy_shape_context_to_dict_object",
+        "non_checkpoint",
+        "current_shape_checkpoint_unserializable_snapshot",
+        "current_shape_checkpoint_circular_reference_snapshot",
+    ],
+)
+def test_raw_and_serialized_checkpoint_checks_drop_the_same_set(case_id) -> None:
+    """The pre-serialization checkpoint check and the post-serialization one
+    drop the same set of frames, from the client's point of view.
+
+    Both checks stay because neither subsumes the other -- see the comment
+    at their call site in ``_convert_trace_event_to_stream_event``. This
+    parametrization is the mechanical guard for that claim, plus the one
+    behavioral difference the raw check introduces (the
+    ``_unserializable_snapshot`` case) and the one case where today's code
+    already drops the frame for an unrelated reason (the
+    ``_circular_reference_snapshot`` case, ``RecursionError``).
+
+    Per-case commentary is written as an inline string literal at the top
+    of that case's branch, rather than as this function's own docstring,
+    because several cases each carry a distinct piece of text and a single
+    function can only have one docstring.
+    """
+    task_id = 90308
+    handler = WebSocketTraceHandler(task_id)
+
+    if case_id == "current_shape_checkpoint":
+        data = {
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "execution_id": "exec-i3-1",
+            "snapshot": {"label": "before_llm"},
+        }
+        event = TraceEvent(
+            CHECKPOINT_EVENT_TYPE, task_id=str(task_id), data=data, timestamp=1.0
+        )
+        assert handler._convert_trace_event_to_stream_event(event) is None
+
+    elif case_id == "legacy_shape_both_dicts":
+        data = {"type": "checkpoint", "pattern_state": {}, "context": {}}
+        event = TraceEvent(
+            CHECKPOINT_EVENT_TYPE, task_id=str(task_id), data=data, timestamp=1.0
+        )
+        assert handler._convert_trace_event_to_stream_event(event) is None
+
+    elif case_id == "legacy_shape_pattern_state_none":
+        """Characterization, not endorsement.
+
+        ``is_agent_checkpoint_data``'s second branch requires *both*
+        ``pattern_state`` and ``context`` to be dicts
+        (``ws_trace_handlers.py:236-240``), while the producer at
+        ``core/agent/runtime.py:1573-1597`` leaves either one ``None`` when the
+        pattern has no ``get_state`` or the context has no ``to_dict`` -- and
+        attaches ``execution_snapshot`` independently of both. A payload of that
+        shape is therefore not classified as a checkpoint and does reach the
+        client today, ``type: "checkpoint"`` and all. This case records that
+        behaviour so a change to it is visible; it is not a statement that
+        shipping such a payload to a browser is correct. If that is later judged
+        a leak, fix it deliberately and update this case -- do not assume a red
+        here means the predicate was broken.
+        """
+        data = {"type": "checkpoint", "pattern_state": None, "context": {}}
+        event = TraceEvent(
+            CHECKPOINT_EVENT_TYPE, task_id=str(task_id), data=data, timestamp=1.0
+        )
+        assert handler._convert_trace_event_to_stream_event(event) is not None
+
+    elif case_id == "legacy_shape_context_none":
+        """Characterization, not endorsement.
+
+        ``is_agent_checkpoint_data``'s second branch requires *both*
+        ``pattern_state`` and ``context`` to be dicts
+        (``ws_trace_handlers.py:236-240``), while the producer at
+        ``core/agent/runtime.py:1573-1597`` leaves either one ``None`` when the
+        pattern has no ``get_state`` or the context has no ``to_dict`` -- and
+        attaches ``execution_snapshot`` independently of both. A payload of that
+        shape is therefore not classified as a checkpoint and does reach the
+        client today, ``type: "checkpoint"`` and all. This case records that
+        behaviour so a change to it is visible; it is not a statement that
+        shipping such a payload to a browser is correct. If that is later judged
+        a leak, fix it deliberately and update this case -- do not assume a red
+        here means the predicate was broken.
+        """
+        data = {"type": "checkpoint", "pattern_state": {}, "context": None}
+        event = TraceEvent(
+            CHECKPOINT_EVENT_TYPE, task_id=str(task_id), data=data, timestamp=1.0
+        )
+        assert handler._convert_trace_event_to_stream_event(event) is not None
+
+    elif case_id == "legacy_shape_pattern_state_model_dump_object":
+        """Regression guard, not a description of today's traffic.
+
+        The standard web execution path wires ``PatternRuntime`` with a
+        ``TraceCheckpointStore`` (``service.py:579`` -> ``:587`` ->
+        ``execution_adapter.py:294`` -> ``runner.py:235``), and that store exposes
+        both ``checkpoint`` and ``write_checkpoint``, so ``_emit_checkpoint``
+        always takes its first branch and nests the legacy payload under
+        ``snapshot``. No producer on that path emits the top-level legacy shape
+        this case feeds in. The case is kept because the same predicate logic has
+        two implementations and three call sites, one of them in historical
+        replay. No stored rows of this shape were found when this was audited;
+        the check is kept so this copy of the predicate stays in step with the
+        copy historical replay calls. Do not delete the post-serialization
+        check on the grounds that this case is synthetic.
+        """
+
+        class _ModelDumpPatternState:
+            def model_dump(self) -> dict:
+                return {"steps": []}
+
+        data = {
+            "type": "checkpoint",
+            "pattern_state": _ModelDumpPatternState(),
+            "context": {},
+        }
+        event = TraceEvent(
+            CHECKPOINT_EVENT_TYPE, task_id=str(task_id), data=data, timestamp=1.0
+        )
+        assert handler._convert_trace_event_to_stream_event(event) is None
+
+    elif case_id == "legacy_shape_context_to_dict_object":
+        """Regression guard, not a description of today's traffic.
+
+        The standard web execution path wires ``PatternRuntime`` with a
+        ``TraceCheckpointStore`` (``service.py:579`` -> ``:587`` ->
+        ``execution_adapter.py:294`` -> ``runner.py:235``), and that store exposes
+        both ``checkpoint`` and ``write_checkpoint``, so ``_emit_checkpoint``
+        always takes its first branch and nests the legacy payload under
+        ``snapshot``. No producer on that path emits the top-level legacy shape
+        this case feeds in. The case is kept because the same predicate logic has
+        two implementations and three call sites, one of them in historical
+        replay. No stored rows of this shape were found when this was audited;
+        the check is kept so this copy of the predicate stays in step with the
+        copy historical replay calls. Do not delete the post-serialization
+        check on the grounds that this case is synthetic.
+        """
+
+        class _ToDictContext:
+            def to_dict(self) -> dict:
+                return {"messages": []}
+
+        data = {
+            "type": "checkpoint",
+            "pattern_state": {},
+            "context": _ToDictContext(),
+        }
+        event = TraceEvent(
+            CHECKPOINT_EVENT_TYPE, task_id=str(task_id), data=data, timestamp=1.0
+        )
+        assert handler._convert_trace_event_to_stream_event(event) is None
+
+    elif case_id == "non_checkpoint":
+        data = {"model": "gpt-test", "prompt": "hello"}
+        event = TraceEvent(
+            TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.LLM),
+            task_id=str(task_id),
+            step_id="step-1",
+            data=data,
+            timestamp=1.0,
+        )
+        assert handler._convert_trace_event_to_stream_event(event) is not None
+
+    elif case_id == "current_shape_checkpoint_unserializable_snapshot":
+        """The one drop this change adds.
+
+        Before this change the frame went out as an error placeholder:
+        ``serialize_trace_data`` replaces the whole payload with
+        ``_serialization_error`` / ``_original_type`` / ``_error``
+        (``ws_trace_handlers.py:340-344``), and ``:522-523`` then adds
+        ``task_description`` on top whenever the task has a non-empty
+        description -- so the client received a frame carrying none of the
+        checkpoint's own content. After this change the raw check catches it
+        first and nothing is broadcast.
+
+        This case is the mechanical counterpart of the reverse constraint
+        appended to ``serialize_trace_data``'s docstring: it holds the raw check
+        responsible for every payload that pass replaces wholesale. If someone
+        adds truncation or field pruning there, this case is where it shows up.
+        """
+
+        class _Unserializable:
+            pass
+
+        data = {
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "execution_id": "exec-i3-8",
+            "snapshot": {"weird": _Unserializable()},
+        }
+        event = TraceEvent(
+            CHECKPOINT_EVENT_TYPE, task_id=str(task_id), data=data, timestamp=1.0
+        )
+        assert handler._convert_trace_event_to_stream_event(event) is None
+
+    else:
+        assert case_id == "current_shape_checkpoint_circular_reference_snapshot"
+        # Before this change, a circular reference in the snapshot made
+        # ``serialize_trace_data`` raise ``RecursionError`` while walking it;
+        # that exception propagated out of
+        # ``_convert_trace_event_to_stream_event`` uncaught and was only
+        # stopped by ``handle_event``'s own ``except Exception``, which drops
+        # the frame and logs a warning. No client received it before this
+        # change either -- the only difference after this change is that the
+        # raw check catches it first and that warning is no longer written.
+        circular: dict = {}
+        circular["self"] = circular
+        data = {
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "execution_id": "exec-i3-9",
+            "snapshot": circular,
+        }
+        event = TraceEvent(
+            CHECKPOINT_EVENT_TYPE, task_id=str(task_id), data=data, timestamp=1.0
+        )
+        assert handler._convert_trace_event_to_stream_event(event) is None
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_event_with_an_audience_never_calls_serialize_trace_data(
+    monkeypatch,
+) -> None:
+    """Extra guard on the ``serialize_trace_data`` call count: with an
+    audience attached, a checkpoint event never reaches
+    ``serialize_trace_data`` at all -- the raw check in
+    ``_convert_trace_event_to_stream_event`` returns before
+    ``_serialize_data`` is called.
+    """
+    task_id = 90309
+    local_manager = ConnectionManager()
+    local_manager.register_connection(object(), task_id)
+    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+
+    serialize_calls: list[object] = []
+    monkeypatch.setattr(
+        "xagent.web.api.ws_trace_handlers.serialize_trace_data",
+        lambda payload: serialize_calls.append(payload) or payload,
+    )
+
+    handler = WebSocketTraceHandler(task_id)
+    handler._task_description = None
+    handler._task_description_loaded = True
+    event = TraceEvent(
+        CHECKPOINT_EVENT_TYPE,
+        task_id=str(task_id),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "execution_id": "exec-audience",
+            "snapshot": {"label": "before_llm"},
+        },
+        timestamp=1_700_000_800.0,
+    )
+
+    await handler.handle_event(event)
+
+    assert serialize_calls == []
+
+
+class _MinimalDuckTypedSink:
+    """A stand-in that only implements ``send_text``, the one attribute
+    ``ConnectionManager`` and its callers actually require of a registered
+    connection -- used to cover the audience paths that do not need a real
+    ``starlette`` ``WebSocket`` (v1 SSE, and the downstream adapters that
+    hand the engine's ``register_connection`` a different object type)."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send_text(self, text: str) -> None:
+        self.sent.append(text)
+
+
+def _register_builder_preview_audience(
+    local_manager: ConnectionManager, task_id: int, replica: object
+) -> None:
+    """Builder preview: no historical replay, and no reconciliation channel either.
+
+    The web chat, guest widget and share-link paths call
+    ``handle_status_request`` right after registering, so a frame skipped
+    before attach still reaches the client from the database. Several paths
+    do not replay -- v1 SSE among them -- but each of those documents a
+    reconciliation channel the client is expected to use instead. This one
+    has neither.
+
+    Its safety rests on ordering **for the first preview turn on a socket**:
+    ``websocket.py:10740`` writes ``websocket.state.preview_task_id`` one line
+    before ``register_connection``, and the task starts only after that. **On
+    later turns the branch at ``websocket.py:10742`` reuses the id without
+    re-registering**, so safety then rests on the socket still being in the
+    registry -- which ``broadcast_to_task`` can revoke on a send error
+    (``websocket.py:5237``) without clearing ``preview_task_id``. That case is
+    not a regression here: with the socket out of the registry, the frame is
+    dropped before this change (by ``broadcast_to_task``) and after it (by the
+    audience check), so no client sees a difference either way.
+
+    If anyone adds reconnect, resume, or any second way to bind a socket to a
+    preview task that is already running, the skip becomes a permanent frame
+    loss on this path. Re-review the audience check before adding one.
+    """
+    local_manager.register_connection(replica, task_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case_id, register",
+    [
+        (
+            "web_chat_websocket",
+            lambda m, t: m.register_connection(_MinimalDuckTypedSink(), t),
+        ),
+        (
+            "builder_preview_websocket",
+            lambda m, t: _register_builder_preview_audience(
+                m, t, _MinimalDuckTypedSink()
+            ),
+        ),
+        (
+            "v1_sse_sink",
+            lambda m, t: m.register_connection(_MinimalDuckTypedSink(), t),
+        ),
+        (
+            "guest_widget_websocket",
+            lambda m, t: m.register_connection(_MinimalDuckTypedSink(), t),
+        ),
+        (
+            "share_link_websocket",
+            lambda m, t: m.register_connection(_MinimalDuckTypedSink(), t),
+        ),
+        (
+            "downstream_duck_typed_adapter",
+            lambda m, t: m.register_connection(_MinimalDuckTypedSink(), t),
+        ),
+    ],
+)
+async def test_every_audience_registration_is_visible_to_the_audience_check(
+    case_id, register, monkeypatch
+) -> None:
+    """The audience check's only source of truth is ``ConnectionManager``.
+
+    All six audience paths -- the web chat WebSocket, the Builder preview
+    WebSocket, a v1 SSE sink, the guest widget WebSocket, the share-link
+    WebSocket, and the two downstream adapters that hand another object
+    to the engine's own ``register_connection`` -- go through the exact
+    same ``ConnectionManager.register_connection`` call. This does not
+    assert there are only six registration call sites (a closed-world claim
+    a seventh audience could violate either way); it asserts that whatever
+    registers through this mechanism is visible to
+    ``has_connections_for_task`` and lets a subsequent ``handle_event``
+    reach ``broadcast_to_task``. See ``_register_builder_preview_audience``
+    for the one path (Builder preview) whose safety is not fully covered by
+    this mechanical guard.
+    """
+    task_id = 90410
+    local_manager = ConnectionManager()
+    register(local_manager, task_id)
+    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+
+    assert local_manager.has_connections_for_task(task_id) is True
+
+    broadcast_calls: list[object] = []
+
+    async def fake_broadcast(message, task_id_arg):
+        broadcast_calls.append((message, task_id_arg))
+
+    monkeypatch.setattr(local_manager, "broadcast_to_task", fake_broadcast)
+
+    handler = WebSocketTraceHandler(task_id)
+    handler._task_description = None
+    handler._task_description_loaded = True
+    event = TraceEvent(
+        TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.LLM),
+        task_id=str(task_id),
+        step_id="step-1",
+        data={"model": "gpt-test"},
+        timestamp=1_700_000_200.0,
+    )
+
+    await handler.handle_event(event)
+
+    assert len(broadcast_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_audience_check_failure_is_contained_in_the_handler(
+    monkeypatch, caplog
+) -> None:
+    """A failing audience check never escapes ``handle_event``.
+
+    First segment: the audience check itself raises. ``handle_event`` must
+    swallow it (the same policy the handler already applies to every other
+    internal failure) and log a warning instead of propagating.
+
+    Second segment (the one that actually matters): a real ``Tracer`` with a
+    real ``WebSocketTraceHandler`` registered, firing a
+    ``require_persisted=True`` event. ``Tracer.trace_event`` collects every
+    handler's exception into ``handler_errors`` and re-raises once
+    dispatch finishes when ``require_persisted`` is set
+    (``core/agent/trace.py:1283-1296``) -- that collection logic lives in
+    ``Tracer``, not in the handler, so a stub tracer would test nothing
+    here, and a stub handler would replace the very object whose ``try:``
+    placement this segment exists to pin. If the audience check were ever
+    moved outside ``handle_event``'s existing ``try:``, this is the segment
+    that would turn red: the exception would reach ``Tracer.trace_event``
+    uncaught by the handler, join ``handler_errors``, and turn one required
+    checkpoint persistence into a failed one.
+    """
+    task_id = 90511
+
+    class _RaisingManager:
+        def has_connections_for_task(self, task_id: int) -> bool:
+            raise RuntimeError("audience registry unavailable")
+
+    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", _RaisingManager())
+
+    # --- first segment: the handler on its own ---
+    handler = WebSocketTraceHandler(task_id)
+    event = TraceEvent(
+        TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.LLM),
+        task_id=str(task_id),
+        step_id="step-1",
+        data={"model": "gpt-test"},
+        timestamp=1_700_000_300.0,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="xagent.web.api.ws_trace_handlers"):
+        await handler.handle_event(event)
+
+    assert any(
+        "Failed to send trace event to WebSocket" in record.getMessage()
+        for record in caplog.records
+    )
+
+    # --- second segment: the real Tracer, the hard requirement ---
+    caplog.clear()
+    tracer = Tracer()
+    real_handler = WebSocketTraceHandler(task_id)
+    tracer.add_handler(real_handler)
+
+    checkpoint_data = {
+        "checkpoint_type": CHECKPOINT_TYPE,
+        "execution_id": "exec-required",
+        "snapshot": {"label": "before_llm"},
+    }
+
+    # Not raising is the assertion: a required-persistence event whose only
+    # handler is a WebSocketTraceHandler whose audience check is broken
+    # must still complete without ``Tracer.trace_event`` raising.
+    await tracer.trace_event(
+        CHECKPOINT_EVENT_TYPE,
+        task_id=str(task_id),
+        data=checkpoint_data,
+        require_persisted=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_late_attach_replays_events_skipped_while_unattached(
+    monkeypatch,
+) -> None:
+    """A client that attaches late does not lose content it is owed on the
+    WebSocket paths, and a client that attaches while a frame is still
+    being built receives that frame.
+
+    First segment (WebSocket paths): while nothing is attached,
+    ``handle_event`` does not broadcast anything for these rows --
+    ``ConnectionManager`` never sees a live audience for them. In
+    production ``DatabaseTraceHandler`` persists every one of them
+    independently of what this handler does (both handlers are notified by
+    the same ``Tracer.trace_event`` call); here the rows are seeded
+    directly to isolate this segment from ``DatabaseTraceHandler``'s own
+    behavior. ``send_historical_data_as_stream`` reads from
+    ``trace_events``, not from anything the WebSocket handler buffered, so
+    it still surfaces every non-checkpoint row to a client that attaches
+    afterward. Checkpoint rows are excluded from replay by a different,
+    pre-existing mechanism
+    (``test_historical_replay_skips_checkpoint_rows_before_streaming``);
+    this segment does not re-test that, only that ordinary rows survive.
+
+    Second segment (a sink that attaches while the frame is being built):
+    one audience is already attached, and a second sink registers itself
+    from inside ``serialize_trace_data`` -- part-way through the very call
+    that is building this frame -- and still receives it. What this pins is
+    that ``handle_event`` must not snapshot the connection registry before
+    doing its work. It asks ``has_connections_for_task`` once, for the
+    emptiness answer only, and the registry is read again at broadcast
+    time: ``broadcast_to_task`` calls ``connections_for_task`` when it fans
+    out. Storing that list in a local at the top of ``handle_event`` and
+    broadcasting to the stored copy would drop this sink, and this segment
+    turns red.
+
+    The loss this change is allowed to introduce is a different one and it
+    is structural, not a race: once the registry is empty on
+    ``handle_event``'s first line, the call returns and nothing else in it
+    runs, so no attach afterward recovers that particular frame for the
+    newly attached sink. **There is no mechanical guard for that loss; it
+    is recorded here in prose only.** It cannot be written as an assertion
+    because the sink does not exist while the call runs -- nothing could
+    have written to it, so asserting that it stayed empty would hold no
+    matter what the production code did. The WebSocket paths recover such
+    frames through the database replay the first segment covers. The v1 SSE
+    path does not, and documents that gap itself:
+    ``v1/_events_stream.py``'s module docstring (lines 16-24) tells v1 SSE
+    clients that a step already in progress at attach time has no matching
+    start on their stream and that they must reconcile with
+    ``GET /v1/chat/tasks/{task_id}/steps``.
+    """
+    # ---- first segment ----
+    SessionLocal, db, task = _create_trace_handler_test_task("i6-late-attach")
+    task_id = int(task.id)
+    user_id = int(task.user_id)
+    db.close()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+
+    local_manager = ConnectionManager()
+    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+
+    broadcast_calls: list[object] = []
+
+    async def fake_broadcast(message, task_id_arg):
+        broadcast_calls.append((message, task_id_arg))
+
+    monkeypatch.setattr(local_manager, "broadcast_to_task", fake_broadcast)
+
+    handler = WebSocketTraceHandler(task_id)
+    handler._task_description = None
+    handler._task_description_loaded = True
+
+    events = [
+        (
+            "i6-llm-row",
+            TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.LLM),
+            "step-a",
+            {"model": "gpt-test"},
+        ),
+        (
+            "i6-user-message-row",
+            TraceEventType(TraceScope.TASK, TraceAction.START, TraceCategory.MESSAGE),
+            None,
+            {"message": "hi", "turn_id": "turn-i6"},
+        ),
+    ]
+    for event_id, event_type, step_id, data in events:
+        trace_event = TraceEvent(
+            event_type,
+            task_id=str(task_id),
+            step_id=step_id,
+            data=data,
+            timestamp=1_700_000_400.0,
+        )
+        trace_event.id = event_id
+        await handler.handle_event(trace_event)
+
+    assert broadcast_calls == []
+
+    base_time = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    db2 = SessionLocal()
+    try:
+        db2.add_all(
+            [
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id="i6-llm-row",
+                    event_type="llm_call_start",
+                    timestamp=base_time + timedelta(seconds=1),
+                    data={"model": "gpt-test"},
+                ),
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id="i6-user-message-row",
+                    event_type="user_message",
+                    timestamp=base_time + timedelta(seconds=2),
+                    data={"message": "hi", "turn_id": "turn-i6"},
+                ),
+            ]
+        )
+        db2.commit()
+    finally:
+        db2.close()
+
+    sent_events: list[dict] = []
+
+    async def send_personal_message(event: dict, websocket: object) -> None:
+        sent_events.append(event)
+
+    monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.manager.send_personal_message",
+        send_personal_message,
+    )
+
+    await send_historical_data_as_stream(
+        websocket=object(),
+        task_id=task_id,
+        user=SimpleNamespace(id=user_id, is_admin=False),
+    )
+
+    streamed_event_ids = {
+        event.get("event_id")
+        for event in sent_events
+        if event.get("type") == "trace_event"
+    }
+    assert "i6-llm-row" in streamed_event_ids
+    assert "i6-user-message-row" in streamed_event_ids
+
+    # ---- second segment ----
+    sse_manager = ConnectionManager()
+    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", sse_manager)
+
+    sse_handler = WebSocketTraceHandler(task_id)
+    sse_handler._task_description = None
+    sse_handler._task_description_loaded = True
+
+    in_flight_event = TraceEvent(
+        TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.LLM),
+        task_id=str(task_id),
+        step_id="step-b",
+        data={"model": "gpt-test"},
+        timestamp=1_700_000_500.0,
+    )
+
+    incumbent_sink = _MinimalDuckTypedSink()
+    sse_manager.register_connection(incumbent_sink, task_id)
+
+    late_sink = _MinimalDuckTypedSink()
+
+    def register_late_sink_mid_serialization(payload):
+        sse_manager.register_connection(late_sink, task_id)
+        return serialize_trace_data(payload)
+
+    monkeypatch.setattr(
+        "xagent.web.api.ws_trace_handlers.serialize_trace_data",
+        register_late_sink_mid_serialization,
+    )
+
+    await sse_handler.handle_event(in_flight_event)
+
+    assert len(incumbent_sink.sent) == 1
+    assert len(late_sink.sent) == 1
+
+
+def _make_failing_sync_load_task_description(call_log: list[int]):
+    def _failing_sync_load_task_description(self: WebSocketTraceHandler) -> None:
+        """Failure tier: one attempt, no retry, and NULL descriptions land here too.
+
+        ``_load_task_description`` sets ``_task_description_loaded`` outside its
+        ``try`` (``ws_trace_handlers.py:435``), so a failed read is still a read
+        and never retried. Two inputs reach this tier, not one: a real database
+        failure, and a task row whose ``description`` is NULL -- the info log at
+        ``ws_trace_handlers.py:453-455`` slices ``task.description``
+        unconditionally, so ``None[:50]`` raises ``TypeError`` and the outer
+        ``except Exception`` swallows it. ``Task.description`` is
+        ``Column(Text)`` (``web/models/task.py:280``), i.e. nullable. This change
+        moves that single attempt to the moment an audience attaches, so the
+        warning this path writes now lands at attach time instead of at task
+        start.
+        """
+        call_log.append(1)
+        raise RuntimeError("simulated task description read failure")
+
+    return _failing_sync_load_task_description
+
+
+@pytest.mark.asyncio
+async def test_task_description_load_is_deferred_until_an_audience_attaches(
+    monkeypatch,
+) -> None:
+    """The task description read happens at most once, and only once an
+    audience exists.
+
+    First three segments pin the lazy-cache contract untouched by this
+    change: no read while unattached, exactly one read on the first event
+    after attach, and no re-read on later events. The fourth segment is the
+    failure tier -- see ``_failing_sync_load_task_description``'s docstring
+    (built by ``_make_failing_sync_load_task_description``) for why a NULL
+    description lands in the same bucket as a real database failure.
+    """
+    task_id = 90712
+    local_manager = ConnectionManager()
+    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+
+    load_calls: list[int] = []
+
+    def counting_stub(self: WebSocketTraceHandler) -> None:
+        load_calls.append(1)
+        self._task_description = "Loaded description"
+
+    monkeypatch.setattr(
+        WebSocketTraceHandler, "_sync_load_task_description", counting_stub
+    )
+
+    broadcast_calls: list[object] = []
+
+    async def fake_broadcast(message, task_id_arg):
+        broadcast_calls.append((message, task_id_arg))
+
+    monkeypatch.setattr(local_manager, "broadcast_to_task", fake_broadcast)
+
+    handler = WebSocketTraceHandler(task_id)
+
+    def make_event(step_id: str) -> TraceEvent:
+        return TraceEvent(
+            TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.LLM),
+            task_id=str(task_id),
+            step_id=step_id,
+            data={"model": "gpt-test"},
+            timestamp=1_700_000_600.0,
+        )
+
+    # Segment 1: no audience, 3 events, zero reads.
+    for i in range(3):
+        await handler.handle_event(make_event(f"pre-{i}"))
+    assert load_calls == []
+    assert broadcast_calls == []
+
+    # Segment 2: register an audience, one event, exactly one read.
+    local_manager.register_connection(object(), task_id)
+    await handler.handle_event(make_event("first-after-attach"))
+    assert len(load_calls) == 1
+    assert len(broadcast_calls) == 1
+
+    # Segment 3: two more events, no further reads.
+    await handler.handle_event(make_event("second-after-attach"))
+    await handler.handle_event(make_event("third-after-attach"))
+    assert len(load_calls) == 1
+    assert len(broadcast_calls) == 3
+
+    # Segment 4: failure tier -- a fresh handler so the cache starts empty.
+    failing_handler = WebSocketTraceHandler(task_id)
+    fail_calls: list[int] = []
+    monkeypatch.setattr(
+        WebSocketTraceHandler,
+        "_sync_load_task_description",
+        _make_failing_sync_load_task_description(fail_calls),
+    )
+
+    await failing_handler.handle_event(make_event("failure-1"))
+    # (a) handle_event did not raise -- reaching this line proves that.
+    assert len(fail_calls) == 1
+    assert len(broadcast_calls) == 4
+    message, _ = broadcast_calls[-1]
+    # (b) the frame that did go out carries no task_description field.
+    assert "task_description" not in message["data"]
+
+    await failing_handler.handle_event(make_event("failure-2"))
+    # (c) the load is not retried on a later event.
+    assert len(fail_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audience_present", [False, True])
+async def test_delegated_child_traces_follow_the_parent_task_audience(
+    audience_present, monkeypatch
+) -> None:
+    """A delegated child agent's traces are gated by the *parent* task's
+    audience, not the child's own.
+
+    ``_DelegatedAgentWebSocketTraceHandler`` is constructed with the parent
+    task id and wraps a ``WebSocketTraceHandler`` bound to that same parent
+    id (``agent_tool.py:97``); the child event's own ``task_id`` field never
+    reaches the audience check or the broadcast frame's ``task_id``.
+    """
+    parent_task_id = 90813
+    child_task_id = 90814
+    local_manager = ConnectionManager()
+    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+
+    if audience_present:
+        local_manager.register_connection(object(), parent_task_id)
+
+    broadcast_calls: list[object] = []
+
+    async def fake_broadcast(message, task_id_arg):
+        broadcast_calls.append((message, task_id_arg))
+
+    monkeypatch.setattr(local_manager, "broadcast_to_task", fake_broadcast)
+
+    delegated_handler = _DelegatedAgentWebSocketTraceHandler(
+        task_id=parent_task_id, metadata={"source": "xagent-agent-tool-child"}
+    )
+    delegated_handler._handler._task_description = None
+    delegated_handler._handler._task_description_loaded = True
+    event = TraceEvent(
+        TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.LLM),
+        task_id=str(child_task_id),
+        step_id="child-step-1",
+        data={"model": "gpt-test"},
+        timestamp=1_700_000_700.0,
+    )
+
+    await delegated_handler.handle_event(event)
+
+    if not audience_present:
+        assert broadcast_calls == []
+        return
+
+    assert len(broadcast_calls) == 1
+    message, broadcast_task_id_arg = broadcast_calls[0]
+    assert broadcast_task_id_arg == parent_task_id
+    assert message["task_id"] == parent_task_id
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        "never_registered",
+        "after_register",
+        "after_register_then_disconnect",
+        "after_register_then_detach_task_connections",
+    ],
+)
+def test_audience_check_matches_the_broadcast_gate(case_id) -> None:
+    """``has_connections_for_task`` and the broadcast gate never disagree.
+
+    Covers the post-state of each of ``active_connections``'s three write
+    sites -- ``register_connection`` (append), ``disconnect`` /
+    ``_remove_from_task`` (remove, deleting the key once its list is
+    empty), and ``detach_task_connections`` (pop the whole key) -- plus a
+    baseline of never having registered anything. This does not assert
+    those three methods are the only writers of ``active_connections``; it
+    asserts that after each of them runs, the new predicate and
+    ``bool(connections_for_task(...))`` -- the read the broadcast gate
+    itself performs -- still agree.
+    """
+    task_id = 90915
+    manager_instance = ConnectionManager()
+    replica = object()
+
+    if case_id == "never_registered":
+        pass
+    elif case_id == "after_register":
+        manager_instance.register_connection(replica, task_id)
+    elif case_id == "after_register_then_disconnect":
+        manager_instance.register_connection(replica, task_id)
+        manager_instance.disconnect(replica)
+    else:
+        assert case_id == "after_register_then_detach_task_connections"
+        manager_instance.register_connection(replica, task_id)
+        manager_instance.detach_task_connections(task_id)
+
+    assert manager_instance.has_connections_for_task(task_id) == bool(
+        manager_instance.connections_for_task(task_id)
     )
 
 

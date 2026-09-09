@@ -5189,6 +5189,15 @@ class ConnectionManager:
         """Return a stable snapshot of a task's current connections."""
         return self.active_connections.get(task_id, []).copy()
 
+    def has_connections_for_task(self, task_id: int) -> bool:
+        """Return whether any audience is attached to a task.
+
+        Same registry ``connections_for_task`` reads, without building the
+        snapshot list: callers that only need the emptiness answer must not
+        pay for a copy they will not iterate.
+        """
+        return bool(self.active_connections.get(task_id))
+
     def is_connection_registered(self, websocket: WebSocket, task_id: int) -> bool:
         """Return whether a connection is still owned by the given task."""
         return self._connection_task_ids.get(websocket) == task_id

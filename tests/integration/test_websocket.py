@@ -563,7 +563,7 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
         """测试WebSocket追踪处理器集成"""
         print("\n=== 测试WebSocket追踪处理器集成 ===")
 
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock, MagicMock, patch
 
         from xagent.core.agent.trace import (
             TraceAction,
@@ -575,7 +575,7 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
         from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
 
         # 创建模拟的WebSocket管理器
-        mock_manager = AsyncMock()
+        mock_manager = MagicMock(broadcast_to_task=AsyncMock())
 
         # 用patch替换manager
         with patch("xagent.web.api.ws_trace_handlers.manager", mock_manager):
