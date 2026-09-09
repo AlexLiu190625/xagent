@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field, create_model
 
 from ..... import config as _root_config
 from .....sandbox.base import Sandbox
+from ....utils.security import redact_sensitive_text
 from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
 from .base import AbstractBaseTool, ToolVisibility
@@ -228,7 +229,11 @@ class EmptyArgsModel(BaseModel):
 logger = logging.getLogger(__name__)
 _RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
 _OAUTH_TOKEN_RESOLVER_REFRESH_KEY = "_oauth_token_resolver_refresh"
-_RESOLVER_HTTP_401_NODE_LIMIT = 64
+# Hard ceiling on how many exception nodes either walk over a failed call
+# visits, so a wide or cyclic __cause__/__context__ graph cannot spin.
+# Two consumers read it: _bounded_exception_nodes (the 401 resolver's
+# challenge lookup) and _level_order_exception_nodes (failure logging).
+_EXCEPTION_WALK_NODE_LIMIT = 64
 # Caps the exception message logged when an MCP tool call fails, so a server
 # that echoes a large payload back in its error (or an SDK that dumps a full
 # request) can't blow up log volume. This bound applies to everything this
@@ -240,6 +245,9 @@ _MCP_TOOL_ERROR_LOG_MAX_CHARS = 500
 # the leaves of a (possibly nested) BaseExceptionGroup and the exceptions on
 # their __cause__/__context__ chains. A fan-out call (e.g. concurrent
 # sub-requests) can otherwise raise a group with dozens of members.
+# Members at the same nesting depth are visited before any of their own
+# chains, so a fan-out failure logs one line per leg before spending
+# budget on a leg's causes.
 _MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS = 5
 _HTTP_401_TEXT_RE = re.compile(
     r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response|code)\s*[:=]?\s*401\b|"
@@ -634,7 +642,7 @@ def _bounded_exception_nodes(
     pending = [(exc, True)]
     visited: set[int] = set()
     visited_count = 0
-    while pending and visited_count < _RESOLVER_HTTP_401_NODE_LIMIT:
+    while pending and visited_count < _EXCEPTION_WALK_NODE_LIMIT:
         current, is_root = pending.pop()
         current_id = id(current)
         if current_id in visited or (
@@ -657,7 +665,44 @@ def _bounded_exception_nodes(
         pending.extend((node, False) for node in reversed(linked))
 
 
-_URL_TOKEN_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+def _level_order_exception_nodes(exc: BaseException) -> Iterator[BaseException]:
+    """Yield ``exc`` and the exceptions linked to it in level order: the
+    members of an exception group at one nesting depth are reached before
+    any of those members' own ``__cause__``/``__context__`` chains.
+
+    ``_bounded_exception_nodes`` walks the same edges depth-first, which is
+    what the 401 resolver wants -- it only needs one matching response from
+    anywhere in the graph. A capped log wants the opposite: a fan-out call
+    fails as a group with one member per failed leg, and depth-first order
+    lets the first leg's own cause chain spend the whole per-call budget,
+    so the other legs never get a line at all.
+    """
+    pending: list[BaseException] = [exc]
+    visited: set[int] = set()
+    index = 0
+    while index < len(pending) and len(visited) < _EXCEPTION_WALK_NODE_LIMIT:
+        current = pending[index]
+        index += 1
+        current_id = id(current)
+        if current_id in visited:
+            continue
+        visited.add(current_id)
+        yield current
+
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        if isinstance(current.__cause__, BaseException):
+            pending.append(current.__cause__)
+        if isinstance(current.__context__, BaseException):
+            pending.append(current.__context__)
+
+
+_URL_TOKEN_RE = re.compile(r"(?:https?|wss?)://[^\s'\"<>]+", re.IGNORECASE)
+# Punctuation that ends the sentence rather than the URL. Closing brackets
+# are only dropped when the token holds no matching opener, so an IPv6
+# authority ("https://[::1]") and a parenthesised path segment survive.
+_URL_TRAILING_PUNCTUATION = ",.;:"
+_URL_TRAILING_BRACKETS = {")": "(", "]": "[", "}": "{"}
 
 
 def redact_urls_in_text(text: str) -> str:
@@ -674,32 +719,65 @@ def redact_urls_in_text(text: str) -> str:
     value). The scheme, host, port, and path are kept so the log line still
     says which server failed. A token that fails to parse as a URL is
     replaced wholesale with ``<url redacted>`` rather than risking a partial
-    leak.
+    leak. ``ws://``/``wss://`` tokens are covered the same way as
+    ``http``/``https``, because a websocket transport cannot send headers,
+    so a websocket connector has nowhere but the URL to put its credential.
+    Sentence punctuation that trails the token (a closing paren, a period,
+    ...) is split off before parsing and re-appended to the result
+    afterwards, so redaction does not eat the punctuation that follows a
+    URL. Text separated from the URL only by a character that is legal
+    inside a query string (a comma, say) is still part of the token and
+    is dropped with the query; see the ``comma-inside-query`` test case.
     """
 
     def _redact(match: "re.Match[str]") -> str:
         token = match.group(0)
+        trailing = ""
+        while token:
+            last = token[-1]
+            if last in _URL_TRAILING_PUNCTUATION or (
+                last in _URL_TRAILING_BRACKETS
+                and token.count(_URL_TRAILING_BRACKETS[last]) < token.count(last)
+            ):
+                trailing = last + trailing
+                token = token[:-1]
+                continue
+            break
         try:
             parts = urlsplit(token)
             # Keep the authority verbatim minus userinfo: re-assembling it
             # from ``hostname``/``port`` would drop IPv6 brackets and lower
             # the case, and reading ``port`` raises on out-of-range values.
             netloc = parts.netloc.rsplit("@", 1)[-1]
-            return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+            return urlunsplit((parts.scheme, netloc, parts.path, "", "")) + trailing
         except (ValueError, UnicodeError):
-            return "<url redacted>"
+            return "<url redacted>" + trailing
 
     return _URL_TOKEN_RE.sub(_redact, text)
 
 
 def _truncated_error_message(exc: BaseException) -> str:
-    """Return ``str(exc)`` with any embedded URLs stripped of their query
-    string and userinfo, bounded to ``_MCP_TOOL_ERROR_LOG_MAX_CHARS`` for
-    logging. It is otherwise just the exception's own message (e.g. a
-    JSON-RPC error string or an HTTP status line) -- it must never be
-    additionally handed tool_args, tool_meta, or connection headers, none of
-    which are exception messages to begin with."""
-    text = redact_urls_in_text(str(exc))
+    """Return ``str(exc)`` made safe to log: URLs lose their query string,
+    userinfo and fragment (``redact_urls_in_text``), header- and
+    assignment-shaped secrets are masked (``redact_sensitive_text``), and
+    the result is bounded to ``_MCP_TOOL_ERROR_LOG_MAX_CHARS``. It is
+    otherwise just the exception's own message (e.g. a JSON-RPC error
+    string or an HTTP status line) -- it must never be additionally handed
+    tool_args, tool_meta, or connection headers, none of which are
+    exception messages to begin with. Two shapes are recognised by neither
+    helper -- a secret sitting in a URL path segment, and an assignment
+    whose key carries a prefix such as ``MCP_API_KEY=`` -- and for those
+    the cap is what bounds the exposure.
+    """
+    try:
+        text = redact_sensitive_text(redact_urls_in_text(str(exc)))
+    except BaseException:
+        # Every caller is an ``except`` handler whose contract is to return
+        # a result dict, so a custom ``__str__`` that raises must not escape
+        # here. ``BaseException`` is deliberate: nothing in the guarded block
+        # awaits, so no cancellation can originate in it, and a ``__str__``
+        # is free to raise a BaseException subclass.
+        return type(exc).__name__
     if len(text) <= _MCP_TOOL_ERROR_LOG_MAX_CHARS:
         return text
     return text[: _MCP_TOOL_ERROR_LOG_MAX_CHARS - 1].rstrip() + "…"
@@ -1483,7 +1561,7 @@ class MCPToolAdapter(AbstractBaseTool):
                 _truncated_error_message(e),
             )
             leaf_count = 0
-            for node in _bounded_exception_nodes(e):
+            for node in _level_order_exception_nodes(e):
                 if node is e or isinstance(node, BaseExceptionGroup):
                     continue
                 if leaf_count >= _MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS:

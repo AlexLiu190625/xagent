@@ -19,6 +19,7 @@ from xagent.core.model.chat.basic.claude import _fix_pydantic_schema_for_claude
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _FIELD_TEXT_MAX_CHARS,
+    _MCP_TOOL_ERROR_LOG_MAX_CHARS,
     EmptyArgsModel,
     MCPFailurePhase,
     MCPServerLoadFailure,
@@ -28,6 +29,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _compact_json,
     _exception_indicates_http_401,
     _mcp_return_value_as_string,
+    _truncated_error_message,
     classify_non_idempotent_write,
     classify_write_hint,
     load_mcp_tools_as_agent_tools,
@@ -509,7 +511,7 @@ def test_resolver_challenge_traversal_stops_at_named_node_budget():
     current: BaseException = _http_status_error(
         authenticate=['Bearer error="invalid_token"']
     )
-    for index in range(mcp_adapter_module._RESOLVER_HTTP_401_NODE_LIMIT):
+    for index in range(mcp_adapter_module._EXCEPTION_WALK_NODE_LIMIT):
         wrapper = RuntimeError(f"wrapper-{index}")
         wrapper.__cause__ = current
         current = wrapper
@@ -1981,7 +1983,7 @@ async def test_resolver_retry_prunes_over_budget_initial_exception_subtree(
     deep_original: BaseException = _http_status_error(
         authenticate=['Bearer error="invalid_token"']
     )
-    for index in range(mcp_adapter_module._RESOLVER_HTTP_401_NODE_LIMIT + 1):
+    for index in range(mcp_adapter_module._EXCEPTION_WALK_NODE_LIMIT + 1):
         wrapper = RuntimeError(f"initial-wrapper-{index}")
         wrapper.__cause__ = deep_original
         deep_original = wrapper
@@ -2367,6 +2369,9 @@ async def test_mcp_tool_execution_error_logs_truncated_message(monkeypatch, capl
     assert "server-said-this-and-nothing-else-" in caplog.text
     assert overlong_detail not in caplog.text
     assert caplog.records[-1].exc_info is None
+    truncated = caplog.records[-1].args[-1]
+    assert len(truncated) == _MCP_TOOL_ERROR_LOG_MAX_CHARS
+    assert truncated.endswith("…")
 
 
 @pytest.mark.asyncio
@@ -2459,9 +2464,9 @@ async def test_mcp_tool_execution_error_redacts_url_userinfo(monkeypatch, caplog
         "content": [{"text": "Error executing MCP tool."}],
         "is_error": True,
     }
-    assert "pw" not in caplog.text
-    assert "x=1" not in caplog.text
-    assert "host" in caplog.text
+    assert caplog.records[-1].args[-1] == (
+        "upstream refused connection to https://host/path"
+    )
 
 
 @pytest.mark.asyncio
@@ -2515,6 +2520,84 @@ async def test_mcp_tool_execution_error_group_logs_each_sub_exception(
     assert "ValueError" in caplog.text
     assert "second-leg" in caplog.text
     assert "related exception ExceptionGroup" not in caplog.text
+
+
+async def _run_json_with_failure(monkeypatch, exc: BaseException) -> dict[str, Any]:
+    """Run an adapter whose session raises ``exc`` and return its result."""
+    adapter = MCPToolAdapter(
+        mcp_tool=_mcp_tool("list_clients"),
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            raise exc
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+    return await adapter.run_json_async({})
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_group_logs_every_member_before_chains(
+    monkeypatch, caplog
+):
+    """A fan-out call raises one group member per failed leg. If one leg's
+    own __cause__/__context__ chain runs deep, a depth-first walk spends the
+    whole per-call log budget on that one leg's chain and the other legs
+    never get a line. Every member must get a line before any single
+    member's chain is followed further."""
+    member_a: BaseException = RuntimeError("member-a-root")
+    for level in range(1, 8):
+        wrapper = RuntimeError(f"member-a-chain-{level}")
+        wrapper.__context__ = member_a
+        member_a = wrapper
+
+    exc_group = BaseExceptionGroup(
+        "fan-out",
+        [member_a, ValueError("second-leg"), ValueError("third-leg")],
+    )
+    caplog.set_level("ERROR")
+
+    result = await _run_json_with_failure(monkeypatch, exc_group)
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert "second-leg" in caplog.text
+    assert "third-leg" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_group_survives_exploding_context_str(
+    monkeypatch, caplog
+):
+    """A group member's __context__ can itself be an exception whose
+    __str__ raises. ``_exception_indicates_http_401`` only recurses into a
+    group's own members, not its __cause__/__context__ chain, so that
+    incidental protection does not cover this shape: the logging path
+    itself must not let a misbehaving __str__ escape ``run_json_async``."""
+
+    class _ExplodingStr(Exception):
+        def __str__(self):
+            raise ValueError("__str__ exploded")
+
+    member = RuntimeError("member-ok")
+    member.__context__ = _ExplodingStr()
+    exc_group = BaseExceptionGroup("fan-out", [member])
+    caplog.set_level("ERROR")
+
+    result = await _run_json_with_failure(monkeypatch, exc_group)
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert "_ExplodingStr" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -3411,6 +3494,25 @@ def test_description_length_boundary(length, truncated):
         assert description == raw
 
 
+@pytest.mark.parametrize(
+    "length,truncated",
+    [
+        (_MCP_TOOL_ERROR_LOG_MAX_CHARS - 1, False),
+        (_MCP_TOOL_ERROR_LOG_MAX_CHARS, False),
+        (_MCP_TOOL_ERROR_LOG_MAX_CHARS + 1, True),
+    ],
+)
+def test_truncated_error_message_length_boundary(length, truncated):
+    """The cap is inclusive: exactly the cap is kept, one over is shortened."""
+    message = _truncated_error_message(RuntimeError("a" * length))
+
+    assert len(message) <= _MCP_TOOL_ERROR_LOG_MAX_CHARS
+    if truncated:
+        assert message == "a" * (_MCP_TOOL_ERROR_LOG_MAX_CHARS - 1) + "…"
+    else:
+        assert message == "a" * length
+
+
 def _listing(*annotations: object) -> dict[str, Any]:
     """A ``tools/list`` payload whose tools carry the given raw annotations."""
     tools = []
@@ -3642,6 +3744,31 @@ def test_only_read_only_is_a_safe_reading():
 
 
 @pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "wss://mcp.example.test/ws?api_key=SECRET-abc123 rejected",
+            "wss://mcp.example.test/ws rejected",
+        ),
+        (
+            "Authorization: Bearer ey.SECRETJWT.sig",
+            "Authorization: Bearer ***.sig",
+        ),
+        ("x-api-key: SECRET-abc123", "x-api-key: ***c123"),
+        (
+            "config error: api_key=SECRET-abc123",
+            "config error: api_key=***c123",
+        ),
+    ],
+)
+def test_truncated_error_message_redacts_non_url_secret_shapes(message, expected):
+    """``_truncated_error_message`` must also mask header- and
+    assignment-shaped secrets that never sit inside a URL token, on top of
+    the URL redaction ``redact_urls_in_text`` already does."""
+    assert _truncated_error_message(RuntimeError(message)) == expected
+
+
+@pytest.mark.parametrize(
     ("text", "expected"),
     [
         ("HTTPS://H.EXAMPLE/P?K=SECRET", "https://H.EXAMPLE/P"),
@@ -3649,6 +3776,16 @@ def test_only_read_only_is_a_safe_reading():
         ("https://[::1]:8080/x?y=1 done", "https://[::1]:8080/x done"),
         ("https://user:pw@Host.Example:8443/p?x=1", "https://Host.Example:8443/p"),
         ("https://[::1/x?y=1 done", "<url redacted> done"),
+        ("wss://h/ws?api_key=SECRET rejected", "wss://h/ws rejected"),
+        ("ws://h/p?tok=SECRET redirect", "ws://h/p redirect"),
+        ("see (https://h/p?k=s) ok", "see (https://h/p) ok"),
+        ("msg: https://h/p?k=s.", "msg: https://h/p."),
+        ("see https://[::1]", "see https://[::1]"),
+        (
+            "https://en.example/wiki/Foo_(bar)",
+            "https://en.example/wiki/Foo_(bar)",
+        ),
+        ("url=https://h/p?k=s,next", "url=https://h/p"),
     ],
     ids=[
         "uppercase-scheme",
@@ -3656,9 +3793,26 @@ def test_only_read_only_is_a_safe_reading():
         "ipv6-brackets-kept",
         "userinfo-and-case",
         "unparsable",
+        "wss-query-dropped",
+        "ws-query-dropped",
+        "trailing-paren",
+        "trailing-period",
+        "bare-ipv6-authority",
+        "balanced-paren-in-path",
+        "comma-inside-query-is-part-of-the-url",
     ],
 )
 def test_redact_urls_in_text_edge_shapes(text, expected):
+    """``comma-inside-query-is-part-of-the-url`` documents a known gap: the
+    comma sits inside the query string, not at the end of the token, so the
+    trailing-punctuation strip (which only looks at the token's own last
+    character) does not reach it. The only way to also recover the ``next``
+    that follows it would be excluding ``,`` from the URL token's character
+    class, but a comma is a legal query-string character -- doing that
+    would split a secret that happens to contain a comma into two pieces
+    and leave the second piece in the log. This case pins the current,
+    deliberate trade-off; it must turn red if that trade-off is reversed.
+    """
     from xagent.core.tools.adapters.vibe.mcp_adapter import redact_urls_in_text
 
     assert redact_urls_in_text(text) == expected
