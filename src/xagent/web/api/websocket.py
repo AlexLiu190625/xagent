@@ -6783,11 +6783,15 @@ async def _handle_chat_message_unserialized(
                     # apart from a fresh Absent). Absent and Unavailable both
                     # become `None` for the same reason as the other two
                     # close sites: `None` binds the close to no primary key,
-                    # which matches zero rows and leaves the active row and
-                    # marker both in place -- the safe outcome for a read
-                    # that could not be made, not a claim that nothing was
-                    # ever active. Three branches, not a two-way isinstance
-                    # fold, so Unavailable stays visible on its own line.
+                    # which matches zero rows and retires no question
+                    # either way -- the safe outcome for a read that could
+                    # not be made, not a claim that nothing was ever
+                    # active. What then happens to the task's marker
+                    # differs between the two, and this value is not what
+                    # decides it: the clear beside the close runs its own
+                    # check (see active_interaction_id_sync's docstring).
+                    # Three branches, not a two-way isinstance fold, so
+                    # Unavailable stays visible on its own line.
                     if isinstance(active_interaction_read, ActiveInteractionFound):
                         active_interaction_id = active_interaction_read.interaction_id
                     elif isinstance(active_interaction_read, ActiveInteractionAbsent):

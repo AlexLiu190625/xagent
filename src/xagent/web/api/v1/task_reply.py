@@ -533,10 +533,13 @@ async def reply_to_task(
         # close call takes. Absent and Unavailable both become `None` here
         # -- but that is not folding Unavailable into Absent, it is this
         # call's own contract: `None` means "bind the close to no primary
-        # key, so it matches zero rows and the active row and marker both
-        # survive" (see active_interaction_id_sync's docstring), which is
-        # the safe outcome for a read that could not be made, not a claim
-        # that nothing was ever active. Written as three branches, not
+        # key", so it matches zero rows and retires no question either
+        # way, which is the safe outcome for a read that could not be
+        # made, not a claim that nothing was ever active. What then
+        # happens to the task's marker differs between the two, and this
+        # value is not what decides it -- the clear beside the close runs
+        # its own check (see active_interaction_id_sync's docstring).
+        # Written as three branches, not
         # `interaction_id if isinstance(..., ActiveInteractionFound) else
         # None`, so a reader (and mypy) sees Unavailable handled on its own
         # line rather than merged into Absent's.
