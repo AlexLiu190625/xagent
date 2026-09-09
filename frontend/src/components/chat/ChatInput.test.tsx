@@ -1916,7 +1916,10 @@ describe("ChatInput", () => {
     const stopButton = screen.getByRole("button", { name: "widgetSession.stopResponse" })
     expect(stopButton).not.toBeDisabled()
     expect(stopButton).toHaveAttribute("type", "button")
-    expect(screen.getByText("widgetSession.stopTimedOut")).toBeInTheDocument()
+    const hint = screen.getByText("widgetSession.stopTimedOut")
+    expect(hint).toBeInTheDocument()
+    expect(stopButton).toHaveAttribute("aria-describedby", hint.id)
+    expect(screen.getByRole("textbox")).not.toHaveAttribute("aria-describedby")
     fireEvent.click(stopButton)
     expect(onStop).toHaveBeenCalledTimes(1)
     secondRender.unmount()
@@ -1966,7 +1969,6 @@ describe("ChatInput", () => {
       ["", "widgetSession.stopResponse"],
       ["draft", "common.send"],
     ]
-    expect(cases).toHaveLength(2)
 
     for (const [inputValue, expectedName] of cases) {
       const otherName = expectedName === "common.send"

@@ -5670,7 +5670,6 @@ describe("AppProvider websocket message routing", () => {
       ["a Session transport with taskStop explicitly disabled", makeSessionTransport(makeSessionConnection(), { taskStop: "disabled" })],
       ["a non-Session transport", { capabilities: {} }],
     ]
-    expect(cases).toHaveLength(4)
 
     cases.forEach(([, transport], index) => {
       const { unmount } = render(
@@ -5857,7 +5856,7 @@ describe("AppProvider websocket message routing", () => {
       "the local 30s timeout elapses before the terminal frame",
     ]
 
-    const assertNeutral = (taskId: number) => {
+    const assertNeutral = () => {
       const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
         content: string
         isResult?: boolean
@@ -5867,7 +5866,6 @@ describe("AppProvider websocket message routing", () => {
       expect(stopped).toBeDefined()
       expect(stopped?.isResult).toBe(true)
       expect(stopped?.status).not.toBe("failed")
-      void taskId
     }
 
     // 1) connection identity changes (routine token refresh) mid-cancel.
@@ -5893,7 +5891,7 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("stop-state").textContent).toBe("idle")
 
       act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
-      assertNeutral(taskId)
+      assertNeutral()
       unmount()
     }
 
@@ -5919,7 +5917,7 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("can-stop-task").textContent).toBe("false")
 
       act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
-      assertNeutral(taskId)
+      assertNeutral()
       unmount()
     }
 
@@ -5942,7 +5940,7 @@ describe("AppProvider websocket message routing", () => {
         expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
 
         act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
-        assertNeutral(taskId)
+        assertNeutral()
         unmount()
       } finally {
         vi.useRealTimers()
@@ -6155,9 +6153,10 @@ describe("AppProvider websocket message routing", () => {
         } as Record<string, unknown>),
       }))
       // The rejection is answered on the agent_error channel, not the
-      // terminal one -- it must retire the intent without touching the
-      // button's own state, which still owns the 30s recovery path.
-      expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+      // terminal one, and it is also the answer to the button itself: the
+      // control leaves "stopping" here rather than waiting out the 30s
+      // recovery path for a request the server has already answered.
+      expect(screen.getByTestId("stop-state").textContent).toBe("idle")
 
       act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
       assertRed()
@@ -6203,6 +6202,117 @@ describe("AppProvider websocket message routing", () => {
       act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
       act(() => getSessionControls().stopTask())
 
+      act(() => { vi.advanceTimersByTime(29_999) })
+      expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+
+      act(() => { vi.advanceTimersByTime(2) })
+      expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("clears the stop control when the server reports the stop did not apply", () => {
+    vi.useFakeTimers()
+    try {
+      // 1) a codeless agent_error rejection returns the control to idle and
+      // disarms the local timeout, so the rest of the 30s window does not
+      // re-arm it.
+      {
+        const taskId = 1208
+        const { unmount } = render(
+          <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+            <SessionControlsProbe />
+          </AppProvider>
+        )
+        act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+        act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+        act(() => getSessionControls().stopTask())
+        expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+
+        act(() => webSocketOptions.current?.onMessage?.({
+          type: "agent_error",
+          timestamp: "2026-05-27T05:00:03Z",
+          task_id: taskId,
+          ...({
+            message: "Stopping this response didn't go through — please try again.",
+            error: "Stopping this response didn't go through — please try again.",
+          } as Record<string, unknown>),
+        }))
+        expect(screen.getByTestId("stop-state").textContent).toBe("idle")
+
+        act(() => { vi.advanceTimersByTime(30_001) })
+        expect(screen.getByTestId("stop-state").textContent).toBe("idle")
+        unmount()
+      }
+
+      // 2) an agent_error carrying an error_code is a different producer's
+      // coded failure, not the codeless stop-rejection -- it must not reset
+      // the button.
+      {
+        const taskId = 1209
+        const { unmount } = render(
+          <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+            <SessionControlsProbe />
+          </AppProvider>
+        )
+        act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+        act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+        act(() => getSessionControls().stopTask())
+        expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+
+        act(() => webSocketOptions.current?.onMessage?.({
+          type: "agent_error",
+          timestamp: "2026-05-27T05:00:03Z",
+          task_id: taskId,
+          ...({ message: "Message processing failed.", error_code: "message_processing_failed" } as Record<string, unknown>),
+        }))
+        expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+        unmount()
+      }
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("arms a fresh 30s window when the stop control is pressed again after a rejection", () => {
+    vi.useFakeTimers()
+    try {
+      const taskId = 1211
+      render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+
+      act(() => getSessionControls().stopTask())
+      expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+
+      // Let the first attempt's timeout age for a while before the rejection
+      // lands, so a re-press that wrongly inherited the first timer's
+      // deadline -- instead of arming its own -- is distinguishable from one
+      // that started a fresh 30s window.
+      act(() => { vi.advanceTimersByTime(10_000) })
+      act(() => webSocketOptions.current?.onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:13Z",
+        task_id: taskId,
+        ...({
+          message: "Stopping this response didn't go through — please try again.",
+          error: "Stopping this response didn't go through — please try again.",
+        } as Record<string, unknown>),
+      }))
+      expect(screen.getByTestId("stop-state").textContent).toBe("idle")
+      expect(screen.getByTestId("can-stop-task").textContent).toBe("true")
+
+      act(() => getSessionControls().stopTask())
+      expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+
+      // The first attempt's original deadline (30s from its own press) would
+      // have landed here if the re-press had not armed its own timer. It has
+      // not: the control is still counting down its own window.
       act(() => { vi.advanceTimersByTime(29_999) })
       expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
 

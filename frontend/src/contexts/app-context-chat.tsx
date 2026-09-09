@@ -127,9 +127,12 @@ type SessionConversationState =
 
 // The stop control's own state. The server sends no acknowledgement frame
 // for a stop, but a stop it cannot execute is answered by a codeless
-// agent_error on this channel. The exits from "stopping" remain this task's
-// terminal frame and the local timeout above -- the rejection clears the
-// intent, deliberately not this state.
+// agent_error on this channel. "stopping" therefore has three exits: this
+// task's terminal frame, the local timeout above, and that rejection --
+// which is the answer to the request, so the control leaves "stopping"
+// there rather than waiting the timeout out; a reconnect also returns it
+// to idle, since the button's own state is per-connection and cannot
+// outlive the connection it was set on.
 export type SessionStopState = "idle" | "stopping" | "timed_out" | "not_sent"
 
 type SessionConversationAction =
@@ -5896,12 +5899,20 @@ export function AppProvider({
         // chose to mean "stop rejected", it is read from what the frame
         // happens to omit. A structured marker is tracked in
         // xorbitsai/xagent#2247.
+        // This frame is also the answer to the stop button, not only to the
+        // intent: the rejection's sentence tells the visitor to try again,
+        // and a button still stuck on "Stopping..." would contradict that
+        // instruction. So the control leaves "stopping" here too, rather than
+        // waiting out the local 30-second window for a request the server has
+        // already answered.
         if (
           !getWebSocketErrorCodeField(message).present
           && stopIntentTaskIdRef.current !== null
           && controlEnvelope.taskId === stopIntentTaskIdRef.current
         ) {
           stopIntentTaskIdRef.current = null
+          clearStopTimeout()
+          setStopState("idle")
         }
         break
 

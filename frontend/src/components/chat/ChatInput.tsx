@@ -1121,7 +1121,6 @@ export function ChatInput({
               }}
               role="textbox"
               aria-multiline="true"
-              aria-describedby={showStopHint ? stopHintId : undefined}
             />
             {!message && (
               <div className="pointer-events-none absolute left-4 top-3 text-[14px] text-muted-foreground/60">
@@ -1191,6 +1190,7 @@ export function ChatInput({
                   disabled={isStopInFlight}
                   aria-label={stopButtonLabel}
                   title={stopButtonLabel}
+                  aria-describedby={showStopHint ? stopHintId : undefined}
                   className={cn(
                     "h-8 w-8 rounded-lg transition-all duration-300",
                     isStopInFlight && "bg-muted text-muted-foreground/50"
