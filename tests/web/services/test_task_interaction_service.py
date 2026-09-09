@@ -5767,7 +5767,8 @@ def test_degraded_as_subclass_maps_to_the_parents_outcome(
     _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
     """A future subclass of a mapped swallowed type must classify as its
-    parent does, not fall through to the slot_taken default.
+    parent does, not fall through to the handoff_degraded_unclassified
+    default.
     InteractionRunPartitionMismatch is the discriminating choice: its
     outcome (CreateStale) is the one the default can never produce, so an
     exact-type lookup's failure is visible in the outcome itself.
@@ -5821,14 +5822,19 @@ def test_unmapped_degraded_as_maps_to_the_unclassified_outcome(
     from a wired caller (see _DEGRADED_AS_OUTCOME's own comment), so this
     test is the only statement of what create() reports for them.
 
-    The registered degradation is asserted, not just the outcome: an
-    unset degraded_as -- which is what a stage_interaction_request that
-    the patch below silently failed to intercept would leave behind --
-    reports the same reason word by design, so the outcome alone cannot
-    tell "the swallow happened and fell through" from "no swallow
-    happened at all". The signal's detail is registered only from
-    interaction_handoff's except clause and names the exception type that
-    fired, so checking it pins both facts.
+    The registered degradation is asserted on top of the outcome because
+    the two pin different facts. The detail assertions pin that the
+    swallow registered its degradation signal at all and that the signal
+    names the exception type that fired: deleting register_degradation
+    from interaction_handoff's except clause leaves the outcome assertion
+    green but makes the active_degradations() lookup below raise
+    KeyError. No assertion here pins the handoff.degraded_as assignment
+    itself; test_handoff_degraded_as_is_set_directly_on_a_slot_taken_swallow
+    covers that. A patch below that silently failed to intercept is
+    caught by the outcome and row-count assertions rather than by the
+    detail: the real stage_interaction_request would succeed, taking the
+    same path as test_system_principal_creates_a_fresh_row and yielding
+    CreateCreated plus one persisted row.
 
     Mutation: reverting the default classification's reason back to
     `CreateConflict(reason="slot_taken")` turns this red."""
@@ -5848,7 +5854,7 @@ def test_unmapped_degraded_as_maps_to_the_unclassified_outcome(
         outcome = _system_create(_db, ctx, request_idempotency_key="sys-key-unmapped")
 
     assert outcome == svc.CreateConflict(reason="handoff_degraded_unclassified")
-    assert real_stage is staging_module.stage_interaction_request
+    assert real_stage is staging_module.stage_interaction_request  # patch released
     assert _db.query(TaskInteractionRequest).count() == 0
 
     detail = active_degradations()[INTERACTION_HANDOFF_DEGRADED]
