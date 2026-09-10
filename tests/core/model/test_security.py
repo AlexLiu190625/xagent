@@ -333,11 +333,46 @@ def test_redact_sensitive_text_masks_prefixed_assignment_keys() -> None:
     )
 
 
+def test_redact_sensitive_text_masks_prefixed_secret_key_names() -> None:
+    # An unknown ``*_key`` is treated as a credential (fail closed): the
+    # common secret names below end in ``key`` without any other credential
+    # word in front of it.
+    text = (
+        "AWS_SECRET_ACCESS_KEY=AKIA-secret-1 "
+        "SECRET_KEY=django-secret-1 "
+        "STRIPE_KEY=sk_live_1234567 "
+        "PRIVATE_KEY=pem-private-1 "
+        "x-client-key=ck-000111"
+    )
+    redacted = redact_sensitive_text(text)
+
+    for raw in (
+        "AKIA-secret-1",
+        "django-secret-1",
+        "sk_live_1234567",
+        "pem-private-1",
+        "ck-000111",
+    ):
+        assert raw not in redacted
+    assert redacted == (
+        "AWS_SECRET_ACCESS_KEY=***et-1 "
+        "SECRET_KEY=***et-1 "
+        "STRIPE_KEY=***4567 "
+        "PRIVATE_KEY=***te-1 "
+        "x-client-key=***0111"
+    )
+
+
 def test_redact_sensitive_text_leaves_non_credential_key_suffixes() -> None:
-    # ``key`` alone is a credential word only when it stands by itself: a
-    # prefixed ``*_key`` names an ordinary field, and this text reaches
-    # user- and model-facing error messages, so it must stay readable.
-    text = "primary_key=42 sort_key=created_at PUBLIC_KEY=pem-body cache_key=user:42"
+    # Only a ``*_key`` whose qualifier names a structural field is left
+    # alone; this text reaches user- and model-facing error messages, so
+    # these must stay readable. ``hotkey=`` / ``monkey=`` have no separate
+    # ``key`` segment and are not assignments of a credential either.
+    text = (
+        "primary_key=42 sort_key=created_at partition_key=tenant "
+        "PUBLIC_KEY=pem-body cache_key=user:42 idempotency_key=uuid-1 "
+        "s3_key=path/to/obj routing_key=orders.new hotkey=ctrl-k monkey=1"
+    )
 
     assert redact_sensitive_text(text) == text
 

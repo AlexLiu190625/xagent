@@ -39,10 +39,12 @@ ASSIGNMENT_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]+)=([^&\s]+)")
 # A credential word may sit behind an identifier prefix (``MCP_API_KEY=``,
 # ``SERVICE_ACCESS_TOKEN=``, ``DB_PASSWORD=``), so a key is a credential when it
 # ends in one of these words and the word is the whole key or is joined to
-# the prefix by ``_``/``-``. A bare ``key`` (or ``--key``) is a credential,
-# but ``primary_key=`` / ``sort_key=`` / ``PUBLIC_KEY=`` name ordinary fields,
-# and this text also reaches user- and model-facing error messages, so a
-# prefixed ``*_key`` is left readable.
+# the prefix by ``_``/``-``. ``key`` itself is included: ``SECRET_KEY=``,
+# ``AWS_SECRET_ACCESS_KEY=``, ``STRIPE_KEY=`` and ``PRIVATE_KEY=`` are all
+# credentials, and an unknown ``*_key`` is treated as one (fail closed). Only
+# the qualifiers below name ordinary fields (``primary_key=``, ``sort_key=``,
+# ``PUBLIC_KEY=``); those stay readable because this text also reaches user-
+# and model-facing error messages.
 _CREDENTIAL_KEY_SUFFIXES = (
     "api_key",
     "api-key",
@@ -53,18 +55,48 @@ _CREDENTIAL_KEY_SUFFIXES = (
     "token",
     "password",
     "secret",
+    "key",
+)
+_NON_CREDENTIAL_KEY_QUALIFIERS = frozenset(
+    {
+        "primary",
+        "foreign",
+        "unique",
+        "composite",
+        "index",
+        "sort",
+        "partition",
+        "range",
+        "hash",
+        "lookup",
+        "cache",
+        "routing",
+        "idempotency",
+        "public",
+        "object",
+        "s3",
+    }
 )
 
 
 def _is_credential_key(key: str) -> bool:
     lowered = key.lower()
-    if lowered.endswith("key") and lowered[:-3].strip("-") == "":
-        return True
     for suffix in _CREDENTIAL_KEY_SUFFIXES:
-        if lowered.endswith(suffix):
-            prefix = lowered[: -len(suffix)]
-            if prefix == "" or prefix[-1] in "_-":
-                return True
+        if not lowered.endswith(suffix):
+            continue
+        prefix = lowered[: -len(suffix)]
+        if prefix.strip("-") == "":
+            # Bare word, or a CLI-style flag such as ``--api-key=``.
+            return True
+        if prefix[-1] not in "_-":
+            # ``monkey=`` / ``hotkey=`` / ``tokens=``: the credential word is
+            # not a separate segment of the identifier.
+            continue
+        if suffix == "key":
+            qualifier = re.split(r"[_-]", prefix.rstrip("_-"))[-1]
+            if qualifier in _NON_CREDENTIAL_KEY_QUALIFIERS:
+                return False
+        return True
     return False
 
 
