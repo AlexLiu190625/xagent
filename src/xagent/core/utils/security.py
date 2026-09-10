@@ -29,17 +29,52 @@ SENSITIVE_QUERY_KEYS = {
 }
 
 URL_PATTERN = re.compile(r"https?://[^\s\"'>]+")
-# A credential key may carry an identifier prefix (``MCP_API_KEY=``,
-# ``SERVICE_ACCESS_TOKEN=``, ``DB_PASSWORD=``), so the key is matched from a
-# non-identifier boundary and allowed any ``_``/``-``-joined prefix in front
-# of a credential word. A bare ``key`` is only masked without a prefix:
-# ``primary_key=`` / ``sort_key=`` / ``PUBLIC_KEY=`` name ordinary fields, not
-# secrets, and this text also reaches user- and model-facing error messages.
-ASSIGNMENT_SECRET_PATTERN = re.compile(
-    r"(?i)(?<![A-Za-z0-9])"
-    r"((?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|token|password|secret)"
-    r"|(?<![_-])key)=([^&\s]+)"
+# Every ``identifier=value`` assignment in the text; ``_is_credential_key``
+# decides which of them carry a secret. The regex itself stays linear: a
+# single identifier run followed by ``=``, anchored on a non-identifier
+# boundary, so a long run of ``a_a_a_...`` without ``=`` fails once per run
+# instead of re-trying every segment split (a nested ``(prefix_)*word``
+# quantifier did that and took seconds on a 20 kB hostile message).
+ASSIGNMENT_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]+)=([^&\s]+)")
+# A credential word may sit behind an identifier prefix (``MCP_API_KEY=``,
+# ``SERVICE_ACCESS_TOKEN=``, ``DB_PASSWORD=``), so a key is a credential when it
+# ends in one of these words and the word is the whole key or is joined to
+# the prefix by ``_``/``-``. A bare ``key`` (or ``--key``) is a credential,
+# but ``primary_key=`` / ``sort_key=`` / ``PUBLIC_KEY=`` name ordinary fields,
+# and this text also reaches user- and model-facing error messages, so a
+# prefixed ``*_key`` is left readable.
+_CREDENTIAL_KEY_SUFFIXES = (
+    "api_key",
+    "api-key",
+    "apikey",
+    "access_token",
+    "access-token",
+    "accesstoken",
+    "token",
+    "password",
+    "secret",
 )
+
+
+def _is_credential_key(key: str) -> bool:
+    lowered = key.lower()
+    if lowered.endswith("key") and lowered[:-3].strip("-") == "":
+        return True
+    for suffix in _CREDENTIAL_KEY_SUFFIXES:
+        if lowered.endswith(suffix):
+            prefix = lowered[: -len(suffix)]
+            if prefix == "" or prefix[-1] in "_-":
+                return True
+    return False
+
+
+def _redact_assignment(match: "re.Match[str]") -> str:
+    key, value = match.group(1), match.group(2)
+    if not _is_credential_key(key):
+        return match.group(0)
+    return f"{key}={_mask_secret(value)}"
+
+
 AUTH_HEADER_PATTERN = re.compile(
     r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)\s+)([^\s,;]+)"
 )
@@ -347,10 +382,7 @@ def redact_sensitive_text(text: str) -> str:
         lambda match: redact_url_credentials_for_logging(match.group(0)),
         text,
     )
-    redacted = ASSIGNMENT_SECRET_PATTERN.sub(
-        lambda match: f"{match.group(1)}={_mask_secret(match.group(2))}",
-        redacted,
-    )
+    redacted = ASSIGNMENT_PATTERN.sub(_redact_assignment, redacted)
     redacted = AUTH_HEADER_PATTERN.sub(
         lambda match: f"{match.group(1)}{_mask_secret(match.group(2))}",
         redacted,

@@ -2407,7 +2407,9 @@ async def test_mcp_tool_execution_error_redacts_prefixed_credential_assignments(
         "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
         _fake_create_session,
     )
-    caplog.set_level("ERROR")
+    # Capture every level, not just ERROR: the guarantee is that the raw
+    # value is absent from every record this call emits.
+    caplog.set_level("DEBUG")
 
     result = await adapter.run_json_async({})
 

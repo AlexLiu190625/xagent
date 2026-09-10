@@ -1,6 +1,7 @@
 """Tests for shared security helpers."""
 
 import socket
+import time
 from unittest.mock import patch
 
 import httpx
@@ -345,3 +346,17 @@ def test_redact_sensitive_text_still_masks_bare_and_cli_style_keys() -> None:
     redacted = redact_sensitive_text("key=SECRET-bare --api-key=sk-cli-secret")
 
     assert redacted == "key=***bare --api-key=***cret"
+
+
+def test_redact_sensitive_text_is_linear_on_hostile_identifier_runs() -> None:
+    # A remote service controls this text. A long run of ``_``-joined
+    # identifier segments with no ``=`` must fail once per run, not once per
+    # segment split: a nested ``(prefix_)*word`` quantifier took seconds on
+    # 20 kB of this input; the current pattern takes well under a
+    # millisecond. The budget is loose on purpose so a slow CI worker cannot
+    # trip it, while a quadratic regression (tens of seconds here) still does.
+    hostile = "a_" * 50_000
+
+    started = time.perf_counter()
+    assert redact_sensitive_text(hostile) == hostile
+    assert time.perf_counter() - started < 1.0
