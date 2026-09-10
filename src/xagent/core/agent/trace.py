@@ -1163,6 +1163,12 @@ class ConsoleTraceHandler(BaseTraceHandler):
     persistence handlers keep the untrimmed payload.
     """
 
+    async def handle_event(self, event: TraceEvent) -> None:
+        """Skip console dispatch and payload rendering when INFO is disabled."""
+        if not logger.isEnabledFor(logging.INFO):
+            return
+        await super().handle_event(event)
+
     async def _handle_task_event(self, event: TraceEvent) -> None:
         """Handle task-level events."""
         logger.info(
@@ -1260,9 +1266,16 @@ class Tracer:
             "xagent.trace.events",
             attributes={"event.type": event_type.value},
         )
-        logger.info(
-            f"trace_event called: {event_type.value} for task {task_id}, step {step_id} with data keys: {list(data.keys()) if data else []}"
-        )
+        # Dispatch diagnostics are verbose on the event-loop hot path. Keep
+        # them opt-in; durable events and ConsoleTraceHandler are independent.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "trace_event called: %s for task %s, step %s with data keys: %s",
+                event_type.value,
+                task_id,
+                step_id,
+                list(data.keys()) if data else [],
+            )
 
         event = TraceEvent(
             event_type=event_type,
@@ -1274,8 +1287,8 @@ class Tracer:
         )
 
         # Notify all handlers
-        logger.info(
-            f"Notifying {len(self.handlers)} handlers for event {event_type.value}"
+        logger.debug(
+            "Notifying %s handlers for event %s", len(self.handlers), event_type.value
         )
         handler_errors: List[Exception] = []
         # Snapshot: a handler removed mid-dispatch must not shift its
@@ -1284,13 +1297,13 @@ class Tracer:
             for i, handler in enumerate(list(self.handlers)):
                 handler_name = type(handler).__name__
                 try:
-                    logger.info(f"Calling handler {i}: {handler_name}")
+                    logger.debug("Calling handler %s: %s", i, handler_name)
                     with observe_duration(
                         "xagent.trace.handler.duration",
                         attributes={"handler": handler_name},
                     ):
                         await handler.handle_event(event)
-                    logger.info(f"Handler {i} completed successfully")
+                    logger.debug("Handler %s completed successfully", i)
                 except Exception as e:
                     increment_counter(
                         "xagent.trace.handler.errors",
@@ -1314,8 +1327,8 @@ class Tracer:
                     "No trace handlers are configured for required trace persistence."
                 )
 
-        logger.info(
-            f"trace_event completed for {event_type.value}, event_id: {event.id}"
+        logger.debug(
+            "trace_event completed for %s, event_id: %s", event_type.value, event.id
         )
         return event.id
 
