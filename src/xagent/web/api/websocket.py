@@ -222,6 +222,7 @@ from ..services.task_lease_service import (
     acquire_task_lease_cancellation_safe,
     acquire_task_lease_no_commit,
     bind_task_lease_context,
+    lock_task_lease_for_settlement_no_commit,
     lock_task_lease_no_commit,
     registered_task_lease,
     release_task_lease_no_commit,
@@ -1210,7 +1211,9 @@ def make_agent_outbound_handler(task_id: int) -> Any:
             },
             event_id=payload.get("event_id"),
         )
-        await asyncio.to_thread(_persist_agent_outbound_event, task_id, event)
+        await run_db_io_cancellation_safe(
+            lambda: _persist_agent_outbound_event(task_id, event)
+        )
         await manager.broadcast_to_task(event, task_id)
 
     return handle_outbound_message
@@ -2504,7 +2507,7 @@ def _finalize_task_execution_result_isolated(
                 task_updated = None
                 late_result = True
             else:
-                lock_task_lease_no_commit(finalize_db, task_lease)
+                lock_task_lease_for_settlement_no_commit(finalize_db, task_lease)
                 task_updated = (
                     task_query.filter(
                         Task.runner_id == task_lease.runner_id,
@@ -3244,7 +3247,7 @@ def _finalize_resumed_task(
     metadata_committed = False
     cleanup_claims: tuple[SupersededObjectCleanupClaim, ...] = ()
     try:
-        lock_task_lease_no_commit(db, task_lease)
+        lock_task_lease_for_settlement_no_commit(db, task_lease)
         task = (
             db.query(Task)
             .filter(

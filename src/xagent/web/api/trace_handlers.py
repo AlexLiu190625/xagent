@@ -37,6 +37,7 @@ from ...web.models.database import get_db
 from ...web.models.task import Task, TaskStatus
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.task_interaction import TaskInteractionRequest
+from ...web.services.db_runtime import drain_async_task_cancellation_safe
 from ...web.services.interaction_rollout import (
     COUNTER_CHECKPOINT_READ_PARTITION_WIDENED,
     increment_counter,
@@ -220,12 +221,16 @@ class DatabaseTraceHandler(BaseTraceHandler):
     async def _save_to_database(self, event: CoreTraceEvent) -> None:
         """Save trace event to database."""
         try:
-            # Run synchronous database operations in a thread pool to avoid blocking event loop
-            await run_in_thread_with_telemetry(
-                "trace_database_write",
-                self._sync_save_to_database,
-                event,
+            # A cancelled caller must wait for the instrumented worker to
+            # release its transaction before task settlement can begin.
+            worker = asyncio.create_task(
+                run_in_thread_with_telemetry(
+                    "trace_database_write",
+                    self._sync_save_to_database,
+                    event,
+                )
             )
+            await drain_async_task_cancellation_safe(worker)
             increment_performance_counter(
                 "xagent.trace.database.writes",
                 attributes={"outcome": "succeeded"},
