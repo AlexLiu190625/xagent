@@ -309,3 +309,39 @@ def test_redact_sensitive_text_masks_assignment_style_secrets() -> None:
     assert "sk-super-secret" not in redacted
     assert "api_key=***" in redacted
     assert "timeout=30" in redacted
+
+
+def test_redact_sensitive_text_masks_prefixed_assignment_keys() -> None:
+    text = (
+        "MCP_API_KEY=SECRET-abc123 rejected; "
+        "SERVICE_ACCESS_TOKEN=tok-987654 expired; "
+        "DB_PASSWORD=pw-secret-1 refused; "
+        "x-client-secret=cs-000111 invalid"
+    )
+    redacted = redact_sensitive_text(text)
+
+    assert "SECRET-abc123" not in redacted
+    assert "tok-987654" not in redacted
+    assert "pw-secret-1" not in redacted
+    assert "cs-000111" not in redacted
+    assert redacted == (
+        "MCP_API_KEY=***c123 rejected; "
+        "SERVICE_ACCESS_TOKEN=***7654 expired; "
+        "DB_PASSWORD=***et-1 refused; "
+        "x-client-secret=***0111 invalid"
+    )
+
+
+def test_redact_sensitive_text_leaves_non_credential_key_suffixes() -> None:
+    # ``key`` alone is a credential word only when it stands by itself: a
+    # prefixed ``*_key`` names an ordinary field, and this text reaches
+    # user- and model-facing error messages, so it must stay readable.
+    text = "primary_key=42 sort_key=created_at PUBLIC_KEY=pem-body cache_key=user:42"
+
+    assert redact_sensitive_text(text) == text
+
+
+def test_redact_sensitive_text_still_masks_bare_and_cli_style_keys() -> None:
+    redacted = redact_sensitive_text("key=SECRET-bare --api-key=sk-cli-secret")
+
+    assert redacted == "key=***bare --api-key=***cret"

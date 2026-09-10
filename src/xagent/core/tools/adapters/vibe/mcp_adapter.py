@@ -764,10 +764,9 @@ def _truncated_error_message(exc: BaseException) -> str:
     otherwise just the exception's own message (e.g. a JSON-RPC error
     string or an HTTP status line) -- it must never be additionally handed
     tool_args, tool_meta, or connection headers, none of which are
-    exception messages to begin with. Two shapes are recognised by neither
-    helper -- a secret sitting in a URL path segment (#2272), and an
-    assignment whose key carries a prefix such as ``MCP_API_KEY=`` (#2304)
-    -- and for those the cap is what bounds the exposure.
+    exception messages to begin with. One shape is recognised by neither
+    helper -- a secret sitting in a URL path segment (#2272) -- and for that
+    the cap is what bounds the exposure.
     """
     try:
         text = redact_sensitive_text(redact_urls_in_text(str(exc)))

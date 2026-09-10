@@ -2375,6 +2375,54 @@ async def test_mcp_tool_execution_error_logs_truncated_message(monkeypatch, capl
 
 
 @pytest.mark.asyncio
+async def test_mcp_tool_execution_error_redacts_prefixed_credential_assignments(
+    monkeypatch, caplog
+):
+    """A server error that echoes a prefixed credential assignment such as
+    ``MCP_API_KEY=...`` must not leave the raw value in any emitted log
+    record: the shared sanitizer masks the value while keeping the key name
+    so the log still says which setting the server complained about."""
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            raise RuntimeError(
+                "MCP_API_KEY=SECRET-abc123 rejected; "
+                "SERVICE_ACCESS_TOKEN=tok-987654 expired"
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert "SECRET-abc123" not in caplog.text
+    assert "tok-987654" not in caplog.text
+    assert "MCP_API_KEY=***c123 rejected" in caplog.text
+    assert "SERVICE_ACCESS_TOKEN=***7654 expired" in caplog.text
+    assert caplog.records[-1].exc_info is None
+
+
+@pytest.mark.asyncio
 async def test_mcp_tool_execution_error_redacts_url_query_and_userinfo(
     monkeypatch, caplog
 ):
@@ -3758,6 +3806,14 @@ def test_only_read_only_is_a_safe_reading():
         (
             "config error: api_key=SECRET-abc123",
             "config error: api_key=***c123",
+        ),
+        (
+            "MCP_API_KEY=SECRET-abc123 rejected",
+            "MCP_API_KEY=***c123 rejected",
+        ),
+        (
+            "SERVICE_ACCESS_TOKEN=tok-987654 expired",
+            "SERVICE_ACCESS_TOKEN=***7654 expired",
         ),
     ],
 )

@@ -29,8 +29,16 @@ SENSITIVE_QUERY_KEYS = {
 }
 
 URL_PATTERN = re.compile(r"https?://[^\s\"'>]+")
+# A credential key may carry an identifier prefix (``MCP_API_KEY=``,
+# ``SERVICE_ACCESS_TOKEN=``, ``DB_PASSWORD=``), so the key is matched from a
+# non-identifier boundary and allowed any ``_``/``-``-joined prefix in front
+# of a credential word. A bare ``key`` is only masked without a prefix:
+# ``primary_key=`` / ``sort_key=`` / ``PUBLIC_KEY=`` name ordinary fields, not
+# secrets, and this text also reaches user- and model-facing error messages.
 ASSIGNMENT_SECRET_PATTERN = re.compile(
-    r"(?i)\b(api[_-]?key|access[_-]?token|token|password|secret|key)=([^&\s]+)"
+    r"(?i)(?<![A-Za-z0-9])"
+    r"((?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|token|password|secret)"
+    r"|(?<![_-])key)=([^&\s]+)"
 )
 AUTH_HEADER_PATTERN = re.compile(
     r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)\s+)([^\s,;]+)"
