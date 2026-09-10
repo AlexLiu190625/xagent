@@ -205,7 +205,10 @@ class LanceDBConnectionManager:
             if env_var == "LANCEDB_DIR":
                 # Use default path only for the standard LANCEDB_DIR environment variable
                 db_dir = self.get_default_lancedb_dir()
-                logger.info(f"Using default LanceDB directory: {db_dir}")
+                # Reached on every connection request now that the KB stores
+                # no longer memoise one (LanceDBVectorStore still does), so
+                # this must be neither INFO nor an eager f-string.
+                logger.debug("Using default LanceDB directory: %s", db_dir)
             else:
                 # For other environment variables, raise KeyError as before
                 raise KeyError(f"Environment variable {env_var} is not set")
