@@ -145,13 +145,18 @@ from xagent.web.models.user import User
 from xagent.web.services import task_interaction_service as svc
 from xagent.web.services.ops_signals import (
     CHECKPOINT_PK_ANCHOR_DANGLING,
+    INTERACTION_HANDOFF_DEGRADED,
     INTERACTION_READ_PAYLOAD_UNREADABLE,
     INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
     active_degradations,
     clear_degradation,
 )
 from xagent.web.services.task_clarification_draft import CLARIFICATION_REQUEST_TTL
-from xagent.web.services.task_interaction_staging import InteractionAnchor
+from xagent.web.services.task_interaction_staging import (
+    InteractionAnchor,
+    InteractionAttemptMismatch,
+    InteractionOriginUnknown,
+)
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD, TaskLease
 
 
@@ -181,10 +186,10 @@ def _clean_degradation_registry():
 # CreateOutcome's vocabulary guards (two pinned numbers, still plain dicts
 # in the source -- do not recompute them here):
 #
-#   - CreateOutcome reason word list: 12 words total (seam_not_wired was
+#   - CreateOutcome reason word list: 13 words total (seam_not_wired was
 #     deleted along with CreateNotWired once this seam's call body landed).
 #   - CreateOutcome pairs this function body has a code path that returns:
-#     9. Producible here means exactly that -- a code path exists in
+#     10. Producible here means exactly that -- a code path exists in
 #     create()'s own body -- not that the path is reachable from any wired
 #     production caller (see CREATE_OUTCOME_PRODUCIBLE_REASONS's own
 #     docstring for the two entries that stay in this set despite being
@@ -227,15 +232,15 @@ def test_respond_outcome_union_has_exactly_the_eight_known_variants() -> None:
     }
 
 
-def test_create_outcome_reason_word_list_has_exactly_12_words() -> None:
-    assert len(svc.CREATE_OUTCOME_REASON_WORDS) == 12
+def test_create_outcome_reason_word_list_has_exactly_13_words() -> None:
+    assert len(svc.CREATE_OUTCOME_REASON_WORDS) == 13
 
 
-def test_create_outcome_producible_pairs_are_exactly_9() -> None:
+def test_create_outcome_producible_pairs_are_exactly_10() -> None:
     total = sum(
         len(reasons) for reasons in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS.values()
     )
-    assert total == 9
+    assert total == 10
 
 
 def test_create_outcome_producible_reasons_are_a_subset_of_the_full_word_list() -> None:
@@ -2581,6 +2586,194 @@ def test_answer_fence_predicate_guest_branch_adds_a_json_lookup_term() -> None:
     )
     guest_terms = svc._answer_fence_task_predicate(guest_principal)
     assert len(guest_terms) == len(user_terms) + 1
+
+
+# ---------------------------------------------------------------------------
+# The write point re-verifies three of the six ownership terms the read
+# point checks; the other three are read-point-only. The next two tests
+# pin that split so it cannot drift silently, either by widening (someone
+# assuming all six are re-verified at write time) or narrowing (someone
+# quietly dropping one of the three that already are).
+#
+# The fact, stated by `_answer_fence_task_predicate`'s own docstring: "A
+# successful answer therefore proves the three terms above held at write
+# time and that the other three held at read time, not that all six held
+# at write time."
+#
+# The window this leaves open: a guest passes all six checks at the read
+# point (`task_is_owned_by_public_principal`); between the read and the
+# write, an administrator tightens the agent's `auth_mode`, or changes the
+# entity binding, or the channel binding -- none of which the write point
+# re-checks -- and the answer still lands.
+#
+# Why accepted rather than closed: it is not the JSON lookup itself that
+# resists being folded into the write point's WHERE clause. The guest's
+# own `guest_id` term is already in that clause, written backend-neutrally
+# as `Task.agent_config["guest_id"].as_string() == ...` and costing
+# neither an extra read nor a Python re-check. What resists is the Python
+# control flow around the other terms. Which entity-binding key needs
+# comparing at all is decided by a four-way dispatch on whichever single
+# principal field is populated (`task_is_owned_by_public_principal`, the
+# `if direction == "widget_agent"` chain), and three of those four
+# branches compare through `_json_entity_binding_matches`, which rejects
+# `bool` outright and treats any value that will not convert to `int` as
+# "does not match" rather than letting the conversion raise. One SQL
+# conjunction has neither the branch selection nor that tolerant
+# coercion, so closing the window means either re-deriving the direction
+# in SQL or keeping a Python re-check beside the UPDATE. The channel
+# binding is not a JSON lookup at all -- it is the row-level
+# `Task.channel_id IS NULL` -- and could be folded in on its own; it
+# stays out because the window is accepted as a whole, not because
+# anything blocks that one term. The production docstring leaves that
+# policy decision to whichever change wires the first production caller
+# of `respond()`; this pair of tests is where accepting the window, for
+# now, is recorded.
+#
+# Why unreachable today: `respond()` has zero production callers,
+# enforced by `test_no_production_module_calls_create_or_respond` in
+# `test_task_interaction_service_create_gate.py`.
+#
+# What the next two tests catch and do not catch: they catch the write
+# point's WHERE clause silently gaining one of the three read-point-only
+# terms, or silently losing one of the three it already re-verifies. They
+# do not narrow the window itself -- a grant already revoked between the
+# read and the write still lets an answer land through this path.
+# ---------------------------------------------------------------------------
+
+
+def test_answer_fence_write_point_reasserts_exactly_three_terms() -> None:
+    """The WHERE clause the write point actually compiles carries all
+    three re-verified terms: task status, task ownership, and (for a
+    guest) the ``guest_id`` match. Uses a guest principal because only the
+    guest branch carries all three terms at once.
+
+    Also asserts the term counts directly (three for a guest, two for a
+    plain user): the existing relative assertion in
+    ``test_answer_fence_predicate_guest_branch_adds_a_json_lookup_term``
+    only checks "guest has one more term than a plain user", which stays
+    green even if both counts were quietly reduced by one together.
+    """
+    guest_principal = svc.InteractionPrincipal(
+        kind="guest",
+        user_id=1,
+        is_admin=False,
+        auth_mode="widget",
+        guest_id="guest-1",
+    )
+    terms = svc._answer_fence_task_predicate(guest_principal)
+    assert len(terms) == 3
+    assert len(svc._answer_fence_task_predicate(_owning_principal(1))) == 2
+
+    stmt = svc._answer_fence_stmt(
+        interaction_id=1,
+        task_id=1,
+        principal=guest_principal,
+        response_payload={"ok": True},
+        now=datetime.now(timezone.utc),
+        responder_user_id=None,
+        responder_identity="guest:guest-1",
+    )
+    import sqlalchemy.dialects.sqlite
+
+    # Compiled from the statement ``_answer_fence_stmt`` returns, not from
+    # a ``sa.select(...)`` this test assembles out of the same terms. Only
+    # the former asserts the wiring: a hand-assembled copy of the write
+    # point's WHERE clause carries these three terms whether or not
+    # ``_answer_fence_stmt`` still splices in
+    # ``_answer_fence_task_predicate``, so it stays green with that call
+    # deleted from production. ``.whereclause`` alone rather than the
+    # whole statement, for the ``literal_binds`` reason the next test's
+    # comment spells out.
+    compiled = str(
+        stmt.whereclause.compile(
+            dialect=sqlalchemy.dialects.sqlite.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert "WAITING_FOR_USER" in compiled
+    assert "tasks.user_id" in compiled
+    assert "guest_id" in compiled
+
+
+def test_answer_fence_write_point_omits_the_read_time_only_terms() -> None:
+    """The write point's full UPDATE statement -- not just the predicate
+    helper -- never carries ``auth_mode``, any of the four entity-binding
+    keys, or the channel binding. Like the previous test it compiles the
+    WHERE clause of the statement ``_answer_fence_stmt`` builds, rather
+    than only ``_answer_fence_task_predicate``'s output: a future change
+    could add one of these terms directly to ``_answer_fence_stmt``'s own
+    ``where(...)`` without ever touching the predicate helper, and only a
+    check against the statement's own WHERE clause would catch that.
+    Where the previous test pins the terms that must be present, this one
+    pins the terms that must be absent.
+
+    This does not assert these three terms go unchecked anywhere -- they
+    are evaluated once in Python at the read point
+    (``task_is_owned_by_public_principal``) before ``respond()`` reaches
+    this statement. It asserts only that they are absent here.
+    """
+    guest_principal = svc.InteractionPrincipal(
+        kind="guest",
+        user_id=1,
+        is_admin=False,
+        auth_mode="widget",
+        guest_id="guest-1",
+    )
+    stmt = svc._answer_fence_stmt(
+        interaction_id=1,
+        task_id=1,
+        principal=guest_principal,
+        response_payload={"ok": True},
+        now=datetime.now(timezone.utc),
+        responder_user_id=None,
+        responder_identity="guest:guest-1",
+    )
+    import sqlalchemy.dialects.sqlite
+
+    # ``literal_binds=True`` cannot compile the whole statement: its
+    # ``VALUES`` clause carries ``response_payload``, a JSON column, and
+    # SQLAlchemy's JSON type has no ``literal_processor`` on any dialect,
+    # so that raises ``sqlalchemy.exc.CompileError: No literal value
+    # renderer is available ... with datatype JSON``. Compiling the WHERE
+    # clause alone avoids the VALUES clause while still covering every
+    # term the statement carries, including one added directly to
+    # ``_answer_fence_stmt``'s own ``where(...)`` rather than through the
+    # predicate helper. With literal binds, a JSON path lookup renders its
+    # key inline (``JSON_EXTRACT(tasks.agent_config, '$."auth_mode"')``)
+    # instead of hiding it in a bind parameter.
+    #
+    # The widget-agent direction compares a row-level column today
+    # (``Task.agent_id``), but its marker below is the bare key name
+    # ``agent_id`` rather than ``tasks.agent_id``. The bare name matches
+    # both renderings -- the row-level ``tasks.agent_id`` and the JSON
+    # path ``JSON_EXTRACT(tasks.agent_config, '$."agent_id"')`` -- so the
+    # loop keeps catching this direction if the binding ever moves into
+    # ``agent_config`` (#1304), which ``tasks.agent_id`` would not. It
+    # cannot fire on the clause this statement compiles today: the only
+    # other ``agent``-prefixed name there is ``tasks.agent_config``. The
+    # channel binding has no JSON form at all, so ``tasks.channel_id``
+    # stays a column-name marker.
+    compiled = str(
+        stmt.whereclause.compile(
+            dialect=sqlalchemy.dialects.sqlite.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    # A positive canary ahead of the negative loop: were ``compiled`` ever
+    # to come back empty or truncated, every ``not in`` below would pass
+    # and this test would assert nothing. ``tasks.user_id`` is one of the
+    # three terms the write point does re-verify, so it is present
+    # whenever this statement compiled at all.
+    assert "tasks.user_id" in compiled
+    for marker in (
+        "auth_mode",
+        "widget_workforce_id",
+        "share_agent_id",
+        "share_workforce_id",
+        "agent_id",
+        "tasks.channel_id",
+    ):
+        assert marker not in compiled
 
 
 # ---------------------------------------------------------------------------
@@ -5792,13 +5985,14 @@ def test_degraded_as_subclass_maps_to_the_parents_outcome(
     _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
     """A future subclass of a mapped swallowed type must classify as its
-    parent does, not fall through to the slot_taken default.
+    parent does, not fall through to the handoff_degraded_unclassified
+    default.
     InteractionRunPartitionMismatch is the discriminating choice: its
     outcome (CreateStale) is the one the default can never produce, so an
     exact-type lookup's failure is visible in the outcome itself.
 
     Mutation: restoring `_DEGRADED_AS_OUTCOME.get(handoff.degraded_as)`
-    turns this red with CreateConflict(slot_taken)."""
+    turns this red with CreateConflict(handoff_degraded_unclassified)."""
 
     from xagent.web.services import task_interaction_staging as staging_module
     from xagent.web.services.task_interaction_staging import (
@@ -5822,6 +6016,68 @@ def test_degraded_as_subclass_maps_to_the_parents_outcome(
     assert outcome == svc.CreateStale(reason="anchor_run_mismatch")
     assert real_stage is staging_module.stage_interaction_request
     assert _db.query(TaskInteractionRequest).count() == 0
+
+
+@pytest.mark.parametrize(
+    "unmapped_exc",
+    [
+        pytest.param(InteractionOriginUnknown, id="origin_unknown"),
+        pytest.param(InteractionAttemptMismatch, id="attempt_mismatch"),
+    ],
+)
+def test_unmapped_degraded_as_maps_to_the_unclassified_outcome(
+    _db: Session,
+    _system_call_ctx: dict[str, Any],
+    unmapped_exc: type[Exception],
+) -> None:
+    """An unrecognized degradation gets its own reason word, not the
+    real-conflict one. InteractionOriginUnknown and
+    InteractionAttemptMismatch are exactly the two swallowed exceptions
+    _DEGRADED_AS_OUTCOME does not map, so both exercise the default
+    classification, which now reports handoff_degraded_unclassified rather
+    than reusing slot_taken. Both are covered because the default is the
+    only place either type's outcome is decided -- neither is reachable
+    from a wired caller (see _DEGRADED_AS_OUTCOME's own comment), so this
+    test is the only statement of what create() reports for them.
+
+    The registered degradation is asserted on top of the outcome because
+    the two pin different facts. The detail assertions pin that the
+    swallow registered its degradation signal at all and that the signal
+    names the exception type that fired: deleting register_degradation
+    from interaction_handoff's except clause leaves the outcome assertion
+    green but makes the active_degradations() lookup below raise
+    KeyError. No assertion here pins the handoff.degraded_as assignment
+    itself; test_handoff_degraded_as_is_set_directly_on_a_slot_taken_swallow
+    covers that. A patch below that silently failed to intercept is
+    caught by the outcome and row-count assertions rather than by the
+    detail: the real stage_interaction_request would succeed, taking the
+    same path as test_system_principal_creates_a_fresh_row and yielding
+    CreateCreated plus one persisted row.
+
+    Mutation: reverting the default classification's reason back to
+    `CreateConflict(reason="slot_taken")` turns this red."""
+
+    from xagent.web.services import task_interaction_staging as staging_module
+
+    ctx = _system_call_ctx
+    real_stage = staging_module.stage_interaction_request
+    forced_message = f"forced for test_unmapped_degraded_as ({unmapped_exc.__name__})"
+
+    def _raise_unmapped(*args: Any, **kwargs: Any) -> Any:
+        raise unmapped_exc(forced_message)
+
+    with mock.patch.object(
+        staging_module, "stage_interaction_request", side_effect=_raise_unmapped
+    ):
+        outcome = _system_create(_db, ctx, request_idempotency_key="sys-key-unmapped")
+
+    assert outcome == svc.CreateConflict(reason="handoff_degraded_unclassified")
+    assert real_stage is staging_module.stage_interaction_request  # patch released
+    assert _db.query(TaskInteractionRequest).count() == 0
+
+    detail = active_degradations()[INTERACTION_HANDOFF_DEGRADED]
+    assert unmapped_exc.__name__ in detail
+    assert forced_message in detail
 
 
 def test_swallowed_exception_types_are_mutually_unrelated() -> None:
@@ -5928,13 +6184,21 @@ def test_handoff_degraded_as_is_set_directly_on_a_slot_taken_swallow(
 ) -> None:
     """Unlike the outcome-level test above, this checks
     InteractionHandoff.degraded_as itself, at the staging primitive's own
-    layer -- discriminating power the outcome-level test lacks for this one
-    exception, since CreateConflict(slot_taken) is also this function's
-    fallback for an unset/unrecognized degraded_as, so an outcome-only
-    check cannot tell "correctly mapped" from "fell through to the
-    default". Deleting the `handoff.degraded_as = type(exc)` assignment in
-    interaction_handoff's except block turns this test red without
-    changing the outcome-level test's result at all."""
+    layer, pinning the `handoff.degraded_as = type(exc)` assignment
+    directly rather than through create()'s downstream mapping. Before the
+    default classification got its own reason word
+    (handoff_degraded_unclassified), CreateConflict(slot_taken) was also
+    this function's fallback for an unset/unrecognized degraded_as, so the
+    outcome alone could not tell "correctly mapped" from "fell through to
+    the default" for this one exception -- only this primitive-level check
+    could. That degeneracy is gone now that the default reports a
+    different word, so the outcome-level test above has the same
+    discriminating power for this exception today. Deleting the
+    `handoff.degraded_as = type(exc)` assignment in interaction_handoff's
+    except block turns both this test and the outcome-level test red
+    (verified; every other test that exercises a mapped swallowed
+    exception turns red too, since the same assignment backs all of
+    them)."""
 
     from xagent.web.services.task_interaction_staging import InteractionSlotTaken
 
@@ -6309,10 +6573,7 @@ def _base_interaction_for_type(
     interaction_type: str, **overrides: Any
 ) -> dict[str, Any]:
     item = _interaction(type=interaction_type, **overrides)
-    if (
-        interaction_type in svc._V1_TYPES_REQUIRING_OPTIONS
-        and "options" not in overrides
-    ):
+    if interaction_type in svc.TYPES_REQUIRING_OPTIONS and "options" not in overrides:
         item["options"] = [{"label": "Option A", "value": "a"}]
     return item
 

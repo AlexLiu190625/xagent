@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps
+from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
@@ -19,7 +20,10 @@ from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import connector_team_scope
-from xagent.web.services.mcp_runtime import MCPBuiltinOAuthActorPolicy
+from xagent.web.services.mcp_runtime import (
+    MCPActorAuthorizationPolicy,
+    MCPBuiltinOAuthActorPolicy,
+)
 from xagent.web.tools import config as web_tools_config
 from xagent.web.tools.config import (
     ResolvedToken,
@@ -245,20 +249,191 @@ def _token(config: dict) -> str:
     return config["config"]["env"]["ACTOR_ACCESS_TOKEN"]
 
 
-def test_actor_policy_is_frozen_normalized_and_owner_only() -> None:
+def test_actor_policy_is_frozen_normalized_and_stdio_disabled_by_default() -> None:
     policy = MCPBuiltinOAuthActorPolicy(resource_owner_key=f"  {OWNER_A}  ")
 
     assert policy.resource_owner_key == OWNER_A
-    assert [field.name for field in fields(policy)] == ["resource_owner_key"]
+    assert policy.allow_builtin_stdio is False
+    assert [field.name for field in fields(policy)] == [
+        "resource_owner_key",
+        "allow_builtin_stdio",
+    ]
     assert OWNER_A not in repr(policy)
     with pytest.raises(FrozenInstanceError):
         policy.resource_owner_key = OWNER_B  # type: ignore[misc]
+
+
+def test_general_actor_policy_keeps_legacy_type_identity() -> None:
+    policy = MCPActorAuthorizationPolicy(
+        resource_owner_key=OWNER_A,
+        allow_builtin_stdio=True,
+    )
+
+    assert MCPBuiltinOAuthActorPolicy is MCPActorAuthorizationPolicy
+    assert isinstance(policy, MCPBuiltinOAuthActorPolicy)
+    assert policy.allow_builtin_stdio is True
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+def test_actor_policy_rejects_non_boolean_stdio_capability(value: object) -> None:
+    with pytest.raises(ValueError, match="allow_builtin_stdio must be a boolean"):
+        MCPActorAuthorizationPolicy(
+            resource_owner_key=OWNER_A,
+            allow_builtin_stdio=value,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize("value", [None, 7, True, "", "   "])
 def test_actor_policy_rejects_invalid_owner(value: object) -> None:
     with pytest.raises((TypeError, ValueError)):
         MCPBuiltinOAuthActorPolicy(resource_owner_key=value)  # type: ignore[arg-type]
+
+
+def test_actor_remote_legacy_classification_queries_each_live_view(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    query = db_session.db.query
+    queried: list[object] = []
+
+    def recording_query(*entities):
+        queried.extend(entities)
+        return query(*entities)
+
+    db_session.db.query = recording_query  # type: ignore[method-assign]
+
+    resolved = mcp_apps.classify_actor_remote_oauth_server(db_session.db, server)
+
+    assert resolved is not None and resolved["id"] == REMOTE_APP_ID
+    assert PublicMCPApp in queried
+    assert MCPServer in queried
+    assert any(entity is UserMCPServer.id for entity in queried)
+
+
+def test_actor_remote_legacy_non_remote_unpersisted_row_remains_native(
+    db_session,
+) -> None:
+    server = SimpleNamespace(name="uncataloged", transport="stdio", auth=None, id=None)
+
+    assert mcp_apps.classify_actor_remote_oauth_server(db_session.db, server) is None
+
+
+def test_actor_remote_snapshot_freezes_catalog_server_and_owner_view(
+    db_session, monkeypatch
+) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    snapshot = mcp_apps.load_mcp_app_snapshot(db_session.db)
+
+    with db_session.session_factory() as live_db:
+        live_db.query(PublicMCPApp).filter(PublicMCPApp.app_id == REMOTE_APP_ID).update(
+            {"is_visible_in_connector": False}
+        )
+        live_db.query(MCPServer).filter(MCPServer.id == int(server.id)).update(
+            {"name": "changed-live-server"}
+        )
+        live_db.query(UserMCPServer).filter(
+            UserMCPServer.mcpserver_id == int(server.id)
+        ).update({"is_owner": True})
+        live_db.commit()
+
+    monkeypatch.setattr(
+        db_session.db,
+        "query",
+        lambda *_args, **_kwargs: pytest.fail(
+            "snapshot classification queried the database"
+        ),
+    )
+
+    resolved = mcp_apps.classify_actor_remote_oauth_server(
+        db_session.db,
+        server,
+        snapshot=snapshot,
+    )
+
+    assert resolved is not None and resolved["id"] == REMOTE_APP_ID
+
+
+def test_actor_remote_snapshot_rejects_ambiguous_server_identity(db_session) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    duplicate = MCPServer.from_config(
+        {
+            "name": "Actor Remote",
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://mcp.example.com/mcp",
+            "auth": dict(server.auth),
+        }
+    )
+    db_session.db.add(duplicate)
+    db_session.db.commit()
+    snapshot = mcp_apps.load_mcp_app_snapshot(db_session.db)
+
+    with pytest.raises(
+        mcp_apps.RemoteOAuthServerDefinitionError,
+        match="exactly one server definition",
+    ):
+        mcp_apps.classify_actor_remote_oauth_server(
+            db_session.db, server, snapshot=snapshot
+        )
+
+
+@pytest.mark.parametrize("drift", ["owner", "invalid_auth"])
+def test_actor_remote_snapshot_rejects_noncanonical_definition(
+    db_session, drift
+) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    if drift == "owner":
+        db_session.db.query(UserMCPServer).one().is_owner = True
+    else:
+        server.auth = {**server.auth, "scope": "records.write"}
+    db_session.db.commit()
+    snapshot = mcp_apps.load_mcp_app_snapshot(db_session.db)
+
+    with pytest.raises(mcp_apps.RemoteOAuthServerDefinitionError):
+        mcp_apps.classify_actor_remote_oauth_server(
+            db_session.db, server, snapshot=snapshot
+        )
+
+
+def test_actor_remote_snapshot_preserves_only_proven_custom_definition(
+    db_session,
+) -> None:
+    server = MCPServer.from_config(
+        {
+            "name": "custom-remote",
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://custom.example.com/mcp",
+            "auth": {"type": "mcp_oauth"},
+        }
+    )
+    db_session.db.add(server)
+    db_session.db.flush()
+    association = UserMCPServer(
+        user_id=int(db_session.user.id),
+        mcpserver_id=int(server.id),
+        is_owner=True,
+        is_active=True,
+    )
+    db_session.db.add(association)
+    db_session.db.commit()
+    snapshot = mcp_apps.load_mcp_app_snapshot(db_session.db)
+
+    assert (
+        mcp_apps.classify_actor_remote_oauth_server(
+            db_session.db, server, snapshot=snapshot
+        )
+        is None
+    )
+
+    association.is_owner = False
+    db_session.db.commit()
+    unowned_snapshot = mcp_apps.load_mcp_app_snapshot(db_session.db)
+    with pytest.raises(
+        mcp_apps.RemoteOAuthServerDefinitionError,
+        match="catalog identity is unavailable",
+    ):
+        mcp_apps.classify_actor_remote_oauth_server(
+            db_session.db, server, snapshot=unowned_snapshot
+        )
 
 
 @pytest.mark.asyncio
@@ -777,6 +952,57 @@ async def test_actor_builtin_uses_only_exact_owner_namespace(db_session) -> None
     assert _token(configs[0]) == "actor-a-token"
     assert "ordinary-token" not in str(configs)
     assert "actor-b-token" not in str(configs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", [OWNER_A, OWNER_B])
+async def test_xero_uses_exact_actor_token(db_session, owner) -> None:
+    db, user = db_session.db, db_session.user
+    app = get_builtin_public_mcp_app("xero")
+    assert app is not None
+    db.add(PublicMCPApp(**app))
+    server = MCPServer(
+        name="Xero",
+        managed="external",
+        transport="oauth",
+        auth={"app_id": "xero", "provider": "xero"},
+    )
+    db.add(server)
+    db.flush()
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    for credential_owner, token in (
+        (None, "workspace-token"),
+        (OWNER_A, "alice-token"),
+        (OWNER_B, "bob-token"),
+    ):
+        db.add(
+            UserOAuth(
+                user_id=user.id,
+                provider="xero",
+                resource_owner_key=credential_owner,
+                provider_user_id="xero-user",
+                access_token=token,
+            )
+        )
+    db.commit()
+
+    configs = await _config(db_session, policy=_policy(owner)).get_mcp_server_configs()
+
+    expected_token = "alice-token" if owner == OWNER_A else "bob-token"
+    other_token = "bob-token" if owner == OWNER_A else "alice-token"
+    assert len(configs) == 1
+    assert configs[0]["config"]["command"] == "npx"
+    assert configs[0]["config"]["args"] == ["-y", "@xeroapi/xero-mcp-server@latest"]
+    assert configs[0]["config"]["env"]["XERO_CLIENT_BEARER_TOKEN"] == expected_token
+    assert "workspace-token" not in str(configs)
+    assert other_token not in str(configs)
 
 
 @pytest.mark.asyncio

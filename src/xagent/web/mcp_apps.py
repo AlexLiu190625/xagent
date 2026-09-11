@@ -13,7 +13,10 @@ from typing import Any, Dict, List
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .builtin_mcp_registry import get_builtin_execution_fields_and_optional_scopes
+from .builtin_mcp_registry import (
+    _persisted_builtin_provenance_matches,
+    get_builtin_execution_fields_and_optional_scopes,
+)
 from .models.public_mcp import PublicMCPApp
 
 # Apps that must not be satisfied by a bare provider-level OAuth grant (one
@@ -50,7 +53,7 @@ APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook", "github", "myob"}
 
 
 def _normalize_oauth_grant_key(value: object) -> str | None:
-    """Case/whitespace-insensitive key, matching mcp.py's _normalize_app_key.
+    """Case/whitespace-insensitive key, matching ``normalize_catalog_key``.
 
     Duplicated rather than imported: mcp.py imports this module, so importing
     back would cycle. An admin-created PublicMCPApp.app_id is free-form (see
@@ -160,6 +163,11 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
     execution_fields, optional_oauth_scopes = (
         get_builtin_execution_fields_and_optional_scopes(app.app_id)
     )
+    if execution_fields is not None and not _persisted_builtin_provenance_matches(
+        app.app_id, app.launch_config
+    ):
+        execution_fields = None
+        optional_oauth_scopes = []
     if execution_fields is None:
         execution_fields = {
             "name": app.name,
@@ -192,19 +200,26 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
 
 @dataclass(frozen=True)
 class MCPAppSnapshot:
-    """One catalog/server view for repeated canonical builtin validation."""
+    """One catalog/server/ownership view for repeated canonical validation."""
 
     catalog_apps: tuple[PublicMCPApp, ...]
     servers: tuple[Any, ...]
+    owner_mcpserver_ids: frozenset[int]
 
 
 def load_mcp_app_snapshot(db: Session) -> MCPAppSnapshot:
     """Load the catalog and server rows once for one validation projection."""
-    from .models.mcp import MCPServer
+    from .models.mcp import MCPServer, UserMCPServer
 
     return MCPAppSnapshot(
         catalog_apps=tuple(db.query(PublicMCPApp).all()),
         servers=tuple(db.query(MCPServer).all()),
+        owner_mcpserver_ids=frozenset(
+            int(server_id)
+            for (server_id,) in db.query(UserMCPServer.mcpserver_id)
+            .filter(UserMCPServer.is_owner)
+            .all()
+        ),
     )
 
 
@@ -245,12 +260,11 @@ class RemoteOAuthDefinitionOwnership(Enum):
     TEAM = "team"
 
 
-def _normalized_catalog_key(value: object) -> str | None:
+def normalize_catalog_key(value: object) -> str | None:
     """Normalize only for collision detection, never for persisted identity."""
-    if value is None:
-        return None
-    normalized = "-".join(str(value).strip().lower().split())
-    return normalized or None
+    from ..builtin_identity import canonicalize_builtin_identity
+
+    return canonicalize_builtin_identity(value)
 
 
 def _strict_catalog_app_by_id(
@@ -282,11 +296,11 @@ def _strict_catalog_app_by_id(
         )
     app = matches[0]
 
-    normalized_id = _normalized_catalog_key(app_id)
+    normalized_id = normalize_catalog_key(app_id)
     collisions = [
         candidate
         for candidate in catalog_apps
-        if _normalized_catalog_key(candidate.app_id) == normalized_id
+        if normalize_catalog_key(candidate.app_id) == normalized_id
     ]
     if len(collisions) != 1:
         raise BuiltinOAuthServerDefinitionError(
@@ -296,6 +310,10 @@ def _strict_catalog_app_by_id(
     execution_fields, _optional_scopes = (
         get_builtin_execution_fields_and_optional_scopes(app.app_id)
     )
+    if execution_fields is not None and not _persisted_builtin_provenance_matches(
+        app.app_id, app.launch_config
+    ):
+        execution_fields = None
     if require_builtin_oauth and execution_fields is None:
         raise BuiltinOAuthServerDefinitionError(
             f"OAuth catalog app {app_id!r} is absent from the builtin registry"
@@ -460,7 +478,7 @@ def _builtin_server_candidates(
     app_id = str(app_info["id"])
     app_name = str(app_info["name"])
     normalized_names = {
-        key for key in map(_normalized_catalog_key, (app_id, app_name)) if key
+        key for key in map(normalize_catalog_key, (app_id, app_name)) if key
     }
     catalog_apps: Sequence[PublicMCPApp] = (
         snapshot.catalog_apps if snapshot is not None else db.query(PublicMCPApp).all()
@@ -486,8 +504,8 @@ def _builtin_server_candidates(
             candidates.append(server)
             continue
         if (
-            _normalized_catalog_key(server_app_id) in normalized_names
-            or _normalized_catalog_key(server.name) in normalized_names
+            normalize_catalog_key(server_app_id) in normalized_names
+            or normalize_catalog_key(server.name) in normalized_names
         ):
             raise BuiltinOAuthServerDefinitionError(
                 f"builtin OAuth app {app_id!r} has an ambiguous reserved server identity"
@@ -524,8 +542,8 @@ def classify_actor_builtin_oauth_server(
     has_app_id = isinstance(auth, Mapping) and "app_id" in auth
     server_app_id = auth.get("app_id") if isinstance(auth, Mapping) else None
     server_name = str(getattr(server, "name", ""))
-    normalized_name = _normalized_catalog_key(server_name)
-    normalized_app_id = _normalized_catalog_key(server_app_id)
+    normalized_name = normalize_catalog_key(server_name)
+    normalized_app_id = normalize_catalog_key(server_app_id)
 
     exact_app = next(
         (
@@ -549,8 +567,8 @@ def classify_actor_builtin_oauth_server(
             normalized_app_id,
         }
         & {
-            _normalized_catalog_key(app_info.get("id")),
-            _normalized_catalog_key(app_info.get("name")),
+            normalize_catalog_key(app_info.get("id")),
+            normalize_catalog_key(app_info.get("name")),
         }
         - {None}
     ]
@@ -745,9 +763,16 @@ def ensure_builtin_oauth_server_visibility_for_user(
     return server
 
 
-def _get_app_for_server_name(db: Session, name: str) -> Dict[str, Any] | None:
-    candidates = (
-        db.query(PublicMCPApp)
+def _get_app_for_server_name(
+    db: Session,
+    name: str,
+    *,
+    snapshot: MCPAppSnapshot | None = None,
+) -> Dict[str, Any] | None:
+    candidates: Sequence[PublicMCPApp] = (
+        [app for app in snapshot.catalog_apps if app.app_id == name or app.name == name]
+        if snapshot is not None
+        else db.query(PublicMCPApp)
         .filter((PublicMCPApp.app_id == name) | (PublicMCPApp.name == name))
         .all()
     )
@@ -809,6 +834,7 @@ def classify_actor_remote_oauth_server(
     definition_ownership: RemoteOAuthDefinitionOwnership = (
         RemoteOAuthDefinitionOwnership.UNKNOWN
     ),
+    snapshot: MCPAppSnapshot | None = None,
 ) -> Dict[str, Any] | None:
     """Validate catalog OAuth or preserve a proven custom definition."""
 
@@ -821,21 +847,31 @@ def classify_actor_remote_oauth_server(
         and isinstance(auth, Mapping)
         and auth.get("type") == "mcp_oauth"
     )
-    app_info = _get_app_for_server_name(db, str(getattr(server, "name", "")))
+    app_info = _get_app_for_server_name(
+        db,
+        str(getattr(server, "name", "")),
+        snapshot=snapshot,
+    )
+
+    def has_owner() -> bool:
+        server_id = int(server.id)
+        if snapshot is not None:
+            return server_id in snapshot.owner_mcpserver_ids
+        return (
+            db.query(UserMCPServer.id)
+            .filter(
+                UserMCPServer.mcpserver_id == server_id,
+                UserMCPServer.is_owner,
+            )
+            .first()
+            is not None
+        )
+
     if app_info is None or app_info.get("auth_type") != "mcp_oauth":
         if is_remote_oauth:
             # Native OAuth servers have an owner. Catalog rows do not.
-            has_owner = (
-                db.query(UserMCPServer.id)
-                .filter(
-                    UserMCPServer.mcpserver_id == int(server.id),
-                    UserMCPServer.is_owner,
-                )
-                .first()
-                is not None
-            )
             if (
-                not has_owner
+                not has_owner()
                 and definition_ownership is not RemoteOAuthDefinitionOwnership.TEAM
             ):
                 raise RemoteOAuthServerDefinitionError(
@@ -848,8 +884,10 @@ def classify_actor_remote_oauth_server(
     app_id = str(app_info["id"])
     app_name = str(app_info["name"])
     # Remote catalog identity is the reserved server name, not mutable auth.
-    candidates = (
-        db.query(MCPServer).filter(MCPServer.name.in_((app_id, app_name))).all()
+    candidates: Sequence[Any] = (
+        [row for row in snapshot.servers if row.name in (app_id, app_name)]
+        if snapshot is not None
+        else db.query(MCPServer).filter(MCPServer.name.in_((app_id, app_name))).all()
     )
     if len(candidates) != 1 or int(candidates[0].id) != int(server.id):
         raise RemoteOAuthServerDefinitionError(
@@ -875,15 +913,7 @@ def classify_actor_remote_oauth_server(
         failures.append("url")
     if actual_auth != expected_auth:
         failures.append("auth")
-    if (
-        db.query(UserMCPServer.id)
-        .filter(
-            UserMCPServer.mcpserver_id == int(server.id),
-            UserMCPServer.is_owner,
-        )
-        .first()
-        is not None
-    ):
+    if has_owner():
         failures.append("ownership")
     if failures:
         raise RemoteOAuthServerDefinitionError(

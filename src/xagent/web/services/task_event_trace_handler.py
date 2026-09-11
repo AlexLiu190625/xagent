@@ -1,6 +1,5 @@
-"""WebSocket trace handlers for real-time updates."""
+"""Publish task trace events through the host event delivery adapter."""
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -12,13 +11,19 @@ from ...core.agent.trace import (
     TraceHandler,
     TraceScope,
 )
-from ..services.trace_event_types import (
+from ...core.runtime_performance import (
+    increment_counter,
+    observe_duration,
+    run_in_thread_with_telemetry,
+)
+from .public_trace_events import is_audit_only_trace_data, normalize_public_trace_event
+from .task_events import publish_task_event
+from .task_execution import create_stream_event
+from .trace_event_types import (
     LEGACY_GENERAL_ERROR_EVENT_TYPE,
     STEP_GENERAL_ERROR_EVENT_TYPE,
     TASK_GENERAL_ERROR_EVENT_TYPE,
 )
-from .public_trace_events import is_audit_only_trace_data, normalize_public_trace_event
-from .websocket import create_stream_event, manager
 
 
 # Helper function to map new event types to old-style handling for compatibility
@@ -262,23 +267,8 @@ def serialize_trace_data(data: Dict[str, Any]) -> Dict[str, Any]:
     (``v1/_events_stream.py``) can reuse the exact same pass on live
     broadcast frames that the WebSocket handler applies before
     broadcasting -- this function never reads ``self``, so lifting it
-    out of ``WebSocketTraceHandler`` changes nothing about its
+    out of ``TaskEventTraceHandler`` changes nothing about its
     behavior for the existing caller below.
-
-    Truncation, field pruning, or any wholesale replacement of the
-    payload added here changes how this pass relates to the two agent
-    checkpoint checks in ``_convert_trace_event_to_stream_event``: one
-    runs on the raw payload and one on this function's output, and they
-    agree only while this pass either preserves the checked fields or
-    replaces the payload outright. The fallback below already does the
-    latter, which is why the raw check exists. Any change to what this
-    function may return must be reviewed together with both checks, and
-    with the same reuse in ``v1/_events_stream.py``.
-
-    The mechanical guard for this is the parametrized case in
-    ``test_raw_and_serialized_checkpoint_checks_drop_the_same_set`` that
-    feeds a checkpoint payload this pass cannot serialize: it asserts the
-    raw check catches it before this fallback runs.
     """
     import json
     from datetime import datetime
@@ -359,8 +349,8 @@ def _convert_timestamp_to_utc_timestamp(timestamp: Any) -> float:
         return datetime.now(timezone.utc).timestamp()
 
 
-class WebSocketTraceHandler(TraceHandler):
-    """Trace handler that sends events to WebSocket clients."""
+class TaskEventTraceHandler(TraceHandler):
+    """Trace handler that publishes events through the host event delivery adapter."""
 
     def __init__(self, task_id: int):
         self.task_id = task_id
@@ -368,34 +358,27 @@ class WebSocketTraceHandler(TraceHandler):
         self._task_description_loaded = False
 
     async def handle_event(self, event: TraceEvent) -> None:
-        """Send trace event to WebSocket clients using unified stream format."""
-        try:
-            # Nothing is attached to this task, so every frame this method
-            # could build would be discarded by ``broadcast_to_task``'s own
-            # audience check at the end. Ask that same question first and
-            # skip the serialization and the two database reads between
-            # here and there. ``ConnectionManager`` is the single registry
-            # for every audience -- browser sockets and v1 SSE sinks alike
-            # register there -- so an empty registry means no reader exists.
-            # A client that attaches later replays this task's history from
-            # ``trace_events``, which ``DatabaseTraceHandler`` has already
-            # committed by the time this handler runs.
-            if not manager.has_connections_for_task(self.task_id):
-                return
+        """Publish a trace event through the host adapter using unified stream format."""
+        with observe_duration("xagent.websocket.trace_handler.duration"):
+            await self._handle_event(event)
 
+    async def _handle_event(self, event: TraceEvent) -> None:
+        try:
             # Debug: Log the event being handled (reduced verbosity)
             logger.debug(
-                f"WebSocketTraceHandler handling event: {event.event_type.value} for task {self.task_id}"
+                f"TaskEventTraceHandler handling event: {event.event_type.value} for task {self.task_id}"
             )
 
             # Load task description if not already loaded
             await self._load_task_description()
 
             # Convert trace event to unified stream format
-            stream_event = self._convert_trace_event_to_stream_event(event)
+            with observe_duration("xagent.websocket.trace_serialization.duration"):
+                stream_event = self._convert_trace_event_to_stream_event(event)
             if stream_event:
                 stream_data = stream_event.get("data")
-                if isinstance(stream_data, dict) and await asyncio.to_thread(
+                if isinstance(stream_data, dict) and await run_in_thread_with_telemetry(
+                    "websocket_prior_user_message_check",
                     self._has_prior_user_message_turn,
                     str(stream_event.get("event_type") or ""),
                     stream_data,
@@ -403,15 +386,23 @@ class WebSocketTraceHandler(TraceHandler):
                 ):
                     stream_event = None
 
-            # Send to all connected WebSocket clients for this task
+            # Publish through the host event delivery adapter for this task
             if stream_event:
-                logger.debug(
-                    f"WebSocketTraceHandler sending stream event: {stream_event.get('event_type')} (id: {stream_event.get('event_id')}) to task {self.task_id}"
+                increment_counter(
+                    "xagent.websocket.trace.events",
+                    attributes={"outcome": "broadcast"},
                 )
-                await manager.broadcast_to_task(stream_event, self.task_id)
-            else:
                 logger.debug(
-                    f"WebSocketTraceHandler no stream event to send for event: {event.event_type.value}"
+                    f"TaskEventTraceHandler sending stream event: {stream_event.get('event_type')} (id: {stream_event.get('event_id')}) to task {self.task_id}"
+                )
+                await publish_task_event(stream_event, self.task_id)
+            else:
+                increment_counter(
+                    "xagent.websocket.trace.events",
+                    attributes={"outcome": "dropped"},
+                )
+                logger.debug(
+                    f"TaskEventTraceHandler no stream event to send for event: {event.event_type.value}"
                 )
 
         except Exception as e:
@@ -426,7 +417,10 @@ class WebSocketTraceHandler(TraceHandler):
 
         try:
             # Run synchronous database operations in a thread pool to avoid blocking event loop
-            await asyncio.to_thread(self._sync_load_task_description)
+            await run_in_thread_with_telemetry(
+                "websocket_task_description_load",
+                self._sync_load_task_description,
+            )
         except Exception as e:
             logger.warning(
                 f"Failed to load task description for task {self.task_id}: {e}"
@@ -473,9 +467,7 @@ class WebSocketTraceHandler(TraceHandler):
              RCA payload (raw LLM messages / response) that must not
              leak to clients.
           2. Agent checkpoint data -- internal runtime state the
-             frontend doesn't render (checked on the raw payload first,
-             then again after serialization; see the comment there for
-             why both checks are kept).
+             frontend doesn't render (checked after serialization).
         """
         # Server-only audit traces: drop early so we don't waste effort
         # serializing payloads we're about to discard.
@@ -490,30 +482,6 @@ class WebSocketTraceHandler(TraceHandler):
         logger.debug(
             f"Converting trace event to stream event: {event_type_str} for task {self.task_id}"
         )
-
-        # Checkpoints never reach a client, so decide that on the raw
-        # payload instead of after a full recursive serialization pass.
-        # Both checks stay, because neither one subsumes the other:
-        #   * a payload that is not a checkpoint here can become one
-        #     below, because ``serialize_trace_data`` turns objects
-        #     exposing ``model_dump`` / ``to_dict`` into plain dicts. No
-        #     producer on the standard execution path emits that shape
-        #     today -- ``TraceCheckpointStore`` nests the legacy payload
-        #     under ``snapshot`` -- and no stored rows of that shape were
-        #     found when this was audited. The check stays so this copy
-        #     of the predicate agrees with the other copy, which
-        #     historical replay also calls;
-        #   * a payload that IS a checkpoint here can stop looking like
-        #     one below, because a payload ``json.dumps`` rejects is
-        #     replaced wholesale by a three-key ``_serialization_error``
-        #     placeholder that carries none of the checked fields.
-        # The second case is the one behavioral difference this check
-        # introduces: an unserializable checkpoint used to reach clients
-        # as a content-free error placeholder and no longer does. The
-        # ``DatabaseTraceHandler`` copy of the same serialization pass
-        # still logs that failure on the same payload.
-        if is_agent_checkpoint_data(event.data):
-            return None
 
         # Make a deep copy of data and serialize non-JSON-serializable objects
         data = self._serialize_data(event.data)

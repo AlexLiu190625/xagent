@@ -120,7 +120,10 @@ from ...core.agent.checkpoint import (
 )
 from ...core.agent.pattern.react.react import _normalize_interaction_text
 from ...core.tools.adapters.vibe.ask_user_tool import AskUserQuestionArgs
-from ...core.tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+from ...core.tools.adapters.vibe.interaction_types import (
+    INTERACTION_TYPES,
+    TYPES_REQUIRING_OPTIONS,
+)
 from ..models.task import Task, TaskStatus, TaskStatusPredicate, TraceEvent
 from ..models.task_command import TaskExecutionCommand
 from ..models.task_interaction import (
@@ -901,10 +904,18 @@ CreateOutcome = (
     | CreateStale
 )
 
-# The full closed vocabulary create() can ever return a reason from. 12
+# The full closed vocabulary create() can ever return a reason from. 13
 # reasons total (the "Created" / None pair is not a reason string and is
 # counted separately). Do not update this number by recounting the set
 # literal below -- it is pinned as part of the vocabulary's contract.
+#
+# handoff_degraded_unclassified names the case where interaction_handoff
+# swallowed one of its six exceptions but the recorded handoff.degraded_as
+# is neither mapped by _DEGRADED_AS_OUTCOME nor set at all -- an
+# unidentified degradation, not a real conflict. It is kept distinct from
+# slot_taken because "an unrecognized failure happened" and "another
+# requester already won the slot" are different facts, and an operator
+# reading the outcome must be able to tell them apart.
 CREATE_OUTCOME_REASON_WORDS: frozenset[str] = frozenset(
     {
         "unknown_kind",
@@ -919,11 +930,12 @@ CREATE_OUTCOME_REASON_WORDS: frozenset[str] = frozenset(
         "idempotency_key_reused",
         "anchor_dangling",
         "run_ended",
+        "handoff_degraded_unclassified",
     }
 )
 
 # The (outcome type, reason) pairs this function body has a code path that
-# returns. 9 of the 12 words in CREATE_OUTCOME_REASON_WORDS are producible
+# returns. 10 of the 13 words in CREATE_OUTCOME_REASON_WORDS are producible
 # by that definition; the other three (checkpoint_unavailable,
 # anchor_dangling, run_ended) stay in the closed word list without a
 # producing code path here today:
@@ -972,7 +984,9 @@ CREATE_OUTCOME_PRODUCIBLE_REASONS: dict[type, frozenset[str]] = {
     ),
     CreateUnauthorized: frozenset({"not_task_principal"}),
     CreateUnavailable: frozenset({"task_missing"}),
-    CreateConflict: frozenset({"slot_taken", "idempotency_key_reused"}),
+    CreateConflict: frozenset(
+        {"slot_taken", "idempotency_key_reused", "handoff_degraded_unclassified"}
+    ),
     CreateStale: frozenset({"anchor_run_mismatch"}),
 }
 
@@ -1068,19 +1082,6 @@ def build_v1_request_payload(parsed: AskUserQuestionArgs) -> dict[str, Any]:
 # red "unsupported type" line. Rejecting the type here on the write side
 # is what keeps either surface from having to.
 _V1_INTERACTION_TYPES = frozenset(INTERACTION_TYPES)
-
-# The types whose whole purpose is picking from a supplied list -- one set,
-# per #1314 item 2 ("key rules by interaction type, rather than one flat
-# list"), read below as a total function of membership rather than the two
-# independent flat sets this replaces. The split is the render surface's,
-# not this module's: ``select_one``, ``select_multiple``, and
-# ``action_cards`` iterate ``interaction.options``
-# (``frontend/src/components/chat/clarification-form.tsx``), while
-# ``confirm`` renders a switch, ``text_input`` a field, ``number_input`` a
-# spinner, and ``file_upload`` a picker -- none of which read ``options``.
-_V1_TYPES_REQUIRING_OPTIONS = frozenset(
-    {"select_one", "select_multiple", "action_cards"}
-)
 
 
 @dataclass(frozen=True)
@@ -1181,7 +1182,7 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
     identifier and the position it fired at, never producer-supplied text
     (``#1314`` item 3) -- describing the first violation found; returns
     ``None`` when the payload may be written. Each rule below is scoped by
-    ``interaction.type`` through ``_V1_TYPES_REQUIRING_OPTIONS`` where a
+    ``interaction.type`` through ``TYPES_REQUIRING_OPTIONS`` where a
     rule is type-specific at all (``#1314`` item 2); the rules that apply
     to every
     type (blank/duplicate field, blank/duplicate option) are not, because
@@ -1205,12 +1206,12 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
     ``build_clarification_payload`` (``task_clarification_draft.py``) is a
     second producer of this same shape and its output has to keep passing
     here, pinned by a test that feeds this function that builder's real
-    output. Two of that builder's shapes are the reason for the boundaries
-    drawn below. An empty ``interactions`` list is accepted: a
-    ``send_message``-sourced draft never carries interactions, and an
-    over-size form is deliberately dropped to ``[]`` rather than truncated
-    to half a form -- both are questions with prose and no form, which the
-    read surface renders. A blank ``message`` is rejected, and that costs
+    output. An empty ``interactions`` list is accepted: an over-size form is
+    deliberately dropped to ``[]`` rather than truncated to half a form, and
+    that is a question with prose and no form, which the read surface
+    renders. (A ``send_message``-sourced draft used to be the other such
+    shape; it now carries the engine's appended free-text field, so its list
+    is never empty.) A blank ``message`` is rejected, and that costs
     the builder nothing: ``resolve_publishable_clarification`` already
     classifies a payload whose message is blank after filtering as
     ``NotApplicable("empty_question")`` and never offers it for writing.
@@ -1323,7 +1324,7 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
         # rule cannot drift from itself. interaction.type is provably in
         # _V1_INTERACTION_TYPES by here -- the unsupported_type check
         # above rejects anything else.
-        requires_options = interaction.type in _V1_TYPES_REQUIRING_OPTIONS
+        requires_options = interaction.type in TYPES_REQUIRING_OPTIONS
         if requires_options and not interaction.options:
             raise InteractionWritePayloadRejected(
                 InteractionWriteRefusal(
@@ -1485,7 +1486,8 @@ def _assert_write_point_admissible(
 # refuses an out-of-vocabulary task.source before a finalizer would ever
 # call this seam. A caller that cannot provide either property must not
 # use this path. If either exception somehow fires anyway, create() falls
-# back to the single default classification below (slot_taken).
+# back to the single default classification below
+# (handoff_degraded_unclassified).
 _DEGRADED_AS_OUTCOME: dict[type[BaseException], "CreateOutcome"] = {
     InteractionSlotTaken: CreateConflict(reason="slot_taken"),
     InteractionRequestClosed: CreateConflict(reason="idempotency_key_reused"),
@@ -1783,8 +1785,10 @@ def create(
     must not use this path. When ``interaction_handoff``'s ``with`` block
     exits with ``handoff.staged`` still ``None`` and ``handoff.degraded_as``
     is one of these two, or is unrecognized, this function reports
-    ``CreateConflict(reason="slot_taken")``, the single default
-    classification for that state.
+    ``CreateConflict(reason="handoff_degraded_unclassified")``, the single
+    default classification for that state -- kept out of
+    ``"slot_taken"`` because an unidentified degradation and a real
+    conflict are different facts a caller must be able to tell apart.
     """
 
     if (
@@ -1986,7 +1990,11 @@ def create(
         # place handoff.staged itself is read -- and _DEGRADED_AS_OUTCOME
         # maps four of the six to a distinct outcome each. The remaining
         # two (see that dict's own docstring), and an unset/unrecognized
-        # degraded_as, fall through to this default.
+        # degraded_as, fall through to this default. The default now
+        # carries its own reason word, handoff_degraded_unclassified,
+        # rather than reusing slot_taken's: an unidentified degradation is
+        # not the same fact as a real conflict, and the two must stay
+        # distinguishable in the reported outcome.
         #
         # issubclass, not an exact-type key lookup: the ``except _SWALLOWED``
         # clause that produced this value matches subclasses, so a future
@@ -2012,7 +2020,7 @@ def create(
             if handoff.degraded_as is not None
             else None
         )
-        return mapped_outcome or CreateConflict(reason="slot_taken")
+        return mapped_outcome or CreateConflict(reason="handoff_degraded_unclassified")
 
     receipt = CreatedInteractionReceipt(
         interaction_id=handoff.staged.staged_db_id,
