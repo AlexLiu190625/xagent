@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -162,6 +163,62 @@ COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES = 20
 # Wire name: request_context keys reach metadata verbatim, so renaming this
 # breaks the clients that populate it.
 CLOCK_TIMEZONE_METADATA_KEY = "timezone"
+
+
+def bounded_notice_lines(
+    entries: Sequence[Any],
+    *,
+    render: Callable[[Any], str],
+    max_chars: int,
+    max_entries: int | None = None,
+    chars_used: int = 0,
+) -> tuple[list[str], int]:
+    """Render entries into notice lines under one shared overflow rule.
+
+    Several notices in this module list things named by runtime MCP server
+    configuration -- tool names, in particular -- rather than by anything
+    checked into this repository. A connected server can register any
+    number of tools with names of any length, so both "how many entries to
+    even consider" and "how many characters the rendered list may cost" are
+    unbounded from this module's point of view, and every such notice needs
+    the same two caps. Sharing this function is what keeps a second,
+    hand-written copy of that arithmetic from drifting from the first the
+    next time either cap changes.
+
+    An entry whose rendered line would overflow ``max_chars`` is skipped and
+    counted as omitted, and rendering continues past it rather than
+    stopping there. Entries are not guaranteed to be sorted by rendered
+    length, so a later entry short enough to fit must still be offered a
+    place in the list; stopping at the first overflow would drop it even
+    though the budget had room for it.
+
+    Everything about how an entry becomes a line stays with the caller: the
+    order entries are passed in, any per-entry clamp such as truncating one
+    over-long name, and the wording used to describe how many entries were
+    left out. Only the overflow decision -- when to stop adding entries and
+    when to skip one instead -- is shared here.
+
+    ``chars_used`` lets a caller pre-charge this budget for characters it
+    has already committed to spend before any entry is rendered, such as a
+    fixed prefix sentence the notice always opens with. That prefix draws
+    from the same ``max_chars`` ceiling the entries share, so the entries
+    must be measured against what remains of it, not against the full
+    budget.
+    """
+    total_entries = len(entries)
+    limit = total_entries if max_entries is None else min(max_entries, total_entries)
+    considered = entries[:limit]
+    omitted = total_entries - limit
+    lines: list[str] = []
+    current_chars = chars_used
+    for entry in considered:
+        line = render(entry)
+        if current_chars + len(line) + 1 > max_chars:
+            omitted += 1
+            continue
+        lines.append(line)
+        current_chars += len(line) + 1
+    return lines, omitted
 
 
 def estimate_provider_prompt_tokens(
@@ -1585,18 +1642,19 @@ class ExecutionContext:
         # per-name length and the total notice size the way the sibling
         # reference notice does.
         ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-        listed = ordered[:COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES]
-        lines: list[str] = []
-        current_chars = len(prefix)
-        omitted = len(ordered) - len(listed)
-        for name, count in listed:
+
+        def render_entry(entry: tuple[str, int]) -> str:
+            name, count = entry
             clamped = name[:COMPACT_DROPPED_TOOL_NAME_MAX_CHARS]
-            line = f"- {clamped} x{count}" if count > 1 else f"- {clamped}"
-            if current_chars + len(line) + 1 > COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS:
-                omitted += 1
-                continue
-            lines.append(line)
-            current_chars += len(line) + 1
+            return f"- {clamped} x{count}" if count > 1 else f"- {clamped}"
+
+        lines, omitted = bounded_notice_lines(
+            ordered,
+            render=render_entry,
+            max_chars=COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS,
+            max_entries=COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+            chars_used=len(prefix),
+        )
         if omitted:
             name_label = "name" if omitted == 1 else "names"
             lines.append(

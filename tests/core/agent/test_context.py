@@ -25,6 +25,7 @@ from xagent.core.agent.context.enrichment import (
 from xagent.core.agent.context.execution import (
     CLOCK_TIMEZONE_METADATA_KEY,
     COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+    bounded_notice_lines,
 )
 from xagent.core.agent.grounding import VALUE_KINDS
 from xagent.core.agent.language import (
@@ -1526,6 +1527,61 @@ def test_compact_with_llm_lists_a_full_page_of_long_tool_names() -> None:
         assert f"- {tool_name}" in notice
     assert "additional" not in notice
     assert result.metadata["dropped_tool_result_count"] == len(tool_names)
+
+
+def test_bounded_notice_lines_keeps_a_later_short_entry_after_a_long_one() -> None:
+    """A too-long entry is skipped, not treated as the end of the list.
+
+    Entries are not sorted by rendered length, so an entry that overflows
+    the remaining budget must not stop consideration of everything after
+    it: a later, shorter entry the budget still has room for has to be
+    listed.
+    """
+    entries = ["short1", "x" * 50, "short2"]
+
+    lines, omitted = bounded_notice_lines(
+        entries,
+        render=str,
+        max_chars=20,
+    )
+
+    assert "short1" in lines
+    assert "short2" in lines
+    assert "x" * 50 not in lines
+    assert omitted == 1
+
+
+@pytest.mark.parametrize(
+    "num_entries, entry_length, max_chars",
+    [
+        (5, 3, 10),
+        (10, 5, 15),
+        (3, 20, 25),
+        (50, 2, 100),
+    ],
+)
+def test_bounded_notice_lines_output_fits_the_char_budget(
+    num_entries: int, entry_length: int, max_chars: int
+) -> None:
+    entries = [f"{index}".rjust(entry_length, "x") for index in range(num_entries)]
+
+    lines, _ = bounded_notice_lines(entries, render=str, max_chars=max_chars)
+
+    assert len("\n".join(lines)) <= max_chars
+
+
+def test_bounded_notice_lines_counts_entries_past_max_entries_as_omitted() -> None:
+    entries = [f"entry-{index}" for index in range(10)]
+
+    lines, omitted = bounded_notice_lines(
+        entries,
+        render=str,
+        max_chars=10_000,
+        max_entries=4,
+    )
+
+    assert lines == entries[:4]
+    assert omitted == 6
 
 
 def test_compact_with_llm_orders_ref_notice_before_tool_notice() -> None:
