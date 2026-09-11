@@ -34,6 +34,8 @@ from xagent.web.models.database import Base, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_interaction import TaskInteractionRequest
+from xagent.web.services import a2a_task_cancel as a2a_cancel_service
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.a2a_protocol import (
     A2A_MAX_MESSAGE_TEXT_LENGTH,
@@ -2723,13 +2725,13 @@ def test_cancel_accepts_only_exact_canceled_terminal_replay(
     finally:
         db.close()
 
-    loaded = a2a_api._load_cancelable_a2a_task_sync(
+    loaded = a2a_cancel_service._load_cancelable_a2a_task_sync(
         task_id=task_id,
         agent_id=agent_id,
         expected_run_id="run-canceled",
         expected_state_version=expected_state_version,
     )
-    finalized = a2a_api._finalize_a2a_cancel_sync(
+    finalized = a2a_cancel_service._finalize_a2a_cancel_sync(
         task_id=task_id,
         agent_id=agent_id,
         expected_run_id="run-canceled",
@@ -2763,8 +2765,8 @@ def test_cancel_accepts_only_exact_canceled_terminal_replay(
 @pytest.mark.parametrize(
     "operation",
     [
-        a2a_api._load_cancelable_a2a_task_sync,
-        a2a_api._finalize_a2a_cancel_sync,
+        a2a_cancel_service._load_cancelable_a2a_task_sync,
+        a2a_cancel_service._finalize_a2a_cancel_sync,
     ],
 )
 def test_cancel_rejects_stale_or_nonterminal_canceled_marker(
@@ -2806,9 +2808,9 @@ def test_cancel_rejects_stale_or_nonterminal_canceled_marker(
         "expected_run_id": "run-canceled",
         "expected_state_version": 7,
     }
-    if operation is a2a_api._finalize_a2a_cancel_sync:
+    if operation is a2a_cancel_service._finalize_a2a_cancel_sync:
         kwargs["local_cancel_requested"] = False
-    with pytest.raises(a2a_api.StaleTaskRunError):
+    with pytest.raises(a2a_cancel_service.StaleTaskRunError):
         operation(**kwargs)
 
 
@@ -2817,8 +2819,6 @@ def test_cancel_rejects_stale_or_nonterminal_canceled_marker(
 async def test_cancel_rejects_run_replaced_during_local_cancel_await(
     initial_run_id: str | None,
 ) -> None:
-    from xagent.web.api import websocket as websocket_api
-
     agent_id, _full_key = _create_published_agent_with_key()
     db = _direct_db_session()
     try:
@@ -2876,7 +2876,7 @@ async def test_cancel_rejects_run_replaced_during_local_cancel_await(
         new=AsyncMock(side_effect=replace_run_during_cancel),
     ):
         with pytest.raises(TaskCommandRejected) as exc_info:
-            await websocket_api._execute_durable_task_command(command)
+            await command_execution_service._execute_durable_task_command(command)
 
     assert exc_info.value.reason == "stale_run"
     db = _direct_db_session()
@@ -2892,7 +2892,6 @@ async def test_cancel_rejects_run_replaced_during_local_cancel_await(
 
 @pytest.mark.asyncio
 async def test_cancel_accepts_exact_same_run_local_settlement() -> None:
-    from xagent.web.api import websocket as websocket_api
     from xagent.web.services.task_lease_service import get_runner_id
 
     agent_id, _full_key = _create_published_agent_with_key()
@@ -2955,7 +2954,7 @@ async def test_cancel_accepts_exact_same_run_local_settlement() -> None:
         "xagent.web.services.task_execution.background_task_manager.cancel_task",
         new=AsyncMock(side_effect=settle_cancelled_local_run),
     ):
-        result = await websocket_api._execute_durable_task_command(command)
+        result = await command_execution_service._execute_durable_task_command(command)
 
     assert result is not None
     db = _direct_db_session()
@@ -3018,8 +3017,8 @@ def test_cancel_rejects_unattributed_or_incomplete_failed_settlement(
     finally:
         db.close()
 
-    with pytest.raises(a2a_api.StaleTaskRunError):
-        a2a_api._finalize_a2a_cancel_sync(
+    with pytest.raises(a2a_cancel_service.StaleTaskRunError):
+        a2a_cancel_service._finalize_a2a_cancel_sync(
             task_id=task_id,
             agent_id=agent_id,
             expected_run_id="run-unattributed-settlement",
@@ -3073,7 +3072,7 @@ async def test_direct_cancel_atomically_clears_execution_lease() -> None:
         new=AsyncMock(return_value=MagicMock(requested=False)),
     ):
         async with a2a_api.task_execution_controller.command(task_id):
-            await a2a_api._cancel_task_unserialized(
+            await a2a_cancel_service.cancel_a2a_task(
                 task_id=task_id,
                 agent_id=agent_id,
                 expected_run_id="run-direct-cancel",
@@ -3100,8 +3099,6 @@ async def test_direct_cancel_atomically_clears_execution_lease() -> None:
 async def test_cancel_holds_local_command_gate_until_final_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from xagent.web.api import websocket as websocket_api
-
     agent_id, _full_key = _create_published_agent_with_key()
     db = _direct_db_session()
     try:
@@ -3161,7 +3158,7 @@ async def test_cancel_holds_local_command_gate_until_final_write(
     )
 
     cancel_command = asyncio.create_task(
-        websocket_api._execute_durable_task_command(command)
+        command_execution_service._execute_durable_task_command(command)
     )
     await cancel_entered.wait()
     begin_turn = asyncio.create_task(
@@ -3271,9 +3268,9 @@ async def test_cancel_does_not_overwrite_a_concurrent_completion() -> None:
             "xagent.web.services.task_execution.background_task_manager.cancel_task",
             new=AsyncMock(side_effect=complete_during_cancel),
         ):
-            with pytest.raises(a2a_api.StaleTaskRunError):
+            with pytest.raises(a2a_cancel_service.StaleTaskRunError):
                 async with a2a_api.task_execution_controller.command(task_id):
-                    await a2a_api._cancel_task_unserialized(
+                    await a2a_cancel_service.cancel_a2a_task(
                         task_id=task_id,
                         agent_id=agent_id,
                         expected_run_id=expected_run_id,

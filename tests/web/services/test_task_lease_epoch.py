@@ -10,11 +10,11 @@ from tests.web.services.test_task_execution_event_store import engine as engine_
 from tests.web.services.test_task_execution_event_store import (
     task_id as task_id_fixture,
 )
-from xagent.web.api.websocket import _task_lease_snapshot
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_lease_service as leases
+from xagent.web.services.task_command_execution import _task_lease_snapshot
 
 engine = engine_fixture
 task_id = task_id_fixture
