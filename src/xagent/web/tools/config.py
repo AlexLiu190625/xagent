@@ -3604,7 +3604,7 @@ class WebToolConfig(BaseToolConfig):
             server,
             code=OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
             message=OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE,
-            resource=_bounded_oauth_metadata(error.resource)
+            resource=_bounded_oauth_metadata(redact_urls_in_text(error.resource))
             if error.resource is not None
             else None,
         )

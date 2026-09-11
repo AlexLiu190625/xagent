@@ -234,12 +234,13 @@ _OAUTH_TOKEN_RESOLVER_REFRESH_KEY = "_oauth_token_resolver_refresh"
 # Two consumers read it: _bounded_exception_nodes (the 401 resolver's
 # challenge lookup) and _level_order_exception_nodes (failure logging).
 _EXCEPTION_WALK_NODE_LIMIT = 64
-# Caps the exception message logged when an MCP tool call fails, so a server
+# Caps each exception message logged when an MCP tool call fails, so a server
 # that echoes a large payload back in its error (or an SDK that dumps a full
-# request) can't blow up log volume. This bound applies to everything this
-# module emits about the failure -- no traceback is attached alongside it,
-# so this cap is what actually reaches the log. The message returned to the
-# caller ("Error executing MCP tool.") never carries it.
+# request) can't blow up log volume. The cap is per line, not per failure: a
+# plain failure logs one capped line, and an exception-group failure logs one
+# for the group plus up to _MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS more, each
+# capped on its own. No traceback is attached to any of them. The message
+# returned to the caller ("Error executing MCP tool.") never carries it.
 _MCP_TOOL_ERROR_LOG_MAX_CHARS = 500
 # Caps how many related exceptions of a failed call get their own log line:
 # the leaves of a (possibly nested) BaseExceptionGroup and the exceptions on
@@ -764,9 +765,9 @@ def _truncated_error_message(exc: BaseException) -> str:
     otherwise just the exception's own message (e.g. a JSON-RPC error
     string or an HTTP status line) -- it must never be additionally handed
     tool_args, tool_meta, or connection headers, none of which are
-    exception messages to begin with. One shape is recognised by neither
-    helper -- a secret sitting in a URL path segment (#2272) -- and for that
-    the cap is what bounds the exposure.
+    exception messages to begin with. Some shapes are recognised by neither
+    helper -- a secret in a URL path segment (#2272) and the others listed in
+    #2356 -- and for those the cap is what bounds the exposure.
     """
     try:
         text = redact_sensitive_text(redact_urls_in_text(str(exc)))
@@ -1552,6 +1553,14 @@ class MCPToolAdapter(AbstractBaseTool):
                         return retry_result
                     raise
 
+        # The tool-loading handlers (_load_direct_mcp_tools,
+        # load_mcp_tools_as_agent_tools) log only the class name above DEBUG
+        # and keep the raw traceback (exc_info) for DEBUG, because a traceback
+        # is unredacted and unbounded. These two handlers log at ERROR, but
+        # only _truncated_error_message() output -- passed through
+        # redact_urls_in_text and redact_sensitive_text and capped per line --
+        # and never a traceback, so do not add exc_info here. Shapes neither
+        # helper recognises: #2272, #2356.
         except BaseExceptionGroup as e:
             logger.error(
                 "MCP tool %s execution failed with exception group %s: %s",

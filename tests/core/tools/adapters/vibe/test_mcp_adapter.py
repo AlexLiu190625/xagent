@@ -1297,12 +1297,44 @@ def test_mcp_runtime_tool_argument_undeclared_target_warns_and_is_skipped(caplog
 
     caplog.set_level("WARNING")
     assert adapter._runtime_tool_arguments() == {}
-    assert (
-        "does not declare this argument" in caplog.text
-        or "input schema does not declare" in caplog.text
+    assert [(record.levelname, record.getMessage()) for record in caplog.records] == [
+        (
+            "WARNING",
+            "Skipping runtime MCP tool argument binding for account_id on tool "
+            "list_clients: the tool's input schema does not declare this argument",
+        )
+    ]
+
+
+@pytest.mark.parametrize("target_key", [123, None])
+def test_mcp_runtime_tool_argument_non_string_target_key_is_skipped_silently(
+    caplog, target_key
+):
+    """A binding whose target key is not a string is dropped without any log
+    line, unlike a string key the tool's schema does not declare, which warns."""
+    adapter = MCPToolAdapter(
+        mcp_tool=_mcp_tool("list_clients"),
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": [],
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {"target_type": "tool_arguments", "key": target_key},
+                },
+            ],
+            "connector_runtime": {
+                "context": {"account_id": "6185"},
+                "secrets": {},
+                "auth_selector": {},
+            },
+        },
     )
-    assert "account_id" in caplog.text
-    assert "list_clients" in caplog.text
+
+    caplog.set_level("DEBUG")
+    assert adapter._runtime_tool_arguments() == {}
+    assert caplog.records == []
 
 
 @pytest.mark.asyncio
@@ -2570,6 +2602,7 @@ async def test_mcp_tool_execution_error_group_logs_each_sub_exception(
     assert "ValueError" in caplog.text
     assert "second-leg" in caplog.text
     assert "related exception ExceptionGroup" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 async def _run_json_with_failure(monkeypatch, exc: BaseException) -> dict[str, Any]:

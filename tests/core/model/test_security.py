@@ -8,6 +8,9 @@ import httpx
 import pytest
 
 from xagent.core.utils.security import (
+    _NON_CREDENTIAL_KEY_QUALIFIERS,
+    _NON_CREDENTIAL_QUALIFIERS_BY_SUFFIX,
+    _NON_CREDENTIAL_TOKEN_QUALIFIERS,
     PrivateNetworkHostError,
     fetch_public_http_bytes,
     redact_sensitive_text,
@@ -375,6 +378,62 @@ def test_redact_sensitive_text_leaves_non_credential_key_suffixes() -> None:
     )
 
     assert redact_sensitive_text(text) == text
+
+
+# ``*_token`` names that locate a page or de-duplicate a request; they are not
+# credentials, and this text reaches user- and model-facing error messages.
+_POSITION_MARKER_TOKEN_KEYS = (
+    "idempotency_token next_token page_token continuation_token cursor_token "
+    "sync_token pagination_token next_page_token X_IDEMPOTENCY_TOKEN "
+    "x-idempotency-token --page-token"
+).split()
+# Credential ``*_token`` names (``page_access_token`` puts a position word in
+# front of ``access_token``), the ``*_key`` family that must keep masking, and
+# every ``*_key`` qualifier that is not also a ``*_token`` one (``public_token``).
+_CREDENTIAL_TOKEN_KEYS = (
+    "token access_token refresh_token id_token session_token auth_token "
+    "api_token bearer_token csrf_token oauth_token github_token "
+    "MCP_ACCESS_TOKEN page_access_token client_token "
+    "AWS_SECRET_ACCESS_KEY MCP_API_KEY api_key"
+).split() + [
+    f"{qualifier}_token"
+    for qualifier in sorted(
+        _NON_CREDENTIAL_KEY_QUALIFIERS - _NON_CREDENTIAL_TOKEN_QUALIFIERS
+    )
+]
+
+
+@pytest.mark.parametrize("key", _POSITION_MARKER_TOKEN_KEYS)
+def test_redact_sensitive_text_leaves_position_marker_tokens(key: str) -> None:
+    text = f"{key}=opaque-cursor-123 rejected"
+
+    assert redact_sensitive_text(text) == text
+
+
+@pytest.mark.parametrize("key", _CREDENTIAL_TOKEN_KEYS)
+def test_redact_sensitive_text_masks_credential_tokens(key: str) -> None:
+    text = f"{key}=SECRET-abc123 rejected"
+
+    assert redact_sensitive_text(text) == f"{key}=***c123 rejected"
+
+
+def test_non_credential_qualifiers_are_listed_per_suffix() -> None:
+    # Each word here leaves ``<word>_token=`` unmasked. Before adding one, add
+    # ``<word>_token`` to _POSITION_MARKER_TOKEN_KEYS and check that no
+    # service uses that name for a credential.
+    assert set(_NON_CREDENTIAL_QUALIFIERS_BY_SUFFIX) == {"key", "token"}
+    assert _NON_CREDENTIAL_TOKEN_QUALIFIERS == {
+        "idempotency",
+        "next",
+        "page",
+        "continuation",
+        "cursor",
+        "sync",
+        "pagination",
+    }
+    assert {f"{q}_token" for q in _NON_CREDENTIAL_TOKEN_QUALIFIERS} <= set(
+        _POSITION_MARKER_TOKEN_KEYS
+    )
 
 
 def test_redact_sensitive_text_still_masks_bare_and_cli_style_keys() -> None:

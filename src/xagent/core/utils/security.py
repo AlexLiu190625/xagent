@@ -41,10 +41,10 @@ ASSIGNMENT_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]+)=([^&\s]+)")
 # ends in one of these words and the word is the whole key or is joined to
 # the prefix by ``_``/``-``. ``key`` itself is included: ``SECRET_KEY=``,
 # ``AWS_SECRET_ACCESS_KEY=``, ``STRIPE_KEY=`` and ``PRIVATE_KEY=`` are all
-# credentials, and an unknown ``*_key`` is treated as one (fail closed). Only
-# the qualifiers below name ordinary fields (``primary_key=``, ``sort_key=``,
-# ``PUBLIC_KEY=``); those stay readable because this text also reaches user-
-# and model-facing error messages.
+# credentials, and an unknown ``*_key`` or ``*_token`` is treated as one (fail
+# closed). Only the per-suffix qualifiers below name ordinary fields
+# (``primary_key=``, ``PUBLIC_KEY=``, ``next_token=``); those stay readable
+# because this text also reaches user- and model-facing error messages.
 _CREDENTIAL_KEY_SUFFIXES = (
     "api_key",
     "api-key",
@@ -77,6 +77,24 @@ _NON_CREDENTIAL_KEY_QUALIFIERS = frozenset(
         "s3",
     }
 )
+# ``*_token`` names that mark a position or a request, not access: paging
+# cursors (``next_token``, ``page_token``, ``continuation_token``, ...) and a
+# client-chosen de-duplication id (``idempotency_token``). Kept apart from
+# the ``key`` list: ``public_token`` is exchanged for an access token, and
+# ``s3_token`` / ``cache_token`` may be credentials.
+# ``page_token`` is ambiguous: some code also names a Facebook Page access
+# token that way. The name alone cannot tell them apart (#2356).
+_NON_CREDENTIAL_TOKEN_QUALIFIERS = frozenset(
+    {"idempotency", "next", "page", "continuation", "cursor", "sync", "pagination"}
+)
+# The qualifier is the ``_``/``-`` segment just before the suffix
+# (``next_page_token`` -> ``page``). Every other suffix (``api_key``,
+# ``access_token``, ``password``, ``secret`` and their spellings) has no
+# exemption, so ``page_access_token=`` stays masked.
+_NON_CREDENTIAL_QUALIFIERS_BY_SUFFIX = {
+    "key": _NON_CREDENTIAL_KEY_QUALIFIERS,
+    "token": _NON_CREDENTIAL_TOKEN_QUALIFIERS,
+}
 
 
 def _is_credential_key(key: str) -> bool:
@@ -92,9 +110,10 @@ def _is_credential_key(key: str) -> bool:
             # ``monkey=`` / ``hotkey=`` / ``tokens=``: the credential word is
             # not a separate segment of the identifier.
             continue
-        if suffix == "key":
+        exempt = _NON_CREDENTIAL_QUALIFIERS_BY_SUFFIX.get(suffix)
+        if exempt is not None:
             qualifier = re.split(r"[_-]", prefix.rstrip("_-"))[-1]
-            if qualifier in _NON_CREDENTIAL_KEY_QUALIFIERS:
+            if qualifier in exempt:
                 return False
         return True
     return False
@@ -406,7 +425,15 @@ def redact_url_credentials_for_logging(url: str) -> str:
 
 
 def redact_sensitive_text(text: str) -> str:
-    """Redact common key/token patterns from arbitrary text."""
+    """Redact common key/token patterns from arbitrary text.
+
+    Recognition is by keyword and shape, so it is not exhaustive: it covers
+    ``http(s)://`` URLs (``redact_url_credentials_for_logging``),
+    ``identifier=value`` assignments whose identifier ``_is_credential_key``
+    accepts, and the header shapes in ``AUTH_HEADER_PATTERN`` and
+    ``HEADER_KEY_PATTERNS``. Shapes it is known to miss are listed in
+    #2356; add a pattern here when a new one turns up.
+    """
     if not text:
         return text
 

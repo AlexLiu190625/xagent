@@ -1722,6 +1722,8 @@ async def test_hook_failure_warning_redacts_and_bounds_resource(
     assert f"resource={expected}" in caplog.text
     assert expected.endswith("...")
     assert len(expected) == 128
+    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] == expected
+    assert configs[0]["config"]["diagnostic"]["resource"] == expected
 
 
 @pytest.mark.asyncio
@@ -1752,6 +1754,12 @@ async def test_hook_failure_warning_redacts_short_resource_query_string(
     assert "tenant=acme" not in caplog.text
     assert "mcp.example.test" in caplog.text
     assert "resource=https://mcp.example.test/oauth" in caplog.text
+    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] == (
+        "https://mcp.example.test/oauth"
+    )
+    assert configs[0]["config"]["diagnostic"]["resource"] == (
+        "https://mcp.example.test/oauth"
+    )
 
 
 @pytest.mark.asyncio
