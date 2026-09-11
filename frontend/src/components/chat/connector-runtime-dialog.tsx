@@ -338,9 +338,17 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     // A resend is one billed model call plus a possibly side-effecting tool
     // run; a double click here must not fire it twice.
     if (resending) return
+    const seqAtStart = request.seq
     setResending(true)
     const sent = await doResend()
     if (!aliveRef.current) return
+    if (requestRef.current.seq !== seqAtStart) {
+      // A newer request retargeted this same dialog instance while the
+      // resend was in flight; the result is stale, but `resending` must
+      // still reset or the retry button stays stuck forever.
+      setResending(false)
+      return
+    }
     setResending(false)
     if (sent) {
       setSendFailed(false)

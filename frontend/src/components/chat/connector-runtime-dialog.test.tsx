@@ -607,6 +607,44 @@ describe("resends the snapshot under a fresh id", () => {
   })
 })
 
+describe("ignores a resend result superseded by a new request", () => {
+  it("ignores a resend result superseded by a new request", async () => {
+    // Get into "value already saved but message not sent": save-and-resend
+    // succeeds on the save half and fails on the resend half.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    const closeSpy = vi.spyOn(latestActions, "close")
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-6", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(new Error("closed"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    // Click retry with sendMessage hung, then a same-task new request (a new
+    // seq) arrives while it is still in flight.
+    sendMessageMock.mockClear()
+    let resolveRetry: () => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((res) => { resolveRetry = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask() // retargets this same dialog instance mid-resend
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    // Now let the stale resend succeed: it must not close the new request's
+    // dialog, and must not report "resent" for a turn that was never
+    // resent under this request.
+    await act(async () => { resolveRetry() })
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(closeSpy).not.toHaveBeenCalledWith("resent")
+  })
+})
+
 async function openSimpleDialog(taskId = 1, withStash = true) {
   fetchMock.mockResolvedValueOnce(ok(report(false, [
     connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
