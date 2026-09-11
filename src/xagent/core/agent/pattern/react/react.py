@@ -60,6 +60,7 @@ import hashlib
 import inspect
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import timezone
 from enum import Enum
@@ -806,12 +807,35 @@ class ReActPattern(AgentPattern):
             self.current_iteration = iteration
             if self.pending_tool_calls:
                 self._ensure_pending_tool_call_envelope(context)
+                # The list of call dicts is snapshotted before the await
+                # because _execute_pending_tool_calls rebinds
+                # self.pending_tool_calls as it runs each segment, so reading
+                # it afterward would see only what is left over. The ids are
+                # read from that snapshot only after the await, though: a
+                # call dict that arrived without an id survives as the same
+                # object throughout execution, and gets one stamped onto it
+                # in place partway through -- reading ids beforehand would
+                # miss exactly those calls.
+                batch_calls = list(self.pending_tool_calls)
                 pending_result = await self._execute_pending_tool_calls(
                     context=context,
                     tools=tools,
                     llm=llm,
                     runtime=runtime,
                 )
+                batch_call_ids = [
+                    call_id
+                    for call_id in (str(call.get("id") or "") for call in batch_calls)
+                    if call_id
+                ]
+                # One of the two points in this loop where a tool batch
+                # finishes. Both carry the discharge, because hanging it on
+                # one of them would make whether a fetched-back observation
+                # is credited depend on whether that batch happened to run
+                # through the resume path or the in-turn path below. It runs
+                # ahead of the early return so that a batch that completed
+                # some work and then paused still gets credit for that work.
+                self._discharge_lost_tool_evidence(batch_call_ids)
                 if pending_result is not None:
                     return pending_result
                 self.current_iteration = iteration + 1
@@ -1146,6 +1170,13 @@ class ReActPattern(AgentPattern):
                 self._remember_tool_call_content(tool_calls, assistant_content)
                 self.status = "acting"
                 self.pending_tool_calls = list(tool_calls)
+                # Same snapshot-before-await, read-ids-after rule as the
+                # loop-top call site above: batch_calls is taken from
+                # tool_calls (not self.pending_tool_calls, which
+                # _execute_pending_tool_calls rebinds as it runs) so the call
+                # dicts survive, and a call that arrived without an id has
+                # one stamped onto that same dict during execution.
+                batch_calls = list(tool_calls)
                 await runtime.checkpoint("after_llm", context=context, pattern=self)
                 pending_result = await self._execute_pending_tool_calls(
                     context=context,
@@ -1153,6 +1184,13 @@ class ReActPattern(AgentPattern):
                     llm=llm,
                     runtime=runtime,
                 )
+                batch_call_ids = [
+                    call_id
+                    for call_id in (str(call.get("id") or "") for call in batch_calls)
+                    if call_id
+                ]
+                # Same discharge rule as the loop-top call site above.
+                self._discharge_lost_tool_evidence(batch_call_ids)
                 if pending_result is not None:
                     return pending_result
                 self.current_iteration = iteration + 1
@@ -1815,6 +1853,79 @@ class ReActPattern(AgentPattern):
         self.lost_tool_evidence.call_ids.update(loss.call_ids)
         if loss.unaccounted > 0:
             self.lost_tool_evidence.unnameable = True
+
+    def _discharge_lost_tool_evidence(self, batch_call_ids: Sequence[str]) -> None:
+        """Remove lost-evidence entries whose value the finished batch fetched back.
+
+        A recorded call id leaves ``self.lost_tool_evidence.call_ids`` if and
+        only if ``batch_call_ids`` -- the tool batch that just finished --
+        contains a call whose ledger record has status "completed", whose
+        result passes ``self._tool_result_success``, and whose
+        ``(tool_name, args_hash)`` pair matches the lost call's own pair. An
+        empty ``batch_call_ids`` matches nothing and discharges nothing.
+
+        The match is on the ``(tool_name, args_hash)`` fingerprint, not on
+        tool name alone. A later call to the same tool with different
+        arguments returns a different value: it does not bring back the
+        observation the lost call produced, so matching on name alone would
+        clear an entry whose actual value is still missing.
+
+        The lost call's fingerprint is looked up in ``self.tool_ledger``
+        rather than in the message transcript, because compaction removes
+        messages, not ledger entries. The ledger is written for every tool
+        call and checkpointed as a whole, so it still knows what tool and
+        arguments a lost id belonged to even after the message that carried
+        that call's result is gone. A lost id the ledger cannot resolve is
+        left in the record rather than matched by any other means.
+
+        Every recorded id is resolved to its fingerprint before anything is
+        removed, so the removals this call makes cannot change which entries
+        this same call considers a match.
+
+        ``unnameable`` is never touched here, under any circumstance. It
+        stands for a destroyed observation that carried no call id at all,
+        so no call in any batch can be shown to be the same observation
+        coming back. Only the end of the run clears it, in
+        ``_clear_lost_tool_evidence_at_run_end``.
+
+        Known limitation: when a batch is interrupted partway through, the
+        calls that had already completed before the interrupt are gone from
+        ``pending_tool_calls`` on resume, so the resumed batch's
+        ``batch_call_ids`` covers only the remainder and this method never
+        sees the earlier completions. The error this produces always runs
+        one direction: an entry can stay in the record after its value is
+        actually back, which costs an extra warning later and never a false
+        claim that a value is missing when it has already returned. This
+        method does not attempt to correct that; doing so needs tracking
+        beyond one finished batch.
+        """
+        if not self.lost_tool_evidence.call_ids:
+            return
+
+        lost_fingerprints: dict[str, tuple[str, str]] = {}
+        for call_id in self.lost_tool_evidence.call_ids:
+            record = self.tool_ledger.get(call_id)
+            if record is None:
+                continue
+            lost_fingerprints[call_id] = (record.tool_name, record.args_hash)
+
+        recovered_fingerprints: set[tuple[str, str]] = set()
+        for batch_call_id in batch_call_ids:
+            record = self.tool_ledger.get(batch_call_id)
+            if record is None:
+                continue
+            if record.status != "completed":
+                continue
+            if not self._tool_result_success(record.result):
+                continue
+            recovered_fingerprints.add((record.tool_name, record.args_hash))
+
+        discharged = {
+            call_id
+            for call_id, fingerprint in lost_fingerprints.items()
+            if fingerprint in recovered_fingerprints
+        }
+        self.lost_tool_evidence.call_ids -= discharged
 
     def get_state(self) -> dict[str, Any]:
         """Return JSON-serializable ReAct state for checkpointing."""

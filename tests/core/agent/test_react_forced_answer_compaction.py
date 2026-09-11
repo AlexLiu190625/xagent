@@ -13,17 +13,21 @@ concern this file does not cover.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import BaseModel
 
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
+from xagent.core.agent.pattern.react import react as react_module
 from xagent.core.agent.pattern.react.react import (
     LOST_TOOL_EVIDENCE_GRANULARITY,
     LOST_TOOL_EVIDENCE_MAX_CALL_IDS,
     CompactionLoss,
     LostToolEvidence,
+    ToolCallRecord,
 )
 
 
@@ -679,3 +683,383 @@ async def test_a_finished_run_leaves_no_lost_evidence_behind(
     assert final_state["lost_tool_evidence"]["unnameable"] is False
     assert pattern.lost_tool_evidence.call_ids == set()
     assert pattern.lost_tool_evidence.unnameable is False
+
+
+def make_ledger_record(
+    tool_call_id: str,
+    *,
+    tool_name: str,
+    args_hash: str = "hash-a",
+    status: str = "completed",
+    result: Any = None,
+) -> ToolCallRecord:
+    """Build a ledger entry with only the fields the discharge rule reads.
+
+    ``_discharge_lost_tool_evidence`` reads a record's ``tool_name``,
+    ``args_hash``, ``status``, and ``result`` -- never its ``args`` or
+    ``turn_id`` -- so those two are left at their dataclass defaults.
+    """
+    return ToolCallRecord(
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        args={},
+        args_hash=args_hash,
+        status=status,
+        result=result,
+    )
+
+
+# These tests exercise ``_discharge_lost_tool_evidence`` directly rather than
+# through ``pattern.run()``. The rule it implements reads only
+# ``self.tool_ledger`` and ``self.lost_tool_evidence`` and takes a plain list
+# of call ids -- it never touches the message transcript, the LLM, or actual
+# tool execution. Reproducing a lost entry whose id is genuinely resolvable in
+# ``self.tool_ledger`` end-to-end would require a real run to execute a tool
+# call (so it lands in the ledger), then a real compaction pass to drop
+# exactly that call's message on a later turn, then a further scripted LLM
+# turn to re-issue a specific tool call shape (success, failure, cancellation,
+# or different arguments) -- none of which the existing scaffolding in this
+# file produces for free (``build_context``'s seeded tool calls are written
+# straight into the context's messages, never through the pattern's own
+# ``tool_ledger``, so they can never be discharged). That machinery would
+# only be replicating this method's own fingerprint-matching logic through an
+# expensive detour. Driving the method directly keeps each test's cause and
+# effect visible in one place.
+
+
+@pytest.mark.parametrize(
+    ("args_hash", "status", "result", "batch_call_ids"),
+    [
+        pytest.param(
+            "hash-a",
+            "failed",
+            {"success": False, "error": "boom", "tool_name": "calculator"},
+            ["batch_1"],
+            id="tool_raised",
+        ),
+        pytest.param(
+            "hash-a",
+            "failed",
+            {"success": False, "error": "explicit failure"},
+            ["batch_1"],
+            id="structured_failure",
+        ),
+        pytest.param(
+            "hash-a",
+            "cancelled",
+            {"success": False, "status": "cancelled", "error": "discarded"},
+            ["batch_1"],
+            id="cancelled",
+        ),
+        pytest.param(
+            "hash-b",
+            "completed",
+            {"output": "a different value"},
+            ["batch_1"],
+            id="different_arguments",
+        ),
+        pytest.param(None, None, None, [], id="empty_batch"),
+    ],
+)
+def test_a_refetch_that_does_not_resolve_the_entry_discharges_nothing(
+    args_hash: str | None,
+    status: str | None,
+    result: Any,
+    batch_call_ids: list[str],
+) -> None:
+    """A refetch discharges nothing unless it is a completed, successful,
+    same-fingerprint (same tool name and args_hash) call named in this
+    batch.
+
+    Four ways a same-tool refetch can fail to qualify, each pinned to its
+    own mutation:
+
+    - ``tool_raised`` / ``structured_failure`` / ``cancelled``: the refetch
+      shares "hash-a" with the lost entry but did not succeed -- it raised,
+      returned a structured failure, or was cancelled -- so its ledger
+      record carries a status other than "completed". Mutation this test
+      catches: relaxing the discharge condition from "completed and
+      successful" down to merely "a matching call ran" would empty the
+      record in all three of these cells; the real condition leaves it
+      unchanged in all three.
+    - ``different_arguments``: the refetch succeeds but under "hash-b", a
+      different observation from the one lost under "hash-a". Mutation
+      this test catches: matching on tool name alone, dropping the
+      args_hash half of the comparison, would empty the record here; with
+      the real fingerprint match it stays unchanged.
+    - ``empty_batch``: no refetch happened at all, so an empty batch must
+      never be read as "everything came back". Mutation this test catches:
+      treating an empty ``batch_call_ids`` as a signal that the whole
+      record is now satisfied would empty it here; the real rule finds no
+      completed, successful call to match against and therefore removes
+      nothing.
+    """
+    pattern = ReActPattern()
+    pattern.tool_ledger["lost_1"] = make_ledger_record(
+        "lost_1", tool_name="calculator", args_hash="hash-a"
+    )
+    pattern.lost_tool_evidence = LostToolEvidence(call_ids={"lost_1"})
+    if args_hash is not None:
+        pattern.tool_ledger["batch_1"] = make_ledger_record(
+            "batch_1",
+            tool_name="calculator",
+            args_hash=args_hash,
+            status=status,
+            result=result,
+        )
+
+    pattern._discharge_lost_tool_evidence(batch_call_ids)
+
+    assert pattern.lost_tool_evidence.call_ids == {"lost_1"}
+    assert pattern.lost_tool_evidence.unnameable is False
+
+
+def test_a_matching_successful_refetch_discharges_its_entry() -> None:
+    """The happy path: a completed, successful, same-fingerprint call
+    discharges exactly its own entry and no other.
+
+    Mutation this test catches: a discharge rule that clears the whole
+    record instead of just the matched id(s) would also drop "lost_other"
+    here; with the real per-fingerprint removal it survives.
+    """
+    pattern = ReActPattern()
+    pattern.tool_ledger["lost_1"] = make_ledger_record(
+        "lost_1", tool_name="calculator", args_hash="hash-a"
+    )
+    pattern.tool_ledger["lost_other"] = make_ledger_record(
+        "lost_other", tool_name="search", args_hash="hash-c"
+    )
+    pattern.lost_tool_evidence = LostToolEvidence(call_ids={"lost_1", "lost_other"})
+    pattern.tool_ledger["batch_1"] = make_ledger_record(
+        "batch_1",
+        tool_name="calculator",
+        args_hash="hash-a",
+        status="completed",
+        result={"output": "the recovered value"},
+    )
+
+    pattern._discharge_lost_tool_evidence(["batch_1"])
+
+    assert pattern.lost_tool_evidence.call_ids == {"lost_other"}
+    assert pattern.lost_tool_evidence.unnameable is False
+
+
+@pytest.mark.parametrize("successful_call_count", [1, 3, 10])
+def test_an_unnameable_loss_survives_every_successful_call(
+    successful_call_count: int,
+) -> None:
+    """``unnameable`` never clears, no matter how many successful calls a
+    batch contains.
+
+    ``unnameable`` stands for a destroyed observation with no call id at
+    all, so there is nothing in any batch -- one call or ten -- that could
+    ever be shown to be that same observation coming back.
+
+    Mutation this test catches: clearing ``unnameable`` alongside the
+    matched ids (or unconditionally, whenever the method runs at all) would
+    make ``still_missing()`` read ``False`` here; the real rule leaves it
+    untouched, so it stays ``True`` regardless of how many calls succeed.
+    """
+    pattern = ReActPattern()
+    pattern.lost_tool_evidence = LostToolEvidence(call_ids=set(), unnameable=True)
+    batch_call_ids = []
+    for index in range(successful_call_count):
+        call_id = f"batch_{index}"
+        pattern.tool_ledger[call_id] = make_ledger_record(
+            call_id,
+            tool_name="calculator",
+            args_hash=f"hash-{index}",
+            status="completed",
+            result={"output": "value"},
+        )
+        batch_call_ids.append(call_id)
+
+    pattern._discharge_lost_tool_evidence(batch_call_ids)
+
+    assert pattern.lost_tool_evidence.call_ids == set()
+    assert pattern.lost_tool_evidence.unnameable is True
+    assert pattern.lost_tool_evidence.still_missing() is True
+
+
+def test_a_stale_success_from_an_earlier_batch_discharges_nothing() -> None:
+    """A matching successful call sitting in the ledger from an earlier,
+    already-finished batch does not discharge an entry.
+
+    Discharge is scoped to the batch that just finished: the ledger holds a
+    completed, successful, fingerprint-matching record, but its id is not
+    among ``batch_call_ids`` for this call, so it must not count.
+
+    Mutation this test catches: scanning the whole ledger for any matching
+    successful record instead of only the ids passed in would empty the
+    record here; the real rule only considers ``batch_call_ids``.
+    """
+    pattern = ReActPattern()
+    pattern.tool_ledger["lost_1"] = make_ledger_record(
+        "lost_1", tool_name="calculator", args_hash="hash-a"
+    )
+    pattern.lost_tool_evidence = LostToolEvidence(call_ids={"lost_1"})
+    # A successful, fingerprint-matching record already sits in the ledger
+    # from an earlier batch, but it is not part of the batch just finished.
+    pattern.tool_ledger["earlier_batch_call"] = make_ledger_record(
+        "earlier_batch_call",
+        tool_name="calculator",
+        args_hash="hash-a",
+        status="completed",
+        result={"output": "an old success"},
+    )
+
+    pattern._discharge_lost_tool_evidence(["some_other_unrelated_call"])
+
+    assert pattern.lost_tool_evidence.call_ids == {"lost_1"}
+    assert pattern.lost_tool_evidence.unnameable is False
+
+
+def test_every_tool_batch_completion_discharges_the_record() -> None:
+    """Every point in react.py that awaits a tool batch must also discharge
+    lost evidence.
+
+    This is a structural check over the source, not a behavioral one -- the
+    discharge rule's own behavior is covered by the tests above. What this
+    pins down is the wiring: every call site that awaits
+    ``self._execute_pending_tool_calls`` is a tool-batch completion point,
+    and each one must also call ``self._discharge_lost_tool_evidence`` in
+    its own enclosing statement block, so a batch that completed work is
+    never left unchecked for recoverable losses just because of which call
+    site it went through.
+
+    The "exactly 2" count is not a number this test is trying to freeze for
+    its own sake. It exists to force whoever adds a third call site to
+    ``_execute_pending_tool_calls`` to make a conscious decision about
+    whether that new site also needs a discharge call, instead of silently
+    inheriting whatever the count happened to be. If react.py grows a third
+    call site, update this test deliberately, with the new site's discharge
+    call added or a stated reason it does not need one.
+
+    Mutation this test catches: deleting the discharge call that follows
+    either await fails that call site's own assertion immediately; a
+    hypothetical third call site added later without a discharge call, or
+    without updating this test, fails the count assertion.
+    """
+    tree = ast.parse(Path(react_module.__file__).read_text())
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            child.parent = node  # type: ignore[attr-defined]
+
+    def is_execute_pending_await(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Await)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "_execute_pending_tool_calls"
+            and isinstance(node.value.func.value, ast.Name)
+            and node.value.func.value.id == "self"
+        )
+
+    def is_discharge_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_discharge_lost_tool_evidence"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        )
+
+    def containing_block(stmt: ast.stmt) -> list[ast.stmt]:
+        parent = getattr(stmt, "parent")
+        for field_name in ("body", "orelse", "finalbody"):
+            value = getattr(parent, field_name, None)
+            if isinstance(value, list) and stmt in value:
+                return value
+        raise AssertionError(
+            f"could not locate the enclosing statement block for {ast.dump(stmt)}"
+        )
+
+    call_sites: list[ast.stmt] = []
+    for node in ast.walk(tree):
+        if not is_execute_pending_await(node):
+            continue
+        enclosing_statement: ast.AST = node
+        while not isinstance(enclosing_statement, ast.stmt):
+            enclosing_statement = getattr(enclosing_statement, "parent")
+        call_sites.append(enclosing_statement)
+
+    assert len(call_sites) == 2, (
+        "expected exactly 2 statements awaiting _execute_pending_tool_calls "
+        f"in react.py; found {len(call_sites)} -- see this test's docstring "
+        "before changing this number"
+    )
+
+    for statement in call_sites:
+        block = containing_block(statement)
+        discharge_calls = [
+            inner
+            for sibling in block
+            for inner in ast.walk(sibling)
+            if is_discharge_call(inner)
+        ]
+        assert discharge_calls, (
+            "a statement awaiting _execute_pending_tool_calls has no "
+            "_discharge_lost_tool_evidence call in its enclosing block: "
+            f"{ast.dump(statement)}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_arrived_without_an_id_still_discharges_its_entry() -> None:
+    """A batch call with no id of its own at plan time still discharges the
+    lost-evidence entry its refetch resolves.
+
+    Reproduced at the loop level rather than by driving the model to omit an
+    id: the model-facing path always normalizes a tool call's id before it
+    ever reaches ``pending_tool_calls``, so a real end-to-end run cannot
+    produce one that is missing there. A checkpoint resume can, though --
+    ``pending_tool_calls`` is restored from state verbatim, with whatever
+    shape it was written in -- and this test starts from exactly that shape:
+    a pending call with no ``id`` key at all, the same as a resumed batch a
+    pre-normalization checkpoint might carry. ``_execute_tool_safely``
+    stamps an id onto that same dict, in place, the moment it actually runs
+    the call, which is the id the discharge lookup has to use.
+
+    Mutation this test catches: reading ``batch_call_ids`` from
+    ``self.pending_tool_calls`` (or from ``tool_calls``) before awaiting
+    ``_execute_pending_tool_calls`` instead of after makes this call's id
+    read back empty, so the fingerprint match never happens and the entry
+    is left in the record even though its value came back.
+    """
+    pattern = ReActPattern(max_iterations=3)
+    args_hash = pattern._args_hash({})
+    pattern.tool_ledger["lost_call"] = make_ledger_record(
+        "lost_call", tool_name="calculator", args_hash=args_hash
+    )
+    pattern.lost_tool_evidence = LostToolEvidence(call_ids={"lost_call"})
+    pattern.status = "acting"
+    tool_call: dict[str, Any] = {"name": "calculator", "args": {}}
+    pattern.pending_tool_calls = [tool_call]
+
+    context = ExecutionContext(execution_id="no-id-discharge")
+    context.add_user_message("Answer now.")
+    llm = RecordingLLM([final_answer_response()])
+    runtime = PatternRuntime()
+
+    result = await pattern.run(
+        context=context,
+        tools=[NamedTool("calculator")],
+        llm=llm,
+        compact_llm=None,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    # The stamp landed on the same dict this test built, and the ledger now
+    # holds the call under that stamped id.
+    stamped_id = tool_call["id"]
+    assert stamped_id
+    assert pattern.tool_ledger[stamped_id].tool_name == "calculator"
+    # Checked mid-run, at the "before_llm" checkpoint the next iteration
+    # writes right after the batch's discharge and well before the run
+    # finishes: the run's own end-of-run clear (``_finalize_outcome`` also
+    # empties this record) would otherwise mask a discharge that never
+    # actually matched anything.
+    mid_run_state = state_at(runtime, "before_llm")
+    assert mid_run_state["lost_tool_evidence"]["call_ids"] == []
+    assert pattern.lost_tool_evidence.call_ids == set()
