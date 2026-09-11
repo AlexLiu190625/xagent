@@ -563,6 +563,7 @@ def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
                     content=message,
                     message_type="question",
                     interactions=interactions,
+                    source_event_id=str(trace_event.event_id),
                 )
 
         db.commit()

@@ -71,6 +71,7 @@ from ..services.assistant_history_safety import (
     assistant_history_has_safe_ancillary_payload,
     client_safe_assistant_history_content,
 )
+from ..services.assistant_question_replay import load_transcript_replay
 from ..services.chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_FAILED,
@@ -85,7 +86,6 @@ from ..services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ..services.file_reference_output_service import (
-    load_assistant_file_reference_records,
     reconcile_assistant_file_references,
 )
 from ..services.file_turn import (
@@ -2006,7 +2006,7 @@ def _load_historical_stream_snapshot_sync(
                 if is_workforce_run
                 else public_task_trace_filter(TraceEvent)
             )
-            trace_scope = "workforce-top-level-v1" if is_workforce_run else "public-v1"
+            trace_scope = "workforce-top-level-v2" if is_workforce_run else "public-v2"
 
             max_trace_event_id = (
                 db.query(func.max(TraceEvent.id))
@@ -2200,11 +2200,25 @@ def _load_historical_stream_snapshot_sync(
                             ("assistant", content.strip(), attachment_key)
                         )
 
+            # A waiting question is persisted as both a trace event and a
+            # transcript row, and replay used to ship both (#2292). Keep the
+            # row and drop the trace twin it claims; see
+            # ``services.assistant_question_replay`` for why the row wins.
+            transcript = load_transcript_replay(
+                db,
+                task_id=int(task_id),
+                task_user_id=int(task.user_id),
+                trace_events=trace_events,
+                trace_data_by_event_id=normalized_trace_data_by_event_id,
+            )
+
             for trace_event in trace_events:
                 normalized_event_data = normalized_trace_data_by_event_id.get(
                     str(trace_event.event_id), trace_event.data
                 )
                 if _is_audit_only_trace_data(normalized_event_data):
+                    continue
+                if transcript.superseded(trace_event.event_id):
                     continue
                 if _is_duplicate_user_message_turn(
                     str(trace_event.event_type),
@@ -2241,18 +2255,7 @@ def _load_historical_stream_snapshot_sync(
                     }
                 )
 
-            chat_messages = (
-                db.query(TaskChatMessage)
-                .filter(TaskChatMessage.task_id == task_id)
-                .order_by(TaskChatMessage.created_at, TaskChatMessage.id)
-                .all()
-            )
-            file_reference_records = load_assistant_file_reference_records(
-                db,
-                task_id=int(task_id),
-                user_id=int(task.user_id),
-            )
-            for chat_message in chat_messages:
+            for chat_message in transcript.rows:
                 role = str(chat_message.role)
                 content = str(chat_message.content or "").strip()
                 if role == "assistant":
@@ -2265,7 +2268,7 @@ def _load_historical_stream_snapshot_sync(
                         task_id=int(task_id),
                         user_id=int(task.user_id),
                         content=content,
-                        records=file_reference_records,
+                        records=transcript.file_reference_records,
                     )
                 # Read attachments off the row so file-only turns (empty
                 # content + non-empty attachments) survive replay and so the
@@ -2318,7 +2321,7 @@ def _load_historical_stream_snapshot_sync(
                         data["files"] = row_attachments
                         data["attachments"] = row_attachments
                 elif role == "assistant":
-                    if (
+                    if not transcript.paired(chat_message.id) and (
                         content
                         and (role, content, _attachment_fingerprint(row_attachments))
                         in trace_message_keys
@@ -2351,7 +2354,9 @@ def _load_historical_stream_snapshot_sync(
                     {
                         "type": "trace_event",
                         "data": {
-                            "event_id": f"chat_message_{chat_message.id}",
+                            "event_id": transcript.event_id_for(
+                                chat_message.id, f"chat_message_{chat_message.id}"
+                            ),
                             "event_type": event_type,
                             "step_id": None,
                             "parent_event_id": None,
