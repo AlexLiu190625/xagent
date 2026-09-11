@@ -6,14 +6,18 @@ This file tests that ``ReActPattern`` keeps one durable record of that loss --
 ``lost_tool_evidence`` -- on the pattern instance for the life of the run, that
 the record accumulates regardless of whether the turn that lost the evidence
 was itself a forced-answer turn, that it survives a checkpoint round trip, and
-that it is cleared once the run actually finishes. How a later forced-answer
-turn reads this record back and changes its own instruction is a separate
-concern this file does not cover.
+that it is cleared once the run actually finishes. It also covers how a later
+forced-answer turn reads this record back and changes the instruction it sends
+to the model: reporting that observations were removed, instead of asking for
+an answer "using the accumulated conversation and tool results" that are gone.
 """
 
 from __future__ import annotations
 
 import ast
+import logging
+import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -21,13 +25,37 @@ import pytest
 from pydantic import BaseModel
 
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
+from xagent.core.agent.context.execution import (
+    COMPACT_DROPPED_TOOL_NAME_MAX_CHARS,
+    COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS,
+    COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+    bounded_notice_lines,
+)
+from xagent.core.agent.grounding import VALUE_KINDS, grounding_rule
+from xagent.core.agent.language import final_answer_language_rule
 from xagent.core.agent.pattern.react import react as react_module
 from xagent.core.agent.pattern.react.react import (
     LOST_TOOL_EVIDENCE_GRANULARITY,
     LOST_TOOL_EVIDENCE_MAX_CALL_IDS,
+    LOST_TOOL_NAME_OMISSION_ALLOWANCE,
     CompactionLoss,
     LostToolEvidence,
     ToolCallRecord,
+)
+from xagent.core.file_ref import final_deliverable_file_reference_instructions
+from xagent.core.model.chat.exceptions import LLMToolProtocolError
+
+# The exact prefix the gate's one log line opens with.
+EVIDENCE_DROPPED_LOG_PHRASE = "Forced answer turn is missing tool evidence"
+
+# The sentence the ordinary forced instruction opens with. On a turn whose
+# evidence was destroyed it is an instruction to invent, so it must be gone.
+STALE_EVIDENCE_PHRASE = "the accumulated conversation and tool results"
+HONEST_PHRASE = "Compaction removed tool observations from this run's context"
+CONDITIONAL_SUMMARY_PHRASE = "If a compaction summary stands above"
+COMPLETED_OFFERED_PHRASE = "Set outcome=completed only when"
+COMPLETED_CONDITIONAL_PHRASE = (
+    "Do not rest an outcome=completed claim on an observation that was removed"
 )
 
 
@@ -207,6 +235,47 @@ def compact_result(
     )
 
 
+class ScriptedCompactionRuntime(PatternRuntime):
+    """Runtime whose compaction returns a caller-supplied result per turn.
+
+    Used for the interleavings the honest-forcing gate has to handle that
+    real threshold-triggered compaction cannot be steered into reliably --
+    in particular, a loss on one turn with several ordinary, nothing-lost
+    turns running in between before a forced turn. The metadata shapes it
+    plays back are anchored to what real compaction actually writes by
+    ``test_real_compaction_reports_the_keys_the_gate_reads`` above.
+
+    ``pattern`` and ``force_after_call`` together let a test flip a
+    pattern's sticky ``force_final_answer_next`` flag partway through a run,
+    without the test code ever getting control back between turns: right
+    after the compaction call at 1-based count ``force_after_call`` returns,
+    which is late enough that call's own turn has already computed its own
+    (unforced) instruction, and early enough that the next turn reads the
+    flag as already set.
+    """
+
+    def __init__(
+        self,
+        results: list[Any],
+        *,
+        pattern: "ReActPattern | None" = None,
+        force_after_call: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.scripted_compactions = list(results)
+        self._pattern = pattern
+        self._force_after_call = force_after_call
+        self._compact_calls = 0
+
+    async def compact_context_if_needed(self, **kwargs: Any) -> Any:
+        self._compact_calls += 1
+        if self._compact_calls == self._force_after_call and self._pattern is not None:
+            self._pattern.force_final_answer_next = True
+        if not self.scripted_compactions:
+            return None
+        return self.scripted_compactions.pop(0)
+
+
 def tool_call_response(tool_name: str, call_id: str = "call_work") -> dict[str, Any]:
     return {
         "content": "",
@@ -219,6 +288,24 @@ def tool_call_response(tool_name: str, call_id: str = "call_work") -> dict[str, 
         ],
         "done": False,
     }
+
+
+def instruction_of(llm: RecordingLLM, index: int = 0) -> str:
+    return str(llm.calls[index]["messages"][0].get("content", ""))
+
+
+def whole_prompt_of(llm: RecordingLLM, index: int = 0) -> str:
+    return "\n".join(
+        str(message.get("content", "")) for message in llm.calls[index]["messages"]
+    )
+
+
+def evidence_dropped_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if EVIDENCE_DROPPED_LOG_PHRASE in record.getMessage()
+    ]
 
 
 @pytest.mark.asyncio
@@ -881,6 +968,40 @@ def test_an_unnameable_loss_survives_every_successful_call(
     assert pattern.lost_tool_evidence.still_missing() is True
 
 
+def test_an_unnameable_loss_survives_a_batch_that_does_discharge_an_entry() -> None:
+    """``unnameable`` also survives the path that actually removes an id.
+
+    The test above starts from an empty ``call_ids``, and an empty record
+    is sent straight back out of the method before it reaches any removal.
+    This one records both an id and an id-less loss, and the finished batch
+    resolves the id -- so the removal step really runs -- and pins that the
+    id-less loss is still outstanding afterwards.
+
+    Mutation this test catches: clearing ``unnameable`` at the end of the
+    removal step would make ``still_missing()`` read ``False`` here, even
+    though nothing in the batch could be the id-less observation coming
+    back.
+    """
+    pattern = ReActPattern()
+    pattern.tool_ledger["lost_1"] = make_ledger_record(
+        "lost_1", tool_name="calculator", args_hash="hash-a"
+    )
+    pattern.lost_tool_evidence = LostToolEvidence(call_ids={"lost_1"}, unnameable=True)
+    pattern.tool_ledger["batch_1"] = make_ledger_record(
+        "batch_1",
+        tool_name="calculator",
+        args_hash="hash-a",
+        status="completed",
+        result={"output": "the recovered value"},
+    )
+
+    pattern._discharge_lost_tool_evidence(["batch_1"])
+
+    assert pattern.lost_tool_evidence.call_ids == set()
+    assert pattern.lost_tool_evidence.unnameable is True
+    assert pattern.lost_tool_evidence.still_missing() is True
+
+
 def test_a_stale_success_from_an_earlier_batch_discharges_nothing() -> None:
     """A matching successful call sitting in the ledger from an earlier,
     already-finished batch does not discharge an entry.
@@ -1063,3 +1184,554 @@ async def test_a_call_that_arrived_without_an_id_still_discharges_its_entry() ->
     mid_run_state = state_at(runtime, "before_llm")
     assert mid_run_state["lost_tool_evidence"]["call_ids"] == []
     assert pattern.lost_tool_evidence.call_ids == set()
+
+
+# The tests below cover how a forced-answer turn reads ``lost_tool_evidence``
+# back and logs what it finds. The tests further down in this file cover how
+# that same read changes the forced-answer instruction text itself.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turns_between", [1, 2, 3])
+@pytest.mark.parametrize(
+    "strategy",
+    ["llm_summary", "truncate"],
+    ids=["summary_strategy", "truncate_strategy"],
+)
+@pytest.mark.parametrize("forcing", ["sticky_flag", "finalize_after_tool_result"])
+async def test_a_loss_on_an_earlier_turn_still_forces_an_honest_answer(
+    turns_between: int,
+    strategy: str,
+    forcing: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A forced turn warns about evidence an earlier turn's compaction
+    destroyed, even when several ordinary turns ran in between and the
+    forced turn's own compaction destroys nothing.
+
+    Covers both ways a turn becomes forced -- the sticky
+    ``force_final_answer_next`` flag, and ``finalize_after_tool_result``
+    deriving the same instruction inline from the last successful tool
+    result -- and both real compaction strategies, since the two report the
+    same metadata keys but under different ``strategy`` labels.
+
+    Mutation this test catches: a gate reading
+    ``dropped_tool_result_count > 0`` off this turn's own ``CompactResult``,
+    instead of the run's durable ``lost_tool_evidence`` record, emits zero
+    warnings on every cell here, because the forced turn's own compaction
+    always reports nothing dropped in this scenario. The record-reading gate
+    emits exactly one.
+    """
+    tool = NamedTool("calculator")
+    no_op_response = {"content": "", "tool_calls": [], "done": False}
+    loss_result = compact_result(count=1, call_ids=["lost_1"], strategy=strategy)
+    nothing_result = compact_result(count=0, by_name={}, strategy=strategy)
+
+    pattern = ReActPattern(max_iterations=turns_between + 5)
+    if forcing == "finalize_after_tool_result":
+        pattern.finalize_after_tool_result = True
+
+    responses: list[Any] = [no_op_response]
+    scripted: list[Any] = [loss_result]
+    for step in range(1, turns_between + 1):
+        scripted.append(nothing_result)
+        if forcing == "finalize_after_tool_result" and step == turns_between:
+            responses.append(tool_call_response("calculator", call_id=f"mid_{step}"))
+        else:
+            responses.append(no_op_response)
+    scripted.append(nothing_result)
+    responses.append(final_answer_response())
+
+    force_after_call = turns_between + 1 if forcing == "sticky_flag" else None
+    runtime = ScriptedCompactionRuntime(
+        scripted, pattern=pattern, force_after_call=force_after_call
+    )
+    llm = RecordingLLM(responses)
+    context = ExecutionContext(execution_id="earlier-loss")
+    context.add_user_message("Use calculator and report every value.")
+
+    with caplog.at_level(logging.WARNING, logger=react_module.__name__):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            compact_llm=None,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert len(evidence_dropped_warnings(caplog)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_forced_turn_with_nothing_missing_says_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A forced turn -- forced for any reason -- with an empty lost-evidence
+    record stays silent. This is the ordinary case: most forced turns have
+    lost nothing at all.
+    """
+    pattern = ReActPattern(max_iterations=3)
+    pattern.force_final_answer_next = True
+    runtime = ScriptedCompactionRuntime([compact_result(count=0, by_name={})])
+    llm = RecordingLLM([final_answer_response()])
+    context = ExecutionContext(execution_id="nothing-missing")
+    context.add_user_message("Answer now.")
+
+    with caplog.at_level(logging.WARNING, logger=react_module.__name__):
+        result = await pattern.run(
+            context=context, tools=[], llm=llm, compact_llm=None, runtime=runtime
+        )
+
+    assert result["success"] is True
+    assert evidence_dropped_warnings(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unforced_turn_says_nothing_however_much_is_missing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unforced turn holds the whole tool set and can fetch the value
+    itself, so there is nothing to warn about yet, however much the record
+    already holds.
+    """
+    pattern = ReActPattern(max_iterations=3)
+    pattern.lost_tool_evidence = LostToolEvidence(
+        call_ids={"lost_1", "lost_2"}, unnameable=True
+    )
+    runtime = ScriptedCompactionRuntime([compact_result(count=0, by_name={})])
+    llm = RecordingLLM(
+        [{"content": "Answering directly.", "tool_calls": [], "done": True}]
+    )
+    context = ExecutionContext(execution_id="unforced-missing")
+    context.add_user_message("Answer now.")
+
+    with caplog.at_level(logging.WARNING, logger=react_module.__name__):
+        result = await pattern.run(
+            context=context, tools=[], llm=llm, compact_llm=None, runtime=runtime
+        )
+
+    assert result["success"] is True
+    assert evidence_dropped_warnings(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unnameable_loss_alone_still_trips_the_gate(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A record holding only ``unnameable=True`` and no call ids still forces
+    the honest turn to say so, and the log must read ``named=unknown``, not
+    ``named=[]``.
+
+    Mutation this test catches: printing the empty names list makes the
+    field read ``named=[]``, which reads as an intact run with nothing
+    actually missing.
+    """
+    pattern = ReActPattern(max_iterations=3)
+    pattern.force_final_answer_next = True
+    pattern.lost_tool_evidence = LostToolEvidence(call_ids=set(), unnameable=True)
+    runtime = ScriptedCompactionRuntime([compact_result(count=0, by_name={})])
+    llm = RecordingLLM([final_answer_response()])
+    context = ExecutionContext(execution_id="unnameable-only")
+    context.add_user_message("Answer now.")
+
+    with caplog.at_level(logging.WARNING, logger=react_module.__name__):
+        result = await pattern.run(
+            context=context, tools=[], llm=llm, compact_llm=None, runtime=runtime
+        )
+
+    assert result["success"] is True
+    warnings = evidence_dropped_warnings(caplog)
+    assert len(warnings) == 1
+    assert "named=unknown" in warnings[0]
+    assert "named_count=0" in warnings[0]
+    assert "named=[]" not in warnings[0]
+
+
+@pytest.mark.parametrize(
+    ("name_count", "name_length"),
+    [(20, 64), (20, 200), (21, 8), (1, 2000), (20, 63)],
+    ids=["at_cap", "long_names", "one_over_cap", "single_long_name", "regression_1176"],
+)
+def test_the_named_list_in_the_log_stays_bounded(
+    name_count: int, name_length: int
+) -> None:
+    """``_bounded_tool_names`` never returns a result whose lines, joined
+    with the trailing omission line it appends, exceed the shared notice
+    budget -- however many names there are, how long each one runs, or
+    whether anything was actually left out.
+
+    ``regression_1176`` is the measured counter-example that used to slip
+    past this budget: 20 names of 63 characters each fit under
+    ``COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS`` on their own, but appending
+    the omission line after the fact pushed the assembled result to 1176
+    characters against a 1152 budget.
+
+    Mutation this test catches: dropping ``chars_used`` from the
+    ``bounded_notice_lines`` call inside ``_bounded_tool_names`` -- or
+    dropping the total character-budget skip inside ``bounded_notice_lines``
+    itself, keeping only the per-name length clamp and the entry-count cap
+    -- lets the joined length, omission line included, exceed
+    ``COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS``.
+    """
+    names = [f"tool_{index}".rjust(name_length, "x") for index in range(name_count)]
+
+    result = ReActPattern._bounded_tool_names(names)
+
+    assert len("\n".join(result)) <= COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS
+
+    expected_lines, omitted = bounded_notice_lines(
+        names,
+        render=lambda name: name[:COMPACT_DROPPED_TOOL_NAME_MAX_CHARS],
+        max_chars=COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS,
+        max_entries=COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+        chars_used=LOST_TOOL_NAME_OMISSION_ALLOWANCE,
+    )
+    if omitted:
+        assert result[:-1] == expected_lines
+        assert re.match(r"^\.\.\. \d+ more names? omitted$", result[-1])
+    else:
+        assert result == expected_lines
+
+
+def test_a_name_the_ledger_cannot_resolve_counts_as_unnamed() -> None:
+    """A call id the ledger cannot resolve is absent from the returned names
+    but still marks the result unnameable, rather than being silently
+    dropped.
+
+    Dropping it instead of flagging it would let a record that still holds a
+    real entry report back as though nothing were missing.
+    """
+    pattern = ReActPattern()
+    pattern.lost_tool_evidence = LostToolEvidence(call_ids={"ghost_call"})
+
+    names, unnamed = pattern._lost_tool_names()
+
+    assert names == []
+    assert unnamed is True
+
+
+@pytest.mark.asyncio
+async def test_a_matching_refetch_stops_the_honest_forcing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A real re-fetch of the same tool with the same arguments discharges
+    the lost-evidence entry through the actual loop wiring, so a later
+    forced turn stays silent.
+
+    This drives a real tool call into ``self.tool_ledger``, scripts a
+    compaction that reports that exact call id destroyed, drives a second
+    real call to the same tool with the same (empty) arguments, and only
+    then forces the answer -- proving the batch-id capture at the in-turn
+    tool-call call site (the ``if tool_calls:`` branch, not the loop-top
+    resume branch) feeds ``_discharge_lost_tool_evidence`` correctly. A test
+    that called ``_discharge_lost_tool_evidence`` directly, as the tests
+    above it in this file do, would not exercise that wiring.
+    """
+    tool = NamedTool("list_clients")
+    pattern = ReActPattern(max_iterations=6)
+    scripted_compactions: list[Any] = [
+        None,
+        compact_result(count=1, call_ids=["first"], by_name={"list_clients": 1}),
+        compact_result(count=0, by_name={}),
+    ]
+    runtime = ScriptedCompactionRuntime(
+        scripted_compactions, pattern=pattern, force_after_call=2
+    )
+    llm = RecordingLLM(
+        [
+            tool_call_response("list_clients", call_id="first"),
+            tool_call_response("list_clients", call_id="refetch"),
+            final_answer_response(),
+        ]
+    )
+    context = ExecutionContext(execution_id="matching-refetch")
+    context.add_user_message("List every client.")
+
+    with caplog.at_level(logging.WARNING, logger=react_module.__name__):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            compact_llm=None,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert len(tool.calls) == 2
+    assert pattern.lost_tool_evidence.call_ids == set()
+    assert evidence_dropped_warnings(caplog) == []
+
+
+# The tests below cover the wording of the forced-answer instruction itself:
+# what it asks for when a turn's evidence is intact, and how it changes when
+# ``lost_tool_evidence`` still holds something compaction destroyed.
+
+
+async def drive_forced_turn_missing_evidence(
+    *,
+    strategy: str = "truncate",
+    named: dict[str, str] | None = None,
+    unnameable_ids: Sequence[str] = (),
+    execution_id: str = "forced-missing-evidence",
+) -> RecordingLLM:
+    """Run one forced-answer turn whose lost-evidence record holds exactly
+    the given call ids, and return the ``RecordingLLM`` that captured every
+    prompt the turn sent.
+
+    ``named`` maps a call id to the tool name it should resolve to: each one
+    is pre-seeded into the pattern's own tool ledger so ``_lost_tool_names``
+    can look it up for the gate's log line, the same way a real run's ledger
+    would after actually executing that call. ``unnameable_ids`` are left
+    out of the ledger entirely, so the same lookup fails. Passing neither
+    leaves the record empty, which is the ordinary case: a forced turn with
+    nothing missing.
+    """
+    named = dict(named or {})
+    pattern = ReActPattern(max_iterations=4)
+    for call_id, tool_name in named.items():
+        pattern.tool_ledger[call_id] = make_ledger_record(call_id, tool_name=tool_name)
+    dropped_ids = [*named.keys(), *unnameable_ids]
+    scripted: list[Any] = [
+        compact_result(count=len(dropped_ids), call_ids=dropped_ids, strategy=strategy)
+        if dropped_ids
+        else compact_result(count=0, by_name={}, strategy=strategy)
+    ]
+    pattern.force_final_answer_next = True
+    runtime = ScriptedCompactionRuntime(scripted)
+    llm = RecordingLLM([final_answer_response()])
+    context = ExecutionContext(execution_id=execution_id)
+    context.add_user_message("Answer now.")
+
+    result = await pattern.run(
+        context=context, tools=[], llm=llm, compact_llm=None, runtime=runtime
+    )
+    assert result["success"] is True
+    return llm
+
+
+class ProtocolErrorLLM(RecordingLLM):
+    """Chat LLM that raises a provider protocol error on a chosen call."""
+
+    def __init__(self, responses: list[Any], *, fail_on: int, code: str) -> None:
+        super().__init__(responses)
+        self.fail_on = fail_on
+        self.code = code
+
+    async def chat(self, **kwargs: Any) -> Any:
+        index = len(self.calls)
+        self.calls.append(kwargs)
+        if index == self.fail_on:
+            raise LLMToolProtocolError(
+                provider="test-provider",
+                code=self.code,
+                message=f"provider returned {self.code}",
+            )
+        if not self.responses:
+            return {"content": "fallback answer", "done": True}
+        return self.responses.pop(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "strategy",
+    ["llm_summary", "truncate"],
+    ids=["summary_strategy", "truncate_strategy"],
+)
+@pytest.mark.parametrize("shape", ["named_only", "unnameable_only", "both"])
+async def test_the_honest_instruction_replaces_the_stale_one(
+    strategy: str, shape: str
+) -> None:
+    """A forced turn whose record still holds something compaction
+    destroyed is told so, whichever compaction path destroyed it and
+    whatever mix of ledger-resolvable and unresolvable ids the record
+    holds.
+
+    Mutation this test catches: dropping the ``evidence_dropped`` argument
+    from the ``_messages_for_llm`` call in ``_run_tool_calling_loop`` sends
+    the ordinary forced instruction, whose opening asks the model to answer
+    from tool results that are gone.
+    """
+    named: dict[str, str] = {}
+    unnameable_ids: list[str] = []
+    if shape in ("named_only", "both"):
+        named["lost_named"] = "list_clients"
+    if shape in ("unnameable_only", "both"):
+        unnameable_ids.append("lost_orphan")
+
+    llm = await drive_forced_turn_missing_evidence(
+        strategy=strategy, named=named, unnameable_ids=unnameable_ids
+    )
+
+    assert HONEST_PHRASE in instruction_of(llm, 0)
+    # Checked against the whole prompt, not just the instruction: a stale
+    # copy of the same advice sitting in any other message would undo the
+    # honest wording just as much as leaving it in the instruction would.
+    assert STALE_EVIDENCE_PHRASE not in whole_prompt_of(llm, 0)
+
+
+@pytest.mark.asyncio
+async def test_the_honest_instruction_is_conditional_on_a_summary_being_present() -> (
+    None
+):
+    """The instruction is worded as a conditional on a summary being
+    present, never as a branch on which compaction strategy destroyed the
+    evidence.
+
+    The message-dropping backstop only trims a tail window, so a summary an
+    earlier turn's own compaction already wrote can still be standing above
+    a forced turn whose own compaction this turn only dropped messages --
+    wording that branched on this turn's own strategy would wrongly tell
+    the model there is no summary in that case.
+
+    Mutation this test catches: branching the opening on which compaction
+    strategy ran makes the two instructions below differ; the real wording
+    is identical either way because it never reads the strategy at all.
+    """
+    summary_llm = await drive_forced_turn_missing_evidence(
+        strategy="llm_summary", named={"lost_named": "list_clients"}
+    )
+    truncate_llm = await drive_forced_turn_missing_evidence(
+        strategy="truncate", named={"lost_named": "list_clients"}
+    )
+
+    summary_instruction = instruction_of(summary_llm, 0)
+    truncate_instruction = instruction_of(truncate_llm, 0)
+
+    assert summary_instruction == truncate_instruction
+    assert CONDITIONAL_SUMMARY_PHRASE in summary_instruction
+    assert CONDITIONAL_SUMMARY_PHRASE in truncate_instruction
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["llm_summary", "truncate"])
+async def test_the_honest_instruction_reuses_the_shared_value_kinds_list(
+    strategy: str,
+) -> None:
+    """The kinds of value the instruction enumerates come from the shared
+    ``VALUE_KINDS`` constant, interpolated, never a hand-written fourth
+    copy of the same list.
+
+    Mutation this test catches: replacing the interpolated constant with a
+    hand-written, shorter list of value kinds makes ``VALUE_KINDS in
+    instruction`` false.
+    """
+    llm = await drive_forced_turn_missing_evidence(
+        strategy=strategy, named={"lost_named": "list_clients"}
+    )
+    assert VALUE_KINDS in instruction_of(llm, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "record_tools",
+    [("send_message",), ("list_clients",), ("send_message", "list_clients")],
+    ids=["write_only", "read_only", "write_and_read"],
+)
+async def test_a_removed_write_observation_does_not_ban_completed_outright(
+    record_tools: tuple[str, ...],
+) -> None:
+    """The completion rule the honest instruction states is a conditional,
+    not a flat ban, whether the removed observation came from a tool that
+    writes, one that reads, or a mix of both.
+
+    A removed observation is not always a removed read: a write whose
+    result message compaction later discarded may already have succeeded,
+    so a flat ban would make the model under-report work that genuinely
+    finished.
+
+    Mutation this test catches: replacing the conditional rule with a flat
+    ban makes the instruction contain "outcome=completed is not available
+    on this turn".
+    """
+    named = {f"lost_{name}": name for name in record_tools}
+    llm = await drive_forced_turn_missing_evidence(named=named)
+
+    instruction = instruction_of(llm, 0)
+    assert COMPLETED_CONDITIONAL_PHRASE in instruction
+    assert "outcome=completed is not available on this turn" not in instruction
+
+
+@pytest.mark.asyncio
+async def test_a_turn_with_nothing_missing_keeps_the_ordinary_instruction() -> None:
+    """A forced turn whose lost-evidence record is empty is given the same
+    words, in the same order, that every forced turn is given.
+
+    The wording below is held as one contiguous literal on purpose. The
+    source builds it from an opening and a shared tail so that a turn
+    missing evidence can swap the opening, and splitting a string that way
+    is exactly how a sentence quietly changes places with its neighbour.
+
+    Mutation this test catches: moving one sentence past another while
+    carving the opening out. Every phrase-level assertion above still
+    passes on the reordered text; this one stops finding the literal.
+    """
+    llm = await drive_forced_turn_missing_evidence()
+
+    instruction = instruction_of(llm, 0)
+    assert STALE_EVIDENCE_PHRASE in instruction
+    assert COMPLETED_OFFERED_PHRASE in instruction
+    assert HONEST_PHRASE not in instruction
+
+    ordinary_wording = (
+        "Produce the final user-facing answer by calling the final_answer "
+        "control tool exactly once using the accumulated conversation and "
+        "tool results. Do not call any other tool and do not output "
+        "tool-call markup as plain text. Set outcome=completed only when "
+        "every requested action or verification succeeded; otherwise set "
+        "outcome=partial or outcome=blocked and say what remains. If a "
+        "previous ask_user_question narrowed the request to a selected "
+        "subset of items or resources, the final answer must cover only "
+        "that subset — leave out anything outside it even if an earlier "
+        "tool call already returned data about it. "
+    )
+    # ExecutionContext's own system message (turn-start time, file-reference
+    # rules) sits ahead of this instruction in the same message; the
+    # instruction itself is appended verbatim, so it is the exact suffix.
+    assert instruction.endswith(
+        f"{ordinary_wording}"
+        f"{grounding_rule(can_call_tools=False)}\n\n"
+        f"{final_deliverable_file_reference_instructions(can_lookup=False)}\n\n"
+        f"{final_answer_language_rule()}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_protocol_repair_keeps_the_honest_wording() -> None:
+    """The retry that repairs a broken tool-protocol response is often the
+    call that actually produces the answer the user sees, so it needs the
+    same honest wording as the first call it replaces.
+
+    Mutation this test catches: not forwarding ``evidence_dropped`` into
+    ``_retry_tool_protocol_response`` makes the retry rebuild its prompt
+    without it, so its instruction falls back to ``STALE_EVIDENCE_PHRASE``;
+    with the real forwarding it carries ``HONEST_PHRASE`` instead, same as
+    the call it is repairing.
+    """
+    pattern = ReActPattern(max_iterations=4)
+    pattern.tool_ledger["lost_named"] = make_ledger_record(
+        "lost_named", tool_name="list_clients"
+    )
+    pattern.force_final_answer_next = True
+    runtime = ScriptedCompactionRuntime(
+        [compact_result(count=1, call_ids=["lost_named"], strategy="truncate")]
+    )
+    llm = ProtocolErrorLLM(
+        [final_answer_response()],
+        fail_on=0,
+        code="invalid_tool_protocol",
+    )
+    context = ExecutionContext(execution_id="protocol-repair-honest")
+    context.add_user_message("Answer now.")
+
+    result = await pattern.run(
+        context=context, tools=[], llm=llm, compact_llm=None, runtime=runtime
+    )
+
+    assert result["success"] is True
+    assert len(llm.calls) >= 2
+    first_instruction = instruction_of(llm, 0)
+    retry_instruction = instruction_of(llm, 1)
+    assert HONEST_PHRASE in first_instruction
+    assert HONEST_PHRASE in retry_instruction
+    assert STALE_EVIDENCE_PHRASE not in retry_instruction

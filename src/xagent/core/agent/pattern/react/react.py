@@ -91,9 +91,15 @@ from ...context.enrichment import (
     pending_user_response_lifecycle,
     pending_user_response_marker,
 )
+from ...context.execution import (
+    COMPACT_DROPPED_TOOL_NAME_MAX_CHARS,
+    COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS,
+    COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+    bounded_notice_lines,
+)
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
-from ...grounding import grounding_rule
+from ...grounding import VALUE_KINDS, grounding_rule
 from ...language import final_answer_language_rule
 from ...result import (
     CONTROL_TOOL_NAMES,
@@ -166,6 +172,15 @@ LOST_TOOL_EVIDENCE_GRANULARITY = "tool_call_id"
 # many ids (by sorted order) with the loss explicitly recorded, rather than
 # silently shortened into a record that looks complete when it is not.
 LOST_TOOL_EVIDENCE_MAX_CALL_IDS = 200
+# Reserves room in the bounded tool-name budget for the one trailing line
+# that reports how many names were left out, which _bounded_tool_names
+# appends after the shared renderer has already spent the rest of the
+# budget on names. Without this reserve, that trailing line lands on top of
+# a list already filled to the budget's edge, so the assembled result can
+# run past COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS by however long the line
+# is. 64 is comfortably more than the longest such line this code can
+# produce.
+LOST_TOOL_NAME_OMISSION_ALLOWANCE = 64
 
 
 @dataclass
@@ -869,6 +884,10 @@ class ReActPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
 
+            # Built only to pick a model for this call (prepare_llm_for_context
+            # inspects message shape); this rendering never reaches the
+            # provider as the turn's actual prompt, so it carries none of the
+            # evidence-dropped wording the real prompt below needs.
             route_messages = self._messages_for_llm(
                 context,
                 has_tools=bool(tool_schemas),
@@ -903,20 +922,46 @@ class ReActPattern(AgentPattern):
                 llm=compact_llm if compact_llm is not None else call_llm,
                 metadata={"iteration": iteration},
             )
-            # Unconditional, and never inside a try. The turn whose
-            # compaction destroys an observation is frequently not the turn
-            # that later has to answer without it, so folding this in only
-            # when this turn happens to already be a forced-answer turn would
-            # lose exactly the interleaving this record exists to catch.
-            # Swallowing an error here would turn "this turn destroyed
-            # evidence" into "this turn did nothing", which is the failure
-            # mode this record exists to prevent.
+            # The turn whose compaction destroys an observation is frequently
+            # not the turn that later has to answer without it. That one fact
+            # shapes both statements below: the record is written on every
+            # turn, and the gate reads the record rather than this
+            # iteration's own compact_result. Folding the loss in only on a
+            # turn that is already answering, or gating on this iteration's
+            # own result, each drops exactly that interleaving.
+            #
+            # Neither statement may be wrapped in a try. Swallowing here
+            # turns "this turn destroyed evidence" into "this turn did
+            # nothing", which is the failure this record exists to prevent.
             self._record_lost_tool_evidence(self._dropped_tool_evidence(compact_result))
+            evidence_dropped = (
+                force_final_answer_now and self.lost_tool_evidence.still_missing()
+            )
+            if evidence_dropped:
+                # Resolved for this operator-facing log line only. The
+                # instruction built below reports that observations were
+                # removed without naming them, so nothing resolved here
+                # reaches the model.
+                names, unnamed = self._lost_tool_names()
+                names_field: list[str] | str = (
+                    self._bounded_tool_names(names) if names else "unknown"
+                )
+                logger.warning(
+                    "Forced answer turn is missing tool evidence compaction destroyed; it will "
+                    "be named as unavailable rather than answered from. missing_calls=%d "
+                    "named_count=%d named=%s unnamed=%s execution_id=%s",
+                    len(self.lost_tool_evidence.call_ids),
+                    len(names),
+                    names_field,
+                    unnamed,
+                    getattr(context, "execution_id", None),
+                )
 
             messages = self._messages_for_llm(
                 context,
                 has_tools=bool(tool_schemas),
                 force_final_answer=force_final_answer_now,
+                evidence_dropped=evidence_dropped,
                 tool_names=self._schema_tool_names(tool_schemas),
             )
             await runtime.checkpoint("before_llm", context=context, pattern=self)
@@ -992,6 +1037,12 @@ class ReActPattern(AgentPattern):
                         force_final_answer=(
                             force_final_answer_now and not unavailable_tool_call
                         ),
+                        # The retry rebuilds the whole prompt from scratch, and
+                        # on a turn whose evidence is gone this is the call
+                        # that actually reaches the user -- without forwarding
+                        # this, the repair would hand back the stale wording
+                        # this turn's first call already replaced.
+                        evidence_dropped=evidence_dropped,
                         recovery_reason=exc.code,
                     )
                 except LLMCallInterrupted:
@@ -1085,6 +1136,11 @@ class ReActPattern(AgentPattern):
                         force_final_answer=(
                             force_final_answer_now and not recover_full_tool_set
                         ),
+                        # Same reason as the other retry call site above: this
+                        # rebuilds the whole prompt and may be the call that
+                        # actually reaches the user, so it needs the same
+                        # evidence-dropped wording as the call it is repairing.
+                        evidence_dropped=evidence_dropped,
                         recovery_reason=recovery_reason,
                         empty_final_answer=empty_final_answer is not None,
                     )
@@ -1324,17 +1380,60 @@ class ReActPattern(AgentPattern):
         *,
         has_tools: bool,
         force_final_answer: bool = False,
+        evidence_dropped: bool = False,
         tool_names: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         messages = list(context.get_messages_for_llm())
         if force_final_answer:
+            # Kept inside each opening rather than hoisted into the shared
+            # tail below, because the two openings place it differently: the
+            # ordinary one keeps it between its own two sentences, which is
+            # where every forced turn reads it, and the honest one ends with
+            # it.
+            tool_call_rule = (
+                "Do not call any other tool and do not output "
+                "tool-call markup as plain text. "
+            )
+            if evidence_dropped:
+                # Conditional on a summary being present, never on which
+                # compaction strategy ran this turn. The message-dropping
+                # backstop only trims a tail window, so a summary an earlier
+                # turn's own compaction wrote can still be standing above --
+                # a sentence that branched on strategy would tell the model
+                # there is no summary while one is sitting right there.
+                #
+                # The outcome=completed rule below is a conditional, not a
+                # flat ban: a removed observation is not always a removed
+                # read. A write whose result message compaction later
+                # discarded already happened, and a flat "completed is
+                # unavailable this turn" would make the model under-report
+                # work that genuinely finished.
+                opening = (
+                    "Produce the final user-facing answer by calling the "
+                    "final_answer control tool exactly once. Compaction removed "
+                    "tool observations from this run's context and their values "
+                    "can no longer be read. If a compaction "
+                    "summary stands above, treat any value not literally present "
+                    f"in that summary -- {VALUE_KINDS} -- as unavailable rather "
+                    "than recalled. Do not reconstruct, estimate, or illustrate a "
+                    "removed value, and do not present one as an example. Do not "
+                    "rest an outcome=completed claim on an observation that was "
+                    "removed; set outcome=partial when part of the request is "
+                    "still answerable from what remains and outcome=blocked when "
+                    f"none of it is. {tool_call_rule}"
+                )
+            else:
+                opening = (
+                    "Produce the final user-facing answer by calling the final_answer "
+                    "control tool exactly once using the accumulated conversation and "
+                    f"tool results. {tool_call_rule}"
+                    "Set outcome=completed only when every requested "
+                    "action or verification succeeded; otherwise set outcome=partial "
+                    "or outcome=blocked and say what remains. "
+                )
             instruction = (
-                "Produce the final user-facing answer by calling the final_answer "
-                "control tool exactly once using the accumulated conversation and "
-                "tool results. Do not call any other tool and do not output "
-                "tool-call markup as plain text. Set outcome=completed only when "
-                "every requested action or verification succeeded; otherwise set "
-                "outcome=partial or outcome=blocked and say what remains. If a "
+                f"{opening}"
+                "If a "
                 "previous ask_user_question narrowed the request to a selected "
                 "subset of items or resources, the final answer must cover only "
                 "that subset — leave out anything outside it even if an earlier "
@@ -1443,6 +1542,7 @@ class ReActPattern(AgentPattern):
         iteration: int,
         tool_schemas: list[dict[str, Any]],
         force_final_answer: bool,
+        evidence_dropped: bool = False,
         recovery_reason: str | None = None,
         empty_final_answer: bool = False,
     ) -> tuple[Any, ReActFinalAnswerStreamer]:
@@ -1453,6 +1553,7 @@ class ReActPattern(AgentPattern):
             context,
             has_tools=True,
             force_final_answer=force_final_answer,
+            evidence_dropped=evidence_dropped,
             tool_names=self._schema_tool_names(tools),
         )
         if recovery_reason == "unavailable_tool_call":
@@ -1926,6 +2027,60 @@ class ReActPattern(AgentPattern):
             if fingerprint in recovered_fingerprints
         }
         self.lost_tool_evidence.call_ids -= discharged
+
+    def _lost_tool_names(self) -> tuple[list[str], bool]:
+        """Name the tools behind this run's still-missing lost-evidence call ids.
+
+        The names come from ``self.tool_ledger`` -- the engine's own record of
+        every tool call this run has made, which compaction never touches --
+        not from anything still readable in the conversation, which is
+        exactly the part a compaction may already have removed.
+
+        The result is sorted alphabetically and deliberately not ranked by
+        how often a tool was lost: ``self.lost_tool_evidence`` accounts for
+        loss per call id, not per tool name, so a frequency ranking is not a
+        fact this record holds.
+
+        A call id the ledger cannot resolve is still something missing. It
+        moves into the returned ``unnameable`` flag rather than being
+        dropped from consideration, because dropping it would let a record
+        that still holds entries report back as though nothing were
+        missing.
+        """
+        names: set[str] = set()
+        unnameable = self.lost_tool_evidence.unnameable
+        for call_id in self.lost_tool_evidence.call_ids:
+            record = self.tool_ledger.get(call_id)
+            if record is None:
+                unnameable = True
+                continue
+            names.add(record.tool_name)
+        return sorted(names), unnameable
+
+    @staticmethod
+    def _bounded_tool_names(names: Sequence[str]) -> list[str]:
+        """Render lost-evidence tool names into one bounded log line.
+
+        Tool names come from runtime MCP server configuration, so a line
+        built from them is unbounded unless it carries the same three caps
+        the in-prompt dropped-tool notice applies: how many names to list,
+        how long each one may be, and a total character budget so the two
+        per-name caps cannot multiply into an unbounded line on their own.
+        A list that was silently cut down would read as the whole set,
+        which is the one thing a line reporting missing evidence must not
+        do.
+        """
+        lines, omitted = bounded_notice_lines(
+            names,
+            render=lambda name: name[:COMPACT_DROPPED_TOOL_NAME_MAX_CHARS],
+            max_chars=COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS,
+            max_entries=COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+            chars_used=LOST_TOOL_NAME_OMISSION_ALLOWANCE,
+        )
+        if omitted:
+            name_label = "name" if omitted == 1 else "names"
+            lines.append(f"... {omitted} more {name_label} omitted")
+        return lines
 
     def get_state(self) -> dict[str, Any]:
         """Return JSON-serializable ReAct state for checkpointing."""
