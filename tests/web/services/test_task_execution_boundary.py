@@ -52,6 +52,7 @@ def test_execution_services_and_tracer_load_without_api_routes() -> None:
 @pytest.mark.asyncio
 async def test_event_delivery_uses_the_host_sink(monkeypatch) -> None:
     monkeypatch.setattr(task_events, "_task_event_sink", None)
+    monkeypatch.setattr(task_events, "_task_audience_probe", None)
     monkeypatch.setattr(task_events, "_warned_missing_sink", False)
     counter = Mock()
     monkeypatch.setattr(task_events, "increment_counter", counter)
@@ -73,6 +74,7 @@ async def test_missing_sink_counts_every_event_and_warns_once_until_registered(
     monkeypatch, caplog
 ) -> None:
     monkeypatch.setattr(task_events, "_task_event_sink", None)
+    monkeypatch.setattr(task_events, "_task_audience_probe", None)
     monkeypatch.setattr(task_events, "_warned_missing_sink", False)
     counter = Mock()
     monkeypatch.setattr(task_events, "increment_counter", counter)
@@ -103,6 +105,109 @@ async def test_missing_sink_counts_every_event_and_warns_once_until_registered(
     )
 
 
+@pytest.mark.parametrize("arrival", ["never_registered", "reset_to_none"])
+def test_the_default_audience_answer_is_yes_and_says_nothing(
+    monkeypatch, caplog, arrival
+) -> None:
+    """No probe registered is a normal state, not a degraded one.
+
+    Both ways of reaching it answer the same: a host that never registered
+    one, and a host that cleared its own with ``None``. Neither counts nor
+    warns -- nothing is lost in this state, so there is nothing to report.
+    """
+    counter = Mock()
+    monkeypatch.setattr(task_events, "increment_counter", counter)
+    monkeypatch.setattr(task_events, "_task_audience_probe", None)
+    if arrival == "reset_to_none":
+        # monkeypatch above takes the restore right before the setter runs,
+        # so the global is restored however this test exits.
+        task_events.set_task_audience_probe(lambda task_id: False)
+        task_events.set_task_audience_probe(None)
+
+    assert task_events.task_has_audience(91016) is True
+
+    assert [
+        record for record in caplog.records if record.name == task_events.__name__
+    ] == []
+    counter.assert_not_called()
+
+
+def test_a_registered_probe_answers_for_the_task_it_was_asked_about(
+    monkeypatch,
+) -> None:
+    asked: list[int] = []
+
+    def probe(task_id: int) -> bool:
+        asked.append(task_id)
+        return True
+
+    monkeypatch.setattr(task_events, "_task_audience_probe", probe)
+
+    assert task_events.task_has_audience(91117) is True
+    assert asked == [91117]
+
+
+def test_a_probe_that_answers_no_is_reported_as_no(monkeypatch) -> None:
+    monkeypatch.setattr(task_events, "_task_audience_probe", lambda task_id: False)
+
+    assert task_events.task_has_audience(91218) is False
+
+
+def test_a_failing_probe_answers_yes_counts_and_warns_once(monkeypatch, caplog) -> None:
+    """A broken probe costs work, never frames.
+
+    The fallback answer is the one that keeps every frame: the caller does
+    all of its work, exactly as it did before the probe existed. The failure
+    is still counted and warned about once, so it is visible rather than
+    folded into "nothing is listening".
+    """
+    counter = Mock()
+    monkeypatch.setattr(task_events, "increment_counter", counter)
+    monkeypatch.setattr(task_events, "_warned_failing_probe", False)
+
+    def failing_probe(task_id: int) -> bool:
+        raise RuntimeError("audience registry unavailable")
+
+    monkeypatch.setattr(task_events, "_task_audience_probe", failing_probe)
+
+    assert task_events.task_has_audience(91319) is True
+    assert task_events.task_has_audience(91319) is True
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == task_events.__name__ and record.levelname == "WARNING"
+    ]
+    assert len(warnings) == 1
+    assert "assuming an audience is present" in warnings[0].getMessage()
+    assert (
+        counter.call_args_list
+        == [call("xagent.task_events.audience_probe", attributes={"outcome": "failed"})]
+        * 2
+    )
+
+
+def test_installing_a_sink_clears_the_probe_that_answered_for_the_old_one(
+    monkeypatch,
+) -> None:
+    """The probe and the sink must describe the same audience.
+
+    A probe reading one registry while the sink delivers to another answers
+    "no audience" for tasks the sink could still reach, and the caller then
+    skips the work with no counter, no warning and no frame. Installing a
+    sink therefore drops the probe attached to the previous one, and the
+    answer falls back to yes until the new host registers its own.
+    """
+    monkeypatch.setattr(task_events, "_task_event_sink", None)
+    monkeypatch.setattr(task_events, "_task_audience_probe", None)
+    task_events.set_task_audience_probe(lambda task_id: False)
+    assert task_events.task_has_audience(91420) is False
+
+    task_events.set_task_event_sink(AsyncMock())
+
+    assert task_events.task_has_audience(91420) is True
+
+
 def test_web_host_registers_event_delivery_on_import() -> None:
     # A fresh process exercises registration, not an adapter installed by a
     # previous test or an importlib.reload that leaves old module state behind.
@@ -121,6 +226,35 @@ def test_web_host_registers_event_delivery_on_import() -> None:
             with patch.object(websocket.manager, "broadcast_to_task", sink):
                 asyncio.run(task_events.publish_task_event(event, 42))
             sink.assert_awaited_once_with(event, 42)
+        """),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_web_host_registers_the_audience_probe_on_import() -> None:
+    # Same reason the sink's registration test above runs in a fresh process:
+    # this asserts the registration statement itself, not a probe a previous
+    # test installed. It also pins that the registered probe reads the real
+    # registry rather than returning a constant -- the answer changes as a
+    # connection is registered and then dropped.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""
+            from xagent.web.services import task_events
+            assert task_events._task_audience_probe is None
+            from xagent.web.api import websocket
+            assert task_events.task_has_audience(42) is False
+            replica = object()
+            websocket.manager.register_connection(replica, 42)
+            assert task_events.task_has_audience(42) is True
+            websocket.manager.disconnect(replica)
+            assert task_events.task_has_audience(42) is False
         """),
         ],
         capture_output=True,

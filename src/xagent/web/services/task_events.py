@@ -30,9 +30,16 @@ _warned_missing_sink = False
 
 
 def set_task_event_sink(sink: TaskEventSink | None) -> None:
-    """Attach the host's live event delivery adapter; None disables delivery."""
-    global _task_event_sink, _warned_missing_sink
+    """Attach the host's live event delivery adapter; None disables delivery.
+
+    Installing a sink also clears any audience probe: the probe answers for
+    one specific delivery target, so a new sink invalidates it. The host
+    registers its own probe afterwards if it has one; until it does, the
+    default answer is that an audience exists and no work is skipped.
+    """
+    global _task_event_sink, _warned_missing_sink, _task_audience_probe
     _task_event_sink = sink
+    _task_audience_probe = None
     if sink is not None:
         _warned_missing_sink = False
 
@@ -53,6 +60,64 @@ async def publish_task_event(message: dict[str, Any], task_id: int) -> None:
             )
         return
     await _task_event_sink(message, task_id)
+
+
+TaskAudienceProbe = Callable[[int], bool]
+_task_audience_probe: TaskAudienceProbe | None = None
+_warned_failing_probe = False
+
+
+def set_task_audience_probe(probe: TaskAudienceProbe | None) -> None:
+    """Attach the host's audience predicate; None restores the default answer.
+
+    The probe and the sink installed through ``set_task_event_sink`` must
+    describe the same audience. A probe that reads one registry while the
+    sink delivers to a different one answers "no audience" for every task
+    the sink could still have reached, and the caller then skips the work
+    silently: no counter, no warning, no frame. A host that replaces the
+    sink must therefore replace this probe as well, or clear it with
+    ``None`` to fall back to always doing the work.
+    """
+    global _task_audience_probe, _warned_failing_probe
+    _task_audience_probe = probe
+    if probe is not None:
+        _warned_failing_probe = False
+
+
+def task_has_audience(task_id: int) -> bool:
+    """Answer whether anything is listening, so callers can skip wasted work.
+
+    This is an optimization hint, not a delivery guarantee, and the two
+    answers are not symmetric. A "yes" only says the work is worth
+    doing: the sink above and whatever that sink hands the frame to
+    still decide delivery, so a spurious "yes" costs work and nothing
+    else. A "no" ends the caller's work, so a probe that wrongly answers
+    "no" does suppress live frames.
+
+    That asymmetry is why both failure modes here answer "yes": a host
+    that registers no probe, and a probe that raises. A host that never
+    opted into this optimization keeps exactly the behaviour it had, and
+    a broken probe costs work instead of content.
+    """
+    global _warned_failing_probe
+    if _task_audience_probe is None:
+        return True
+    try:
+        return bool(_task_audience_probe(task_id))
+    except Exception as exc:  # noqa: BLE001
+        increment_counter(
+            "xagent.task_events.audience_probe", attributes={"outcome": "failed"}
+        )
+        if not _warned_failing_probe:
+            _warned_failing_probe = True
+            logger.warning(
+                "The registered task audience probe failed; assuming an "
+                "audience is present so no work is skipped. Further "
+                "warnings are suppressed until a probe is registered "
+                "again. Cause: %s",
+                exc,
+            )
+        return True
 
 
 CommandReply = Callable[[dict[str, Any]], Awaitable[None]]

@@ -126,6 +126,7 @@ from ..services.task_command_transport import (
 from ..services.task_events import (
     CommandReply,
     discard_command_reply,
+    set_task_audience_probe,
     set_task_command_delivery,
     set_task_event_sink,
 )
@@ -1374,7 +1375,15 @@ async def _deliver_task_event(message: dict[str, Any], task_id: int) -> None:
     await manager.broadcast_to_task(message, task_id)
 
 
+# The execution service asks whether anyone is listening; this process owns
+# the registry that knows. Registered after the sink above, and never before
+# it: installing a sink clears any probe attached to a previous one.
+def _task_event_audience(task_id: int) -> bool:
+    return manager.has_connections_for_task(task_id)
+
+
 set_task_event_sink(_deliver_task_event)
+set_task_audience_probe(_task_event_audience)
 set_task_command_delivery(_command_origins)
 
 

@@ -100,11 +100,21 @@ async def test_websocket_trace_handler_emits_metrics(monkeypatch, metric_reader)
     from unittest.mock import AsyncMock
 
     from xagent.core.agent.trace import TASK_START_GENERAL, TraceEvent
+    from xagent.web.api.websocket import ConnectionManager
     from xagent.web.services import task_event_trace_handler as ws_trace_handlers
+    from xagent.web.services import task_events
 
     handler = ws_trace_handlers.TaskEventTraceHandler(42)
     handler._task_description_loaded = True
     monkeypatch.setattr(handler, "_has_prior_user_message_turn", lambda *_: False)
+    # This case measures what the handler emits for an event it actually
+    # publishes, so it needs an audience: without one the handler returns
+    # before the metrics below are ever recorded.
+    audience_manager = ConnectionManager()
+    audience_manager.register_connection(AsyncMock(), 42)
+    monkeypatch.setattr(
+        task_events, "_task_audience_probe", audience_manager.has_connections_for_task
+    )
     broadcast = AsyncMock()
     monkeypatch.setattr(ws_trace_handlers, "publish_task_event", broadcast)
     await handler.handle_event(
@@ -112,7 +122,11 @@ async def test_websocket_trace_handler_emits_metrics(monkeypatch, metric_reader)
     )
     broadcast.assert_awaited_once()
     metrics = collected_metrics(metric_reader)
-    assert metrics["xagent.websocket.trace.events"].data.data_points[0].value == 1
+    trace_points = metrics["xagent.websocket.trace.events"].data.data_points
+    broadcast_point = next(
+        point for point in trace_points if point.attributes["outcome"] == "broadcast"
+    )
+    assert broadcast_point.value == 1
     assert (
         metrics["xagent.websocket.trace_serialization.duration"]
         .data.data_points[0]

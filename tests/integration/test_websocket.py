@@ -572,15 +572,30 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
             TraceEventType,
             TraceScope,
         )
+        from xagent.web.api.websocket import ConnectionManager
+        from xagent.web.services import task_events
         from xagent.web.services.task_event_trace_handler import TaskEventTraceHandler
 
         # 创建模拟的WebSocket管理器
         mock_manager = AsyncMock()
 
+        # This case assumes the task has an audience. Register a stand-in
+        # connection on a real connection manager so the audience question
+        # runs through the production path instead of a hard-coded answer.
+        audience_manager = ConnectionManager()
+        audience_manager.register_connection(AsyncMock(), 1)
+
         # 用patch替换manager
-        with patch(
-            "xagent.web.services.task_event_trace_handler.publish_task_event",
-            mock_manager.broadcast_to_task,
+        with (
+            patch(
+                "xagent.web.services.task_event_trace_handler.publish_task_event",
+                mock_manager.broadcast_to_task,
+            ),
+            patch.object(
+                task_events,
+                "_task_audience_probe",
+                audience_manager.has_connections_for_task,
+            ),
         ):
             # 创建WebSocket追踪处理器
             handler = TaskEventTraceHandler(task_id=1)
