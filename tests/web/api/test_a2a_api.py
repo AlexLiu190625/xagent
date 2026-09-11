@@ -37,6 +37,7 @@ from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import a2a_task_cancel as a2a_cancel_service
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services import task_resume
 from xagent.web.services.a2a_protocol import (
     A2A_MAX_MESSAGE_TEXT_LENGTH,
     A2AApiError,
@@ -688,7 +689,9 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
             "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=agent_manager,
         ),
-        patch("xagent.web.api.a2a._schedule_waiting_a2a_resume") as schedule_resume,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_a2a_resume"
+        ) as schedule_resume,
         patch(
             "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
             new=begin_turn,
@@ -786,7 +789,7 @@ def test_checkpoint_resume_schedule_failure_exactly_restores_waiting_task() -> N
             return_value=agent_manager,
         ),
         patch(
-            "xagent.web.api.a2a._schedule_waiting_a2a_resume",
+            "xagent.web.services.task_resume._schedule_waiting_a2a_resume",
             side_effect=fail_schedule,
         ),
     ):
@@ -870,7 +873,7 @@ def test_update_a2a_resume_input_rolls_back_the_interaction_close_with_the_fence
         run_id="run-atomicity",
         attempt_id="test-attempt",
     )
-    updated = a2a_api._update_a2a_resume_input_sync(
+    updated = task_resume._update_a2a_resume_input_sync(
         stale_lease,
         "attempted text",
         row_id,
@@ -942,7 +945,7 @@ def test_message_send_closes_the_legacy_resume_interaction_row_on_successful_inj
             "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=agent_manager,
         ),
-        patch("xagent.web.api.a2a._schedule_waiting_a2a_resume"),
+        patch("xagent.web.services.task_resume._schedule_waiting_a2a_resume"),
         patch(
             "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
             new=begin_turn,
@@ -1030,13 +1033,13 @@ def test_message_send_skips_the_close_on_a_replayed_injection() -> None:
             "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=agent_manager,
         ),
-        patch("xagent.web.api.a2a._schedule_waiting_a2a_resume"),
+        patch("xagent.web.services.task_resume._schedule_waiting_a2a_resume"),
         patch(
             "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.a2a.close_legacy_resume_interaction",
+            "xagent.web.services.task_resume.close_legacy_resume_interaction",
         ) as close_mock,
     ):
         response = client.post(
@@ -1142,16 +1145,17 @@ def test_message_send_reads_the_interaction_row_before_injecting(
             "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=agent_manager,
         ),
-        patch("xagent.web.api.a2a._schedule_waiting_a2a_resume"),
+        patch("xagent.web.services.task_resume._schedule_waiting_a2a_resume"),
         patch("xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn", new=AsyncMock()),
         patch(
-            "xagent.web.api.a2a.active_interaction_id_sync",
+            "xagent.web.services.task_resume.active_interaction_id_sync",
             side_effect=record_read,
         ),
         patch(
-            "xagent.web.api.a2a.close_legacy_resume_interaction", return_value=1
+            "xagent.web.services.task_resume.close_legacy_resume_interaction",
+            return_value=1,
         ) as close_mock,
-        caplog.at_level(logging.INFO, logger="xagent.web.api.a2a"),
+        caplog.at_level(logging.INFO, logger="xagent.web.services.task_resume"),
     ):
         response = client.post(
             f"/api/a2a/agents/{agent_id}/message:send",
@@ -1317,7 +1321,9 @@ def test_recovered_paused_checkpoint_resumes_without_transcript_fallback() -> No
             "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=agent_manager,
         ),
-        patch("xagent.web.api.a2a._schedule_waiting_a2a_resume") as schedule_resume,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_a2a_resume"
+        ) as schedule_resume,
         patch(
             "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
             new=begin_turn,
@@ -1671,7 +1677,7 @@ def test_prelease_restore_from_a_cancelled_acquisition_leaves_marker_untouched()
         run_id="run-cancelled-acquire",
         attempt_id="test-attempt",
     )
-    restored = a2a_api._restore_a2a_resume_prelease_sync(
+    restored = task_resume._restore_a2a_resume_prelease_sync(
         acquired_lease, status=TaskStatus.WAITING_FOR_USER
     )
 

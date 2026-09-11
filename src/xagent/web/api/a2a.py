@@ -5,22 +5,22 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from time import monotonic
-from typing import Any, Mapping, assert_never
+from typing import Any, Mapping
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import String, and_, cast, func, or_
+from sqlalchemy import String, and_, cast, or_
 
 from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
     CheckpointReadError,
 )
-from ...core.agent.runner import UserMessageInjectionOutcome
 from ..models.agent import Agent
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
+from ..services import task_resume as task_resume_service
 from ..services.a2a_protocol import (
     A2A_VERSION,
     ALL_TASK_STATES,
@@ -45,7 +45,6 @@ from ..services.a2a_protocol import (
 )
 from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ..services.db_runtime import (
-    cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
@@ -60,30 +59,7 @@ from ..services.task_command_transport import (
     retry_failed_task_command,
 )
 from ..services.task_execution_controller import (
-    TaskControlState,
     task_execution_controller,
-)
-from ..services.task_interaction_close import (
-    ActiveInteractionAbsent,
-    ActiveInteractionFound,
-    ActiveInteractionUnavailable,
-    active_interaction_id_sync,
-    clear_interaction_marker_if_unpaired,
-    close_legacy_resume_interaction,
-)
-from ..services.task_interaction_schema import interaction_requests_table_exists
-from ..services.task_lease_service import (
-    TaskLease,
-    TaskLeaseHeartbeatOutcome,
-    TaskLeaseLostError,
-    acquire_task_lease_cancellation_safe,
-    acquire_task_lease_no_commit,
-    bind_task_lease_context,
-    release_task_lease_no_commit,
-    run_task_lease_heartbeat,
-    run_while_task_lease_owned,
-    stop_task_lease_heartbeat,
-    task_lease_attempt_predicate,
 )
 from ..services.task_orchestrator import (
     TaskTurnError,
@@ -161,263 +137,6 @@ def _require_bound_agent(path_agent_id: int, agent: AgentPrincipalSnapshot) -> N
         raise a2a_error("agent_not_found", "Agent not found.", status_code=404)
 
 
-async def _schedule_waiting_a2a_resume(
-    *,
-    task_id: int,
-    agent_service: Any,
-    task_owner_user_id: int,
-    task_lease: TaskLease,
-    heartbeat_stop: asyncio.Event,
-    heartbeat_task: asyncio.Task[TaskLeaseHeartbeatOutcome],
-    resumable_status: TaskStatus,
-) -> None:
-    from ..services.task_execution import (
-        background_task_manager,
-        execute_resume_background,
-    )
-
-    if task_lease.task_id != task_id or task_lease.run_id is None:
-        raise ValueError("A2A resume scheduling requires an exact task lease")
-    if not background_task_manager.reserve_resume(task_id):
-        raise RuntimeError(f"Task {task_id} already has a resume in progress")
-    previous_task = background_task_manager.running_tasks.get(task_id)
-    bg_task: asyncio.Task[None] | None = None
-    try:
-        bg_task = asyncio.create_task(
-            execute_resume_background(
-                task_id=task_id,
-                agent_service=agent_service,
-                task_owner_user_id=task_owner_user_id,
-                expected_run_id=task_lease.run_id,
-                previous_task=previous_task,
-                preacquired_lease=task_lease,
-                preacquired_heartbeat_stop=heartbeat_stop,
-                preacquired_heartbeat_task=heartbeat_task,
-                # The prelease claimed this task out of an input-required
-                # status; hand that over so a checkpoint the resume cannot
-                # read restores it instead of failing it terminally.
-                preacquired_prior_status=resumable_status,
-            )
-        )
-        background_task_manager.register_reserved_resume(
-            task_id,
-            bg_task,
-            run_id=task_lease.run_id,
-        )
-    except BaseException:
-        if bg_task is not None:
-            await cancel_and_drain_async_task(bg_task)
-        background_task_manager.release_resume_reservation(task_id)
-        raise
-
-
-def _acquire_a2a_resume_prelease_sync(
-    *,
-    task_id: int,
-    agent_id: int,
-    resumable_status: TaskStatus,
-    previous_run_id: str | None,
-) -> TaskLease | None:
-    """Claim and commit one exact A2A resume lease in a worker transaction."""
-
-    resumable_control_states = {
-        TaskControlState.IDLE.value,
-        (
-            TaskControlState.PAUSED.value
-            if resumable_status == TaskStatus.PAUSED
-            else TaskControlState.WAITING_FOR_USER.value
-        ),
-    }
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
-        claimed = (
-            db.query(Task)
-            .filter(
-                Task.id == task_id,
-                Task.agent_id == agent_id,
-                Task.source == "a2a",
-                Task.status == resumable_status,
-                Task.control_state.in_(resumable_control_states),
-            )
-            .update(
-                {
-                    Task.control_state: TaskControlState.RESUME_REQUESTED.value,
-                    Task.state_version: func.coalesce(Task.state_version, 0) + 1,
-                },
-                synchronize_session=False,
-            )
-        )
-        if claimed != 1:
-            db.rollback()
-            return None
-        task_lease = acquire_task_lease_no_commit(
-            db,
-            task_id,
-            expected_run_id=previous_run_id,
-        )
-        if task_lease is None or task_lease.run_id is None:
-            db.rollback()
-            return None
-        db.commit()
-        return task_lease
-
-
-def _restore_a2a_resume_prelease_sync(
-    task_lease: TaskLease,
-    *,
-    status: TaskStatus = TaskStatus.WAITING_FOR_USER,
-) -> bool:
-    """Release one exact A2A prelease in a worker-owned short Session.
-
-    A successful restore retains the run id and its tagged checkpoint, so a
-    retry with the same A2A message id is idempotent at the runner boundary.
-    If ownership changed, no row is mutated and the current owner remains the
-    sole lifecycle authority.
-
-    Two callers reach this today: the isolated wrapper right below, used by
-    the no-checkpoint and checkpoint-read-error fallbacks; and the cancel
-    settlement callback ``acquire_task_lease_cancellation_safe`` passes to
-    ``_resume_input_required_a2a_task``'s lease acquisition, which fires on
-    a cancellation with no ``posted`` outcome to consult at all -- the
-    marker clear below has to hold on that path too, not only on the two
-    ``posted``-gated fallbacks.
-    """
-
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
-        restored = release_task_lease_no_commit(
-            db,
-            task_lease,
-            status=status,
-        )
-        if restored:
-            # Mirror of the WebSocket lease restore: this is an abandoned
-            # resume, not a completed one, so only the marker may need
-            # reconciling -- see clear_interaction_marker_if_unpaired's
-            # docstring for the NOT EXISTS semantics. No lock read precedes
-            # this statement; release_task_lease_no_commit's own tasks
-            # UPDATE writes only non-key columns and is already the first
-            # statement this transaction directs at tasks or
-            # task_interaction_requests.
-            assert task_lease.run_id is not None
-            clear_interaction_marker_if_unpaired(
-                db, task_id=task_lease.task_id, run_id=task_lease.run_id
-            )
-            db.commit()
-        else:
-            db.rollback()
-        return restored
-
-
-async def _restore_a2a_resume_prelease_isolated(
-    task_lease: TaskLease,
-    *,
-    status: TaskStatus,
-) -> bool:
-    return await run_db_io_cancellation_safe(
-        lambda: _restore_a2a_resume_prelease_sync(
-            task_lease,
-            status=status,
-        )
-    )
-
-
-# The exact non-key column set the resume-input fence UPDATE below writes.
-# Shared with test_interaction_close_lock_ordering.py's static guard, which
-# asserts the UPDATE's values keys equal this set exactly: the fence's
-# no-lock-read argument (see the inline comment inside
-# _update_a2a_resume_input_sync) depends on every one of these columns being
-# a non-key column, so a future change widening the UPDATE's values must
-# widen this constant too, deliberately, not just add a key to a dict
-# literal the guard never looks at again.
-RESUME_INPUT_FENCE_UPDATE_COLUMNS = frozenset({"input", "output", "error_message"})
-
-
-def _update_a2a_resume_input_sync(
-    task_lease: TaskLease,
-    text: str,
-    interaction_id: int | None,
-    injection_outcome: UserMessageInjectionOutcome,
-) -> bool:
-    """Persist A2A input only while the exact prelease remains current.
-
-    ``interaction_id`` is the active interaction row the caller observed
-    before injecting the message, passed in rather than read here: this
-    function's session does not open until after the injection has already
-    committed. See ``task_interaction_close``'s module docstring for why
-    the read has to precede the injection.
-
-    ``injection_outcome`` is the caller's own ``post_user_message`` report,
-    not re-derived here: a replayed turn id must not retire the close, and
-    only the call that produced the short circuit can say whether this was
-    one.
-    """
-
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
-        updated = (
-            db.query(Task)
-            .filter(
-                Task.id == task_lease.task_id,
-                Task.status == TaskStatus.RUNNING,
-                Task.runner_id == task_lease.runner_id,
-                task_lease_attempt_predicate(task_lease),
-                Task.run_id == task_lease.run_id,
-            )
-            .update(
-                {
-                    Task.input: text,
-                    Task.output: None,
-                    Task.error_message: None,
-                },
-                synchronize_session=False,
-            )
-        )
-        if updated != 1:
-            db.rollback()
-            return False
-        # This update() call is the fence above, not a new transaction: a
-        # rollback here would undo it together with the input write, which
-        # is the point -- ownership and the interaction close are one
-        # atomic fact. No run_db_io_cancellation_safe wrap: the caller
-        # already wraps this whole function in one. No lock read either --
-        # the fence UPDATE above writes only non-key columns (input,
-        # output, error_message) and is already the first statement this
-        # transaction directs at tasks or task_interaction_requests, so it
-        # satisfies the same ordering and strength obligation a dedicated
-        # lock read would. If a future change adds a key column (or any
-        # column covered by a unique index) to that UPDATE's values, this
-        # judgment call must be redone -- the lock strength that UPDATE
-        # takes would change.
-        #
-        # The table-presence gate sits here, immediately before the close
-        # call and after the fence UPDATE, not at the top of the function:
-        # the gate only inspects the catalog and takes no row lock, so it
-        # does not count as preceding the fence UPDATE in the sense the
-        # ordering obligation above means.
-        assert task_lease.run_id is not None
-        if interaction_requests_table_exists(db):
-            # A retried A2A message replays this site's deterministic turn
-            # id (f"a2a:{task_id}:{message_id}"), and inject_user_message
-            # short-circuits a repeated turn id without persisting
-            # anything. interaction_id above was read fresh by this
-            # attempt, so on such a replay it names whatever the resumed
-            # agent has staged since rather than the question this call
-            # answered, and closing on it would retire a live question.
-            # See task_interaction_close's module docstring for the rule,
-            # the other sites, and why the v1 reply resume-input path
-            # needs no guard at all.
-            if injection_outcome is UserMessageInjectionOutcome.POSTED_FRESH:
-                close_legacy_resume_interaction(
-                    db,
-                    task_id=task_lease.task_id,
-                    run_id=task_lease.run_id,
-                    interaction_id=interaction_id,
-                )
-        db.commit()
-        return True
-
-
 async def _resume_input_required_a2a_task(
     *,
     agent_id: int,
@@ -427,192 +146,31 @@ async def _resume_input_required_a2a_task(
     message_id: str,
 ) -> bool:
     task_id = int(task.id)
-    resumable_status = task.status
-    if resumable_status not in {
-        TaskStatus.PAUSED,
-        TaskStatus.WAITING_FOR_USER,
-    }:
-        return False
-    task_lease = await acquire_task_lease_cancellation_safe(
-        lambda: _acquire_a2a_resume_prelease_sync(
-            task_id=task_id,
+    try:
+        return await task_resume_service.resume_a2a_task(
             agent_id=agent_id,
-            resumable_status=resumable_status,
+            task_owner_user_id=task_owner_user_id,
+            task_id=task_id,
             previous_run_id=task.run_id,
-        ),
-        lambda acquired: _restore_a2a_resume_prelease_sync(
-            acquired,
-            status=resumable_status,
-        ),
-    )
-    if task_lease is None or task_lease.run_id is None:
+            resumable_status=task.status,
+            text=text,
+            message_id=message_id,
+        )
+    except task_resume_service.TaskResumeBusyError as exc:
         raise a2a_error(
             "unsupported_operation",
             "Task is currently running and cannot accept a new message.",
             status_code=400,
             details={"taskId": task_id},
-        )
-
-    heartbeat_stop = asyncio.Event()
-    heartbeat_task = asyncio.create_task(
-        run_task_lease_heartbeat(task_lease, heartbeat_stop)
-    )
-    ownership_transferred = False
-    prelease_cleanup_done = False
-
-    async def stop_and_restore_prelease() -> bool:
-        nonlocal prelease_cleanup_done
-        if prelease_cleanup_done:
-            return False
-        prelease_cleanup_done = True
-        try:
-            outcome = await stop_task_lease_heartbeat(
-                heartbeat_task,
-                heartbeat_stop,
-            )
-        except BaseException:
-            logger.error(
-                "A2A prelease heartbeat failed before task %s could be restored; "
-                "retaining run %s for TTL recovery",
-                task_id,
-                task_lease.run_id,
-                exc_info=True,
-            )
-            return False
-        if outcome.requires_ttl_recovery:
-            logger.error(
-                "A2A prelease for task %s became unhealthy; retaining run %s "
-                "for TTL recovery (lost=%s, pool_timeout=%s)",
-                task_id,
-                task_lease.run_id,
-                outcome.lease_lost,
-                outcome.pool_timeout is not None,
-            )
-            return False
-        return await _restore_a2a_resume_prelease_isolated(
-            task_lease,
-            status=resumable_status,
-        )
-
-    try:
-        # Read before the injection below, not inside
-        # _update_a2a_resume_input_sync, whose session opens only afterwards.
-        # See task_interaction_close's module docstring for why.
-        #
-        # This site's turn id is deterministic (f"a2a:{task_id}:{message_id}"
-        # below), so a retried A2A message replays the same turn.
-        # AgentRunner.inject_user_message reports that replay explicitly
-        # (see UserMessageInjectionOutcome) instead of folding it into the
-        # same truthy value a fresh write produces, and
-        # _update_a2a_resume_input_sync reads that report to decide whether
-        # to skip its close call -- see the guard inside that function for
-        # why a replay must skip it.
-        active_interaction_read = await run_db_io_cancellation_safe(
-            lambda: active_interaction_id_sync(task_id)
-        )
-        # Translate the three-state read into the `int | None` this site's
-        # close call takes. Absent and Unavailable both become `None` here
-        # -- but that is not folding Unavailable into Absent, it is this
-        # call's own contract: `None` means "bind the close to no primary
-        # key", so it matches zero rows and retires no question either
-        # way, which is the safe outcome for a read that could not be
-        # made, not a claim that nothing was ever active. What then
-        # happens to the task's marker differs between the two, and this
-        # value is not what decides it -- the clear beside the close runs
-        # its own check (see active_interaction_id_sync's docstring).
-        # Written as three branches, not
-        # `interaction_id if isinstance(..., ActiveInteractionFound) else
-        # None`, so a reader (and mypy) sees Unavailable handled on its own
-        # line rather than merged into Absent's.
-        if isinstance(active_interaction_read, ActiveInteractionFound):
-            active_interaction_id = active_interaction_read.interaction_id
-        elif isinstance(active_interaction_read, ActiveInteractionAbsent):
-            active_interaction_id = None
-        elif isinstance(active_interaction_read, ActiveInteractionUnavailable):
-            active_interaction_id = None
-            logger.info(
-                "active interaction read unavailable (reason=%s) for "
-                "task_id=%s; the legacy resume close will match no row",
-                active_interaction_read.reason,
-                task_id,
-            )
-        else:
-            assert_never(active_interaction_read)
-
-        async def inject_user_message() -> tuple[Any, UserMessageInjectionOutcome]:
-            from ..services.agent_service_manager import get_agent_manager
-
-            agent_service = await get_agent_manager().get_agent_for_task(
-                task_id,
-                None,
-                task_owner_user_id=task_owner_user_id,
-            )
-            posted = await agent_service.post_user_message(
-                str(task_id),
-                execution_message=text,
-                display_message=text,
-                turn_id=f"a2a:{task_id}:{message_id}",
-                request_interrupt=False,
-                reason="A2A input-required response",
-            )
-            return agent_service, posted
-
-        with bind_task_lease_context(task_lease):
-            agent_service, posted = await run_while_task_lease_owned(
-                inject_user_message(),
-                heartbeat_task,
-            )
-
-        if not posted:
-            # Untagged or otherwise unreadable legacy checkpoints are never
-            # resumed under a fabricated run or transcript fallback. Release
-            # the exact prelease back to the prior input-required state and
-            # fail closed so a caller must start a new task explicitly.
-            cleanup_task = asyncio.create_task(stop_and_restore_prelease())
-            if not await drain_async_task_cancellation_safe(cleanup_task):
-                raise TaskLeaseLostError(
-                    f"Task {task_id} lease changed before A2A fallback"
-                )
-            raise a2a_error(
-                "unsupported_operation",
-                "No run-fenced checkpoint is available for this task.",
-                status_code=400,
-                details={"taskId": task_id},
-            )
-
-        updated = await run_db_io_cancellation_safe(
-            lambda: _update_a2a_resume_input_sync(
-                task_lease, text, active_interaction_id, posted
-            )
-        )
-        if not updated:
-            raise TaskLeaseLostError(
-                f"Task {task_id} lease changed before A2A resume scheduling"
-            )
-
-        await _schedule_waiting_a2a_resume(
-            task_id=task_id,
-            agent_service=agent_service,
-            task_owner_user_id=task_owner_user_id,
-            task_lease=task_lease,
-            heartbeat_stop=heartbeat_stop,
-            heartbeat_task=heartbeat_task,
-            resumable_status=resumable_status,
-        )
-        ownership_transferred = True
+        ) from exc
+    except task_resume_service.TaskResumeNotResumableError as exc:
+        raise a2a_error(
+            "unsupported_operation",
+            "No run-fenced checkpoint is available for this task.",
+            status_code=400,
+            details={"taskId": task_id},
+        ) from exc
     except CheckpointReadError as exc:
-        # Ownership was never transferred, so restore the exact prelease
-        # to the prior input-required status exactly like the absent-
-        # checkpoint fallback above, then translate the failure instead of
-        # letting it escape as a raw exception. Same ownership_transferred/
-        # prelease_cleanup_done guard as the sibling except BaseException
-        # handler below, for symmetry.
-        if not ownership_transferred and not prelease_cleanup_done:
-            cleanup_task = asyncio.create_task(stop_and_restore_prelease())
-            if not await drain_async_task_cancellation_safe(cleanup_task):
-                raise TaskLeaseLostError(
-                    f"Task {task_id} lease changed before A2A checkpoint-failure fallback"
-                ) from exc
         if isinstance(exc, CheckpointCorruptError):
             raise a2a_error(
                 "unsupported_operation",
@@ -651,22 +209,13 @@ async def _resume_input_required_a2a_task(
             status_code=503,
             details={"taskId": task_id},
         ) from exc
-    except BaseException as exc:
-        if not ownership_transferred and not prelease_cleanup_done:
-            cleanup_task = asyncio.create_task(stop_and_restore_prelease())
-            await drain_async_task_cancellation_safe(cleanup_task)
-        if isinstance(exc, AutoModelUnavailableError):
-            raise a2a_error(
-                "unsupported_operation",
-                CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
-                status_code=409,
-                details={"code": "auto_model_unavailable"},
-            ) from exc
-        raise
-    finally:
-        if not ownership_transferred and not prelease_cleanup_done:
-            await stop_task_lease_heartbeat(heartbeat_task, heartbeat_stop)
-    return True
+    except AutoModelUnavailableError as exc:
+        raise a2a_error(
+            "unsupported_operation",
+            CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
+            status_code=409,
+            details={"code": "auto_model_unavailable"},
+        ) from exc
 
 
 def _validate_a2a_version(request: Request) -> None:

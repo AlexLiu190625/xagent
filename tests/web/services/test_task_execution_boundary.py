@@ -26,7 +26,7 @@ def test_execution_services_and_tracer_load_without_api_routes() -> None:
                             raise AssertionError(f"Execution imported API route: {fullname}")
 
                 sys.meta_path.insert(0, RejectRoutes())
-                from xagent.web.services import agent_service_manager, task_execution, task_orchestrator
+                from xagent.web.services import agent_service_manager, task_execution, task_orchestrator, task_resume
                 from xagent.web.services.external_task_cancel import _broadcast_external_cancel_terminal_event
                 import asyncio
                 from unittest.mock import AsyncMock, patch
@@ -130,7 +130,7 @@ def test_web_host_registers_event_delivery_on_import() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_control_commands_execute_without_api_routes() -> None:
+def test_control_and_reply_commands_execute_without_api_routes() -> None:
     result = subprocess.run(
         [
             sys.executable,
@@ -163,6 +163,11 @@ def test_control_commands_execute_without_api_routes() -> None:
                 TaskCommandKind,
             )
             from xagent.web.services import agent_service_manager
+            from xagent.core.agent.runner import UserMessageInjectionOutcome
+            from xagent.web.services import task_execution, task_resume
+            from xagent.web.services.task_lease_service import (
+                stop_task_lease_heartbeat, release_task_lease_no_commit,
+            )
 
 
             async def main():
@@ -247,6 +252,60 @@ def test_control_commands_execute_without_api_routes() -> None:
                         assert canceled.agent_config["a2a_state"] == "TASK_STATE_CANCELED"
                         assert canceled.state_version == 1
                         assert db.query(TaskChatMessage).filter_by(task_id=ids[0]).count() == 1
+                    # Both reply paths run their real claims, writes and scheduling
+                    # without loading HTTP routes. Only the Agent and execution
+                    # leaf are replaced, so no model or external tools are needed.
+                    with get_session_local()() as db:
+                        replies = [
+                            Task(
+                                user_id=uid, agent_id=1, source=source,
+                                title="reply", status=TaskStatus.WAITING_FOR_USER,
+                                control_state="waiting_for_user", run_id=f"reply-{source}",
+                            )
+                            for source in ["a2a", "sdk"]
+                        ]
+                        db.add_all(replies)
+                        db.flush()
+                        reply_ids = [task.id for task in replies]
+                        db.commit()
+
+                    async def finish_resume(**kwargs):
+                        await stop_task_lease_heartbeat(
+                            kwargs["preacquired_heartbeat_task"],
+                            kwargs["preacquired_heartbeat_stop"],
+                        )
+                        with get_session_local()() as db:
+                            assert release_task_lease_no_commit(
+                                db, kwargs["preacquired_lease"], status=TaskStatus.COMPLETED,
+                            )
+                            db.commit()
+
+                    agent.post_user_message.return_value = UserMessageInjectionOutcome.POSTED_FRESH
+                    with (
+                        patch.object(agent_service_manager, "get_agent_manager") as manager,
+                        patch.object(task_execution, "execute_resume_background", side_effect=finish_resume),
+                    ):
+                        manager.return_value.get_agent_for_task = AsyncMock(return_value=agent)
+                        assert await task_resume.resume_a2a_task(
+                            agent_id=1, task_owner_user_id=uid, task_id=reply_ids[0],
+                            previous_run_id="reply-a2a", resumable_status=TaskStatus.WAITING_FOR_USER,
+                            text="A2A answer", message_id="answer-1",
+                        )
+                        a2a_resume = task_execution.background_task_manager.resume_tasks[reply_ids[0]]
+                        result = await task_resume.resume_task_reply(task_resume.TaskReplyInput(
+                            task_id=reply_ids[1], agent_id=1, task_owner_user_id=uid,
+                            run_id="reply-sdk", status=TaskStatus.WAITING_FOR_USER, text="SDK answer",
+                        ))
+                        assert result.run_id == "reply-sdk"
+                        assert result.control_state == "running"
+                        sdk_resume = task_execution.background_task_manager.resume_tasks[reply_ids[1]]
+                        await asyncio.gather(a2a_resume, sdk_resume)
+                    with get_session_local()() as db:
+                        for tid, answer in zip(reply_ids, ["A2A answer", "SDK answer"]):
+                            row = db.get(Task, tid)
+                            assert row.input == answer
+                            assert row.status == TaskStatus.COMPLETED
+                            assert row.runner_id is None
                     assert not any(
                         name == "xagent.web.api" or name.startswith("xagent.web.api.")
                         for name in sys.modules
