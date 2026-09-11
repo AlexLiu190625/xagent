@@ -522,3 +522,17 @@ def test_redact_sensitive_text_is_linear_on_hostile_assignment_runs(
     started = time.perf_counter()
     redact_sensitive_text(hostile)
     assert time.perf_counter() - started < 1.0
+
+
+def test_redact_sensitive_text_leaves_a_credential_without_a_value() -> None:
+    # A credential name followed directly by ``&``, whitespace or the end of
+    # the text has no value to mask; the text after it is still scanned.
+    assert (
+        redact_sensitive_text("api_key=&token=SECRET-abc123")
+        == "api_key=&token=***c123"
+    )
+    assert (
+        redact_sensitive_text("missing api_key= in request")
+        == "missing api_key= in request"
+    )
+    assert redact_sensitive_text("host=db;api_key=") == "host=db;api_key="
