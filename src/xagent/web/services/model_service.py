@@ -10,6 +10,7 @@ import logging
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional, cast
 
+from sqlalchemy import and_, case, or_
 from sqlalchemy.orm import Session
 
 from xagent.core.model.image.base import BaseImageModel, default_image_abilities
@@ -226,6 +227,103 @@ def get_default_vision_model(
 
     # No fallback to environment variables - require database configuration
     return None
+
+
+def resolve_default_model_id(
+    db: Session, user_id: int, config_type: str
+) -> Optional[int]:
+    """Resolve the ``DBModel.id`` a user's default for *config_type* points at.
+
+    The user's own default first, then one belonging to a visible user -- the
+    same two layers ``agent_tool``, ``llm_utils`` and the LLM-returning
+    resolvers here apply. A default row pointing at a model the caller cannot
+    see is simply not a candidate, and the next one is tried instead.
+
+    Visibility is the SQL form of ``_is_model_visible_to_user``, which is what
+    decides at run time whether a configured id can actually be loaded
+    (``llm_utils``, ``agent_tool``, ``api/chat``): injecting an id it rejects
+    would hand the agent a ``general`` slot that cannot resolve. It is spelled
+    out rather than taken from ``build_user_model_visibility_filter`` because
+    that filter's own-row branch deliberately omits ``is_owner`` -- the model
+    list endpoints show borrowed rows and sort by it (``model_store``) -- so it
+    is one notch wider than the run-time check.
+
+    Reads the rows directly rather than through ``ModelStore``, whose getter
+    opens with a ``cache_get`` -- a Redis round-trip inside the caller's write
+    transaction (the pattern issue #889 is about).
+    """
+    # Opened outside the try: begin_nested() flushes the session first, which
+    # autoflush=False otherwise suppresses here, and swallowing a caller's
+    # failed flush below would leave the session in PendingRollbackError while
+    # workforce_creator's `except IntegrityError` retry never sees it.
+    nested = db.begin_nested()
+    try:
+        # Own savepoint: a failed read aborts the transaction on PostgreSQL, so
+        # returning None would only move the error to the caller's next
+        # statement -- and in workforce_creator's begin_nested retry loops
+        # (which catch IntegrityError alone) that escapes as a 500.
+        model_id = _query_default_model_id(db, user_id, config_type)
+        nested.commit()
+        return model_id
+    except Exception as exc:
+        nested.rollback()
+        logger.warning(
+            "Failed to resolve the %s default model for user %s: %s",
+            config_type,
+            user_id,
+            exc,
+        )
+        return None
+
+
+def _query_default_model_id(
+    db: Session, user_id: int, config_type: str
+) -> Optional[int]:
+    from ..models.user import UserDefaultModel, UserModel
+
+    visible_ids = _get_visible_user_ids(db, user_id)
+    row = (
+        db.query(UserDefaultModel.model_id)
+        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+        .join(UserModel, UserModel.model_id == UserDefaultModel.model_id)
+        .filter(
+            UserDefaultModel.config_type == config_type,
+            DBModel.is_active.is_(True),
+            or_(
+                UserDefaultModel.user_id == user_id,
+                UserDefaultModel.user_id.in_(visible_ids),
+            ),
+            or_(
+                and_(UserModel.user_id == user_id, UserModel.is_owner.is_(True)),
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
+            ),
+        )
+        .order_by(
+            # Own default wins; uq_user_default_model is per (user, config_type),
+            # so several visible users can each hold one -- take the newest.
+            case((UserDefaultModel.user_id == user_id, 0), else_=1),
+            UserDefaultModel.id.desc(),
+        )
+        .first()
+    )
+    return int(row[0]) if row is not None else None
+
+
+def with_default_general_model(db: Session, models: Any, *, user_id: int) -> Any:
+    """Fill an omitted ``general`` slot from the owner's default model.
+
+    An explicit ``{"general": None}`` means "no main model" and is kept; a
+    non-dict payload is unvalidated template YAML this layer must not reject.
+    """
+    if models is not None and not isinstance(models, dict):
+        return models
+    if models is not None and "general" in models:
+        return models
+
+    default_model_id = resolve_default_model_id(db, user_id, "general")
+    if default_model_id is None:
+        return models
+    return {**(models or {}), "general": default_model_id}
 
 
 def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
