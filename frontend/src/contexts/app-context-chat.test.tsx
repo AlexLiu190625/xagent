@@ -1,4 +1,6 @@
 import React from "react"
+import { readFileSync } from "node:fs"
+import path from "node:path"
 import { flushSync } from "react-dom"
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
@@ -63,6 +65,11 @@ const sendRawMessageMock = vi.hoisted(() => vi.fn())
 const wsHarness = vi.hoisted(() => ({ isConnected: true }))
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
+// Mutable so connector-runtime dialog tests (which render the real
+// ConnectorRuntimeDialog, mounted inside AppProvider's own return tree) can
+// simulate the viewed page without touching every other test in this file,
+// which all rely on the "/" default.
+const currentPathname = vi.hoisted(() => ({ current: "/" as string | null }))
 
 vi.mock("@/lib/api-wrapper", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api-wrapper")>()
@@ -74,7 +81,7 @@ vi.mock("@/lib/api-wrapper", async (importOriginal) => {
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: routerPushMock, replace: vi.fn(), refresh: vi.fn() }),
-  usePathname: () => "/",
+  usePathname: () => currentPathname.current,
 }))
 
 vi.mock("@/contexts/auth-context", () => ({
@@ -155,6 +162,12 @@ import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { TASK_ERROR_EVENT, type TaskErrorEventDetail } from "@/lib/task-error-events"
 import type { Translate } from "@/contexts/i18n-context"
+import {
+  ConnectorRuntimeDialogProvider,
+  useConnectorRuntimeDialog,
+  useConnectorRuntimeDialogActions,
+} from "@/contexts/connector-runtime-dialog-context"
+import { CONNECTOR_RUNTIME_DIALOG_TRIGGER_CODES } from "@/lib/connector-runtime-api"
 
 type TaskControlMessage = Parameters<typeof extractTaskControlEnvelope>[0]
 
@@ -6373,6 +6386,7 @@ describe("terminal error frames", () => {
       client_message_id: "turn-optimistic",
       turn_id: "turn-optimistic",
     })
+    currentPathname.current = "/task/1"
     localStorage.clear()
     ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
       .clearDuplicateMessageCache?.()
@@ -6381,6 +6395,7 @@ describe("terminal error frames", () => {
   afterEach(() => {
     cleanup()
     localStorage.clear()
+    currentPathname.current = "/"
   })
 
   // The conversation panel renders only user / isResult / system-notice
@@ -7183,6 +7198,367 @@ describe("terminal error frames", () => {
   })
 })
 
+let connectorRuntimeState: { request: unknown; payload: unknown } = { request: null, payload: null }
+function ConnectorRuntimeStateProbe() {
+  const { request, payload } = useConnectorRuntimeDialog()
+  connectorRuntimeState = { request, payload }
+  return null
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
+}
+
+const CONNECTOR_RUNTIME_REPORT_NEEDS_FILL = {
+  satisfied: false,
+  secrets_expires_at: null,
+  connectors: [{
+    connector_ref: { connector_type: "custom_api", connector_id: 1 },
+    name: "A",
+    inputs: [{ section: "context", key: "token", type: "string", required: true, satisfied: false, expired: false }],
+  }],
+}
+
+function stubConnectorRuntimeGet(): void {
+  apiRequestMock.mockImplementation(async (url: string) => {
+    if (typeof url === "string" && url.includes("connector-runtime-requirements")) {
+      return jsonResponse(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
+    }
+    if (typeof url === "string" && url.includes("connector-runtime-values")) {
+      return jsonResponse({ satisfied: true, secrets_expires_at: null, connectors: [] })
+    }
+    return jsonResponse({})
+  })
+}
+
+describe("connector runtime dialog trigger", () => {
+  beforeEach(() => {
+    webSocketOptions.current = null
+    webSocketOptions.all = []
+    sessionControls = null
+    wsHarness.isConnected = true
+    apiRequestMock.mockReset()
+    routerPushMock.mockReset()
+    sendRawMessageMock.mockReset()
+    sendRawMessageMock.mockReturnValue("sent")
+    sendChatMessageMock.mockReset()
+    sendChatMessageMock.mockResolvedValue({ client_message_id: "turn-optimistic", turn_id: "turn-optimistic" })
+    currentPathname.current = "/task/1"
+    connectorRuntimeState = { request: null, payload: null }
+    localStorage.clear()
+    ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+      .clearDuplicateMessageCache?.()
+  })
+
+  afterEach(() => {
+    cleanup()
+    localStorage.clear()
+    currentPathname.current = "/"
+  })
+
+  it("opens the connector runtime dialog on a triggering terminal frame", async () => {
+    stubConnectorRuntimeGet()
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    expect(CONNECTOR_RUNTIME_DIALOG_TRIGGER_CODES).toHaveLength(3)
+
+    let version = 1
+    for (const code of CONNECTOR_RUNTIME_DIALOG_TRIGGER_CODES) {
+      apiRequestMock.mockClear()
+      act(() => {
+        onMessage?.({
+          type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 1,
+          task: { id: 1, status: "failed" }, message: "x", error: "x",
+          code, run_id: `run-${version}`, state_version: version,
+        } as TestWebSocketMessage)
+      })
+      version += 1
+      await waitFor(() =>
+        expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+      )
+    }
+
+    // Control rows: none of these reach the read endpoint.
+    for (const extra of [{ code: "invalid_runtime_context" }, { code: "connector_runtime_unavailable" }, {}]) {
+      apiRequestMock.mockClear()
+      act(() => {
+        onMessage?.({
+          type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 1,
+          task: { id: 1, status: "failed" }, message: "x", error: "x",
+          run_id: `run-${version}`, state_version: version, ...extra,
+        } as unknown as TestWebSocketMessage)
+      })
+      version += 1
+      expect(apiRequestMock).not.toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+    }
+
+    // Another task's frame never opens this task's dialog.
+    apiRequestMock.mockClear()
+    act(() => {
+      onMessage?.({
+        type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 999,
+        task: { id: 999, status: "failed" }, message: "x", error: "x",
+        code: "missing_runtime_context", run_id: `run-${version}`, state_version: version,
+      } as TestWebSocketMessage)
+    })
+    expect(apiRequestMock).not.toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+
+    // A repeated occurrence (same run_id/state_version) is swallowed by the
+    // existing dedup and does not re-open.
+    apiRequestMock.mockClear()
+    const dup = {
+      type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 1,
+      task: { id: 1, status: "failed" }, message: "x", error: "x",
+      code: "missing_runtime_context", run_id: "run-dup", state_version: 900,
+    } as TestWebSocketMessage
+    act(() => { onMessage?.(dup) })
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalled())
+    apiRequestMock.mockClear()
+    act(() => { onMessage?.(dup) })
+    expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it("stashes a delivered turn for the viewed task only", async () => {
+    stubConnectorRuntimeGet()
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+          <StateProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    let send: (() => Promise<void>) | undefined
+    function SendProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage("hello there", { clientMessageId: "turn-a" })
+      return null
+    }
+    cleanup()
+
+    // Row 1: delivered while still viewing this task -> stashed.
+    sendChatMessageMock.mockResolvedValue({ client_message_id: "turn-a", turn_id: "turn-a" })
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+          <SendProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    await act(async () => { await send?.() })
+    expect((connectorRuntimeState.payload as { clientMessageId: string } | null)?.clientMessageId).toBe("turn-a")
+    cleanup()
+
+    // Row 2: the delivery is rejected -> nothing stashed.
+    sendChatMessageMock.mockRejectedValueOnce(new Error("network"))
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+          <SendProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    await act(async () => { await send?.().catch(() => {}) })
+    expect(connectorRuntimeState.payload).toBeNull()
+    cleanup()
+
+    // Row 3: the user switches to a different task before the delivery
+    // acknowledgement arrives -> nothing stashed for either task.
+    let acknowledgeDelivery: (() => void) | undefined
+    sendChatMessageMock.mockImplementation(
+      () => new Promise((resolve) => {
+        acknowledgeDelivery = () => resolve({ client_message_id: "turn-a", turn_id: "turn-a" })
+      }),
+    )
+    let switchTask: (() => void) | undefined
+    function SwitchProbe() {
+      const { sendMessage, setTaskId } = useApp()
+      send = () => sendMessage("hello there", { clientMessageId: "turn-a" })
+      switchTask = () => setTaskId(2, { navigate: false })
+      return null
+    }
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+          <SwitchProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    const delivery = send?.()
+    switchTask?.()
+    await act(async () => {
+      acknowledgeDelivery?.()
+      await delivery
+    })
+    expect(connectorRuntimeState.payload).toBeNull()
+  })
+
+  it("forgets the stash on every settlement frame of the viewed task", async () => {
+    // Binds the tested frame-type set to the production source's own
+    // VERSIONED_TASK_EVENT_TYPES rather than a hand-typed list, so a future
+    // addition to that set is caught here rather than silently untested.
+    const source = readFileSync(path.resolve(__dirname, "./app-context-chat.tsx"), "utf8")
+    expect(source).toContain("const VERSIONED_TASK_EVENT_TYPES = new Set([")
+    const setBody = source.split("const VERSIONED_TASK_EVENT_TYPES = new Set([")[1].split("])")[0]
+    const sourceTypes = Array.from(setBody.matchAll(/"([a-z_]+)"/g)).map(m => m[1])
+    expect(sourceTypes.sort()).toEqual([
+      "agent_error", "error", "task_completed", "task_error", "task_pause_requested",
+      "task_paused", "task_resumed", "task_started", "task_waiting_for_user",
+    ].sort())
+
+    async function deliverThenFeed(
+      frame: Partial<TestWebSocketMessage> & { code?: string; error_code?: string },
+    ): Promise<boolean> {
+      sendChatMessageMock.mockResolvedValue({ client_message_id: "turn-a", turn_id: "turn-a" })
+      let send: (() => Promise<void>) | undefined
+      function SendProbe() {
+        const { sendMessage } = useApp()
+        send = () => sendMessage("hello there", { clientMessageId: "turn-a" })
+        return null
+      }
+      render(
+        <ConnectorRuntimeDialogProvider>
+          <AppProvider token="token">
+            <SeedRunningTask />
+            <ConnectorRuntimeStateProbe />
+            <SendProbe />
+          </AppProvider>
+        </ConnectorRuntimeDialogProvider>
+      )
+      await act(async () => { await send?.() })
+      const stashedBefore = connectorRuntimeState.payload !== null
+      const onMessage = webSocketOptions.current?.onMessage
+      act(() => {
+        onMessage?.({
+          timestamp: "2026-05-27T05:00:02Z", task_id: 1, task: { id: 1, status: "failed" },
+          message: "x", error: "x", run_id: "run-1", state_version: 2, ...frame,
+        } as unknown as TestWebSocketMessage)
+      })
+      const clearedAfter = connectorRuntimeState.payload === null
+      cleanup()
+      return stashedBefore && clearedAfter
+    }
+
+    expect(await deliverThenFeed({ type: "task_completed", task: { id: 1, status: "completed" } })).toBe(true)
+    expect(await deliverThenFeed({
+      type: "task_completed", task: { id: 1, status: "failed" }, error_code: "task_execution_failed",
+    })).toBe(true)
+    expect(await deliverThenFeed({ type: "task_error", code: "invalid_runtime_context" })).toBe(true)
+    expect(await deliverThenFeed({ type: "task_error" })).toBe(true)
+    expect(await deliverThenFeed({ type: "error" })).toBe(false)
+    expect(await deliverThenFeed({ type: "agent_error" })).toBe(false)
+    for (const type of ["task_paused", "task_waiting_for_user", "task_started", "task_resumed", "task_pause_requested"]) {
+      expect(await deliverThenFeed({ type })).toBe(false)
+    }
+
+    // A settlement for a different task never touches this one's stash.
+    expect(await deliverThenFeed({ type: "task_completed", task_id: 999, task: { id: 999, status: "completed" } })).toBe(false)
+  })
+
+  it("does not re-render the app tree on dialog state changes", async () => {
+    stubConnectorRuntimeGet()
+    let appRenderCount = 0
+    let appDispatch: ReturnType<typeof useApp>["dispatch"] | undefined
+    function AppRenderCounter() {
+      const { dispatch } = useApp()
+      appDispatch = dispatch
+      appRenderCount += 1
+      return null
+    }
+    let dialogActions: ReturnType<typeof useConnectorRuntimeDialogActions> | undefined
+    function DialogActionsProbe() {
+      dialogActions = useConnectorRuntimeDialogActions()
+      return null
+    }
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <AppRenderCounter />
+          <DialogActionsProbe />
+          <ConnectorRuntimeStateProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    await waitFor(() => expect(dialogActions).toBeDefined())
+    appRenderCount = 0
+
+    await act(async () => { dialogActions?.openForTask(1) })
+    await waitFor(() => expect(connectorRuntimeState.request).not.toBeNull())
+    expect(appRenderCount).toBe(0)
+
+    act(() => { dialogActions?.recordDelivery({ taskId: 1, clientMessageId: "x", text: "hi" }) })
+    expect(appRenderCount).toBe(0)
+
+    act(() => { dialogActions?.close("dismissed") })
+    expect(appRenderCount).toBe(0)
+
+    // Control: a real app-state dispatch does bump the counter, proving it
+    // would have caught a leak above.
+    act(() => { appDispatch?.({ type: "SET_PROCESSING", payload: true }) })
+    expect(appRenderCount).toBeGreaterThan(0)
+  })
+
+  it("hands the stash to the dialog before the triggering frame settles it", async () => {
+    stubConnectorRuntimeGet()
+    sendChatMessageMock.mockResolvedValue({ client_message_id: "turn-a", turn_id: "turn-a" })
+    let send: (() => Promise<void>) | undefined
+    function SendProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage("hello there", { clientMessageId: "turn-a" })
+      return null
+    }
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+          <SendProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    await act(async () => { await send?.() })
+    expect((connectorRuntimeState.payload as { clientMessageId: string } | null)?.clientMessageId).toBe("turn-a")
+
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => {
+      onMessage?.({
+        type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 1,
+        task: { id: 1, status: "failed" }, message: "x", error: "x",
+        code: "missing_runtime_context", run_id: "run-1", state_version: 2,
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => expect(connectorRuntimeState.request).not.toBeNull())
+    expect(connectorRuntimeState.payload).toBeNull()
+    const request = connectorRuntimeState.request as { resendPayload: { clientMessageId: string } | null }
+    expect(request.resendPayload?.clientMessageId).toBe("turn-a")
+
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndResend")).toBeInTheDocument())
+    sendChatMessageMock.mockClear()
+    sendChatMessageMock.mockResolvedValue({ client_message_id: "turn-b", turn_id: "turn-b" })
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalled())
+    expect(sendChatMessageMock.mock.calls[0][0]).toBe("hello there")
+  })
+})
+
 describe("error frame display projection", () => {
   const translate = ((key: string) => key) as unknown as Translate
 
@@ -7210,6 +7586,7 @@ describe("error frame display projection", () => {
         occurrenceIdentity: undefined,
         bubbleContent: "clientErrors.missingRuntimeContext",
         isResult: true,
+        terminalErrorCode: "missing_runtime_context",
       },
     },
     {
@@ -7233,6 +7610,7 @@ describe("error frame display projection", () => {
         occurrenceIdentity: undefined,
         bubbleContent: "agent.logs.event.messages.errorPrefix Task execution failed.",
         isResult: true,
+        terminalErrorCode: null,
       },
     },
     {
@@ -7263,6 +7641,10 @@ describe("error frame display projection", () => {
         occurrenceIdentity: undefined,
         bubbleContent: "agent.logs.event.messages.errorPrefix clientErrors.taskExecutionFailed",
         isResult: true,
+        // error_code lives on the root, not the `code` field
+        // getTaskErrorProjection reads -- this frame carries no code by this
+        // function's own definition.
+        terminalErrorCode: null,
       },
     },
     {
@@ -7285,6 +7667,7 @@ describe("error frame display projection", () => {
         occurrenceIdentity: undefined,
         bubbleContent: "clientErrors.missingRuntimeContext",
         isResult: true,
+        terminalErrorCode: "missing_runtime_context",
       },
     },
     {
@@ -7309,6 +7692,7 @@ describe("error frame display projection", () => {
         occurrenceIdentity: "run-1:12",
         bubbleContent: "clientErrors.runtimeSecretUnavailable",
         isResult: true,
+        terminalErrorCode: "runtime_secret_unavailable",
       },
     },
     {
@@ -7332,6 +7716,7 @@ describe("error frame display projection", () => {
         occurrenceIdentity: "run-1:12",
         bubbleContent: "agent.logs.event.messages.errorPrefix Task execution failed.",
         isResult: true,
+        terminalErrorCode: null,
       },
     },
     {
@@ -7357,6 +7742,35 @@ describe("error frame display projection", () => {
         occurrenceIdentity: undefined,
         bubbleContent: "agent.logs.event.messages.errorPrefix Task is currently busy; please wait for the previous turn to finish.",
         isResult: false,
+        terminalErrorCode: null,
+      },
+    },
+    {
+      // The client error table has 22 non-connector codes plus this one the
+      // server can also emit on this frame (task_execution.py's docstring);
+      // this row proves the new field is never widened to "whatever code
+      // the frame carries" -- it stays null for a code outside the table,
+      // even though the frame is terminal and the code did survive.
+      name: "a terminal frame with a code outside the client error table on a trusted transport",
+      frame: {
+        type: "task_error",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "failed" },
+        message: "Model unavailable.",
+        error: "Model unavailable.",
+        code: "auto_model_unavailable",
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse: true,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed",
+        stopsProcessing: true,
+        dedupText: "Model unavailable.",
+        occurrenceIdentity: undefined,
+        bubbleContent: "agent.logs.event.messages.errorPrefix Model unavailable.",
+        isResult: true,
+        terminalErrorCode: null,
       },
     },
   ])("derives $name", ({ frame, trustLegacyErrorProse, expected }) => {
