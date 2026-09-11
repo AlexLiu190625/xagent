@@ -27,6 +27,7 @@ from tests.web.services.task_lease_shared import (
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.client_error_messages import ClientErrorCode
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicyRequiredError,
@@ -139,7 +140,7 @@ async def test_execute_task_redacts_an_incidental_validation_error(
     assert SECRET not in serialized
     assert str(raised) not in serialized
     assert any(
-        payload.get("message") == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        payload.get("message") == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
         for payload in payloads
     )
 
@@ -166,6 +167,25 @@ async def test_execute_task_uses_the_authentication_error_contract(
     )
 
 
+@pytest.mark.parametrize("mutation", ["wrong_helper_import", "missing_constant"])
+def test_delivery_guard_rejects_invalid_route_bindings(monkeypatch, mutation):
+    path = Path(websocket_api.__file__)
+    read_text = Path.read_text
+    source = read_text(path, encoding="utf-8")
+    if mutation == "wrong_helper_import":
+        source = source.replace("    client_safe_error_message,\n", "")
+        source += "\nfrom ..services.assistant_history_safety import safe_str as client_safe_error_message\n"
+    else:
+        source = source.replace("    CLIENT_SAFE_TASK_FAILURE,\n", "", 1)
+
+    def mutated_read(candidate, *args, **kwargs):
+        return source if candidate == path else read_text(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", mutated_read)
+    with pytest.raises(AssertionError):
+        test_no_delivery_producer_can_bypass_the_client_safe_message()
+
+
 def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     """Exception text may not reach a client through the *recognized* shapes.
 
@@ -181,17 +201,33 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     """
     # Explicit encoding: this module carries non-ASCII prose, and the
     # platform default would decode it as cp1252/GBK on a Windows runner.
-    source = Path(websocket_api.__file__).read_text(encoding="utf-8")
-    result = _scan(ast.parse(source))
+    # Scan each module independently: imported helpers must retain their exact
+    # origin, and constants must be available in the module that uses them.
+    trees = [
+        ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        for module in (websocket_api, task_execution_service)
+    ]
+    for node in ast.walk(trees[1]):
+        if isinstance(node, ast.ImportFrom) and node.level == 1:
+            node.level = 2
+            node.module = "services." + (node.module or "")
+    results = [_scan(tree) for tree in trees]
+    result = type(results[0])(
+        offenders=[item for result in results for item in result.offenders],
+        producers=sum(result.producers for result in results),
+        error_payloads=sum(result.error_payloads for result in results),
+        used_allowlist=set().union(*(result.used_allowlist for result in results)),
+    )
 
+    modules = (websocket_api, task_execution_service)
     for builder in SAFE_MESSAGE_BUILDERS:
-        assert callable(getattr(websocket_api, builder, None)), (
+        assert any(callable(getattr(module, builder, None)) for module in modules), (
             f"SAFE_MESSAGE_BUILDERS blesses {builder!r}, which does not exist"
         )
     for constant in SAFE_MESSAGE_CONSTANTS:
-        assert isinstance(getattr(websocket_api, constant, None), str), (
-            f"SAFE_MESSAGE_CONSTANTS blesses {constant!r}, which is not text"
-        )
+        assert any(
+            isinstance(getattr(module, constant, None), str) for module in modules
+        ), f"SAFE_MESSAGE_CONSTANTS blesses {constant!r}, which is not text"
 
     # These are deliberate exact baselines. If a producer is added or removed,
     # inspect the changed site and bump the corresponding count in this test.
@@ -206,8 +242,9 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # ``_broadcast_terminal_command_error`` gained a third payload literal for
     # external-scope non-cancel commands, mirroring the persisted-event
     # identity rule for the live frame too, bringing the census to 51.
-    assert result.error_payloads == 51, (
-        f"expected exactly 51 error payloads, matched {result.error_payloads}; "
+    # The host event adapter adds one forwarding sink to the original 51.
+    assert result.error_payloads == 52, (
+        f"expected exactly 52 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
@@ -253,9 +290,10 @@ def test_missing_task_keeps_its_wording_for_the_sender(_test_db: None) -> None:
             allow_missing_task=False,
         )
 
-    assert isinstance(raised.value, websocket_api.ClientVisibleValidationError)
+    assert isinstance(raised.value, task_execution_service.ClientVisibleValidationError)
     assert (
-        websocket_api.client_safe_error_message(raised.value) == "Task 424242 not found"
+        task_execution_service.client_safe_error_message(raised.value)
+        == "Task 424242 not found"
     )
 
 
@@ -414,7 +452,7 @@ async def test_redacted_enqueue_failure_still_reaches_the_log(
     assert payloads, "the handler must tell the client something"
     assert SECRET not in repr(payloads)
     assert any(
-        payload.get("message") == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        payload.get("message") == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
         for payload in payloads
     )
 
@@ -428,7 +466,9 @@ async def test_redacted_enqueue_failure_still_reaches_the_log(
     ("error", "expected_level", "expects_traceback"),
     [
         (
-            websocket_api.ClientVisibleValidationError("User authentication required"),
+            task_execution_service.ClientVisibleValidationError(
+                "User authentication required"
+            ),
             logging.WARNING,
             False,
         ),
@@ -462,7 +502,7 @@ def test_malformed_curated_failure_remains_a_warning_without_traceback(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     websocket_api.log_client_facing_failure(
-        websocket_api.ClientVisibleValidationError("Authentication required"),
+        task_execution_service.ClientVisibleValidationError("Authentication required"),
         "Pause command rejected",
     )
 
@@ -603,20 +643,22 @@ def test_log_helper_does_not_raise_for_unprintable_values(
 def test_client_visible_error_is_a_subclass_only_marker() -> None:
     """The marker base cannot escape handlers that catch its typed subclasses."""
     with pytest.raises(TypeError, match="must be subclassed"):
-        websocket_api.ClientVisibleError("bare marker")
+        task_execution_service.ClientVisibleError("bare marker")
 
-    assert str(websocket_api.ClientVisibleValidationError("curated")) == "curated"
+    assert (
+        str(task_execution_service.ClientVisibleValidationError("curated")) == "curated"
+    )
 
 
 @pytest.mark.parametrize("message", ["", "   ", "\t\n"])
 def test_empty_client_visible_message_falls_back_to_the_generic_text(
     message: str,
 ) -> None:
-    error = websocket_api.ClientVisibleValidationError(message)
+    error = task_execution_service.ClientVisibleValidationError(message)
 
     assert (
-        websocket_api.client_safe_error_message(error)
-        == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        task_execution_service.client_safe_error_message(error)
+        == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
     )
 
 
@@ -624,8 +666,8 @@ def test_client_visible_message_preserves_non_ascii_text() -> None:
     message = "请求无效：缺少步骤标识"
 
     assert (
-        websocket_api.client_safe_error_message(
-            websocket_api.ClientVisibleValidationError(message)
+        task_execution_service.client_safe_error_message(
+            task_execution_service.ClientVisibleValidationError(message)
         )
         == message
     )
@@ -634,7 +676,7 @@ def test_client_visible_message_preserves_non_ascii_text() -> None:
 def test_incidental_exception_uses_the_requested_safe_fallback() -> None:
     fallback = "The requested operation could not be completed."
 
-    rendered = websocket_api.client_safe_error_message(
+    rendered = task_execution_service.client_safe_error_message(
         RuntimeError(SECRET),
         fallback=fallback,
     )
@@ -645,12 +687,12 @@ def test_incidental_exception_uses_the_requested_safe_fallback() -> None:
 
 def test_empty_client_visible_outer_error_does_not_expose_its_cause() -> None:
     cause = RuntimeError(SECRET)
-    error = websocket_api.ClientVisibleValidationError("")
+    error = task_execution_service.ClientVisibleValidationError("")
     error.__cause__ = cause
 
-    rendered = websocket_api.client_safe_error_message(error)
+    rendered = task_execution_service.client_safe_error_message(error)
 
-    assert rendered == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert rendered == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
     assert SECRET not in rendered
 
 
@@ -694,7 +736,7 @@ async def test_builder_chat_redacts_through_its_own_socket_sink(
     errors = [p for p in payloads if p.get("type") == "error"]
     assert errors, "the handler must answer the builder client"
     assert SECRET not in repr(payloads)
-    assert errors[-1]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert errors[-1]["message"] == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
 
 
 @pytest.mark.asyncio
@@ -728,14 +770,14 @@ async def test_actor_policy_rejection_returns_chat_delivery_error(
         client_message_id="command-1",
         turn_id="command-1",
         accepted=False,
-        message=websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+        message=task_execution_service.CLIENT_SAFE_VALIDATION_ERROR,
         error_code=ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
         rejection_outcome="not_accepted",
     )
     connection_manager.send_personal_message.assert_awaited_once_with(
         {
             "type": "error",
-            "message": websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+            "message": task_execution_service.CLIENT_SAFE_VALIDATION_ERROR,
             "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
         },
         websocket,
@@ -773,7 +815,7 @@ async def test_actor_policy_rejection_returns_websocket_error(
     payload = connection_manager.send_personal_message.await_args.args[0]
     assert payload == {
         "type": "error",
-        "message": websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+        "message": task_execution_service.CLIENT_SAFE_VALIDATION_ERROR,
         "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
     }
 
@@ -2004,7 +2046,7 @@ async def test_terminal_command_failure_keeps_context_and_redacts_detail() -> No
     assert task_id == 7
     assert SECRET not in repr(payload)
     assert payload["message"] == (
-        f"Task command pause failed: {websocket_api.CLIENT_SAFE_VALIDATION_ERROR}"
+        f"Task command pause failed: {task_execution_service.CLIENT_SAFE_VALIDATION_ERROR}"
     )
     assert payload["command_kind"] == "pause"
 
@@ -2041,7 +2083,7 @@ async def test_inner_command_validation_redacts_the_client_payload(
     assert payloads, "the handler must answer the client"
     assert SECRET not in repr(payloads)
     assert any(
-        payload.get("message") == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        payload.get("message") == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
         for payload in payloads
     )
 
@@ -2077,7 +2119,8 @@ async def test_inner_command_runtime_failure_uses_safe_localizable_error(
     assert SECRET not in repr(payloads)
     assert any(
         payload.get("error_code") == "message_processing_failed"
-        and payload.get("message") == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        and payload.get("message")
+        == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
         for payload in payloads
     )
 
@@ -2101,7 +2144,7 @@ async def test_intervention_validation_redacts_the_client_payload(
     sent = [c.args[0] for c in connection_manager.send_personal_message.await_args_list]
     assert sent, "the handler must answer the sender"
     assert SECRET not in repr(sent)
-    assert sent[-1]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert sent[-1]["message"] == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
 
 
 @pytest.mark.asyncio
@@ -2127,7 +2170,7 @@ async def test_intervention_runtime_failure_uses_a_safe_localizable_error(
     assert payload == {
         "type": "error",
         "error_code": "message_processing_failed",
-        "message": websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+        "message": task_execution_service.CLIENT_SAFE_VALIDATION_ERROR,
     }
 
 
@@ -2260,7 +2303,7 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
     )
     bg_mgr = MagicMock()
     bg_mgr.try_reserve_resume.return_value = (
-        websocket_api.ResumeReservationOutcome.RESERVED
+        task_execution_service.ResumeReservationOutcome.RESERVED
     )
 
     def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
@@ -2270,9 +2313,12 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
         return payload
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
         patch(
             "xagent.web.api.websocket.mark_user_message_delivery_sync",
             MagicMock(),
@@ -2301,11 +2347,11 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
 
     rejected = [p for p in personal if p.get("type") == "message_rejected"]
     assert rejected and rejected[0]["message"] == (
-        websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
     )
     task_errors = [b for b in broadcast if b.get("type") == "agent_error"]
     assert task_errors and task_errors[0]["message"] == (
-        websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
     )
 
 
@@ -2322,7 +2368,7 @@ def _chat_runtime_error_harness(secret_error: Exception):
     )
     bg_mgr = MagicMock()
     bg_mgr.try_reserve_resume.return_value = (
-        websocket_api.ResumeReservationOutcome.RESERVED
+        task_execution_service.ResumeReservationOutcome.RESERVED
     )
 
     def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
@@ -2367,9 +2413,12 @@ async def test_runtime_error_is_redacted_and_coded_for_every_audience(
     mgr, ws_manager, bg_mgr, fake_payload = _chat_runtime_error_harness(raised)
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
         patch(
             "xagent.web.api.websocket.mark_user_message_delivery_sync",
             MagicMock(),
@@ -2408,7 +2457,7 @@ async def test_runtime_error_is_redacted_and_coded_for_every_audience(
             "client_message_id": "runtime-boundary",
             "turn_id": "runtime-boundary",
             "timestamp": rejected[0]["timestamp"],
-            "message": websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+            "message": task_execution_service.CLIENT_SAFE_VALIDATION_ERROR,
             "error_code": "message_processing_failed",
             "rejection_outcome": "not_accepted",
         }
@@ -2735,9 +2784,12 @@ async def test_durable_chat_runtime_error_is_safe_for_verified_origin(
     origin_socket = MagicMock(name="verified-origin")
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
         patch(
             "xagent.web.api.websocket.mark_user_message_delivery_sync",
             MagicMock(),
@@ -3082,9 +3134,12 @@ async def test_live_chat_runtime_error_sends_one_safe_rejection(
     raised = RuntimeError(f"live fault {SECRET}")
     mgr, ws_manager, bg_mgr, fake_payload = _chat_runtime_error_harness(raised)
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
         patch("xagent.web.api.websocket.mark_user_message_delivery_sync", MagicMock()),
         patch(
             "xagent.web.api.websocket._read_task_error_payload_isolated",

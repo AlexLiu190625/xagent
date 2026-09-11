@@ -529,7 +529,7 @@ async def test_retained_agent_services_wait_without_holding_postgres_pool(
     tmp_path: Path,
     postgres_url: str,
 ) -> None:
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     _configure_postgres_app(
         monkeypatch,

@@ -13,7 +13,6 @@ from typing import Any, Dict, Iterator, Optional, cast
 from sqlalchemy.orm import Session
 
 from xagent.core.model.image.base import BaseImageModel, default_image_abilities
-from xagent.web.api.model import DBModel
 
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.image.dashscope import DashScopeImageModel
@@ -21,6 +20,7 @@ from ...core.model.image.gemini import GeminiImageModel
 from ...core.model.image.openai import OpenAIImageModel
 from ...core.model.image.xinference import XinferenceImageModel
 from ...core.model.video.base import BaseVideoModel
+from ..models.model import Model as DBModel
 from .llm_utils import AutoModelUnavailableError
 
 logger = logging.getLogger(__name__)

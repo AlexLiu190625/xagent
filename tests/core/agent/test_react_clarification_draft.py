@@ -12,9 +12,9 @@ from xagent.core.agent.clarification import (
     draft_from_waiting_request,
 )
 from xagent.core.agent.trace import TraceAction
-from xagent.web.api.trace_handlers import DatabaseTraceHandler
 from xagent.web.api.websocket import SharedWebSocketTracer
-from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
+from xagent.web.services.task_event_trace_handler import TaskEventTraceHandler
+from xagent.web.services.trace_handlers import DatabaseTraceHandler
 
 
 class CalculatorArgs(BaseModel):
@@ -326,7 +326,7 @@ async def test_marker_survives_trace_serialization_of_a_dirty_interaction_id() -
 
     from xagent.core.agent.checkpoint import TraceCheckpointStore
     from xagent.core.agent.clarification import _MARKER_KEEP
-    from xagent.web.api.trace_handlers import DatabaseTraceHandler
+    from xagent.web.services.trace_handlers import DatabaseTraceHandler
 
     class RecordingTraceBackend:
         def __init__(self) -> None:
@@ -515,7 +515,7 @@ class RecordingTracer:
     ("handler_factory", "serialize_method"),
     [
         (lambda: DatabaseTraceHandler(1), "_serialize_data_for_json"),
-        (lambda: WebSocketTraceHandler(1), "_serialize_data"),
+        (lambda: TaskEventTraceHandler(1), "_serialize_data"),
         (lambda: SharedWebSocketTracer(ws=None, task_id=1), "_serialize_data"),
     ],
     ids=[
@@ -584,7 +584,7 @@ async def test_pattern_end_trace_payload_with_draft_survives_real_serializer(
     ("handler_factory", "serialize_method"),
     [
         (lambda: DatabaseTraceHandler(1), "_serialize_data_for_json"),
-        (lambda: WebSocketTraceHandler(1), "_serialize_data"),
+        (lambda: TaskEventTraceHandler(1), "_serialize_data"),
         (lambda: SharedWebSocketTracer(ws=None, task_id=1), "_serialize_data"),
     ],
     ids=[

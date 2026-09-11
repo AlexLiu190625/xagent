@@ -13,14 +13,14 @@ from fastapi.testclient import TestClient
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.task_runtime import TaskRuntimeClientError
 from xagent.web.api.auth import auth_router
-from xagent.web.api.chat import (
-    AgentServiceManager,
-    _load_agent_for_task_runtime,
-    chat_router,
-)
+from xagent.web.api.chat import chat_router
 from xagent.web.api.model import model_router
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.schemas.chat import MAX_SEED_INTERACTIONS
+from xagent.web.services.agent_service_manager import (
+    AgentServiceManager,
+    _load_agent_for_task_runtime,
+)
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 

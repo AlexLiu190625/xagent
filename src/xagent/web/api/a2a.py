@@ -172,7 +172,10 @@ async def _schedule_waiting_a2a_resume(
     heartbeat_task: asyncio.Task[TaskLeaseHeartbeatOutcome],
     resumable_status: TaskStatus,
 ) -> None:
-    from .websocket import background_task_manager, execute_resume_background
+    from ..services.task_execution import (
+        background_task_manager,
+        execute_resume_background,
+    )
 
     if task_lease.task_id != task_id or task_lease.run_id is None:
         raise ValueError("A2A resume scheduling requires an exact task lease")
@@ -538,7 +541,7 @@ async def _resume_input_required_a2a_task(
             assert_never(active_interaction_read)
 
         async def inject_user_message() -> tuple[Any, UserMessageInjectionOutcome]:
-            from .chat import get_agent_manager
+            from ..services.agent_service_manager import get_agent_manager
 
             agent_service = await get_agent_manager().get_agent_for_task(
                 task_id,
@@ -1727,7 +1730,7 @@ async def _cancel_task_unserialized(
             details={"taskId": task.id},
         )
 
-    from .websocket import background_task_manager
+    from ..services.task_execution import background_task_manager
 
     cancel_outcome = await background_task_manager.cancel_task(task.id)
     finalized = await run_db_io_cancellation_safe(

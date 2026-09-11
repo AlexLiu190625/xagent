@@ -14,17 +14,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.websocket import (
-    ANY_RESUME_RUN,
-    BackgroundTaskManager,
-    ResumeCommandOutcome,
-    ResumeReservationOutcome,
-    _execute_durable_task_command,
-)
+from xagent.web.api.websocket import ResumeCommandOutcome, _execute_durable_task_command
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.task_command_transport import (
     COMMAND_PENDING,
     ClaimedTaskCommand,
@@ -33,6 +28,11 @@ from xagent.web.services.task_command_transport import (
     TaskCommandRejected,
     dispatch_one_task_command,
     enqueue_task_command,
+)
+from xagent.web.services.task_execution import (
+    ANY_RESUME_RUN,
+    BackgroundTaskManager,
+    ResumeReservationOutcome,
 )
 from xagent.web.services.task_execution_controller import TaskControlState
 
@@ -124,11 +124,16 @@ def _resume_runtime_patches(
     background_manager.running_tasks = {}
 
     stack.enter_context(
-        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager)
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=agent_manager,
+        )
     )
     stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
     stack.enter_context(
-        patch.object(websocket_api, "background_task_manager", background_manager)
+        patch.object(
+            task_execution_service, "background_task_manager", background_manager
+        )
     )
     stack.enter_context(
         patch.object(
@@ -393,7 +398,7 @@ async def test_reserved_resume_records_scheduled_result(db_session) -> None:
             new=transition,
         ),
         patch.object(
-            websocket_api,
+            task_execution_service,
             "execute_resume_background",
             side_effect=execute_resume_background,
         ),
@@ -434,7 +439,7 @@ async def test_held_reservation_can_schedule_after_the_holder_releases(
             new=transition,
         ),
         patch.object(
-            websocket_api,
+            task_execution_service,
             "execute_resume_background",
             side_effect=execute_resume_background,
         ),
@@ -560,7 +565,7 @@ async def test_expired_foreign_lease_does_not_defer_a_settled_resume(
             new=transition,
         ),
         patch.object(
-            websocket_api,
+            task_execution_service,
             "execute_resume_background",
             side_effect=execute_resume_background,
         ),
@@ -701,9 +706,12 @@ async def test_two_concurrent_durable_resumes_schedule_one_execution(
     connection_manager.broadcast_to_task = AsyncMock()
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=agent_manager,
+        ),
         patch.object(websocket_api, "manager", connection_manager),
-        patch.object(websocket_api, "background_task_manager", real_manager),
+        patch.object(task_execution_service, "background_task_manager", real_manager),
         patch.object(
             websocket_api, "resolve_execution_scope_off_turn", return_value=None
         ),
@@ -711,7 +719,7 @@ async def test_two_concurrent_durable_resumes_schedule_one_execution(
             websocket_api.task_execution_controller, "transition", new=transition
         ),
         patch.object(
-            websocket_api,
+            task_execution_service,
             "execute_resume_background",
             side_effect=execute_resume_background,
         ),
@@ -850,9 +858,14 @@ async def test_running_resume_correction_reaches_the_client_enriched(
     agent_manager.get_agent_for_task = AsyncMock(return_value=agent)
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=agent_manager,
+        ),
         patch.object(websocket_api, "manager", real_manager),
-        patch.object(websocket_api, "background_task_manager", _free_slot_manager()),
+        patch.object(
+            task_execution_service, "background_task_manager", _free_slot_manager()
+        ),
     ):
         websocket_api._command_origins.register(command.command_id, sink, int(task.id))
         try:
@@ -923,7 +936,7 @@ async def test_resume_defers_when_the_row_moves_under_the_admission_snapshot(
             _agent_manager,
         ),
         patch.object(
-            websocket_api,
+            task_execution_service,
             "execute_resume_background",
             side_effect=execute_resume_background,
         ),

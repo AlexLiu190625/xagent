@@ -16,12 +16,13 @@ from xagent.core.execution_scope import (
     ExecutionScope,
     set_execution_scope_snapshot_loader,
 )
-from xagent.web.api import chat as chat_api
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models import database as database_module
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_setup_snapshot as snapshot_module
 from xagent.web.services.task_execution_controller import (
     StaleTaskRunError,
@@ -103,7 +104,9 @@ async def test_pause_handler_keeps_database_work_off_the_event_loop(
         raising=False,
     )
     monkeypatch.setattr(database_module, "get_db", forbidden_event_loop_db)
-    monkeypatch.setattr(chat_api, "get_agent_manager", lambda: agent_manager)
+    monkeypatch.setattr(
+        agent_runtime_service, "get_agent_manager", lambda: agent_manager
+    )
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
 
     try:
@@ -113,7 +116,7 @@ async def test_pause_handler_keeps_database_work_off_the_event_loop(
             {"user": actor},
         )
     finally:
-        websocket_api._clear_task_pause_accepted(task_id)
+        task_execution_service._clear_task_pause_accepted(task_id)
 
     assert set(worker_threads) == {"snapshot", "scope", "finalize"}
     assert all(thread_id != event_loop_thread for thread_id in worker_threads.values())
@@ -177,7 +180,9 @@ async def test_pause_survives_a_scope_authority_mismatch(
         lambda *a, **k: True,
         raising=False,
     )
-    monkeypatch.setattr(chat_api, "get_agent_manager", lambda: agent_manager)
+    monkeypatch.setattr(
+        agent_runtime_service, "get_agent_manager", lambda: agent_manager
+    )
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
 
     try:
@@ -185,7 +190,7 @@ async def test_pause_survives_a_scope_authority_mismatch(
             MagicMock(), task_id, {"user": actor}
         )
     finally:
-        websocket_api._clear_task_pause_accepted(task_id)
+        task_execution_service._clear_task_pause_accepted(task_id)
 
     # The pause went through on the resolver's answer instead of raising.
     agent_service.pause_execution.assert_awaited_once_with()

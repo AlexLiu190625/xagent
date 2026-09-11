@@ -37,7 +37,7 @@ CLARIFICATION_SOURCES = frozenset({"send_message", "ask_user_question", "tool_wa
 
 # Marker composition constants. ``_MARKER_KEEP`` must stay character-for-
 # character identical to the whitelist in
-# ``src/xagent/web/api/trace_handlers.py``'s ``clean_string`` (see
+# ``src/xagent/web/services/trace_handlers.py``'s ``clean_string`` (see
 # ``_marker_clean`` below for the full cross-layer contract note).
 _MARKER_KEEP = "\n\r\t"
 _MARKER_SEP = "|"
@@ -124,8 +124,8 @@ class ClarificationDraft:
         ``ClarificationDraft`` (under ``result["clarification_draft"]``) is
         serialized into trace events by handlers that use the ``to_dict``
         protocol -- ``DatabaseTraceHandler._serialize_data_for_json`` and its
-        WebSocket twins, ``WebSocketTraceHandler._serialize_data`` in
-        ``ws_trace_handlers.py`` and ``SharedWebSocketTracer._serialize_data``
+        WebSocket twins, ``TaskEventTraceHandler._serialize_data`` in
+        ``task_event_trace_handler.py`` and ``SharedWebSocketTracer._serialize_data``
         in ``websocket.py``, call ``value.to_dict()`` whenever it is
         callable, and then recursively re-serialize whatever that call
         returns. So this
@@ -163,9 +163,9 @@ def _marker_clean(value: str) -> str:
     Five independent copies of this control-character filter exist in the
     codebase, and all five must stay in the same domain: this function,
     three web-layer closures that the core layer cannot import and so
-    cannot share code with -- ``src/xagent/web/api/trace_handlers.py``'s
+    cannot share code with -- ``src/xagent/web/services/trace_handlers.py``'s
     ``DatabaseTraceHandler._serialize_data_for_json`` (``clean_string``),
-    ``src/xagent/web/api/ws_trace_handlers.py``'s
+    ``src/xagent/web/services/task_event_trace_handler.py``'s
     ``serialize_trace_data`` (``clean_string``), and
     ``src/xagent/web/api/websocket.py``'s
     ``SharedWebSocketTracer._serialize_data`` (``clean_string``) -- and

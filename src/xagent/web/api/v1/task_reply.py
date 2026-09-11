@@ -53,6 +53,8 @@ from ....core.agent.checkpoint import (
 from ...models.database import get_session_local
 from ...models.task import Task, TaskStatus
 from ...schemas.v1 import ReplyRequest, ReplyResponse
+from ...services import agent_service_manager as agent_runtime_service
+from ...services import task_execution as task_execution_service
 from ...services.db_runtime import (
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
@@ -406,21 +408,21 @@ async def _schedule_waiting_reply_resume(
     heartbeat_stop: asyncio.Event,
     heartbeat_task: "asyncio.Task[TaskLeaseHeartbeatOutcome]",
 ) -> None:
-    from .. import websocket
-
     if task_lease.task_id != task_id or task_lease.run_id is None:
         raise ValueError("Reply resume scheduling requires an exact task lease")
-    if not websocket.background_task_manager.reserve_resume(task_id):
+    if not task_execution_service.background_task_manager.reserve_resume(task_id):
         # A same-process resume is already registered for this task despite
         # the exclusive DB claim above -- report it the same way a caller
         # would read a lost race on the claim itself, rather than a bare
         # 500: retrying (after the other resume settles) can succeed.
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
-    previous_task = websocket.background_task_manager.running_tasks.get(task_id)
+    previous_task = task_execution_service.background_task_manager.running_tasks.get(
+        task_id
+    )
     bg_task: "asyncio.Task[None] | None" = None
     try:
         bg_task = asyncio.create_task(
-            websocket.execute_resume_background(
+            task_execution_service.execute_resume_background(
                 task_id=task_id,
                 agent_service=agent_service,
                 task_owner_user_id=task_owner_user_id,
@@ -435,7 +437,7 @@ async def _schedule_waiting_reply_resume(
                 preacquired_prior_status=TaskStatus.WAITING_FOR_USER,
             )
         )
-        websocket.background_task_manager.register_reserved_resume(
+        task_execution_service.background_task_manager.register_reserved_resume(
             task_id,
             bg_task,
             run_id=task_lease.run_id,
@@ -443,7 +445,9 @@ async def _schedule_waiting_reply_resume(
     except BaseException:
         if bg_task is not None:
             await cancel_and_drain_async_task(bg_task)
-        websocket.background_task_manager.release_resume_reservation(task_id)
+        task_execution_service.background_task_manager.release_resume_reservation(
+            task_id
+        )
         raise
 
 
@@ -577,12 +581,12 @@ async def reply_to_task(
             assert_never(active_interaction_read)
 
         async def inject_user_message() -> tuple[Any, bool]:
-            from .. import chat
-
-            agent_service = await chat.get_agent_manager().get_agent_for_task(
-                task_id,
-                None,
-                task_owner_user_id=ctx.task_owner_user_id,
+            agent_service = (
+                await agent_runtime_service.get_agent_manager().get_agent_for_task(
+                    task_id,
+                    None,
+                    task_owner_user_id=ctx.task_owner_user_id,
+                )
             )
             posted = await agent_service.post_user_message(
                 str(task_id),

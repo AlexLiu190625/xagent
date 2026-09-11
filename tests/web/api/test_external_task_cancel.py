@@ -21,7 +21,9 @@ from xagent.web.api import websocket as websocket_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
-from xagent.web.services import external_task_cancel, task_orchestrator
+from xagent.web.services import external_task_cancel, task_events
+from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services import task_orchestrator
 from xagent.web.services.assistant_history_safety import (
     CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
 )
@@ -209,7 +211,7 @@ async def test_external_cancel_broadcasts_terminal_frame(
     )
     manager = _broadcast_manager(monkeypatch)
     monkeypatch.setattr(
-        websocket_api.background_task_manager,
+        task_execution_service.background_task_manager,
         "cancel_task",
         AsyncMock(return_value=MagicMock(requested=False)),
     )
@@ -232,6 +234,46 @@ async def test_external_cancel_broadcasts_terminal_frame(
     assert cancelled.error_message == EXTERNAL_CANCEL_ERROR_MESSAGE
     assert cancelled.runner_id is None
     assert cancelled.lease_expires_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery_fails", [False, True])
+async def test_external_cancel_publishes_after_commit(monkeypatch, delivery_fails):
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_task(
+        agent_id=agent_id,
+        owner_user_id=owner_user_id,
+        title="external cancel event sink",
+    )
+
+    observed_statuses = []
+
+    async def deliver(event, published_task_id):
+        observed_statuses.append(_load_task(task_id).status)
+        if delivery_fails:
+            raise RuntimeError("disconnected host")
+
+    sink = AsyncMock(side_effect=deliver)
+    monkeypatch.setattr(task_events, "_task_event_sink", sink)
+    monkeypatch.setattr(
+        task_execution_service.background_task_manager,
+        "cancel_task",
+        AsyncMock(return_value=MagicMock(requested=False)),
+    )
+    await cancel_external_task_unserialized(
+        task_id=task_id,
+        agent_id=agent_id,
+        expected_run_id="run-external",
+        expected_state_version=4,
+    )
+    sink.assert_awaited_once()
+    event, published_task_id = sink.await_args.args
+    assert published_task_id == task_id
+    assert event["type"] == "task_error"
+    assert event["message"] == EXTERNAL_TURN_INTERRUPTED_MESSAGE
+    assert observed_statuses == [TaskStatus.FAILED]
+    assert _load_task(task_id).state_version == 5
+    assert _interruption_transcript_count(task_id) == 1
 
 
 @pytest.mark.asyncio
@@ -269,7 +311,9 @@ async def test_settlement_text_by_task_source(
         execution_started.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(websocket_api, "execute_task_background", block_until_cancelled)
+    monkeypatch.setattr(
+        task_execution_service, "execute_task_background", block_until_cancelled
+    )
     monkeypatch.setattr(
         task_orchestrator,
         "load_task_setup_snapshot_sync",
@@ -291,7 +335,7 @@ async def test_settlement_text_by_task_source(
         with pytest.raises(asyncio.CancelledError):
             await bg_task
     finally:
-        websocket_api.background_task_manager.running_tasks.pop(task_id, None)
+        task_execution_service.background_task_manager.running_tasks.pop(task_id, None)
 
     assert _load_task(task_id).error_message == expected_error
 
@@ -315,7 +359,7 @@ async def test_interrupted_transcript_finalize_wins(
     )
     _broadcast_manager(monkeypatch)
     monkeypatch.setattr(
-        websocket_api.background_task_manager,
+        task_execution_service.background_task_manager,
         "cancel_task",
         AsyncMock(return_value=MagicMock(requested=False)),
     )
@@ -374,7 +418,9 @@ async def test_interrupted_transcript_settlement_wins(
         execution_started.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(websocket_api, "execute_task_background", block_until_cancelled)
+    monkeypatch.setattr(
+        task_execution_service, "execute_task_background", block_until_cancelled
+    )
     monkeypatch.setattr(
         task_orchestrator,
         "load_task_setup_snapshot_sync",
@@ -397,7 +443,7 @@ async def test_interrupted_transcript_settlement_wins(
         with pytest.raises(asyncio.CancelledError):
             await bg_task
     finally:
-        websocket_api.background_task_manager.running_tasks.pop(task_id, None)
+        task_execution_service.background_task_manager.running_tasks.pop(task_id, None)
 
     settled = _load_task(task_id)
     assert settled.error_message == EXTERNAL_TURN_INTERRUPTED_MESSAGE
@@ -441,7 +487,7 @@ async def test_interrupted_transcript_replayed_after_finalize(
     )
     _broadcast_manager(monkeypatch)
     monkeypatch.setattr(
-        websocket_api.background_task_manager,
+        task_execution_service.background_task_manager,
         "cancel_task",
         AsyncMock(return_value=MagicMock(requested=False)),
     )
@@ -485,7 +531,7 @@ async def test_external_cancel_finalize_replay_idempotent(
     manager = _broadcast_manager(monkeypatch)
     cancel_task = AsyncMock(return_value=MagicMock(requested=False))
     monkeypatch.setattr(
-        websocket_api.background_task_manager, "cancel_task", cancel_task
+        task_execution_service.background_task_manager, "cancel_task", cancel_task
     )
     task_id = _create_task(
         agent_id=agent_id,
@@ -536,7 +582,7 @@ async def test_replay_judgement_ignores_a_genuine_failure(
     manager = _broadcast_manager(monkeypatch)
     cancel_task = AsyncMock(return_value=MagicMock(requested=False))
     monkeypatch.setattr(
-        websocket_api.background_task_manager, "cancel_task", cancel_task
+        task_execution_service.background_task_manager, "cancel_task", cancel_task
     )
     task_id = _create_task(
         agent_id=agent_id,
@@ -596,7 +642,7 @@ async def test_external_cancel_marks_delivery_dispatched_on_timeout(
             await asyncio.sleep(0.2)
 
     unwinding = asyncio.create_task(unwind_past_the_wait())
-    websocket_api.background_task_manager.register_task(task_id, unwinding)
+    task_execution_service.background_task_manager.register_task(task_id, unwinding)
     try:
         await cancel_external_task_unserialized(
             task_id=task_id,
@@ -605,7 +651,7 @@ async def test_external_cancel_marks_delivery_dispatched_on_timeout(
             expected_state_version=4,
         )
     finally:
-        websocket_api.background_task_manager.running_tasks.pop(task_id, None)
+        task_execution_service.background_task_manager.running_tasks.pop(task_id, None)
 
     assert _load_task(task_id).status == TaskStatus.FAILED
     assert _delivery_status(task_id, "turn-timeout") == DELIVERY_DISPATCHED
@@ -636,7 +682,7 @@ async def test_external_cancel_closes_the_named_turn(
     )
     _broadcast_manager(monkeypatch)
     monkeypatch.setattr(
-        websocket_api.background_task_manager,
+        task_execution_service.background_task_manager,
         "cancel_task",
         AsyncMock(return_value=MagicMock(requested=False)),
     )
@@ -731,7 +777,7 @@ async def test_cancel_wait_constants_isolated(monkeypatch: pytest.MonkeyPatch) -
         return MagicMock(requested=False)
 
     monkeypatch.setattr(
-        websocket_api.background_task_manager, "cancel_task", record_wait
+        task_execution_service.background_task_manager, "cancel_task", record_wait
     )
 
     await cancel_external_task_unserialized(
@@ -748,7 +794,7 @@ async def test_cancel_wait_constants_isolated(monkeypatch: pytest.MonkeyPatch) -
     )
 
     a2a_default = inspect.signature(
-        websocket_api.BackgroundTaskManager.cancel_task
+        task_execution_service.BackgroundTaskManager.cancel_task
     ).parameters["timeout_seconds"]
     assert waits == [EXTERNAL_CANCEL_WAIT_SECONDS, None]
     assert EXTERNAL_CANCEL_WAIT_SECONDS == 5.0
@@ -773,7 +819,7 @@ async def test_external_cancel_invalidates_the_task_cache_on_finalize_commit(
     )
     _broadcast_manager(monkeypatch)
     monkeypatch.setattr(
-        websocket_api.background_task_manager,
+        task_execution_service.background_task_manager,
         "cancel_task",
         AsyncMock(return_value=MagicMock(requested=False)),
     )
@@ -834,7 +880,7 @@ async def test_external_cancel_replay_short_circuit_skips_cache_invalidation(
         return MagicMock(requested=False)
 
     monkeypatch.setattr(
-        websocket_api.background_task_manager,
+        task_execution_service.background_task_manager,
         "cancel_task",
         settle_during_the_wait,
     )
@@ -880,7 +926,7 @@ async def test_external_cancel_failures_classified_rejected(
     )
     _broadcast_manager(monkeypatch)
     monkeypatch.setattr(
-        websocket_api.background_task_manager,
+        task_execution_service.background_task_manager,
         "cancel_task",
         AsyncMock(return_value=MagicMock(requested=False)),
     )
@@ -1305,7 +1351,7 @@ async def test_cancel_without_scope_stays_on_the_a2a_core(
     )
     _broadcast_manager(monkeypatch)
     monkeypatch.setattr(
-        websocket_api.background_task_manager,
+        task_execution_service.background_task_manager,
         "cancel_task",
         AsyncMock(return_value=MagicMock(requested=False)),
     )

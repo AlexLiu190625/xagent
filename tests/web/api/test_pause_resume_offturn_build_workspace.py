@@ -45,11 +45,12 @@ from xagent.core.execution_scope import (
     set_execution_scope_snapshot_loader,
 )
 from xagent.core.workspace import scoped_user_root
-from xagent.web.api import chat as chat_api
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.task import TaskStatus
+from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_setup_snapshot as snapshot_module
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskSetupSnapshot,
@@ -102,11 +103,14 @@ def _enter_build_only_patches(stack: ExitStack, manager: AgentServiceManager) ->
     """
     manager._default_llm = MagicMock()
     stack.enter_context(
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock())
+        patch(
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        )
     )
     stack.enter_context(
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], None)),
         )
     )
@@ -164,7 +168,7 @@ async def test_pause_cache_miss_builds_under_resolver_namespace_not_snapshot(
             )
         )
         stack.enter_context(
-            patch.object(chat_api, "get_agent_manager", lambda: manager)
+            patch.object(agent_runtime_service, "get_agent_manager", lambda: manager)
         )
         stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
         stack.enter_context(
@@ -186,7 +190,7 @@ async def test_pause_cache_miss_builds_under_resolver_namespace_not_snapshot(
                 {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
             )
         finally:
-            websocket_api._clear_task_pause_accepted(TASK_ID)
+            task_execution_service._clear_task_pause_accepted(TASK_ID)
 
     resolver_workspace = _workspace_dir(OWNER_ID, ("from-resolver",))
     snapshot_workspace = _workspace_dir(OWNER_ID, ("from-snapshot",))
@@ -233,7 +237,7 @@ async def test_resume_cache_miss_builds_under_resolver_namespace_not_snapshot(
     background_manager.running_tasks = {}
     background_manager.resume_admission_state.return_value = None
     background_manager.try_reserve_resume.return_value = (
-        websocket_api.ResumeReservationOutcome.RESERVED
+        task_execution_service.ResumeReservationOutcome.RESERVED
     )
     transition = AsyncMock(
         return_value=SimpleNamespace(run_id="run-1", status=TaskStatus.PAUSED)
@@ -250,7 +254,7 @@ async def test_resume_cache_miss_builds_under_resolver_namespace_not_snapshot(
             )
         )
         stack.enter_context(
-            patch.object(chat_api, "get_agent_manager", lambda: manager)
+            patch.object(agent_runtime_service, "get_agent_manager", lambda: manager)
         )
         stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
         stack.enter_context(
@@ -259,7 +263,9 @@ async def test_resume_cache_miss_builds_under_resolver_namespace_not_snapshot(
             )
         )
         stack.enter_context(
-            patch.object(websocket_api, "background_task_manager", background_manager)
+            patch.object(
+                task_execution_service, "background_task_manager", background_manager
+            )
         )
         # The handler asks the DB whether another process still holds a live
         # lease before it schedules; these suites drive the handler without a
@@ -271,7 +277,7 @@ async def test_resume_cache_miss_builds_under_resolver_namespace_not_snapshot(
         )
         stack.enter_context(
             patch.object(
-                websocket_api,
+                task_execution_service,
                 "execute_resume_background",
                 side_effect=_stub_execute_resume_background,
             )
@@ -332,11 +338,14 @@ async def test_pause_abstention_mismatch_fails_closed_with_no_workspace_residue(
             )
         )
         stack.enter_context(
-            patch.object(chat_api, "get_agent_manager", lambda: manager)
+            patch.object(agent_runtime_service, "get_agent_manager", lambda: manager)
         )
         stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
         stack.enter_context(
-            patch("xagent.web.api.chat.AgentService", agent_service_spy)
+            patch(
+                "xagent.web.services.agent_service_manager.AgentService",
+                agent_service_spy,
+            )
         )
         _enter_build_only_patches(stack, manager)
         with pytest.raises(ExecutionScopeAbstentionMismatchError):
@@ -390,7 +399,7 @@ async def test_pause_cache_hit_returns_running_agent_without_new_namespace(
             )
         )
         stack.enter_context(
-            patch.object(chat_api, "get_agent_manager", lambda: manager)
+            patch.object(agent_runtime_service, "get_agent_manager", lambda: manager)
         )
         stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
         stack.enter_context(
@@ -399,11 +408,15 @@ async def test_pause_cache_hit_returns_running_agent_without_new_namespace(
             )
         )
         stack.enter_context(
-            patch("xagent.web.api.chat.AgentService", agent_service_spy)
+            patch(
+                "xagent.web.services.agent_service_manager.AgentService",
+                agent_service_spy,
+            )
         )
         stack.enter_context(
             patch(
-                "xagent.web.api.chat.create_default_tools", new=create_default_tools_spy
+                "xagent.web.services.agent_service_manager.create_default_tools",
+                new=create_default_tools_spy,
             )
         )
         stack.enter_context(
@@ -416,7 +429,7 @@ async def test_pause_cache_hit_returns_running_agent_without_new_namespace(
                 {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
             )
         finally:
-            websocket_api._clear_task_pause_accepted(TASK_ID)
+            task_execution_service._clear_task_pause_accepted(TASK_ID)
 
     cached_agent.pause_execution.assert_awaited_once_with()
     agent_service_spy.assert_not_called()

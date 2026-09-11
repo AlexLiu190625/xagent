@@ -21,6 +21,7 @@ from xagent.web.models.agent import Agent
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.external_task_input import (
     EXTERNAL_INPUT_NOT_APPLIED_MESSAGE,
     EXTERNAL_INPUT_UNCONFIRMED_MESSAGE,
@@ -354,7 +355,9 @@ async def test_client_frames_cannot_name_a_command_scope() -> None:
         TaskCommandKind.PAUSE,
         TaskCommandKind.RESUME,
     ):
-        with pytest.raises(websocket_api.ClientVisibleValidationError, match="scope"):
+        with pytest.raises(
+            task_execution_service.ClientVisibleValidationError, match="scope"
+        ):
             await websocket_api._enqueue_websocket_task_command(
                 task_id=1,
                 message_data={

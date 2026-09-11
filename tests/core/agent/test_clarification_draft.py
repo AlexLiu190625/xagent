@@ -14,8 +14,8 @@ from xagent.core.agent.clarification import (
     draft_from_waiting_request,
 )
 from xagent.core.agent.pattern.react.react import _normalize_ask_user_interactions
-from xagent.web.api.trace_handlers import DatabaseTraceHandler
 from xagent.web.services.task_clarification_draft import clarification_idempotency_key
+from xagent.web.services.trace_handlers import DatabaseTraceHandler
 
 
 class FakeLLM:

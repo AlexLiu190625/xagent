@@ -2337,7 +2337,7 @@ def test_spec_wants_mcp_only_for_explicit_mcp_selection():
         _SpecNone,
         should_load_mcp_server_configs,
     )
-    from xagent.web.api.chat import _spec_wants_mcp
+    from xagent.web.services.agent_service_manager import _spec_wants_mcp
 
     specs = [
         (None, False),

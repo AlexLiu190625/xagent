@@ -40,10 +40,10 @@ from xagent.core.tools.adapters.vibe.config import (
     MCPUnavailableSummary,
     RequiredMCPUnavailableError,
 )
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import DAGExecution, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -223,18 +223,18 @@ def _stub_downstream(manager: AgentServiceManager):
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch(
-            "xagent.web.api.chat.create_task_tracer",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
             return_value=MagicMock(),
         ),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ),
         patch(
             "xagent.web.sandbox_manager.get_sandbox_manager",
             return_value=None,
         ),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
     ]
 
 
@@ -261,7 +261,7 @@ async def test_running_with_no_history_skips_reconstruct() -> None:
     with (
         patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
         patch.object(
@@ -312,7 +312,7 @@ async def test_running_with_prior_trace_event_runs_reconstruct() -> None:
     with (
         patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
         patch.object(
@@ -368,7 +368,7 @@ async def test_required_mcp_failure_does_not_fall_back_after_reconstruct() -> No
             manager, "_reconstruct_agent_from_history", side_effect=fail_reconstruct
         ),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
         patch.object(
@@ -400,7 +400,7 @@ async def test_active_snapshot_owner_mismatch_does_not_fall_back() -> None:
     mismatch = TaskOwnerMismatchError(42, expected=999, actual=1)
 
     with patch(
-        "xagent.web.api.chat.load_task_setup_snapshot_sync",
+        "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
         side_effect=mismatch,
     ) as snapshot_loader:
         with pytest.raises(TaskOwnerMismatchError) as exc_info:
@@ -431,7 +431,7 @@ async def test_auto_model_unavailable_does_not_fall_back_during_task_setup(
     error = AutoModelUnavailableError("Auto model has no active configured candidates")
 
     with patch(
-        "xagent.web.api.chat.load_task_setup_snapshot_sync",
+        "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
         side_effect=error,
     ) as snapshot_loader:
         with pytest.raises(AutoModelUnavailableError) as exc_info:
@@ -464,7 +464,7 @@ async def test_running_with_dag_plan_runs_reconstruct() -> None:
     with (
         patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
         patch.object(
@@ -519,7 +519,7 @@ async def test_paused_with_no_history_still_runs_reconstruct() -> None:
     with (
         patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
     ):
@@ -564,7 +564,7 @@ async def test_waiting_for_user_with_no_history_still_runs_reconstruct() -> None
     with (
         patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
     ):
@@ -633,7 +633,7 @@ async def test_reconstruct_return_path_syncs_connector_runtime_turn() -> None:
     with (
         patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
         patch.object(manager, "_load_persisted_conversation_history"),

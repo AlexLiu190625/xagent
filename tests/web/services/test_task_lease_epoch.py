@@ -12,6 +12,8 @@ from tests.web.services.test_task_execution_event_store import (
 )
 from xagent.web.api.websocket import _task_lease_snapshot
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_lease_service as leases
 
 engine = engine_fixture
@@ -23,7 +25,7 @@ def lease_database(engine, task_id, monkeypatch):
     factory = sessionmaker(engine)
     monkeypatch.setattr("xagent.web.models.database.get_session_local", lambda: factory)
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_db", lambda: iter([factory()])
+        "xagent.web.services.trace_handlers.get_db", lambda: iter([factory()])
     )
     return factory, task_id
 
@@ -217,8 +219,7 @@ def test_old_acquisition_cannot_commit_any_execution_result(
     from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE, CHECKPOINT_TYPE
     from xagent.core.agent.runner import UserMessageInjectionOutcome
     from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
-    from xagent.web.api import a2a, chat, websocket
-    from xagent.web.api.trace_handlers import DatabaseTraceHandler
+    from xagent.web.api import a2a
     from xagent.web.api.v1 import task_reply
     from xagent.web.models.chat_message import TaskChatMessage
     from xagent.web.models.task import TraceEvent
@@ -227,10 +228,11 @@ def test_old_acquisition_cannot_commit_any_execution_result(
         finalize_managed_task_lease_result,
     )
     from xagent.web.services.task_orchestrator import finish_turn
+    from xagent.web.services.trace_handlers import DatabaseTraceHandler
 
     factory, tid = lease_database
-    monkeypatch.setattr(websocket, "get_db", lambda: iter([factory()]))
-    monkeypatch.setattr(websocket, "get_session_local", lambda: factory)
+    monkeypatch.setattr(task_execution_service, "get_db", lambda: iter([factory()]))
+    monkeypatch.setattr(task_execution_service, "get_session_local", lambda: factory)
     monkeypatch.setattr(a2a, "get_session_local", lambda: factory)
     monkeypatch.setattr(task_reply, "get_session_local", lambda: factory)
     with factory() as db:
@@ -243,7 +245,7 @@ def test_old_acquisition_cannot_commit_any_execution_result(
         user_id = task.user_id
         before = (task.title, task.input, task.output, task.error_message)
 
-    empty_outputs = websocket._PreparedTaskFileOutputs((), (), ())
+    empty_outputs = task_execution_service._PreparedTaskFileOutputs((), (), ())
     with leases.bind_task_lease_context(old), factory() as db:
         if writer == "release":
             assert not leases.release_task_lease(db, old, status=TaskStatus.COMPLETED)
@@ -259,7 +261,7 @@ def test_old_acquisition_cannot_commit_any_execution_result(
         elif writer == "finish":
             assert not finish_turn(db, tid, task_lease=old)
         elif writer == "result":
-            result = websocket._finalize_task_execution_result_isolated(
+            result = task_execution_service._finalize_task_execution_result_isolated(
                 task_id=tid,
                 task_user_id=user_id,
                 pre_run_status=TaskStatus.RUNNING,
@@ -271,7 +273,7 @@ def test_old_acquisition_cannot_commit_any_execution_result(
             )
             assert result.late_result
         elif writer == "resume":
-            result = websocket._finalize_resumed_task(
+            result = task_execution_service._finalize_resumed_task(
                 tid,
                 status="completed",
                 success=True,
@@ -283,7 +285,9 @@ def test_old_acquisition_cannot_commit_any_execution_result(
             )
             assert result["late_result"]
         elif writer == "title":
-            assert not chat._update_task_title_isolated(tid, "stale", task_lease=old)
+            assert not agent_runtime_service._update_task_title_isolated(
+                tid, "stale", task_lease=old
+            )
         elif writer == "a2a_input":
             assert not a2a._update_a2a_resume_input_sync(
                 old, "stale", None, UserMessageInjectionOutcome.NOT_POSTED
@@ -318,7 +322,7 @@ def test_old_acquisition_cannot_commit_any_execution_result(
                 handler._save_trace_event(db, event)
         else:
             with pytest.raises(RuntimeError):
-                websocket._persist_agent_outbound_event(
+                task_execution_service._persist_agent_outbound_event(
                     tid,
                     {
                         "type": "agent_message",

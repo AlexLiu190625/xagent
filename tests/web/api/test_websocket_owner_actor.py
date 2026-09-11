@@ -41,19 +41,15 @@ from xagent.core.execution_scope import (
 )
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
-    ResumeReservationOutcome,
     _claim_user_message_delivery_isolated,
     _execute_durable_task_command,
     _handle_chat_message_unserialized,
     _handle_pause_task_unserialized,
     _handle_resume_task_unserialized,
-    _restore_resumed_task_lease_to_prior_status,
-    _waiting_or_paused_event_fields,
-    background_task_manager,
-    execute_resume_background,
     handle_chat_message,
     handle_pause_task,
     handle_resume_task,
+    make_delivery_notifier,
     send_message_delivery,
 )
 from xagent.web.models.chat_message import TaskChatMessage
@@ -63,6 +59,7 @@ from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_orchestrator
 from xagent.web.services.chat_history_service import DELIVERY_FAILED, DELIVERY_PENDING
 from xagent.web.services.managed_file_ref import (
@@ -74,6 +71,13 @@ from xagent.web.services.task_command_transport import (
     ClaimedTaskCommand,
     TaskCommandKind,
     TaskCommandRejected,
+)
+from xagent.web.services.task_execution import (
+    ResumeReservationOutcome,
+    _restore_resumed_task_lease_to_prior_status,
+    _waiting_or_paused_event_fields,
+    background_task_manager,
+    execute_resume_background,
 )
 from xagent.web.services.task_execution_controller import StaleTaskRunError
 from xagent.web.services.task_interaction_close import (
@@ -690,7 +694,7 @@ async def test_pause_accepted_wait_releases_one_slot_pool_before_previous_run(
     prepare_turn = websocket_api._prepare_websocket_turn_sync
     monkeypatch.setattr(websocket_api, "manager", ws_manager)
     monkeypatch.setattr(
-        websocket_api,
+        task_execution_service,
         "background_task_manager",
         background_manager,
     )
@@ -699,7 +703,7 @@ async def test_pause_accepted_wait_releases_one_slot_pool_before_previous_run(
         begin_turn,
     )
 
-    websocket_api._mark_task_pause_accepted(task_id)
+    task_execution_service._mark_task_pause_accepted(task_id)
     probe = _EventLoopLivenessProbe()
     monkeypatch.setattr(
         websocket_api,
@@ -721,7 +725,7 @@ async def test_pause_accepted_wait_releases_one_slot_pool_before_previous_run(
             timeout=_HANDLER_DEADLINE_SECONDS,
         )
     finally:
-        websocket_api._clear_task_pause_accepted(task_id)
+        task_execution_service._clear_task_pause_accepted(task_id)
         engine.dispose()
 
     probe.assert_loop_stayed_responsive("pause settlement preparation")
@@ -1301,10 +1305,15 @@ async def test_running_chat_message_is_persisted_before_resume(
     bg_mgr.running_tasks.get.return_value = None
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", resume_bg
+        ),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
     ):
         await handle_chat_message(
             MagicMock(),
@@ -1367,7 +1376,10 @@ async def test_legacy_continuation_runtime_fails_closed_without_side_effects(
     )
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch(
             "xagent.web.api.websocket.mark_user_message_delivery_sync",
@@ -1495,10 +1507,18 @@ async def test_running_chat_message_uses_one_offloop_scope_and_no_request_sessio
                 "xagent.web.api.websocket._claim_user_message_delivery_isolated",
                 side_effect=claim_delivery,
             ),
-            patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+            patch(
+                "xagent.web.services.agent_service_manager.get_agent_manager",
+                return_value=agent_manager,
+            ),
             patch("xagent.web.api.websocket.manager", ws_manager),
-            patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
-            patch("xagent.web.api.websocket.background_task_manager", bg_manager),
+            patch(
+                "xagent.web.services.task_execution.execute_resume_background",
+                resume_bg,
+            ),
+            patch(
+                "xagent.web.services.task_execution.background_task_manager", bg_manager
+            ),
             patch(
                 "xagent.web.api.websocket.task_execution_controller.transition",
                 new=AsyncMock(
@@ -1557,10 +1577,15 @@ async def test_deferred_chat_message_is_acked_after_durable_command_commit(
     websocket = MagicMock()
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", resume_bg
+        ),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
     ):
         await handle_chat_message(
             websocket,
@@ -1603,8 +1628,7 @@ async def test_deferred_chat_message_is_acked_after_durable_command_commit(
     )
     kwargs = resume_bg.call_args.kwargs
     assert kwargs["delivery_already_dispatched"] is False
-    assert kwargs["delivery_websocket"] is None
-    assert kwargs["delivery_client_message_id"] is None
+    assert kwargs["delivery_notifier"] is None
 
 
 @pytest.mark.asyncio
@@ -1639,10 +1663,15 @@ async def test_live_lease_injection_degrades_to_deferred_on_checkpoint_unavailab
     websocket = MagicMock()
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", resume_bg
+        ),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
     ):
         await handle_chat_message(
             websocket,
@@ -1685,8 +1714,7 @@ async def test_live_lease_injection_degrades_to_deferred_on_checkpoint_unavailab
     )
     kwargs = resume_bg.call_args.kwargs
     assert kwargs["delivery_already_dispatched"] is False
-    assert kwargs["delivery_websocket"] is None
-    assert kwargs["delivery_client_message_id"] is None
+    assert kwargs["delivery_notifier"] is None
 
 
 @pytest.mark.asyncio
@@ -1771,10 +1799,15 @@ async def test_durable_failure_keeps_detail_sender_only(
         payload["_durable_ack_sent"] = True
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", resume_bg
+        ),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
     ):
         await _handle_chat_message_unserialized(
             origin_socket,
@@ -1876,9 +1909,12 @@ async def test_attachment_bind_race_keeps_specific_failure_on_origin_lane(
     bg_manager.running_tasks.get.return_value = None
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=agent_manager,
+        ),
         patch("xagent.web.api.websocket.manager", connection_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_manager),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_manager),
         patch(
             "xagent.web.api.websocket.bind_turn_files_no_commit",
             return_value=["bind-race-file"],
@@ -1947,14 +1983,19 @@ async def test_resume_registration_failure_keeps_injected_delivery_pending(
     bg_handle = MagicMock()
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
+        ),
         patch(
             "xagent.web.api.websocket.asyncio.create_task",
             return_value=bg_handle,
         ),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
     ):
         await handle_chat_message(
             MagicMock(),
@@ -2016,12 +2057,14 @@ async def test_live_marker_failure_after_registered_handoff_is_still_accepted(
 
     with (
         patch(
-            "xagent.web.api.chat.get_agent_manager",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
         ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
-        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
+        ),
         patch(
             "xagent.web.api.websocket.mark_user_message_delivery_sync",
             side_effect=RuntimeError("marker unavailable"),
@@ -2110,12 +2153,14 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
 
     with (
         patch(
-            "xagent.web.api.chat.get_agent_manager",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
         ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
-        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
+        ),
         patch(
             "xagent.web.api.websocket.active_interaction_id_sync",
             side_effect=record_read,
@@ -2205,12 +2250,14 @@ async def test_live_injection_skips_the_close_on_a_replayed_turn_id(
 
     with (
         patch(
-            "xagent.web.api.chat.get_agent_manager",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
         ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
-        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
+        ),
         patch(
             "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
         ) as close_mock,
@@ -2259,12 +2306,14 @@ async def test_live_close_failure_after_registered_handoff_is_still_accepted(
 
     with (
         patch(
-            "xagent.web.api.chat.get_agent_manager",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
         ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
-        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
+        ),
         patch(
             "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
             side_effect=RuntimeError("interaction close unavailable"),
@@ -2325,12 +2374,14 @@ async def test_live_close_cancellation_does_not_abort_registered_handoff(
 
     with (
         patch(
-            "xagent.web.api.chat.get_agent_manager",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
         ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
-        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
+        ),
         patch(
             "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
             side_effect=raise_cancelled,
@@ -2554,13 +2605,13 @@ async def test_message_handoff_registers_the_minted_run_not_the_stale_one(
     bg_mgr.register_reserved_resume.side_effect = register_resume
     with (
         patch(
-            "xagent.web.api.chat.get_agent_manager",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
         ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
         patch(
-            "xagent.web.api.websocket.execute_resume_background",
+            "xagent.web.services.task_execution.execute_resume_background",
             side_effect=resume_forever,
         ) as resume_bg,
     ):
@@ -2648,13 +2699,13 @@ async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
     bg_mgr.register_reserved_resume.side_effect = register_resume
     with (
         patch(
-            "xagent.web.api.chat.get_agent_manager",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
         ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
         patch(
-            "xagent.web.api.websocket.execute_resume_background",
+            "xagent.web.services.task_execution.execute_resume_background",
             side_effect=resume_forever,
         ),
         patch(
@@ -2933,9 +2984,12 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
     error_payload_reader = MagicMock()
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
         patch(
             "xagent.web.api.websocket.mark_user_message_delivery_sync",
             mark_delivery,
@@ -2968,7 +3022,7 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
     assert len(rejected) == 1
     assert rejected[0]["client_message_id"] == "live-control-pool-timeout"
     assert "inject failed" not in repr(rejected[0])
-    assert rejected[0]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert rejected[0]["message"] == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
     assert rejected[0]["error_code"] == "message_processing_failed"
     assert rejected[0]["rejection_outcome"] == "outcome_unknown"
 
@@ -3005,9 +3059,12 @@ async def test_delivery_failure_persistence_drains_before_cancellation(
         persistence_finished.set()
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=agent_manager,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_manager),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_manager),
         patch(
             "xagent.web.api.websocket.mark_user_message_delivery_sync",
             side_effect=blocking_mark_delivery,
@@ -3065,7 +3122,10 @@ async def test_retried_durable_message_is_accepted_without_reexecution(
     )
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=agent_manager,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
     ):
         await handle_chat_message(
@@ -3254,7 +3314,10 @@ async def test_pause_admin_on_other_users_task_runs_as_owner(db_session) -> None
     captured, agent, mgr, ws_manager = _patched_manager_and_agent()
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
     ):
         await handle_pause_task(MagicMock(), int(task.id), {"user": admin})
@@ -3277,7 +3340,10 @@ async def test_durable_pause_propagates_stale_run_error(db_session) -> None:
     _captured, _agent, mgr, ws_manager = _patched_manager_and_agent()
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch(
             "xagent.web.api.websocket._apply_pause_requested_isolated",
@@ -3303,9 +3369,12 @@ async def test_durable_resume_propagates_stale_run_error(db_session) -> None:
     bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
         patch(
             "xagent.web.api.websocket.task_execution_controller.transition",
             new=AsyncMock(side_effect=StaleTaskRunError("run rotated")),
@@ -3505,7 +3574,10 @@ async def test_pause_non_owner_non_admin_is_refused(db_session) -> None:
     captured, agent, mgr, ws_manager = _patched_manager_and_agent()
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
     ):
         # The handler authorizes the task away and handles the denial
@@ -3524,7 +3596,10 @@ async def test_resume_admin_on_other_users_task_runs_as_owner(db_session) -> Non
     captured, agent, mgr, ws_manager = _patched_manager_and_agent()
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": admin})
@@ -3568,7 +3643,10 @@ async def test_running_resume_completes_as_explicit_idempotent_success(
     agent.supports_live_control = MagicMock(return_value=True)
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": owner})
@@ -3642,14 +3720,19 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
     bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", resume_bg
+        ),
         patch(
             "xagent.web.api.websocket.task_execution_controller.transition",
             new=transition,
         ),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": admin})
         # ``dispatch_task_command_promptly`` may detach the durable resume
@@ -3700,14 +3783,19 @@ async def test_resume_registration_failure_cancels_coordinator(db_session) -> No
     bg_handle = MagicMock()
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.execute_resume_background", MagicMock()),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", MagicMock()
+        ),
         patch(
             "xagent.web.api.websocket.asyncio.create_task",
             return_value=bg_handle,
         ),
-        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": owner})
         for _ in range(100):
@@ -3736,7 +3824,10 @@ async def test_execute_resume_background_rejects_owner_mismatch(db_session) -> N
     ws_manager.broadcast_to_task = AsyncMock()
 
     with (
-        patch("xagent.web.api.websocket.stop_task_lease_heartbeat", new=AsyncMock()),
+        patch(
+            "xagent.web.services.task_execution.stop_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
     ):
         _register_current_resume(int(task.id))
@@ -4019,7 +4110,7 @@ async def test_resume_failure_broadcasts_only_after_exact_settlement(
     with (
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch(
-            "xagent.web.api.websocket._settle_resumed_task_lease",
+            "xagent.web.services.task_execution._settle_resumed_task_lease",
             side_effect=settle,
         ),
     ):
@@ -4071,8 +4162,9 @@ async def test_resume_failure_rejection_redacts_exception_text(db_session) -> No
             agent_service=agent,
             task_owner_user_id=int(owner.id),
             delivery_turn_id="resume-rejection-turn",
-            delivery_websocket=MagicMock(),
-            delivery_client_message_id="resume-rejection-turn",
+            delivery_notifier=make_delivery_notifier(
+                MagicMock(), "resume-rejection-turn"
+            ),
         )
 
     rejected = [
@@ -4081,7 +4173,7 @@ async def test_resume_failure_rejection_redacts_exception_text(db_session) -> No
         if call.args[0].get("type") == "message_rejected"
     ]
     assert len(rejected) == 1
-    assert rejected[0]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert rejected[0]["message"] == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
     assert secret not in repr(rejected[0])
 
 
@@ -4120,7 +4212,9 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
 
     with (
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
+        patch(
+            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
+        ),
     ):
         await execute_resume_background(
             task_id=int(task.id),
@@ -4133,8 +4227,9 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
                 "turn_id": "deferred-injection-failure",
             },
             delivery_turn_id="deferred-injection-failure",
-            delivery_websocket=MagicMock(),
-            delivery_client_message_id="deferred-injection-failure",
+            delivery_notifier=make_delivery_notifier(
+                MagicMock(), "deferred-injection-failure"
+            ),
         )
 
     delivery_events = [
@@ -4209,11 +4304,13 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
 
     with (
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
         patch(
-            "xagent.web.api.websocket.mark_user_message_delivery_sync",
-            side_effect=mark_delivery,
+            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
         ),
+        patch(
+            "xagent.web.services.task_execution.mark_user_message_delivery_sync",
+            side_effect=mark_delivery,
+        ) as mark_mock,
     ):
         await execute_resume_background(
             task_id=int(task.id),
@@ -4226,10 +4323,14 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
                 "turn_id": "deferred-marker-turn",
             },
             delivery_turn_id="deferred-marker-turn",
-            delivery_websocket=MagicMock(),
-            delivery_client_message_id="deferred-marker-turn",
+            delivery_notifier=make_delivery_notifier(
+                MagicMock(), "deferred-marker-turn"
+            ),
         )
 
+    mark_mock.assert_any_call(
+        int(task.id), "deferred-marker-turn", websocket_api.DELIVERY_DISPATCHED
+    )
     agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
     accepted = [
         call.args[0]
@@ -4237,6 +4338,8 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
         if call.args[0].get("type") == "message_accepted"
     ]
     assert len(accepted) == 1
+    db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -4290,11 +4393,13 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
 
     with (
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
         patch(
-            "xagent.web.api.websocket.mark_user_message_delivery_sync",
-            side_effect=mark_delivery,
+            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
         ),
+        patch(
+            "xagent.web.services.task_execution.mark_user_message_delivery_sync",
+            side_effect=mark_delivery,
+        ) as mark_mock,
     ):
         await execute_resume_background(
             task_id=int(task.id),
@@ -4307,10 +4412,14 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
                 "turn_id": "deferred-marker-cancel-turn",
             },
             delivery_turn_id="deferred-marker-cancel-turn",
-            delivery_websocket=MagicMock(),
-            delivery_client_message_id="deferred-marker-cancel-turn",
+            delivery_notifier=make_delivery_notifier(
+                MagicMock(), "deferred-marker-cancel-turn"
+            ),
         )
 
+    mark_mock.assert_any_call(
+        int(task.id), "deferred-marker-cancel-turn", websocket_api.DELIVERY_DISPATCHED
+    )
     agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
     accepted = [
         call.args[0]
@@ -4318,6 +4427,8 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
         if call.args[0].get("type") == "message_accepted"
     ]
     assert len(accepted) == 1
+    db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -4389,9 +4500,11 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
 
     with (
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
         patch(
-            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
+        ),
+        patch(
+            "xagent.web.services.task_execution.close_legacy_resume_interaction_sync",
             side_effect=fail_close,
         ),
     ):
@@ -4406,8 +4519,9 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
                 "turn_id": "deferred-close-failure-turn",
             },
             delivery_turn_id="deferred-close-failure-turn",
-            delivery_websocket=MagicMock(),
-            delivery_client_message_id="deferred-close-failure-turn",
+            delivery_notifier=make_delivery_notifier(
+                MagicMock(), "deferred-close-failure-turn"
+            ),
         )
 
     agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
@@ -4473,13 +4587,15 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
 
     with (
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
         patch(
-            "xagent.web.api.websocket.active_interaction_id_sync",
-            side_effect=AssertionError("the deferred path must not read its own"),
+            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
         ),
         patch(
-            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            "xagent.web.services.task_interaction_close.active_interaction_id_sync",
+            side_effect=AssertionError("the deferred path must not read its own"),
+        ) as read_mock,
+        patch(
+            "xagent.web.services.task_execution.close_legacy_resume_interaction_sync",
             return_value=1,
         ) as close_mock,
     ):
@@ -4495,13 +4611,23 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
                 "interaction_id": 9876,
             },
             delivery_turn_id="deferred-carry-turn",
-            delivery_websocket=MagicMock(),
-            delivery_client_message_id="deferred-carry-turn",
+            delivery_notifier=make_delivery_notifier(
+                MagicMock(), "deferred-carry-turn"
+            ),
         )
 
     close_mock.assert_called_once()
     assert close_mock.call_args.kwargs["task_id"] == int(task.id)
     assert close_mock.call_args.kwargs["interaction_id"] == 9876
+
+    read_mock.assert_not_called()
+    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert any(
+        call.args[0].get("type") == "message_accepted"
+        for call in ws_manager.send_personal_message.call_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -4571,13 +4697,15 @@ async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
 
     with (
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
         patch(
-            "xagent.web.api.websocket.active_interaction_id_sync",
-            side_effect=AssertionError("the deferred path must not read its own"),
+            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
         ),
         patch(
-            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            "xagent.web.services.task_interaction_close.active_interaction_id_sync",
+            side_effect=AssertionError("the deferred path must not read its own"),
+        ) as read_mock,
+        patch(
+            "xagent.web.services.task_execution.close_legacy_resume_interaction_sync",
         ) as close_mock,
     ):
         await execute_resume_background(
@@ -4594,12 +4722,22 @@ async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
                 "interaction_id": 424242,
             },
             delivery_turn_id="deferred-replay-turn",
-            delivery_websocket=MagicMock(),
-            delivery_client_message_id="deferred-replay-turn",
+            delivery_notifier=make_delivery_notifier(
+                MagicMock(), "deferred-replay-turn"
+            ),
         )
 
     agent.post_user_message.assert_awaited_once()
     close_mock.assert_not_called()
+
+    read_mock.assert_not_called()
+    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert any(
+        call.args[0].get("type") == "message_accepted"
+        for call in ws_manager.send_personal_message.call_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -4665,9 +4803,11 @@ async def test_deferred_injection_close_cancellation_does_not_abort_resume(
 
     with (
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
         patch(
-            "xagent.web.api.websocket.close_legacy_resume_interaction_sync",
+            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
+        ),
+        patch(
+            "xagent.web.services.task_execution.close_legacy_resume_interaction_sync",
             side_effect=raise_cancelled,
         ),
     ):
@@ -4682,8 +4822,9 @@ async def test_deferred_injection_close_cancellation_does_not_abort_resume(
                 "turn_id": "deferred-close-cancel-turn",
             },
             delivery_turn_id="deferred-close-cancel-turn",
-            delivery_websocket=MagicMock(),
-            delivery_client_message_id="deferred-close-cancel-turn",
+            delivery_notifier=make_delivery_notifier(
+                MagicMock(), "deferred-close-cancel-turn"
+            ),
         )
 
     agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
@@ -4730,9 +4871,14 @@ async def test_deferred_injection_rejects_before_post_when_lease_is_denied(
     )
 
     with (
-        patch("xagent.web.api.websocket._acquire_resume_task_lease", return_value=None),
+        patch(
+            "xagent.web.services.task_execution._acquire_resume_task_lease",
+            return_value=None,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
+        patch(
+            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
+        ),
     ):
         await execute_resume_background(
             task_id=int(task.id),
@@ -4745,8 +4891,9 @@ async def test_deferred_injection_rejects_before_post_when_lease_is_denied(
                 "turn_id": "deferred-lease-denied",
             },
             delivery_turn_id="deferred-lease-denied",
-            delivery_websocket=MagicMock(),
-            delivery_client_message_id="deferred-lease-denied",
+            delivery_notifier=make_delivery_notifier(
+                MagicMock(), "deferred-lease-denied"
+            ),
         )
 
     agent.post_user_message.assert_not_awaited()
@@ -4774,7 +4921,10 @@ async def test_resume_non_owner_non_admin_is_refused(db_session) -> None:
     captured, agent, mgr, ws_manager = _patched_manager_and_agent()
 
     with (
-        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": stranger})

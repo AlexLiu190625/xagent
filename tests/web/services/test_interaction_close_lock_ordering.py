@@ -13,7 +13,8 @@ it two different ways (see task_interaction_close.py's module docstring,
 _update_a2a_resume_input_sync's inline comment, and
 _update_reply_input_sync's inline comment):
 
-* The two WebSocket injection sites (websocket.py) share one
+* The online and deferred injection sites (websocket.py and
+  task_execution.py) share one
   short-transaction helper, close_legacy_resume_interaction_sync, which
   takes one explicit FOR NO KEY UPDATE / key_share=True lock read before
   calling into the close-and-clear function -- one lock read, not two,
@@ -62,7 +63,7 @@ from pathlib import Path
 import xagent
 from xagent.web.api import a2a, websocket
 from xagent.web.api.v1 import task_reply
-from xagent.web.services import task_interaction_close
+from xagent.web.services import task_execution, task_interaction_close
 
 CLOSE_MODULE_NAME = "task_interaction_close"
 UNLOCKED_CLOSE_FUNCTION = "close_legacy_resume_interaction"
@@ -86,8 +87,8 @@ CLOSE_FAMILY_CALL_NAMES = frozenset(
 # web/ modules that call post_user_message but are exempt from the
 # close-family wiring obligation checked below. Empty by construction:
 # every known post_user_message call site today (a2a.py, websocket.py,
-# task_reply.py) wires in a close-family call. A new call site should wire
-# one in too, not be added here as an exception.
+# task_execution.py, task_reply.py) wires in a close-family call. A new call
+# site should wire one in too, not be added here as an exception.
 APPROVED_UNWIRED_POST_USER_MESSAGE_CALLERS: frozenset[str] = frozenset()
 
 
@@ -185,11 +186,12 @@ def test_close_sync_takes_the_lock_read_before_the_close_call() -> None:
 
 def test_both_websocket_injection_sites_call_the_shared_close_helper() -> None:
     """The online and deferred injection handlers each call the shared
-    helper exactly once, and it is called from nowhere else in the
+    helper exactly once, and it is called from nowhere else in either
     module."""
-    tree = ast.parse(_source(websocket))
-    online = _find_function(tree, "_handle_chat_message_unserialized")
-    deferred = _find_function(tree, "execute_resume_background")
+    websocket_tree = ast.parse(_source(websocket))
+    execution_tree = ast.parse(_source(task_execution))
+    online = _find_function(websocket_tree, "_handle_chat_message_unserialized")
+    deferred = _find_function(execution_tree, "execute_resume_background")
     online_calls = _call_lines(online, attr="close_legacy_resume_interaction_sync")
     deferred_calls = _call_lines(deferred, attr="close_legacy_resume_interaction_sync")
     assert len(online_calls) == 1, (
@@ -200,11 +202,13 @@ def test_both_websocket_injection_sites_call_the_shared_close_helper() -> None:
         "expected exactly one close_legacy_resume_interaction_sync call in "
         f"the deferred injection handler, found {len(deferred_calls)}"
     )
-    all_calls = _call_lines(tree, attr="close_legacy_resume_interaction_sync")
+    all_calls = _call_lines(
+        websocket_tree, attr="close_legacy_resume_interaction_sync"
+    ) + _call_lines(execution_tree, attr="close_legacy_resume_interaction_sync")
     assert len(all_calls) == 2, (
         "close_legacy_resume_interaction_sync must be called from exactly "
         f"the two websocket injection sites, found {len(all_calls)} call(s) "
-        "across the module"
+        "across the adapter and execution service"
     )
 
 
@@ -472,7 +476,8 @@ def test_every_post_user_message_caller_wires_the_close_family() -> None:
     This is a module-level check, not a call-site-level one: it proves a
     close-family call exists somewhere in the module, not that it runs on
     every code path that reaches post_user_message. Today's four call
-    sites across three modules (a2a.py, websocket.py x2, task_reply.py)
+    sites across four modules (a2a.py, websocket.py, task_execution.py,
+    task_reply.py)
     each carry their own per-site argument for why their wiring is
     complete; see the tests
     above and task_interaction_close.py's module docstring.

@@ -37,11 +37,11 @@ from tests.web.pool_contention_shared import (
     LOOP_LIVENESS_TICKS,
     wait_for_ticks,
 )
-from xagent.web.api.websocket import execute_task_background
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.llm_utils import AgentRuntimeFields
+from xagent.web.services.task_execution import execute_task_background
 from xagent.web.services.task_lease_service import TaskLease
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -151,14 +151,14 @@ def _common_patches(db: Any, agent_service: Any) -> list[Any]:
             return_value=_make_snapshot(),
         ),
         patch(
-            "xagent.web.api.websocket.background_task_manager.wait_for_previous",
+            "xagent.web.services.task_execution.background_task_manager.wait_for_previous",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.websocket._register_uploaded_files_for_agent",
+            "xagent.web.services.task_execution._register_uploaded_files_for_agent",
         ),
         patch(
-            "xagent.web.api.websocket._finalize_task_execution_result_isolated",
+            "xagent.web.services.task_execution._finalize_task_execution_result_isolated",
             return_value=SimpleNamespace(
                 normalized_outputs=[],
                 ai_response="ok",
@@ -288,12 +288,12 @@ async def test_cancellation_during_finalization_broadcasts_committed_result(
 
     patches = [
         patch(
-            "xagent.web.api.websocket.background_task_manager.wait_for_previous",
+            "xagent.web.services.task_execution.background_task_manager.wait_for_previous",
             new=AsyncMock(),
         ),
-        patch("xagent.web.api.websocket._register_uploaded_files_for_agent"),
+        patch("xagent.web.services.task_execution._register_uploaded_files_for_agent"),
         patch(
-            "xagent.web.api.websocket._finalize_task_execution_result_isolated",
+            "xagent.web.services.task_execution._finalize_task_execution_result_isolated",
             side_effect=blocking_finalize,
         ),
         patch(
@@ -371,13 +371,13 @@ async def test_cancellation_after_uncommitted_finalization_always_propagates(
         )
 
     patches = [
-        patch("xagent.web.api.websocket._register_uploaded_files_for_agent"),
+        patch("xagent.web.services.task_execution._register_uploaded_files_for_agent"),
         patch(
-            "xagent.web.api.websocket._finalize_task_execution_result_isolated",
+            "xagent.web.services.task_execution._finalize_task_execution_result_isolated",
             side_effect=blocking_finalize,
         ),
         patch(
-            "xagent.web.api.websocket._terminal_task_error_payload",
+            "xagent.web.services.task_execution._terminal_task_error_payload",
             return_value=None,
         ),
         patch(
@@ -468,7 +468,7 @@ async def test_snapshot_execution_start_stays_responsive_with_exhausted_pool(
             *_common_patches(db, MagicMock()),
             patch.object(engine.pool, "_do_get", checkout),
             patch(
-                "xagent.web.api.websocket._terminal_task_error_payload",
+                "xagent.web.services.task_execution._terminal_task_error_payload",
                 return_value=None,
             ),
         ]
@@ -584,7 +584,7 @@ async def test_missing_snapshot_broadcasts_task_unavailable_code() -> None:
                 return_value=None,
             ),
             patch(
-                "xagent.web.api.websocket._terminal_task_error_payload",
+                "xagent.web.services.task_execution._terminal_task_error_payload",
                 return_value={"type": "task_error"},
             ),
             patch(

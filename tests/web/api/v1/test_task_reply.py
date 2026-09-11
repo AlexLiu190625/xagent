@@ -29,6 +29,7 @@ from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.schemas.v1 import ReplyRequest
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_execution_controller import TaskControlState
@@ -151,7 +152,7 @@ def _patch_agent_service(post_user_message: AsyncMock):
     agent_manager = MagicMock()
     agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
     return patch(
-        "xagent.web.api.chat.get_agent_manager",
+        "xagent.web.services.agent_service_manager.get_agent_manager",
         return_value=agent_manager,
     ), agent_service
 
@@ -1075,9 +1076,7 @@ async def test_reply_resume_binds_the_coordinator_to_the_leased_run() -> None:
     idempotent success.
     """
 
-    from xagent.web.api import websocket as websocket_api
-
-    real_manager = websocket_api.BackgroundTaskManager()
+    real_manager = task_execution_service.BackgroundTaskManager()
     lease = TaskLease(task_id=4242, runner_id="runner-x", run_id="run-reply")
     resume_gate = asyncio.Event()
 
@@ -1085,9 +1084,9 @@ async def test_reply_resume_binds_the_coordinator_to_the_leased_run() -> None:
         await resume_gate.wait()
 
     with (
-        patch.object(websocket_api, "background_task_manager", real_manager),
+        patch.object(task_execution_service, "background_task_manager", real_manager),
         patch.object(
-            websocket_api,
+            task_execution_service,
             "execute_resume_background",
             side_effect=execute_resume_background,
         ),
@@ -1103,13 +1102,13 @@ async def test_reply_resume_binds_the_coordinator_to_the_leased_run() -> None:
         try:
             assert (
                 real_manager.resume_admission_state(4242, expected_run_id="run-reply")
-                is websocket_api.ResumeReservationOutcome.COORDINATOR_RUNNING
+                is task_execution_service.ResumeReservationOutcome.COORDINATOR_RUNNING
             )
             assert (
                 real_manager.resume_admission_state(
                     4242, expected_run_id="some-other-run"
                 )
-                is websocket_api.ResumeReservationOutcome.RESERVATION_HELD
+                is task_execution_service.ResumeReservationOutcome.RESERVATION_HELD
             )
         finally:
             resume_gate.set()
