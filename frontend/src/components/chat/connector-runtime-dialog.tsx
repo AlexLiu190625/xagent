@@ -179,6 +179,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const [fieldError, setFieldError] = useState<FieldErrorState | null>(null)
   const [lastAlsoResend, setLastAlsoResend] = useState(false)
   const [sendFailed, setSendFailed] = useState(false)
+  const [resending, setResending] = useState(false)
 
   // Read on mount and on every subsequent request for this same task (the
   // dialog is already open and a new terminal frame retargeted it): the
@@ -276,7 +277,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     setSubmitting(true)
     setLastAlsoResend(alsoResend)
     const result = await submitTaskConnectorRuntimeValues(request.taskId, items)
-    if (!aliveRef.current || requestRef.current.seq !== seqAtStart) return
+    if (!aliveRef.current) return
+    if (requestRef.current.seq !== seqAtStart) {
+      // A newer request retargeted this same dialog instance while the save
+      // was in flight; the result is stale, but `submitting` must still
+      // reset or the save buttons and close handlers stay stuck forever.
+      setSubmitting(false)
+      return
+    }
 
     if (!result.ok) {
       const disposition = classifySubmitFailure(result, report)
@@ -320,8 +328,13 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   }
 
   const handleRetryResend = async () => {
+    // A resend is one billed model call plus a possibly side-effecting tool
+    // run; a double click here must not fire it twice.
+    if (resending) return
+    setResending(true)
     const sent = await doResend()
     if (!aliveRef.current) return
+    setResending(false)
     if (sent) {
       setSendFailed(false)
       close("resent")
@@ -363,7 +376,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         {sendFailed ? (
           <div className="space-y-3">
             <p className="text-sm text-destructive">{t("connectorRuntime.sendFailed")}</p>
-            <Button onClick={handleRetryResend}>{t("connectorRuntime.actions.resend")}</Button>
+            <Button disabled={resending} onClick={handleRetryResend}>{t("connectorRuntime.actions.resend")}</Button>
           </div>
         ) : (
           <div className="space-y-4">

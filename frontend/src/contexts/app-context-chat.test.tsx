@@ -7286,8 +7286,16 @@ describe("connector runtime dialog trigger", () => {
       )
     }
 
-    // Control rows: none of these reach the read endpoint.
-    for (const extra of [{ code: "invalid_runtime_context" }, { code: "connector_runtime_unavailable" }, {}]) {
+    // Control rows: none of these reach the read endpoint. The last two are
+    // task_error look-alikes: a root error frame is never terminal, and
+    // task_completed's own error_code is never read by this path.
+    for (const extra of [
+      { code: "invalid_runtime_context" },
+      { code: "connector_runtime_unavailable" },
+      {},
+      { type: "error", code: "missing_runtime_context" },
+      { type: "task_completed", task: { id: 1, status: "failed" }, error_code: "missing_runtime_context" },
+    ]) {
       apiRequestMock.mockClear()
       act(() => {
         onMessage?.({
@@ -7298,6 +7306,23 @@ describe("connector runtime dialog trigger", () => {
       })
       version += 1
       expect(apiRequestMock).not.toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+    }
+
+    // Same code, state_version differing by 2 (a resend hitting the same
+    // failure again): the second must still re-open, not be folded by a
+    // dedup layer keyed on the error code alone.
+    for (const stateVersion of [500, 502]) {
+      apiRequestMock.mockClear()
+      act(() => {
+        onMessage?.({
+          type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 1,
+          task: { id: 1, status: "failed" }, message: "x", error: "x",
+          code: "missing_runtime_context", run_id: "run-retry", state_version: stateVersion,
+        } as TestWebSocketMessage)
+      })
+      await waitFor(() =>
+        expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+      )
     }
 
     // Another task's frame never opens this task's dialog.

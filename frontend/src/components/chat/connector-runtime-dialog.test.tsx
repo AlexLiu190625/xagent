@@ -70,6 +70,11 @@ import {
 const REF_A = { connector_type: "custom_api", connector_id: 1 }
 const REF_B = { connector_type: "mcp", connector_id: 2 }
 
+// Shared by the two source-scanning tests below instead of each re-reading.
+const libSource = readFileSync(path.resolve(__dirname, "../../lib/connector-runtime-api.ts"), "utf8")
+const dialogSource = readFileSync(path.resolve(__dirname, "./connector-runtime-dialog.tsx"), "utf8")
+const providerSource = readFileSync(path.resolve(__dirname, "../../contexts/connector-runtime-dialog-context.tsx"), "utf8")
+
 function input(
   overrides: Partial<ConnectorRuntimeInput> & { section: ConnectorRuntimeSection; key: string; type: ConnectorRuntimeType },
 ): ConnectorRuntimeInput {
@@ -148,6 +153,11 @@ afterEach(() => {
 describe("keeps read outcomes in three distinct tiers", () => {
   it("keeps read outcomes in three distinct tiers", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+    // The full read-failure warn matrix: every status READ_FAILURE_STATUSES
+    // lists, 418 standing in for "any other non-200", and the two non-HTTP
+    // failure kinds. `.every` over the spy's calls would pass on an empty
+    // array, so this pins down the exact call list instead.
+    const expectedWarnCalls: unknown[][] = []
 
     for (const status of READ_FAILURE_STATUSES) {
       fetchMock.mockReset()
@@ -156,6 +166,7 @@ describe("keeps read outcomes in three distinct tiers", () => {
       await openForTask()
       await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+      expectedWarnCalls.push(["[connector-runtime] requirements read failed", status])
       cleanup()
     }
     fetchMock.mockReset()
@@ -164,21 +175,24 @@ describe("keeps read outcomes in three distinct tiers", () => {
     await openForTask()
     await waitFor(() => expect(fetchMock).toHaveBeenCalled())
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    expectedWarnCalls.push(["[connector-runtime] requirements read failed", 418])
     cleanup()
 
     fetchMock.mockResolvedValueOnce({ ok: false, kind: "transport" })
     renderHarness()
     await openForTask()
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expectedWarnCalls.push(["[connector-runtime] requirements read failed", "transport"])
     cleanup()
 
     fetchMock.mockResolvedValueOnce({ ok: false, kind: "malformed" })
     renderHarness()
     await openForTask()
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expectedWarnCalls.push(["[connector-runtime] requirements read failed", "malformed"])
     cleanup()
 
-    expect(warnSpy.mock.calls.every(call => call[0] === "[connector-runtime] requirements read failed")).toBe(true)
+    expect(warnSpy.mock.calls).toEqual(expectedWarnCalls)
 
     // Met: nothing to fill at all, and met with an unfilled optional key.
     fetchMock.mockResolvedValueOnce(ok(report(true, [])))
@@ -248,6 +262,94 @@ describe("renders each row by section, type, satisfaction and outcome", () => {
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument()
     expect(screen.queryByText("connectorRuntime.contextNote")).not.toBeInTheDocument()
     expect(screen.getByText("connectorRuntime.keyNameWarning")).toBeInTheDocument()
+  })
+})
+
+describe("keeps drafts and the snapshot when re-requested while open", () => {
+  it("keeps drafts and the snapshot when re-requested while open", async () => {
+    // A second request for an already-open task keeps a draft for a key
+    // still unsatisfied, but drops one the refreshed report now reports
+    // satisfied.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "stillMissing", type: "string", required: true }),
+        input({ section: "context", key: "getsFilled", type: "string", required: true }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("stillMissing"), { target: { value: "draft-a" } })
+    fireEvent.change(screen.getByLabelText("getsFilled"), { target: { value: "draft-b" } })
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "stillMissing", type: "string", required: true }),
+        input({ section: "context", key: "getsFilled", type: "string", required: true, satisfied: true }),
+      ]),
+    ])))
+    await openForTask() // same task: a second request, not a remount
+    await waitFor(() => expect(screen.getByText("connectorRuntime.filled")).toBeInTheDocument())
+    expect(screen.getByLabelText("stillMissing")).toHaveValue("draft-a")
+    expect(screen.queryByLabelText("getsFilled")).not.toBeInTheDocument()
+    cleanup()
+    fetchMock.mockClear()
+
+    // A read started earlier must not overwrite a fresher read's result if
+    // it resolves later (dropped via the request's own seq).
+    let resolveFirst: (v: unknown) => void = () => {}
+    let resolveSecond: (v: unknown) => void = () => {}
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveFirst = res }))
+    renderHarness()
+    await openForTask()
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveSecond = res }))
+    await openForTask()
+    await act(async () => { resolveSecond(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "fromSecondRequest", type: "string", required: true })]),
+    ]))) })
+    await waitFor(() => expect(screen.getByLabelText("fromSecondRequest")).toBeInTheDocument())
+    await act(async () => { resolveFirst(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "fromStaleFirstRequest", type: "string", required: true })]),
+    ]))) })
+    expect(screen.queryByLabelText("fromStaleFirstRequest")).not.toBeInTheDocument()
+    expect(screen.getByLabelText("fromSecondRequest")).toBeInTheDocument()
+    cleanup()
+    fetchMock.mockClear()
+
+    // A same-task re-request with no fresh stash in between keeps the resend
+    // snapshot the first request already carried.
+    const tokenReport = ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ]))
+    fetchMock.mockResolvedValueOnce(tokenReport)
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-4", text: "keep me" })
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndResend")).toBeInTheDocument())
+    fetchMock.mockResolvedValueOnce(tokenReport)
+    await openForTask() // second request, no recordDelivery first
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
+    expect(sendMessageMock.mock.calls[0][0]).toBe("keep me")
+    cleanup()
+    fetchMock.mockClear()
+
+    // A save in flight when the task is re-requested must not leave the
+    // dialog stuck once the stale save settles.
+    fetchMock.mockResolvedValueOnce(tokenReport)
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    let resolveSave: (v: unknown) => void = () => {}
+    submitMock.mockReturnValueOnce(new Promise((res) => { resolveSave = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    fetchMock.mockResolvedValueOnce(tokenReport)
+    await openForTask() // retargets this same dialog instance mid-save
+    await act(async () => { resolveSave(ok(report(true, []))) })
+    fireEvent.click(screen.getByRole("button", { name: "Close" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
   })
 })
 
@@ -513,38 +615,37 @@ describe("clears the stash when the dialog closes", () => {
   })
 })
 
-describe("drops the stash and request of a task switched away from", () => {
-  it("drops the stash and request of a task switched away from", async () => {
-    await openSimpleDialog(1)
-    // A fresh delivery for the same task after the original stash was
-    // already claimed into the request on open -- without this, `payload`
-    // would already be null before the switch below, and this assertion
-    // would pass even if switching tasks stopped narrowing the stash.
-    await act(async () => {
-      latestActions.recordDelivery({ taskId: 1, clientMessageId: "still-here", text: "hi" })
-    })
-    await act(async () => { latestActions.retainOnlyTask(2) })
-    expect(latestState).toEqual({ request: null, payload: null })
-  })
-})
+describe("clears the stash at the task-switch and reset cleanup points", () => {
+  it.each([
+    ["drops the stash and request of a task switched away from", async () => {
+      await openSimpleDialog(1)
+      // A fresh delivery for the same task after the original stash was
+      // already claimed into the request on open -- without this, `payload`
+      // would already be null before the switch below, and this assertion
+      // would pass even if switching tasks stopped narrowing the stash.
+      await act(async () => {
+        latestActions.recordDelivery({ taskId: 1, clientMessageId: "still-here", text: "hi" })
+      })
+      await act(async () => { latestActions.retainOnlyTask(2) })
+      expect(latestState).toEqual({ request: null, payload: null })
+    }],
+    ["clears the stash on conversation reset", async () => {
+      await openSimpleDialog(1)
+      await act(async () => { latestActions.retainOnlyTask(null) })
+      expect(latestState).toEqual({ request: null, payload: null })
+      cleanup()
 
-describe("clears the stash on conversation reset", () => {
-  it("clears the stash on conversation reset", async () => {
-    await openSimpleDialog(1)
-    await act(async () => { latestActions.retainOnlyTask(null) })
-    expect(latestState).toEqual({ request: null, payload: null })
-    cleanup()
-
-    // The dialog unmounts (AppProvider going away), a late delivery still
-    // lands, then it remounts with no viewed task: the mount-time task
-    // effect (not the unmount cleanup, which already ran) wipes it.
-    appStateRef.taskId = null
-    const toggle = render(providerTree())
-    toggle.rerender(<ConnectorRuntimeDialogProvider><Probe mounted={false} /></ConnectorRuntimeDialogProvider>)
-    await act(async () => { latestActions.recordDelivery({ taskId: 1, clientMessageId: "x", text: "hi" }) })
-    toggle.rerender(providerTree())
-    await waitFor(() => expect(latestState.payload).toBeNull())
-  })
+      // The dialog unmounts (AppProvider going away), a late delivery still
+      // lands, then it remounts with no viewed task: the mount-time task
+      // effect (not the unmount cleanup, which already ran) wipes it.
+      appStateRef.taskId = null
+      const toggle = render(providerTree())
+      toggle.rerender(<ConnectorRuntimeDialogProvider><Probe mounted={false} /></ConnectorRuntimeDialogProvider>)
+      await act(async () => { latestActions.recordDelivery({ taskId: 1, clientMessageId: "x", text: "hi" }) })
+      toggle.rerender(providerTree())
+      await waitFor(() => expect(latestState.payload).toBeNull())
+    }],
+  ])("%s", async (_name, run) => { await run() })
 })
 
 function providerTree() {
@@ -730,14 +831,13 @@ describe("logs only a fixed prefix and a status", () => {
 
 describe("never renders server text as HTML", () => {
   it("never renders server text as HTML", () => {
-    const files = [
-      { file: path.resolve(__dirname, "../../lib/connector-runtime-api.ts"), marker: "export function readConnectorRuntimeReport" },
-      { file: path.resolve(__dirname, "../../contexts/connector-runtime-dialog-context.tsx"), marker: "export function ConnectorRuntimeDialogProvider" },
-      { file: path.resolve(__dirname, "./connector-runtime-dialog.tsx"), marker: "export function ConnectorRuntimeDialog" },
+    const sources = [
+      { source: libSource, marker: "export function readConnectorRuntimeReport" },
+      { source: providerSource, marker: "export function ConnectorRuntimeDialogProvider" },
+      { source: dialogSource, marker: "export function ConnectorRuntimeDialog" },
     ]
-    expect(files).toHaveLength(3)
-    for (const { file, marker } of files) {
-      const source = readFileSync(file, "utf8")
+    expect(sources).toHaveLength(3)
+    for (const { source, marker } of sources) {
       expect(source).toContain(marker)
       expect(source).not.toContain("dangerouslySetInnerHTML")
       expect(source).not.toContain("innerHTML")
@@ -754,8 +854,6 @@ function leafTranslationPaths(obj: Record<string, unknown>, prefix: string): str
 describe("resolves every connectorRuntime key the dialog uses", () => {
   it("resolves every connectorRuntime key the dialog uses", async () => {
     const { translations, resolveTranslation } = await import("@/i18n/translations")
-    const libSource = readFileSync(path.resolve(__dirname, "../../lib/connector-runtime-api.ts"), "utf8")
-    const dialogSource = readFileSync(path.resolve(__dirname, "./connector-runtime-dialog.tsx"), "utf8")
     expect(libSource).toContain("export function readConnectorRuntimeReport")
     expect(dialogSource).toContain("export function ConnectorRuntimeDialog")
     expect(dialogSource).not.toMatch(/connectorRuntime\.\$\{/)
@@ -816,9 +914,13 @@ describe("does not open off the host routes", () => {
     await openForTask()
     await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
     await act(async () => { latestActions.recordDelivery({ taskId: 1, clientMessageId: "z", text: "hi" }) })
+    // "not-shown"/"resent" also keep the stash, so only a spy on the actual
+    // argument proves this passed "left-host".
+    const closeSpy = vi.spyOn(latestActions, "close")
     pathnameRef.current = "/settings"
     first.rerender(providerTree())
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expect(closeSpy).toHaveBeenCalledWith("left-host")
     expect(latestState.request).toBeNull()
     expect((latestState.payload as { clientMessageId: string } | null)?.clientMessageId).toBe("z")
     cleanup()
