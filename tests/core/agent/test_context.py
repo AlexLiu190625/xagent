@@ -1327,6 +1327,77 @@ def test_compact_with_llm_reports_dropped_tool_results_by_name() -> None:
     }
 
 
+def test_compact_with_llm_reports_the_calls_it_destroyed() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Build a KPI report")
+    call_ids = [f"call-search-{index}" for index in range(3)]
+    for call_id in call_ids:
+        ctx.add_assistant_message(
+            "",
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "web_search"},
+                }
+            ],
+        )
+        ctx.add_tool_result("web_search", {"output": "rows"}, call_id)
+
+    result = ctx.compact_with_llm_response({"content": "Collected KPI inputs."})
+
+    assert result.metadata["dropped_tool_result_call_ids"] == call_ids
+    assert result.metadata["dropped_tool_results_without_call_id"] == 0
+
+
+def test_an_observation_without_a_call_id_is_counted_not_named() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Run legacy tools")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "web_search"}}
+        ],
+    )
+    ctx.add_tool_result("web_search", {"output": "rows-a"}, None)
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-2", "type": "function", "function": {"name": "web_search"}}
+        ],
+    )
+    ctx.add_tool_result("web_search", {"output": "rows-b"}, "")
+
+    result = ctx.compact_with_llm_response({"content": "Ran legacy tools."})
+
+    assert result.metadata["dropped_tool_result_call_ids"] == []
+    assert result.metadata["dropped_tool_results_without_call_id"] == 2
+    assert result.metadata["dropped_tool_result_count"] == 2
+
+
+def test_an_excluded_observation_contributes_no_call_id() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Fetch the KPI rows")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-fail", "type": "function", "function": {"name": "web_search"}}
+        ],
+    )
+    ctx.add_tool_result(
+        "web_search", {"success": False, "error": "timeout"}, "call-fail"
+    )
+
+    result = ctx.compact_with_llm_response({"content": "Fetched rows."})
+
+    assert result.metadata["dropped_tool_result_call_ids"] == []
+    assert result.metadata["dropped_tool_results_without_call_id"] == 0
+    assert result.metadata["dropped_tool_result_count"] == 0
+
+
 def test_compact_with_llm_omits_tool_notice_without_tool_results() -> None:
     ctx = ExecutionContext()
     ctx.compact_config.threshold = 1
@@ -1659,6 +1730,29 @@ def test_compact_truncate_counts_dropped_tool_results() -> None:
 
     assert result.strategy == "truncate"
     assert result.metadata["dropped_tool_result_count"] == 1
+
+
+def test_compact_truncate_reports_the_calls_it_destroyed() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.compact_config.max_messages = 4
+    call_ids = [f"call-{index}" for index in range(2)]
+    for call_id in call_ids:
+        ctx.add_assistant_message(
+            "",
+            tool_calls=[
+                {"id": call_id, "type": "function", "function": {"name": "web_search"}}
+            ],
+        )
+        ctx.add_tool_result("web_search", {"output": "dropped rows"}, call_id)
+    for index in range(6):
+        ctx.add_user_message(f"tail-{index}")
+
+    result = ctx.compact_if_needed()
+
+    assert result.strategy == "truncate"
+    assert result.metadata["dropped_tool_result_call_ids"] == call_ids
+    assert result.metadata["dropped_tool_results_without_call_id"] == 0
 
 
 def test_compact_truncate_counts_tool_result_excised_from_window_interior() -> None:

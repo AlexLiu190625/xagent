@@ -290,6 +290,29 @@ class CompactResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class DroppedToolObservations:
+    """Tool observations one compaction destroys, counted and identified.
+
+    ``counts`` is per tool name and is exactly what the in-prompt dropped-
+    tool notice is built from. ``call_ids`` identifies the individual calls
+    behind those counts, so a consumer that later sees the same tool name
+    called again can tell a fresh call with different arguments from the
+    very call whose observation this was -- the tool name recurring is not
+    evidence that the lost value came back. ``without_call_id`` counts
+    destroyed observations that carried no ``tool_call_id`` at all, so
+    nothing identifies which call produced them. That is a real outcome
+    this type has to represent on its own, not an edge case to fold into
+    the other two fields: inventing an id for one of these observations, or
+    falling back to its tool name as if that identified the call, would
+    both claim knowledge the data does not carry.
+    """
+
+    counts: dict[str, int]
+    call_ids: tuple[str, ...]
+    without_call_id: int
+
+
 @dataclass
 class ExecutionContext:
     """Execution state plus pluggable runtime components."""
@@ -1395,7 +1418,7 @@ class ExecutionContext:
         # The window is a suffix minus any interior tool fragments sanitized
         # out of it, so diff by object identity rather than slicing a prefix.
         retained_ids = {id(message) for message in retained}
-        dropped_tool_counts = self._dropped_tool_result_counts(
+        dropped_observations = self._dropped_tool_observations(
             [message for message in self.messages if id(message) not in retained_ids]
         )
         self.messages = retained
@@ -1406,8 +1429,12 @@ class ExecutionContext:
             strategy="truncate",
             metadata={
                 "removed_count": removed,
-                "dropped_tool_result_count": sum(dropped_tool_counts.values()),
-                "dropped_tool_results_by_name": dropped_tool_counts,
+                "dropped_tool_result_count": sum(dropped_observations.counts.values()),
+                "dropped_tool_results_by_name": dropped_observations.counts,
+                "dropped_tool_result_call_ids": list(dropped_observations.call_ids),
+                "dropped_tool_results_without_call_id": (
+                    dropped_observations.without_call_id
+                ),
             },
         )
 
@@ -1454,8 +1481,10 @@ class ExecutionContext:
         # next_messages below keeps only the system summary and, at most, a
         # role=="user" message, so no tool observation survives: here the whole
         # list is the diff. truncate needs a real diff; this does not.
-        dropped_tool_counts = self._dropped_tool_result_counts(self.messages)
-        dropped_tools_notice = self._dropped_tool_results_notice(dropped_tool_counts)
+        dropped_observations = self._dropped_tool_observations(self.messages)
+        dropped_tools_notice = self._dropped_tool_results_notice(
+            dropped_observations.counts
+        )
         summary_content = (
             "Compacted conversation summary:\n"
             f"{summary}\n\n"
@@ -1500,8 +1529,16 @@ class ExecutionContext:
                 "compact_model": getattr(llm, "model_name", None),
                 "retained_context_ref_count": len(compacted_context_refs),
                 "dropped_context_ref_count": len(dropped_context_refs),
-                "dropped_tool_result_count": sum(dropped_tool_counts.values()),
-                "dropped_tool_results_by_name": dropped_tool_counts,
+                "dropped_tool_result_count": sum(dropped_observations.counts.values()),
+                "dropped_tool_results_by_name": dropped_observations.counts,
+                # Additive: the two keys above keep their existing meaning
+                # and count, so a reader that does not know about these two
+                # is unaffected. These identify the individual calls behind
+                # those counts.
+                "dropped_tool_result_call_ids": list(dropped_observations.call_ids),
+                "dropped_tool_results_without_call_id": (
+                    dropped_observations.without_call_id
+                ),
                 # The summary body itself, so a later turn can replay it
                 # without re-deriving it. This is the whole point of emitting
                 # it: the in-memory context holding it does not survive the
@@ -1590,8 +1627,8 @@ class ExecutionContext:
         return prefix + "\n".join(lines)
 
     @staticmethod
-    def _dropped_tool_result_counts(messages: list[Message]) -> dict[str, int]:
-        """Count tool observations whose raw result this compaction discards.
+    def _dropped_tool_observations(messages: list[Message]) -> DroppedToolObservations:
+        """Count and identify tool observations this compaction discards.
 
         Superseded observations are excluded: a later observation already
         replaced their content and ``raw_result``, so compacting them away
@@ -1604,6 +1641,8 @@ class ExecutionContext:
         restoring evidence.
         """
         names: list[str] = []
+        call_ids: list[str] = []
+        without_call_id = 0
         for message in messages:
             if message.role != "tool":
                 continue
@@ -1618,7 +1657,16 @@ class ExecutionContext:
             if name in NON_EVIDENCE_TOOL_NAMES:
                 continue
             names.append(name or "unnamed tool")
-        return dict(Counter(names))
+            call_id = message.tool_call_id
+            if isinstance(call_id, str) and call_id:
+                call_ids.append(call_id)
+            else:
+                without_call_id += 1
+        return DroppedToolObservations(
+            counts=dict(Counter(names)),
+            call_ids=tuple(call_ids),
+            without_call_id=without_call_id,
+        )
 
     @staticmethod
     def _dropped_tool_results_notice(counts: dict[str, int]) -> str:
