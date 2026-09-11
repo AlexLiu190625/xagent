@@ -67,6 +67,7 @@ from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services import task_command_execution as command_execution_service
+from ..services import task_start as task_start_service
 from ..services.assistant_history_safety import (
     assistant_history_has_safe_ancillary_payload,
     client_safe_assistant_history_content,
@@ -206,14 +207,6 @@ async def send_message_delivery(
         error_code=error_code,
         retry_with_new_id=retry_with_new_id,
         rejection_outcome=rejection_outcome,
-    )
-
-
-async def _handle_chat_message_unserialized(
-    websocket: WebSocket, task_id: int, message_data: dict
-) -> None:
-    await command_execution_service.handle_task_message(
-        _make_command_reply(websocket), task_id, message_data
     )
 
 
@@ -1490,8 +1483,9 @@ async def handle_chat_message(
         # Legacy recovery path for a client still connected to a task that was
         # deleted. The existing handler creates the replacement task first;
         # subsequent commands use the durable transport normally.
-        async with task_execution_controller.command(task_id):
-            await _handle_chat_message_unserialized(websocket, task_id, message_data)
+        await command_execution_service.handle_missing_task_message(
+            _make_command_reply(websocket), task_id, message_data
+        )
         return
     if not enqueued.payload_matches:
         await send_message_delivery(
@@ -1828,25 +1822,14 @@ async def handle_execute_task(
             request.task_id,
         )
 
-        from ..services.task_orchestrator import (
-            TaskTurnOrchestrator,
-            TaskTurnPayload,
-        )
-
-        background_task = await TaskTurnOrchestrator.schedule_existing_task_execution(
+        await task_start_service.execute_existing_task(
             task_id=request.task_id,
             task_owner_user_id=request.task_owner_user_id,
             task_source=request.task_source,
-            payload=TaskTurnPayload(
-                transcript_message=request.task_description,
-                execution_message=request.task_description,
-            ),
+            task_description=request.task_description,
             context=request.task_context,
             actor_user_id=actor_user_id,
         )
-        # The legacy command did not return until execution finished. Keep that
-        # ordering while the scheduled coroutine owns all runtime DB work.
-        await background_task
 
     except (
         MCPBuiltinOAuthActorPolicyRequiredError,

@@ -48,6 +48,7 @@ from xagent.web.models.task import (
     TraceEvent,
 )
 from xagent.web.models.user import User
+from xagent.web.services import task_start
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
     drop_ephemeral_runtime_values_for_testing,
@@ -1204,7 +1205,7 @@ def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
     mock_start_task,
 ) -> None:
     agent_id, full_key = _create_agent_with_key()
-    prepare_runtime_plan = v1_tasks.prepare_create_connector_runtime
+    prepare_runtime_plan = task_start.prepare_create_connector_runtime
 
     def prepare_mismatched_identity(**kwargs):
         plan = prepare_runtime_plan(**kwargs)
@@ -1214,7 +1215,7 @@ def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
         )
 
     monkeypatch.setattr(
-        v1_tasks,
+        task_start,
         "prepare_create_connector_runtime",
         prepare_mismatched_identity,
     )
@@ -1497,7 +1498,7 @@ def test_create_task_rolls_back_when_runtime_secret_store_fails(mock_start_task)
     )
 
     with patch(
-        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
         side_effect=RuntimeError("store failed for Bearer tenant-token"),
     ):
         resp = client.post(
@@ -1555,7 +1556,7 @@ def test_create_task_cleans_runtime_secret_when_schedule_fails(mock_start_task):
 
     with (
         patch(
-            "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+            "xagent.web.services.task_start.store_ephemeral_runtime_values",
             new=recording_store,
         ),
         patch(
@@ -2172,9 +2173,9 @@ def test_append_message_uses_persisted_task_owner_after_agent_owner_changes(
     mock_start_task.reset_mock()
 
     with patch.object(
-        v1_tasks.TaskTurnOrchestrator,
+        task_start.TaskTurnOrchestrator,
         "schedule_claimed_turn",
-        wraps=v1_tasks.TaskTurnOrchestrator.schedule_claimed_turn,
+        wraps=task_start.TaskTurnOrchestrator.schedule_claimed_turn,
     ) as schedule_claimed_turn:
         response = client.post(
             f"/v1/chat/tasks/{task_id}/messages",
@@ -2712,7 +2713,7 @@ def test_append_message_keeps_task_state_when_runtime_secret_store_fails(
     mock_start_task.reset_mock()
 
     with patch(
-        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
         side_effect=RuntimeError("store failed for Bearer append-token"),
     ):
         resp = client.post(
@@ -2787,7 +2788,7 @@ def test_append_message_does_not_store_runtime_secret_when_task_is_busy(
         store_ephemeral_runtime_values(turn_id, values_by_ref)
 
     with patch(
-        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
         new=recording_store,
     ):
         resp = client.post(

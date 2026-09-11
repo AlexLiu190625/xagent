@@ -1330,6 +1330,16 @@ def _prepare_task_message_sync(
         )
 
 
+async def handle_missing_task_message(
+    reply: CommandReply,
+    task_id: int,
+    message_data: dict,
+) -> None:
+    """Serialize replacement-task creation for a deleted-task connection."""
+    async with task_execution_controller.command(task_id):
+        await handle_task_message(reply, task_id, message_data)
+
+
 async def handle_task_message(
     reply: CommandReply, task_id: int, message_data: dict
 ) -> None:

@@ -29,6 +29,7 @@ import xagent.web.services.chat_history_service as chat_history_service_module
 import xagent.web.services.task_interaction_read as task_interaction_read_module
 import xagent.web.services.task_interaction_service as task_interaction_service_module
 import xagent.web.services.task_resume as task_resume_module
+import xagent.web.services.task_start as task_start_module
 
 pytestmark = pytest.mark.skipif(
     sys.version_info < (3, 11),
@@ -44,6 +45,7 @@ _IMPORT_GUARD_MODULES = {
     "chat_history_service.py": chat_history_service_module,
     "a2a.py": a2a_module,
     "task_resume.py": task_resume_module,
+    "task_start.py": task_start_module,
     # The tuple adapter and the fifth consumption point. Both are read
     # side: the adapter answers "what is this task asking" and the v1
     # snapshot builder consumes it, and neither may reach for the

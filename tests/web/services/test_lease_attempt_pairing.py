@@ -25,7 +25,12 @@ from pathlib import Path
 import pytest
 
 from xagent.web.api import a2a
-from xagent.web.services import task_lease_service, task_orchestrator, task_resume
+from xagent.web.services import (
+    task_lease_service,
+    task_orchestrator,
+    task_resume,
+    task_start,
+)
 
 LEASE_COLUMNS = frozenset({"runner_id", "lease_attempt_id"})
 
@@ -35,6 +40,7 @@ SUBJECT_MODULES = [
     task_lease_service,
     task_orchestrator,
     task_resume,
+    task_start,
     a2a,
 ]
 

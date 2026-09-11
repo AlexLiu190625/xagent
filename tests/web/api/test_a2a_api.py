@@ -35,9 +35,10 @@ from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import a2a_task_cancel as a2a_cancel_service
+from xagent.web.services import a2a_task_read
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
-from xagent.web.services import task_resume
+from xagent.web.services import task_resume, task_start
 from xagent.web.services.a2a_protocol import (
     A2A_MAX_MESSAGE_TEXT_LENGTH,
     A2AApiError,
@@ -456,7 +457,7 @@ def test_message_send_blocks_by_default_until_task_finishes() -> None:
         return object()
 
     with patch(
-        "xagent.web.api.a2a.TaskTurnOrchestrator.schedule_claimed_create_turn",
+        "xagent.web.services.task_start.TaskTurnOrchestrator.schedule_claimed_create_turn",
         new=_complete_turn,
     ):
         response = client.post(
@@ -693,7 +694,7 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
             "xagent.web.services.task_resume._schedule_waiting_a2a_resume"
         ) as schedule_resume,
         patch(
-            "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+            "xagent.web.services.task_start.TaskTurnOrchestrator.begin_turn",
             new=begin_turn,
         ),
     ):
@@ -947,7 +948,7 @@ def test_message_send_closes_the_legacy_resume_interaction_row_on_successful_inj
         ),
         patch("xagent.web.services.task_resume._schedule_waiting_a2a_resume"),
         patch(
-            "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+            "xagent.web.services.task_start.TaskTurnOrchestrator.begin_turn",
             new=begin_turn,
         ),
     ):
@@ -1035,7 +1036,7 @@ def test_message_send_skips_the_close_on_a_replayed_injection() -> None:
         ),
         patch("xagent.web.services.task_resume._schedule_waiting_a2a_resume"),
         patch(
-            "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+            "xagent.web.services.task_start.TaskTurnOrchestrator.begin_turn",
             new=AsyncMock(),
         ),
         patch(
@@ -1146,7 +1147,10 @@ def test_message_send_reads_the_interaction_row_before_injecting(
             return_value=agent_manager,
         ),
         patch("xagent.web.services.task_resume._schedule_waiting_a2a_resume"),
-        patch("xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn", new=AsyncMock()),
+        patch(
+            "xagent.web.services.task_start.TaskTurnOrchestrator.begin_turn",
+            new=AsyncMock(),
+        ),
         patch(
             "xagent.web.services.task_resume.active_interaction_id_sync",
             side_effect=record_read,
@@ -1243,10 +1247,12 @@ async def test_a2a_handover_restores_input_required_on_unreadable_checkpoint() -
         "xagent.web.services.agent_service_manager.get_agent_manager",
         return_value=agent_manager,
     ):
-        assert await a2a_api._resume_input_required_a2a_task(
+        assert await task_resume.resume_a2a_task(
             agent_id=agent_id,
             task_owner_user_id=owner_id,
-            task=snapshot,
+            task_id=snapshot.id,
+            previous_run_id=snapshot.run_id,
+            resumable_status=snapshot.status,
             text="follow up after handover",
             message_id="msg-handover",
         )
@@ -1325,7 +1331,7 @@ def test_recovered_paused_checkpoint_resumes_without_transcript_fallback() -> No
             "xagent.web.services.task_resume._schedule_waiting_a2a_resume"
         ) as schedule_resume,
         patch(
-            "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+            "xagent.web.services.task_start.TaskTurnOrchestrator.begin_turn",
             new=begin_turn,
         ),
     ):
@@ -1417,10 +1423,12 @@ async def test_untagged_checkpoint_is_not_resumed_without_an_exact_run() -> None
             return_value=agent_manager,
         ):
             with pytest.raises(A2AApiError) as exc_info:
-                await a2a_api._resume_input_required_a2a_task(
+                await a2a_api._start_a2a_turn(
                     agent_id=agent_id,
                     task_owner_user_id=int(agent.user_id),
-                    task=A2ATaskSnapshot.from_task(task),
+                    task_id=int(task.id),
+                    agent_execution_mode="balanced",
+                    context_id=None,
                     text="legacy follow up",
                     message_id="msg-legacy",
                 )
@@ -1471,7 +1479,7 @@ def test_checkpoint_resume_rejects_duplicate_request_while_exact_lease_is_live()
             "xagent.web.services.agent_service_manager.get_agent_manager",
         ) as get_agent_manager,
         patch(
-            "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+            "xagent.web.services.task_start.TaskTurnOrchestrator.begin_turn",
             new=begin_turn,
         ),
     ):
@@ -1525,7 +1533,7 @@ def test_failed_follow_up_restores_input_required_status() -> None:
             return_value=agent_manager,
         ),
         patch(
-            "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+            "xagent.web.services.task_start.TaskTurnOrchestrator.begin_turn",
             side_effect=TaskTurnError("busy"),
         ),
     ):
@@ -2146,8 +2154,8 @@ async def test_stream_artifact_updates_are_incremental_and_finalize(
 
     monkeypatch.setattr(a2a_api.asyncio, "sleep", no_sleep)
     monkeypatch.setattr(
-        a2a_api,
-        "_fetch_fresh_a2a_task",
+        a2a_task_read,
+        "_load_a2a_task_snapshot_sync",
         lambda _agent_id, _task_id: next(fresh_tasks),
     )
 
@@ -2202,7 +2210,7 @@ async def test_a2a_poll_pool_wait_does_not_block_event_loop(
         db.commit()
 
     held_connection = engine.connect()
-    monkeypatch.setattr(a2a_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(a2a_task_read, "get_session_local", lambda: SessionLocal)
     ticker_stop = asyncio.Event()
     ticks = 0
 
@@ -2213,7 +2221,7 @@ async def test_a2a_poll_pool_wait_does_not_block_event_loop(
             await asyncio.sleep(0.01)
 
     with gated_pool_checkout(engine) as gate:
-        fetch_task = asyncio.create_task(a2a_api._fetch_fresh_a2a_task_isolated(7, 101))
+        fetch_task = asyncio.create_task(a2a_task_read.load_a2a_task_snapshot(7, 101))
         ticker_task = asyncio.create_task(ticker())
         try:
             await gate.wait_until_contending()
@@ -2371,7 +2379,7 @@ async def test_subscribe_closes_loader_session_before_returning_stream(
         )
         db.commit()
     session_closed.clear()
-    monkeypatch.setattr(a2a_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(a2a_task_read, "get_session_local", lambda: SessionLocal)
     agent = a2a_api.AgentPrincipalSnapshot(
         id=7,
         user_id=1,
@@ -2406,12 +2414,12 @@ async def test_start_a2a_turn_cancellation_drains_atomic_create_into_scheduling(
     finally:
         db.close()
 
-    original_prepare = a2a_api._prepare_a2a_turn_sync
+    original_prepare = task_start._prepare_a2a_turn_sync
     preparation_committed = Event()
     allow_preparation_return = Event()
     prepared_task_ids: list[int] = []
 
-    def delayed_prepare(**kwargs: object) -> a2a_api._A2ATurnPreparation:
+    def delayed_prepare(**kwargs: object) -> task_start._A2ATurnPreparation:
         preparation = original_prepare(**kwargs)
         prepared_task_ids.append(preparation.task.id)
         preparation_committed.set()
@@ -2429,10 +2437,10 @@ async def test_start_a2a_turn_cancellation_drains_atomic_create_into_scheduling(
 
         return MagicMock(background_task=asyncio.create_task(noop()))
 
-    monkeypatch.setattr(a2a_api, "_prepare_a2a_turn_sync", delayed_prepare)
-    monkeypatch.setattr(a2a_api.TaskTurnOrchestrator, "begin_turn", begin_turn)
+    monkeypatch.setattr(task_start, "_prepare_a2a_turn_sync", delayed_prepare)
+    monkeypatch.setattr(task_start.TaskTurnOrchestrator, "begin_turn", begin_turn)
     monkeypatch.setattr(
-        a2a_api.TaskTurnOrchestrator,
+        task_start.TaskTurnOrchestrator,
         "schedule_claimed_create_turn",
         schedule_claimed_create_turn,
     )
@@ -3077,7 +3085,7 @@ async def test_direct_cancel_atomically_clears_execution_lease() -> None:
         "xagent.web.services.task_execution.background_task_manager.cancel_task",
         new=AsyncMock(return_value=MagicMock(requested=False)),
     ):
-        async with a2a_api.task_execution_controller.command(task_id):
+        async with task_start.task_execution_controller.command(task_id):
             await a2a_cancel_service.cancel_a2a_task(
                 task_id=task_id,
                 agent_id=agent_id,
@@ -3275,7 +3283,7 @@ async def test_cancel_does_not_overwrite_a_concurrent_completion() -> None:
             new=AsyncMock(side_effect=complete_during_cancel),
         ):
             with pytest.raises(a2a_cancel_service.StaleTaskRunError):
-                async with a2a_api.task_execution_controller.command(task_id):
+                async with task_start.task_execution_controller.command(task_id):
                     await a2a_cancel_service.cancel_a2a_task(
                         task_id=task_id,
                         agent_id=agent_id,
