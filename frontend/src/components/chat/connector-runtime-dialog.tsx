@@ -316,7 +316,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
 
     if (alsoResend) {
       const sent = await doResend()
-      if (!aliveRef.current || requestRef.current.seq !== seqAtStart) return
+      if (!aliveRef.current) return
+      if (requestRef.current.seq !== seqAtStart) {
+        // Same reason as the earlier seq check: a newer request retargeted
+        // this dialog instance while the resend was in flight, so this
+        // result is stale, but `submitting` must still reset.
+        setSubmitting(false)
+        return
+      }
       if (!sent) {
         setSubmitting(false)
         setSendFailed(true)

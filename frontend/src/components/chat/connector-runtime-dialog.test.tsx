@@ -350,6 +350,30 @@ describe("keeps drafts and the snapshot when re-requested while open", () => {
     await act(async () => { resolveSave(ok(report(true, []))) })
     fireEvent.click(screen.getByRole("button", { name: "Close" }))
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    cleanup()
+    fetchMock.mockClear()
+
+    // The save half of a save-and-resend settles, then the resend it
+    // triggers is still in flight when the task is re-requested: submitting
+    // must still reset once that stale resend settles, or the dialog stays
+    // stuck exactly like the save-only case above.
+    fetchMock.mockResolvedValueOnce(tokenReport)
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-5", text: "keep me" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    let resolveSend: () => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((res) => { resolveSend = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
+    fetchMock.mockResolvedValueOnce(tokenReport)
+    await openForTask() // retargets this same dialog instance mid-resend
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await act(async () => { resolveSend() })
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
+    fireEvent.click(screen.getByRole("button", { name: "Close" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
   })
 })
 
@@ -555,6 +579,31 @@ describe("resends the snapshot under a fresh id", () => {
     const closeOrder = closeSpy.mock.invocationCallOrder[closeSpy.mock.invocationCallOrder.length - 1]
     expect(sendOrder).toBeLessThan(closeOrder)
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    cleanup()
+    sendMessageMock.mockClear()
+    submitMock.mockClear()
+
+    // A hung resend must not fire twice from a double click on the retry
+    // button.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-4", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(new Error("closed"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    sendMessageMock.mockClear()
+    let resolveRetry: () => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((res) => { resolveRetry = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await act(async () => { resolveRetry() })
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
   })
 })
 
