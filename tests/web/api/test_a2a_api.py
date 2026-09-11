@@ -1788,6 +1788,58 @@ def _resume_error_task(agent_id: int, *, context_id: str) -> int:
         db.close()
 
 
+def test_resume_lease_contention_preserves_the_a2a_error() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    _resume_error_task(agent_id, context_id="ctx-resume-busy-filler")
+    task_id = _resume_error_task(agent_id, context_id="ctx-resume-busy")
+    assert task_id != agent_id
+
+    with patch.object(
+        task_resume, "_acquire_a2a_resume_prelease_sync", return_value=None
+    ) as acquire:
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-resume-busy",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "retry safely"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    acquire.assert_called_once_with(
+        task_id=task_id,
+        agent_id=agent_id,
+        resumable_status=TaskStatus.WAITING_FOR_USER,
+        previous_run_id=None,
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == {
+        "code": 400,
+        "status": "FAILED_PRECONDITION",
+        "message": "Task is currently running and cannot accept a new message.",
+        "details": [
+            {
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "UNSUPPORTED_OPERATION",
+                "domain": "a2a-protocol.org",
+                "metadata": {"taskId": str(task_id)},
+            }
+        ],
+    }
+
+    db = _direct_db_session()
+    try:
+        recovered = db.query(Task).filter(Task.id == task_id).one()
+        assert recovered.status == TaskStatus.WAITING_FOR_USER
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize(
     ("error", "expected_status"),
     [
@@ -1884,15 +1936,23 @@ def test_checkpoint_access_refused_reuses_existing_running_task_message() -> Non
 
 
 @pytest.mark.parametrize(
-    ("reason", "unexpected_phrase"),
+    ("reason", "expected_message"),
     [
-        ("lease_mismatch", "currently running"),
-        ("superseded_legacy", "currently running"),
+        (
+            "lease_mismatch",
+            "This task is currently owned by a different execution "
+            "and cannot accept a new message.",
+        ),
+        (
+            "superseded_legacy",
+            "This task's checkpoint history has been superseded by "
+            "a newer run and cannot accept a new message.",
+        ),
     ],
 )
 def test_checkpoint_access_refused_reason_gets_a_distinct_message(
     reason: str,
-    unexpected_phrase: str,
+    expected_message: str,
 ) -> None:
     """Only the ``active_run`` reason reuses the pre-existing 'currently
     running' message; the other two refusal reasons are distinct facts
@@ -1926,8 +1986,19 @@ def test_checkpoint_access_refused_reason_gets_a_distinct_message(
         )
 
     assert response.status_code == 400, response.text
-    message = response.json()["error"]["message"]
-    assert unexpected_phrase not in message
+    assert response.json()["error"] == {
+        "code": 400,
+        "status": "FAILED_PRECONDITION",
+        "message": expected_message,
+        "details": [
+            {
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "UNSUPPORTED_OPERATION",
+                "domain": "a2a-protocol.org",
+                "metadata": {"taskId": str(task_id)},
+            }
+        ],
+    }
     db = _direct_db_session()
     try:
         recovered = db.query(Task).filter(Task.id == task_id).one()

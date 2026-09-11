@@ -830,6 +830,11 @@ async def resume_task_reply(ctx: TaskReplyInput) -> TaskReplyResumeResult:
     rejection semantics; the subsequent conditional claim checks current state.
     """
     task_id = ctx.task_id
+    # RUNNING is transient: a turn is in flight, so retrying later can
+    # succeed (task_busy). Other non-waiting states have no interaction to
+    # answer (no_pending_interaction). For PAUSED / COMPLETED / FAILED,
+    # callers should append a new turn. PENDING cannot accept an append
+    # yet; callers must wait for the task to leave that state.
     if ctx.status != TaskStatus.WAITING_FOR_USER:
         if ctx.status == TaskStatus.RUNNING:
             raise TaskResumeBusyError
