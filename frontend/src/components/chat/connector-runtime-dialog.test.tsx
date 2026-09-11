@@ -469,6 +469,14 @@ async function openSimpleDialog(taskId = 1, withStash = true) {
 describe("clears the stash when the dialog closes", () => {
   it("clears the stash when the dialog closes", async () => {
     await openSimpleDialog()
+    // A fresh delivery lands for this task while the dialog is already open
+    // (its own stash was already claimed into the request on open, so this
+    // is the only way to put a non-null payload in front of the close click
+    // below -- without it this assertion would pass even if closing stopped
+    // clearing the stash).
+    await act(async () => {
+      latestActions.recordDelivery({ taskId: 1, clientMessageId: "late-clean", text: "hi" })
+    })
     fireEvent.click(screen.getByRole("button", { name: "Close" }))
     await waitFor(() => expect(latestState).toEqual({ request: null, payload: null }))
     cleanup()
@@ -508,6 +516,13 @@ describe("clears the stash when the dialog closes", () => {
 describe("drops the stash and request of a task switched away from", () => {
   it("drops the stash and request of a task switched away from", async () => {
     await openSimpleDialog(1)
+    // A fresh delivery for the same task after the original stash was
+    // already claimed into the request on open -- without this, `payload`
+    // would already be null before the switch below, and this assertion
+    // would pass even if switching tasks stopped narrowing the stash.
+    await act(async () => {
+      latestActions.recordDelivery({ taskId: 1, clientMessageId: "still-here", text: "hi" })
+    })
     await act(async () => { latestActions.retainOnlyTask(2) })
     expect(latestState).toEqual({ request: null, payload: null })
   })
@@ -826,17 +841,20 @@ describe("does not open off the host routes", () => {
 
 describe("does nothing after unmount when a request settles", () => {
   it("does nothing after unmount when a request settles", async () => {
-    // POST in flight when the tree unmounts: resolving it afterward does nothing.
+    // POST in flight when the tree unmounts: resolving it afterward does
+    // nothing. Uses a resend snapshot and "save and resend" (not "save
+    // only") so a broken alive-after-unmount guard would show up as a
+    // spurious sendMessage call, not just a same-outcome no-op.
     fetchMock.mockResolvedValueOnce(ok(report(false, [
       connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
     ])))
     let resolveSubmit: (v: unknown) => void = () => {}
     submitMock.mockReturnValueOnce(new Promise((res) => { resolveSubmit = res }))
     const first = render(<ConnectorRuntimeDialogProvider><Probe /></ConnectorRuntimeDialogProvider>)
-    await openForTask()
+    await recordThenOpen({ taskId: 1, clientMessageId: "unmount-guard", text: "hi" })
     await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
     fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
-    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
     first.rerender(<ConnectorRuntimeDialogProvider><Probe mounted={false} /></ConnectorRuntimeDialogProvider>)
     sendMessageMock.mockClear()
     await act(async () => { resolveSubmit(ok(report(true, []))) })
