@@ -29,13 +29,18 @@ SENSITIVE_QUERY_KEYS = {
 }
 
 URL_PATTERN = re.compile(r"https?://[^\s\"'>]+")
-# Every ``identifier=value`` assignment in the text; ``_is_credential_key``
-# decides which of them carry a secret. The regex itself stays linear: a
-# single identifier run followed by ``=``, anchored on a non-identifier
-# boundary, so a long run of ``a_a_a_...`` without ``=`` fails once per run
-# instead of re-trying every segment split (a nested ``(prefix_)*word``
-# quantifier did that and took seconds on a 20 kB hostile message).
-ASSIGNMENT_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]+)=([^&\s]+)")
+# Every ``identifier=`` in the text; ``_is_credential_key`` decides which
+# identifiers name a secret. Only a credential's value is consumed
+# (``_ASSIGNMENT_VALUE_PATTERN``: up to ``&`` or whitespace). After any other
+# identifier the scan resumes right behind its ``=``, so a credential that
+# follows it without a space (``host=db;password=...``) is still judged on
+# its own. The regex itself stays linear: a single identifier run followed
+# by ``=``, anchored on a non-identifier boundary, so a long run of
+# ``a_a_a_...`` without ``=`` fails once per run instead of re-trying every
+# segment split (a nested ``(prefix_)*word`` quantifier did that and took
+# seconds on a 20 kB hostile message).
+ASSIGNMENT_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]+)=")
+_ASSIGNMENT_VALUE_PATTERN = re.compile(r"[^&\s]+")
 # A credential word may sit behind an identifier prefix (``MCP_API_KEY=``,
 # ``SERVICE_ACCESS_TOKEN=``, ``DB_PASSWORD=``), so a key is a credential when it
 # ends in one of these words and the word is the whole key or is joined to
@@ -107,7 +112,7 @@ def _is_credential_key(key: str) -> bool:
             # Bare word, or a CLI-style flag such as ``--api-key=``.
             return True
         if prefix[-1] not in "_-":
-            # ``monkey=`` / ``hotkey=`` / ``tokens=``: the credential word is
+            # ``monkey=`` / ``hotkey=`` / ``mytoken=``: the credential word is
             # not a separate segment of the identifier.
             continue
         exempt = _NON_CREDENTIAL_QUALIFIERS_BY_SUFFIX.get(suffix)
@@ -119,11 +124,25 @@ def _is_credential_key(key: str) -> bool:
     return False
 
 
-def _redact_assignment(match: "re.Match[str]") -> str:
-    key, value = match.group(1), match.group(2)
-    if not _is_credential_key(key):
-        return match.group(0)
-    return f"{key}={_mask_secret(value)}"
+def _redact_assignments(text: str) -> str:
+    # Values are read only for credentials and never overlap, and finditer
+    # tries each position once, so every character is examined a constant
+    # number of times however many ``identifier=`` runs the text holds.
+    parts: list[str] = []
+    copied = 0
+    for match in ASSIGNMENT_PATTERN.finditer(text):
+        if match.start() < copied or not _is_credential_key(match.group(1)):
+            # Inside a value already masked, or not a credential: leave the
+            # text as it is and keep scanning right after this ``=``.
+            continue
+        value = _ASSIGNMENT_VALUE_PATTERN.match(text, match.end())
+        if value is None:
+            continue
+        parts.append(text[copied : match.end()])
+        parts.append(_mask_secret(value.group(0)))
+        copied = value.end()
+    parts.append(text[copied:])
+    return "".join(parts)
 
 
 AUTH_HEADER_PATTERN = re.compile(
@@ -432,7 +451,8 @@ def redact_sensitive_text(text: str) -> str:
     ``identifier=value`` assignments whose identifier ``_is_credential_key``
     accepts, and the header shapes in ``AUTH_HEADER_PATTERN`` and
     ``HEADER_KEY_PATTERNS``. Shapes it is known to miss are listed in
-    #2356; add a pattern here when a new one turns up.
+    #2356, and secrets in URL path segments in #2272; add a pattern here
+    when a new one turns up.
     """
     if not text:
         return text
@@ -441,7 +461,7 @@ def redact_sensitive_text(text: str) -> str:
         lambda match: redact_url_credentials_for_logging(match.group(0)),
         text,
     )
-    redacted = ASSIGNMENT_PATTERN.sub(_redact_assignment, redacted)
+    redacted = _redact_assignments(redacted)
     redacted = AUTH_HEADER_PATTERN.sub(
         lambda match: f"{match.group(1)}{_mask_secret(match.group(2))}",
         redacted,

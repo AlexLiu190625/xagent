@@ -766,8 +766,8 @@ def _truncated_error_message(exc: BaseException) -> str:
     string or an HTTP status line) -- it must never be additionally handed
     tool_args, tool_meta, or connection headers, none of which are
     exception messages to begin with. Some shapes are recognised by neither
-    helper -- a secret in a URL path segment (#2272) and the others listed in
-    #2356 -- and for those the cap is what bounds the exposure.
+    helper -- a secret in a URL path segment (#2272) and some of the shapes
+    listed in #2356 -- and for those the cap is what bounds the exposure.
     """
     try:
         text = redact_sensitive_text(redact_urls_in_text(str(exc)))
@@ -1560,7 +1560,7 @@ class MCPToolAdapter(AbstractBaseTool):
         # only _truncated_error_message() output -- passed through
         # redact_urls_in_text and redact_sensitive_text and capped per line --
         # and never a traceback, so do not add exc_info here. Shapes neither
-        # helper recognises: #2272, #2356.
+        # helper recognises: #2272 and some of those listed in #2356.
         except BaseExceptionGroup as e:
             logger.error(
                 "MCP tool %s execution failed with exception group %s: %s",

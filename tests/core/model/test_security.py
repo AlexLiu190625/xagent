@@ -454,3 +454,71 @@ def test_redact_sensitive_text_is_linear_on_hostile_identifier_runs() -> None:
     started = time.perf_counter()
     assert redact_sensitive_text(hostile) == hostile
     assert time.perf_counter() - started < 1.0
+
+
+# Assignments that are not credentials, and characters that can sit between
+# one of them and a credential right behind it: first the ones that do not
+# end a value, then the three that do. The non-credential assignment must
+# not take its value with it, or the credential is never looked at.
+_NON_CREDENTIAL_ASSIGNMENTS = (
+    "host=example.com",
+    "Username=app",
+    "error=invalid_request",
+    "code=400",
+    "primary_key=42",
+    "next_token=CUR",
+    "page_token=p1",
+)
+_ASSIGNMENT_SEPARATORS = tuple(";,|\"':/)]}=") + ("\t", "&", " ")
+_TRAILING_CREDENTIAL_KEYS = (
+    "api_key",
+    "access_token",
+    "Password",
+    "token",
+    "MCP_API_KEY",
+)
+
+
+@pytest.mark.parametrize("separator", _ASSIGNMENT_SEPARATORS, ids=repr)
+def test_redact_sensitive_text_masks_a_credential_after_a_non_credential_one(
+    separator: str,
+) -> None:
+    for prefix in _NON_CREDENTIAL_ASSIGNMENTS:
+        for key in _TRAILING_CREDENTIAL_KEYS:
+            text = f"{prefix}{separator}{key}=SECRET-abc123"
+
+            assert redact_sensitive_text(text) == (
+                f"{prefix}{separator}{key}=***c123"
+            ), text
+
+
+def test_redact_sensitive_text_masks_a_credential_value_as_one_piece() -> None:
+    # A credential's value runs to the next ``&`` or whitespace, so it can
+    # take a following field with it (#2356); a credential inside that value
+    # is covered by the same mask and is not masked a second time.
+    assert (
+        redact_sensitive_text("Host=db;Username=app;Password=SECRET-pw;Database=x")
+        == "Host=db;Username=app;Password=***se=x"
+    )
+    assert (
+        redact_sensitive_text("api_key=SECRET-abc123;token=SECRET-def456 rest")
+        == "api_key=***f456 rest"
+    )
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    ["a=" * 50_000, "a=b;" * 25_000, "x_" * 50_000 + "=v", "api_key=" * 12_500],
+    ids=["bare-assignments", "semicolon-assignments", "one-long-key", "credentials"],
+)
+def test_redact_sensitive_text_is_linear_on_hostile_assignment_runs(
+    hostile: str,
+) -> None:
+    # 100 kB of back-to-back ``identifier=`` from a remote service. The scan
+    # resumes right after a non-credential's ``=`` and reads a value only for
+    # a credential, so this takes milliseconds; re-reading each value to the
+    # end of the text after every identifier takes seconds here. The budget
+    # is loose so a slow CI worker cannot trip it.
+    started = time.perf_counter()
+    redact_sensitive_text(hostile)
+    assert time.perf_counter() - started < 1.0
