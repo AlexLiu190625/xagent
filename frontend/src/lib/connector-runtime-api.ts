@@ -287,8 +287,12 @@ export type ConnectorRuntimeErrorMessageKey =
 export interface ConnectorRuntimeFailureDisposition {
   messageKey: ConnectorRuntimeErrorMessageKey
   retry: boolean
+  // Whether the dialog should re-read the report before the next submit. A
+  // conflict disposition sets this because the stored value moved out from
+  // under the user; the next `buildSubmitItems(refreshedReport, drafts)` call
+  // already drops any key the refreshed report now reports satisfied, so no
+  // separate "drop the keys the retry no longer needs" field is needed here.
   refresh: boolean
-  dropSatisfiedOnRetry: boolean
   locate: ConnectorRuntimeFailureLocation
 }
 
@@ -314,7 +318,6 @@ const GENERIC_DISPOSITION: ConnectorRuntimeFailureDisposition = {
   messageKey: "contactAdmin",
   retry: false,
   refresh: false,
-  dropSatisfiedOnRetry: false,
   locate: {},
 }
 
@@ -336,7 +339,7 @@ export function classifySubmitFailure(
   report: ConnectorRuntimeReport,
 ): ConnectorRuntimeFailureDisposition {
   if (outcome.kind === "transport") {
-    return { messageKey: "network", retry: true, refresh: false, dropSatisfiedOnRetry: false, locate: {} }
+    return { messageKey: "network", retry: true, refresh: false, locate: {} }
   }
 
   if (outcome.kind === "http") return GENERIC_DISPOSITION
@@ -347,7 +350,7 @@ export function classifySubmitFailure(
   const { status, code, reason, connectorRef } = outcome
 
   if (status === 503 && code === "connector_runtime_unavailable" && reason === undefined) {
-    return { messageKey: "busyRetry", retry: true, refresh: false, dropSatisfiedOnRetry: false, locate: {} }
+    return { messageKey: "busyRetry", retry: true, refresh: false, locate: {} }
   }
   // Any 503 with a reason key present (including an empty string) is treated
   // uniformly: the one case this client mints on purpose
@@ -362,7 +365,7 @@ export function classifySubmitFailure(
     && reason.startsWith(CONFLICT_CONTEXT_PREFIX)
   ) {
     const key = reason.slice(CONFLICT_CONTEXT_PREFIX.length)
-    return { messageKey: "conflict", retry: false, refresh: true, dropSatisfiedOnRetry: true, locate: { connectorRef, key } }
+    return { messageKey: "conflict", retry: false, refresh: true, locate: { connectorRef, key } }
   }
 
   if (status === 400 && code === "invalid_runtime_context" && reason !== undefined) {
@@ -373,27 +376,26 @@ export function classifySubmitFailure(
         messageKey: declaredType === "object" ? "typeObject" : "typeString",
         retry: false,
         refresh: false,
-        dropSatisfiedOnRetry: false,
         locate: { connectorRef, key },
       }
     }
     if (reason.startsWith(EMPTY_VALUE_CONTEXT_PREFIX)) {
       const key = reason.slice(EMPTY_VALUE_CONTEXT_PREFIX.length)
-      return { messageKey: "emptyValue", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: { connectorRef, key } }
+      return { messageKey: "emptyValue", retry: false, refresh: false, locate: { connectorRef, key } }
     }
     if (reason === KEY_NAME_REJECTED_REASON) {
       // The response never carries the offending key -- only which
       // connector it belongs to -- so this cannot locate a specific row.
-      return { messageKey: "keyNameRejected", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: { connectorRef } }
+      return { messageKey: "keyNameRejected", retry: false, refresh: false, locate: { connectorRef } }
     }
     if (reason === "undeclared_context_key") {
-      return { messageKey: "configChanged", retry: false, refresh: true, dropSatisfiedOnRetry: false, locate: { connectorRef } }
+      return { messageKey: "configChanged", retry: false, refresh: true, locate: { connectorRef } }
     }
     if (reason === "connector_not_selected") {
-      return { messageKey: "notInSession", retry: false, refresh: true, dropSatisfiedOnRetry: false, locate: { connectorRef } }
+      return { messageKey: "notInSession", retry: false, refresh: true, locate: { connectorRef } }
     }
     if (reason === "payload_too_large") {
-      return { messageKey: "tooLarge", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: { connectorRef } }
+      return { messageKey: "tooLarge", retry: false, refresh: false, locate: { connectorRef } }
     }
     if ((CONNECTOR_RUNTIME_KNOWN_REASONS as readonly string[]).includes(reason)) {
       // empty_items / empty_item_payload / duplicate_ref: shapes this
@@ -403,7 +405,7 @@ export function classifySubmitFailure(
   }
 
   if (status === 404 && code === "connector_not_found") {
-    return { messageKey: "connectorUnavailable", retry: false, refresh: true, dropSatisfiedOnRetry: false, locate: { connectorRef } }
+    return { messageKey: "connectorUnavailable", retry: false, refresh: true, locate: { connectorRef } }
   }
 
   // Closed set exhausted: an unrecognized code, a reason outside every
@@ -570,6 +572,11 @@ export function buildSubmitItems(
           continue
         }
         if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue
+        // An empty object is the object-draft equivalent of a blank string:
+        // the server's own blank check (`not value` for an object-typed
+        // context field) treats `{}` as empty and 400s the whole submission,
+        // taking every other filled-in key in the same batch down with it.
+        if (Object.keys(parsed).length === 0) continue
         context[input.key] = parsed
       }
     }

@@ -16,6 +16,7 @@ import {
   resolveDialogActions,
   resolveDialogOutcome,
   type ConnectorRuntimeConnector,
+  type ConnectorRuntimeErrorMessageKey,
   type ConnectorRuntimeInput,
   type ConnectorRuntimeReport,
   type ConnectorRuntimeSection,
@@ -132,19 +133,18 @@ describe("buildSubmitItems", () => {
     }
     expect(buildSubmitItems(r, tabDrafts)).toEqual([])
 
+    // An empty object is treated the same as a blank string: the server's
+    // own blank check on an object-typed field is `not value`, and `{}`
+    // fails it, so a submission that includes it 400s the whole batch.
     const emptyObjectDrafts: Record<string, string> = {
       [connectorRuntimeInputDraftKey(REF_A, "objKey")]: "{}",
     }
-    expect(buildSubmitItems(r, emptyObjectDrafts)).toEqual([
-      { connector_ref: REF_A, context: { objKey: {} } },
-    ])
+    expect(buildSubmitItems(r, emptyObjectDrafts)).toEqual([])
 
     const paddedEmptyObjectDrafts: Record<string, string> = {
       [connectorRuntimeInputDraftKey(REF_A, "objKey")]: "  {}  ",
     }
-    expect(buildSubmitItems(r, paddedEmptyObjectDrafts)).toEqual([
-      { connector_ref: REF_A, context: { objKey: {} } },
-    ])
+    expect(buildSubmitItems(r, paddedEmptyObjectDrafts)).toEqual([])
 
     const validDrafts: Record<string, string> = {
       [connectorRuntimeInputDraftKey(REF_A, "unsatisfiedKey")]: "a",
@@ -174,68 +174,80 @@ describe("classifySubmitFailure", () => {
 
   it("maps every write failure shape to exactly one disposition", () => {
     expect(CONNECTOR_RUNTIME_KNOWN_REASONS).toHaveLength(6)
+    // Binds every member of the constant to the disposition it actually
+    // produces -- a `Record` keyed by the constant's own member type, so
+    // adding a reason to CONNECTOR_RUNTIME_KNOWN_REASONS without adding its
+    // row here is a type error, not a silently-passing loop.
+    const messageKeyByKnownReason: Record<(typeof CONNECTOR_RUNTIME_KNOWN_REASONS)[number], ConnectorRuntimeErrorMessageKey> = {
+      empty_items: "contactAdmin",
+      empty_item_payload: "contactAdmin",
+      payload_too_large: "tooLarge",
+      duplicate_ref: "contactAdmin",
+      connector_not_selected: "notInSession",
+      undeclared_context_key: "configChanged",
+    }
     for (const reason of CONNECTOR_RUNTIME_KNOWN_REASONS) {
-      // Every known reason must appear in at least one row below; this walk
-      // just proves each one classifies to a disposition without throwing.
-      expect(() => classifySubmitFailure(coded(400, "invalid_runtime_context", reason, REF_A), baseReport)).not.toThrow()
+      expect(classifySubmitFailure(coded(400, "invalid_runtime_context", reason, REF_A), baseReport).messageKey).toBe(
+        messageKeyByKnownReason[reason],
+      )
     }
 
     expect(classifySubmitFailure({ ok: false, kind: "transport" }, baseReport)).toEqual({
-      messageKey: "network", retry: true, refresh: false, dropSatisfiedOnRetry: false, locate: {},
+      messageKey: "network", retry: true, refresh: false, locate: {},
     })
     expect(classifySubmitFailure(coded(503, "connector_runtime_unavailable"), baseReport)).toEqual({
-      messageKey: "busyRetry", retry: true, refresh: false, dropSatisfiedOnRetry: false, locate: {},
+      messageKey: "busyRetry", retry: true, refresh: false, locate: {},
     })
     for (const reason of ["team_scope_resolution_failed", "", "unknown"]) {
       expect(classifySubmitFailure(coded(503, "connector_runtime_unavailable", reason), baseReport)).toEqual({
-        messageKey: "contactAdmin", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: {},
+        messageKey: "contactAdmin", retry: false, refresh: false, locate: {},
       })
     }
     expect(classifySubmitFailure(coded(409, "runtime_context_immutable", "conflict.context.token", REF_A), baseReport)).toEqual({
-      messageKey: "conflict", retry: false, refresh: true, dropSatisfiedOnRetry: true, locate: { connectorRef: REF_A, key: "token" },
+      messageKey: "conflict", retry: false, refresh: true, locate: { connectorRef: REF_A, key: "token" },
     })
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", "type_mismatch.context.config", REF_A), baseReport)).toEqual({
-      messageKey: "typeObject", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: { connectorRef: REF_A, key: "config" },
+      messageKey: "typeObject", retry: false, refresh: false, locate: { connectorRef: REF_A, key: "config" },
     })
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", "type_mismatch.context.token", REF_A), baseReport)).toEqual({
-      messageKey: "typeString", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: { connectorRef: REF_A, key: "token" },
+      messageKey: "typeString", retry: false, refresh: false, locate: { connectorRef: REF_A, key: "token" },
     })
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", "empty_value.context.token", REF_A), baseReport)).toEqual({
-      messageKey: "emptyValue", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: { connectorRef: REF_A, key: "token" },
+      messageKey: "emptyValue", retry: false, refresh: false, locate: { connectorRef: REF_A, key: "token" },
     })
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", KEY_NAME_REJECTED_REASON, REF_A), baseReport)).toEqual({
-      messageKey: "keyNameRejected", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: { connectorRef: REF_A },
+      messageKey: "keyNameRejected", retry: false, refresh: false, locate: { connectorRef: REF_A },
     })
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", "undeclared_context_key", REF_A), baseReport)).toEqual({
-      messageKey: "configChanged", retry: false, refresh: true, dropSatisfiedOnRetry: false, locate: { connectorRef: REF_A },
+      messageKey: "configChanged", retry: false, refresh: true, locate: { connectorRef: REF_A },
     })
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", "connector_not_selected", REF_A), baseReport)).toEqual({
-      messageKey: "notInSession", retry: false, refresh: true, dropSatisfiedOnRetry: false, locate: { connectorRef: REF_A },
+      messageKey: "notInSession", retry: false, refresh: true, locate: { connectorRef: REF_A },
     })
     expect(classifySubmitFailure(coded(404, "connector_not_found", undefined, REF_A), baseReport)).toEqual({
-      messageKey: "connectorUnavailable", retry: false, refresh: true, dropSatisfiedOnRetry: false, locate: { connectorRef: REF_A },
+      messageKey: "connectorUnavailable", retry: false, refresh: true, locate: { connectorRef: REF_A },
     })
     expect(classifySubmitFailure(coded(404, "connector_not_found"), baseReport)).toEqual({
-      messageKey: "connectorUnavailable", retry: false, refresh: true, dropSatisfiedOnRetry: false, locate: {},
+      messageKey: "connectorUnavailable", retry: false, refresh: true, locate: {},
     })
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", "payload_too_large", REF_A), baseReport)).toEqual({
-      messageKey: "tooLarge", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: { connectorRef: REF_A },
+      messageKey: "tooLarge", retry: false, refresh: false, locate: { connectorRef: REF_A },
     })
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", "payload_too_large"), baseReport)).toEqual({
-      messageKey: "tooLarge", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: {},
+      messageKey: "tooLarge", retry: false, refresh: false, locate: {},
     })
     for (const reason of ["empty_items", "empty_item_payload", "duplicate_ref"]) {
       expect(classifySubmitFailure(coded(400, "invalid_runtime_context", reason), baseReport)).toEqual({
-        messageKey: "contactAdmin", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: {},
+        messageKey: "contactAdmin", retry: false, refresh: false, locate: {},
       })
     }
     for (const status of [401, 403, 404, 422, 500]) {
       expect(classifySubmitFailure({ ok: false, kind: "http", status }, baseReport)).toEqual({
-        messageKey: "contactAdmin", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: {},
+        messageKey: "contactAdmin", retry: false, refresh: false, locate: {},
       })
     }
     expect(classifySubmitFailure({ ok: false, kind: "malformed" }, baseReport)).toEqual({
-      messageKey: "contactAdmin", retry: false, refresh: true, dropSatisfiedOnRetry: false, locate: {},
+      messageKey: "contactAdmin", retry: false, refresh: true, locate: {},
     })
 
     // W13/W14: a corrupted stored selection also carries code
@@ -249,13 +261,13 @@ describe("classifySubmitFailure", () => {
       "connector ref has unknown field(s): ['x']",
     ]) {
       expect(classifySubmitFailure(coded(400, "invalid_runtime_context", reason), baseReport)).toEqual({
-        messageKey: "contactAdmin", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: {},
+        messageKey: "contactAdmin", retry: false, refresh: false, locate: {},
       })
     }
 
     // A hook-installed code entirely outside the closed set.
     expect(classifySubmitFailure(coded(400, "some_future_code", "anything"), baseReport)).toEqual({
-      messageKey: "contactAdmin", retry: false, refresh: false, dropSatisfiedOnRetry: false, locate: {},
+      messageKey: "contactAdmin", retry: false, refresh: false, locate: {},
     })
   })
 })
@@ -284,55 +296,73 @@ describe("resolveDialogOutcome", () => {
   })
 })
 
-describe("resolveDialogOutcome / resolveDialogActions matrix", () => {
-  it.each([
-    ["only a required context key missing", report(false, [connector(REF_A, "A", [
+describe("resolves the dialog outcome from required context and unsupported inputs", () => {
+  // The report shapes this rule has to reconcile, numbered so the standalone
+  // cases below can refer back to a row here. Rows 4, 6 and 10 have two
+  // shapes -- one at the moment the dialog opens, one after a save fills in
+  // the required key -- and the rows below carry the post-save shape, which
+  // is the stricter of the two. Row 10 is the standalone test further down.
+  // A row for "top-level false with nothing unsatisfied" is left out: it is
+  // not reachable in production, because a malformed key's own `satisfied`
+  // is always false.
+  const reconciliationRows: Array<[string, ConnectorRuntimeReport, DialogOutcome]> = [
+    ["only a required context key missing (row 1)", report(false, [connector(REF_A, "A", [
       input({ section: "context", key: "k1", type: "string", required: true }),
     ])]), { kind: "fillable", blocking: [] }],
-    ["one of two required context keys already satisfied", report(false, [connector(REF_A, "A", [
+    ["one of two required context keys already satisfied (row 2)", report(false, [connector(REF_A, "A", [
       input({ section: "context", key: "k1", type: "string", required: true, satisfied: true }),
       input({ section: "context", key: "k2", type: "string", required: true }),
     ])]), { kind: "fillable", blocking: [] }],
-    ["only a required secrets key missing", report(false, [connector(REF_A, "A", [
+    ["only a required secrets key missing (row 3a)", report(false, [connector(REF_A, "A", [
       input({ section: "secrets", key: "s1", type: "string", required: true }),
     ])]), { kind: "unsupported_only", blocking: [{ connectorRef: REF_A, key: "s1" }] }],
-    ["only a required auth_selector key missing", report(false, [connector(REF_A, "A", [
+    ["only a required auth_selector key missing (row 3b)", report(false, [connector(REF_A, "A", [
       input({ section: "auth_selector", key: "a1", type: "string", required: true }),
     ])]), { kind: "unsupported_only", blocking: [{ connectorRef: REF_A, key: "a1" }] }],
-    ["required context + required secrets after the context key is filled", report(false, [connector(REF_A, "A", [
+    ["required context satisfied, required secrets still missing (row 4, post-save shape)", report(false, [connector(REF_A, "A", [
       input({ section: "context", key: "k1", type: "string", required: true, satisfied: true }),
       input({ section: "secrets", key: "s1", type: "string", required: true }),
     ])]), { kind: "unsupported_only", blocking: [{ connectorRef: REF_A, key: "s1" }] }],
-    ["required + optional secrets both unsatisfied", report(false, [connector(REF_A, "A", [
+    ["required context satisfied, an optional context key still open, required secrets missing (row 5)", report(false, [connector(REF_A, "A", [
+      input({ section: "context", key: "k1", type: "string", required: true, satisfied: true }),
+      input({ section: "context", key: "k2", type: "string", required: false }),
+      input({ section: "secrets", key: "s1", type: "string", required: true }),
+    ])]), { kind: "unsupported_only", blocking: [{ connectorRef: REF_A, key: "s1" }] }],
+    ["required context satisfied, required secrets missing, an optional secret also unfilled (row 6, post-save shape)", report(false, [connector(REF_A, "A", [
       input({ section: "context", key: "k1", type: "string", required: true, satisfied: true }),
       input({ section: "secrets", key: "s1", type: "string", required: true }),
       input({ section: "secrets", key: "s2", type: "string", required: false }),
     ])]), { kind: "unsupported_only", blocking: [{ connectorRef: REF_A, key: "s1" }] }],
-    ["a required context key with a malformed name", report(false, [connector(REF_A, "A", [
+    ["a required context key with a malformed name (row 7)", report(false, [connector(REF_A, "A", [
       input({ section: "context", key: "bad key", type: "string", required: true }),
     ])]), { kind: "fillable", blocking: [] }],
-    ["an optional malformed context key + a required secret", report(false, [connector(REF_A, "A", [
+    ["an optional malformed context key + a required secret (row 8)", report(false, [connector(REF_A, "A", [
       input({ section: "context", key: "bad key", type: "string", required: false }),
       input({ section: "secrets", key: "s1", type: "string", required: true }),
     ])]), { kind: "unsupported_only", blocking: [{ connectorRef: REF_A, key: "s1" }] }],
-    ["a required secrets key with a malformed name", report(false, [connector(REF_A, "A", [
+    ["a required secrets key with a malformed name (row 9)", report(false, [connector(REF_A, "A", [
       input({ section: "secrets", key: "bad key", type: "string", required: true }),
     ])]), { kind: "unsupported_only", blocking: [{ connectorRef: REF_A, key: "bad key" }] }],
-    ["everything satisfied", report(true, [connector(REF_A, "A", [
+    ["everything satisfied (row 12)", report(true, [connector(REF_A, "A", [
       input({ section: "context", key: "k1", type: "string", required: true, satisfied: true }),
     ])]), { kind: "met" }],
-    ["satisfied with an unfilled optional context key", report(true, [connector(REF_A, "A", [
+    ["satisfied with an unfilled optional context key (row 13)", report(true, [connector(REF_A, "A", [
       input({ section: "context", key: "optional", type: "string", required: false }),
     ])]), { kind: "met" }],
-  ])("%s", (_name, r, expected) => {
+  ]
+  it.each(reconciliationRows)("%s", (_name, r, expected) => {
     expect(resolveDialogOutcome(r)).toEqual(expected)
   })
 
-  // A required context + a required secret, once the required secret's own
-  // required-optional pair means the top-level flag never trips true -- an
-  // edge only a malformed *optional* secrets key produces (services/
-  // connector_runtime.py:1199).
-  it("resolves nothing_fillable when a malformed optional secrets key blocks the aggregate with nothing left for the user to do", () => {
+  // Row 10, post-save shape: every required key satisfied, but a malformed
+  // *optional* secrets key still forces the server's own aggregate false --
+  // the one row where reading `report.satisfied` is stricter than
+  // recomputing completeness from the per-key flags, which would close the
+  // dialog here. A required context + a required secret would also hit this
+  // if the required secret's own flag never trips true, but only a
+  // malformed *optional* secrets key produces it in practice
+  // (services/connector_runtime.py:1199).
+  it("resolves nothing_fillable when a malformed optional secrets key blocks the aggregate with nothing left for the user to do (row 10, post-save shape)", () => {
     const r = report(false, [connector(REF_A, "A", [
       input({ section: "context", key: "k1", type: "string", required: true, satisfied: true }),
       input({ section: "secrets", key: "bad key", type: "string", required: false }),
@@ -340,12 +370,15 @@ describe("resolveDialogOutcome / resolveDialogActions matrix", () => {
     expect(resolveDialogOutcome(r)).toEqual({ kind: "nothing_fillable" })
   })
 
-  it("binds DIALOG_OUTCOME_KINDS to every kind this function can produce", () => {
+  it("binds DIALOG_OUTCOME_KINDS to every kind the reconciliation rows above actually produce", () => {
     expect(DIALOG_OUTCOME_KINDS).toHaveLength(4)
+    const producedKinds = new Set(reconciliationRows.map(([, , expected]) => expected.kind))
+    producedKinds.add("nothing_fillable") // produced by the row-10 test above, not the table here
+    expect(producedKinds).toEqual(new Set(DIALOG_OUTCOME_KINDS))
   })
 })
 
-describe("resolveDialogActions", () => {
+describe("derives the action set from the outcome and the resend snapshot", () => {
   const fillable: DialogOutcome = { kind: "fillable", blocking: [] }
   const unsupportedOnly: DialogOutcome = { kind: "unsupported_only", blocking: [] }
   const nothingFillable: DialogOutcome = { kind: "nothing_fillable" }
@@ -367,7 +400,25 @@ describe("isSubmitEnabled", () => {
     expect(isSubmitEnabled([], false)).toBe(false)
     expect(isSubmitEnabled([{ connector_ref: REF_A, context: { k: "v" } }], false)).toBe(true)
     expect(isSubmitEnabled([{ connector_ref: REF_A, context: { k: "v" } }], true)).toBe(false)
-    expect(isSubmitEnabled([], true)).toBe(false)
+
+    // Four missing context keys, only the malformed-name one filled in: a
+    // malformed key name never blocks submission (it is a hint, not a
+    // gate, 2.10), so this must still enable the button. Routed through
+    // buildSubmitItems rather than a hand-written items array, so this row
+    // actually exercises the two functions together instead of restating
+    // isSubmitEnabled's own rule against itself.
+    const fourMissingKeysReport = report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "k1", type: "string", required: true }),
+        input({ section: "context", key: "k2", type: "string", required: true }),
+        input({ section: "context", key: "k3", type: "string", required: true }),
+        input({ section: "context", key: "bad key", type: "string", required: true }),
+      ]),
+    ])
+    const onlyBadKeyFilled: Record<string, string> = {
+      [connectorRuntimeInputDraftKey(REF_A, "bad key")]: "value",
+    }
+    expect(isSubmitEnabled(buildSubmitItems(fourMissingKeysReport, onlyBadKeyFilled), false)).toBe(true)
   })
 })
 
