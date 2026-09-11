@@ -49,6 +49,7 @@ from xagent.web.models.task import TraceEvent as DatabaseTraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.user import User
 from xagent.web.models.workforce import WorkforceRun
+from xagent.web.services import task_events
 from xagent.web.services.ops_signals import (
     CHECKPOINT_PRUNE_FAILED,
     active_degradations,
@@ -3806,10 +3807,21 @@ def test_websocket_trace_handler_dedupes_prior_user_message_turn_id(
 
 
 # ---------------------------------------------------------------------------
-# Tests for skipping WebSocket trace work when a task has no audience, and
+# Tests for skipping task event trace work when a task has no audience, and
 # for dropping agent checkpoint data before serializing it rather than
 # after. These land in this file because it is already the landing spot for
-# WebSocketTraceHandler / checkpoint-stream coverage.
+# TaskEventTraceHandler / checkpoint-stream coverage.
+#
+# The handler no longer reaches for a connection manager: it asks
+# ``task_has_audience`` and publishes through ``publish_task_event``, both of
+# which the hosting process backs with hooks. A test that changes the
+# audience therefore changes both hooks, and points them at the same local
+# connection manager -- a probe reading one registry while the sink delivers
+# to another is exactly the misconfiguration ``set_task_event_sink`` exists
+# to prevent. ``publish_task_event`` itself is never replaced: it is the only
+# seam between the handler and the outside, and the case that pins the
+# registry being re-read at delivery time depends on the real broadcast path
+# running.
 # ---------------------------------------------------------------------------
 
 
@@ -3853,32 +3865,42 @@ async def test_handle_event_does_no_work_without_an_attached_audience(
     """No audience means no work.
 
     Every frame ``handle_event`` could build for an unattached task would be
-    discarded by ``broadcast_to_task``'s own audience check anyway, so the
-    audience check at the top of ``handle_event`` must make the whole call a
-    no-op -- no serialization, no thread-pool submission, no broadcast --
-    regardless of the event's shape. Covers a checkpoint event, an ordinary
-    event, a ``user_message`` event (the one type that would otherwise
-    trigger an extra database read via ``asyncio.to_thread`` inside
+    discarded further down the delivery path anyway, so the audience check at
+    the top of ``handle_event`` must make the whole call a no-op -- no
+    serialization, no thread-pool submission, no publish -- regardless of the
+    event's shape, and the skip must be counted so it is visible in the
+    handler's event totals rather than absent from them. Covers a checkpoint
+    event, an ordinary event, a ``user_message`` event (the one type that
+    would otherwise trigger an extra database read in a worker thread inside
     ``_has_prior_user_message_turn``), and a non-dict payload.
     """
     task_id = 90101
     local_manager = ConnectionManager()
-    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+    monkeypatch.setattr(
+        task_events, "_task_audience_probe", local_manager.has_connections_for_task
+    )
 
     serialize_calls: list[object] = []
     monkeypatch.setattr(
-        "xagent.web.api.ws_trace_handlers.serialize_trace_data",
+        "xagent.web.services.task_event_trace_handler.serialize_trace_data",
         lambda payload: serialize_calls.append(payload) or payload,
     )
 
-    to_thread_calls: list[object] = []
+    thread_calls: list[object] = []
 
-    async def fake_to_thread(func, /, *args, **kwargs):
-        to_thread_calls.append((func, args, kwargs))
+    async def fake_run_in_thread(operation, func, /, *args, **kwargs):
+        thread_calls.append((operation, func, args, kwargs))
         return func(*args, **kwargs)
 
     monkeypatch.setattr(
-        "xagent.web.api.ws_trace_handlers.asyncio.to_thread", fake_to_thread
+        "xagent.web.services.task_event_trace_handler.run_in_thread_with_telemetry",
+        fake_run_in_thread,
+    )
+
+    counter_calls: list[object] = []
+    monkeypatch.setattr(
+        "xagent.web.services.task_event_trace_handler.increment_counter",
+        lambda name, attributes=None: counter_calls.append((name, attributes)),
     )
 
     broadcast_calls: list[object] = []
@@ -3886,9 +3908,9 @@ async def test_handle_event_does_no_work_without_an_attached_audience(
     async def fake_broadcast(message, task_id_arg):
         broadcast_calls.append((message, task_id_arg))
 
-    monkeypatch.setattr(local_manager, "broadcast_to_task", fake_broadcast)
+    monkeypatch.setattr(task_events, "_task_event_sink", fake_broadcast)
 
-    handler = WebSocketTraceHandler(task_id)
+    handler = TaskEventTraceHandler(task_id)
     event = TraceEvent(
         event_type,
         task_id=str(task_id),
@@ -3900,8 +3922,11 @@ async def test_handle_event_does_no_work_without_an_attached_audience(
     await handler.handle_event(event)
 
     assert serialize_calls == []
-    assert to_thread_calls == []
+    assert thread_calls == []
     assert broadcast_calls == []
+    assert counter_calls == [
+        ("xagent.websocket.trace.events", {"outcome": "no_audience"})
+    ]
 
 
 @pytest.mark.asyncio
@@ -3917,10 +3942,10 @@ async def test_handle_event_does_no_work_without_an_attached_audience(
 async def test_broadcast_payload_is_unchanged_for_an_attached_audience(
     case_id, monkeypatch
 ) -> None:
-    """The payload handed to ``broadcast_to_task`` is unchanged for an
+    """The payload handed to the host's event sink is unchanged for an
     attached audience.
 
-    Captures at ``broadcast_to_task``'s own input, not at ``send_text`` --
+    Captures at the sink's own input, not at ``send_text`` --
     the ``run_id`` / ``state_version`` stamping
     ``_with_current_task_control_state`` adds happens strictly after this
     point and depends on database state that would make a hardcoded
@@ -3969,16 +3994,18 @@ async def test_broadcast_payload_is_unchanged_for_an_attached_audience(
 
     local_manager = ConnectionManager()
     local_manager.register_connection(object(), task_id)
-    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+    monkeypatch.setattr(
+        task_events, "_task_audience_probe", local_manager.has_connections_for_task
+    )
 
     broadcast_calls: list[tuple[dict, int]] = []
 
     async def fake_broadcast(message, task_id_arg):
         broadcast_calls.append((message, task_id_arg))
 
-    monkeypatch.setattr(local_manager, "broadcast_to_task", fake_broadcast)
+    monkeypatch.setattr(task_events, "_task_event_sink", fake_broadcast)
 
-    handler = WebSocketTraceHandler(task_id)
+    handler = TaskEventTraceHandler(task_id)
     handler._task_description = "Task chat description"
     handler._task_description_loaded = True
 
@@ -4093,7 +4120,7 @@ def test_raw_and_serialized_checkpoint_checks_drop_the_same_set(case_id) -> None
     function can only have one docstring.
     """
     task_id = 90308
-    handler = WebSocketTraceHandler(task_id)
+    handler = TaskEventTraceHandler(task_id)
 
     if case_id == "current_shape_checkpoint":
         data = {
@@ -4118,8 +4145,8 @@ def test_raw_and_serialized_checkpoint_checks_drop_the_same_set(case_id) -> None
 
         ``is_agent_checkpoint_data``'s second branch requires *both*
         ``pattern_state`` and ``context`` to be dicts
-        (``ws_trace_handlers.py:236-240``), while the producer at
-        ``core/agent/runtime.py:1573-1597`` leaves either one ``None`` when the
+        (``task_event_trace_handler.py:233-245``), while the producer at
+        ``core/agent/runtime.py:1655-1682`` leaves either one ``None`` when the
         pattern has no ``get_state`` or the context has no ``to_dict`` -- and
         attaches ``execution_snapshot`` independently of both. A payload of that
         shape is therefore not classified as a checkpoint and does reach the
@@ -4140,8 +4167,8 @@ def test_raw_and_serialized_checkpoint_checks_drop_the_same_set(case_id) -> None
 
         ``is_agent_checkpoint_data``'s second branch requires *both*
         ``pattern_state`` and ``context`` to be dicts
-        (``ws_trace_handlers.py:236-240``), while the producer at
-        ``core/agent/runtime.py:1573-1597`` leaves either one ``None`` when the
+        (``task_event_trace_handler.py:233-245``), while the producer at
+        ``core/agent/runtime.py:1655-1682`` leaves either one ``None`` when the
         pattern has no ``get_state`` or the context has no ``to_dict`` -- and
         attaches ``execution_snapshot`` independently of both. A payload of that
         shape is therefore not classified as a checkpoint and does reach the
@@ -4161,8 +4188,8 @@ def test_raw_and_serialized_checkpoint_checks_drop_the_same_set(case_id) -> None
         """Regression guard, not a description of today's traffic.
 
         The standard web execution path wires ``PatternRuntime`` with a
-        ``TraceCheckpointStore`` (``service.py:579`` -> ``:587`` ->
-        ``execution_adapter.py:294`` -> ``runner.py:235``), and that store exposes
+        ``TraceCheckpointStore`` (``service.py:579`` -> ``:593`` ->
+        ``execution_adapter.py:296`` -> ``runner.py:235``), and that store exposes
         both ``checkpoint`` and ``write_checkpoint``, so ``_emit_checkpoint``
         always takes its first branch and nests the legacy payload under
         ``snapshot``. No producer on that path emits the top-level legacy shape
@@ -4192,8 +4219,8 @@ def test_raw_and_serialized_checkpoint_checks_drop_the_same_set(case_id) -> None
         """Regression guard, not a description of today's traffic.
 
         The standard web execution path wires ``PatternRuntime`` with a
-        ``TraceCheckpointStore`` (``service.py:579`` -> ``:587`` ->
-        ``execution_adapter.py:294`` -> ``runner.py:235``), and that store exposes
+        ``TraceCheckpointStore`` (``service.py:579`` -> ``:593`` ->
+        ``execution_adapter.py:296`` -> ``runner.py:235``), and that store exposes
         both ``checkpoint`` and ``write_checkpoint``, so ``_emit_checkpoint``
         always takes its first branch and nests the legacy payload under
         ``snapshot``. No producer on that path emits the top-level legacy shape
@@ -4236,7 +4263,7 @@ def test_raw_and_serialized_checkpoint_checks_drop_the_same_set(case_id) -> None
         Before this change the frame went out as an error placeholder:
         ``serialize_trace_data`` replaces the whole payload with
         ``_serialization_error`` / ``_original_type`` / ``_error``
-        (``ws_trace_handlers.py:340-344``), and ``:522-523`` then adds
+        (``task_event_trace_handler.py:347-351``), and ``:565-566`` then adds
         ``task_description`` on top whenever the task has a non-empty
         description -- so the client received a frame carrying none of the
         checkpoint's own content. After this change the raw check catches it
@@ -4297,15 +4324,17 @@ async def test_checkpoint_event_with_an_audience_never_calls_serialize_trace_dat
     task_id = 90309
     local_manager = ConnectionManager()
     local_manager.register_connection(object(), task_id)
-    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+    monkeypatch.setattr(
+        task_events, "_task_audience_probe", local_manager.has_connections_for_task
+    )
 
     serialize_calls: list[object] = []
     monkeypatch.setattr(
-        "xagent.web.api.ws_trace_handlers.serialize_trace_data",
+        "xagent.web.services.task_event_trace_handler.serialize_trace_data",
         lambda payload: serialize_calls.append(payload) or payload,
     )
 
-    handler = WebSocketTraceHandler(task_id)
+    handler = TaskEventTraceHandler(task_id)
     handler._task_description = None
     handler._task_description_loaded = True
     event = TraceEvent(
@@ -4338,36 +4367,6 @@ class _MinimalDuckTypedSink:
         self.sent.append(text)
 
 
-def _register_builder_preview_audience(
-    local_manager: ConnectionManager, task_id: int, replica: object
-) -> None:
-    """Builder preview: no historical replay, and no reconciliation channel either.
-
-    The web chat, guest widget and share-link paths call
-    ``handle_status_request`` right after registering, so a frame skipped
-    before attach still reaches the client from the database. Several paths
-    do not replay -- v1 SSE among them -- but each of those documents a
-    reconciliation channel the client is expected to use instead. This one
-    has neither.
-
-    Its safety rests on ordering **for the first preview turn on a socket**:
-    ``websocket.py:10740`` writes ``websocket.state.preview_task_id`` one line
-    before ``register_connection``, and the task starts only after that. **On
-    later turns the branch at ``websocket.py:10742`` reuses the id without
-    re-registering**, so safety then rests on the socket still being in the
-    registry -- which ``broadcast_to_task`` can revoke on a send error
-    (``websocket.py:5237``) without clearing ``preview_task_id``. That case is
-    not a regression here: with the socket out of the registry, the frame is
-    dropped before this change (by ``broadcast_to_task``) and after it (by the
-    audience check), so no client sees a difference either way.
-
-    If anyone adds reconnect, resume, or any second way to bind a socket to a
-    preview task that is already running, the skip becomes a permanent frame
-    loss on this path. Re-review the audience check before adding one.
-    """
-    local_manager.register_connection(replica, task_id)
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case_id, register",
@@ -4376,11 +4375,36 @@ def _register_builder_preview_audience(
             "web_chat_websocket",
             lambda m, t: m.register_connection(_MinimalDuckTypedSink(), t),
         ),
+        # Builder preview: no historical replay, and no reconciliation
+        # channel either.
+        #
+        # The web chat, guest widget and share-link paths call
+        # ``handle_status_request`` right after registering, so a frame
+        # skipped before attach still reaches the client from the database.
+        # Several paths do not replay -- v1 SSE among them -- but each of
+        # those documents a reconciliation channel the client is expected to
+        # use instead. This one has neither.
+        #
+        # Its safety rests on ordering **for the first preview turn on a
+        # socket**: ``websocket.py:3604`` writes
+        # ``websocket.state.preview_task_id`` one line before
+        # ``register_connection``, and the task starts only after that. **On
+        # later turns the branch at ``websocket.py:3606`` reuses the id
+        # without re-registering**, so safety then rests on the socket still
+        # being in the registry -- which ``broadcast_to_task`` can revoke on
+        # a send error (``websocket.py:1371``) without clearing
+        # ``preview_task_id``. That case is not a regression here: with the
+        # socket out of the registry, the frame is dropped before this
+        # change (by ``broadcast_to_task``) and after it (by the audience
+        # check), so no client sees a difference either way.
+        #
+        # If anyone adds reconnect, resume, or any second way to bind a
+        # socket to a preview task that is already running, the skip becomes
+        # a permanent frame loss on this path. Re-review the audience check
+        # before adding one.
         (
             "builder_preview_websocket",
-            lambda m, t: _register_builder_preview_audience(
-                m, t, _MinimalDuckTypedSink()
-            ),
+            lambda m, t: m.register_connection(_MinimalDuckTypedSink(), t),
         ),
         (
             "v1_sse_sink",
@@ -4414,25 +4438,31 @@ async def test_every_audience_registration_is_visible_to_the_audience_check(
     a seventh audience could violate either way); it asserts that whatever
     registers through this mechanism is visible to
     ``has_connections_for_task`` and lets a subsequent ``handle_event``
-    reach ``broadcast_to_task``. See ``_register_builder_preview_audience``
-    for the one path (Builder preview) whose safety is not fully covered by
-    this mechanical guard.
+    reach the host's event sink. See the comment on the
+    ``builder_preview_websocket`` case above for the one path whose safety is
+    not fully covered by this mechanical guard.
     """
     task_id = 90410
+    unregistered_task_id = 90411
     local_manager = ConnectionManager()
     register(local_manager, task_id)
-    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+    monkeypatch.setattr(
+        task_events, "_task_audience_probe", local_manager.has_connections_for_task
+    )
 
-    assert local_manager.has_connections_for_task(task_id) is True
+    # Paired on purpose: a probe wired to something that always answers yes
+    # would satisfy the first assertion alone.
+    assert task_events.task_has_audience(task_id) is True
+    assert task_events.task_has_audience(unregistered_task_id) is False
 
     broadcast_calls: list[object] = []
 
     async def fake_broadcast(message, task_id_arg):
         broadcast_calls.append((message, task_id_arg))
 
-    monkeypatch.setattr(local_manager, "broadcast_to_task", fake_broadcast)
+    monkeypatch.setattr(task_events, "_task_event_sink", fake_broadcast)
 
-    handler = WebSocketTraceHandler(task_id)
+    handler = TaskEventTraceHandler(task_id)
     handler._task_description = None
     handler._task_description_loaded = True
     event = TraceEvent(
@@ -4448,22 +4478,27 @@ async def test_every_audience_registration_is_visible_to_the_audience_check(
     assert len(broadcast_calls) == 1
 
 
+def _raise_audience_failure(task_id: int) -> bool:
+    raise RuntimeError("audience registry unavailable")
+
+
 @pytest.mark.asyncio
 async def test_audience_check_failure_is_contained_in_the_handler(
     monkeypatch, caplog
 ) -> None:
-    """A failing audience check never escapes ``handle_event``.
+    """A failing audience check never costs a frame, and never escapes.
 
-    First segment: the audience check itself raises. ``handle_event`` must
-    swallow it (the same policy the handler already applies to every other
-    internal failure) and log a warning instead of propagating.
+    First segment: the registered probe raises. ``task_has_audience``
+    contains that failure itself, answers that an audience is present, and
+    warns once -- so the handler does its full work and the frame goes out.
+    A probe that breaks may cost work; it may not cost content.
 
     Second segment (the one that actually matters): a real ``Tracer`` with a
-    real ``WebSocketTraceHandler`` registered, firing a
+    real ``TaskEventTraceHandler`` registered, firing a
     ``require_persisted=True`` event. ``Tracer.trace_event`` collects every
     handler's exception into ``handler_errors`` and re-raises once
     dispatch finishes when ``require_persisted`` is set
-    (``core/agent/trace.py:1283-1296``) -- that collection logic lives in
+    (``core/agent/trace.py:1313-1324``) -- that collection logic lives in
     ``Tracer``, not in the handler, so a stub tracer would test nothing
     here, and a stub handler would replace the very object whose ``try:``
     placement this segment exists to pin. If the audience check were ever
@@ -4471,17 +4506,31 @@ async def test_audience_check_failure_is_contained_in_the_handler(
     that would turn red: the exception would reach ``Tracer.trace_event``
     uncaught by the handler, join ``handler_errors``, and turn one required
     checkpoint persistence into a failed one.
+
+    The two segments deliberately patch different names. The first patches
+    the probe hook, because what it pins is that ``task_has_audience``
+    swallows a probe failure. The second patches the name the handler module
+    imported, because what it pins is where the call site sits: a probe
+    failure is swallowed inside ``task_has_audience``, so with the probe
+    patched this segment would stay green with the ``if`` on either side of
+    the ``try``. Do not unify the two.
     """
     task_id = 90511
 
-    class _RaisingManager:
-        def has_connections_for_task(self, task_id: int) -> bool:
-            raise RuntimeError("audience registry unavailable")
+    # --- first segment: the failure is contained and costs no frame ---
+    monkeypatch.setattr(task_events, "_warned_failing_probe", False)
+    monkeypatch.setattr(task_events, "_task_audience_probe", _raise_audience_failure)
 
-    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", _RaisingManager())
+    published: list[object] = []
 
-    # --- first segment: the handler on its own ---
-    handler = WebSocketTraceHandler(task_id)
+    async def fake_broadcast(message, task_id_arg):
+        published.append((message, task_id_arg))
+
+    monkeypatch.setattr(task_events, "_task_event_sink", fake_broadcast)
+
+    handler = TaskEventTraceHandler(task_id)
+    handler._task_description = None
+    handler._task_description_loaded = True
     event = TraceEvent(
         TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.LLM),
         task_id=str(task_id),
@@ -4490,18 +4539,28 @@ async def test_audience_check_failure_is_contained_in_the_handler(
         timestamp=1_700_000_300.0,
     )
 
-    with caplog.at_level(logging.WARNING, logger="xagent.web.api.ws_trace_handlers"):
+    with caplog.at_level(logging.WARNING, logger="xagent.web.services.task_events"):
         await handler.handle_event(event)
 
-    assert any(
-        "Failed to send trace event to WebSocket" in record.getMessage()
+    assert len(published) == 1
+    warnings = [
+        record
         for record in caplog.records
-    )
+        if record.name == "xagent.web.services.task_events"
+        and record.levelname == "WARNING"
+    ]
+    assert len(warnings) == 1
+    assert "assuming an audience is present" in warnings[0].getMessage()
 
     # --- second segment: the real Tracer, the hard requirement ---
     caplog.clear()
+    monkeypatch.setattr(
+        "xagent.web.services.task_event_trace_handler.task_has_audience",
+        _raise_audience_failure,
+    )
+
     tracer = Tracer()
-    real_handler = WebSocketTraceHandler(task_id)
+    real_handler = TaskEventTraceHandler(task_id)
     tracer.add_handler(real_handler)
 
     checkpoint_data = {
@@ -4511,7 +4570,7 @@ async def test_audience_check_failure_is_contained_in_the_handler(
     }
 
     # Not raising is the assertion: a required-persistence event whose only
-    # handler is a WebSocketTraceHandler whose audience check is broken
+    # handler is a TaskEventTraceHandler whose audience check is broken
     # must still complete without ``Tracer.trace_event`` raising.
     await tracer.trace_event(
         CHECKPOINT_EVENT_TYPE,
@@ -4530,8 +4589,8 @@ async def test_late_attach_replays_events_skipped_while_unattached(
     being built receives that frame.
 
     First segment (WebSocket paths): while nothing is attached,
-    ``handle_event`` does not broadcast anything for these rows --
-    ``ConnectionManager`` never sees a live audience for them. In
+    ``handle_event`` publishes nothing for these rows -- the audience
+    question answers no for them. In
     production ``DatabaseTraceHandler`` persists every one of them
     independently of what this handler does (both handlers are notified by
     the same ``Tracer.trace_event`` call); here the rows are seeded
@@ -4549,10 +4608,12 @@ async def test_late_attach_replays_events_skipped_while_unattached(
     from inside ``serialize_trace_data`` -- part-way through the very call
     that is building this frame -- and still receives it. What this pins is
     that ``handle_event`` must not snapshot the connection registry before
-    doing its work. It asks ``has_connections_for_task`` once, for the
-    emptiness answer only, and the registry is read again at broadcast
-    time: ``broadcast_to_task`` calls ``connections_for_task`` when it fans
-    out. Storing that list in a local at the top of ``handle_event`` and
+    doing its work. It asks the audience question once, for the emptiness
+    answer only, and the registry is read again at delivery time:
+    ``broadcast_to_task`` calls ``connections_for_task`` when it fans out.
+    That is why this segment delivers through the real broadcast path
+    instead of a stand-in sink -- the second read lives there, not in the
+    handler. Storing that list in a local at the top of ``handle_event`` and
     broadcasting to the stored copy would drop this sink, and this segment
     turns red.
 
@@ -4588,16 +4649,18 @@ async def test_late_attach_replays_events_skipped_while_unattached(
     monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
 
     local_manager = ConnectionManager()
-    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+    monkeypatch.setattr(
+        task_events, "_task_audience_probe", local_manager.has_connections_for_task
+    )
 
     broadcast_calls: list[object] = []
 
     async def fake_broadcast(message, task_id_arg):
         broadcast_calls.append((message, task_id_arg))
 
-    monkeypatch.setattr(local_manager, "broadcast_to_task", fake_broadcast)
+    monkeypatch.setattr(task_events, "_task_event_sink", fake_broadcast)
 
-    handler = WebSocketTraceHandler(task_id)
+    handler = TaskEventTraceHandler(task_id)
     handler._task_description = None
     handler._task_description_loaded = True
 
@@ -4683,9 +4746,12 @@ async def test_late_attach_replays_events_skipped_while_unattached(
 
     # ---- second segment ----
     sse_manager = ConnectionManager()
-    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", sse_manager)
+    monkeypatch.setattr(
+        task_events, "_task_audience_probe", sse_manager.has_connections_for_task
+    )
+    monkeypatch.setattr(task_events, "_task_event_sink", sse_manager.broadcast_to_task)
 
-    sse_handler = WebSocketTraceHandler(task_id)
+    sse_handler = TaskEventTraceHandler(task_id)
     sse_handler._task_description = None
     sse_handler._task_description_loaded = True
 
@@ -4707,7 +4773,7 @@ async def test_late_attach_replays_events_skipped_while_unattached(
         return serialize_trace_data(payload)
 
     monkeypatch.setattr(
-        "xagent.web.api.ws_trace_handlers.serialize_trace_data",
+        "xagent.web.services.task_event_trace_handler.serialize_trace_data",
         register_late_sink_mid_serialization,
     )
 
@@ -4717,26 +4783,95 @@ async def test_late_attach_replays_events_skipped_while_unattached(
     assert len(late_sink.sent) == 1
 
 
-def _make_failing_sync_load_task_description(call_log: list[int]):
-    def _failing_sync_load_task_description(self: WebSocketTraceHandler) -> None:
-        """Failure tier: one attempt, no retry, and NULL descriptions land here too.
+@pytest.mark.asyncio
+async def test_skipped_frames_are_recoverable_through_the_real_persistence_path(
+    monkeypatch,
+) -> None:
+    """The safety claim, end to end: no audience -> no frame, but a real
+    ``DatabaseTraceHandler`` on the same dispatch still writes the row that
+    a later attach replays.
 
-        ``_load_task_description`` sets ``_task_description_loaded`` outside its
-        ``try`` (``ws_trace_handlers.py:435``), so a failed read is still a read
-        and never retried. Two inputs reach this tier, not one: a real database
-        failure, and a task row whose ``description`` is NULL -- the info log at
-        ``ws_trace_handlers.py:453-455`` slices ``task.description``
-        unconditionally, so ``None[:50]`` raises ``TypeError`` and the outer
-        ``except Exception`` swallows it. ``Task.description`` is
-        ``Column(Text)`` (``web/models/task.py:280``), i.e. nullable. This change
-        moves that single attempt to the moment an audience attaches, so the
-        warning this path writes now lands at attach time instead of at task
-        start.
-        """
-        call_log.append(1)
-        raise RuntimeError("simulated task description read failure")
+    The sibling test seeds ``trace_events`` rows directly to isolate the
+    replay reader. This one does not isolate anything: one ``Tracer`` with
+    both real handlers, one real database session, and the same replay
+    function the websocket endpoints call after registering a connection.
 
-    return _failing_sync_load_task_description
+    Two details are load bearing. ``DatabaseTraceHandler`` binds ``get_db``
+    at import time, so patching ``xagent.web.models.database.get_db`` alone
+    does not reach it; the replay reader imports it inside the function body
+    and does. And the event is deliberately not a checkpoint: replay filters
+    checkpoint rows out on two separate mechanisms, so a checkpoint would
+    prove nothing about this change.
+    """
+    SessionLocal, db, task = _create_trace_handler_test_task("i6-e2e-replay")
+    task_id = int(task.id)
+    user_id = int(task.user_id)
+    db.close()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", get_test_db)
+
+    empty_manager = ConnectionManager()
+    monkeypatch.setattr(
+        task_events, "_task_audience_probe", empty_manager.has_connections_for_task
+    )
+
+    published: list[object] = []
+
+    async def fake_broadcast(message, task_id_arg):
+        published.append((message, task_id_arg))
+
+    monkeypatch.setattr(task_events, "_task_event_sink", fake_broadcast)
+
+    tracer = Tracer()
+    tracer.add_handler(DatabaseTraceHandler(task_id))
+    tracer.add_handler(TaskEventTraceHandler(task_id))
+
+    await tracer.trace_event(
+        TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.LLM),
+        task_id=str(task_id),
+        step_id="e2e-step",
+        data={"model": "gpt-test"},
+    )
+
+    # Nothing was listening, so nothing was published.
+    assert published == []
+
+    sent_events: list[dict] = []
+
+    async def send_personal_message(event: dict, websocket: object) -> None:
+        sent_events.append(event)
+
+    monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.manager.send_personal_message",
+        send_personal_message,
+    )
+
+    await send_historical_data_as_stream(
+        websocket=object(),
+        task_id=task_id,
+        user=SimpleNamespace(id=user_id, is_admin=False),
+    )
+
+    replayed = [
+        event
+        for event in sent_events
+        if event.get("type") == "trace_event"
+        and event.get("event_type") == "llm_call_start"
+    ]
+    assert len(replayed) == 1
+    assert replayed[0]["data"]["model"] == "gpt-test"
 
 
 @pytest.mark.asyncio
@@ -4749,22 +4884,24 @@ async def test_task_description_load_is_deferred_until_an_audience_attaches(
     First three segments pin the lazy-cache contract untouched by this
     change: no read while unattached, exactly one read on the first event
     after attach, and no re-read on later events. The fourth segment is the
-    failure tier -- see ``_failing_sync_load_task_description``'s docstring
-    (built by ``_make_failing_sync_load_task_description``) for why a NULL
-    description lands in the same bucket as a real database failure.
+    failure tier -- see ``failing_sync_load_task_description``'s docstring
+    below for why a NULL description lands in the same bucket as a real
+    database failure.
     """
     task_id = 90712
     local_manager = ConnectionManager()
-    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+    monkeypatch.setattr(
+        task_events, "_task_audience_probe", local_manager.has_connections_for_task
+    )
 
     load_calls: list[int] = []
 
-    def counting_stub(self: WebSocketTraceHandler) -> None:
+    def counting_stub(self: TaskEventTraceHandler) -> None:
         load_calls.append(1)
         self._task_description = "Loaded description"
 
     monkeypatch.setattr(
-        WebSocketTraceHandler, "_sync_load_task_description", counting_stub
+        TaskEventTraceHandler, "_sync_load_task_description", counting_stub
     )
 
     broadcast_calls: list[object] = []
@@ -4772,9 +4909,9 @@ async def test_task_description_load_is_deferred_until_an_audience_attaches(
     async def fake_broadcast(message, task_id_arg):
         broadcast_calls.append((message, task_id_arg))
 
-    monkeypatch.setattr(local_manager, "broadcast_to_task", fake_broadcast)
+    monkeypatch.setattr(task_events, "_task_event_sink", fake_broadcast)
 
-    handler = WebSocketTraceHandler(task_id)
+    handler = TaskEventTraceHandler(task_id)
 
     def make_event(step_id: str) -> TraceEvent:
         return TraceEvent(
@@ -4804,12 +4941,31 @@ async def test_task_description_load_is_deferred_until_an_audience_attaches(
     assert len(broadcast_calls) == 3
 
     # Segment 4: failure tier -- a fresh handler so the cache starts empty.
-    failing_handler = WebSocketTraceHandler(task_id)
+    failing_handler = TaskEventTraceHandler(task_id)
     fail_calls: list[int] = []
+
+    def failing_sync_load_task_description(self: TaskEventTraceHandler) -> None:
+        """Failure tier: one attempt, no retry, and NULL descriptions land here too.
+
+        ``_load_task_description`` sets ``_task_description_loaded`` outside its
+        ``try`` (``task_event_trace_handler.py:478``), so a failed read is still a
+        read and never retried. Two inputs reach this tier, not one: a real
+        database failure, and a task row whose ``description`` is NULL -- the info
+        log at ``task_event_trace_handler.py:496-498`` slices ``task.description``
+        unconditionally, so ``None[:50]`` raises ``TypeError`` and the outer
+        ``except Exception`` swallows it. ``Task.description`` is
+        ``Column(Text)`` (``web/models/task.py:280``), i.e. nullable. This change
+        moves that single attempt to the moment an audience attaches, so the
+        warning this path writes now lands at attach time instead of at task
+        start.
+        """
+        fail_calls.append(1)
+        raise RuntimeError("simulated task description read failure")
+
     monkeypatch.setattr(
-        WebSocketTraceHandler,
+        TaskEventTraceHandler,
         "_sync_load_task_description",
-        _make_failing_sync_load_task_description(fail_calls),
+        failing_sync_load_task_description,
     )
 
     await failing_handler.handle_event(make_event("failure-1"))
@@ -4833,15 +4989,17 @@ async def test_delegated_child_traces_follow_the_parent_task_audience(
     """A delegated child agent's traces are gated by the *parent* task's
     audience, not the child's own.
 
-    ``_DelegatedAgentWebSocketTraceHandler`` is constructed with the parent
-    task id and wraps a ``WebSocketTraceHandler`` bound to that same parent
+    ``_DelegatedAgentTaskEventTraceHandler`` is constructed with the parent
+    task id and wraps a ``TaskEventTraceHandler`` bound to that same parent
     id (``agent_tool.py:97``); the child event's own ``task_id`` field never
-    reaches the audience check or the broadcast frame's ``task_id``.
+    reaches the audience check or the published frame's ``task_id``.
     """
     parent_task_id = 90813
     child_task_id = 90814
     local_manager = ConnectionManager()
-    monkeypatch.setattr("xagent.web.api.ws_trace_handlers.manager", local_manager)
+    monkeypatch.setattr(
+        task_events, "_task_audience_probe", local_manager.has_connections_for_task
+    )
 
     if audience_present:
         local_manager.register_connection(object(), parent_task_id)
@@ -4851,9 +5009,9 @@ async def test_delegated_child_traces_follow_the_parent_task_audience(
     async def fake_broadcast(message, task_id_arg):
         broadcast_calls.append((message, task_id_arg))
 
-    monkeypatch.setattr(local_manager, "broadcast_to_task", fake_broadcast)
+    monkeypatch.setattr(task_events, "_task_event_sink", fake_broadcast)
 
-    delegated_handler = _DelegatedAgentWebSocketTraceHandler(
+    delegated_handler = _DelegatedAgentTaskEventTraceHandler(
         task_id=parent_task_id, metadata={"source": "xagent-agent-tool-child"}
     )
     delegated_handler._handler._task_description = None
@@ -4876,49 +5034,6 @@ async def test_delegated_child_traces_follow_the_parent_task_audience(
     message, broadcast_task_id_arg = broadcast_calls[0]
     assert broadcast_task_id_arg == parent_task_id
     assert message["task_id"] == parent_task_id
-
-
-@pytest.mark.parametrize(
-    "case_id",
-    [
-        "never_registered",
-        "after_register",
-        "after_register_then_disconnect",
-        "after_register_then_detach_task_connections",
-    ],
-)
-def test_audience_check_matches_the_broadcast_gate(case_id) -> None:
-    """``has_connections_for_task`` and the broadcast gate never disagree.
-
-    Covers the post-state of each of ``active_connections``'s three write
-    sites -- ``register_connection`` (append), ``disconnect`` /
-    ``_remove_from_task`` (remove, deleting the key once its list is
-    empty), and ``detach_task_connections`` (pop the whole key) -- plus a
-    baseline of never having registered anything. This does not assert
-    those three methods are the only writers of ``active_connections``; it
-    asserts that after each of them runs, the new predicate and
-    ``bool(connections_for_task(...))`` -- the read the broadcast gate
-    itself performs -- still agree.
-    """
-    task_id = 90915
-    manager_instance = ConnectionManager()
-    replica = object()
-
-    if case_id == "never_registered":
-        pass
-    elif case_id == "after_register":
-        manager_instance.register_connection(replica, task_id)
-    elif case_id == "after_register_then_disconnect":
-        manager_instance.register_connection(replica, task_id)
-        manager_instance.disconnect(replica)
-    else:
-        assert case_id == "after_register_then_detach_task_connections"
-        manager_instance.register_connection(replica, task_id)
-        manager_instance.detach_task_connections(task_id)
-
-    assert manager_instance.has_connections_for_task(task_id) == bool(
-        manager_instance.connections_for_task(task_id)
-    )
 
 
 def test_historical_replay_duplicate_turn_helper_allows_distinct_turns() -> None:
