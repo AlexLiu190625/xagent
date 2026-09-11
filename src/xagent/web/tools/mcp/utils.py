@@ -3,11 +3,55 @@ import os
 import re
 import urllib.request
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ....config import get_tool_max_output_length
+
+
+def allowed_dirs_from_env(env_var_name: str) -> list[Path]:
+    """Parse JSON or legacy comma-separated roots.
+
+    An unset, blank, or empty legacy value falls back to CWD for compatibility.
+    An explicit JSON array is authoritative, so an empty array denies all roots.
+    """
+    raw_dirs = os.environ.get(env_var_name, "")
+    stripped_raw_dirs = raw_dirs.strip()
+    is_json_array = stripped_raw_dirs.startswith("[")
+    if is_json_array:
+        try:
+            decoded_dirs = json.loads(stripped_raw_dirs)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{env_var_name} must contain a valid JSON array") from exc
+        if not isinstance(decoded_dirs, list) or not all(
+            isinstance(raw_dir, str) for raw_dir in decoded_dirs
+        ):
+            raise ValueError(f"{env_var_name} must contain a JSON array of paths")
+        raw_dir_values = decoded_dirs
+    else:
+        raw_dir_values = raw_dirs.split(",")
+    try:
+        parsed_dirs = []
+        for raw_dir in raw_dir_values:
+            stripped = raw_dir.strip()
+            if not stripped:
+                continue
+            candidate = Path(stripped).expanduser()
+            resolved = candidate.resolve()
+            # Python 3.13's non-strict resolve() can leave a symlink loop
+            # unresolved instead of raising. Validate an explicit symlink
+            # strictly so a broken or cyclic configured root cannot be
+            # mistaken for a usable authorization boundary.
+            if candidate.is_symlink():
+                resolved = candidate.resolve(strict=True)
+            parsed_dirs.append(resolved)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{env_var_name} contains an invalid path") from exc
+    if is_json_array:
+        return parsed_dirs
+    return parsed_dirs or [Path.cwd().resolve()]
 
 
 class InsufficientScopeError(RuntimeError):
