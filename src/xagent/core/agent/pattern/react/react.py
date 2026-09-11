@@ -60,7 +60,7 @@ import hashlib
 import inspect
 import json
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import timezone
 from enum import Enum
 from typing import Any, cast
@@ -151,6 +151,20 @@ REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Follow the canonical request-language policy in the system context; do not "
     "collapse Chinese variants into generic Chinese."
 )
+# Written into the checkpoint's lost_tool_evidence payload and compared on
+# read-back. The record's meaning depends on what one entry stands for: a
+# build that accounts per call and a build that accounted per tool name would
+# both accept the other's payload as a well-formed dict and mean something
+# different by the same field, so the payload states its own accounting unit
+# and a mismatch is treated as unreadable rather than silently reinterpreted.
+LOST_TOOL_EVIDENCE_GRANULARITY = "tool_call_id"
+# Caps how many call ids a read-back of the lost-evidence record accepts. The
+# ids come from a run's own tool calls, so the only bound on how many there
+# can be is how many iterations the run has gone through -- nothing in this
+# module limits that. A payload over the cap is truncated to the first this
+# many ids (by sorted order) with the loss explicitly recorded, rather than
+# silently shortened into a record that looks complete when it is not.
+LOST_TOOL_EVIDENCE_MAX_CALL_IDS = 200
 
 
 @dataclass
@@ -193,6 +207,105 @@ class ToolCallRecord:
             error=data.get("error"),
             turn_id=str(data["turn_id"]) if data.get("turn_id") else None,
         )
+
+
+@dataclass
+class LostToolEvidence:
+    """Observations compaction destroyed that no later call has fetched back.
+
+    There is one of these per run, not per turn. It lives on the pattern
+    instance for the whole life of the run and travels in the checkpoint the
+    same way the rest of ``ReActPattern`` state does, so a turn that runs long
+    after the turn whose compaction destroyed the evidence can still see that
+    it happened.
+
+    Each entry in ``call_ids`` is one destroyed tool call, identified by its
+    ``tool_call_id``. A later call to the same tool with different arguments
+    does not bring back the observation the earlier call produced, so the
+    tool name recurring is never enough to say the lost value came back; only
+    seeing that exact call id's observation again would be, and this record
+    does not attempt that -- it only remembers which ids are still owed.
+
+    ``unnameable`` records that something was destroyed that this record
+    cannot identify at all: a destroyed observation that carried no call id
+    of its own, a checkpoint payload this build could not read, or a payload
+    naming more ids than this build accepts. It is a boolean rather than a
+    counter for two reasons. First, replaying the same turn after an
+    interrupt must not double-count the same loss as if it happened twice.
+    Second, and more importantly, nothing but the end of the run is allowed
+    to turn it back off: no successful call can prove that an observation
+    nobody can name has come back, because nobody can name it to check.
+    """
+
+    call_ids: set[str] = field(default_factory=set)
+    unnameable: bool = False
+
+    def still_missing(self) -> bool:
+        return bool(self.call_ids) or self.unnameable
+
+    def to_state(self) -> dict[str, Any]:
+        # call_ids is sorted so the checkpoint payload is stable across
+        # writes of the same logical state -- a set has no defined order of
+        # its own, and an unstable payload would make every checkpoint diff
+        # noisy even when nothing changed.
+        return {
+            "granularity": LOST_TOOL_EVIDENCE_GRANULARITY,
+            "call_ids": sorted(self.call_ids),
+            "unnameable": self.unnameable,
+        }
+
+    @classmethod
+    def from_state(cls, raw: Any) -> "LostToolEvidence":
+        """Read a checkpointed record back, or say it cannot be read.
+
+        This only handles a present value. ``load_state`` decides separately
+        whether the key was present at all -- that is a different fact from
+        anything checked here, and the two must not share a branch.
+
+        Every failure below reads as ``unnameable=True`` with no call ids,
+        never as an empty record. A payload that fails one of these checks
+        was still written by some turn, so something really was destroyed;
+        reading it as "nothing was lost" is the one direction that could let
+        a later answer rest on evidence that is actually gone. An absent key
+        is the opposite fact -- nothing was ever written -- and that case is
+        handled in ``load_state``, not here.
+        """
+        if not isinstance(raw, dict):
+            return cls(set(), unnameable=True)
+        if raw.get("granularity") != LOST_TOOL_EVIDENCE_GRANULARITY:
+            return cls(set(), unnameable=True)
+        raw_call_ids = raw.get("call_ids")
+        if not isinstance(raw_call_ids, list) or not all(
+            isinstance(call_id, str) and call_id for call_id in raw_call_ids
+        ):
+            return cls(set(), unnameable=True)
+        raw_unnameable = raw.get("unnameable")
+        if not isinstance(raw_unnameable, bool):
+            return cls(set(), unnameable=True)
+        if len(raw_call_ids) > LOST_TOOL_EVIDENCE_MAX_CALL_IDS:
+            # Over the cap: keep the first LOST_TOOL_EVIDENCE_MAX_CALL_IDS ids
+            # from the sorted list and force unnameable so the truncation
+            # itself is not silently lost.
+            truncated = sorted(raw_call_ids)[:LOST_TOOL_EVIDENCE_MAX_CALL_IDS]
+            return cls(set(truncated), unnameable=True)
+        return cls(set(raw_call_ids), unnameable=raw_unnameable)
+
+
+@dataclass(frozen=True)
+class CompactionLoss:
+    """What one compaction destroyed, as far as this turn can account for it.
+
+    ``call_ids`` and ``unaccounted`` are read independently from the same
+    compaction metadata rather than one being derived unconditionally from
+    the other, because compaction can report a positive
+    ``dropped_tool_result_count`` while the id list that should explain it is
+    missing or malformed. "Compaction destroyed N observations but this turn
+    can identify none of them" is a real outcome, and it must read as
+    evidence missing, not as nothing having happened.
+    """
+
+    call_ids: tuple[str, ...]
+    unaccounted: int
 
 
 # Every code point that Python's str.strip() or JavaScript's
@@ -512,6 +625,7 @@ class ReActPattern(AgentPattern):
         self.pending_tool_calls: list[dict[str, Any]] = []
         self.pending_tool_call_content: dict[str, str] = {}
         self.tool_ledger: dict[str, ToolCallRecord] = {}
+        self.lost_tool_evidence = LostToolEvidence()
         self.force_final_answer_next = False
         self.repeated_tool_decision: dict[str, Any] | None = None
         self.waiting_for_user_request: dict[str, Any] | None = None
@@ -746,7 +860,7 @@ class ReActPattern(AgentPattern):
                 "iteration": iteration,
                 **resolved_llm_metadata(call_llm),
             }
-            await runtime.compact_context_if_needed(
+            compact_result = await runtime.compact_context_if_needed(
                 context=context,
                 # Fall back to the main model when no compact model is
                 # configured. PatternRuntime skips summarization entirely
@@ -765,6 +879,15 @@ class ReActPattern(AgentPattern):
                 llm=compact_llm if compact_llm is not None else call_llm,
                 metadata={"iteration": iteration},
             )
+            # Unconditional, and never inside a try. The turn whose
+            # compaction destroys an observation is frequently not the turn
+            # that later has to answer without it, so folding this in only
+            # when this turn happens to already be a forced-answer turn would
+            # lose exactly the interleaving this record exists to catch.
+            # Swallowing an error here would turn "this turn destroyed
+            # evidence" into "this turn did nothing", which is the failure
+            # mode this record exists to prevent.
+            self._record_lost_tool_evidence(self._dropped_tool_evidence(compact_result))
 
             messages = self._messages_for_llm(
                 context,
@@ -1045,6 +1168,7 @@ class ReActPattern(AgentPattern):
                 )
 
         self.status = "max_iterations"
+        self._clear_lost_tool_evidence_at_run_end()
         await runtime.checkpoint("max_iterations", context=context, pattern=self)
         return PatternResult(
             success=False,
@@ -1081,6 +1205,7 @@ class ReActPattern(AgentPattern):
         )
         if answer_streamer is not None:
             await answer_streamer.fail(stream_failure_message)
+        self._clear_lost_tool_evidence_at_run_end()
         await runtime.checkpoint(
             "invalid_tool_protocol",
             context=context,
@@ -1641,6 +1766,56 @@ class ReActPattern(AgentPattern):
     def _tool_decision_group_for_name(self, tool_name: str) -> str:
         return self._tool_decision_groups_by_name.get(tool_name, tool_name)
 
+    def _dropped_tool_evidence(self, compact_result: Any) -> CompactionLoss:
+        """Read what one compaction destroyed from its ``CompactResult``.
+
+        Every check below is a type check on an attribute or a mapping key,
+        never a ``try``: this method raises nothing, and a caller that wraps
+        it in a ``try`` anyway is defending against a failure mode that
+        cannot occur here.
+        """
+        empty = CompactionLoss(call_ids=(), unaccounted=0)
+        if compact_result is None:
+            return empty
+        # compacted=True does not by itself mean anything was removed -- the
+        # tail-window path in ExecutionContext reports it even when the tail
+        # window kept every message -- so a falsy value here is as much
+        # "nothing to account for" as a missing result is.
+        if not getattr(compact_result, "compacted", False):
+            return empty
+        metadata = getattr(compact_result, "metadata", None)
+        if not isinstance(metadata, dict):
+            return empty
+        count = metadata.get("dropped_tool_result_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            return empty
+        raw_call_ids = metadata.get("dropped_tool_result_call_ids")
+        if isinstance(raw_call_ids, list) and all(
+            isinstance(call_id, str) and call_id for call_id in raw_call_ids
+        ):
+            call_ids = tuple(raw_call_ids)
+        else:
+            # The id list is absent or malformed: nothing identifies any of
+            # the destroyed observations, so the whole count is unaccounted
+            # for rather than partially explained.
+            return CompactionLoss(call_ids=(), unaccounted=count)
+        without_call_id = metadata.get("dropped_tool_results_without_call_id")
+        if (
+            isinstance(without_call_id, int)
+            and not isinstance(without_call_id, bool)
+            and without_call_id >= 0
+        ):
+            unaccounted = without_call_id
+        else:
+            unaccounted = max(0, count - len(call_ids))
+        return CompactionLoss(call_ids=call_ids, unaccounted=unaccounted)
+
+    def _record_lost_tool_evidence(self, loss: CompactionLoss) -> None:
+        """Fold one compaction's loss into the run's durable evidence record."""
+        self.lost_tool_evidence.call_ids.update(loss.call_ids)
+        if loss.unaccounted > 0:
+            self.lost_tool_evidence.unnameable = True
+
     def get_state(self) -> dict[str, Any]:
         """Return JSON-serializable ReAct state for checkpointing."""
         return {
@@ -1671,6 +1846,7 @@ class ReActPattern(AgentPattern):
             "tool_ledger": {
                 key: record.to_dict() for key, record in self.tool_ledger.items()
             },
+            "lost_tool_evidence": self.lost_tool_evidence.to_state(),
         }
 
     def load_state(self, state: dict[str, Any]) -> None:
@@ -1746,6 +1922,16 @@ class ReActPattern(AgentPattern):
             key: ToolCallRecord.from_dict(value)
             for key, value in state.get("tool_ledger", {}).items()
         }
+        if "lost_tool_evidence" not in state:
+            # A checkpoint written before this key existed has nothing
+            # missing to report, so it reads as an empty record. Reading an
+            # absent key as "something is missing" would put every
+            # pre-existing run into the missing-evidence path for no reason.
+            self.lost_tool_evidence = LostToolEvidence()
+        else:
+            self.lost_tool_evidence = LostToolEvidence.from_state(
+                state["lost_tool_evidence"]
+            )
 
     async def _resume_waiting_for_user_if_needed(
         self,
@@ -3658,6 +3844,18 @@ class ReActPattern(AgentPattern):
             return "blocked"
         return outcome
 
+    def _clear_lost_tool_evidence_at_run_end(self) -> None:
+        """Drop the lost-evidence record before the run's last checkpoint.
+
+        The run is over, so a record left standing in the final checkpoint
+        would hand a later resume a warning about observations that stopped
+        mattering the moment the run ended. Every terminal path calls this,
+        not only the successful one: a run that exhausts its iterations or
+        fails a tool protocol still writes a checkpoint a resume can load
+        from, exactly like a normal completion does.
+        """
+        self.lost_tool_evidence = LostToolEvidence()
+
     async def _finalize_outcome(
         self,
         *,
@@ -3672,6 +3870,7 @@ class ReActPattern(AgentPattern):
         self.waiting_for_user_request = None
         self.pending_tool_interaction_responses = []
         self.force_final_answer_next = False
+        self._clear_lost_tool_evidence_at_run_end()
         self.status = "completed"
         await runtime.checkpoint("final", context=context, pattern=self)
         result = PatternResult(
