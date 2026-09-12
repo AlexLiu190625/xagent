@@ -95,7 +95,10 @@ _NON_CREDENTIAL_TOKEN_QUALIFIERS = frozenset(
 # The qualifier is the ``_``/``-`` segment just before the suffix
 # (``next_page_token`` -> ``page``). Every other suffix (``api_key``,
 # ``access_token``, ``password``, ``secret`` and their spellings) has no
-# exemption, so ``page_access_token=`` stays masked.
+# exemption, so ``page_access_token=`` stays masked. The exemption below
+# only applies when that segment is joined to the suffix with ``_``; a
+# hyphen join (``next-token=``, ``cache-key=``) is treated as a credential
+# and masked.
 _NON_CREDENTIAL_QUALIFIERS_BY_SUFFIX = {
     "key": _NON_CREDENTIAL_KEY_QUALIFIERS,
     "token": _NON_CREDENTIAL_TOKEN_QUALIFIERS,
@@ -115,8 +118,13 @@ def _is_credential_key(key: str) -> bool:
             # ``monkey=`` / ``hotkey=`` / ``mytoken=``: the credential word is
             # not a separate segment of the identifier.
             continue
+        # The exemption only reads as a deliberate structural-field name
+        # when the qualifier is joined to the suffix by ``_``
+        # (``primary_key=``, ``next_token=``). A hyphen join is treated as
+        # a credential name: ``cache-key=`` / ``next-token=`` are masked;
+        # only the underscore-joined spelling is exempt.
         exempt = _NON_CREDENTIAL_QUALIFIERS_BY_SUFFIX.get(suffix)
-        if exempt is not None:
+        if exempt is not None and prefix[-1] == "_":
             qualifier = re.split(r"[_-]", prefix.rstrip("_-"))[-1]
             if qualifier in exempt:
                 return False

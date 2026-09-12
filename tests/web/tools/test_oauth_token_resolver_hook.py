@@ -1762,6 +1762,25 @@ async def test_hook_failure_warning_redacts_short_resource_query_string(
     )
 
 
+def test_redacted_bounded_resource_treats_none_and_empty_string_alike():
+    """``_build_oauth_token_resolver_diagnostic`` and
+    ``_resolver_failure_config`` used to guard the same expression with
+    ``is not None`` and truthiness respectively, so the two calls would
+    have disagreed on a ``""`` resource (kept as ``""`` vs. treated as
+    absent) had one ever reached them -- neither of this value's two
+    producers (``mcp_runtime.py``'s resource selection and this module's
+    ``_oauth_token_configured_resource``) emits ``""``, so this was never
+    reachable, but the shared helper now makes the two call sites agree by
+    construction rather than by their producers' contract.
+    """
+    assert web_tools_config._redacted_bounded_resource(None) is None
+    assert web_tools_config._redacted_bounded_resource("") is None
+    resource = "https://mcp.example.com/oauth?api_key=SECRET-abc123"
+    assert web_tools_config._redacted_bounded_resource(
+        resource
+    ) == web_tools_config._bounded_oauth_metadata(redact_urls_in_text(resource))
+
+
 @pytest.mark.asyncio
 async def test_hook_connector_runtime_error_propagates(db_session):
     db, user = db_session

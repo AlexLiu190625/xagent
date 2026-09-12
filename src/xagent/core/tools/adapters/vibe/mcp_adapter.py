@@ -242,6 +242,15 @@ _EXCEPTION_WALK_NODE_LIMIT = 64
 # capped on its own. No traceback is attached to any of them. The message
 # returned to the caller ("Error executing MCP tool.") never carries it.
 _MCP_TOOL_ERROR_LOG_MAX_CHARS = 500
+# Caps str(exc) before either redaction pass in _truncated_error_message runs.
+# str(exc) comes from a remote MCP server (or an SDK relaying its response)
+# and has no length limit of its own, while both redaction passes cost time
+# proportional to their input, so an unbounded message is a CPU-cost lever a
+# hostile or compromised server can pull regardless of how cheap either pass
+# is made per character. This bound only needs to keep the redaction passes
+# themselves cheap -- _MCP_TOOL_ERROR_LOG_MAX_CHARS is still what bounds the
+# final logged size.
+_MCP_TOOL_ERROR_RAW_MAX_CHARS = 4096
 # Caps how many related exceptions of a failed call get their own log line:
 # the leaves of a (possibly nested) BaseExceptionGroup and the exceptions on
 # their __cause__/__context__ chains. A fan-out call (e.g. concurrent
@@ -706,6 +715,51 @@ _URL_TRAILING_PUNCTUATION = ",.;:"
 _URL_TRAILING_BRACKETS = {")": "(", "]": "[", "}": "{"}
 
 
+def _split_url_token(token: str) -> tuple[str, str]:
+    """Split a matched URL token into ``(clean, trailing)``.
+
+    ``trailing`` is sentence punctuation immediately following the URL (a
+    closing paren, a period, ...) that should survive redaction even
+    though the URL itself does not; ``clean`` is the token with that
+    punctuation removed, ready to hand to ``urlsplit``.
+
+    The boundary between the two is found by scanning backward from the
+    end of the *scheme+authority+path* portion of the token only -- never
+    past the first ``?`` or ``#`` -- dropping characters that are either
+    in ``_URL_TRAILING_PUNCTUATION`` or a closing bracket with no
+    matching opener earlier in that same portion, until neither applies.
+    Stopping at the query/fragment boundary is deliberate: those parts are
+    dropped wholesale by the caller, so a credential value ending in one
+    of these characters (``...api_key=S)))``) must not have that tail
+    split off, survive the drop, and be reattached to the redacted URL as
+    if it were sentence punctuation -- nothing at or after the boundary is
+    ever part of either return value. Bracket counts for the scanned
+    portion are computed once up front and decremented as brackets are
+    consumed, rather than re-scanned on every character, so the scan is
+    linear in the token length instead of quadratic.
+    """
+    boundary = len(token)
+    for sep in ("?", "#"):
+        idx = token.find(sep)
+        if idx != -1 and idx < boundary:
+            boundary = idx
+    scanned = token[:boundary]
+    remaining = {c: scanned.count(c) for c in _URL_TRAILING_BRACKETS}
+    openers = {c: scanned.count(o) for c, o in _URL_TRAILING_BRACKETS.items()}
+    end = boundary
+    while end > 0:
+        last = token[end - 1]
+        if last in _URL_TRAILING_PUNCTUATION:
+            end -= 1
+            continue
+        if last in _URL_TRAILING_BRACKETS and openers[last] < remaining[last]:
+            remaining[last] -= 1
+            end -= 1
+            continue
+        break
+    return token[:end], token[end:boundary]
+
+
 def redact_urls_in_text(text: str) -> str:
     """Return ``text`` with every ``scheme://...`` URL replaced by a copy
     that has its query string and userinfo stripped.
@@ -726,32 +780,28 @@ def redact_urls_in_text(text: str) -> str:
     Sentence punctuation that trails the token (a closing paren, a period,
     ...) is split off before parsing and re-appended to the result
     afterwards, so redaction does not eat the punctuation that follows a
-    URL. Text separated from the URL only by a character that is legal
-    inside a query string (a comma, say) is still part of the token and
-    is dropped with the query; see the ``comma-inside-query`` test case.
+    URL -- but only punctuation trailing the scheme/authority/path:
+    nothing at or after the first ``?``/``#`` is ever treated as trailing,
+    since that is where the query string / fragment begins and both are
+    dropped wholesale (see ``_split_url_token``). Text separated from the
+    URL only by a character that is legal inside a query string (a comma,
+    say) is still part of the token and is dropped with the query; see
+    the ``comma-inside-query`` test case.
     """
 
     def _redact(match: "re.Match[str]") -> str:
         token = match.group(0)
-        trailing = ""
-        while token:
-            last = token[-1]
-            if last in _URL_TRAILING_PUNCTUATION or (
-                last in _URL_TRAILING_BRACKETS
-                and token.count(_URL_TRAILING_BRACKETS[last]) < token.count(last)
-            ):
-                trailing = last + trailing
-                token = token[:-1]
-                continue
-            break
+        clean, trailing = _split_url_token(token)
         try:
-            parts = urlsplit(token)
+            parts = urlsplit(clean)
             # Keep the authority verbatim minus userinfo: re-assembling it
             # from ``hostname``/``port`` would drop IPv6 brackets and lower
             # the case, and reading ``port`` raises on out-of-range values.
             netloc = parts.netloc.rsplit("@", 1)[-1]
             return urlunsplit((parts.scheme, netloc, parts.path, "", "")) + trailing
-        except (ValueError, UnicodeError):
+        except ValueError:
+            # UnicodeError is a ValueError subclass, so this also covers a
+            # token that fails to decode as IDNA.
             return "<url redacted>" + trailing
 
     return _URL_TOKEN_RE.sub(_redact, text)
@@ -768,9 +818,15 @@ def _truncated_error_message(exc: BaseException) -> str:
     exception messages to begin with. Some shapes are recognised by neither
     helper -- a secret in a URL path segment (#2272) and some of the shapes
     listed in #2356 -- and for those the cap is what bounds the exposure.
+    ``str(exc)`` is also bounded to ``_MCP_TOOL_ERROR_RAW_MAX_CHARS`` before
+    either redaction pass runs, since it is remote-controlled and unbounded
+    while both passes cost time proportional to their input.
     """
     try:
-        text = redact_sensitive_text(redact_urls_in_text(str(exc)))
+        raw = str(exc)
+        if len(raw) > _MCP_TOOL_ERROR_RAW_MAX_CHARS:
+            raw = raw[:_MCP_TOOL_ERROR_RAW_MAX_CHARS]
+        text = redact_sensitive_text(redact_urls_in_text(raw))
     except BaseException:
         # Every caller is an ``except`` handler whose contract is to return
         # a result dict, so a custom ``__str__`` that raises must not escape

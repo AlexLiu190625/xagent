@@ -380,21 +380,78 @@ def test_redact_sensitive_text_leaves_non_credential_key_suffixes() -> None:
     assert redact_sensitive_text(text) == text
 
 
+# Each hyphen-joined structural qualifier paired with its underscore-joined
+# counterpart. The exemption requires an underscore join, so these
+# hyphen-joined names are masked; their underscore counterparts stay
+# exempt.
+_HYPHEN_QUALIFIER_REGRESSION_PAIRS = [
+    ("primary-key", "primary_key"),
+    ("foreign-key", "foreign_key"),
+    ("unique-key", "unique_key"),
+    ("composite-key", "composite_key"),
+    ("index-key", "index_key"),
+    ("sort-key", "sort_key"),
+    ("partition-key", "partition_key"),
+    ("range-key", "range_key"),
+    ("hash-key", "hash_key"),
+    ("lookup-key", "lookup_key"),
+    ("cache-key", "cache_key"),
+    ("routing-key", "routing_key"),
+    ("idempotency-key", "idempotency_key"),
+    ("public-key", "public_key"),
+    ("object-key", "object_key"),
+    ("s3-key", "s3_key"),
+    ("idempotency-token", "idempotency_token"),
+    ("next-token", "next_token"),
+    ("page-token", "page_token"),
+    ("continuation-token", "continuation_token"),
+    ("cursor-token", "cursor_token"),
+    ("sync-token", "sync_token"),
+    ("pagination-token", "pagination_token"),
+]
+
+
+@pytest.mark.parametrize(
+    ("hyphen_key", "underscore_key"), _HYPHEN_QUALIFIER_REGRESSION_PAIRS
+)
+def test_redact_sensitive_text_masks_hyphenated_structural_qualifiers(
+    hyphen_key: str, underscore_key: str
+) -> None:
+    hyphen_text = f"{hyphen_key}=SECRET-abc123"
+    underscore_text = f"{underscore_key}=SECRET-abc123"
+
+    assert redact_sensitive_text(hyphen_text) == f"{hyphen_key}=***c123"
+    assert redact_sensitive_text(underscore_text) == underscore_text
+
+
+def test_redact_sensitive_text_still_masks_prefixed_key_despite_hyphen_gate() -> None:
+    # The hyphen-vs-underscore gate above only governs the non-credential
+    # qualifier exemption; it must not weaken the fail-closed prefixed-key
+    # masking (#2304), which has no exemption at all.
+    assert redact_sensitive_text("MCP_API_KEY=SECRET-abc123") == "MCP_API_KEY=***c123"
+
+
 # ``*_token`` names that locate a page or de-duplicate a request; they are not
 # credentials, and this text reaches user- and model-facing error messages.
+# The exemption only fires when the qualifier is joined to ``token`` by
+# ``_`` (see ``_is_credential_key``); a hyphen join is masked, so
+# hyphenated names like ``x-idempotency-token`` and ``--page-token`` are
+# not listed here even though their qualifier is the same word.
 _POSITION_MARKER_TOKEN_KEYS = (
     "idempotency_token next_token page_token continuation_token cursor_token "
-    "sync_token pagination_token next_page_token X_IDEMPOTENCY_TOKEN "
-    "x-idempotency-token --page-token"
+    "sync_token pagination_token next_page_token X_IDEMPOTENCY_TOKEN"
 ).split()
 # Credential ``*_token`` names (``page_access_token`` puts a position word in
-# front of ``access_token``), the ``*_key`` family that must keep masking, and
-# every ``*_key`` qualifier that is not also a ``*_token`` one (``public_token``).
+# front of ``access_token``), the ``*_key`` family that must keep masking,
+# every ``*_key`` qualifier that is not also a ``*_token`` one (``public_token``),
+# and hyphen-joined position-marker names -- the exemption above only exempts
+# an underscore join, so these are masked.
 _CREDENTIAL_TOKEN_KEYS = (
     "token access_token refresh_token id_token session_token auth_token "
     "api_token bearer_token csrf_token oauth_token github_token "
     "MCP_ACCESS_TOKEN page_access_token client_token "
-    "AWS_SECRET_ACCESS_KEY MCP_API_KEY api_key"
+    "AWS_SECRET_ACCESS_KEY MCP_API_KEY api_key "
+    "x-idempotency-token --page-token"
 ).split() + [
     f"{qualifier}_token"
     for qualifier in sorted(

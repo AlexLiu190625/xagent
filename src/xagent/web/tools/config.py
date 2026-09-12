@@ -478,6 +478,21 @@ def _bounded_oauth_metadata(value: Any, *, max_length: int = 128) -> str:
     return f"{text[: max_length - 3]}..."
 
 
+def _redacted_bounded_resource(resource: str | None) -> str | None:
+    """Redact and bound an OAuth resource URL for a diagnostic, or ``None``
+    if there is none. Every producer of ``resource`` (``mcp_runtime.py``'s
+    ``effective_mcp_oauth_resource`` and this module's
+    ``_oauth_token_configured_resource``) excludes the empty string, so a
+    truthy guard and an ``is not None`` guard are equivalent in practice;
+    this uses the truthy form so ``""`` -- if a producer's contract ever
+    changes -- is treated the same as ``None`` rather than redacted and
+    bounded into a diagnostic-empty string.
+    """
+    if not resource:
+        return None
+    return _bounded_oauth_metadata(redact_urls_in_text(resource))
+
+
 def _extract_oauth_token_resolver_diagnostic_actor_id(exc: Exception) -> str | None:
     try:
         raw_actor_id = getattr(exc, "oauth_token_resolver_diagnostic_actor_id", None)
@@ -3604,9 +3619,7 @@ class WebToolConfig(BaseToolConfig):
             server,
             code=OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
             message=OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE,
-            resource=_bounded_oauth_metadata(redact_urls_in_text(error.resource))
-            if error.resource is not None
-            else None,
+            resource=_redacted_bounded_resource(error.resource),
         )
         diagnostic["providers"] = [
             _bounded_oauth_metadata(provider) for provider in error.providers[:2]
@@ -3634,9 +3647,7 @@ class WebToolConfig(BaseToolConfig):
             getattr(server, "name", "<unknown>"),
             error.exception_type,
             error.failure_code,
-            _bounded_oauth_metadata(redact_urls_in_text(error.resource))
-            if error.resource
-            else None,
+            _redacted_bounded_resource(error.resource),
         )
         return self._build_unavailable_mcp_config(
             server=server,

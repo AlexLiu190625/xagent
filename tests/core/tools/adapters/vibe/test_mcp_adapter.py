@@ -3,6 +3,7 @@ import logging
 import re
 import subprocess
 import sys
+import time
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _FIELD_TEXT_MAX_CHARS,
     _MCP_TOOL_ERROR_LOG_MAX_CHARS,
+    _MCP_TOOL_ERROR_RAW_MAX_CHARS,
     EmptyArgsModel,
     MCPFailurePhase,
     MCPServerLoadFailure,
@@ -29,10 +31,12 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _compact_json,
     _exception_indicates_http_401,
     _mcp_return_value_as_string,
+    _split_url_token,
     _truncated_error_message,
     classify_non_idempotent_write,
     classify_write_hint,
     load_mcp_tools_as_agent_tools,
+    redact_urls_in_text,
 )
 from xagent.core.tools.adapters.vibe.tool_naming_limits import (
     MAX_AGENT_TOOL_NAME_LENGTH,
@@ -3869,8 +3873,10 @@ def test_truncated_error_message_redacts_non_url_secret_shapes(message, expected
         ("https://[::1/x?y=1 done", "<url redacted> done"),
         ("wss://h/ws?api_key=SECRET rejected", "wss://h/ws rejected"),
         ("ws://h/p?tok=SECRET redirect", "ws://h/p redirect"),
-        ("see (https://h/p?k=s) ok", "see (https://h/p) ok"),
-        ("msg: https://h/p?k=s.", "msg: https://h/p."),
+        ("see (https://h/p) ok", "see (https://h/p) ok"),
+        ("msg: https://h/p.", "msg: https://h/p."),
+        ("see (https://h/p?k=s) ok", "see (https://h/p ok"),
+        ("msg: https://h/p?k=s.", "msg: https://h/p"),
         ("see https://[::1]", "see https://[::1]"),
         (
             "https://en.example/wiki/Foo_(bar)",
@@ -3886,8 +3892,10 @@ def test_truncated_error_message_redacts_non_url_secret_shapes(message, expected
         "unparsable",
         "wss-query-dropped",
         "ws-query-dropped",
-        "trailing-paren",
-        "trailing-period",
+        "trailing-paren-no-query",
+        "trailing-period-no-query",
+        "trailing-paren-in-dropped-query",
+        "trailing-period-in-dropped-query",
         "bare-ipv6-authority",
         "balanced-paren-in-path",
         "comma-inside-query-is-part-of-the-url",
@@ -3903,7 +3911,115 @@ def test_redact_urls_in_text_edge_shapes(text, expected):
     would split a secret that happens to contain a comma into two pieces
     and leave the second piece in the log. This case pins the current,
     deliberate trade-off; it must turn red if that trade-off is reversed.
-    """
-    from xagent.core.tools.adapters.vibe.mcp_adapter import redact_urls_in_text
 
+    ``trailing-paren-in-dropped-query`` and ``trailing-period-in-dropped-query``
+    pin the fix for the mirror-image bug: the token's own trailing ``)``/
+    ``.`` sits right after a query string (``?k=s)`` / ``?k=s.``), so
+    stripping it as sentence punctuation *before* the query is located
+    would split a credential value ending in one of those characters off
+    its query, survive the query's removal, and get reattached to the
+    redacted URL. ``_split_url_token`` never looks past the query/fragment
+    boundary, so that trailing text is dropped with the rest of the query
+    instead -- these two cases have no trailing punctuation reattached,
+    unlike their no-query counterparts just above them.
+    """
     assert redact_urls_in_text(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("token", "expected_clean", "expected_trailing"),
+    [
+        ("https://h/p)))", "https://h/p", ")))"),
+        ("https://h/a(b)c", "https://h/a(b)c", ""),
+        ("https://[::1]", "https://[::1]", ""),
+        ("https://h/p,.;:", "https://h/p", ",.;:"),
+        ("https://h/p", "https://h/p", ""),
+    ],
+    ids=[
+        "unmatched-closing-bracket",
+        "matched-brackets-in-path",
+        "ipv6-authority-brackets",
+        "trailing-punctuation-run",
+        "no-trailing-punctuation",
+    ],
+)
+def test_split_url_token(token, expected_clean, expected_trailing):
+    """``_split_url_token`` is the boundary scan ``redact_urls_in_text`` uses
+    to separate a URL from sentence punctuation trailing it, extracted out
+    of ``_redact`` so it can be tested on its own. ``matched-brackets-in-path``
+    and ``ipv6-authority-brackets`` pin that a *balanced* bracket is never
+    treated as trailing punctuation, only an unmatched one is.
+    """
+    assert _split_url_token(token) == (expected_clean, expected_trailing)
+
+
+def test_split_url_token_stops_at_query_boundary():
+    """A trailing character that is actually the tail of a query value (a
+    credential ending in ``)``) must never be classified as sentence
+    punctuation: the scan stops at the first ``?``/``#`` in the token, so
+    nothing at or after that point can appear in either half of the
+    result. See ``test_redact_urls_in_text_does_not_reattach_query_tail``
+    for the same fix exercised through ``redact_urls_in_text``.
+    """
+    assert _split_url_token("https://h/p?api_key=S)))") == ("https://h/p", "")
+
+
+def test_redact_urls_in_text_is_linear_on_unmatched_closing_brackets():
+    """Before this fix, ``_redact``'s trailing-punctuation strip re-scanned
+    the whole token on every character it stripped (``token.count(...)``
+    plus ``token = token[:-1]``, both full-length operations run once per
+    stripped character), making it quadratic in the length of a run of
+    unmatched closing brackets -- measured at roughly 24s for a
+    300,000-character run before this fix. The budget below is loose on
+    purpose so a slow CI worker cannot trip it, while a quadratic
+    regression (tens of seconds here) still does.
+    """
+    text = "see https://mcp.example.com/x" + ")" * 300_000
+
+    start = time.perf_counter()
+    redact_urls_in_text(text)
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 1.0
+
+
+def test_redact_urls_in_text_does_not_reattach_query_tail_as_trailing_punctuation():
+    """The trailing-punctuation strip used to run on the raw token before
+    the query string was located, so a credential value ending in a
+    character ``_split_url_token`` treats as sentence punctuation (a
+    closing paren, a period, or an unmatched bracket) had that tail split
+    off, survived the query being dropped, and was reattached to the
+    redacted URL -- leaking a few trailing characters of the credential.
+    The fix stops the boundary scan at the query separator, so the whole
+    query -- tail included -- is dropped together and nothing survives to
+    be reattached.
+    """
+    text = "connect failed for url 'https://mcp.example.com/p?api_key=S)))'"
+
+    result = redact_urls_in_text(text)
+
+    assert not result.endswith(")))'")
+    assert result == "connect failed for url 'https://mcp.example.com/p'"
+
+
+def test_truncated_error_message_bounds_raw_text_before_redaction(monkeypatch):
+    """``str(exc)`` is remote-controlled and has no length limit of its
+    own, while both redaction passes cost time proportional to their
+    input, so it must be capped to ``_MCP_TOOL_ERROR_RAW_MAX_CHARS``
+    before either one runs -- not just truncated to
+    ``_MCP_TOOL_ERROR_LOG_MAX_CHARS`` afterwards, which would leave both
+    passes running on the full, unbounded message.
+    """
+    seen_lengths = []
+    original_redact_urls = mcp_adapter_module.redact_urls_in_text
+
+    def spy(text):
+        seen_lengths.append(len(text))
+        return original_redact_urls(text)
+
+    monkeypatch.setattr(mcp_adapter_module, "redact_urls_in_text", spy)
+
+    message = _truncated_error_message(RuntimeError("x" * 100_000))
+
+    assert seen_lengths == [_MCP_TOOL_ERROR_RAW_MAX_CHARS]
+    assert len(message) <= _MCP_TOOL_ERROR_LOG_MAX_CHARS
