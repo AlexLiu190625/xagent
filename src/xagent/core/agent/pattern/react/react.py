@@ -190,19 +190,41 @@ LOST_TOOL_EVIDENCE_MAX_CALL_IDS = 200
 # produce.
 LOST_TOOL_NAME_OMISSION_ALLOWANCE = 64
 # What a prompt states while this run's lost-evidence record still holds
-# something: what happened, and what the model may not do about it. Held as
-# one shared literal because both openings that can carry it -- the forced
-# one, where the model can only answer, and the ordinary tool-carrying one,
-# where it can also fetch the value back -- must state the same facts. Two
-# hand-written copies of this would drift, and the turn that got the weaker
-# copy is exactly the turn that invents a value.
-EVIDENCE_REMOVED_FACTS = (
+# something: what happened, and what the model may not do about it. Written
+# once, here, because both openings that can carry it -- the forced one, where
+# the model can only answer, and the ordinary tool-carrying one, where it can
+# also fetch the value back -- must state the same facts. Two hand-written
+# copies of this would drift, and the turn that got the weaker copy is exactly
+# the turn that invents a value.
+#
+# Two halves rather than one literal, because one clause in the middle of it
+# is not fixed: the names of the tools whose results were removed. Both halves
+# and the clause between them are assembled in the one place that renders this
+# text, ReActPattern._evidence_removed_facts, so an opening cannot name a
+# different set of tools than the other opening would from the same record.
+EVIDENCE_REMOVED_FACTS_BEFORE_NAMES = (
     "Compaction removed tool observations from this run's context and their "
-    "values can no longer be read. If a compaction summary stands above, "
+    "values can no longer be read"
+)
+EVIDENCE_REMOVED_FACTS_AFTER_NAMES = (
+    ". If a compaction summary stands above, "
     "treat any value not literally present in that summary -- "
     f"{VALUE_KINDS} -- as unavailable rather than recalled. Do not "
     "reconstruct, estimate, or illustrate a removed value, and do not "
     "present one as an example. "
+)
+# Introduces the names of the tools whose removed results the record could
+# still identify. Naming them is what lets the model tell a value it may no
+# longer use from one it never fetched: without the names, "some observations
+# were removed" applies equally to every value in the conversation.
+EVIDENCE_REMOVED_NAMED_CLAUSE_PREFIX = ", including results from these tools: "
+# Used instead when the record holds losses it cannot name at all -- every
+# destroyed call whose fingerprint was already unresolvable when the loss was
+# recorded. Stating that plainly is the honest reading of such a record;
+# rendering the clause above with an empty list would read as though nothing
+# had been removed.
+EVIDENCE_REMOVED_UNNAMED_CLAUSE = (
+    ", and this conversation does not record which ones they were"
 )
 # The one instruction that belongs only to a turn still holding its tools:
 # it can end the loss by calling the tool again, which a forced turn cannot.
@@ -1055,28 +1077,36 @@ class ReActPattern(AgentPattern):
             # that makes the difference matter -- it stops being a forced turn
             # and keeps every missing observation.
             evidence_missing = self.lost_tool_evidence.still_missing()
+            # Resolved once, here, and used by both the prompt built below and
+            # the operator-facing log line, so the two can never disagree
+            # about what the record holds. Resolved whenever the record holds
+            # something, not only on a forced turn: the prompt names the
+            # removed observations on every turn that carries the wording, and
+            # a turn that still holds its tools carries it too.
+            lost_tool_names: list[str] = []
+            lost_evidence_unnameable = False
+            if evidence_missing:
+                lost_tool_names, lost_evidence_unnameable = self._lost_tool_names()
             if force_final_answer_now and evidence_missing:
-                # Resolved for this operator-facing log line only. The
-                # instruction built below reports that observations were
-                # removed without naming them, so nothing resolved here
-                # reaches the model. The line stays specific to forced turns:
-                # it reports a turn that must answer without the evidence,
-                # which an ordinary turn still holding the full tool set is
-                # not.
-                names, unnamed = self._lost_tool_names()
+                # The line stays specific to forced turns: it reports a turn
+                # that must answer without the evidence, which an ordinary
+                # turn still holding the full tool set is not.
+                #
                 # Joined here rather than handed to the logger as a list: the
                 # budget _bounded_tool_names spends is measured against the
                 # joined string, and "%s" on a list renders repr(list)
                 # instead -- a longer string than the one that was budgeted.
-                names_field = "\n".join(self._bounded_tool_names(names)) or "unknown"
+                names_field = (
+                    "\n".join(self._bounded_tool_names(lost_tool_names)) or "unknown"
+                )
                 logger.warning(
                     "Forced answer turn is missing tool evidence compaction destroyed; it will "
                     "be named as unavailable rather than answered from. missing_calls=%d "
                     "named_count=%d named=%s unnamed=%s execution_id=%s",
                     len(self.lost_tool_evidence.calls),
-                    len(names),
+                    len(lost_tool_names),
                     names_field,
-                    unnamed,
+                    lost_evidence_unnameable,
                     getattr(context, "execution_id", None),
                 )
 
@@ -1085,6 +1115,7 @@ class ReActPattern(AgentPattern):
                 has_tools=bool(tool_schemas),
                 force_final_answer=force_final_answer_now,
                 evidence_missing=evidence_missing,
+                lost_tool_names=lost_tool_names,
                 tool_names=self._schema_tool_names(tool_schemas),
             )
             await runtime.checkpoint("before_llm", context=context, pattern=self)
@@ -1163,9 +1194,10 @@ class ReActPattern(AgentPattern):
                         # The retry rebuilds the whole prompt from scratch, and
                         # on a turn whose evidence is gone this is the call
                         # that actually reaches the user -- without forwarding
-                        # this, the repair would hand back the stale wording
+                        # these, the repair would hand back the stale wording
                         # this turn's first call already replaced.
                         evidence_missing=evidence_missing,
+                        lost_tool_names=lost_tool_names,
                         recovery_reason=exc.code,
                     )
                 except LLMCallInterrupted:
@@ -1263,6 +1295,7 @@ class ReActPattern(AgentPattern):
                         # actually reaches the user, so it needs the same
                         # evidence wording as the call it is repairing.
                         evidence_missing=evidence_missing,
+                        lost_tool_names=lost_tool_names,
                         recovery_reason=recovery_reason,
                         empty_final_answer=empty_final_answer is not None,
                     )
@@ -1522,6 +1555,38 @@ class ReActPattern(AgentPattern):
         self.force_final_answer_next = False
         return False
 
+    @classmethod
+    def _evidence_removed_facts(cls, lost_tool_names: Sequence[str] | None) -> str:
+        """State what compaction removed, naming the tools it can name.
+
+        The single place both openings get this text from. An opening that
+        built its own copy could name a different set of tools than the other
+        opening would from the same record, and the turn that got the vaguer
+        copy is the one that answers from a value it cannot see.
+
+        The names are rendered through ``_bounded_tool_names``, the same
+        bounded renderer the operator-facing log line uses. Tool names come
+        from runtime MCP server configuration and the number of destroyed
+        calls is bounded only by how many iterations a run takes, so an
+        unrendered list would put an unbounded span of configuration text
+        into every prompt this turn and each retry rebuilds.
+
+        With no resolvable name -- either nothing was resolvable when the
+        losses were recorded, or the record's only entry is one it could never
+        fingerprint -- the text says so outright instead of naming an empty
+        list, which would read as nothing having been removed.
+        """
+        if lost_tool_names:
+            rendered = ", ".join(cls._bounded_tool_names(list(lost_tool_names)))
+            clause = f"{EVIDENCE_REMOVED_NAMED_CLAUSE_PREFIX}{rendered}"
+        else:
+            clause = EVIDENCE_REMOVED_UNNAMED_CLAUSE
+        return (
+            f"{EVIDENCE_REMOVED_FACTS_BEFORE_NAMES}"
+            f"{clause}"
+            f"{EVIDENCE_REMOVED_FACTS_AFTER_NAMES}"
+        )
+
     def _messages_for_llm(
         self,
         context: Any,
@@ -1529,6 +1594,7 @@ class ReActPattern(AgentPattern):
         has_tools: bool,
         force_final_answer: bool = False,
         evidence_missing: bool = False,
+        lost_tool_names: Sequence[str] | None = None,
         tool_names: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the prompt for one LLM call.
@@ -1540,6 +1606,12 @@ class ReActPattern(AgentPattern):
         holds its tools is told the same and to fetch the value again instead.
         Wording it on one opening only leaves the other silently inviting the
         model to answer from observations that are not there.
+
+        ``lost_tool_names`` are the tool names the record could resolve those
+        destroyed observations to, already sorted, and they are named in
+        whichever opening carries the wording. Both openings render them
+        through the one helper below, so neither can end up naming more or
+        fewer tools than the other.
         """
         messages = list(context.get_messages_for_llm())
         if force_final_answer:
@@ -1572,7 +1644,7 @@ class ReActPattern(AgentPattern):
                 opening = (
                     "Produce the final user-facing answer by calling the "
                     "final_answer control tool exactly once. "
-                    f"{EVIDENCE_REMOVED_FACTS}"
+                    f"{self._evidence_removed_facts(lost_tool_names)}"
                     "Do not "
                     "rest an outcome=completed claim on an observation that was "
                     "removed; set outcome=partial when part of the request is "
@@ -1607,8 +1679,12 @@ class ReActPattern(AgentPattern):
             # whenever a forced answer was undone -- the model called a tool
             # the narrowed schema did not hold, the full set was handed back,
             # and this turn and every turn after it is an ordinary one again.
+            # Named here for the same reason the forced opening names them:
+            # this turn can call the tools it is told to call again, and it can
+            # only do that for tools it has been told the names of.
             evidence_opening = (
-                f"{EVIDENCE_REMOVED_FACTS}{EVIDENCE_REFETCH_RULE}"
+                f"{self._evidence_removed_facts(lost_tool_names)}"
+                f"{EVIDENCE_REFETCH_RULE}"
                 if evidence_missing
                 else ""
             )
@@ -1713,6 +1789,7 @@ class ReActPattern(AgentPattern):
         tool_schemas: list[dict[str, Any]],
         force_final_answer: bool,
         evidence_missing: bool = False,
+        lost_tool_names: Sequence[str] | None = None,
         recovery_reason: str | None = None,
         empty_final_answer: bool = False,
     ) -> tuple[Any, ReActFinalAnswerStreamer]:
@@ -1724,6 +1801,7 @@ class ReActPattern(AgentPattern):
             has_tools=True,
             force_final_answer=force_final_answer,
             evidence_missing=evidence_missing,
+            lost_tool_names=lost_tool_names,
             tool_names=self._schema_tool_names(tools),
         )
         if recovery_reason == "unavailable_tool_call":
