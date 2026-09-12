@@ -36,12 +36,14 @@ from xagent.core.agent.language import final_answer_language_rule
 from xagent.core.agent.pattern.react import react as react_module
 from xagent.core.agent.pattern.react.react import (
     LOST_TOOL_EVIDENCE_GRANULARITY,
+    LOST_TOOL_EVIDENCE_GRANULARITY_CALL_IDS_ONLY,
     LOST_TOOL_EVIDENCE_MAX_CALL_IDS,
     LOST_TOOL_NAME_OMISSION_ALLOWANCE,
     CompactionLoss,
     LostToolEvidence,
     ToolCallRecord,
 )
+from xagent.core.agent.runtime import load_pattern_checkpoint
 from xagent.core.file_ref import final_deliverable_file_reference_instructions
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 
@@ -57,6 +59,14 @@ COMPLETED_OFFERED_PHRASE = "Set outcome=completed only when"
 COMPLETED_CONDITIONAL_PHRASE = (
     "Do not rest an outcome=completed claim on an observation that was removed"
 )
+# The one sentence only a turn that still holds its tools is given: it can
+# end the loss by calling the tool again.
+EVIDENCE_REFETCH_PHRASE = "call the tool that produces it again"
+# Two sentences that belong to a forced turn alone. On a turn whose tools
+# came back, the first is a wrong description of what is being asked for and
+# the second forbids the tool call that would fetch the missing value.
+FORCED_ANSWER_PHRASE = "Produce the final user-facing answer by calling the"
+FORCED_ONLY_TOOL_RULE = "Do not call any other tool and do not output"
 
 
 class _EmptyArgs(BaseModel):
@@ -373,7 +383,7 @@ async def test_an_unforced_turn_still_records_what_it_lost(
     Mutation this test catches: if the fold-in call in
     ``_run_tool_calling_loop`` were moved inside
     ``if force_final_answer_now:``, the unforced cell's checkpointed
-    ``call_ids`` would read back empty here; with the actual unconditional
+    ``calls`` would read back empty here; with the actual unconditional
     fold-in it does not.
     """
     max_messages = 40 if use_summary else 4
@@ -406,8 +416,8 @@ async def test_an_unforced_turn_still_records_what_it_lost(
     )
 
     recorded = state_at(runtime, "after_llm")["lost_tool_evidence"]
-    assert recorded["call_ids"] == expected_call_ids
-    assert recorded["call_ids"] != []
+    assert sorted(recorded["calls"]) == expected_call_ids
+    assert recorded["calls"] != {}
 
 
 @pytest.mark.parametrize(
@@ -459,33 +469,43 @@ def test_the_lost_evidence_record_round_trips_through_a_checkpoint(
     expected_unnameable: bool,
 ) -> None:
     """``get_state()``/``load_state()`` must reproduce the record on the
-    other side.
+    other side, fingerprints included.
 
     Without a correct round trip, a run resumed from a checkpoint would
     silently start with a wrong lost-evidence record: either forgetting real
     losses (a missing-key regression) or inventing ones that were never
-    there.
+    there. The fingerprint travels with each entry because it is what a
+    later refetch is matched against; an entry that arrived without one
+    could only be matched by looking the id up in the live ledger, which is
+    the lookup this record exists to avoid.
 
-    The over-cap cell does not expect the exact same call ids back: writing
-    more ids than a read-back accepts is a legitimate outcome of a long run's
-    own accumulation over many compactions, and the cap's truncation-on-read
-    is what the dedicated over-cap test below pins down in detail. Included
-    here only to confirm that ``get_state()`` itself never truncates -- only
-    ``from_state()`` does -- so the source's full set survives the write side
-    of the round trip even though the read side then shortens it.
+    The over-cap cell expects the cap applied on the WRITE side: the payload
+    carries at most ``LOST_TOOL_EVIDENCE_MAX_CALL_IDS`` entries and says so
+    by reading back unnameable. A write that stored more than a read-back
+    accepts would be a record that cannot survive its own round trip.
     """
     source = ReActPattern()
     source.lost_tool_evidence = LostToolEvidence(
-        call_ids=set(source_call_ids), unnameable=source_unnameable
+        calls={
+            call_id: ("calculator", f"hash-{call_id}") for call_id in source_call_ids
+        },
+        unnameable=source_unnameable,
     )
     state = source.get_state()
-    assert len(state["lost_tool_evidence"]["call_ids"]) == len(source_call_ids)
+    assert len(state["lost_tool_evidence"]["calls"]) == min(
+        len(source_call_ids), LOST_TOOL_EVIDENCE_MAX_CALL_IDS
+    )
 
     destination = ReActPattern()
     destination.load_state(state)
 
-    assert destination.lost_tool_evidence.call_ids == expected_call_ids
+    assert set(destination.lost_tool_evidence.calls) == expected_call_ids
     assert destination.lost_tool_evidence.unnameable is expected_unnameable
+    for call_id in expected_call_ids:
+        assert destination.lost_tool_evidence.calls[call_id] == (
+            "calculator",
+            f"hash-{call_id}",
+        )
 
 
 @pytest.mark.parametrize(
@@ -493,21 +513,23 @@ def test_the_lost_evidence_record_round_trips_through_a_checkpoint(
     [
         [],
         "x",
-        {"call_ids": "x"},
-        {"granularity": LOST_TOOL_EVIDENCE_GRANULARITY, "call_ids": [1]},
-        {"granularity": "tool_name", "call_ids": []},
-        # Both of these carry a call id rather than an empty list, and the
+        {"calls": {"call_a": ["search", "hash-a"]}},
+        {"granularity": LOST_TOOL_EVIDENCE_GRANULARITY, "calls": {"call_a": [1, 2]}},
+        {"granularity": LOST_TOOL_EVIDENCE_GRANULARITY, "calls": {"call_a": ["s"]}},
+        {"granularity": LOST_TOOL_EVIDENCE_GRANULARITY, "calls": ["call_a"]},
+        {"granularity": "tool_name", "calls": {}},
+        # Both of these carry an entry rather than an empty mapping, and the
         # second carries a falsy value. Without either, a build that kept no
         # guard at all and simply coerced the field would land on the same
         # answer these cells expect, and the cell would pass against both.
         {
             "granularity": LOST_TOOL_EVIDENCE_GRANULARITY,
-            "call_ids": ["call_a"],
+            "calls": {"call_a": ["search", "hash-a"]},
             "unnameable": "yes",
         },
         {
             "granularity": LOST_TOOL_EVIDENCE_GRANULARITY,
-            "call_ids": ["call_a"],
+            "calls": {"call_a": ["search", "hash-a"]},
             "unnameable": 0,
         },
     ],
@@ -515,7 +537,9 @@ def test_the_lost_evidence_record_round_trips_through_a_checkpoint(
         "not_a_dict_list",
         "not_a_dict_str",
         "missing_granularity",
-        "non_string_call_id",
+        "non_string_fingerprint_parts",
+        "fingerprint_wrong_length",
+        "calls_not_a_mapping",
         "wrong_granularity",
         "unnameable_not_bool_str",
         # bool is a subclass of int in Python, so a guard written as
@@ -539,26 +563,29 @@ def test_an_unreadable_record_reads_as_evidence_still_missing(raw: Any) -> None:
     missing_key_state.pop("lost_tool_evidence", None)
     missing_key_pattern = ReActPattern()
     missing_key_pattern.load_state(missing_key_state)
-    assert missing_key_pattern.lost_tool_evidence.call_ids == set()
+    assert missing_key_pattern.lost_tool_evidence.calls == {}
     assert missing_key_pattern.lost_tool_evidence.unnameable is False
     assert missing_key_pattern.lost_tool_evidence.still_missing() is False
 
     wellformed_state = dict(base_state)
     wellformed_state["lost_tool_evidence"] = {
         "granularity": LOST_TOOL_EVIDENCE_GRANULARITY,
-        "call_ids": ["call_a", "call_b"],
+        "calls": {
+            "call_a": ["search", "hash-a"],
+            "call_b": ["read_file", "hash-b"],
+        },
         "unnameable": False,
     }
     wellformed_pattern = ReActPattern()
     wellformed_pattern.load_state(wellformed_state)
-    assert wellformed_pattern.lost_tool_evidence.call_ids == {"call_a", "call_b"}
+    assert set(wellformed_pattern.lost_tool_evidence.calls) == {"call_a", "call_b"}
     assert wellformed_pattern.lost_tool_evidence.unnameable is False
 
     unreadable_state = dict(base_state)
     unreadable_state["lost_tool_evidence"] = raw
     unreadable_pattern = ReActPattern()
     unreadable_pattern.load_state(unreadable_state)
-    assert unreadable_pattern.lost_tool_evidence.call_ids == set()
+    assert unreadable_pattern.lost_tool_evidence.calls == {}
     assert unreadable_pattern.lost_tool_evidence.unnameable is True
     assert unreadable_pattern.lost_tool_evidence.still_missing() is True
 
@@ -576,15 +603,52 @@ def test_an_over_long_record_is_truncated_and_says_so() -> None:
     )
     raw = {
         "granularity": LOST_TOOL_EVIDENCE_GRANULARITY,
-        "call_ids": ids,
+        "calls": {call_id: ["calculator", "hash-a"] for call_id in ids},
         "unnameable": False,
     }
 
     evidence = LostToolEvidence.from_state(raw)
 
-    assert len(evidence.call_ids) == LOST_TOOL_EVIDENCE_MAX_CALL_IDS
-    assert evidence.call_ids == set(ids[:LOST_TOOL_EVIDENCE_MAX_CALL_IDS])
+    assert len(evidence.calls) == LOST_TOOL_EVIDENCE_MAX_CALL_IDS
+    assert set(evidence.calls) == set(ids[:LOST_TOOL_EVIDENCE_MAX_CALL_IDS])
     assert evidence.unnameable is True
+
+
+def test_the_write_side_applies_the_same_cap_and_says_when_it_did() -> None:
+    """A checkpoint is never written holding more entries than a read-back
+    accepts, and a write that had to shorten the record says so.
+
+    Two sides of one round trip: writing past the cap stores a record that
+    cannot survive being read back, and truncating quietly would produce 200
+    entries with ``unnameable=False`` -- a payload that reads as the
+    complete list of what this run lost.
+
+    Mutation this test catches: truncating on write without forcing
+    ``unnameable`` leaves the written flag False, so the assertion on it
+    fails; writing the whole mapping instead leaves the length at
+    ``LOST_TOOL_EVIDENCE_MAX_CALL_IDS + 5``.
+    """
+    over_cap = LostToolEvidence(
+        calls={
+            f"call_{index:04d}": ("calculator", "hash-a")
+            for index in range(LOST_TOOL_EVIDENCE_MAX_CALL_IDS + 5)
+        }
+    )
+    at_cap = LostToolEvidence(
+        calls={
+            f"call_{index:04d}": ("calculator", "hash-a")
+            for index in range(LOST_TOOL_EVIDENCE_MAX_CALL_IDS)
+        }
+    )
+
+    over_state = over_cap.to_state()
+    at_state = at_cap.to_state()
+
+    assert len(over_state["calls"]) == LOST_TOOL_EVIDENCE_MAX_CALL_IDS
+    assert over_state["unnameable"] is True
+    # A record exactly at the cap loses nothing, so nothing is flagged.
+    assert len(at_state["calls"]) == LOST_TOOL_EVIDENCE_MAX_CALL_IDS
+    assert at_state["unnameable"] is False
 
 
 @pytest.mark.parametrize("times", [1, 3, 10])
@@ -613,7 +677,7 @@ def test_an_unnameable_loss_is_recorded_once_however_often_it_is_seen(
         == once.get_state()["lost_tool_evidence"]
     )
     assert repeated.lost_tool_evidence.unnameable is True
-    assert repeated.lost_tool_evidence.call_ids == set()
+    assert repeated.lost_tool_evidence.calls == {}
 
 
 @pytest.mark.parametrize(
@@ -663,13 +727,19 @@ def test_an_observation_without_a_call_id_is_not_given_one(
     assert set(loss.call_ids) == expected_call_ids
 
     pattern._record_lost_tool_evidence(loss)
-    assert pattern.lost_tool_evidence.call_ids == expected_call_ids
+    assert set(pattern.lost_tool_evidence.calls) == expected_call_ids
     assert pattern.lost_tool_evidence.unnameable is True
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("llm_responses", "max_iterations", "expected_label", "expected_success"),
+    (
+        "llm_responses",
+        "max_iterations",
+        "expected_label",
+        "expected_success",
+        "expected_record_retired",
+    ),
     [
         # A final_answer call reaches _finalize_outcome (checkpoint "final")
         # through _execute_pending_tool_calls, whose caller then writes one
@@ -679,12 +749,14 @@ def test_an_observation_without_a_call_id_is_not_given_one(
             6,
             "completed",
             True,
+            True,
             id="final_answer_tool_call",
         ),
         pytest.param(
             [{"content": "Here is the answer.", "tool_calls": [], "done": True}],
             6,
             "final",
+            True,
             True,
             id="plain_assistant_text",
         ),
@@ -696,6 +768,7 @@ def test_an_observation_without_a_call_id_is_not_given_one(
             6,
             "completed",
             True,
+            True,
             id="rejected_then_finishes",
         ),
         # A work-tool call, never a final_answer: with max_iterations=1 the
@@ -706,6 +779,7 @@ def test_an_observation_without_a_call_id_is_not_given_one(
             1,
             "max_iterations",
             False,
+            False,
             id="max_iterations",
         ),
         pytest.param(
@@ -713,29 +787,40 @@ def test_an_observation_without_a_call_id_is_not_given_one(
             6,
             "invalid_tool_protocol",
             False,
+            False,
             id="invalid_tool_protocol",
         ),
     ],
 )
-async def test_a_finished_run_leaves_no_lost_evidence_behind(
+async def test_only_a_run_that_answered_retires_its_lost_evidence(
     llm_responses: list[Any],
     max_iterations: int,
     expected_label: str,
     expected_success: bool,
+    expected_record_retired: bool,
 ) -> None:
-    """However a run ends, the checkpoint it leaves behind carries no
-    leftover loss.
+    """What a run's last checkpoint carries depends on whether it answered.
 
     A run can end five ways here: it answers on the first turn with a
     ``final_answer`` tool call, it answers with plain assistant text, its
     first answer is rejected for an empty ``answer`` field and the one
     repair retry then answers, it runs out of iterations without ever
     answering, or that one repair retry also comes back empty and the run is
-    abandoned. The last two do not go through ``_finalize_outcome`` at all --
-    they write a checkpoint labeled ``max_iterations`` or
-    ``invalid_tool_protocol`` instead of ``final`` -- but a resume can load
-    from either checkpoint just as it can load from ``final``, so a leftover
-    record there is exactly as stale as one left behind on a normal finish.
+    abandoned.
+
+    The first three delivered an answer. Whatever their turns could not read
+    stopped mattering when the answer went out, so their checkpoints carry
+    an empty record and a later resume -- a new request in the same
+    conversation -- starts clean.
+
+    The last two ended with the task unfinished, and a follow-up message
+    resumes from exactly those checkpoints into exactly that compacted
+    context: the observations really are still missing there. Their
+    checkpoints keep the record, so the resumed run's first forced turn is
+    still told what it cannot read. The two cells assert the record is
+    RETAINED, reversing what this test asserted when every terminal path
+    cleared alike -- see the design's "run teardown" rows, which now
+    separate a delivered answer from the two paths that end without one.
 
     Every cell starts from the same context, whose three seeded tool
     observations this run's own first-turn compaction destroys, so the
@@ -743,12 +828,12 @@ async def test_a_finished_run_leaves_no_lost_evidence_behind(
     without that, the assertions below would pass vacuously against a record
     nothing ever populated.
 
-    Mutation this test catches: dropping
-    ``_clear_lost_tool_evidence_at_run_end()`` from the ``max_iterations``
-    path or from ``_invalid_tool_protocol_result`` leaves that one cell's
-    ``call_ids`` still holding the seeded run's lost ids, while the three
-    cells that finish through ``_finalize_outcome`` keep passing regardless,
-    because that path clears the record on its own.
+    Mutation this test catches: calling
+    ``_clear_lost_tool_evidence_at_run_end()`` on the ``max_iterations``
+    path or in ``_invalid_tool_protocol_result`` again empties those two
+    cells' records, so their retained-record assertions fail; adding it is
+    invisible to the three cells that answered, because the path that
+    delivers an answer clears the record itself.
     """
     context = build_context(max_messages=4)
     pattern = ReActPattern(max_iterations=max_iterations)
@@ -766,10 +851,20 @@ async def test_a_finished_run_leaves_no_lost_evidence_behind(
     last_checkpoint = runtime.checkpoints[-1]
     assert last_checkpoint.get("label") == expected_label
     final_state = dict(last_checkpoint.get("pattern_state") or {})
-    assert final_state["lost_tool_evidence"]["call_ids"] == []
-    assert final_state["lost_tool_evidence"]["unnameable"] is False
-    assert pattern.lost_tool_evidence.call_ids == set()
-    assert pattern.lost_tool_evidence.unnameable is False
+    checkpointed = final_state["lost_tool_evidence"]
+    if expected_record_retired:
+        assert checkpointed["calls"] == {}
+        assert checkpointed["unnameable"] is False
+        assert pattern.lost_tool_evidence.calls == {}
+        assert pattern.lost_tool_evidence.unnameable is False
+    else:
+        assert set(checkpointed["calls"]) <= {"seed_0", "seed_1", "seed_2"}
+        assert checkpointed["calls"]
+        assert pattern.lost_tool_evidence.still_missing() is True
+        # A resume reads this payload back, not the live object.
+        resumed = ReActPattern()
+        resumed.load_state(final_state)
+        assert resumed.lost_tool_evidence.still_missing() is True
 
 
 def make_ledger_record(
@@ -793,6 +888,20 @@ def make_ledger_record(
         args_hash=args_hash,
         status=status,
         result=result,
+    )
+
+
+def record_lost(pattern: ReActPattern, *call_ids: str) -> None:
+    """Record the given call ids as destroyed, the way a compaction does.
+
+    Goes through ``_record_lost_tool_evidence`` rather than assigning a
+    hand-built record, because that is where each entry's fingerprint is
+    taken from the ledger. A hand-built record could carry a fingerprint the
+    ledger never held, which is exactly the mismatch these tests exist to
+    detect.
+    """
+    pattern._record_lost_tool_evidence(
+        CompactionLoss(call_ids=tuple(call_ids), unaccounted=0)
     )
 
 
@@ -885,7 +994,7 @@ def test_a_refetch_that_does_not_resolve_the_entry_discharges_nothing(
     pattern.tool_ledger["lost_1"] = make_ledger_record(
         "lost_1", tool_name="calculator", args_hash="hash-a"
     )
-    pattern.lost_tool_evidence = LostToolEvidence(call_ids={"lost_1"})
+    record_lost(pattern, "lost_1")
     if args_hash is not None:
         pattern.tool_ledger["batch_1"] = make_ledger_record(
             "batch_1",
@@ -897,7 +1006,7 @@ def test_a_refetch_that_does_not_resolve_the_entry_discharges_nothing(
 
     pattern._discharge_lost_tool_evidence(batch_call_ids)
 
-    assert pattern.lost_tool_evidence.call_ids == {"lost_1"}
+    assert set(pattern.lost_tool_evidence.calls) == {"lost_1"}
     assert pattern.lost_tool_evidence.unnameable is False
 
 
@@ -916,7 +1025,7 @@ def test_a_matching_successful_refetch_discharges_its_entry() -> None:
     pattern.tool_ledger["lost_other"] = make_ledger_record(
         "lost_other", tool_name="search", args_hash="hash-c"
     )
-    pattern.lost_tool_evidence = LostToolEvidence(call_ids={"lost_1", "lost_other"})
+    record_lost(pattern, "lost_1", "lost_other")
     pattern.tool_ledger["batch_1"] = make_ledger_record(
         "batch_1",
         tool_name="calculator",
@@ -927,8 +1036,122 @@ def test_a_matching_successful_refetch_discharges_its_entry() -> None:
 
     pattern._discharge_lost_tool_evidence(["batch_1"])
 
-    assert pattern.lost_tool_evidence.call_ids == {"lost_other"}
+    assert set(pattern.lost_tool_evidence.calls) == {"lost_other"}
     assert pattern.lost_tool_evidence.unnameable is False
+
+
+def test_a_later_call_reusing_a_lost_id_does_not_discharge_it() -> None:
+    """An unrelated later call that reuses a lost call's id must not count
+    as that lost observation coming back.
+
+    Provider-supplied tool_call ids are not unique, and the ledger entry for
+    an id is overwritten when one is reused, so by the time a batch finishes
+    the ledger can describe a completely different call under the lost id.
+    The entry's own fingerprint is taken when the loss is recorded, so the
+    later call is compared against what was actually lost -- a different
+    tool, different arguments -- and matches nothing.
+
+    The sequence below is the one that used to clear the record: a search
+    succeeds and is destroyed; a write_file call reuses its id and succeeds;
+    that batch finishes.
+
+    Mutation this test catches: resolving the lost entry's fingerprint from
+    ``self.tool_ledger`` at discharge time instead of reading the stored one
+    makes the lost id resolve to the write_file record, which is exactly the
+    record the finished batch just marked recovered, so the entry is
+    discharged and ``still_missing()`` goes False.
+    """
+    pattern = ReActPattern()
+    pattern.tool_ledger["call_1"] = make_ledger_record(
+        "call_1", tool_name="search", args_hash="hash-search"
+    )
+    record_lost(pattern, "call_1")
+    assert pattern.lost_tool_evidence.calls == {"call_1": ("search", "hash-search")}
+
+    # The same id, now standing for an unrelated later call, exactly as
+    # _record_tool_call overwrites it.
+    pattern.tool_ledger["call_1"] = make_ledger_record(
+        "call_1",
+        tool_name="write_file",
+        args_hash="hash-write",
+        status="completed",
+        result={"output": "written"},
+    )
+
+    pattern._discharge_lost_tool_evidence(["call_1"])
+
+    assert set(pattern.lost_tool_evidence.calls) == {"call_1"}
+    assert pattern.lost_tool_evidence.still_missing() is True
+
+
+def test_a_second_record_of_a_lost_id_keeps_its_first_fingerprint() -> None:
+    """Recording a loss again for an id already in the record must not
+    replace the fingerprint that loss was first stored with.
+
+    The ledger entry for an id is overwritten when a later call reuses the
+    id, so by the time a second compaction reports the same id as destroyed
+    the ledger can describe an unrelated call. If that second report
+    replaced the stored fingerprint, the later call's success would then
+    discharge a loss whose own value is still gone -- the same outcome the
+    stored fingerprint exists to prevent, reached through the recording
+    path instead of the discharge path.
+
+    Mutation this test catches: dropping the ``continue`` that skips ids
+    already in the record lets the second report overwrite the fingerprint
+    with the write_file one, so the finished write_file batch discharges the
+    entry and ``still_missing()`` goes False.
+    """
+    pattern = ReActPattern()
+    pattern.tool_ledger["call_1"] = make_ledger_record(
+        "call_1", tool_name="search", args_hash="hash-search"
+    )
+    record_lost(pattern, "call_1")
+
+    pattern.tool_ledger["call_1"] = make_ledger_record(
+        "call_1",
+        tool_name="write_file",
+        args_hash="hash-write",
+        status="completed",
+        result={"output": "written"},
+    )
+    record_lost(pattern, "call_1")
+    assert pattern.lost_tool_evidence.calls == {"call_1": ("search", "hash-search")}
+
+    pattern._discharge_lost_tool_evidence(["call_1"])
+
+    assert set(pattern.lost_tool_evidence.calls) == {"call_1"}
+    assert pattern.lost_tool_evidence.still_missing() is True
+
+
+def test_a_compaction_that_does_not_add_up_is_read_as_evidence_missing() -> None:
+    """A metadata shape whose fields are each valid but do not add up is
+    read as a loss nobody can name, not as nothing having been lost.
+
+    Every field below passes its own check: three observations destroyed, a
+    well-formed (empty) id list, and zero observations that carried no id.
+    Read field by field, that says three things were destroyed and none of
+    them is accounted for anywhere. Real compaction builds the three
+    together and cannot produce it -- ``_dropped_tool_observations`` appends
+    to exactly one of the two per message -- so this is a backstop, and it
+    resolves to the more cautious of the two readings rather than raising,
+    because ``_dropped_tool_evidence`` promises to raise nothing.
+
+    Mutation this test catches: dropping the final ``max`` that reconciles
+    the count against the id list leaves ``unaccounted`` at the reported
+    zero, so the record stays empty and ``still_missing()`` is False.
+    """
+    pattern = ReActPattern()
+
+    loss = pattern._dropped_tool_evidence(
+        compact_result(count=3, call_ids=[], without_call_id=0)
+    )
+
+    assert loss.call_ids == ()
+    assert loss.unaccounted == 3
+
+    pattern._record_lost_tool_evidence(loss)
+    assert pattern.lost_tool_evidence.unnameable is True
+    assert pattern.lost_tool_evidence.still_missing() is True
 
 
 @pytest.mark.parametrize("successful_call_count", [1, 3, 10])
@@ -948,7 +1171,7 @@ def test_an_unnameable_loss_survives_every_successful_call(
     untouched, so it stays ``True`` regardless of how many calls succeed.
     """
     pattern = ReActPattern()
-    pattern.lost_tool_evidence = LostToolEvidence(call_ids=set(), unnameable=True)
+    pattern.lost_tool_evidence = LostToolEvidence(calls={}, unnameable=True)
     batch_call_ids = []
     for index in range(successful_call_count):
         call_id = f"batch_{index}"
@@ -963,7 +1186,7 @@ def test_an_unnameable_loss_survives_every_successful_call(
 
     pattern._discharge_lost_tool_evidence(batch_call_ids)
 
-    assert pattern.lost_tool_evidence.call_ids == set()
+    assert pattern.lost_tool_evidence.calls == {}
     assert pattern.lost_tool_evidence.unnameable is True
     assert pattern.lost_tool_evidence.still_missing() is True
 
@@ -986,7 +1209,8 @@ def test_an_unnameable_loss_survives_a_batch_that_does_discharge_an_entry() -> N
     pattern.tool_ledger["lost_1"] = make_ledger_record(
         "lost_1", tool_name="calculator", args_hash="hash-a"
     )
-    pattern.lost_tool_evidence = LostToolEvidence(call_ids={"lost_1"}, unnameable=True)
+    record_lost(pattern, "lost_1")
+    pattern.lost_tool_evidence.unnameable = True
     pattern.tool_ledger["batch_1"] = make_ledger_record(
         "batch_1",
         tool_name="calculator",
@@ -997,7 +1221,7 @@ def test_an_unnameable_loss_survives_a_batch_that_does_discharge_an_entry() -> N
 
     pattern._discharge_lost_tool_evidence(["batch_1"])
 
-    assert pattern.lost_tool_evidence.call_ids == set()
+    assert pattern.lost_tool_evidence.calls == {}
     assert pattern.lost_tool_evidence.unnameable is True
     assert pattern.lost_tool_evidence.still_missing() is True
 
@@ -1018,7 +1242,7 @@ def test_a_stale_success_from_an_earlier_batch_discharges_nothing() -> None:
     pattern.tool_ledger["lost_1"] = make_ledger_record(
         "lost_1", tool_name="calculator", args_hash="hash-a"
     )
-    pattern.lost_tool_evidence = LostToolEvidence(call_ids={"lost_1"})
+    record_lost(pattern, "lost_1")
     # A successful, fingerprint-matching record already sits in the ledger
     # from an earlier batch, but it is not part of the batch just finished.
     pattern.tool_ledger["earlier_batch_call"] = make_ledger_record(
@@ -1031,7 +1255,7 @@ def test_a_stale_success_from_an_earlier_batch_discharges_nothing() -> None:
 
     pattern._discharge_lost_tool_evidence(["some_other_unrelated_call"])
 
-    assert pattern.lost_tool_evidence.call_ids == {"lost_1"}
+    assert set(pattern.lost_tool_evidence.calls) == {"lost_1"}
     assert pattern.lost_tool_evidence.unnameable is False
 
 
@@ -1055,6 +1279,18 @@ def test_every_tool_batch_completion_discharges_the_record() -> None:
     inheriting whatever the count happened to be. If react.py grows a third
     call site, update this test deliberately, with the new site's discharge
     call added or a stated reason it does not need one.
+
+    What this test does NOT cover, deliberately: where in the block the
+    discharge call sits. It reads the enclosing statement block, so moving a
+    discharge call above its ``await`` -- which would discharge against the
+    batch's ids before the batch has run -- still satisfies it. That
+    ordering is pinned behaviorally instead, by
+    ``test_a_call_that_arrived_without_an_id_still_discharges_its_entry``
+    for the loop-top site and ``test_a_matching_refetch_stops_the_honest_forcing``
+    for the in-turn one; both go red when their site's call is moved ahead
+    of the await. Asserting statement order here as well would make this
+    test track the shape of the loop rather than the wiring it exists to
+    pin.
 
     Mutation this test catches: deleting the discharge call that follows
     either await fails that call site's own assertion immediately; a
@@ -1152,7 +1388,7 @@ async def test_a_call_that_arrived_without_an_id_still_discharges_its_entry() ->
     pattern.tool_ledger["lost_call"] = make_ledger_record(
         "lost_call", tool_name="calculator", args_hash=args_hash
     )
-    pattern.lost_tool_evidence = LostToolEvidence(call_ids={"lost_call"})
+    record_lost(pattern, "lost_call")
     pattern.status = "acting"
     tool_call: dict[str, Any] = {"name": "calculator", "args": {}}
     pattern.pending_tool_calls = [tool_call]
@@ -1182,8 +1418,8 @@ async def test_a_call_that_arrived_without_an_id_still_discharges_its_entry() ->
     # empties this record) would otherwise mask a discharge that never
     # actually matched anything.
     mid_run_state = state_at(runtime, "before_llm")
-    assert mid_run_state["lost_tool_evidence"]["call_ids"] == []
-    assert pattern.lost_tool_evidence.call_ids == set()
+    assert mid_run_state["lost_tool_evidence"]["calls"] == {}
+    assert pattern.lost_tool_evidence.calls == {}
 
 
 # The tests below cover how a forced-answer turn reads ``lost_tool_evidence``
@@ -1297,7 +1533,7 @@ async def test_an_unforced_turn_says_nothing_however_much_is_missing(
     """
     pattern = ReActPattern(max_iterations=3)
     pattern.lost_tool_evidence = LostToolEvidence(
-        call_ids={"lost_1", "lost_2"}, unnameable=True
+        calls={"lost_1": ("calculator", "hash-a"), "lost_2": None}, unnameable=True
     )
     runtime = ScriptedCompactionRuntime([compact_result(count=0, by_name={})])
     llm = RecordingLLM(
@@ -1329,7 +1565,7 @@ async def test_an_unnameable_loss_alone_still_trips_the_gate(
     """
     pattern = ReActPattern(max_iterations=3)
     pattern.force_final_answer_next = True
-    pattern.lost_tool_evidence = LostToolEvidence(call_ids=set(), unnameable=True)
+    pattern.lost_tool_evidence = LostToolEvidence(calls={}, unnameable=True)
     runtime = ScriptedCompactionRuntime([compact_result(count=0, by_name={})])
     llm = RecordingLLM([final_answer_response()])
     context = ExecutionContext(execution_id="unnameable-only")
@@ -1403,7 +1639,7 @@ def test_a_name_the_ledger_cannot_resolve_counts_as_unnamed() -> None:
     real entry report back as though nothing were missing.
     """
     pattern = ReActPattern()
-    pattern.lost_tool_evidence = LostToolEvidence(call_ids={"ghost_call"})
+    record_lost(pattern, "ghost_call")
 
     names, unnamed = pattern._lost_tool_names()
 
@@ -1459,7 +1695,7 @@ async def test_a_matching_refetch_stops_the_honest_forcing(
 
     assert result["success"] is True
     assert len(tool.calls) == 2
-    assert pattern.lost_tool_evidence.call_ids == set()
+    assert pattern.lost_tool_evidence.calls == {}
     assert evidence_dropped_warnings(caplog) == []
 
 
@@ -1735,3 +1971,252 @@ async def test_the_protocol_repair_keeps_the_honest_wording() -> None:
     assert HONEST_PHRASE in first_instruction
     assert HONEST_PHRASE in retry_instruction
     assert STALE_EVIDENCE_PHRASE not in retry_instruction
+
+
+# The two tests below cover the turn that stops being a forced answer. When
+# the model calls a tool the narrowed schema does not hold, the full tool set
+# is handed back and the forcing is undone -- for this turn and every turn
+# after it. The record is untouched by that, so those turns still have to be
+# told what cannot be read.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "escape",
+    ["provider_rejected_the_call", "model_called_a_work_tool"],
+)
+async def test_a_turn_that_escapes_the_forced_answer_keeps_the_honest_facts(
+    escape: str,
+) -> None:
+    """Undoing the forced answer must not undo the honest wording.
+
+    Both ways a forced turn hands its full tool set back are covered: the
+    provider itself rejects the call with ``unavailable_tool_call``, and the
+    model answers a narrowed schema with a work tool, which this pattern
+    detects and recovers from. Either way the turn continues with every
+    tool available and with the same observations still destroyed, so the
+    prompt states the facts about the loss -- and states them without the
+    forced turn's "call final_answer exactly once" instruction, which is
+    wrong for a turn that can still go and fetch the value.
+
+    The turn after the escape is checked too. The sticky flag is cleared by
+    the recovery, so every later turn of this run is an ordinary one; wording
+    that lived only on forced turns would go quiet for the rest of the run.
+
+    Mutation this test catches: moving the honest facts back inside
+    ``if force_final_answer:`` in ``_messages_for_llm`` -- that is, leaving
+    the ordinary tool-carrying opening without them -- makes both cells fail
+    on the first ``HONEST_PHRASE`` assertion, because after the
+    escape neither prompt is a forced one.
+    """
+    pattern = ReActPattern(max_iterations=5)
+    pattern.tool_ledger["lost_named"] = make_ledger_record(
+        "lost_named", tool_name="list_clients", args_hash="hash-lost"
+    )
+    pattern.force_final_answer_next = True
+    runtime = ScriptedCompactionRuntime(
+        [
+            compact_result(count=1, call_ids=["lost_named"], strategy="truncate"),
+            compact_result(count=0, by_name={}, strategy="truncate"),
+            compact_result(count=0, by_name={}, strategy="truncate"),
+        ]
+    )
+    if escape == "provider_rejected_the_call":
+        llm: RecordingLLM = ProtocolErrorLLM(
+            [tool_call_response("calculator"), final_answer_response()],
+            fail_on=0,
+            code="unavailable_tool_call",
+        )
+    else:
+        llm = RecordingLLM(
+            [
+                # A work tool on a turn whose schema holds final_answer
+                # alone: the pattern hands the full set back and retries.
+                tool_call_response("calculator"),
+                tool_call_response("calculator", call_id="call_work_2"),
+                final_answer_response(),
+            ]
+        )
+    context = ExecutionContext(execution_id=f"escape-{escape}")
+    context.add_user_message("Answer now.")
+
+    result = await pattern.run(
+        context=context,
+        tools=[NamedTool("calculator")],
+        llm=llm,
+        compact_llm=None,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert pattern.force_final_answer_next is False
+    # Call 0 is the forced turn itself; call 1 is the prompt built after the
+    # escape, and call 2 is the ordinary turn that follows it.
+    assert len(llm.calls) >= 3
+    for index in (1, 2):
+        instruction = instruction_of(llm, index)
+        assert HONEST_PHRASE in instruction
+        assert EVIDENCE_REFETCH_PHRASE in instruction
+        # The forced turn's own instructions have no place here: this turn
+        # holds every tool again and is not being asked to answer.
+        assert FORCED_ANSWER_PHRASE not in instruction
+        assert FORCED_ONLY_TOOL_RULE not in instruction
+
+
+@pytest.mark.asyncio
+async def test_the_logged_names_are_the_string_the_budget_measured(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The log line reports the same string the length budget was spent on.
+
+    ``_bounded_tool_names`` returns lines and measures its budget against
+    them joined with newlines. Handing that list straight to the logger
+    would log ``repr(list)`` instead -- a different, longer string than the
+    one the budget allowed, and one no test of the budget is looking at.
+
+    Mutation this test catches: passing the list itself instead of the
+    joined string makes the logged field read ``named=['list_clients',
+    'read_file']``, so the bracket assertion fails and the joined-form
+    assertion finds nothing.
+    """
+    pattern = ReActPattern(max_iterations=3)
+    for call_id, tool_name in (
+        ("lost_a", "list_clients"),
+        ("lost_b", "read_file"),
+    ):
+        pattern.tool_ledger[call_id] = make_ledger_record(
+            call_id, tool_name=tool_name, args_hash=f"hash-{call_id}"
+        )
+    pattern.force_final_answer_next = True
+    runtime = ScriptedCompactionRuntime(
+        [compact_result(count=2, call_ids=["lost_a", "lost_b"], strategy="truncate")]
+    )
+    llm = RecordingLLM([final_answer_response()])
+    context = ExecutionContext(execution_id="logged-names-rendering")
+    context.add_user_message("Answer now.")
+
+    with caplog.at_level(logging.WARNING, logger=react_module.__name__):
+        result = await pattern.run(
+            context=context, tools=[], llm=llm, compact_llm=None, runtime=runtime
+        )
+
+    assert result["success"] is True
+    warnings = evidence_dropped_warnings(caplog)
+    assert len(warnings) == 1
+    message = warnings[0]
+    assert "named=list_clients\nread_file" in message
+    assert "named=['" not in message
+    assert "named_count=2" in message
+
+
+@pytest.mark.asyncio
+async def test_a_run_resumed_from_an_unfinished_checkpoint_is_still_told() -> None:
+    """The whole point of a durable record, driven end to end.
+
+    An unfinished run writes its checkpoint and stops. A follow-up message
+    resumes from that checkpoint -- the same context, restored the way
+    ``AgentRunner.inject_user_message`` restores it, and the same pattern
+    state, restored through ``load_pattern_checkpoint`` -- and the resumed
+    run's forced turn is told that observations were destroyed, by a
+    compaction that happened in a process that has since exited.
+
+    This is the case a serialization round-trip test cannot reach: the
+    record has to survive being written by one run and read by another, and
+    the write has to happen on a path that ends without an answer.
+
+    Mutation this test catches: restoring
+    ``_clear_lost_tool_evidence_at_run_end()`` to the ``max_iterations``
+    path empties the record before the checkpoint is written, so the
+    resumed run's forced turn gets the ordinary opening and
+    ``STALE_EVIDENCE_PHRASE`` appears where ``HONEST_PHRASE`` should be.
+    """
+    first_context = build_context(max_messages=4)
+    first_pattern = ReActPattern(max_iterations=1)
+    first_runtime = PatternRuntime()
+
+    first_result = await first_pattern.run(
+        context=first_context,
+        tools=[NamedTool("calculator")],
+        llm=RecordingLLM([tool_call_response("calculator")]),
+        compact_llm=RecordingLLM([{"content": ""}]),
+        runtime=first_runtime,
+    )
+
+    assert first_result["success"] is False
+    checkpoint = first_runtime.checkpoints[-1]
+    assert checkpoint["label"] == "max_iterations"
+    assert checkpoint["pattern_state"]["lost_tool_evidence"]["calls"]
+
+    resumed_context = ExecutionContext.from_dict(checkpoint["context"])
+    resumed_pattern = ReActPattern(max_iterations=2)
+    load_pattern_checkpoint(resumed_pattern, checkpoint)
+    assert resumed_pattern.lost_tool_evidence.still_missing() is True
+
+    # The checkpoint also restores the exhausted iteration counter, so the
+    # resumed run is given room to take a turn. That budget is not what this
+    # test is about; the record it carries into that turn is.
+    resumed_pattern.max_iterations = 3
+    resumed_pattern.current_iteration = 0
+    resumed_pattern.force_final_answer_next = True
+    resumed_llm = RecordingLLM([final_answer_response()])
+
+    resumed_result = await resumed_pattern.run(
+        context=resumed_context,
+        tools=[NamedTool("calculator")],
+        llm=resumed_llm,
+        # A compaction model of its own, so every call recorded on
+        # ``resumed_llm`` is a turn rather than a compaction request.
+        compact_llm=RecordingLLM([{"content": ""}]),
+        runtime=PatternRuntime(),
+    )
+
+    assert resumed_result["success"] is True
+    forced_instruction = instruction_of(resumed_llm, 0)
+    assert HONEST_PHRASE in forced_instruction
+    assert STALE_EVIDENCE_PHRASE not in forced_instruction
+
+
+def test_a_checkpoint_from_a_build_without_fingerprints_is_still_read() -> None:
+    """A payload that names lost ids but not what they were is readable,
+    into a record whose entries can never be discharged.
+
+    A build that wrote ids alone left the fingerprint to be resolved from
+    the live ledger when a batch finished -- the lookup that clears the
+    wrong entry once a provider reuses a call id. Doing that lookup now, on
+    behalf of an old payload, would reintroduce exactly that. So the ids
+    come across as losses with no fingerprint: still counted, still
+    reported, and never matched by any later call.
+
+    Mutation this test catches: rejecting the older accounting unit outright
+    (falling through to the unreadable branch) drops the ids, so the entry
+    assertion fails; resolving their fingerprints from the ledger instead
+    lets the refetch below discharge ``old_call``, so the final
+    ``still_missing`` assertion fails.
+    """
+    legacy_payload = {
+        "granularity": LOST_TOOL_EVIDENCE_GRANULARITY_CALL_IDS_ONLY,
+        "call_ids": ["old_call"],
+        "unnameable": False,
+    }
+
+    pattern = ReActPattern()
+    pattern.lost_tool_evidence = LostToolEvidence.from_state(legacy_payload)
+
+    assert set(pattern.lost_tool_evidence.calls) == {"old_call"}
+    assert pattern.lost_tool_evidence.calls["old_call"] is None
+    assert pattern.lost_tool_evidence.still_missing() is True
+    assert pattern._lost_tool_names() == ([], True)
+
+    # A successful refetch of whatever that id used to be cannot discharge
+    # it: nothing recorded what it was.
+    pattern.tool_ledger["old_call"] = make_ledger_record(
+        "old_call",
+        tool_name="calculator",
+        args_hash="hash-a",
+        status="completed",
+        result={"output": "value"},
+    )
+    pattern._discharge_lost_tool_evidence(["old_call"])
+
+    assert set(pattern.lost_tool_evidence.calls) == {"old_call"}
+    assert pattern.lost_tool_evidence.still_missing() is True
