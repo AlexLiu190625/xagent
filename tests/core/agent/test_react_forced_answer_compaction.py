@@ -8,8 +8,8 @@ the record accumulates regardless of whether the turn that lost the evidence
 was itself a forced-answer turn, that it survives a checkpoint round trip, and
 that it is cleared once the run actually finishes. It also covers how a later
 forced-answer turn reads this record back and changes the instruction it sends
-to the model: reporting that observations were removed, instead of asking for
-an answer "using the accumulated conversation and tool results" that are gone.
+to the model: naming what was removed instead of asking for an answer "using
+the accumulated conversation and tool results" that are gone.
 """
 
 from __future__ import annotations
@@ -52,6 +52,8 @@ EVIDENCE_DROPPED_LOG_PHRASE = "Forced answer turn is missing tool evidence"
 # evidence was destroyed it is an instruction to invent, so it must be gone.
 STALE_EVIDENCE_PHRASE = "the accumulated conversation and tool results"
 HONEST_PHRASE = "Compaction removed tool observations from this run's context"
+NAMED_CLAUSE_PHRASE = "including results from these tools:"
+UNNAMED_FALLBACK_PHRASE = "does not record which ones they were"
 CONDITIONAL_SUMMARY_PHRASE = "If a compaction summary stands above"
 COMPLETED_OFFERED_PHRASE = "Set outcome=completed only when"
 COMPLETED_CONDITIONAL_PHRASE = (
@@ -1481,11 +1483,11 @@ async def drive_forced_turn_missing_evidence(
 
     ``named`` maps a call id to the tool name it should resolve to: each one
     is pre-seeded into the pattern's own tool ledger so ``_lost_tool_names``
-    can look it up for the gate's log line, the same way a real run's ledger
-    would after actually executing that call. ``unnameable_ids`` are left
-    out of the ledger entirely, so the same lookup fails. Passing neither
-    leaves the record empty, which is the ordinary case: a forced turn with
-    nothing missing.
+    can look it up, the same way a real run's ledger would after actually
+    executing that call. ``unnameable_ids`` are left out of the ledger
+    entirely, so the same lookup fails and the record can only say
+    something is missing, not what. Passing neither leaves the record
+    empty, which is the ordinary case: a forced turn with nothing missing.
     """
     named = dict(named or {})
     pattern = ReActPattern(max_iterations=4)
@@ -1539,18 +1541,17 @@ class ProtocolErrorLLM(RecordingLLM):
     ids=["summary_strategy", "truncate_strategy"],
 )
 @pytest.mark.parametrize("shape", ["named_only", "unnameable_only", "both"])
-async def test_the_honest_instruction_replaces_the_stale_one(
+async def test_the_honest_instruction_names_what_the_engine_recorded(
     strategy: str, shape: str
 ) -> None:
-    """A forced turn whose record still holds something compaction
-    destroyed is told so, whichever compaction path destroyed it and
-    whatever mix of ledger-resolvable and unresolvable ids the record
-    holds.
+    """The honest instruction names the tools the ledger can resolve the
+    run's still-missing call ids to, whichever compaction path destroyed
+    them and whatever mix of named and unnameable ids the record holds.
 
-    Mutation this test catches: dropping the ``evidence_dropped`` argument
-    from the ``_messages_for_llm`` call in ``_run_tool_calling_loop`` sends
-    the ordinary forced instruction, whose opening asks the model to answer
-    from tool results that are gone.
+    Mutation this test catches: dropping the ``lost_tool_names`` argument
+    from the ``_messages_for_llm`` call in ``_run_tool_calling_loop`` leaves
+    zero tool names in the prompt; with the real wiring the ledger's
+    resolved names are present.
     """
     named: dict[str, str] = {}
     unnameable_ids: list[str] = []
@@ -1563,7 +1564,11 @@ async def test_the_honest_instruction_replaces_the_stale_one(
         strategy=strategy, named=named, unnameable_ids=unnameable_ids
     )
 
-    assert HONEST_PHRASE in instruction_of(llm, 0)
+    instruction = instruction_of(llm, 0)
+    if shape in ("named_only", "both"):
+        assert "list_clients" in instruction
+    if shape == "unnameable_only":
+        assert UNNAMED_FALLBACK_PHRASE in instruction
     # Checked against the whole prompt, not just the instruction: a stale
     # copy of the same advice sitting in any other message would undo the
     # honest wording just as much as leaving it in the instruction would.
@@ -1697,16 +1702,74 @@ async def test_a_turn_with_nothing_missing_keeps_the_ordinary_instruction() -> N
 
 
 @pytest.mark.asyncio
+async def test_an_unnameable_only_record_falls_back_to_the_unnamed_wording() -> None:
+    """A record holding only an unresolvable call id asks for no names: the
+    instruction states plainly that this conversation cannot say which
+    tools they were, instead of naming an empty list.
+
+    Mutation this test catches: rendering the named clause even when
+    ``lost_tool_names`` is empty would put ``NAMED_CLAUSE_PHRASE`` in the
+    instruction with nothing after it; the real wording swaps in the
+    unnamed fallback clause instead.
+    """
+    llm = await drive_forced_turn_missing_evidence(unnameable_ids=["lost_orphan"])
+
+    instruction = instruction_of(llm, 0)
+    assert UNNAMED_FALLBACK_PHRASE in instruction
+    assert NAMED_CLAUSE_PHRASE not in instruction
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name_count", "name_length"),
+    [(20, 64), (20, 200), (21, 8), (1, 2000)],
+)
+async def test_the_named_list_in_the_instruction_stays_bounded(
+    name_count: int, name_length: int
+) -> None:
+    """The instruction's named-tools clause goes through the same bounded
+    renderer as the dropped-evidence log line, so it never grows without
+    bound however many lost tools there are or how long their names run.
+
+    Mutation this test catches: interpolating the raw resolved-name list
+    into the instruction instead of ``self._bounded_tool_names(...)`` would
+    let a name over the per-name character cap appear in the instruction in
+    full; with the real bounded rendering it never does.
+    """
+    names = [f"tool_{index}".rjust(name_length, "x") for index in range(name_count)]
+    named = {f"call_{index}": name for index, name in enumerate(names)}
+
+    llm = await drive_forced_turn_missing_evidence(named=named)
+    instruction = instruction_of(llm, 0)
+
+    # _lost_tool_names() returns the resolved names sorted, not in the order
+    # the ledger happened to receive them, so the expected bounded rendering
+    # has to be built from the same sorted list the production code reads.
+    resolved_names = sorted(set(names))
+    expected_bounded = ReActPattern._bounded_tool_names(resolved_names)
+    assert ", ".join(expected_bounded) in instruction
+    # The budget charges one character per entry for a separator, while the
+    # instruction joins with two. The reserved allowance leaves room for that,
+    # and this is the assertion that says so rather than assuming it.
+    assert len(", ".join(expected_bounded)) <= COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS
+
+    if expected_bounded and expected_bounded[-1].startswith("..."):
+        assert re.search(r"\.\.\. \d+ more names? omitted", instruction)
+    if name_length > COMPACT_DROPPED_TOOL_NAME_MAX_CHARS:
+        assert names[0] not in instruction
+
+
+@pytest.mark.asyncio
 async def test_the_protocol_repair_keeps_the_honest_wording() -> None:
     """The retry that repairs a broken tool-protocol response is often the
     call that actually produces the answer the user sees, so it needs the
     same honest wording as the first call it replaces.
 
-    Mutation this test catches: not forwarding ``evidence_dropped`` into
-    ``_retry_tool_protocol_response`` makes the retry rebuild its prompt
-    without it, so its instruction falls back to ``STALE_EVIDENCE_PHRASE``;
-    with the real forwarding it carries ``HONEST_PHRASE`` instead, same as
-    the call it is repairing.
+    Mutation this test catches: not forwarding ``evidence_dropped`` and
+    ``lost_tool_names`` into ``_retry_tool_protocol_response`` makes the
+    retry rebuild its prompt without them, so its instruction falls back to
+    ``STALE_EVIDENCE_PHRASE``; with the real forwarding it carries
+    ``HONEST_PHRASE`` instead, same as the call it is repairing.
     """
     pattern = ReActPattern(max_iterations=4)
     pattern.tool_ledger["lost_named"] = make_ledger_record(

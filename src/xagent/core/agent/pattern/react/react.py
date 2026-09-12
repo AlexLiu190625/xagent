@@ -937,21 +937,22 @@ class ReActPattern(AgentPattern):
             evidence_dropped = (
                 force_final_answer_now and self.lost_tool_evidence.still_missing()
             )
+            lost_tool_names: list[str] = []
             if evidence_dropped:
-                # Resolved for this operator-facing log line only. The
-                # instruction built below reports that observations were
-                # removed without naming them, so nothing resolved here
-                # reaches the model.
-                names, unnamed = self._lost_tool_names()
+                # Resolved once so the log line and the prompt built below
+                # can never disagree about what the ledger found.
+                lost_tool_names, unnamed = self._lost_tool_names()
                 names_field: list[str] | str = (
-                    self._bounded_tool_names(names) if names else "unknown"
+                    self._bounded_tool_names(lost_tool_names)
+                    if lost_tool_names
+                    else "unknown"
                 )
                 logger.warning(
                     "Forced answer turn is missing tool evidence compaction destroyed; it will "
                     "be named as unavailable rather than answered from. missing_calls=%d "
                     "named_count=%d named=%s unnamed=%s execution_id=%s",
                     len(self.lost_tool_evidence.call_ids),
-                    len(names),
+                    len(lost_tool_names),
                     names_field,
                     unnamed,
                     getattr(context, "execution_id", None),
@@ -962,6 +963,7 @@ class ReActPattern(AgentPattern):
                 has_tools=bool(tool_schemas),
                 force_final_answer=force_final_answer_now,
                 evidence_dropped=evidence_dropped,
+                lost_tool_names=lost_tool_names,
                 tool_names=self._schema_tool_names(tool_schemas),
             )
             await runtime.checkpoint("before_llm", context=context, pattern=self)
@@ -1040,9 +1042,10 @@ class ReActPattern(AgentPattern):
                         # The retry rebuilds the whole prompt from scratch, and
                         # on a turn whose evidence is gone this is the call
                         # that actually reaches the user -- without forwarding
-                        # this, the repair would hand back the stale wording
+                        # these, the repair would hand back the stale wording
                         # this turn's first call already replaced.
                         evidence_dropped=evidence_dropped,
+                        lost_tool_names=lost_tool_names,
                         recovery_reason=exc.code,
                     )
                 except LLMCallInterrupted:
@@ -1141,6 +1144,7 @@ class ReActPattern(AgentPattern):
                         # actually reaches the user, so it needs the same
                         # evidence-dropped wording as the call it is repairing.
                         evidence_dropped=evidence_dropped,
+                        lost_tool_names=lost_tool_names,
                         recovery_reason=recovery_reason,
                         empty_final_answer=empty_final_answer is not None,
                     )
@@ -1381,6 +1385,7 @@ class ReActPattern(AgentPattern):
         has_tools: bool,
         force_final_answer: bool = False,
         evidence_dropped: bool = False,
+        lost_tool_names: Sequence[str] | None = None,
         tool_names: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         messages = list(context.get_messages_for_llm())
@@ -1395,6 +1400,15 @@ class ReActPattern(AgentPattern):
                 "tool-call markup as plain text. "
             )
             if evidence_dropped:
+                if lost_tool_names:
+                    named_clause = (
+                        ", including results from these tools: "
+                        f"{', '.join(self._bounded_tool_names(list(lost_tool_names)))}"
+                    )
+                else:
+                    named_clause = (
+                        ", and this conversation does not record which ones they were"
+                    )
                 # Conditional on a summary being present, never on which
                 # compaction strategy ran this turn. The message-dropping
                 # backstop only trims a tail window, so a summary an earlier
@@ -1412,7 +1426,7 @@ class ReActPattern(AgentPattern):
                     "Produce the final user-facing answer by calling the "
                     "final_answer control tool exactly once. Compaction removed "
                     "tool observations from this run's context and their values "
-                    "can no longer be read. If a compaction "
+                    f"can no longer be read{named_clause}. If a compaction "
                     "summary stands above, treat any value not literally present "
                     f"in that summary -- {VALUE_KINDS} -- as unavailable rather "
                     "than recalled. Do not reconstruct, estimate, or illustrate a "
@@ -1543,6 +1557,7 @@ class ReActPattern(AgentPattern):
         tool_schemas: list[dict[str, Any]],
         force_final_answer: bool,
         evidence_dropped: bool = False,
+        lost_tool_names: Sequence[str] | None = None,
         recovery_reason: str | None = None,
         empty_final_answer: bool = False,
     ) -> tuple[Any, ReActFinalAnswerStreamer]:
@@ -1554,6 +1569,7 @@ class ReActPattern(AgentPattern):
             has_tools=True,
             force_final_answer=force_final_answer,
             evidence_dropped=evidence_dropped,
+            lost_tool_names=lost_tool_names,
             tool_names=self._schema_tool_names(tools),
         )
         if recovery_reason == "unavailable_tool_call":
