@@ -2863,3 +2863,27 @@ def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
     monkeypatch.setenv(config.TOBY_PERSONAL_STDIO_ENABLED, value)
 
     assert config.get_toby_personal_stdio_enabled() is True
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, False), ("true", True), ("false", False)]
+)
+def test_shared_task_execution_is_dormant_by_default(monkeypatch, value, expected):
+    monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)
+    if value is not None:
+        monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, value)
+    assert config.get_shared_task_execution_enabled() is expected
+
+
+@pytest.mark.parametrize("value", ["", " ", "deployment/channel"])
+def test_task_event_channel_prefix_rejects_invalid_namespace(monkeypatch, value):
+    monkeypatch.setenv(config.TASK_EVENT_CHANNEL_PREFIX, value)
+    with pytest.raises(ValueError, match="channel prefix"):
+        config.get_task_event_channel_prefix()
+
+
+def test_task_event_channel_prefix_default_and_override(monkeypatch):
+    monkeypatch.delenv(config.TASK_EVENT_CHANNEL_PREFIX, raising=False)
+    assert config.get_task_event_channel_prefix() == "xagent:task-events:v1"
+    monkeypatch.setenv(config.TASK_EVENT_CHANNEL_PREFIX, "xagent:staging:v1")
+    assert config.get_task_event_channel_prefix() == "xagent:staging:v1"

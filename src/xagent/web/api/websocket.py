@@ -123,6 +123,13 @@ from ..services.task_command_transport import (
     dispatch_task_command_promptly,
     enqueue_task_command,
 )
+from ..services.task_event_state import (
+    _is_versioned_task_event as _is_versioned_task_event,
+)
+from ..services.task_event_state import (
+    _with_current_task_control_state,
+    _with_task_control_state_snapshot,
+)
 from ..services.task_events import (
     CommandReply,
     discard_command_reply,
@@ -150,7 +157,9 @@ from ..services.task_execution import (
 )
 from ..services.task_execution_controller import (
     task_control_snapshot,
-    task_execution_controller,
+)
+from ..services.task_execution_controller import (
+    task_execution_controller as task_execution_controller,
 )
 from ..services.task_interaction_read import get_pending_interaction_question
 from ..services.task_runtime import (
@@ -984,150 +993,6 @@ async def redirect_legacy_preview(
     )
 
 
-_VERSIONED_TASK_EVENT_TYPES = {
-    "agent_error",
-    "error",
-    "task_completed",
-    "task_error",
-    "task_pause_requested",
-    "task_paused",
-    "task_resumed",
-    "task_started",
-    "task_waiting_for_user",
-}
-
-
-def _is_versioned_task_event(message: dict[str, Any]) -> bool:
-    message_type = str(message.get("type") or "")
-    if message_type in _VERSIONED_TASK_EVENT_TYPES:
-        return True
-    return (
-        message_type == "trace_event"
-        and str(
-            message.get("event_type")
-            or (
-                message.get("data", {}).get("event_type")
-                if isinstance(message.get("data"), dict)
-                else ""
-            )
-        )
-        == "task_info"
-    )
-
-
-def _event_task_id(message: dict[str, Any]) -> int | None:
-    candidates = [message.get("task_id")]
-    task_data = message.get("task")
-    if isinstance(task_data, dict):
-        candidates.append(task_data.get("id"))
-        candidates.append(task_data.get("task_id"))
-    data = message.get("data")
-    if isinstance(data, dict):
-        candidates.append(data.get("id"))
-        candidates.append(data.get("task_id"))
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        try:
-            return int(candidate)
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _event_task_control_state(message: dict[str, Any]) -> dict[str, Any] | None:
-    sources = [message]
-    task_data = message.get("task")
-    if isinstance(task_data, dict):
-        sources.append(task_data)
-    data = message.get("data")
-    if isinstance(data, dict):
-        sources.append(data)
-
-    for source in sources:
-        version = source.get("state_version")
-        control_state = source.get("control_state")
-        status = source.get("status")
-        if (
-            isinstance(version, int)
-            and not isinstance(version, bool)
-            and version >= 0
-            and isinstance(control_state, str)
-            and isinstance(status, str)
-            and (isinstance(source.get("run_id"), str) or source.get("run_id") is None)
-        ):
-            return {
-                "run_id": source.get("run_id"),
-                "state_version": version,
-                "control_state": control_state,
-                "status": status,
-            }
-    return None
-
-
-def _with_task_control_state_snapshot(
-    message: dict[str, Any],
-    *,
-    task_id: int,
-    state: dict[str, Any],
-) -> dict[str, Any]:
-    """Attach one already-loaded control-state tuple without database I/O."""
-
-    if not _is_versioned_task_event(message):
-        return deepcopy(message)
-    resolved_state = _event_task_control_state(message) or state
-    enriched = deepcopy(message)
-    enriched.update(resolved_state)
-    enriched["task_id"] = task_id
-
-    if enriched.get("type") == "trace_event":
-        data = enriched.get("data")
-        enriched["data"] = {
-            **(data if isinstance(data, dict) else {}),
-            **resolved_state,
-        }
-
-    task_data = enriched.get("task")
-    if isinstance(task_data, dict):
-        enriched["task"] = {
-            **task_data,
-            **resolved_state,
-            "id": task_id,
-        }
-    return enriched
-
-
-async def _with_current_task_control_state(
-    message: dict[str, Any],
-    *,
-    fallback_task_id: int | None = None,
-) -> dict[str, Any]:
-    """Attach one canonical DB state tuple to a state-bearing event.
-
-    Event producers can finish out of order. Preserve a producer-captured
-    state tuple when present; otherwise attach the current row snapshot.
-    Clients compare the resulting ``run_id`` / ``state_version`` before
-    applying the event.
-    """
-
-    if not _is_versioned_task_event(message):
-        return message
-    task_id = _event_task_id(message) or fallback_task_id
-    if task_id is None:
-        return message
-    state = _event_task_control_state(message)
-    if state is None:
-        snapshot = await task_execution_controller.snapshot(task_id)
-        if snapshot is None:
-            return message
-        state = snapshot.as_dict()
-    return _with_task_control_state_snapshot(
-        message,
-        task_id=task_id,
-        state=state,
-    )
-
-
 # Connection manager
 class _CommandOriginRegistry:
     """(task_id, command_id) -> the exact socket that submitted the command.
@@ -1220,10 +1085,16 @@ class _CommandOriginRegistry:
 _command_origins = _CommandOriginRegistry()
 
 
+from ...config import get_shared_task_execution_enabled  # noqa: E402
+from ..services.task_socket_writer import TaskSocketWriter  # noqa: E402
+
+
 class ConnectionManager:
     def __init__(self) -> None:
         # task_id -> List[WebSocket]
         self.active_connections: Dict[int, List[WebSocket]] = {}
+        self._writers: dict[WebSocket, TaskSocketWriter] = {}
+        self._stream_reconciler: asyncio.Task[None] | None = None
         # WebSocket -> current task_id
         self._connection_task_ids: Dict[WebSocket, int] = {}
 
@@ -1241,6 +1112,10 @@ class ConnectionManager:
         if websocket not in self.active_connections[task_id]:
             self.active_connections[task_id].append(websocket)
         self._connection_task_ids[websocket] = task_id
+        if get_shared_task_execution_enabled() and websocket not in self._writers:
+            self._writers[websocket] = TaskSocketWriter(
+                websocket, lambda: self.disconnect(websocket)
+            )
 
     def _remove_from_task(self, websocket: WebSocket, task_id: int) -> None:
         if task_id in self.active_connections:
@@ -1252,6 +1127,13 @@ class ConnectionManager:
                 pass
 
     def disconnect(self, websocket: WebSocket) -> None:
+        writer = self._writers.pop(websocket, None)
+        if writer is not None:
+            writer.stop()
+        if get_shared_task_execution_enabled():
+            from ..services.task_event_bridge import get_task_event_bridge
+
+            get_task_event_bridge().discard_recipient(websocket)
         task_id = self._connection_task_ids.pop(websocket, None)
         if task_id is not None:
             self._remove_from_task(websocket, task_id)
@@ -1263,7 +1145,7 @@ class ConnectionManager:
         for connection in connections:
             if self._connection_task_ids.get(connection) == task_id:
                 del self._connection_task_ids[connection]
-            _command_origins.discard_socket(connection)
+            self.disconnect(connection)
         return connections
 
     def connections_for_task(self, task_id: int) -> List[WebSocket]:
@@ -1294,9 +1176,61 @@ class ConnectionManager:
 
     async def send_personal_message(self, message: dict, websocket: WebSocket) -> None:
         versioned_message = await _with_current_task_control_state(message)
-        await websocket.send_text(json.dumps(versioned_message))
+        writer = self._writers.get(websocket)
+        if writer is not None:
+            delivery = writer.enqueue(json.dumps(versioned_message), acknowledge=True)
+            await cast(asyncio.Future[None], delivery)
+        else:
+            await websocket.send_text(json.dumps(versioned_message))
+
+    async def deliver_shared_event(self, message: dict[str, Any], task_id: int) -> None:
+        encoded = json.dumps(message)
+        for connection in self.connections_for_task(task_id):
+            writer = self._writers.get(connection)
+            if writer is not None:
+                try:
+                    writer.enqueue(encoded)
+                except ConnectionError:
+                    self.disconnect(connection)
+
+    def start_stream_reconciliation(self) -> None:
+        self._stream_reconciler = asyncio.create_task(self._reconcile_streams())
+
+    async def stop_stream_reconciliation(self) -> None:
+        if self._stream_reconciler is not None:
+            self._stream_reconciler.cancel()
+            await asyncio.gather(self._stream_reconciler, return_exceptions=True)
+            self._stream_reconciler = None
+
+    async def _reconcile_streams(self) -> None:
+        from ..services.task_stream_snapshot import load_task_stream_snapshots
+
+        while True:
+            try:
+                task_ids = list(self.active_connections)
+                snapshots = await run_db_io_cancellation_safe(
+                    lambda: load_task_stream_snapshots(task_ids)
+                )
+                for snapshot in snapshots:
+                    await self.deliver_shared_event(snapshot, snapshot["task_id"])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Shared stream state reconciliation failed", exc_info=True
+                )
+            await asyncio.sleep(5)
+
+    async def shared_stream_status(self, kind: str) -> None:
+        for task_id in list(self.active_connections):
+            await self.deliver_shared_event({"type": kind, "task_id": task_id}, task_id)
 
     async def broadcast_to_task(self, message: dict, task_id: int) -> None:
+        if get_shared_task_execution_enabled():
+            from ..services.task_event_bridge import get_task_event_bridge
+
+            await get_task_event_bridge().publish(message, task_id)
+            return
         has_connections = self.has_connections_for_task(task_id)
         increment_performance_counter(
             "xagent.websocket.broadcast.calls",
@@ -1449,6 +1383,7 @@ async def handle_chat_message(
 
     try:
         enqueued = await _enqueue_websocket_task_command(
+            websocket=websocket,
             task_id=task_id,
             message_data=message_data,
             kind=TaskCommandKind.MESSAGE,
@@ -1533,7 +1468,7 @@ async def handle_chat_message(
         accepted=True,
     )
     if enqueued.command_id:
-        if enqueued.created:
+        if enqueued.created and not get_shared_task_execution_enabled():
             # Only the ingress that created the durable row owns the origin.
             # A payload-matching duplicate (created=False) - a co-tenant
             # resubmission, one arriving after the creator disconnected, or one
@@ -1556,6 +1491,8 @@ def _enqueue_websocket_task_command_sync(
     kind: TaskCommandKind,
     payload: dict[str, Any],
     allow_missing_task: bool,
+    reply_host_id: str | None = None,
+    reply_origin: str | None = None,
 ) -> EnqueuedTaskCommand | None:
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -1618,6 +1555,11 @@ def _enqueue_websocket_task_command_sync(
                 command_id=command_id,
                 kind=kind,
                 payload=payload,
+                **(
+                    {"reply_host_id": reply_host_id, "reply_origin": reply_origin}
+                    if reply_host_id is not None
+                    else {}
+                ),
             )
         except TaskCommandTaskMissing as exc:
             # The row was deleted after the check above, so route this through
@@ -1638,6 +1580,7 @@ def _enqueue_websocket_task_command_sync(
 
 async def _enqueue_websocket_task_command(
     *,
+    websocket: WebSocket | None = None,
     task_id: int,
     message_data: dict[str, Any],
     kind: TaskCommandKind,
@@ -1673,7 +1616,30 @@ async def _enqueue_websocket_task_command(
         # This remains stable across retries even when an API client omitted
         # or supplied an invalid client_message_id.
         payload["client_message_id"] = resolved_command_id
-    return await asyncio.to_thread(
+    route = {}
+    bridge = None
+    token = None
+    if get_shared_task_execution_enabled():
+        from ..services.task_event_bridge import TaskEventBridge, get_task_event_bridge
+
+        bridge = get_task_event_bridge()
+        if kind == TaskCommandKind.MESSAGE and not bridge.ready.is_set():
+            raise ClientVisibleValidationError(
+                "Task event transport is unavailable; retry after reconnection",
+                error_code=ClientErrorCode.TASK_UNAVAILABLE,
+            )
+        if websocket is not None and bridge.ready.is_set():
+
+            async def reply(message: dict[str, Any]) -> None:
+                if not manager.is_connection_registered(websocket, task_id):
+                    raise ConnectionError("Original task connection is unavailable")
+                await _make_command_reply(websocket)(message)
+
+            token = bridge.register_origin(
+                task_id, resolved_command_id, reply, recipient=websocket
+            )
+            route = {"reply_host_id": bridge.host_id, "reply_origin": token}
+    result = await asyncio.to_thread(
         _enqueue_websocket_task_command_sync,
         task_id=int(task_id),
         actor_user_id=int(user.id),
@@ -1682,7 +1648,11 @@ async def _enqueue_websocket_task_command(
         kind=kind,
         payload=payload,
         allow_missing_task=allow_missing_task,
+        **route,
     )
+    if token is not None and (result is None or not result.created):
+        cast(TaskEventBridge, bridge).discard_origin(token)
+    return result
 
 
 @dataclass(frozen=True)
@@ -2810,6 +2780,7 @@ async def handle_pause_task(
 
     try:
         enqueued = await _enqueue_websocket_task_command(
+            websocket=websocket,
             task_id=task_id,
             message_data=message_data,
             kind=TaskCommandKind.PAUSE,
@@ -2858,7 +2829,7 @@ async def handle_pause_task(
         },
         websocket,
     )
-    if enqueued.created:
+    if enqueued.created and not get_shared_task_execution_enabled():
         # Only the creating ingress owns the origin; a payload-matching
         # duplicate must never bind (see handle_chat_message). Registered
         # before dispatch so local execution cannot outrun the binding.
@@ -2876,6 +2847,7 @@ async def handle_resume_task(
 
     try:
         enqueued = await _enqueue_websocket_task_command(
+            websocket=websocket,
             task_id=task_id,
             message_data=message_data,
             kind=TaskCommandKind.RESUME,
@@ -2924,7 +2896,7 @@ async def handle_resume_task(
         },
         websocket,
     )
-    if enqueued.created:
+    if enqueued.created and not get_shared_task_execution_enabled():
         # Only the creating ingress owns the origin; a payload-matching
         # duplicate must never bind (see handle_chat_message). Registered
         # before dispatch so local execution cannot outrun the binding.

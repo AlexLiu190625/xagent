@@ -1666,6 +1666,16 @@ def _finalize_task_execution_result_isolated(
                         is_failure=task_updated.status == TaskStatus.FAILED,
                     )
                 )
+                # Shared readers may observe completion before scheduler
+                # cleanup runs. Publish its durable output in this same
+                # fenced transaction as the terminal state and transcript.
+                setattr(
+                    task_updated,
+                    "output",
+                    history_content
+                    if task_updated.status == TaskStatus.COMPLETED
+                    else None,
+                )
                 persist_assistant_message_no_commit(
                     finalize_db,
                     task_id=task_id,

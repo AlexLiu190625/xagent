@@ -14,6 +14,8 @@ type TestWebSocketMessage = {
   task?: Record<string, unknown>
   status?: string
   run_id?: string | null
+  stream_run_id?: string | null
+  stream_attempt_id?: string | null
   state_version?: number
   control_state?: string
   request_id?: string
@@ -188,6 +190,7 @@ function StateProbe() {
           })
         )}
       </div>
+      <div data-testid="last-task-update">{state.lastTaskUpdate}</div>
       <div data-testid="task-status">{state.currentTask?.status || ""}</div>
       <div data-testid="waiting-request-id">{state.currentTask?.waitingRequestId || ""}</div>
       <div data-testid="waiting-interactions">{JSON.stringify(state.currentTask?.waitingInteractions || [])}</div>
@@ -214,6 +217,7 @@ function StateProbe() {
       <div data-testid="history-loading">{String(state.isHistoryLoading)}</div>
       <div data-testid="preview-open">{String(state.filePreview.isOpen)}</div>
       <div data-testid="processing">{String(state.isProcessing)}</div>
+      <div data-testid="stream-recovery">{state.streamRecoveryTaskId ?? ""}</div>
     </>
   )
 }
@@ -568,6 +572,126 @@ describe("AppProvider websocket message routing", () => {
   afterEach(() => {
     cleanup()
     localStorage.clear()
+  })
+
+  it.each([false, true])("rejects an initial shared delta and accepts a complete replacement (wrapped=%s)", (wrapped) => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (eventType: string, data: Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        task_id: 1, timestamp: "2026-05-27T05:00:00Z",
+        stream_run_id: "run-1", stream_attempt_id: "attempt-1",
+        ...(wrapped ? { type: "trace_event", event_type: eventType, data: { data } } : { type: eventType, data }),
+      })
+    })
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_started", task_id: 1, run_id: "run-1", state_version: 1,
+        status: "running", control_state: "running", timestamp: "2026-05-27T05:00:00Z",
+      })
+    })
+    // Joining a known active run can deliver a delta before either start or snapshot.
+    send("final_answer_delta", { message_id: "final_answer_1", delta: "WRONG SUFFIX" })
+    expect(screen.getByTestId("messages").textContent).not.toContain("WRONG SUFFIX")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+    send("final_answer_delta", { message_id: "final_answer_1", delta: "MORE SUFFIX" })
+    expect(screen.getByTestId("messages").textContent).not.toContain("MORE SUFFIX")
+    send("final_answer_end", { message_id: "final_answer_1", content: "complete answer" })
+    expect(screen.getByTestId("messages").textContent).toContain("complete answer")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+    send("final_answer_delta", { message_id: "final_answer_1", delta: "LATE SUFFIX" })
+    expect(screen.getByTestId("messages").textContent).not.toContain("LATE SUFFIX")
+  })
+
+  it.each([false, true])("handles task completion after a shared answer ends (wrapped=%s)", (wrapped) => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage> & Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_started", task_id: 1, timestamp: "2026-05-27T05:00:02Z",
+        stream_run_id: "run-1", stream_attempt_id: "attempt-1", ...message,
+      })
+    })
+    send({ run_id: "run-1", state_version: 1, status: "running", control_state: "running" })
+    send({ type: "trace_event", data: {
+      event_id: "dag-before-answer", event_type: "dag_execution",
+      data: { phase: "executing", turn_id: "run-1" },
+    } })
+    expect(screen.getByTestId("dag-phase").textContent).toBe("executing")
+    const answerFrame = (eventType: string, data: Record<string, unknown>) => send(
+      wrapped ? { type: "trace_event", event_type: eventType, data: { data } } : { type: eventType, data },
+    )
+    answerFrame("final_answer_start", { message_id: "final_answer_1" })
+    answerFrame("final_answer_end", { message_id: "final_answer_1", content: "complete answer" })
+    const previousUpdate = screen.getByTestId("last-task-update").textContent
+    send({ type: "task_completed", run_id: "run-1", state_version: 2,
+      control_state: "completed", task: { id: 1, status: "completed" }, success: true,
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("completed")
+    expect(screen.getByTestId("processing").textContent).toBe("false")
+    expect(screen.getByTestId("dag-phase").textContent).toBe("completed")
+    expect(screen.getByTestId("task-dag-terminated-at").textContent).not.toBe("")
+    expect(screen.getByTestId("last-task-update").textContent).not.toBe(previousUpdate)
+    answerFrame("final_answer_delta", { message_id: "final_answer_1", delta: "LATE SUFFIX" })
+    expect(screen.getByTestId("messages").textContent).toContain("complete answer")
+    expect(screen.getByTestId("messages").textContent).not.toContain("LATE SUFFIX")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+  })
+
+  it("resumes shared deltas when a start establishes the missing prefix", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (type: string, data: Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type, task_id: 1, timestamp: "2026-05-27T05:00:00Z",
+        stream_run_id: "run-1", stream_attempt_id: "attempt-1", data,
+      })
+    })
+    send("final_answer_delta", { message_id: "final_answer_1", delta: "WRONG SUFFIX" })
+    send("final_answer_start", { message_id: "final_answer_1" })
+    send("final_answer_delta", { message_id: "final_answer_1", delta: "answer from its beginning" })
+    expect(screen.getByTestId("messages").textContent).toContain("answer from its beginning")
+    expect(screen.getByTestId("messages").textContent).not.toContain("WRONG SUFFIX")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+  })
+
+  it("streams a new answer whose prefix arrives after an active snapshot", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_stream_snapshot", task_id: 1,
+        timestamp: "2026-05-27T05:00:00Z", ...message,
+      })
+    })
+    send({ run_id: "run-1", state_version: 1, control_state: "running", status: "running", data: {} })
+    send({ type: "final_answer_start", stream_run_id: "run-1", data: { message_id: "final_answer_1" } })
+    send({ type: "final_answer_delta", stream_run_id: "run-1", data: { message_id: "final_answer_1", delta: "first visible answer" } })
+    expect(screen.getByTestId("messages").textContent).toContain("first visible answer")
+    send({ type: "task_started", stream_run_id: "run-2", run_id: "run-2", state_version: 2, status: "running", control_state: "running" })
+    send({ type: "final_answer_start", stream_run_id: "run-2", data: { message_id: "final_answer_2" } })
+    send({ type: "final_answer_delta", stream_run_id: "run-2", data: { message_id: "final_answer_2", delta: "second visible answer" } })
+    expect(screen.getByTestId("messages").textContent).toContain("second visible answer")
+  })
+
+  it("reconciles a gapped shared stream without appending later deltas or accepting an old run", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_stream_snapshot", task_id: 1,
+        timestamp: "2026-05-27T05:00:00Z", ...message,
+      })
+    })
+    send({ type: "task_started", run_id: "run-2", state_version: 2, control_state: "running", status: "running" })
+    send({ type: "final_answer_start", stream_run_id: "run-2", data: { message_id: "final_answer_2" } })
+    send({ type: "final_answer_delta", stream_run_id: "run-2", data: { message_id: "final_answer_2", delta: "prefix" } })
+    expect(screen.getByTestId("messages").textContent).toContain("prefix")
+    send({ type: "stream_unavailable" })
+    send({ type: "final_answer_delta", stream_run_id: "run-2", data: { message_id: "final_answer_2", delta: "WRONG SUFFIX" } })
+    expect(screen.getByTestId("messages").textContent).not.toContain("WRONG SUFFIX")
+    send({ run_id: "run-1", state_version: 1, status: "completed", control_state: "completed", data: { output: "OLD RESULT" } })
+    expect(screen.getByTestId("messages").textContent).not.toContain("OLD RESULT")
+    send({ run_id: "run-2", state_version: 3, status: "completed", control_state: "completed", data: { output: "complete persisted result" } })
+    expect(screen.getByTestId("messages").textContent).toContain("complete persisted result")
+    expect(screen.getByTestId("messages").textContent).not.toContain("prefix")
+    send({ type: "final_answer_delta", stream_run_id: "run-2", data: { message_id: "final_answer_2", delta: "LATE" } })
+    expect(screen.getByTestId("messages").textContent).not.toContain("LATE")
   })
 
   it("routes historical assistant transcript rows to chat and progress events to trace", async () => {

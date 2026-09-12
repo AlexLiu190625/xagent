@@ -303,6 +303,7 @@ async def test_output_staging_holds_no_pool_slot_or_task_lock(
         assert not finalized.late_result
         check_db = _direct_db_session()
         try:
+            assert check_db.get(Task, task_id).output == "done"
             assert (
                 check_db.query(UploadedFile)
                 .filter(UploadedFile.task_id == task_id)

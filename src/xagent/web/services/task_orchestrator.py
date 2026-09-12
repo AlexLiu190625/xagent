@@ -48,7 +48,7 @@ import asyncio
 import enum
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -697,12 +697,7 @@ class TaskTurnOrchestrator:
 
 
 @dataclass(frozen=True)
-class _ClaimedTurn:
-    """Snapshot returned by ``_begin_turn_atomic_sync`` after the claim
-    commits, so ``begin_turn`` can build :class:`TurnStarted` without the
-    caller re-reading the ORM."""
-
-    task_lease: TaskLease
+class _AcceptedTurn:
     status: TaskStatus
     updated_at: Optional[datetime]
     before_message_id: Optional[int]
@@ -711,6 +706,11 @@ class _ClaimedTurn:
     state_version: int = 0
     control_state: str = TaskControlState.RUNNING.value
     agent_config: Optional[dict[str, Any]] = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class _ClaimedTurn(_AcceptedTurn):
+    task_lease: TaskLease
 
 
 async def _schedule_committed_turn(
@@ -966,15 +966,14 @@ def _turn_started_snapshot(
     )
 
 
-def _persist_claimed_turn_no_commit(
+def _persist_accepted_turn_no_commit(
     db: Session,
     *,
     task_id: int,
     task_owner_user_id: int,
     payload: TaskTurnPayload,
-    task_lease: TaskLease,
-) -> _ClaimedTurn:
-    """Persist the first message and snapshot one already-claimed turn."""
+) -> _AcceptedTurn:
+    """Persist the first message and snapshot one accepted turn."""
 
     from .chat_history_service import persist_user_message_no_commit
 
@@ -1014,8 +1013,7 @@ def _persist_claimed_turn_no_commit(
         .filter(Task.id == task_id)
         .one()
     )
-    return _ClaimedTurn(
-        task_lease=task_lease,
+    return _AcceptedTurn(
         status=status,
         updated_at=updated_at,
         before_message_id=before_message_id,
@@ -1064,15 +1062,15 @@ def _task_requires_actor_policy_sync(
         return _task_requires_actor_policy(db, task_id, task_owner_user_id)
 
 
-def _claim_turn_no_commit(
+def _accept_turn_no_commit(
     db: Session,
     task_id: int,
     task_owner_user_id: int,
     *,
     payload: TaskTurnPayload,
     kind: TurnKind,
-) -> _ClaimedTurn:
-    """Stage one atomic turn claim; the caller owns commit and rollback."""
+) -> _AcceptedTurn:
+    """Stage turn acceptance without a lease; the caller owns the transaction."""
 
     if kind == TurnKind.APPEND and _task_requires_actor_policy(
         db,
@@ -1125,22 +1123,11 @@ def _claim_turn_no_commit(
             raise TaskTurnError("interaction_response_required")
         raise TaskTurnError("busy")
 
-    task_lease = acquire_task_lease_no_commit(
-        db,
-        task_id,
-        expected_run_id=run_id,
-    )
-    if task_lease is None:
-        raise RuntimeError(
-            f"task {task_id} claim could not stage its exact execution lease"
-        )
-
-    result = _persist_claimed_turn_no_commit(
+    result = _persist_accepted_turn_no_commit(
         db,
         task_id=task_id,
         task_owner_user_id=task_owner_user_id,
         payload=payload,
-        task_lease=task_lease,
     )
     missing_bindings = bind_turn_files_no_commit(
         file_ids=list(payload.file_ids),
@@ -1172,7 +1159,7 @@ def _claim_turn_no_commit(
         except WorkforceTurnRejectedError as exc:
             raise TaskTurnError(exc.reason) from exc
         # Keep the WorkforceRun projection in the same transaction as the
-        # Task RUNNING claim and exact prelease. A later best-effort worker can
+        # Task RUNNING acceptance. A later best-effort worker can
         # otherwise arrive after completion and resurrect the projection.
         from .workforce_runtime import sync_workforce_run_status
 
@@ -1181,14 +1168,29 @@ def _claim_turn_no_commit(
             .filter(
                 Task.id == task_id,
                 Task.status == TaskStatus.RUNNING,
-                Task.runner_id == task_lease.runner_id,
-                task_lease_attempt_predicate(task_lease),
-                Task.run_id == task_lease.run_id,
+                Task.run_id == run_id,
             )
             .one()
         )
         sync_workforce_run_status(db, claimed_task, TaskStatus.RUNNING)
     return result
+
+
+def _claim_turn_no_commit(
+    db: Session,
+    task_id: int,
+    task_owner_user_id: int,
+    *,
+    payload: TaskTurnPayload,
+    kind: TurnKind,
+) -> _ClaimedTurn:
+    accepted = _accept_turn_no_commit(
+        db, task_id, task_owner_user_id, payload=payload, kind=kind
+    )
+    lease = acquire_task_lease_no_commit(db, task_id, expected_run_id=accepted.run_id)
+    if lease is None:
+        raise RuntimeError(f"task {task_id} could not stage its exact execution lease")
+    return _ClaimedTurn(**asdict(accepted), task_lease=lease)
 
 
 def _begin_turn_atomic_sync(

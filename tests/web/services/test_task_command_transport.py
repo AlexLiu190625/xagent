@@ -2993,3 +2993,30 @@ def test_defer_budget_is_coupled_to_the_lease_ttl(
     # An invalid value falls back to the default TTL, not the floor.
     monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "not-a-number")
     assert max_command_defers() == 120
+
+
+def test_duplicate_command_cannot_replace_persisted_reply_origin(db_session):
+    user, task = _create_running_task(db_session)
+    arguments = dict(
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="routed-pause",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    original = enqueue_task_command(
+        db_session, **arguments, reply_host_id="web-a", reply_origin="socket-a"
+    )
+    duplicate = enqueue_task_command(
+        db_session, **arguments, reply_host_id="web-b", reply_origin="socket-b"
+    )
+    assert original.created
+    assert not duplicate.created
+    assert duplicate.payload_matches
+    db_session.expire_all()
+    row = (
+        db_session.query(TaskExecutionCommand)
+        .filter_by(command_id="routed-pause")
+        .one()
+    )
+    assert (row.reply_host_id, row.reply_origin) == ("web-a", "socket-a")

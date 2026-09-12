@@ -1101,7 +1101,7 @@ async def test_create_workforce_run_claim_timeout_rolls_back_created_records(
 
     monkeypatch.setattr(
         task_orchestrator_module,
-        "_persist_claimed_turn_no_commit",
+        "_persist_accepted_turn_no_commit",
         MagicMock(side_effect=synthetic_timeout),
     )
     monkeypatch.setattr(

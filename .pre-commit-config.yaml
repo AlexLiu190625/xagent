@@ -20,6 +20,7 @@ repos:
         additional_dependencies:
           - "pydantic[mypy]"
           - aiohttp
+          - redis==6.4.0
           - types-PyYAML
           - types-beautifulsoup4
           - types-requests

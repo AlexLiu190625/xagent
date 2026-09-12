@@ -40,6 +40,8 @@ EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
+SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
+TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
@@ -742,6 +744,21 @@ def get_redis_url() -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def get_shared_task_execution_enabled() -> bool:
+    """Enable durable task handoff and the shared event bridge when explicitly configured."""
+    return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
+
+
+def get_task_event_channel_prefix() -> str:
+    """Redis Pub/Sub is not isolated by Redis DB number; namespace each deployment."""
+    prefix = os.getenv(TASK_EVENT_CHANNEL_PREFIX, "xagent:task-events:v1").strip()
+    if not prefix or not re.fullmatch(r"[A-Za-z0-9:._-]+", prefix):
+        raise ValueError(
+            f"{TASK_EVENT_CHANNEL_PREFIX} must be a nonempty channel prefix"
+        )
+    return prefix
 
 
 def get_hot_path_cache_enabled() -> bool:
