@@ -25,6 +25,7 @@ from xagent.core.agent.context.enrichment import (
 from xagent.core.agent.context.execution import (
     CLOCK_TIMEZONE_METADATA_KEY,
     COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+    DroppedToolObservations,
     bounded_notice_lines,
 )
 from xagent.core.agent.grounding import VALUE_KINDS
@@ -1316,15 +1317,58 @@ def test_compact_with_llm_reports_dropped_tool_results_by_name() -> None:
     assert "- web_search x3" in notice
     assert "- read_file" in notice
     assert (
-        f"Treat any value not literally present in that summary -- {VALUE_KINDS} --"
-        in notice
+        "Otherwise treat any value not literally present in that summary -- "
+        f"{VALUE_KINDS} --" in notice
     )
     assert "unavailable rather than recalled" in notice
+    # The notice is baked into the summary message and is never rewritten, so
+    # it says when the removal happened and which reading wins if one of the
+    # values comes back, rather than claiming they are gone from here on.
+    assert "Their values were removed from context at that point" in notice
+    assert (
+        "If a later tool call has since returned one of these values, that "
+        "later result is the current one." in notice
+    )
+    assert "are no longer in context" not in notice
     assert result.metadata["dropped_tool_result_count"] == 4
     assert result.metadata["dropped_tool_results_by_name"] == {
         "web_search": 3,
         "read_file": 1,
     }
+    # The metadata carries its own copy, so a consumer building that dict up
+    # cannot reach back into the settled DroppedToolObservations value.
+    result.metadata["dropped_tool_results_by_name"]["web_search"] = 99
+    assert result.metadata["dropped_tool_result_count"] == 4
+
+
+def test_the_dropped_observation_counts_cannot_be_written_through() -> None:
+    """``DroppedToolObservations`` is frozen, and so is the mapping it holds.
+
+    ``frozen=True`` only stops the field from being reassigned; a plain dict
+    behind it stays writable by anyone holding the instance or a reference
+    handed out of it. These counts describe what one compaction destroyed --
+    a fact that is settled once the compaction has run.
+
+    Mutation this test catches: constructing the value with a plain ``dict``
+    instead of a read-only mapping makes the write below succeed, so
+    ``pytest.raises`` fails.
+    """
+    ctx = ExecutionContext()
+    ctx.add_user_message("Run a tool")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "web_search"}}
+        ],
+    )
+    ctx.add_tool_result("web_search", {"output": "rows"}, "call-1")
+
+    dropped = ExecutionContext._dropped_tool_observations(ctx.messages)
+
+    assert dropped.counts == {"web_search": 1}
+    assert isinstance(dropped, DroppedToolObservations)
+    with pytest.raises(TypeError):
+        dropped.counts["web_search"] = 99  # type: ignore[index]
 
 
 def test_compact_with_llm_reports_the_calls_it_destroyed() -> None:

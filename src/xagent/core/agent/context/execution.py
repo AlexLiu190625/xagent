@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import lru_cache
-from typing import Any
+from types import MappingProxyType
+from typing import Any, TypeVar
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -125,9 +126,15 @@ COMPACT_SUMMARY_MIN_TOKENS = 256
 COMPACT_SUMMARY_FALLBACK_BUDGETS = (4096, 2048, 1024, COMPACT_SUMMARY_MIN_TOKENS)
 COMPACT_CONTEXT_REF_MAX_TOKENS = 2048
 COMPACT_DROPPED_REF_NOTICE_MAX_CHARS = 2048
-# Sized so the notice prefix, which spells out the shared VALUE_KINDS list,
-# leaves room for the full name list rather than crowding names out of it.
-COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1152
+# Sized so the notice prefix -- which spells out the shared VALUE_KINDS list
+# and what a later refetch does to this notice -- leaves room for the full
+# name list rather than crowding names out of it. Derived, not picked: the
+# prefix runs about 515 characters, and a full page is
+# COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES names of a realistic MCP length (34)
+# rendered as "- name\n", or 740. Anything added to the prefix has to be
+# added here as well, or the addition is paid for by dropping names the run
+# actually used.
+COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1280
 COMPACT_DROPPED_TOOL_NAME_MAX_CHARS = 64
 
 
@@ -164,11 +171,17 @@ COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES = 20
 # breaks the clients that populate it.
 CLOCK_TIMEZONE_METADATA_KEY = "timezone"
 
+# Ties a notice's entry type to what its renderer accepts. The two callers
+# pass different element types -- (name, count) pairs and plain tool names --
+# and with Any on both sides a renderer written for one of them type-checks
+# against the other's entries.
+NoticeEntryT = TypeVar("NoticeEntryT")
+
 
 def bounded_notice_lines(
-    entries: Sequence[Any],
+    entries: Sequence[NoticeEntryT],
     *,
-    render: Callable[[Any], str],
+    render: Callable[[NoticeEntryT], str],
     max_chars: int,
     max_entries: int | None = None,
     chars_used: int = 0,
@@ -306,9 +319,17 @@ class DroppedToolObservations:
     the other two fields: inventing an id for one of these observations, or
     falling back to its tool name as if that identified the call, would
     both claim knowledge the data does not carry.
+
+    ``counts`` is a read-only mapping, not a plain dict. ``frozen=True``
+    stops the field from being reassigned but does nothing about the object
+    it holds, and this instance's counts are handed to a compaction result's
+    metadata that other code goes on to build up -- so a plain dict here
+    would be a shared, writable view into a value the type declares settled.
+    The metadata sites take their own dict copy of it, the way they already
+    do for ``call_ids``.
     """
 
-    counts: dict[str, int]
+    counts: Mapping[str, int]
     call_ids: tuple[str, ...]
     without_call_id: int
 
@@ -1430,7 +1451,7 @@ class ExecutionContext:
             metadata={
                 "removed_count": removed,
                 "dropped_tool_result_count": sum(dropped_observations.counts.values()),
-                "dropped_tool_results_by_name": dropped_observations.counts,
+                "dropped_tool_results_by_name": dict(dropped_observations.counts),
                 "dropped_tool_result_call_ids": list(dropped_observations.call_ids),
                 "dropped_tool_results_without_call_id": (
                     dropped_observations.without_call_id
@@ -1530,7 +1551,7 @@ class ExecutionContext:
                 "retained_context_ref_count": len(compacted_context_refs),
                 "dropped_context_ref_count": len(dropped_context_refs),
                 "dropped_tool_result_count": sum(dropped_observations.counts.values()),
-                "dropped_tool_results_by_name": dropped_observations.counts,
+                "dropped_tool_results_by_name": dict(dropped_observations.counts),
                 # Additive: the two keys above keep their existing meaning
                 # and count, so a reader that does not know about these two
                 # is unaffected. These identify the individual calls behind
@@ -1663,17 +1684,26 @@ class ExecutionContext:
             else:
                 without_call_id += 1
         return DroppedToolObservations(
-            counts=dict(Counter(names)),
+            counts=MappingProxyType(dict(Counter(names))),
             call_ids=tuple(call_ids),
             without_call_id=without_call_id,
         )
 
     @staticmethod
-    def _dropped_tool_results_notice(counts: dict[str, int]) -> str:
+    def _dropped_tool_results_notice(counts: Mapping[str, int]) -> str:
         """Describe the tool observations this compaction removes from context.
 
         Without this, the summary silently replaces every retrieved value and
         the agent cannot tell a remembered value from an invented one.
+
+        Worded as a record of what this compaction did, not as a claim about
+        what is in context from here on. The notice is baked into the summary
+        message and is never rewritten, while a later tool call can fetch one
+        of these values back -- so a present-tense "their values are no longer
+        in context" would still be sitting in the prompt after it stopped
+        being true, next to ordinary wording that says nothing is missing.
+        Saying when the removal happened, and which reading wins if a value
+        did come back, keeps the sentence true for the life of the message.
         """
         if not counts:
             return ""
@@ -1681,10 +1711,12 @@ class ExecutionContext:
         call_label = "call was" if total == 1 else "calls were"
         prefix = (
             f"Raw observations from {total} tool {call_label} dropped by this "
-            "compaction. Their exact values are no longer in context; only the "
-            "summary above describes them. Treat any value not literally present in "
-            f"that summary -- {VALUE_KINDS} -- as unavailable rather than recalled. "
-            "Tools whose results were dropped:\n"
+            "compaction. Their values were removed from context at that point; "
+            "only the summary above describes them. If a later tool call has "
+            "since returned one of these values, that later result is the "
+            "current one. Otherwise treat any value not literally present in "
+            f"that summary -- {VALUE_KINDS} -- as unavailable rather than "
+            "recalled. Tools whose results were dropped:\n"
         )
         # Tool names can come from dynamic MCP server config, so bound both the
         # per-name length and the total notice size the way the sibling
