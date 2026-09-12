@@ -163,7 +163,12 @@ def url_path_id(value: str, field_name: str) -> str:
     return quote(value, safe="")
 
 
-def success_with_capped_dict(field_name: str, data: Any) -> str:
+def success_with_capped_dict(
+    field_name: str,
+    data: Any,
+    *,
+    extra_fields: dict[str, Any] | None = None,
+) -> str:
     """Build a ``{"status": "success", ...}`` payload, trimming a dict
     until it fits the platform's output limit.
 
@@ -183,20 +188,39 @@ def success_with_capped_dict(field_name: str, data: Any) -> str:
     the residual case -- a dict with no list/dict-valued keys at all (e.g.
     a handful of scalar keys with huge string values) -- and drops whole
     keys, exactly as phase 1 replaces; it's guaranteed to terminate at {}.
-    """
-    max_output_length = get_tool_max_output_length()
-    response = json.dumps(
-        {"status": "success", field_name: data, "truncated": False},
-        ensure_ascii=False,
-    )
-    if not isinstance(data, dict) or len(response) <= max_output_length:
-        return response
 
-    def _build(payload: dict[str, Any], truncated: bool) -> str:
+    ``extra_fields`` adds fixed top-level response fields that must be counted
+    while trimming the dict, such as a calendar event's derived Meet link.
+    Reserved envelope keys cannot be overridden.
+    """
+    extras = extra_fields or {}
+    reserved_fields = {"status", field_name, "truncated"}
+    if reserved_fields.intersection(extras):
+        raise ValueError(
+            "extra_fields must not override status, the capped field, or truncated"
+        )
+
+    max_output_length = get_tool_max_output_length()
+
+    def _build(
+        payload: Any,
+        truncated: bool,
+        *,
+        with_extras: bool = True,
+    ) -> str:
         return json.dumps(
-            {"status": "success", field_name: payload, "truncated": truncated},
+            {
+                "status": "success",
+                field_name: payload,
+                **(extras if with_extras else {}),
+                "truncated": truncated,
+            },
             ensure_ascii=False,
         )
+
+    response = _build(data, False)
+    if not isinstance(data, dict) or len(response) <= max_output_length:
+        return response
 
     working = dict(data)
     truncated = False
@@ -230,6 +254,20 @@ def success_with_capped_dict(field_name: str, data: Any) -> str:
         working = {key: working[key] for key in keys}
         truncated = True
         response = _build(working, truncated)
+
+    if len(response) > max_output_length:
+        compact_data: dict[str, Any] = {}
+        if isinstance(data.get("id"), (str, int, float, bool)):
+            compact_data["id"] = data["id"]
+        candidates = (
+            _build(compact_data, True, with_extras=False),
+            _build({}, True, with_extras=False),
+            json.dumps({"status": "success", "truncated": True}, ensure_ascii=False),
+        )
+        for candidate in candidates:
+            if len(candidate) <= max_output_length:
+                return candidate
+        return json.dumps({"status": "success"}, ensure_ascii=False)
     return response
 
 
@@ -255,11 +293,33 @@ def normalize_addresses(addresses: list[str] | str) -> list[str]:
     return deduped
 
 
+def _halve_largest_list_fields_until_bounded(
+    payload: dict[str, Any], field_names: tuple[str, ...], max_output_length: int
+) -> str:
+    """Serialize ``payload``, halving its largest named list until bounded."""
+    response = json.dumps(payload, ensure_ascii=False)
+    while len(response) > max_output_length:
+        populated_fields = [name for name in field_names if payload.get(name)]
+        if not populated_fields:
+            break
+        field_name = max(
+            populated_fields,
+            key=lambda name: len(json.dumps(payload[name], ensure_ascii=False)),
+        )
+        values = payload[field_name]
+        payload[field_name] = values[: len(values) // 2]
+        payload["truncated"] = True
+        response = json.dumps(payload, ensure_ascii=False)
+    return response
+
+
 def conflict_response(
     conflicts: list[dict[str, Any]],
     unchecked_attendees: list[str],
     start: str,
     end: str,
+    *,
+    check_error: str | None = None,
 ) -> str:
     """Build the status="conflict" envelope a calendar-writing MCP tool
     returns instead of creating/updating an event, so the calling agent
@@ -314,26 +374,12 @@ def conflict_response(
         # to special-case this one.
         "truncated": False,
     }
-    response = json.dumps(payload, ensure_ascii=False)
+    if check_error:
+        payload["check_error"] = check_error
     max_output_length = get_tool_max_output_length()
-    if len(response) <= max_output_length:
-        return response
-
-    remaining_conflicts = conflicts
-    remaining_unchecked = unchecked_attendees
-    while (remaining_conflicts or remaining_unchecked) and len(
-        response
-    ) > max_output_length:
-        conflicts_size = len(json.dumps(remaining_conflicts, ensure_ascii=False))
-        unchecked_size = len(json.dumps(remaining_unchecked, ensure_ascii=False))
-        if remaining_conflicts and conflicts_size >= unchecked_size:
-            remaining_conflicts = remaining_conflicts[: len(remaining_conflicts) // 2]
-        else:
-            remaining_unchecked = remaining_unchecked[: len(remaining_unchecked) // 2]
-        payload["conflicts"] = remaining_conflicts
-        payload["unchecked_attendees"] = remaining_unchecked
-        payload["truncated"] = True
-        response = json.dumps(payload, ensure_ascii=False)
+    response = _halve_largest_list_fields_until_bounded(
+        payload, ("conflicts", "unchecked_attendees"), max_output_length
+    )
 
     if len(response) > max_output_length:
         compact_payloads: tuple[dict[str, Any], ...] = (
@@ -355,6 +401,57 @@ def conflict_response(
         # smallest contract-preserving response rather than returning `{}`.
         return json.dumps({"status": "conflict"}, ensure_ascii=False)
     return response
+
+
+def incomplete_check_response(
+    unchecked_attendees: list[str],
+    start: str,
+    end: str,
+    *,
+    message: str | None = None,
+) -> str:
+    """Return a bounded pre-write response when required calendars could
+    not be checked. The caller may retry with ``ignore_conflicts=True`` only
+    after the user explicitly accepts proceeding without complete checks.
+    ``message`` can describe a non-calendar prerequisite, such as a malformed
+    event window, while preserving the same bounded response contract.
+    """
+    payload: dict[str, Any] = {
+        "status": "conflict_check_incomplete",
+        "message": message
+        or (
+            f"Availability could not be checked for {len(unchecked_attendees)} "
+            f"calendar(s) for {start} - {end}. No event was written."
+        ),
+        "unchecked_attendees": unchecked_attendees,
+        "hint": (
+            "Report the unchecked calendars to the user. Choose another action, "
+            "or call this tool again with ignore_conflicts=true only after the "
+            "user explicitly confirms they want to proceed without complete "
+            "availability checks."
+        ),
+        "truncated": False,
+    }
+    max_output_length = get_tool_max_output_length()
+    response = _halve_largest_list_fields_until_bounded(
+        payload, ("unchecked_attendees",), max_output_length
+    )
+    if len(response) <= max_output_length:
+        return response
+
+    compact_payloads: tuple[dict[str, Any], ...] = (
+        {
+            "status": "conflict_check_incomplete",
+            "message": "Availability check incomplete; details truncated.",
+            "truncated": True,
+        },
+        {"status": "conflict_check_incomplete", "truncated": True},
+    )
+    for compact_payload in compact_payloads:
+        compact = json.dumps(compact_payload, ensure_ascii=False)
+        if len(compact) <= max_output_length:
+            return compact
+    return json.dumps({"status": "conflict_check_incomplete"}, ensure_ascii=False)
 
 
 def attendees_were_given(attendees: list[str] | str | None) -> bool:
@@ -381,11 +478,10 @@ def attendees_to_add(
     """
     if not attendees_were_given(attendees):
         return []
-    assert attendees is not None  # narrows for mypy; attendees_were_given implies this
     existing = {email.strip().lower() for email in existing_attendee_emails}
     return [
         address
-        for address in normalize_addresses(attendees)
+        for address in normalize_addresses(attendees or [])
         if address.lower() not in existing
     ]
 
@@ -440,9 +536,10 @@ def datetime_key_for_comparison(value: str | None) -> datetime | str | None:
         normalized = normalized[:-1] + "+00:00"
     normalized = _OVERLONG_FRACTIONAL_SECONDS.sub(r"\1", normalized)
     try:
-        return datetime.fromisoformat(normalized)
+        parsed: datetime = _date_parser.isoparse(normalized)
     except ValueError:
         return value
+    return parsed
 
 
 def reject_reversed_window(start_value: str, end_value: str) -> None:
@@ -495,7 +592,7 @@ def require_offset_datetime(value: str, field_name: str) -> None:
     its own clear error, not this function's job to preempt.
     """
     try:
-        parsed = datetime.fromisoformat(value)
+        parsed: datetime = _date_parser.isoparse(value)
     except ValueError:
         return
     if parsed.tzinfo is None:
@@ -554,7 +651,7 @@ def offset_datetime_string(value: str, tz_name: str) -> str:
     passing one with an offset already attached is a real, reachable
     input here, not just a theoretical one.
     """
-    parsed = datetime.fromisoformat(value)
+    parsed: datetime = _date_parser.isoparse(value)
     if parsed.tzinfo is not None:
         raise ValueError(
             f"{value!r} already carries a UTC offset; pass a naive "
@@ -579,7 +676,7 @@ def calendar_day_bounds(
     if days <= 0:
         raise ValueError("days must be a positive integer")
     zone = resolve_zoneinfo(tz_name)
-    day: date = datetime.fromisoformat(date_value).date()
+    day: date = _date_parser.isoparse(date_value).date()
     start = datetime.combine(day, time.min, tzinfo=zone)
     # Advance the local calendar date before attaching the timezone again.
     # Adding a timedelta to an aware datetime preserves the original
