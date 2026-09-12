@@ -29,6 +29,7 @@ from xagent.core.agent.language import (
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
 from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
+from xagent.core.agent.pattern.react.react import ToolCallRecord
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
@@ -248,6 +249,7 @@ def default_completion_assessment_response(kwargs: dict[str, Any]) -> dict[str, 
 class CapturingChildPattern:
     def __init__(self) -> None:
         self.kwargs: dict[str, Any] | None = None
+        self.recorded_compactions: list[Any] = []
 
     async def run(self, **kwargs: Any) -> dict[str, Any]:
         self.kwargs = kwargs
@@ -255,6 +257,15 @@ class CapturingChildPattern:
 
     def get_state(self) -> dict[str, Any]:
         return {"captured": True}
+
+    def record_lost_tool_evidence(self, compact_result: Any) -> None:
+        """Stand in for the real pattern's lost-evidence bookkeeping.
+
+        AutoPattern hands the result of its routing-stage compaction to the
+        pattern it shares the context with, so a stub standing in for
+        ``ReActPattern`` has to accept it.
+        """
+        self.recorded_compactions.append(compact_result)
 
 
 class FakeSearchTool:
@@ -1312,6 +1323,76 @@ async def test_auto_pattern_react_decision_delegates_to_react() -> None:
         "llm_end",
     ]
     assert runtime.hooks[0][1]["metadata"] == {"phase": "auto_decision"}
+
+
+@pytest.mark.asyncio
+async def test_routing_compaction_reaches_the_shared_lost_evidence_record() -> None:
+    """A compaction during routing is a loss the ReAct turns below must see.
+
+    Routing and the ReAct execution that follows it share one context and one
+    pattern instance, so an observation destroyed while the routing decision
+    is being made is destroyed for every turn after it too. The record those
+    turns read has to hold it, exactly as it holds a loss from a compaction
+    ReAct itself triggered.
+
+    The decision here answers directly, so no ReAct turn runs and nothing
+    clears the record at the end of a run -- what the assertions see is what
+    the routing stage alone put there.
+
+    Mutation this test catches: discarding the result of
+    ``compact_context_if_needed`` in ``AutoPattern._decide`` -- that is, not
+    calling ``record_lost_tool_evidence`` with it -- leaves the record empty
+    and ``still_missing()`` False, while the compaction still really removed
+    the observations.
+    """
+    react = ReActPattern(max_iterations=2)
+    pattern = AutoPattern(react_pattern=react)
+    llm = FakeLLM(
+        [
+            {"content": "summary for the routing decision"},
+            decision_tool_response(
+                "final_answer", "Nothing left to run.", answer="done"
+            ),
+        ]
+    )
+    # Without a window the runtime cannot bound a summary request and
+    # preserves the context instead of compacting it at all.
+    llm.context_window = 128_000  # type: ignore[attr-defined]
+    context = ExecutionContext()
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    context.add_user_message("Use calculator and report every value.")
+    for index in range(3):
+        call_id = f"seed_{index}"
+        context.add_assistant_message(
+            "",
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "calculator"},
+                }
+            ],
+        )
+        context.add_tool_result("calculator", {"output": "x" * 400}, call_id)
+        # The ledger is what a fingerprint is taken from when the loss is
+        # recorded, so seed it the way an executed call would have.
+        react.tool_ledger[call_id] = ToolCallRecord(
+            tool_call_id=call_id,
+            tool_name="calculator",
+            args={},
+            args_hash=f"hash-{index}",
+            status="completed",
+            result={"output": "x" * 400},
+        )
+
+    result = await pattern.run(
+        context=context, tools=[], llm=llm, runtime=PatternRuntime()
+    )
+
+    assert result["success"] is True
+    assert react.lost_tool_evidence.still_missing() is True
+    assert set(react.lost_tool_evidence.calls) == {"seed_0", "seed_1", "seed_2"}
 
 
 @pytest.mark.asyncio

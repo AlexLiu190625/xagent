@@ -794,12 +794,19 @@ class AutoPattern(AgentPattern):
             messages=context.get_messages_for_llm(),
             context=context,
         )
-        await runtime.compact_context_if_needed(
+        compact_result = await runtime.compact_context_if_needed(
             context=context,
             # See ReActPattern for why the fallback lives at the call site.
             llm=compact_llm if compact_llm is not None else route_llm,
             metadata={"phase": "auto_decision"},
         )
+        # Routing compacts the same context the ReAct turns below will answer
+        # from, and routing and those turns share one pattern instance, so
+        # what this compaction destroys has to reach the same record those
+        # turns read. Discarding the result here is what let a resumed session
+        # lose observations while routing and then answer as though nothing
+        # had gone.
+        self.react_pattern.record_lost_tool_evidence(compact_result)
 
         retry_feedback: str | None = None
         attempt = 0
