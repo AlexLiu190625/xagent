@@ -3647,7 +3647,7 @@ class WebToolConfig(BaseToolConfig):
             getattr(server, "name", "<unknown>"),
             error.exception_type,
             error.failure_code,
-            _redacted_bounded_resource(error.resource),
+            diagnostic["resource"],
         )
         return self._build_unavailable_mcp_config(
             server=server,

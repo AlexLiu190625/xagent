@@ -4023,3 +4023,75 @@ def test_truncated_error_message_bounds_raw_text_before_redaction(monkeypatch):
 
     assert seen_lengths == [_MCP_TOOL_ERROR_RAW_MAX_CHARS]
     assert len(message) <= _MCP_TOOL_ERROR_LOG_MAX_CHARS
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("https://alice:s?ecret@host/p", "<url redacted>"),  # codespell:ignore ecret
+        ("https://alice:sec#ret@host/p", "<url redacted>"),
+        ("https://alice:PASSWORDabcd", "<url redacted>"),
+        ("https://alice:secret@host/p", "https://host/p"),
+        ("https://host:8080/p?k=v", "https://host:8080/p"),
+        ("https://[::1]:8080/p", "https://[::1]:8080/p"),
+        ("https://host:/p", "https://host:/p"),
+    ],
+    ids=[
+        "password-with-question-mark",
+        "password-with-hash",
+        "userinfo-without-at-sign",
+        "userinfo-with-at-sign",
+        "numeric-port",
+        "ipv6-authority-with-port",
+        "empty-port",
+    ],
+)
+def test_redact_urls_in_text_rejects_unparsable_authority(text, expected):
+    """The first three rows are three distinct ways an authority fails to
+    parse as ``host[:port]`` (a password containing ``?`` or ``#`` pulls
+    the ``@`` into the query string; a raw-text cut can drop the ``@``
+    entirely) and must be redacted wholesale. The last four rows are
+    authorities that do parse and must pass through unchanged, including
+    an empty port and an IPv6 host with a port. Both halves share one
+    table so the guard is proven to reject the broken shapes without also
+    rejecting the legal ones.
+    """
+    assert redact_urls_in_text(text) == expected
+
+
+def _shrinking_url(raw_length: int) -> str:
+    """A URL token of exactly ``raw_length`` characters that redacts down to
+    a fixed 23 characters, used to place the raw cap at a chosen offset
+    while keeping the redacted result under the per-line cap."""
+    base = "https://f.example.com/p?k="
+    return base + "v" * (raw_length - len(base))
+
+
+def test_truncated_error_message_does_not_leak_userinfo_split_by_the_raw_cap():
+    """Builds an error message longer than the raw cap where the cut point
+    lands in the middle of a URL's password, then checks the redacted
+    output does not keep any part of that password.
+    """
+    password = "PASSWORDabcdefghijklmnop"
+    leaked_prefix_length = 12
+    filler_unit = _shrinking_url(816) + " "
+    adjuster_length = (
+        mcp_adapter_module._MCP_TOOL_ERROR_RAW_MAX_CHARS
+        - 4 * len(filler_unit)
+        - len("https://alice:")
+        - leaked_prefix_length
+    )
+    raw = (
+        filler_unit * 4
+        + _shrinking_url(adjuster_length - 1)
+        + " "
+        + f"https://alice:{password}@host/path"
+    )
+    assert len(raw) > mcp_adapter_module._MCP_TOOL_ERROR_RAW_MAX_CHARS
+    cut = raw[: mcp_adapter_module._MCP_TOOL_ERROR_RAW_MAX_CHARS]
+    assert cut.endswith("https://alice:" + password[:leaked_prefix_length])
+
+    message = _truncated_error_message(RuntimeError(raw))
+
+    assert message.endswith("<url redacted>")
+    assert password[:4] not in message

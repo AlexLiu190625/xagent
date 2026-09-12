@@ -3312,3 +3312,42 @@ async def test_remote_hook_refresh_classification_reaches_tool_failure_trace(
     public_output = repr(result) + repr(tracer.events) + caplog.text
     assert private_exception_text not in public_output
     assert "http-private-exception-secret" not in public_output
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_reads_the_resource_from_the_diagnostic(
+    db_session,
+    caplog,
+    monkeypatch,
+):
+    """The resource in the log line and the resource in the diagnostic dict
+    must come from the same computation rather than each being computed
+    separately from ``error.resource``. Both paths return the same value
+    today, so asserting on the value cannot tell them apart; this asserts
+    on how many times the redacting helper was called instead.
+    """
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://mcp.example.test/oauth?api_key=SECRET-abc123"
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    calls: list[Any] = []
+    original = web_tools_config._redacted_bounded_resource
+
+    def _counting(value):
+        calls.append(value)
+        return original(value)
+
+    monkeypatch.setattr(web_tools_config, "_redacted_bounded_resource", _counting)
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert calls == [resource]
+    assert f"resource={configs[0]['config']['diagnostic']['resource']}" in caplog.text

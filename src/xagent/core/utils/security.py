@@ -47,9 +47,10 @@ _ASSIGNMENT_VALUE_PATTERN = re.compile(r"[^&\s]+")
 # the prefix by ``_``/``-``. ``key`` itself is included: ``SECRET_KEY=``,
 # ``AWS_SECRET_ACCESS_KEY=``, ``STRIPE_KEY=`` and ``PRIVATE_KEY=`` are all
 # credentials, and an unknown ``*_key`` or ``*_token`` is treated as one (fail
-# closed). Only the per-suffix qualifiers below name ordinary fields
-# (``primary_key=``, ``PUBLIC_KEY=``, ``next_token=``); those stay readable
-# because this text also reaches user- and model-facing error messages.
+# closed). A per-suffix qualifier below keeps a key readable only when the
+# rest of the prefix carries no credential word, because this text also
+# reaches user- and model-facing error messages: ``next_token=`` stays
+# readable, ``secret_next_token=`` does not.
 _CREDENTIAL_KEY_SUFFIXES = (
     "api_key",
     "api-key",
@@ -92,13 +93,39 @@ _NON_CREDENTIAL_KEY_QUALIFIERS = frozenset(
 _NON_CREDENTIAL_TOKEN_QUALIFIERS = frozenset(
     {"idempotency", "next", "page", "continuation", "cursor", "sync", "pagination"}
 )
+# Credential words that make a key a credential wherever they sit in its
+# prefix, not only in the segment next to the suffix: ``secret_next_token``
+# is a secret however structural its last qualifier reads. The
+# single-segment credential suffixes are reused verbatim (a prefix segment
+# can only ever equal one of those), plus the words that appear only as a
+# qualifier and never as a suffix of their own.
+_CREDENTIAL_PREFIX_WORDS = frozenset(
+    {
+        suffix
+        for suffix in _CREDENTIAL_KEY_SUFFIXES
+        if "_" not in suffix and "-" not in suffix
+    }
+    | {
+        "access",
+        "auth",
+        "bearer",
+        "client",
+        "oauth",
+        "private",
+        "refresh",
+        "session",
+        "signing",
+    }
+)
 # The qualifier is the ``_``/``-`` segment just before the suffix
 # (``next_page_token`` -> ``page``). Every other suffix (``api_key``,
 # ``access_token``, ``password``, ``secret`` and their spellings) has no
 # exemption, so ``page_access_token=`` stays masked. The exemption below
 # only applies when that segment is joined to the suffix with ``_``; a
 # hyphen join (``next-token=``, ``cache-key=``) is treated as a credential
-# and masked.
+# and masked. It also requires the *whole* prefix to be free of credential
+# words (``_CREDENTIAL_PREFIX_WORDS``), so ``secret_next_token`` is masked
+# even though its qualifier is ``next``.
 _NON_CREDENTIAL_QUALIFIERS_BY_SUFFIX = {
     "key": _NON_CREDENTIAL_KEY_QUALIFIERS,
     "token": _NON_CREDENTIAL_TOKEN_QUALIFIERS,
@@ -122,11 +149,16 @@ def _is_credential_key(key: str) -> bool:
         # when the qualifier is joined to the suffix by ``_``
         # (``primary_key=``, ``next_token=``). A hyphen join is treated as
         # a credential name: ``cache-key=`` / ``next-token=`` are masked;
-        # only the underscore-joined spelling is exempt.
+        # only the underscore-joined spelling is exempt, and only when the
+        # whole prefix is also free of credential words
+        # (``_CREDENTIAL_PREFIX_WORDS``): ``secret_next_token=`` stays
+        # masked even though its last qualifier is ``next``.
         exempt = _NON_CREDENTIAL_QUALIFIERS_BY_SUFFIX.get(suffix)
         if exempt is not None and prefix[-1] == "_":
-            qualifier = re.split(r"[_-]", prefix.rstrip("_-"))[-1]
-            if qualifier in exempt:
+            segments = re.split(r"[_-]", prefix.rstrip("_-"))
+            if not _CREDENTIAL_PREFIX_WORDS.intersection(segments) and (
+                segments[-1] in exempt
+            ):
                 return False
         return True
     return False

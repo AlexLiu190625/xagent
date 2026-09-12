@@ -593,3 +593,37 @@ def test_redact_sensitive_text_leaves_a_credential_without_a_value() -> None:
         == "missing api_key= in request"
     )
     assert redact_sensitive_text("host=db;api_key=") == "host=db;api_key="
+
+
+_CREDENTIAL_WORD_IN_PREFIX_PAIRS = [
+    ("secret_next_token", "next_token"),
+    ("access_page_token", "page_token"),
+    ("password_cache_key", "cache_key"),
+    ("client_secret_page_token", "page_token"),
+    ("oauth_sync_token", "sync_token"),
+    ("refresh_next_token", "next_token"),
+    ("bearer_cache_key", "cache_key"),
+]
+
+
+@pytest.mark.parametrize(
+    ("credential_key", "readable_key"), _CREDENTIAL_WORD_IN_PREFIX_PAIRS
+)
+def test_redact_sensitive_text_masks_credential_word_anywhere_in_prefix(
+    credential_key: str, readable_key: str
+) -> None:
+    # Each pair shares the same structural qualifier (``next``, ``page``,
+    # ``cache``, ``sync``) as its last prefix segment. The left column adds a
+    # credential word earlier in the prefix and must stay masked even though
+    # the qualifier immediately before the suffix reads as ordinary; the
+    # right column is the same qualifier with no credential word anywhere in
+    # the prefix and must stay readable. Testing both together pins down
+    # that the fix neither under-masks the left column nor over-masks the
+    # right one.
+    assert (
+        redact_sensitive_text(f"{credential_key}=SECRET-abc123")
+        == f"{credential_key}=***c123"
+    )
+    assert redact_sensitive_text(f"{readable_key}=SECRET-abc123") == (
+        f"{readable_key}=SECRET-abc123"
+    )

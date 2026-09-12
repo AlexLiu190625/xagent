@@ -772,9 +772,17 @@ def redact_urls_in_text(text: str) -> str:
     userinfo, so those parts are dropped before the message is logged, and
     so is the fragment (it never reaches a server and carries no diagnostic
     value). The scheme, host, port, and path are kept so the log line still
-    says which server failed. A token that fails to parse as a URL is
-    replaced wholesale with ``<url redacted>`` rather than risking a partial
-    leak. ``ws://``/``wss://`` tokens are covered the same way as
+    says which server failed. A token that fails to parse as a URL, or
+    whose authority does not parse as ``host[:port]``, is replaced
+    wholesale with ``<url redacted>`` rather than risking a partial leak.
+    The second half covers userinfo that lost its ``@``: a password
+    containing ``?`` or ``#`` pushes the ``@`` into the query string, and a
+    caller that caps the raw text can cut between the password and the
+    ``@``. Both leave ``user:pass`` sitting where ``host:port`` belongs,
+    which is exactly what this rejects. What it cannot reject is a password
+    that is itself all digits (``https://alice:123``): that is
+    byte-for-byte a legal ``host:port`` and no parse can tell the two
+    apart. ``ws://``/``wss://`` tokens are covered the same way as
     ``http``/``https``, because a websocket transport cannot send headers,
     so a websocket connector has nowhere but the URL to put its credential.
     Sentence punctuation that trails the token (a closing paren, a period,
@@ -794,9 +802,24 @@ def redact_urls_in_text(text: str) -> str:
         clean, trailing = _split_url_token(token)
         try:
             parts = urlsplit(clean)
+            # Fail closed unless the authority parses as ``host[:port]``.
+            # ``urlsplit`` ends the authority at the first ``?``/``#``, so a
+            # password holding one of those leaves its ``user:pass`` where a
+            # ``host:port`` belongs and the ``@`` inside the query string;
+            # a raw message cut mid-password by
+            # ``_MCP_TOOL_ERROR_RAW_MAX_CHARS`` leaves the same shape with no
+            # ``@`` at all. ``SplitResult.port`` is the standard library's own
+            # reading of that field and raises ``ValueError`` on anything that
+            # is not a port number, so the ``except`` below turns the whole URL
+            # into ``<url redacted>``. Reading it IS the check: deleting this
+            # line as an unused assignment removes the guard. This closes a
+            # class of malformed authorities by delegating the validity
+            # judgment to ``urlsplit`` itself rather than adding another
+            # hand-rolled pattern for one more malformed shape.
+            _port = parts.port
             # Keep the authority verbatim minus userinfo: re-assembling it
             # from ``hostname``/``port`` would drop IPv6 brackets and lower
-            # the case, and reading ``port`` raises on out-of-range values.
+            # the case.
             netloc = parts.netloc.rsplit("@", 1)[-1]
             return urlunsplit((parts.scheme, netloc, parts.path, "", "")) + trailing
         except ValueError:
@@ -820,7 +843,11 @@ def _truncated_error_message(exc: BaseException) -> str:
     listed in #2356 -- and for those the cap is what bounds the exposure.
     ``str(exc)`` is also bounded to ``_MCP_TOOL_ERROR_RAW_MAX_CHARS`` before
     either redaction pass runs, since it is remote-controlled and unbounded
-    while both passes cost time proportional to their input.
+    while both passes cost time proportional to their input. Cutting the
+    raw text can land between a URL's password and its ``@``; the leftover
+    ``user:pass`` no longer parses as an authority, so
+    ``redact_urls_in_text`` replaces that whole token instead of keeping
+    its visible half.
     """
     try:
         raw = str(exc)
