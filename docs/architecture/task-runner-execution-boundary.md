@@ -62,3 +62,63 @@ before crossing that boundary.
 Regression coverage includes the existing start/resume, ownership, cancellation,
 output and trace tests, plus a subprocess test rejecting API route imports while
 loading execution services and constructing the persisted-task tracer.
+
+## Dormant START protocol
+
+`services/task_start_protocol.py` defines version 1 of the durable input for
+CREATE and APPEND. This is a protocol-only step: no API produces START, no
+runner consumes it, and existing acceptance/scheduling remains unchanged.
+`TaskCommandKind.START` reuses `task_execution_commands.kind` (a string column),
+so this step needs no schema migration. The current dispatcher excludes START,
+including targeted immediate dispatch. An unfinished START still blocks later
+commands for the same task; it does not block unrelated tasks. Do not enable a
+producer before a consumer is implemented.
+
+The command envelope retains task/actor identity, immutable owner subjects,
+target run/version and the existing `(task_id, command_id)` unique identity.
+The START command ID is the turn ID, also used by the persisted user message.
+Its versioned JSON payload contains:
+
+- accepted `run_id`, `state_version`, `turn_id` and CREATE/APPEND kind;
+- transcript `message` and optional separate `execution_message`;
+- authorized `file_ids`, optional `before_message_id`, timezone and
+  `force_fresh` (APPEND only).
+
+Only these fields are accepted. In particular, version 1 does not encode
+arbitrary execution context, trigger metadata, actor authorization policy,
+connector secrets, live runtime objects or leases. Producers requiring these
+inputs must not silently drop them or use this version until their explicit
+handoff contract is implemented. File IDs are references, not a guarantee that
+the runner can access the file bytes. Stored task/Agent configuration and file
+metadata are loaded at execution time; a serialized Agent or setup snapshot is
+not part of START. Resume retains its separate, currently local contract.
+
+A future producer must perform its existing authorization and business-state
+CAS, reserve the accepted run, persist the transcript, bind files, and stage
+START in **one transaction**, without acquiring an execution lease. It must
+preserve applicable Workforce projections in that transaction as well.
+`stage_task_start_command` verifies the exact accepted RUNNING run/version and
+absence of lease metadata, then delegates to `stage_task_command` as the final
+write. It does not itself accept a turn or commit. The caller must roll back
+all acceptance writes on failure or a conflicting payload. On SQLite the
+caller's acceptance write owns the writer lock; on PostgreSQL the acceptance
+CAS already holds the task row lock, and staging explicitly requests it again. Calling staging in a later transaction is not this contract.
+
+`read_task_start_command` strictly decodes the JSON and checks its run and turn
+against the immutable command envelope. It does not authorize execution or
+check the current task state. The eventual consumer must acquire the exact run's
+lease and start its heartbeat before executing, and finish START processing
+after the local scheduling handoff rather than waiting for the whole run.
+The accepted public run identity is retained; adding a new client-visible queue
+status is not required by this protocol. RUNNING continues to mean an accepted,
+active turn, including the interval before a runner claims it; lease ownership
+distinguishes execution admission. This preserves the existing client-visible
+status contract. A distinct QUEUED status would require coordinated changes to
+status storage, API/client handling, acceptance and the staging precondition,
+and the transition performed when the runner acquires its lease.
+
+This step adds no effect receipts and no safe replay guarantee for a START whose
+execution outcome is unknown. The existing generic retry behavior must not be
+assumed safe for START when wiring the future consumer. Process roles, producer
+migration, consumer admission, cross-process events and credentials remain
+subsequent work.

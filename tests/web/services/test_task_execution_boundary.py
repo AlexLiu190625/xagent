@@ -26,7 +26,7 @@ def test_execution_services_and_tracer_load_without_api_routes() -> None:
                             raise AssertionError(f"Execution imported API route: {fullname}")
 
                 sys.meta_path.insert(0, RejectRoutes())
-                from xagent.web.services import agent_service_manager, task_execution, task_orchestrator, task_resume
+                from xagent.web.services import agent_service_manager, task_execution, task_orchestrator, task_resume, task_start_protocol
                 from xagent.web.services.external_task_cancel import _broadcast_external_cancel_terminal_event
                 import asyncio
                 from unittest.mock import AsyncMock, patch
@@ -358,8 +358,9 @@ def test_control_and_reply_commands_execute_without_api_routes() -> None:
                     agent.pause_execution.return_value = True
                     with patch.object(agent_service_manager, "get_agent_manager") as manager:
                         manager.return_value.get_agent_for_task = AsyncMock(return_value=agent)
-                        for index, kind in enumerate(TaskCommandKind):
-                            # Enum includes only the four durable command kinds.
+                        control_kinds = (kind for kind in TaskCommandKind if kind != TaskCommandKind.START)
+                        for index, kind in enumerate(control_kinds):
+                            # Exercise the four wired commands; START is protocol-only.
                             task_index = ["message", "pause", "resume", "cancel"].index(kind.value)
                             payload = (
                                 {"client_message_id": "message-command", "message": "hello"}

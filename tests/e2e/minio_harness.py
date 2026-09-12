@@ -89,7 +89,7 @@ def run_minio_storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[MinioStorage]
     client = _docker_client()
     container, host_ports = run_container_with_dynamic_ports(
         client,
-        "minio/minio",  # Docker Hub — more reliable than quay.io
+        "quay.io/minio/minio",
         "server /data --console-address :9001",
         name=f"xagent-minio-e2e-{uuid4().hex[:12]}",
         container_ports=("9000/tcp", "9001/tcp"),

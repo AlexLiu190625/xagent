@@ -90,6 +90,7 @@ DISPATCHER_CONCURRENCY = 4
 
 
 class TaskCommandKind(str, enum.Enum):
+    START = "start"  # Protocol only; the current dispatcher must not consume it.
     MESSAGE = "message"
     PAUSE = "pause"
     RESUME = "resume"
@@ -671,6 +672,10 @@ def _claimable_query(
         db.query(TaskExecutionCommand)
         .join(Task, Task.id == TaskExecutionCommand.task_id)
         .filter(
+            # START remains dormant until runner consumption is implemented.
+            # Keep it in the earlier-command check: later commands must not
+            # overtake START. Without a consumer they remain blocked.
+            TaskExecutionCommand.kind != TaskCommandKind.START.value,
             _claim_availability_predicate(now),
             ~_unfinished_earlier_command(),
             _command_routing_predicate(runner_id, now),

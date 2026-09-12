@@ -27,6 +27,8 @@ on:
       - 'tests/web/services/test_runtime_key_transition_postgres.py'
       - 'src/xagent/web/api/auth.py'
       - 'tests/web/services/test_user_preferences_lock_postgres.py'
+      - 'src/xagent/web/services/task_start_protocol.py'
+      - 'tests/web/services/test_task_start_protocol.py'
       - 'src/xagent/web/services/task_command_transport.py'
       - 'tests/web/services/test_task_command_transport.py'
       - 'src/xagent/web/models/task.py'
@@ -133,6 +135,8 @@ jobs:
             tests/web/services/test_runtime_key_transition_postgres.py
             src/xagent/web/api/auth.py
             tests/web/services/test_user_preferences_lock_postgres.py
+            src/xagent/web/services/task_start_protocol.py
+            tests/web/services/test_task_start_protocol.py
             src/xagent/web/services/task_command_transport.py
             tests/web/services/test_task_command_transport.py
             src/xagent/web/models/task.py
@@ -427,7 +431,7 @@ jobs:
       - name: Test task command staging concurrency (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          pytest tests/web/services/test_task_command_transport.py -m postgresql -q
+          pytest tests/web/services/test_task_command_transport.py tests/web/services/test_task_start_protocol.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
