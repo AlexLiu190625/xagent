@@ -443,11 +443,13 @@ describe("classifySubmitFailure", () => {
   }
 
   it("maps every write failure shape to exactly one disposition", () => {
-    expect(CONNECTOR_RUNTIME_KNOWN_REASONS).toHaveLength(6)
+    expect(CONNECTOR_RUNTIME_KNOWN_REASONS).toHaveLength(7)
     // Binds every member of the constant to the disposition it actually
     // produces -- a `Record` keyed by the constant's own member type, so
     // adding a reason to CONNECTOR_RUNTIME_KNOWN_REASONS without adding its
-    // row here is a type error, not a silently-passing loop.
+    // row here is a type error, not a silently-passing loop. A member mapped
+    // to "contactAdmin" is one classifySubmitFailure has no specific branch
+    // for and deliberately lets reach the generic fallthrough.
     const messageKeyByKnownReason: Record<(typeof CONNECTOR_RUNTIME_KNOWN_REASONS)[number], ConnectorRuntimeErrorMessageKey> = {
       empty_items: "contactAdmin",
       empty_item_payload: "contactAdmin",
@@ -455,6 +457,7 @@ describe("classifySubmitFailure", () => {
       duplicate_ref: "contactAdmin",
       connector_not_selected: "notInSession",
       undeclared_context_key: "configChanged",
+      auth_selector_not_supported: "contactAdmin",
     }
     for (const reason of CONNECTOR_RUNTIME_KNOWN_REASONS) {
       expect(classifySubmitFailure(coded(400, "invalid_runtime_context", reason, REF_A), baseReport).messageKey).toBe(

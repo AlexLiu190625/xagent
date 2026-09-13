@@ -232,8 +232,15 @@ export async function submitTaskConnectorRuntimeValues(
   }
 }
 
-// Exact-match reason strings the disposition table below branches on by
-// value. Deliberately excludes the two "stored selection is corrupted" reason
+// The enumerable exact-match `reason` strings the server raises alongside
+// code `invalid_runtime_context`. classifySubmitFailure does not read this
+// constant: it branches on the individual strings it has a specific
+// disposition for and lets every other reason reach the generic fallthrough.
+// The constant exists so a test can bind each member to the disposition it
+// actually produces, which is what makes "a new reason silently becomes
+// generic" a visible choice rather than an accident.
+//
+// Deliberately excludes the two "stored selection is corrupted" reason
 // strings the server can produce (services/connector_runtime.py's
 // _load_task_selected_refs): one of them interpolates a field name from
 // whatever the corrupted row actually stored, so the full set is not
@@ -246,6 +253,7 @@ export const CONNECTOR_RUNTIME_KNOWN_REASONS = [
   "duplicate_ref",
   "connector_not_selected",
   "undeclared_context_key",
+  "auth_selector_not_supported",
 ] as const
 
 // The one exact sentence the per-turn gate raises for a malformed key name
@@ -397,11 +405,6 @@ export function classifySubmitFailure(
     if (reason === "payload_too_large") {
       return { messageKey: "tooLarge", retry: false, refresh: false, locate: { connectorRef } }
     }
-    if ((CONNECTOR_RUNTIME_KNOWN_REASONS as readonly string[]).includes(reason)) {
-      // empty_items / empty_item_payload / duplicate_ref: shapes this
-      // client's own request-building should never produce.
-      return GENERIC_DISPOSITION
-    }
   }
 
   if (status === 404 && code === "connector_not_found") {
@@ -409,10 +412,13 @@ export function classifySubmitFailure(
   }
 
   // Closed set exhausted: an unrecognized code, a reason outside every
-  // matched prefix and the known-reason set, or a corrupted stored
-  // selection's unenumerable sentence. A hook a deployment installs can also
-  // raise a ConnectorRuntimeError with any code/status of its own choosing,
-  // and it lands here the same way.
+  // prefix and exact string matched above, or a corrupted stored selection's
+  // unenumerable sentence. The reasons this client's own request-building
+  // should never produce (empty_items, empty_item_payload, duplicate_ref)
+  // and auth_selector_not_supported also land here: they carry nothing a
+  // user can act on. A hook a deployment installs can raise a
+  // ConnectorRuntimeError with any code/status of its own choosing, and it
+  // lands here the same way.
   return GENERIC_DISPOSITION
 }
 
