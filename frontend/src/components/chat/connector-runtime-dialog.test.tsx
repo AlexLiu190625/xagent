@@ -375,6 +375,38 @@ describe("keeps drafts and the snapshot when re-requested while open", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close" }))
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
   })
+
+  it("does not let an invalid-object mark on a row the report now hides keep submission disabled", async () => {
+    // A key the refreshed report reports satisfied loses its editable row,
+    // so an invalid-object mark recorded against it while it was still
+    // editable must not gate submission forever.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "objKey", type: "object", required: true }),
+        input({ section: "context", key: "strKey", type: "string", required: true }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    const objField = screen.getByLabelText("objKey")
+    fireEvent.change(objField, { target: { value: "{oops" } })
+    fireEvent.blur(objField)
+    expect(screen.getByText("connectorRuntime.objectInvalid")).toBeInTheDocument()
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "objKey", type: "object", required: true, satisfied: true }),
+        input({ section: "context", key: "strKey", type: "string", required: true }),
+      ]),
+    ])))
+    await openForTask() // same task: a second request, not a remount
+    await waitFor(() => expect(screen.getByText("connectorRuntime.filled")).toBeInTheDocument())
+
+    fireEvent.change(screen.getByLabelText("strKey"), { target: { value: "value" } })
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
+    expect(screen.queryByText("connectorRuntime.objectInvalid")).not.toBeInTheDocument()
+  })
 })
 
 describe("flags a non-object JSON draft on blur and does not submit it", () => {
