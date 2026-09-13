@@ -230,7 +230,22 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
 
   const outcome: DialogOutcome | null = report ? resolveDialogOutcome(report) : null
   const submitItems = report ? buildSubmitItems(report, drafts) : []
-  const hasInvalidObjectDraft = invalidDraftKeys.size > 0
+  // Only a mark on a row the current report still renders an editable control
+  // for may gate submission. A key a refreshed report reports satisfied loses
+  // its textarea, so its mark could never be cleared again -- submit would
+  // stay disabled with no error anywhere on screen. Derived from the report
+  // during render rather than pruned at each point that installs one, because
+  // there are three such points today and a fourth would silently reintroduce
+  // this.
+  const hasInvalidObjectDraft = report !== null && report.connectors.some(connector =>
+    connector.inputs.some(
+      input =>
+        input.section === "context"
+        && !input.satisfied
+        && input.type === "object"
+        && invalidDraftKeys.has(connectorRuntimeInputDraftKey(connector.connector_ref, input.key)),
+    ),
+  )
   const canSubmit = isSubmitEnabled(submitItems, hasInvalidObjectDraft)
   const hasResendPayload = request.resendPayload !== null
   const actions = outcome ? resolveDialogActions(outcome, hasResendPayload) : []
