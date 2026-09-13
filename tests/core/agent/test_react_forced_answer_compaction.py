@@ -95,7 +95,7 @@ async def run_one_turn(
 
 @pytest.mark.asyncio
 async def test_forced_turn_keeps_every_observation_and_does_not_compact() -> None:
-    """T-A1: the raw observation text reaches the model on a forced turn."""
+    """The raw observation text reaches the model on a forced turn."""
     context = build_context(observations=6, threshold=500)
     before = len(context.messages)
 
@@ -111,7 +111,7 @@ async def test_forced_turn_keeps_every_observation_and_does_not_compact() -> Non
 
 @pytest.mark.asyncio
 async def test_ordinary_turn_still_compacts_and_latches() -> None:
-    """T-A2: the skip is confined to the forced turn."""
+    """The skip is confined to the forced turn."""
     context = build_context(observations=6, threshold=500)
     before = len(context.messages)
 
@@ -123,7 +123,7 @@ async def test_ordinary_turn_still_compacts_and_latches() -> None:
 
 @pytest.mark.asyncio
 async def test_route_and_call_prompts_match_only_on_the_forced_turn() -> None:
-    """T-A3: routing and the real call see the same messages when nothing compacts.
+    """Routing and the real call see the same messages when nothing compacts.
 
     Both prompts are locals inside the loop, so ``_messages_for_llm`` is wrapped
     to record what it returned. Asserting only "called twice" would pass under
@@ -210,7 +210,7 @@ async def test_skip_never_spans_more_than_one_turn(
     make_llm: Any,
     compactions_expected: int,
 ) -> None:
-    """T-A4: the skipped compaction covers one turn and never a second.
+    """The skipped compaction covers one turn and never a second.
 
     Two turns are offered to every shape. What is asserted is how many turns
     skipped compaction -- counted off the production log line, one per skip --
@@ -263,7 +263,7 @@ async def test_skip_never_spans_more_than_one_turn(
 async def test_the_skip_is_logged_with_numbers_only(
     caplog: pytest.LogCaptureFixture, forced: bool, threshold: int, expected: str | None
 ) -> None:
-    """T-A5: one info line per skipped compaction, ids and numbers only.
+    """One info line per skipped compaction, ids and numbers only.
 
     ``over_threshold`` is what separates a skip that mattered from one on a
     turn that was never going to compact anyway.
@@ -326,14 +326,14 @@ def _result(**metadata: Any) -> CompactResult:
 def test_latch_reads_dropped_observations_not_compacted(
     result: Any, expected: bool
 ) -> None:
-    """T-B2/B3/B4/B9/B10/E2: only a removed observation latches the marker."""
+    """Only a removed observation latches the marker."""
     context = ContextManager().create_context(execution_id="latch")
     note_compaction_evidence_loss(context, result)
     assert context.metadata[KEY] is expected
 
 
 def test_latch_is_monotonic() -> None:
-    """T-B10: a later lossless compaction does not clear an earlier loss."""
+    """A later lossless compaction does not clear an earlier loss."""
     context = ContextManager().create_context(execution_id="latch-monotonic")
     note_compaction_evidence_loss(context, _result(dropped_tool_result_count=3))
     note_compaction_evidence_loss(context, _result(dropped_tool_result_count=0))
@@ -341,7 +341,7 @@ def test_latch_is_monotonic() -> None:
 
 
 def test_only_one_place_in_src_writes_the_marker_false() -> None:
-    """T-B11: nothing resets the marker; the single False write is the stamp."""
+    """Nothing resets the marker; the single False write is the stamp."""
     src = pathlib.Path(__file__).resolve().parents[3] / "src" / "xagent"
     writes = {
         str(path.relative_to(src))
@@ -354,7 +354,7 @@ def test_only_one_place_in_src_writes_the_marker_false() -> None:
 
 @pytest.mark.asyncio
 async def test_truncate_path_latches_without_writing_a_notice() -> None:
-    """T-B3: the truncate path stays silent; the marker is what carries it.
+    """The truncate path stays silent; the marker is what carries it.
 
     Reached with no summarizer at all, the only way to get it: the ReAct call
     site substitutes the main model when no compact model is set.
@@ -373,7 +373,7 @@ async def test_truncate_path_latches_without_writing_a_notice() -> None:
 
 @pytest.mark.asyncio
 async def test_windowless_compact_model_does_not_latch() -> None:
-    """T-B4 sixth cell, built the only way it is reachable: no declared window."""
+    """The marker also latches when no window is declared, the one way that cell is reachable."""
     context = build_context(observations=6, threshold=500)
     await run_one_turn(
         context=context, forced=False, compact_llm=WindowlessCompactingLLM()
@@ -384,7 +384,7 @@ async def test_windowless_compact_model_does_not_latch() -> None:
 
 @pytest.mark.asyncio
 async def test_loss_in_an_earlier_turn_reaches_the_later_forced_turn() -> None:
-    """T-B1: the cross-turn cell -- compaction one turn, forced answer the next."""
+    """The cross-turn cell -- compaction one turn, forced answer the next."""
     context = build_context(observations=6, threshold=500)
     await run_one_turn(context=context, forced=False)
     assert context.metadata[KEY] is True
@@ -417,7 +417,7 @@ class RoutingLLM(ScriptedLLM):
 
 @pytest.mark.asyncio
 async def test_auto_routing_loss_reaches_the_react_forced_turn() -> None:
-    """T-B5: the loss Auto's own compaction caused is stated downstream.
+    """The loss Auto's own compaction caused is stated downstream.
 
     Driven through ``AutoPattern._decide`` rather than by calling the compact
     runtime and the latch by hand: what is under test is that the routing
@@ -494,7 +494,7 @@ CONSUMERS = [
 
 @pytest.mark.parametrize("build", CONSUMERS)
 def test_every_toolless_answer_prompt_states_the_loss(build: Any) -> None:
-    """T-B1(a)/T-C0/T-F1/T-G1, plus the mechanical form of invariant B.
+    """Every tool-less answer prompt carries the facts, and none of them claims accumulated results.
 
     The scope of the second assertion is the prompt this builder writes for
     this turn, not the whole payload: a guidance line written into the context
@@ -537,7 +537,7 @@ MAIN_DECISION_SUFFICIENCY_CLAUSE = (
 
 @pytest.mark.parametrize("build", CONSUMERS)
 def test_a_run_that_never_lost_anything_reads_exactly_like_main(build: Any) -> None:
-    """T-B7: the marker-false branch is word-for-word main's wording.
+    """The marker-false branch is word-for-word main's wording.
 
     The context must come from ``ContextManager.create_context``. One built
     directly carries no key, reads as "evidence removed", and would make this
@@ -555,7 +555,7 @@ def test_a_run_that_never_lost_anything_reads_exactly_like_main(build: Any) -> N
 
 
 def test_a_directly_built_context_reads_as_evidence_removed() -> None:
-    """T-C7: deliberate, and pinned so nobody later "fixes" it to False.
+    """Deliberate, and pinned so nobody later "fixes" it to False.
 
     Production stamps the key at its one brand-new-context site, so this shape
     is unreachable there.
@@ -564,7 +564,7 @@ def test_a_directly_built_context_reads_as_evidence_removed() -> None:
 
 
 def test_the_outcome_rule_stays_a_conditional() -> None:
-    """T-B8: a dropped result message is not a dropped action."""
+    """A dropped result message is not a dropped action."""
     context = build_context(observations=2, threshold=500)
     context.metadata[KEY] = True
     text = _react_forced(context)
@@ -578,7 +578,7 @@ def test_the_outcome_rule_stays_a_conditional() -> None:
 async def test_the_guidance_written_into_the_context_matches_the_marker(
     removed: bool,
 ) -> None:
-    """T-G2: this guidance is history, so it must agree with the next prompt."""
+    """This guidance is history, so it must agree with the next prompt."""
     context = build_context(observations=2, threshold=500)
     context.metadata[KEY] = removed
     pattern = ReActPattern()
@@ -618,7 +618,7 @@ async def test_the_guidance_written_into_the_context_matches_the_marker(
 
 @pytest.mark.asyncio
 async def test_protocol_repair_retry_inherits_the_same_wording() -> None:
-    """T-B6: the repair retry inside a forced turn carries the same wording.
+    """The repair retry inside a forced turn carries the same wording.
 
     The retry is reached, not simulated: the first response calls
     final_answer with an empty answer field, which the pattern treats as a
@@ -654,7 +654,7 @@ async def test_protocol_repair_retry_inherits_the_same_wording() -> None:
 
 @pytest.mark.asyncio
 async def test_a_skipped_compaction_that_overflows_fails_the_run_cleanly() -> None:
-    """T-E1: overflow ends the run -- no retry, no fallback compaction, no answer."""
+    """Overflow ends the run -- no retry, no fallback compaction, no answer."""
 
     class OverflowLLM(ScriptedLLM):
         async def chat(self, **kwargs: Any) -> Any:

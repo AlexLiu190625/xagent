@@ -1641,7 +1641,7 @@ def test_compact_truncate_counts_tool_result_excised_from_window_interior() -> N
 
 
 def test_compact_truncate_adds_no_in_prompt_notice() -> None:
-    """truncate keeps an exact message count; a notice would break that."""
+    """Truncate keeps an exact message count; a notice would break that."""
     ctx = ExecutionContext()
     ctx.compact_config.threshold = 1
     ctx.compact_config.max_messages = 2
@@ -2705,13 +2705,13 @@ def test_marker_helpers_tolerate_a_context_without_dict_metadata(
 
 
 def test_a_new_context_starts_from_not_removed() -> None:
-    """T-C6: the stamp is what makes an absent key mean "an older build"."""
+    """The stamp is what makes an absent key mean "an older build"."""
     context = ContextManager().create_context(execution_id="marker-new")
     assert context.metadata[_MARKER] is False
 
 
 def test_the_marker_survives_a_checkpoint_round_trip() -> None:
-    """T-C1: metadata travels whole, so no serialization code is needed."""
+    """Metadata travels whole, so no serialization code is needed."""
     context = ContextManager().create_context(execution_id="marker-roundtrip")
     context.metadata[_MARKER] = True
 
@@ -2723,7 +2723,7 @@ def test_the_marker_survives_a_checkpoint_round_trip() -> None:
 
 
 def test_a_checkpoint_written_without_the_key_reads_as_removed() -> None:
-    """T-C2: older builds dropped observations on the truncate path silently."""
+    """Older builds dropped observations on the truncate path silently."""
     payload = ContextManager().create_context(execution_id="marker-old").to_dict()
     payload["metadata"].pop(_MARKER, None)
     restored = ExecutionContext.from_dict(json.loads(json.dumps(payload)))
@@ -2731,7 +2731,7 @@ def test_a_checkpoint_written_without_the_key_reads_as_removed() -> None:
 
 
 def test_a_later_question_on_the_same_context_keeps_the_marker() -> None:
-    """T-C5: the marker lives as long as the message list with the hole."""
+    """The marker lives as long as the message list with the hole."""
     context = ContextManager().create_context(execution_id="marker-followup")
     execution_module.note_compaction_evidence_loss(
         context,
@@ -2744,7 +2744,7 @@ def test_a_later_question_on_the_same_context_keeps_the_marker() -> None:
 
 
 def test_a_child_context_inherits_the_marker_and_keeps_its_own_copy() -> None:
-    """T-D1/T-D2/T-D3: down to every step, never back up or sideways."""
+    """Down to every step, never back up or sideways."""
     root = ContextManager().create_context(execution_id="marker-root")
     root.add_user_message("plan this")
     for index in range(8):
