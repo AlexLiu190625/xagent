@@ -37,6 +37,7 @@ import {
   type ConnectorRuntimeConnector,
   type ConnectorRuntimeErrorMessageKey,
   type ConnectorRuntimeFailureDisposition,
+  type ConnectorRuntimeInput,
   type ConnectorRuntimeReport,
   type DialogOutcome,
 } from "@/lib/connector-runtime-api"
@@ -118,6 +119,28 @@ function findConnector(
 
 function connectorKeyOf(ref: { connector_type: string; connector_id: number }): string {
   return `${ref.connector_type}:${ref.connector_id}`
+}
+
+/**
+ * Whether an invalid-object mark for this input is still live. Only a
+ * `context` row the current report leaves unsatisfied and still declares
+ * `object`-typed renders the textarea whose blur handler can clear such a
+ * mark; against any other row the mark is unreachable. Both the submit gate
+ * and the row's own error message read this one predicate, so the button can
+ * never be disabled by an error the row does not show, and the row can never
+ * show an error that leaves the button enabled.
+ */
+function hasLiveInvalidObjectMark(
+  connector: ConnectorRuntimeConnector,
+  input: ConnectorRuntimeInput,
+  invalidDraftKeys: Set<string>,
+): boolean {
+  return (
+    input.section === "context"
+    && !input.satisfied
+    && input.type === "object"
+    && invalidDraftKeys.has(connectorRuntimeInputDraftKey(connector.connector_ref, input.key))
+  )
 }
 
 type FieldErrorLocation =
@@ -236,15 +259,10 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // stay disabled with no error anywhere on screen. Derived from the report
   // during render rather than pruned at each point that installs one, because
   // there are three such points today and a fourth would silently reintroduce
-  // this.
+  // this. Reads the same `hasLiveInvalidObjectMark` predicate the row
+  // renderer reads for its error message, so the two can never disagree.
   const hasInvalidObjectDraft = report !== null && report.connectors.some(connector =>
-    connector.inputs.some(
-      input =>
-        input.section === "context"
-        && !input.satisfied
-        && input.type === "object"
-        && invalidDraftKeys.has(connectorRuntimeInputDraftKey(connector.connector_ref, input.key)),
-    ),
+    connector.inputs.some(input => hasLiveInvalidObjectMark(connector, input, invalidDraftKeys)),
   )
   const canSubmit = isSubmitEnabled(submitItems, hasInvalidObjectDraft)
   const hasResendPayload = request.resendPayload !== null
@@ -433,6 +451,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
                   {connector.inputs.map((input) => {
                     const draftKey = connectorRuntimeInputDraftKey(connector.connector_ref, input.key)
                     const acceptedKeyName = input.section !== "context" || isAcceptedRuntimeKeyName(input.key)
+                    const markLive = hasLiveInvalidObjectMark(connector, input, invalidDraftKeys)
                     const fieldLevelError =
                       fieldError
                       && fieldError.location.scope === "field"
@@ -479,7 +498,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
                           <Textarea
                             id={`connector-runtime-${draftKey}`}
                             value={drafts[draftKey] ?? ""}
-                            aria-invalid={invalidDraftKeys.has(draftKey)}
+                            aria-invalid={markLive}
                             onChange={e => handleDraftChange(connector, input.key, e.target.value)}
                             onBlur={e => handleObjectBlur(connector, input.key, e.target.value)}
                           />
@@ -491,7 +510,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
                             onChange={e => handleDraftChange(connector, input.key, e.target.value)}
                           />
                         )}
-                        {invalidDraftKeys.has(draftKey) && (
+                        {markLive && (
                           <p className="text-sm text-destructive">{t("connectorRuntime.objectInvalid")}</p>
                         )}
                         <p className="text-sm text-muted-foreground">{t("connectorRuntime.contextNote")}</p>

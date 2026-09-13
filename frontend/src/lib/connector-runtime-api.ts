@@ -600,12 +600,16 @@ export function buildSubmitItems(
 
 /**
  * The submit button's only enabling rule: at least one submittable key, and
- * no context draft that failed object-JSON parsing. Never adds "every
- * required key filled" -- that would be a second, independently-maintained
- * copy of the server's own completeness rule, the exact drift the design
- * forbids. A malformed key-name warning never participates here either: it
- * is informational, and the row it warns about can still be submitted (the
- * server, not this rule, is the one that will reject it).
+ * `hasInvalidObjectDraft` is false. That flag means an invalid-object draft
+ * on a row the current report still offers an editable control for --
+ * deciding which marks are still live is the caller's job, not this
+ * function's; a mark against a row the report no longer renders as editable
+ * must not reach this parameter. Never adds "every required key filled" --
+ * that would be a second, independently-maintained copy of the server's own
+ * completeness rule, the exact drift the design forbids. A malformed
+ * key-name warning never participates here either: it is informational, and
+ * the row it warns about can still be submitted (the server, not this rule,
+ * is the one that will reject it).
  */
 export function isSubmitEnabled(items: ConnectorRuntimeSubmitItem[], hasInvalidObjectDraft: boolean): boolean {
   return items.length > 0 && !hasInvalidObjectDraft
