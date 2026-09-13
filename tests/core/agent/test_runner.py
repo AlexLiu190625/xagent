@@ -19,6 +19,7 @@ from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointUnavailableError,
 )
+from xagent.core.agent.context.execution import TOOL_EVIDENCE_REMOVED_METADATA_KEY
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
@@ -2173,3 +2174,62 @@ def test_resume_migration_reaches_a_nested_auto_pattern_child_context() -> None:
 
     nested = checkpoint["pattern_state"]["dag_state"]["active_step_contexts"]["step_1"]
     assert OUTPUT_LANGUAGE_METADATA_KEY not in nested["metadata"]
+
+
+@pytest.mark.parametrize("client_value", [True, False, "true", 1])
+@pytest.mark.parametrize("surface", ["top_level", "request_context"])
+def test_a_client_cannot_set_the_tool_evidence_marker(
+    tmp_path: Path, surface: str, client_value: object
+) -> None:
+    """Both surfaces that carry client input into metadata refuse this key.
+
+    Client keys reach ``context.metadata`` twice -- the top-level dict is
+    copied wholesale, then request_context is merged key by key -- and nothing
+    in the code says the first of those is engine-only.
+    """
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ContextManager().create_context(execution_id="exec-reserved-key")
+    client_keys = {
+        TOOL_EVIDENCE_REMOVED_METADATA_KEY: client_value,
+        "some_client_key": "kept",
+    }
+    metadata = (
+        dict(client_keys)
+        if surface == "top_level"
+        else {"request_context": dict(client_keys)}
+    )
+
+    runner._merge_context_metadata(context, metadata)
+
+    assert context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] is False
+    # Proves the merge actually ran; without it, the line above could pass
+    # simply because nothing was merged at all.
+    assert context.metadata["some_client_key"] == "kept"
+
+
+def test_the_marker_is_stamped_before_any_client_metadata_is_merged(
+    tmp_path: Path,
+) -> None:
+    """The refusal must not depend on the stamp happening to win a race.
+
+    ``create_context`` writes False before the merge runs, so the ordering is
+    asserted here and a later refactor that moves the stamp cannot pass quietly.
+    """
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ContextManager().create_context(execution_id="exec-reserved-order")
+    seen: list[object] = []
+    original = runner._apply_request_context
+
+    def record(ctx: ExecutionContext, request_context: dict[str, Any]) -> None:
+        seen.append(ctx.metadata.get(TOOL_EVIDENCE_REMOVED_METADATA_KEY))
+        original(ctx, request_context)
+
+    runner._apply_request_context = record  # type: ignore[method-assign]
+    runner._merge_context_metadata(context, {"request_context": {"a": 1}})
+    assert seen == [False]

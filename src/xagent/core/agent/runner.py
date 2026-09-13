@@ -21,11 +21,18 @@ from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
 from .checkpoint import CheckpointCorruptError, read_latest_checkpoint_payload
 from .context import ContextManager, ExecutionContext
+from .context.execution import TOOL_EVIDENCE_REMOVED_METADATA_KEY
 from .language import reset_output_language_to_request_context
 from .result import extract_assistant_message, set_assistant_message
 from .runtime import ExecutionInterrupted, PatternRuntime, load_pattern_checkpoint
 
 logger = logging.getLogger(__name__)
+
+# Metadata keys the engine writes as run facts. Client input reaches
+# ``context.metadata`` verbatim through two surfaces -- the top-level metadata
+# dict and the nested request_context -- so both are filtered at the single
+# merge point rather than defended again at each reader.
+RESERVED_ENGINE_METADATA_KEYS = frozenset({TOOL_EVIDENCE_REMOVED_METADATA_KEY})
 
 
 @dataclass
@@ -883,6 +890,8 @@ class AgentRunner:
             return
 
         current_metadata = dict(metadata)
+        for reserved_key in RESERVED_ENGINE_METADATA_KEYS:
+            current_metadata.pop(reserved_key, None)
         preferred_modalities = normalize_input_modalities(
             current_metadata.pop(PREFERRED_INPUT_MODALITIES_METADATA_KEY, ())
         )
@@ -984,7 +993,7 @@ class AgentRunner:
                 context.system_prompt = prompt
 
         for key, value in request_context.items():
-            if key == "system_prompt":
+            if key == "system_prompt" or key in RESERVED_ENGINE_METADATA_KEYS:
                 continue
             context.metadata[key] = value
 
