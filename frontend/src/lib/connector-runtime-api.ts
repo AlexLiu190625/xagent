@@ -562,8 +562,14 @@ export function buildSubmitItems(
       const rawValue = drafts[connectorRuntimeInputDraftKey(connector.connector_ref, input.key)]
       if (rawValue === undefined) continue
       if (input.type === "string") {
-        if (rawValue.trim() === "") continue
-        context[input.key] = rawValue
+        // Submit the trimmed value, not the raw one. The server's merge makes
+        // a stored context value immutable, so surrounding whitespace a paste
+        // carried in would be written permanently: resubmitting the same
+        // secret without it returns 409 runtime_context_immutable, and the
+        // only recovery left is a new task.
+        const value = rawValue.trim()
+        if (value === "") continue
+        context[input.key] = value
       } else {
         let parsed: unknown
         try {

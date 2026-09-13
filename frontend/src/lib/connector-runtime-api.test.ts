@@ -158,6 +158,27 @@ describe("buildSubmitItems", () => {
       { connector_ref: REF_A, context: { unsatisfiedKey: "a", objKey: { k: 1 } } },
     ])
   })
+
+  it("stores a string draft with its surrounding whitespace removed", () => {
+    // The stored value is immutable once the server merges it, so submitting
+    // the untrimmed text writes a pasted secret's stray whitespace
+    // permanently: the same secret resubmitted without it comes back 409
+    // runtime_context_immutable and the task cannot be recovered.
+    const r = report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "token", type: "string", required: true }),
+      ]),
+    ])
+    for (const raw of ["  abc  ", "\tabc\n", "abc ", " abc"]) {
+      expect(buildSubmitItems(r, { [connectorRuntimeInputDraftKey(REF_A, "token")]: raw })).toEqual([
+        { connector_ref: REF_A, context: { token: "abc" } },
+      ])
+    }
+    // Interior whitespace is part of the value and is left alone.
+    expect(buildSubmitItems(r, { [connectorRuntimeInputDraftKey(REF_A, "token")]: "  a b  " })).toEqual([
+      { connector_ref: REF_A, context: { token: "a b" } },
+    ])
+  })
 })
 
 describe("classifySubmitFailure", () => {
