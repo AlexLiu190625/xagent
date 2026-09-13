@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import xagent.core.agent.grounding as grounding
-from xagent.core.agent.grounding import VALUE_KINDS, grounding_rule
+from xagent.core.agent.grounding import (
+    EVIDENCE_REMOVED_FACTS,
+    VALUE_KINDS,
+    grounding_rule,
+)
 
 # The sole sentence that may appear inside the answer without a source: it
 # names the exception explicitly and is unique to this rule's wording.
@@ -322,3 +326,22 @@ def test_grounding_module_docstring_states_the_default_as_a_prohibition() -> Non
     )
     assert "Proposals B (evidence-preserving compaction)" not in normalized_doc
     assert "illustrative" not in (grounding_rule.__doc__ or "")
+
+
+def test_evidence_removed_facts_states_the_loss_and_forbids_reconstruction() -> None:
+    """The sentence every tool-less answer prompt carries, pinned once.
+
+    The suites that check a prompt carries this text derive their expectation
+    from the constant, which by construction cannot notice the constant itself
+    being emptied or weakened. This cell is where that is noticed: the wording
+    lives here, so rewording it is one deliberate edit rather than a sweep
+    across every suite that quotes it.
+    """
+    assert EVIDENCE_REMOVED_FACTS == (
+        "Compaction removed tool observations from this run's context and "
+        "their values can no longer be read. If a compaction summary stands "
+        "above, treat any value not literally present in that summary -- "
+        f"{VALUE_KINDS} -- as unavailable rather than recalled. Do not "
+        "reconstruct, estimate, or illustrate a removed value, and do not "
+        "present one as an example. "
+    )

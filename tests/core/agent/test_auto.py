@@ -26,7 +26,7 @@ from xagent.core.agent.context.execution import (
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
     tool_evidence_removed,
 )
-from xagent.core.agent.grounding import VALUE_KINDS
+from xagent.core.agent.grounding import EVIDENCE_REMOVED_FACTS, VALUE_KINDS
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
@@ -2565,6 +2565,7 @@ def test_routing_prompt_is_rebuilt_with_the_marker_on_every_parse_retry() -> Non
         [], evidence_removed=tool_evidence_removed(context)
     )
 
-    assert "Compaction removed tool observations" not in first
-    assert "Compaction removed tool observations" in second
+    facts_head = EVIDENCE_REMOVED_FACTS.split(".")[0]
+    assert facts_head not in first
+    assert facts_head in second
     assert "set existing_context_sufficient=false and choose react" in second

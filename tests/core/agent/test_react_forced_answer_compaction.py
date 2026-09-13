@@ -33,6 +33,7 @@ from xagent.core.agent.context.execution import (
     note_compaction_evidence_loss,
     tool_evidence_removed,
 )
+from xagent.core.agent.grounding import EVIDENCE_REMOVED_FACTS
 from xagent.core.agent.pattern.auto.auto import (
     DECISION_TOOL_NAME,
     AutoAction,
@@ -45,7 +46,7 @@ from xagent.core.model.chat.exceptions import (
 )
 
 _KEEP_DEFAULT = object()
-FACTS_HEAD = "Compaction removed tool observations from this run's context"
+FACTS_HEAD = EVIDENCE_REMOVED_FACTS.split(".")[0]
 
 
 def tool_call(name: str, arguments: str = "{}") -> dict[str, Any]:
