@@ -69,6 +69,13 @@ READ_FILE_CONTEXT_LIMIT = 12_000
 # caller that issued it -- but carrying it through compaction is what lets a
 # later turn know which stored rows the summary already stands in for.
 TRANSCRIPT_WATERMARK_METADATA_KEY = "transcript_watermark"
+# Wire name: ``to_dict`` writes ``self.metadata`` unfiltered, so renaming this
+# strands every checkpoint written before the rename, and request_context keys
+# reach this dict verbatim, which is why AgentRunner refuses this one there.
+# That refusal covers the effective value only -- a refused key still sits
+# under ``metadata["request_context"]`` and rides into every checkpoint from
+# there, so nothing may read that copy as authoritative.
+TOOL_EVIDENCE_REMOVED_METADATA_KEY = "tool_evidence_removed"
 # Written onto ``CompactResult.metadata`` (and from there onto the compact
 # trace event) when an LLM summary replaces the history. The message-dropping
 # backstop never sets them: a dropped-message result stands in for nothing and
@@ -231,6 +238,28 @@ class CompactResult:
     final_count: int
     strategy: str
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def note_compaction_evidence_loss(context: Any, result: Any) -> None:
+    """Latch the context marker when a compaction removed tool observations.
+
+    Reads ``dropped_tool_result_count``, never ``compacted``: the tail window
+    reports ``compacted=True`` while keeping every message it was handed, and a
+    summary can replace a transcript that held no tool observation at all. Only
+    ever writes True -- a later lossless compaction must not clear it, because
+    the hole the earlier one left is still in ``messages``.
+    """
+    metadata = getattr(context, "metadata", None)
+    if not isinstance(metadata, dict):
+        return
+    result_metadata = getattr(result, "metadata", None)
+    if not isinstance(result_metadata, dict):
+        return
+    dropped = result_metadata.get("dropped_tool_result_count")
+    if isinstance(dropped, bool) or not isinstance(dropped, int):
+        return
+    if dropped > 0:
+        metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = True
 
 
 @dataclass

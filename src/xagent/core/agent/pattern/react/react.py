@@ -90,6 +90,7 @@ from ...context.enrichment import (
     pending_user_response_lifecycle,
     pending_user_response_marker,
 )
+from ...context.execution import note_compaction_evidence_loss
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
 from ...grounding import grounding_rule
@@ -746,25 +747,55 @@ class ReActPattern(AgentPattern):
                 "iteration": iteration,
                 **resolved_llm_metadata(call_llm),
             }
-            await runtime.compact_context_if_needed(
-                context=context,
-                # Fall back to the main model when no compact model is
-                # configured. PatternRuntime skips summarization entirely
-                # without one and drops all but the last few messages
-                # instead, losing what the agent actually did; agent preview
-                # and delegated sub-agents resolve the compact slot on their
-                # own and validate only the default model, so an empty slot
-                # is ordinary rather than exceptional.
-                #
-                # Substituting here, rather than defaulting the field further
-                # up, keeps "unset" distinguishable from "explicitly set to
-                # the main model" -- and hands compaction the *resolved*
-                # per-call model, so a virtual model reuses this turn's
-                # routing decision instead of routing again on the compaction
-                # prompt, whose only user message is the whole transcript.
-                llm=compact_llm if compact_llm is not None else call_llm,
-                metadata={"iteration": iteration},
-            )
+            # A forced turn's schema is already down to final_answer alone,
+            # so compacting here deletes the values it must answer from and
+            # closes the only route back to them in the same breath. Every
+            # other turn still holds its tools and can fetch a compacted-away
+            # value again. The cost is deliberate: this turn can now exceed
+            # the model's window and fail instead of answering.
+            if force_final_answer_now:
+                # Measures the one new failure mode this change introduces,
+                # so it carries no switch. Numbers and ids only -- never
+                # message text, a tool name, or a tool argument.
+                estimate = getattr(context, "estimate_context_tokens", None)
+                context_tokens = estimate() if callable(estimate) else None
+                threshold = getattr(
+                    getattr(context, "compact_config", None), "threshold", None
+                )
+                logger.info(
+                    "Forced-answer turn did not compact. execution_id=%s "
+                    "iteration=%s context_tokens=%s threshold=%s "
+                    "over_threshold=%s",
+                    getattr(context, "execution_id", None),
+                    iteration,
+                    context_tokens,
+                    threshold,
+                    isinstance(context_tokens, int)
+                    and isinstance(threshold, int)
+                    and context_tokens > threshold,
+                )
+            else:
+                compact_result = await runtime.compact_context_if_needed(
+                    context=context,
+                    # Fall back to the main model when no compact model is
+                    # configured. PatternRuntime skips summarization entirely
+                    # without one and drops all but the last few messages
+                    # instead, losing what the agent actually did; agent
+                    # preview and delegated sub-agents resolve the compact
+                    # slot on their own and validate only the default model,
+                    # so an empty slot is ordinary rather than exceptional.
+                    #
+                    # Substituting here, rather than defaulting the field
+                    # further up, keeps "unset" distinguishable from
+                    # "explicitly set to the main model" -- and hands
+                    # compaction the *resolved* per-call model, so a virtual
+                    # model reuses this turn's routing decision instead of
+                    # routing again on the compaction prompt, whose only user
+                    # message is the whole transcript.
+                    llm=compact_llm if compact_llm is not None else call_llm,
+                    metadata={"iteration": iteration},
+                )
+                note_compaction_evidence_loss(context, compact_result)
 
             messages = self._messages_for_llm(
                 context,

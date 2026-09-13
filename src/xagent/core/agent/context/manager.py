@@ -4,7 +4,7 @@ import logging
 import threading
 from typing import Any
 
-from .execution import ExecutionContext
+from .execution import TOOL_EVIDENCE_REMOVED_METADATA_KEY, ExecutionContext
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,10 @@ class ContextManager:
             session_id=session_id,
             system_prompt=system_prompt,
         )
+        # Stamped on every context this build creates, so that an absent key
+        # means "written by a build that did not track this" and reads
+        # fail-safe. See tool_evidence_removed.
+        context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = False
         if any(
             value is not None
             for value in (workspace_id, workspace_path, cwd, workspace_state)
