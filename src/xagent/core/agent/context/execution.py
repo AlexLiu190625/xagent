@@ -262,6 +262,21 @@ def note_compaction_evidence_loss(context: Any, result: Any) -> None:
         metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = True
 
 
+def tool_evidence_removed(context: Any) -> bool:
+    """Whether a compaction on this context has removed tool observations.
+
+    Absent reads as True. Every context this build creates carries the key from
+    ``ContextManager.create_context``, so an absent key means a payload written
+    by a build that did not track this -- and those builds drop tool
+    observations on the truncate path without leaving a word in the context.
+    Anything that is not literally ``False`` reads as True for the same reason.
+    """
+    metadata = getattr(context, "metadata", None)
+    if not isinstance(metadata, dict):
+        return True
+    return metadata.get(TOOL_EVIDENCE_REMOVED_METADATA_KEY, True) is not False
+
+
 @dataclass
 class ExecutionContext:
     """Execution state plus pluggable runtime components."""

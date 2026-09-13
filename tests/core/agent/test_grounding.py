@@ -311,8 +311,14 @@ def test_grounding_module_docstring_states_the_default_as_a_prohibition() -> Non
     # A denial of one phrasing is evaded by any synonym, so pin the claim
     # the docstring must positively make.
     assert "makes reporting the gap the instructed response" in normalized_doc
+    # Proposal B is no longer open in full: the forced answer turn now keeps
+    # its evidence. The docstring states that behaviour rather than claiming
+    # the proposal landed, and still says what remains open.
+    assert "ReAct's forced answer turn no longer compacts" in normalized_doc
+    assert "every other turn still compacts unconditionally" in normalized_doc
     assert (
-        "Proposals B (evidence-preserving compaction) and C (provenance "
-        "tracking and a data-source gate) remain open." in normalized_doc
+        "Proposal C (provenance tracking and a data-source gate) remains open."
+        in normalized_doc
     )
+    assert "Proposals B (evidence-preserving compaction)" not in normalized_doc
     assert "illustrative" not in (grounding_rule.__doc__ or "")

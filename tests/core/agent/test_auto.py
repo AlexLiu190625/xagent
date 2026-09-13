@@ -20,7 +20,12 @@ from xagent.core.agent import (
     PatternRuntime,
     ReActPattern,
 )
+from xagent.core.agent.context import ContextManager
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
+from xagent.core.agent.context.execution import (
+    TOOL_EVIDENCE_REMOVED_METADATA_KEY,
+    tool_evidence_removed,
+)
 from xagent.core.agent.grounding import VALUE_KINDS
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
@@ -2537,3 +2542,29 @@ def test_auto_child_runtime_forwards_dag_turn_resolution() -> None:
     # with a default is what hides a raising property, so the assertion has
     # to go through the same access to catch a regression.
     assert getattr(step_runtime, "active_turn_id", None) == "turn-42"
+
+
+def test_routing_prompt_is_rebuilt_with_the_marker_on_every_parse_retry() -> None:
+    """The marker is read inside the retry loop, not hoisted above it.
+
+    A compaction between two parse attempts must reach the second prompt.
+    Hoisting the read is the cheap "optimization" that would drop it silently,
+    so the source position is asserted rather than left to a comment.
+    """
+    source = inspect.getsource(AutoPattern._decide)
+    loop_body = source.split("while attempt < MAX_DECISION_PARSE_ATTEMPTS:", 1)[1]
+    assert "evidence_removed=tool_evidence_removed(context)" in loop_body
+
+    pattern = AutoPattern()
+    context = ContextManager().create_context(execution_id="auto-retry-marker")
+    first = pattern._decision_prompt(
+        [], evidence_removed=tool_evidence_removed(context)
+    )
+    context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = True
+    second = pattern._decision_prompt(
+        [], evidence_removed=tool_evidence_removed(context)
+    )
+
+    assert "Compaction removed tool observations" not in first
+    assert "Compaction removed tool observations" in second
+    assert "set existing_context_sufficient=false and choose react" in second

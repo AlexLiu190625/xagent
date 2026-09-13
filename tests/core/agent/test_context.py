@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -2649,3 +2650,136 @@ def test_oversized_content_is_replaced_whole_not_sliced() -> None:
     # Byte-identical across builds: nothing in the notice comes from the
     # clock or a request id.
     assert transcript == second["messages"][-1]["content"]
+
+
+# --------------------------------------------------------------------------
+# The tool-evidence marker: how it reads, how it travels, how it survives
+# --------------------------------------------------------------------------
+
+
+_MARKER = execution_module.TOOL_EVIDENCE_REMOVED_METADATA_KEY
+
+
+@pytest.mark.parametrize(
+    "stored, expected",
+    [
+        ({}, True),
+        ({_MARKER: False}, False),
+        ({_MARKER: True}, True),
+        ({_MARKER: None}, True),
+        ({_MARKER: 0}, True),
+        ({_MARKER: 1}, True),
+        ({_MARKER: "false"}, True),
+        ({_MARKER: ""}, True),
+        ({_MARKER: []}, True),
+    ],
+    ids="absent literal_false literal_true none zero one string_false "
+    "empty_string empty_list".split(),
+)
+def test_tool_evidence_removed_reads_only_literal_false_as_intact(
+    stored: dict[str, object], expected: bool
+) -> None:
+    """Anything not literally False degrades toward caution.
+
+    ``bool(metadata.get(KEY, True))`` reads ``0`` and ``""`` as intact, which
+    is the direction that puts the fabricated answer back.
+    """
+    context = ExecutionContext(execution_id="marker-read")
+    context.metadata.update(stored)
+    assert execution_module.tool_evidence_removed(context) is expected
+
+
+@pytest.mark.parametrize(
+    "context",
+    [None, object(), SimpleNamespace(metadata=None), SimpleNamespace(metadata=[])],
+    ids=["none", "no_metadata", "metadata_none", "metadata_list"],
+)
+def test_marker_helpers_tolerate_a_context_without_dict_metadata(
+    context: object,
+) -> None:
+    """A stand-in object degrades to caution and never raises."""
+    assert execution_module.tool_evidence_removed(context) is True
+    execution_module.note_compaction_evidence_loss(
+        context, execution_module.CompactResult(True, 2, 1, "truncate", {})
+    )
+
+
+def test_a_new_context_starts_from_not_removed() -> None:
+    """T-C6: the stamp is what makes an absent key mean "an older build"."""
+    context = ContextManager().create_context(execution_id="marker-new")
+    assert context.metadata[_MARKER] is False
+
+
+def test_the_marker_survives_a_checkpoint_round_trip() -> None:
+    """T-C1: metadata travels whole, so no serialization code is needed."""
+    context = ContextManager().create_context(execution_id="marker-roundtrip")
+    context.metadata[_MARKER] = True
+
+    payload = context.to_dict()
+    assert payload["metadata"] is context.metadata
+    restored = ExecutionContext.from_dict(json.loads(json.dumps(payload)))
+
+    assert restored.metadata[_MARKER] is True
+
+
+def test_a_checkpoint_written_without_the_key_reads_as_removed() -> None:
+    """T-C2: older builds dropped observations on the truncate path silently."""
+    payload = ContextManager().create_context(execution_id="marker-old").to_dict()
+    payload["metadata"].pop(_MARKER, None)
+    restored = ExecutionContext.from_dict(json.loads(json.dumps(payload)))
+    assert execution_module.tool_evidence_removed(restored) is True
+
+
+def test_a_later_question_on_the_same_context_keeps_the_marker() -> None:
+    """T-C5: the marker lives as long as the message list with the hole."""
+    context = ContextManager().create_context(execution_id="marker-followup")
+    execution_module.note_compaction_evidence_loss(
+        context,
+        execution_module.CompactResult(
+            True, 10, 2, "truncate", {"dropped_tool_result_count": 4}
+        ),
+    )
+    context.add_user_message("and what about last week?")
+    assert execution_module.tool_evidence_removed(context) is True
+
+
+def test_a_child_context_inherits_the_marker_and_keeps_its_own_copy() -> None:
+    """T-D1/T-D2/T-D3: down to every step, never back up or sideways."""
+    root = ContextManager().create_context(execution_id="marker-root")
+    root.add_user_message("plan this")
+    for index in range(8):
+        root.add_tool_result(
+            tool_call_id=f"c-{index}",
+            tool_name="list_clients",
+            result={"success": True, "rows": ["x" * 200]},
+        )
+    root_messages_before = len(root.messages)
+
+    child_a = root.create_child_context()
+    child_b = root.create_child_context()
+    assert child_a.metadata is not child_b.metadata
+    assert execution_module.tool_evidence_removed(child_a) is False
+
+    execution_module.note_compaction_evidence_loss(
+        child_a,
+        execution_module.CompactResult(
+            True, 9, 2, "truncate", {"dropped_tool_result_count": 8}
+        ),
+    )
+    child_a.compact_config.max_messages = 1
+    child_a.compact_if_needed()
+
+    assert execution_module.tool_evidence_removed(child_a) is True
+    assert execution_module.tool_evidence_removed(child_b) is False
+    assert execution_module.tool_evidence_removed(root) is False
+    assert len(root.messages) == root_messages_before
+
+    inherited = root.create_child_context()
+    execution_module.note_compaction_evidence_loss(
+        root,
+        execution_module.CompactResult(
+            True, 9, 2, "truncate", {"dropped_tool_result_count": 1}
+        ),
+    )
+    assert execution_module.tool_evidence_removed(inherited) is False
+    assert execution_module.tool_evidence_removed(root.create_child_context()) is True

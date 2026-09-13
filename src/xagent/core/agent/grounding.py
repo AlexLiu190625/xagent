@@ -15,9 +15,12 @@ pattern, which owns the user-interaction policy this module cannot see.
 
 This is the proposal-A mitigation from issue #1235. It forbids unsourced values
 by default and makes reporting the gap the instructed response, but it cannot
-repair a session whose evidence compaction already discarded.
-Proposals B (evidence-preserving compaction) and C (provenance tracking and a
-data-source gate) remain open.
+repair a session whose evidence compaction already discarded. ReAct's forced
+answer turn no longer compacts, so that turn's tool observations survive to be
+answered from; every other turn still compacts unconditionally, and
+``EVIDENCE_REMOVED_FACTS`` below is what a prompt states once a compaction on
+this context has removed observations. Proposal C (provenance tracking and a
+data-source gate) remains open.
 """
 
 from __future__ import annotations
@@ -25,6 +28,20 @@ from __future__ import annotations
 VALUE_KINDS = (
     "a number, a person or organization name, an identifier or reference "
     "code, a date, a status, or a row of a table"
+)
+
+# What a prompt states once a compaction on this context has removed tool
+# observations: what happened, and what the model may not do about it. Held as
+# one shared literal because every prompt that carries it must state the same
+# facts -- two hand-written copies would drift, and the call that got the
+# weaker copy is exactly the one that invents a value.
+EVIDENCE_REMOVED_FACTS = (
+    "Compaction removed tool observations from this run's context and their "
+    "values can no longer be read. If a compaction summary stands above, "
+    "treat any value not literally present in that summary -- "
+    f"{VALUE_KINDS} -- as unavailable rather than recalled. Do not "
+    "reconstruct, estimate, or illustrate a removed value, and do not "
+    "present one as an example. "
 )
 
 

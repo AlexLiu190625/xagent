@@ -19,8 +19,9 @@ from ...context.enrichment import (
     pending_user_response_marker,
     top_level_user_request,
 )
+from ...context.execution import tool_evidence_removed
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
-from ...grounding import grounding_rule
+from ...grounding import EVIDENCE_REMOVED_FACTS, grounding_rule
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     effective_output_language,
@@ -1561,6 +1562,11 @@ class DAGPattern(AgentPattern):
             "candidate_output": self._final_output(),
             "previous_completion_feedback": self.completion_feedback,
         }
+        # This call writes the answer the user receives, with no tool to fetch
+        # anything back, and its payload filters out system messages -- so the
+        # compaction summary never reaches it and this is the only place the
+        # loss can be stated.
+        evidence_rule = EVIDENCE_REMOVED_FACTS if tool_evidence_removed(context) else ""
         return [
             {
                 "role": "system",
@@ -1581,6 +1587,7 @@ class DAGPattern(AgentPattern):
                     "status before answer in the tool arguments. "
                     "When writing the answer field, including any content carried "
                     "over from candidate_output or step_results: "
+                    f"{evidence_rule}"
                     f"{grounding_rule(can_call_tools=False)}\n\n"
                     f"{final_deliverable_file_reference_instructions(can_lookup=False)}\n\n"
                     "If the answer leaves out a value because no step produced "
