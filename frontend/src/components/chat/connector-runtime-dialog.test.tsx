@@ -409,6 +409,84 @@ describe("keeps drafts and the snapshot when re-requested while open", () => {
   })
 })
 
+describe("couples the invalid-object error to the submit gate", () => {
+  it("keeps the save button disabled while a live invalid-object mark's error is shown", async () => {
+    // Kills a predicate that always evaluates to false: with the error on
+    // screen, the button must actually be unusable, not merely styled as if
+    // it were.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "objKey", type: "object", required: true }),
+        input({ section: "context", key: "strKey", type: "string", required: true }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+
+    fireEvent.change(screen.getByLabelText("strKey"), { target: { value: "value" } })
+    const objField = screen.getByLabelText("objKey")
+    fireEvent.change(objField, { target: { value: "{oops" } })
+    fireEvent.blur(objField)
+    expect(screen.getByText("connectorRuntime.objectInvalid")).toBeInTheDocument()
+
+    const saveButton = screen.getByText("connectorRuntime.actions.saveOnly")
+    expect(saveButton).toBeDisabled()
+    fireEvent.click(saveButton)
+    expect(submitMock).not.toHaveBeenCalled()
+  })
+
+  it("drops a stale invalid-object error and mark once the key's declared type is no longer object", async () => {
+    // Kills both dropping the `input.type === "object"` clause from the
+    // shared predicate, and reverting the row's error paragraph back to
+    // reading the raw `invalidDraftKeys` set directly.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "objKey", type: "object", required: true }),
+        input({ section: "context", key: "strKey", type: "string", required: true }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+
+    const objField = screen.getByLabelText("objKey")
+    fireEvent.change(objField, { target: { value: "{oops" } })
+    fireEvent.blur(objField)
+    expect(screen.getByText("connectorRuntime.objectInvalid")).toBeInTheDocument()
+
+    // Same task, same key, but the connector now declares it a plain string
+    // -- the shape the server itself can flip a key's declaration to between
+    // two reads.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "objKey", type: "string", required: true }),
+        input({ section: "context", key: "strKey", type: "string", required: true }),
+      ]),
+    ])))
+    await openForTask() // same task: a second request, not a remount
+    await waitFor(() => expect(screen.getByLabelText("objKey").tagName).toBe("INPUT"))
+
+    expect(screen.queryByText("connectorRuntime.objectInvalid")).not.toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText("strKey"), { target: { value: "value" } })
+    const saveButton = screen.getByText("connectorRuntime.actions.saveOnly")
+    expect(saveButton).toBeEnabled()
+
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    fireEvent.click(saveButton)
+    await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(1))
+    const items = submitMock.mock.calls[0][1] as Array<{ context: Record<string, unknown> }>
+    expect(items).toHaveLength(1)
+    // `buildSubmitItems` types each draft from what the *current* report
+    // declares, not from what the mark was recorded against: once `objKey`
+    // reads as a plain string, its stale "{oops" text is a perfectly valid
+    // string value and is submitted verbatim, with no residual JSON check
+    // left over from when the row was object-typed.
+    expect(items[0].context).toEqual({ objKey: "{oops", strKey: "value" })
+  })
+})
+
 describe("flags a non-object JSON draft on blur and does not submit it", () => {
   it("flags a non-object JSON draft on blur and does not submit it", async () => {
     fetchMock.mockResolvedValueOnce(ok(report(false, [
