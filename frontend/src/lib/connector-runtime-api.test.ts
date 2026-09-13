@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
   CONNECTOR_RUNTIME_DIALOG_HOST_PATTERNS,
@@ -10,11 +10,13 @@ import {
   buildSubmitItems,
   classifySubmitFailure,
   connectorRuntimeInputDraftKey,
+  fetchTaskConnectorRuntimeRequirements,
   isConnectorRuntimeDialogHostPath,
   isSubmitEnabled,
   readConnectorRuntimeReport,
   resolveDialogActions,
   resolveDialogOutcome,
+  submitTaskConnectorRuntimeValues,
   type ConnectorRuntimeConnector,
   type ConnectorRuntimeErrorMessageKey,
   type ConnectorRuntimeInput,
@@ -99,6 +101,253 @@ describe("readConnectorRuntimeReport", () => {
       satisfied: true,
       secrets_expires_at: null,
       connectors: [],
+    })
+  })
+})
+
+// The two functions that actually talk to the server, driven through a
+// stubbed `fetch`. apiRequest falls straight through to `fetch` with no
+// stored access token, which is what an empty localStorage gives every test
+// here, so the stub sees the real request this client builds and the real
+// response handling runs against it -- including readSubmitErrorEnvelope,
+// which has no other way in.
+describe("the connector-runtime HTTP calls", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  /** Installs the stub and returns the request log it appends to. */
+  function stubFetch(responder: () => Promise<Response> | Response) {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = []
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, init })
+      return responder()
+    }))
+    return calls
+  }
+
+  function jsonResponse(status: number, body: unknown): Response {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { "content-type": "application/json" },
+    })
+  }
+
+  const validReportBody = rawReport()
+  const expectedReport = {
+    satisfied: true,
+    secrets_expires_at: null,
+    connectors: [
+      {
+        connector_ref: { connector_type: "custom_api", connector_id: 1 },
+        name: "Example",
+        inputs: [
+          { section: "context", key: "k", type: "string", required: false, satisfied: true, expired: false },
+        ],
+      },
+    ],
+  }
+
+  describe("fetchTaskConnectorRuntimeRequirements", () => {
+    it("reads a report off a 200 and asks the per-task read endpoint for it", async () => {
+      const calls = stubFetch(() => jsonResponse(200, validReportBody))
+      await expect(fetchTaskConnectorRuntimeRequirements(7)).resolves.toEqual({
+        ok: true,
+        report: expectedReport,
+      })
+      expect(calls).toHaveLength(1)
+      expect(calls[0].url).toBe("/api/chat/task/7/connector-runtime-requirements")
+    })
+
+    it("reports a transport failure when the request never completes", async () => {
+      stubFetch(() => Promise.reject(new TypeError("Failed to fetch")))
+      await expect(fetchTaskConnectorRuntimeRequirements(7)).resolves.toEqual({
+        ok: false,
+        kind: "transport",
+      })
+    })
+
+    it("reports the status on any non-200, envelope or not", async () => {
+      // The read endpoint downgrades every ConnectorRuntimeError into an
+      // envelope-less HTTPException, so a body that happens to carry an
+      // envelope must not be read as one here either: this path has exactly
+      // one failure shape and the status is all of it.
+      for (const [status, body] of [
+        [503, { error: { code: "connector_runtime_unavailable", details: { reason: "team_scope_resolution_failed" } } }],
+        [404, { detail: "Task not found" }],
+        [403, { detail: "Forbidden" }],
+      ] as const) {
+        stubFetch(() => jsonResponse(status, body))
+        await expect(fetchTaskConnectorRuntimeRequirements(7)).resolves.toEqual({
+          ok: false,
+          kind: "http",
+          status,
+        })
+        vi.unstubAllGlobals()
+      }
+    })
+
+    it("reports malformed for a 200 whose body is not a report", async () => {
+      for (const body of [
+        { satisfied: "yes", secrets_expires_at: null, connectors: [] },
+        rawReport({ connectors: "not-an-array" }),
+        rawReport({ connectors: [{ connector_ref: { connector_type: "custom_api" }, name: "x", inputs: [] }] }),
+        [],
+        null,
+      ]) {
+        stubFetch(() => jsonResponse(200, body))
+        await expect(fetchTaskConnectorRuntimeRequirements(7)).resolves.toEqual({
+          ok: false,
+          kind: "malformed",
+        })
+        vi.unstubAllGlobals()
+      }
+
+      // A 200 carrying a body that is not JSON at all lands in the same
+      // place rather than throwing: parseApiResponse hands back a null
+      // `data`, which is not the closed report shape.
+      stubFetch(() => new Response("<html>gateway</html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      }))
+      await expect(fetchTaskConnectorRuntimeRequirements(7)).resolves.toEqual({
+        ok: false,
+        kind: "malformed",
+      })
+    })
+  })
+
+  describe("submitTaskConnectorRuntimeValues", () => {
+    const items = [{ connector_ref: REF_A, context: { token: "abc" } }]
+
+    it("posts the items and reads the refreshed report off a 200", async () => {
+      const calls = stubFetch(() => jsonResponse(200, validReportBody))
+      await expect(submitTaskConnectorRuntimeValues(7, items)).resolves.toEqual({
+        ok: true,
+        report: expectedReport,
+      })
+      expect(calls).toHaveLength(1)
+      expect(calls[0].url).toBe("/api/chat/task/7/connector-runtime-values")
+      expect(calls[0].init?.method).toBe("POST")
+      expect(JSON.parse(String(calls[0].init?.body))).toEqual({ items })
+    })
+
+    it("reports a transport failure when the request never completes", async () => {
+      stubFetch(() => Promise.reject(new TypeError("Failed to fetch")))
+      await expect(submitTaskConnectorRuntimeValues(7, items)).resolves.toEqual({
+        ok: false,
+        kind: "transport",
+      })
+    })
+
+    it("reads the error envelope off a non-200 that carries one", async () => {
+      stubFetch(() => jsonResponse(409, {
+        error: {
+          code: "runtime_context_immutable",
+          details: { reason: "conflict.context.token", connector_ref: { connector_type: "custom_api", connector_id: 1 } },
+        },
+      }))
+      await expect(submitTaskConnectorRuntimeValues(7, items)).resolves.toEqual({
+        ok: false,
+        kind: "coded",
+        status: 409,
+        code: "runtime_context_immutable",
+        reason: "conflict.context.token",
+        connectorRef: REF_A,
+      })
+
+      // The 503 shape carries no details at all. "Absent" has to survive as
+      // absent: classifySubmitFailure tells the retryable 503 from the
+      // unretryable one by whether `reason` is undefined, so an envelope
+      // reader that normalized a missing reason to "" would flip that.
+      stubFetch(() => jsonResponse(503, { error: { code: "connector_runtime_unavailable" } }))
+      await expect(submitTaskConnectorRuntimeValues(7, items)).resolves.toEqual({
+        ok: false,
+        kind: "coded",
+        status: 503,
+        code: "connector_runtime_unavailable",
+        reason: undefined,
+        connectorRef: undefined,
+      })
+
+      // Present-and-empty is a different input from absent and must stay
+      // one; a connector_ref that fails ref validation drops out without
+      // taking the code with it.
+      stubFetch(() => jsonResponse(400, {
+        error: { code: "invalid_runtime_context", details: { reason: "", connector_ref: { connector_type: "custom_api" } } },
+      }))
+      await expect(submitTaskConnectorRuntimeValues(7, items)).resolves.toEqual({
+        ok: false,
+        kind: "coded",
+        status: 400,
+        code: "invalid_runtime_context",
+        reason: "",
+        connectorRef: undefined,
+      })
+
+      // A `details` that is not an object at all still leaves a usable code.
+      stubFetch(() => jsonResponse(400, {
+        error: { code: "invalid_runtime_context", details: "not-an-object" },
+      }))
+      await expect(submitTaskConnectorRuntimeValues(7, items)).resolves.toEqual({
+        ok: false,
+        kind: "coded",
+        status: 400,
+        code: "invalid_runtime_context",
+        reason: undefined,
+        connectorRef: undefined,
+      })
+    })
+
+    it("falls back to the status on a non-200 with no readable envelope", async () => {
+      // The task-not-found 404 is the production case: it is a plain
+      // HTTPException and carries no envelope. The rest are the ways an
+      // envelope can be present but unreadable -- every one of them has to
+      // become a status, never a half-trusted `coded` with a guessed code.
+      for (const body of [
+        { detail: "Task not found" },
+        { error: "not-an-object" },
+        { error: { message: "no code field" } },
+        { error: { code: 42 } },
+        [],
+        null,
+      ]) {
+        stubFetch(() => jsonResponse(404, body))
+        await expect(submitTaskConnectorRuntimeValues(7, items)).resolves.toEqual({
+          ok: false,
+          kind: "http",
+          status: 404,
+        })
+        vi.unstubAllGlobals()
+      }
+
+      // A non-200 whose body is not JSON at all -- the proxy HTML page --
+      // has no envelope either.
+      stubFetch(() => new Response("<html>502</html>", {
+        status: 502,
+        headers: { "content-type": "text/html" },
+      }))
+      await expect(submitTaskConnectorRuntimeValues(7, items)).resolves.toEqual({
+        ok: false,
+        kind: "http",
+        status: 502,
+      })
+    })
+
+    it("reports malformed for a 200 whose body is not a report", async () => {
+      // Distinct from "http": a 200 that does not validate is a server bug,
+      // and the dialog re-reads the report on it instead of retrying.
+      stubFetch(() => jsonResponse(200, { satisfied: true, connectors: [] }))
+      await expect(submitTaskConnectorRuntimeValues(7, items)).resolves.toEqual({
+        ok: false,
+        kind: "malformed",
+      })
+
+      stubFetch(() => new Response("", { status: 200 }))
+      await expect(submitTaskConnectorRuntimeValues(7, items)).resolves.toEqual({
+        ok: false,
+        kind: "malformed",
+      })
     })
   })
 })
