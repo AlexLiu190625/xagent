@@ -436,6 +436,52 @@ describe("couples the invalid-object error to the submit gate", () => {
     expect(submitMock).not.toHaveBeenCalled()
   })
 
+  it("closes the retry button on a draft turned invalid after a failed save", async () => {
+    // The retry button a retryable failure offers is a third submit entry
+    // point, and it used to be rendered off the failure alone. This sequence
+    // is the one that made that matter: a save fails, the user edits an
+    // object field into something unparsable, the save buttons go disabled,
+    // and the retry button next to them stays usable. buildSubmitItems drops
+    // an unparsable object draft rather than failing, so the retried batch
+    // would have written the string field, silently lost the object field,
+    // and closed -- with a stored context value immutable afterwards.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "objKey", type: "object", required: true }),
+        input({ section: "context", key: "strKey", type: "string", required: true }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+
+    const objField = screen.getByLabelText("objKey")
+    fireEvent.change(objField, { target: { value: "{\"a\": 1}" } })
+    fireEvent.blur(objField)
+    fireEvent.change(screen.getByLabelText("strKey"), { target: { value: "value" } })
+
+    submitMock.mockResolvedValueOnce({ ok: false, kind: "transport" })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.retry")).toBeInTheDocument())
+    expect(submitMock).toHaveBeenCalledTimes(1)
+
+    fireEvent.change(objField, { target: { value: "{oops" } })
+    fireEvent.blur(objField)
+    expect(screen.getByText("connectorRuntime.objectInvalid")).toBeInTheDocument()
+
+    const retryButton = screen.getByText("connectorRuntime.actions.retry")
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeDisabled()
+    expect(retryButton).toBeDisabled()
+    fireEvent.click(retryButton)
+    expect(submitMock).toHaveBeenCalledTimes(1)
+
+    // And the other direction: repairing the draft restores all three.
+    fireEvent.change(objField, { target: { value: "{\"a\": 2}" } })
+    fireEvent.blur(objField)
+    expect(retryButton).toBeEnabled()
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
+  })
+
   it("drops a stale invalid-object error and mark once the key's declared type is no longer object", async () => {
     // Kills both dropping the `input.type === "object"` clause from the
     // shared predicate, and reverting the row's error paragraph back to
