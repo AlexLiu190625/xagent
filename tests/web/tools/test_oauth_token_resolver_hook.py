@@ -1762,6 +1762,71 @@ async def test_hook_failure_warning_redacts_short_resource_query_string(
     )
 
 
+@pytest.mark.asyncio
+async def test_hook_failure_warning_redacts_resource_userinfo_pushed_out_by_query(
+    db_session,
+    caplog,
+):
+    """The resource logged here is the connector URL the user typed
+    verbatim -- it never passes through an HTTP client and is never
+    truncated -- so the userinfo-provenance rule that rejects a token
+    still carrying an ``@`` its parsed authority does not must be
+    provided by the shared ``redact_urls_in_text`` helper itself, not
+    duplicated by this call site.
+    """
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://SECRET_API_KEY?x@mcp.example.test/oauth"
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert "SECRET_API_KEY" not in caplog.text
+    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] == "<url redacted>"
+    assert configs[0]["config"]["diagnostic"]["resource"] == "<url redacted>"
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_redacts_resource_query_value_containing_quote(
+    db_session,
+    caplog,
+):
+    """Same call site as the test above, for the token-boundary
+    correction rather than the userinfo-provenance rule: a query value
+    containing a single quote must not end the URL token early and leave
+    the ``api_key=`` key name -- and the secret after it -- outside the
+    token entirely.
+    """
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://mcp.example.test/oauth?api_key='SECRET-abc123'"
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert "SECRET-abc123" not in caplog.text
+    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] == (
+        "https://mcp.example.test/oauth"
+    )
+    assert configs[0]["config"]["diagnostic"]["resource"] == (
+        "https://mcp.example.test/oauth"
+    )
+
+
 def test_redacted_bounded_resource_treats_none_and_empty_string_alike():
     """``_build_oauth_token_resolver_diagnostic`` and
     ``_resolver_failure_config`` used to guard the same expression with

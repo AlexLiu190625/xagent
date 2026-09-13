@@ -3992,14 +3992,18 @@ def test_redact_urls_in_text_does_not_reattach_query_tail_as_trailing_punctuatio
     redacted URL -- leaking a few trailing characters of the credential.
     The fix stops the boundary scan at the query separator, so the whole
     query -- tail included -- is dropped together and nothing survives to
-    be reattached.
+    be reattached. The token boundary also no longer stops at a quote (a
+    quote is legal query-string content, not a token delimiter), so the
+    single quote HTTPX wraps its URL in is now consumed as part of the
+    token and dropped with the query instead of surviving as sentence
+    punctuation on the result.
     """
     text = "connect failed for url 'https://mcp.example.com/p?api_key=S)))'"
 
     result = redact_urls_in_text(text)
 
     assert not result.endswith(")))'")
-    assert result == "connect failed for url 'https://mcp.example.com/p'"
+    assert result == "connect failed for url 'https://mcp.example.com/p"
 
 
 def test_truncated_error_message_bounds_raw_text_before_redaction(monkeypatch):
@@ -4008,7 +4012,11 @@ def test_truncated_error_message_bounds_raw_text_before_redaction(monkeypatch):
     input, so it must be capped to ``_MCP_TOOL_ERROR_RAW_MAX_CHARS``
     before either one runs -- not just truncated to
     ``_MCP_TOOL_ERROR_LOG_MAX_CHARS`` afterwards, which would leave both
-    passes running on the full, unbounded message.
+    passes running on the full, unbounded message. The string handed to
+    the redaction pass is ``_MCP_TOOL_ERROR_RAW_MAX_CHARS`` characters of
+    the original text plus the truncation mark, which is the only
+    evidence ``redact_urls_in_text`` has that a URL token in that text may
+    have been cut mid-authority.
     """
     seen_lengths = []
     original_redact_urls = mcp_adapter_module.redact_urls_in_text
@@ -4021,7 +4029,9 @@ def test_truncated_error_message_bounds_raw_text_before_redaction(monkeypatch):
 
     message = _truncated_error_message(RuntimeError("x" * 100_000))
 
-    assert seen_lengths == [_MCP_TOOL_ERROR_RAW_MAX_CHARS]
+    assert seen_lengths == [
+        _MCP_TOOL_ERROR_RAW_MAX_CHARS + len(mcp_adapter_module._TEXT_TRUNCATION_MARK)
+    ]
     assert len(message) <= _MCP_TOOL_ERROR_LOG_MAX_CHARS
 
 
@@ -4035,6 +4045,14 @@ def test_truncated_error_message_bounds_raw_text_before_redaction(monkeypatch):
         ("https://host:8080/p?k=v", "https://host:8080/p"),
         ("https://[::1]:8080/p", "https://[::1]:8080/p"),
         ("https://host:/p", "https://host:/p"),
+        ("https://alice:123?ecret@host/p", "<url redacted>"),  # codespell:ignore ecret
+        ("https://SECRET_API_KEY:?ecret@host/p", "<url redacted>:"),  # codespell:ignore
+        ("https://SECRET_API_KEY?ecret@host/p", "<url redacted>"),  # codespell:ignore
+        ("https://SECRET_API_KEY#ecret@host/p", "<url redacted>"),  # codespell:ignore
+        ("https://alice:8080#ecret@host/p", "<url redacted>"),  # codespell:ignore ecret
+        ("https://h/p?email=a@b.com", "<url redacted>"),
+        ("https://h/users/a@b.com", "<url redacted>"),
+        ("https://alice:12345", "https://alice:12345"),
     ],
     ids=[
         "password-with-question-mark",
@@ -4044,17 +4062,48 @@ def test_truncated_error_message_bounds_raw_text_before_redaction(monkeypatch):
         "numeric-port",
         "ipv6-authority-with-port",
         "empty-port",
+        "numeric-password-pushed-out-by-query",
+        "username-only-pushed-out-by-query",
+        "username-only-no-colon",
+        "username-only-pushed-out-by-fragment",
+        "port-shaped-password-pushed-out-by-fragment",
+        "at-sign-in-dropped-query",
+        "at-sign-in-path",
+        "legal-host-port-without-provenance",
     ],
 )
 def test_redact_urls_in_text_rejects_unparsable_authority(text, expected):
-    """The first three rows are three distinct ways an authority fails to
-    parse as ``host[:port]`` (a password containing ``?`` or ``#`` pulls
-    the ``@`` into the query string; a raw-text cut can drop the ``@``
-    entirely) and must be redacted wholesale. The last four rows are
-    authorities that do parse and must pass through unchanged, including
-    an empty port and an IPv6 host with a port. Both halves share one
-    table so the guard is proven to reject the broken shapes without also
-    rejecting the legal ones.
+    """Two independent rules decide whether a token is redacted wholesale.
+    The authority-parse rule rejects a token whose authority does not
+    parse as ``host[:port]`` at all; it runs first and so is what actually
+    catches ``password-with-question-mark``, ``password-with-hash``, and
+    ``userinfo-without-at-sign`` in this table, even though the first two
+    also carry a stray ``@`` further into the token (after the ``?``/``#``
+    that pushed it out of the authority) and so would equally be caught
+    by the userinfo-provenance rule below if the authority-parse rule
+    were not there. ``userinfo-without-at-sign`` carries no ``@`` anywhere
+    in the token, so it has no such second line of defense -- it is the
+    only row in this table that only the authority-parse rule can reject.
+    The userinfo-provenance rule rejects a token that still carries an
+    ``@`` the parsed authority does not, because ``urlsplit`` stopped the
+    authority at a ``?``/``#`` that the ``@`` fell after
+    (``numeric-password-pushed-out-by-query``,
+    ``username-only-pushed-out-by-query``, ``username-only-no-colon``,
+    ``username-only-pushed-out-by-fragment``,
+    ``port-shaped-password-pushed-out-by-fragment``,
+    ``at-sign-in-dropped-query``, ``at-sign-in-path``) -- the remnant left
+    behind in each of these parses as ``host[:port]`` on its own (a bare
+    username, or a numeric ``host:port``), so the authority-parse rule
+    cannot reject any of them; only the stray ``@`` can.
+    ``username-only-pushed-out-by-query`` keeps a trailing colon that
+    ``_split_url_token`` had already classified as sentence punctuation
+    before either rule runs -- that colon is not part of the redacted
+    authority and carries no credential material.
+    ``legal-host-port-without-provenance`` and ``empty-port`` are
+    deliberately kept: with no ``@`` anywhere in the token and no
+    truncation mark, ``https://alice:12345`` is byte-for-byte the same as
+    a host named ``alice`` on port 12345, and rejecting it would reject
+    every legal ``host:port``.
     """
     assert redact_urls_in_text(text) == expected
 
@@ -4067,31 +4116,169 @@ def _shrinking_url(raw_length: int) -> str:
     return base + "v" * (raw_length - len(base))
 
 
-def test_truncated_error_message_does_not_leak_userinfo_split_by_the_raw_cap():
+@pytest.mark.parametrize(
+    ("credential", "prefix", "leaked_prefix_length"),
+    [
+        ("PASSWORDabcdefghijklmnop", "https://alice:", 12),
+        ("12345678901234567890", "https://alice:", 4),
+        ("SECRETUSERNAMEabcdefghijklmnop", "https://", 12),
+    ],
+    ids=[
+        "alphabetic-password",
+        "all-digit-password",
+        "username-only",
+    ],
+)
+def test_truncated_error_message_does_not_leak_userinfo_split_by_the_raw_cap(
+    credential, prefix, leaked_prefix_length
+):
     """Builds an error message longer than the raw cap where the cut point
-    lands in the middle of a URL's password, then checks the redacted
-    output does not keep any part of that password.
+    lands in the middle of a URL's userinfo, then checks the redacted
+    output does not keep any part of it and does not leak the truncation
+    mark. All three rows carry the mark once cut, and the mark check runs
+    before ``urlsplit`` on any token that carries it, so all three are
+    closed by the truncation-mark rule regardless of what the remnant
+    itself looks like -- neither the authority-parse rule nor the
+    userinfo-provenance rule ever gets a chance to run on these inputs.
+
+    ``all-digit-password``'s leaked prefix is kept to 4 digits rather than
+    the 12 used for the other two rows so the revealed number stays inside
+    the valid port range (0-65535). A longer numeric prefix would still
+    pass, but not because the truncation-mark check caught it: the mark
+    character itself lands inside the netloc alongside the leaked digits,
+    which makes ``SplitResult.port`` raise on its own regardless of
+    whether the mark is appended at the cut, so a 12-digit remnant would
+    be closed by the authority-parse rule instead of by the rule this row
+    exists to pin. 4 digits keeps the revealed netloc a legal port number,
+    so this row is a witness for the mark being appended at the cut, not
+    for the mark being checked.
+
+    ``alphabetic-password`` is doubly covered and has no single-mutation
+    witness: with the mark present, the mark check closes it before
+    ``urlsplit`` runs; with the mark absent, ``https://alice:PASSWORDabcd``
+    still fails to parse as ``host[:port]`` and the authority-parse rule
+    closes it on its own. Deleting either rule alone leaves the other one
+    standing, so only deleting both the mark check and ``_port`` together
+    turns this row red. It is kept anyway as a regression guard for the
+    authority-parse rule on exactly this shape, predating the
+    truncation-mark rule.
+
+    Assertion (d) below (the mark never appearing in the message) cannot
+    be made to fail through any of these three rows: the mark sits inside
+    the URL token, and a token carrying it is always replaced wholesale
+    with ``<url redacted>``, which never contains the mark regardless of
+    whether the unconditional ``.replace()`` in ``_truncated_error_message``
+    runs. The assertion is kept here as defence in depth, not as this
+    rule's witness; the mark landing outside every token and surviving
+    only because that ``.replace()`` was skipped is what
+    ``test_truncated_error_message_does_not_leak_truncation_mark_outside_any_token``
+    below exists to catch.
     """
-    password = "PASSWORDabcdefghijklmnop"
-    leaked_prefix_length = 12
     filler_unit = _shrinking_url(816) + " "
     adjuster_length = (
         mcp_adapter_module._MCP_TOOL_ERROR_RAW_MAX_CHARS
         - 4 * len(filler_unit)
-        - len("https://alice:")
+        - len(prefix)
         - leaked_prefix_length
     )
     raw = (
         filler_unit * 4
         + _shrinking_url(adjuster_length - 1)
         + " "
-        + f"https://alice:{password}@host/path"
+        + f"{prefix}{credential}@host/path"
     )
     assert len(raw) > mcp_adapter_module._MCP_TOOL_ERROR_RAW_MAX_CHARS
     cut = raw[: mcp_adapter_module._MCP_TOOL_ERROR_RAW_MAX_CHARS]
-    assert cut.endswith("https://alice:" + password[:leaked_prefix_length])
+    assert cut.endswith(prefix + credential[:leaked_prefix_length])
 
     message = _truncated_error_message(RuntimeError(raw))
 
     assert message.endswith("<url redacted>")
-    assert password[:4] not in message
+    assert credential[:4] not in message
+    assert mcp_adapter_module._TEXT_TRUNCATION_MARK not in message
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_redacts_query_value_containing_quote(
+    monkeypatch, caplog
+):
+    """A query value that itself contains a single quote used to end the
+    URL token early: HTTPX wraps its own error message's URL in single
+    quotes, so the token stopped at the first quote inside the query
+    value, leaving the ``key=`` half dropped with the (also-truncated)
+    query while the value stood outside the token and outside the
+    key-name-shaped masking pass -- so the value reached the log
+    unmasked. The token now ends only at whitespace or an angle bracket,
+    so HTTPX's own surrounding quote is consumed as part of the token and
+    dropped together with the rest of the query string.
+    """
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+    request = httpx.Request(
+        "POST",
+        "https://mcp.example.test/mcp?api_key='SECRET-abc123'",
+    )
+    response = httpx.Response(403, request=request)
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        response.raise_for_status()
+    status_error = exc_info.value
+
+    class _FakeSession:
+        async def initialize(self):
+            raise status_error
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert "SECRET-abc123" not in caplog.text
+    assert "api_key" not in caplog.text
+    assert "403" in caplog.text
+    assert "mcp.example.test" in caplog.text
+
+
+def test_truncated_error_message_does_not_leak_truncation_mark_outside_any_token():
+    """The truncation mark is stripped from the redacted text
+    unconditionally, not only when it lands inside a URL token: a cut
+    that falls outside every token must not leave the mark in the logged
+    message either. The message is built from URL tokens that each redact
+    down to a short, fixed size so the text remaining after redaction
+    stays under ``_MCP_TOOL_ERROR_LOG_MAX_CHARS`` -- otherwise the mark,
+    sitting right at the cut point near the end of the raw text, would be
+    dropped by that bound regardless of whether it was stripped, and the
+    mutation this case exists to catch would go unnoticed.
+    """
+    filler_unit = _shrinking_url(816) + " "
+    unit_count = mcp_adapter_module._MCP_TOOL_ERROR_RAW_MAX_CHARS // len(filler_unit)
+    non_url_tail = "z" * (
+        mcp_adapter_module._MCP_TOOL_ERROR_RAW_MAX_CHARS - unit_count * len(filler_unit)
+    )
+    raw = filler_unit * unit_count + non_url_tail + "padding after the cut point" * 10
+    assert len(raw) > mcp_adapter_module._MCP_TOOL_ERROR_RAW_MAX_CHARS
+    cut = raw[: mcp_adapter_module._MCP_TOOL_ERROR_RAW_MAX_CHARS]
+    assert cut.endswith(non_url_tail)
+    assert "https://" not in cut[-len(non_url_tail) :]
+
+    message = _truncated_error_message(RuntimeError(raw))
+
+    assert len(message) < mcp_adapter_module._MCP_TOOL_ERROR_LOG_MAX_CHARS
+    assert mcp_adapter_module._TEXT_TRUNCATION_MARK not in message
