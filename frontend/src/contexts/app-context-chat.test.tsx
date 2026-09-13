@@ -7443,7 +7443,8 @@ describe("connector runtime dialog trigger", () => {
     const sourceTypes = Array.from(setBody.matchAll(/"([a-z_]+)"/g)).map(m => m[1])
     expect(sourceTypes.sort()).toEqual([
       "agent_error", "error", "task_completed", "task_error", "task_pause_requested",
-      "task_paused", "task_resumed", "task_started", "task_waiting_for_user",
+      "task_paused", "task_resumed", "task_started", "task_stream_snapshot",
+      "task_waiting_for_user",
     ].sort())
 
     async function deliverThenFeed(
@@ -7490,6 +7491,13 @@ describe("connector runtime dialog trigger", () => {
     for (const type of ["task_paused", "task_waiting_for_user", "task_started", "task_resumed", "task_pause_requested"]) {
       expect(await deliverThenFeed({ type })).toBe(false)
     }
+    // A stream snapshot replays task state after a reconnect; it is not a
+    // settlement of the turn this tab sent, so the stash survives it even
+    // when the replayed status is terminal. A stale stash is harmless: the
+    // next delivery on this task replaces it before any dialog can read it.
+    expect(await deliverThenFeed({
+      type: "task_stream_snapshot", task: { id: 1, status: "failed" }, data: { output: "" },
+    })).toBe(false)
 
     // A settlement for a different task never touches this one's stash.
     expect(await deliverThenFeed({ type: "task_completed", task_id: 999, task: { id: 999, status: "completed" } })).toBe(false)
