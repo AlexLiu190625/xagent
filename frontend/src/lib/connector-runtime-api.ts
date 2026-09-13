@@ -526,16 +526,22 @@ export type ConnectorRuntimeDialogAction = "saveAndResend" | "saveOnly" | "ackno
  * stash is non-empty, which is cleared the moment the snapshot is handed to
  * the request; reading the stash here instead would make the resend button
  * disappear right after the handoff that is supposed to enable it.
+ *
+ * Every outcome maps to at least one button, `met` included. A met report
+ * normally closes the dialog before it renders -- the first read does, and
+ * so does a successful save -- but the refresh a failed save triggers can
+ * install one into an already-open dialog, and returning no buttons there
+ * left the footer empty with only the window chrome's close control to get
+ * out of it.
  */
 export function resolveDialogActions(
   outcome: DialogOutcome,
   hasResendPayload: boolean,
 ): ConnectorRuntimeDialogAction[] {
-  if (outcome.kind === "unsupported_only" || outcome.kind === "nothing_fillable") {
-    return ["acknowledge"]
+  if (outcome.kind === "fillable") {
+    return hasResendPayload ? ["saveAndResend", "saveOnly"] : ["saveOnly"]
   }
-  if (outcome.kind === "met") return []
-  return hasResendPayload ? ["saveAndResend", "saveOnly"] : ["saveOnly"]
+  return ["acknowledge"]
 }
 
 /** Shared by the dialog's draft state and buildSubmitItems so a draft value

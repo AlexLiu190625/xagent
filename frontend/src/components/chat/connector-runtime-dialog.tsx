@@ -279,8 +279,16 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const canSubmitNow = canSubmit && !submitting
   const hasResendPayload = request.resendPayload !== null
   const actions = outcome ? resolveDialogActions(outcome, hasResendPayload) : []
+  // Whether this shape offers any way to submit. The row renderer asks this
+  // instead of listing the outcome kinds that offer none, because that list
+  // was one kind short: a `met` report reaches the render only through the
+  // refresh a failed save triggers, and an unfilled *optional* context key
+  // inside one was still drawn as an editable field with no button able to
+  // send it. Derived from the action set, so the rows and the footer cannot
+  // disagree about whether saving is possible.
+  const hasSaveEntryPoint = actions.includes("saveOnly")
 
-  const handleDraftChange = (connector: ConnectorRuntimeConnector, key: string, value: string) => {
+  const handleDraftChange =(connector: ConnectorRuntimeConnector, key: string, value: string) => {
     const draftKey = connectorRuntimeInputDraftKey(connector.connector_ref, key)
     setDrafts(prev => ({ ...prev, [draftKey]: value }))
   }
@@ -492,7 +500,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
                     // Unfilled context row while only "Got it" is offered:
                     // no input control and no "saved, cannot be changed"
                     // hint, since there is no save entry point in this shape.
-                    if (outcome.kind === "unsupported_only" || outcome.kind === "nothing_fillable") {
+                    if (!hasSaveEntryPoint) {
                       return (
                         <div key={input.key} className="text-sm">
                           <span className="font-medium">{input.key}</span>
