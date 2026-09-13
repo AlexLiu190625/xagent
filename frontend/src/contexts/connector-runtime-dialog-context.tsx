@@ -70,12 +70,31 @@ export interface ConnectorRuntimeDialogValue {
 // provider above it: a consumer outside this provider's tree (a widget or
 // share page) gets an object whose functions do nothing and whose fields are
 // always null, not a thrown error.
+//
+// Doing nothing is the correct production behavior on a widget or share
+// page, but it is indistinguishable from a wiring mistake: a component
+// mounted as a sibling of the provider rather than inside it -- the shell
+// keeps TaskErrorController and VoiceInputController as siblings today --
+// would call these and get no dialog, no crash, and no signal. The warning
+// below is that signal. It is limited to non-production builds because the
+// widget and share pages reach this default legitimately, and it fires once
+// per action name so a call from a render loop cannot flood the console.
+const reportedNoProviderActions = new Set<string>()
+
+function warnCalledOutsideProvider(action: string): void {
+  if (process.env.NODE_ENV === "production" || reportedNoProviderActions.has(action)) return
+  reportedNoProviderActions.add(action)
+  console.warn(
+    `ConnectorRuntimeDialog: ${action}() was called outside ConnectorRuntimeDialogProvider and did nothing.`,
+  )
+}
+
 const NOOP_ACTIONS: ConnectorRuntimeDialogActions = {
-  openForTask: () => {},
-  close: () => {},
-  recordDelivery: () => {},
-  retainOnlyTask: () => {},
-  forgetDelivery: () => {},
+  openForTask: () => warnCalledOutsideProvider("openForTask"),
+  close: () => warnCalledOutsideProvider("close"),
+  recordDelivery: () => warnCalledOutsideProvider("recordDelivery"),
+  retainOnlyTask: () => warnCalledOutsideProvider("retainOnlyTask"),
+  forgetDelivery: () => warnCalledOutsideProvider("forgetDelivery"),
 }
 
 const NOOP_VALUE: ConnectorRuntimeDialogValue = { request: null, payload: null }

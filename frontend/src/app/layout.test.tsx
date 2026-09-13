@@ -136,6 +136,11 @@ describe("connector runtime dialog provider boundary", () => {
   afterEach(cleanup)
 
   it("mounts the connector runtime dialog provider only outside external routes", async () => {
+    // Doing nothing here is correct, and is also exactly what a caller
+    // mounted outside the provider by mistake would see, so the default
+    // announces itself outside a production build -- once per action name,
+    // however many times it is called.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     for (const path of ["/widget", "/widget/chat/x", "/share", "/share/x"]) {
       expect(isExternalRoutePath(path)).toBe(true)
       route.pathname = path
@@ -145,6 +150,10 @@ describe("connector runtime dialog provider boundary", () => {
       expect(probe).toHaveTextContent("noop")
       cleanup()
     }
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(String(warn.mock.calls[0][0])).toContain("openForTask")
+    expect(String(warn.mock.calls[0][0])).toContain("outside ConnectorRuntimeDialogProvider")
+    warn.mockRestore()
 
     route.pathname = "/task/1"
     render(<RootLayout><ConnectorRuntimeProbe /></RootLayout>)
