@@ -592,6 +592,60 @@ describe("refreshes after a conflict and drops newly satisfied keys", () => {
   })
 })
 
+describe("leaves a way out when a refresh reports the whole report satisfied", () => {
+  it("leaves a way out when a refresh reports the whole report satisfied", async () => {
+    // The one path that can install a satisfied report into an already-open
+    // dialog: every other place that installs one closes first. The first
+    // read closes on met before anything renders, and a successful save
+    // closes after its optional resend. A failed save whose disposition
+    // asks for a refresh does neither, so whatever that refresh returns is
+    // rendered -- and a concurrent writer can have satisfied everything
+    // between the read and the save.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "a", type: "string", required: true }),
+        input({ section: "context", key: "optional", type: "string" }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+
+    fireEvent.change(screen.getByLabelText("a"), { target: { value: "1" } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 409, code: "runtime_context_immutable",
+      reason: "conflict.context.a", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(ok(report(true, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "a", type: "string", required: true, satisfied: true }),
+        input({ section: "context", key: "optional", type: "string" }),
+      ]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.filled")).toBeInTheDocument())
+
+    // The footer must not be empty: without a button the only way out of
+    // this dialog is the window chrome's own close control.
+    expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.saveOnly")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.saveAndResend")).not.toBeInTheDocument()
+    // The still-unfilled optional key must lose its control too: an
+    // editable field no button can submit is the same inconsistency read
+    // from the other end.
+    expect(screen.queryByLabelText("optional")).not.toBeInTheDocument()
+    expect(screen.getByText("optional")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText("connectorRuntime.actions.acknowledge"))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    // Acknowledging must not resend the failed turn: the save it followed
+    // was rejected, and a resend is a billed model call.
+    expect(sendMessageMock).not.toHaveBeenCalled()
+  })
+})
+
 describe("locates a field error by connector and key", () => {
   it("locates a field error by connector and key", async () => {
     const twoConnectors = report(false, [

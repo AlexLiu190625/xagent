@@ -24,6 +24,7 @@ import {
   type ConnectorRuntimeSection,
   type ConnectorRuntimeType,
   type DialogOutcome,
+  type DialogOutcomeKind,
   type SubmitTaskConnectorRuntimeValuesFailure,
 } from "./connector-runtime-api"
 
@@ -655,6 +656,7 @@ describe("derives the action set from the outcome and the resend snapshot", () =
   const fillable: DialogOutcome = { kind: "fillable", blocking: [] }
   const unsupportedOnly: DialogOutcome = { kind: "unsupported_only", blocking: [] }
   const nothingFillable: DialogOutcome = { kind: "nothing_fillable" }
+  const met: DialogOutcome = { kind: "met" }
 
   it.each([
     ["fillable", fillable, true, ["saveAndResend", "saveOnly"]],
@@ -663,8 +665,27 @@ describe("derives the action set from the outcome and the resend snapshot", () =
     ["unsupported_only", unsupportedOnly, false, ["acknowledge"]],
     ["nothing_fillable", nothingFillable, true, ["acknowledge"]],
     ["nothing_fillable", nothingFillable, false, ["acknowledge"]],
+    // A met report is normally closed before it can render, but the refresh
+    // a failed save triggers can install one into an open dialog. It must
+    // still carry a button, or that dialog has an empty footer.
+    ["met", met, true, ["acknowledge"]],
+    ["met", met, false, ["acknowledge"]],
   ] as const)("derives the action set for %s with resend=%s", (_label, outcome, hasResendPayload, expected) => {
     expect(resolveDialogActions(outcome, hasResendPayload)).toEqual(expected)
+  })
+
+  it("gives every outcome kind at least one action", () => {
+    const byKind: Record<DialogOutcomeKind, DialogOutcome> = {
+      met,
+      unsupported_only: unsupportedOnly,
+      nothing_fillable: nothingFillable,
+      fillable,
+    }
+    for (const kind of DIALOG_OUTCOME_KINDS) {
+      for (const hasResendPayload of [true, false]) {
+        expect(resolveDialogActions(byKind[kind], hasResendPayload).length).toBeGreaterThan(0)
+      }
+    }
   })
 })
 
