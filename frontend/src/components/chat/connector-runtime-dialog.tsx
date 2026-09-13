@@ -265,6 +265,18 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     connector.inputs.some(input => hasLiveInvalidObjectMark(connector, input, invalidDraftKeys)),
   )
   const canSubmit = isSubmitEnabled(submitItems, hasInvalidObjectDraft)
+  // The one value every entry point into a submission reads: both footer
+  // save buttons, the retry button a retryable failure offers, and
+  // handleSave itself. The retry button used to be rendered off
+  // `dialogFieldError.retry` alone, so a draft edited into an invalid object
+  // after a failed save stayed submittable through it while the save buttons
+  // were correctly disabled. That matters because buildSubmitItems drops an
+  // unparsable object draft instead of failing: such a batch writes every
+  // other field, silently loses that one and closes the dialog -- and a
+  // stored context value is immutable, so there is no correcting it
+  // afterwards. handleSave re-checks rather than trusting its callers, so a
+  // fourth entry point cannot reintroduce the same bypass.
+  const canSubmitNow = canSubmit && !submitting
   const hasResendPayload = request.resendPayload !== null
   const actions = outcome ? resolveDialogActions(outcome, hasResendPayload) : []
 
@@ -304,7 +316,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   }
 
   const handleSave = async (alsoResend: boolean) => {
-    if (!report || submitting) return
+    if (!report || !canSubmitNow) return
     const seqAtStart = request.seq
     const items = buildSubmitItems(report, drafts)
     setSubmitting(true)
@@ -546,19 +558,19 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
             {actions.includes("saveOnly") && (
               <Button
                 variant={actions.includes("saveAndResend") ? "outline" : "default"}
-                disabled={!canSubmit || submitting}
+                disabled={!canSubmitNow}
                 onClick={() => handleSave(false)}
               >
                 {t("connectorRuntime.actions.saveOnly")}
               </Button>
             )}
             {actions.includes("saveAndResend") && (
-              <Button disabled={!canSubmit || submitting} onClick={() => handleSave(true)}>
+              <Button disabled={!canSubmitNow} onClick={() => handleSave(true)}>
                 {t("connectorRuntime.actions.saveAndResend")}
               </Button>
             )}
             {dialogFieldError?.retry && (
-              <Button variant="outline" onClick={() => handleSave(lastAlsoResend)}>
+              <Button variant="outline" disabled={!canSubmitNow} onClick={() => handleSave(lastAlsoResend)}>
                 {t("connectorRuntime.actions.retry")}
               </Button>
             )}
