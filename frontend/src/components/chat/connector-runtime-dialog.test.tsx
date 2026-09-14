@@ -1294,3 +1294,25 @@ describe("does nothing after unmount when a request settles", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
   })
 })
+
+describe("stays usable when StrictMode remounts it", () => {
+  it("stays usable when StrictMode remounts it", async () => {
+    // Development builds run under StrictMode (next.config.mjs enables it),
+    // where React mounts, cleans up and mounts again. Every other case in
+    // this file renders without it, so none of them would notice an
+    // unmount flag the interleaved cleanup left set on a dialog that is
+    // still mounted -- which would short-circuit the read continuation and
+    // leave the dialog permanently invisible in dev.
+    fetchMock.mockResolvedValue(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    render(
+      <React.StrictMode>
+        <ConnectorRuntimeDialogProvider><Probe /></ConnectorRuntimeDialogProvider>
+      </React.StrictMode>,
+    )
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    expect(screen.getByLabelText("token")).toBeInTheDocument()
+  })
+})

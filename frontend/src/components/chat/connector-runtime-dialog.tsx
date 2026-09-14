@@ -189,7 +189,15 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const { t } = useI18n()
 
   const aliveRef = useRef(true)
-  useEffect(() => () => { aliveRef.current = false }, [])
+  useEffect(() => {
+    // The assignment is not redundant with useRef(true): React 18 StrictMode
+    // double-invokes this effect in development (mount -> cleanup -> mount),
+    // and the cleanup below runs in between. Without resetting here, every
+    // guard that reads this ref would short-circuit for a component that is
+    // genuinely still mounted, and the dialog would never become visible.
+    aliveRef.current = true
+    return () => { aliveRef.current = false }
+  }, [])
 
   const requestRef = useRef(request)
   requestRef.current = request
