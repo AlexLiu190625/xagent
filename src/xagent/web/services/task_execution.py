@@ -3402,6 +3402,11 @@ class BackgroundTaskManager:
         if self._shutting_down:
             task.cancel()
             raise RuntimeError("Background task manager is shutting down")
+        from .task_coordinator_runtime import current_task_coordinator
+
+        coordinator = current_task_coordinator(task_id)
+        if coordinator is not None:
+            coordinator.track_execution(task)
         self.running_tasks[task_id] = task
         # Execution may run in a lease-guard child task, whose finally block
         # cannot remove this still-running outer owner. Release the registration
@@ -3505,6 +3510,11 @@ class BackgroundTaskManager:
             raise RuntimeError("Background task manager is shutting down")
         if task_id not in self._resume_reservations:
             raise RuntimeError(f"Task {task_id} has no reserved resume slot")
+        from .task_coordinator_runtime import current_task_coordinator
+
+        coordinator = current_task_coordinator(task_id)
+        if coordinator is not None:
+            coordinator.track_execution(task)
         self._resume_reservations.discard(task_id)
         self._resume_owner_started_at.setdefault(task_id, time.monotonic())
         self.resume_tasks[task_id] = task
