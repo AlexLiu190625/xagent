@@ -1254,7 +1254,7 @@ class AutoPattern(AgentPattern):
         *,
         memory_tools_available: bool = False,
         skill_loading_available: bool = False,
-        evidence_removed: bool = False,
+        evidence_removed: bool,
     ) -> str:
         memory_rule = (
             "If the latest user message asks to remember, store, forget, or "
@@ -1311,8 +1311,8 @@ class AutoPattern(AgentPattern):
             "when action is final_answer, you must include a complete non-empty "
             "answer field in the same tool call. Put action before answer in the "
             "tool arguments. "
-            f"When writing that answer field: {grounding_rule(can_call_tools=False)} "
             f"{EVIDENCE_REMOVED_FACTS if evidence_removed else ''}"
+            f"When writing that answer field: {grounding_rule(can_call_tools=False)} "
             "If the answer would need any value the rule above forbids you to "
             f"supply -- {VALUE_KINDS} -- that no source here supports, set "
             "existing_context_sufficient=false and choose react, so the agent "

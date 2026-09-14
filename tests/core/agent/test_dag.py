@@ -28,7 +28,6 @@ from xagent.core.agent.clarification import (
 )
 from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
-from xagent.core.agent.grounding import EVIDENCE_REMOVED_FACTS, grounding_rule
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
@@ -5810,24 +5809,3 @@ def test_a_restored_step_context_keeps_the_marker() -> None:
         True
     )
     assert execution_module.tool_evidence_removed(restored) is True
-
-
-def test_the_assessment_states_the_loss_before_the_shared_grounding_rule() -> None:
-    """Which of the two comes first is a decision, so it is pinned.
-
-    What is no longer readable is stated before the wider rule about answering
-    from sources, and the three prompts carrying both do not agree on that
-    order, so nothing else would catch this one being swapped.
-    """
-    pattern = _assessment_pattern()
-    context = ContextManager().create_context(execution_id="dag-order")
-    context.add_user_message("Build a KPI report")
-    context.metadata[execution_module.TOOL_EVIDENCE_REMOVED_METADATA_KEY] = True
-
-    system_message = pattern._completion_assessment_messages(context)[0]["content"]
-
-    facts_head = EVIDENCE_REMOVED_FACTS.split(".")[0]
-    grounding_head = grounding_rule(can_call_tools=False).split(".")[0]
-    assert facts_head in system_message
-    assert grounding_head in system_message
-    assert system_message.index(facts_head) < system_message.index(grounding_head)

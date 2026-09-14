@@ -33,7 +33,7 @@ from xagent.core.agent.context.execution import (
     note_compaction_evidence_loss,
     tool_evidence_removed,
 )
-from xagent.core.agent.grounding import EVIDENCE_REMOVED_FACTS
+from xagent.core.agent.grounding import EVIDENCE_REMOVED_FACTS, grounding_rule
 from xagent.core.agent.pattern.auto.auto import (
     DECISION_TOOL_NAME,
     AutoAction,
@@ -485,29 +485,6 @@ def _auto_decision(context: ExecutionContext) -> str:
     )
 
 
-CONSUMERS = [
-    pytest.param(_react_forced, id="react_forced_answer"),
-    pytest.param(_react_decision, id="react_repeated_tool_decision"),
-    pytest.param(_dag_assessment, id="dag_completion_assessment"),
-    pytest.param(_auto_decision, id="auto_routing_decision"),
-]
-
-
-@pytest.mark.parametrize("build", CONSUMERS)
-def test_every_toolless_answer_prompt_states_the_loss(build: Any) -> None:
-    """Every tool-less answer prompt carries the facts, and none of them claims accumulated results.
-
-    The scope of the second assertion is the prompt this builder writes for
-    this turn, not the whole payload: a guidance line written into the context
-    on an earlier turn can still carry main's wording, which is an acknowledged
-    gap no per-turn builder can reach.
-    """
-    context = build_context(observations=2, threshold=500)
-    context.metadata[KEY] = True
-    assert FACTS_HEAD in build(context)
-    assert "accumulated" not in build(context)
-
-
 # Main's wording at the spots this change splits into branches, quoted whole
 # rather than probed for a few words: probing catches a deleted phrase but not
 # a rewritten one, and "only when" turned into "whenever" inverts the rule
@@ -536,8 +513,64 @@ MAIN_DECISION_SUFFICIENCY_CLAUSE = (
 )
 
 
-@pytest.mark.parametrize("build", CONSUMERS)
-def test_a_run_that_never_lost_anything_reads_exactly_like_main(build: Any) -> None:
+CONSUMERS = [
+    pytest.param(
+        _react_forced, (MAIN_FORCED_ANSWER_OPENING,), True, id="react_forced_answer"
+    ),
+    pytest.param(
+        _react_decision,
+        (MAIN_DECISION_COMPLETION_CLAUSE, MAIN_DECISION_SUFFICIENCY_CLAUSE),
+        False,
+        id="react_repeated_tool_decision",
+    ),
+    pytest.param(_dag_assessment, (), True, id="dag_completion_assessment"),
+    pytest.param(_auto_decision, (), True, id="auto_routing_decision"),
+]
+
+
+@pytest.mark.parametrize("build, _main_fragments, _carries_grounding_rule", CONSUMERS)
+def test_every_toolless_answer_prompt_states_the_loss(
+    build: Any, _main_fragments: tuple[str, ...], _carries_grounding_rule: bool
+) -> None:
+    """Every tool-less answer prompt carries the facts, and none of them claims accumulated results.
+
+    The scope of the second assertion is the prompt this builder writes for
+    this turn, not the whole payload: a guidance line written into the context
+    on an earlier turn can still carry main's wording, which is an acknowledged
+    gap no per-turn builder can reach.
+    """
+    context = build_context(observations=2, threshold=500)
+    context.metadata[KEY] = True
+    assert FACTS_HEAD in build(context)
+    assert "accumulated" not in build(context)
+
+
+@pytest.mark.parametrize("build, _main_fragments, carries_grounding_rule", CONSUMERS)
+def test_the_loss_is_stated_before_the_shared_grounding_rule(
+    build: Any, _main_fragments: tuple[str, ...], carries_grounding_rule: bool
+) -> None:
+    """Which of the two comes first is a decision, so it is pinned at every site.
+
+    The three prompts that carry both state what is no longer readable before
+    the wider rule about answering from sources. The fourth builder carries no
+    shared rule at all; that exclusion is asserted rather than left silent, so
+    adding the rule there without picking an order reddens this cell.
+    """
+    context = build_context(observations=2, threshold=500)
+    context.metadata[KEY] = True
+    text = build(context)
+    grounding_head = grounding_rule(can_call_tools=False).split(".")[0]
+    assert FACTS_HEAD in text
+    if not carries_grounding_rule:
+        assert grounding_head not in text
+        return
+    assert text.index(FACTS_HEAD) < text.index(grounding_head)
+
+
+@pytest.mark.parametrize("build, _main_fragments, _carries_grounding_rule", CONSUMERS)
+def test_a_run_that_never_lost_anything_reads_exactly_like_main(
+    build: Any, _main_fragments: tuple[str, ...], _carries_grounding_rule: bool
+) -> None:
     """The marker-false branch is word-for-word main's wording.
 
     The context must come from ``ContextManager.create_context``. One built
