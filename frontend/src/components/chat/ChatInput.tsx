@@ -695,6 +695,16 @@ export function ChatInput({
   // visible control on screen would have nothing to refer to.
   const showStopButton = compact && !!onStop && !hasDraft;
   const isStopInFlight = stopState === "stopping";
+  // The stop control and the send control take turns in the same slot, so the
+  // size and the box styling come from here instead of each of them carrying
+  // its own copy: the slot keeps one shape whichever control is on screen.
+  const composerActionButtonProps = (isDimmed: boolean) => ({
+    size: "icon" as const,
+    className: cn(
+      "h-8 w-8 rounded-lg transition-all duration-300",
+      isDimmed && "bg-muted text-muted-foreground/50"
+    ),
+  });
   // Two outcomes, two sentences: "timed_out" means the request went out and
   // was never confirmed; "not_sent" means the socket refused it and nobody
   // received it.
@@ -1185,30 +1195,22 @@ export function ChatInput({
               {showStopButton ? (
                 <Button
                   type="button"
-                  size="icon"
+                  {...composerActionButtonProps(isStopInFlight)}
                   onClick={onStop}
                   disabled={isStopInFlight}
                   aria-label={stopButtonLabel}
                   title={stopButtonLabel}
                   aria-describedby={showStopHint ? stopHintId : undefined}
-                  className={cn(
-                    "h-8 w-8 rounded-lg transition-all duration-300",
-                    isStopInFlight && "bg-muted text-muted-foreground/50"
-                  )}
                 >
                   <Square className="h-3.5 w-3.5 fill-current" />
                 </Button>
               ) : (
                 <Button
                   type="submit"
-                  size="icon"
+                  {...composerActionButtonProps(!canSubmit())}
                   disabled={!canSubmit()}
                   aria-label={t("common.send")}
                   title={t("common.send")}
-                  className={cn(
-                    "h-8 w-8 rounded-lg transition-all duration-300",
-                    !canSubmit() && "bg-muted text-muted-foreground/50"
-                  )}
                 >
                   {isInputBusy ? (
                     <Sparkles className="h-4 w-4 animate-pulse" />

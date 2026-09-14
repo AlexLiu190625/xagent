@@ -1969,6 +1969,7 @@ describe("ChatInput", () => {
       ["", "widgetSession.stopResponse"],
       ["draft", "common.send"],
     ]
+    const renderedClassNames: string[] = []
 
     for (const [inputValue, expectedName] of cases) {
       const otherName = expectedName === "common.send"
@@ -1988,10 +1989,20 @@ describe("ChatInput", () => {
           taskStatus="running"
         />
       )
-      expect(screen.getByRole("button", { name: expectedName })).toBeInTheDocument()
+      const control = screen.getByRole("button", { name: expectedName })
+      expect(control).toBeInTheDocument()
       expect(screen.queryByRole("button", { name: otherName })).not.toBeInTheDocument()
+      renderedClassNames.push(control.className)
       unmount()
     }
+
+    // Neither render dims its control here, so the two class strings differ
+    // only if the controls stopped taking their size and box styling from the
+    // same expression -- which is what would let the slot change shape when
+    // the stop square takes the send button's place.
+    const [stopClassName, submitClassName] = renderedClassNames
+    expect(stopClassName).toContain("h-8 w-8")
+    expect(submitClassName).toBe(stopClassName)
   })
 
   it("renders no stop control without an onStop callback", () => {

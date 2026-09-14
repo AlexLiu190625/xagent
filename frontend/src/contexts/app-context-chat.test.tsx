@@ -5698,15 +5698,6 @@ describe("AppProvider websocket message routing", () => {
   })
 
   it("withholds task stop for each unmet precondition", () => {
-    const preconditionLabels = [
-      "transport does not declare taskStop",
-      "isProcessing is false",
-      "session phase is unbound",
-      "session phase is reset_requested",
-      "session phase is replacement_ready",
-      "session phase is reload_required",
-    ]
-
     // 1) taskStop not declared, everything else satisfied.
     {
       const { unmount } = render(
@@ -5850,12 +5841,6 @@ describe("AppProvider websocket message routing", () => {
   })
 
   it("keeps the stop intent across a reconnect and a waiting turn", () => {
-    const perturbationLabels = [
-      "the connection identity changes mid-cancel",
-      "the turn asks the visitor a question before finishing",
-      "the local 30s timeout elapses before the terminal frame",
-    ]
-
     const assertNeutral = () => {
       const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
         content: string
@@ -5949,16 +5934,6 @@ describe("AppProvider websocket message routing", () => {
   })
 
   it("leaves an unsolicited failure on the error path", async () => {
-    const rowLabels = [
-      "never pressed stop",
-      "bound switched to another task before the old task's terminal frame",
-      "the stop frame was not sent",
-      "the same task's next turn fails after a normal completion",
-      "a non-terminal rejection arrives on the mixed error channel mid-stop",
-      "the server answers that the stop did not go through",
-      "an agent_error with an error_code arrives mid-stop",
-    ]
-
     const assertRed = () => {
       const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
         content: string
@@ -6021,12 +5996,14 @@ describe("AppProvider websocket message routing", () => {
         JSON.parse(screen.getByTestId("messages").textContent || "[]") as unknown[]
       ).length
       act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(oldTaskId)))
-      // The view has already moved to newTaskId, so the pre-existing
-      // isMessageForOtherTask task-scoping guard (TASK_SCOPED_ACTION_TYPES
-      // includes ADD_MESSAGE) drops the old task's frame before this turn's
-      // stop-intent branching ever runs a dispatch. No message - neutral or
-      // failed - is added for it; this is the same guard every other stray
-      // cross-task frame already goes through, unrelated to stop.
+      // The view has already moved to newTaskId, and oldTaskId was added to
+      // retiredSessionTaskIdsRef in the same reset that rebound the
+      // connection. The session lineage guard in handleSessionMessage
+      // returns on a retired task id before handleMessage ever runs, so
+      // neither the message-append code nor the stop-intent branching sees
+      // this frame at all. No message - neutral or failed - is added for it;
+      // this is the same guard every other stray cross-task frame already
+      // goes through, unrelated to stop.
       const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
         content: string
       }>
@@ -6126,68 +6103,87 @@ describe("AppProvider websocket message routing", () => {
       expect(stopped?.status).not.toBe("failed")
       unmount()
     }
+  })
 
-    // 6) the server answers that the stop did not go through, then the task
-    // fails for an unrelated reason -- the standing intent must not paint
-    // that later, genuine failure as a stopped turn.
-    {
-      const taskId = 1206
-      const { unmount } = render(
-        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
-          <SessionControlsProbe />
-          <StateProbe />
-        </AppProvider>
-      )
-      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
-      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
-      act(() => getSessionControls().stopTask())
-      expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+  it("releases the stop control on a codeless failure without retiring the intent", () => {
+    // The server sends the same codeless agent_error for a stop it could not
+    // apply and for any other external-scope command that fails on this task,
+    // so this frame cannot say which of them happened. It returns the control
+    // to pressable -- a button left on "Stopping..." would contradict the
+    // sentence the visitor has just been shown -- and leaves the stop intent
+    // standing, so this task's own terminal frame still renders as the
+    // stopped turn it is.
+    const taskId = 1206
+    render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+    act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+    act(() => getSessionControls().stopTask())
+    expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
 
-      act(() => webSocketOptions.current?.onMessage?.({
-        type: "agent_error",
-        timestamp: "2026-05-27T05:00:03Z",
-        task_id: taskId,
-        ...({
-          message: "Stopping this response didn't go through — please try again.",
-          error: "Stopping this response didn't go through — please try again.",
-        } as Record<string, unknown>),
-      }))
-      // The rejection is answered on the agent_error channel, not the
-      // terminal one, and it is also the answer to the button itself: the
-      // control leaves "stopping" here rather than waiting out the 30s
-      // recovery path for a request the server has already answered.
-      expect(screen.getByTestId("stop-state").textContent).toBe("idle")
+    act(() => webSocketOptions.current?.onMessage?.({
+      type: "agent_error",
+      timestamp: "2026-05-27T05:00:03Z",
+      task_id: taskId,
+      ...({
+        message: "Stopping this response didn't go through — please try again.",
+        error: "Stopping this response didn't go through — please try again.",
+      } as Record<string, unknown>),
+    }))
+    expect(screen.getByTestId("stop-state").textContent).toBe("idle")
 
-      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
-      assertRed()
-      unmount()
-    }
+    act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+      content: string
+      isResult?: boolean
+      status?: string
+    }>
+    const stopped = messages.find((message) => message.content === "This response was interrupted.")
+    expect(stopped).toBeDefined()
+    expect(stopped?.isResult).toBe(true)
+    expect(stopped?.status).not.toBe("failed")
+  })
 
-    // 7) an agent_error carrying an error_code is a different producer's
-    // coded failure, not the codeless stop-rejection -- it must not retire
-    // the intent. The later terminal frame still renders as the stopped turn.
-    {
-      const taskId = 1207
-      const { unmount } = render(
-        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
-          <SessionControlsProbe />
-          <StateProbe />
-        </AppProvider>
-      )
-      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
-      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
-      act(() => getSessionControls().stopTask())
-      act(() => webSocketOptions.current?.onMessage?.({
-        type: "agent_error",
-        timestamp: "2026-05-27T05:00:03Z",
-        task_id: taskId,
-        ...({ message: "Message processing failed.", error_code: "message_processing_failed" } as Record<string, unknown>),
-      }))
-      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
-      const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{ content: string }>
-      expect(messages.some((message) => message.content === "This response was interrupted.")).toBe(true)
-      unmount()
-    }
+  it("retires the stop intent on the stopped turn's own terminal frame", () => {
+    // Isolates the cleanup that runs when a stopped turn's terminal frame
+    // arrives. Its reset of the control is not observable on its own -- the
+    // same frame also ends processing, and that already returns the control to
+    // idle through canStopTask -- so this pins the half only this cleanup
+    // does: retiring the intent, so the same task's NEXT failure is rendered
+    // as a failure and not as a second stopped turn.
+    const taskId = 1302
+    render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+    act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+    act(() => getSessionControls().stopTask())
+    act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+
+    const afterStop = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+      content: string
+      status?: string
+    }>
+    expect(afterStop.find((message) => message.content === "This response was interrupted.")?.status).not.toBe("failed")
+
+    // The next turn of the same task starts and fails on its own.
+    act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:11:00Z" }))
+    act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId, "The connector timed out.")))
+
+    const afterFailure = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+      content: string
+      status?: string
+    }>
+    const failure = afterFailure.find((message) => message.content.includes("The connector timed out."))
+    expect(failure).toBeDefined()
+    expect(failure?.status).toBe("failed")
   })
 
   it("recovers the stop control on the local timeout", () => {
