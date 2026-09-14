@@ -355,12 +355,24 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     if (!result.ok) {
       const disposition = classifySubmitFailure(result, report)
       setFieldError({ disposition, location: locateFieldError(report, disposition) })
-      setSubmitting(false)
-      if (disposition.refresh) {
-        const refreshed = await fetchTaskConnectorRuntimeRequirements(request.taskId)
-        if (!aliveRef.current || requestRef.current.seq !== seqAtStart) return
-        if (refreshed.ok) setReport(refreshed.report)
+      if (!disposition.refresh) {
+        setSubmitting(false)
+        return
       }
+      // The save buttons stay disabled across the refresh: re-enabling before
+      // it settles lets a second submit go out built from the report this
+      // refresh is about to replace. Every path that settles the dialog below
+      // still resets `submitting`, or the buttons and the close handlers stay
+      // stuck forever; only an unmounted instance skips it, since it has no
+      // buttons left to re-enable.
+      const refreshed = await fetchTaskConnectorRuntimeRequirements(request.taskId)
+      if (!aliveRef.current) return
+      if (requestRef.current.seq !== seqAtStart) {
+        setSubmitting(false)
+        return
+      }
+      if (refreshed.ok) setReport(refreshed.report)
+      setSubmitting(false)
       return
     }
 
@@ -422,13 +434,16 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     }
   }
 
+  // A resend in flight holds the dialog open for the same reason a save does:
+  // dismissing mid-send drops the request (and with it the snapshot the retry
+  // button reads), leaving nothing to retry from if that send fails.
   const handleDismiss = () => {
-    if (submitting) return
+    if (submitting || resending) return
     close("dismissed")
   }
 
   const handleOpenChange = (open: boolean) => {
-    if (open || submitting) return
+    if (open || submitting || resending) return
     handleDismiss()
   }
 

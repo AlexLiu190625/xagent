@@ -1331,3 +1331,56 @@ describe("warns when a resend fails", () => {
     expect(warnSpy.mock.calls).toEqual([["[connector-runtime] resend failed"]])
   })
 })
+
+describe("keeps the save buttons disabled until a failure refresh settles", () => {
+  it("keeps the save buttons disabled until a failure refresh settles", async () => {
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    // A failure whose disposition asks for a refresh, with the refresh GET
+    // held open: that is the window in which a second submit would be built
+    // from the report the refresh is about to replace.
+    submitMock.mockResolvedValueOnce({ ok: false, kind: "malformed" })
+    let resolveRefresh: (v: unknown) => void = () => {}
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveRefresh = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    const saveOnly = screen.getByText("connectorRuntime.actions.saveOnly")
+    expect(saveOnly).toBeDisabled()
+    fireEvent.click(saveOnly)
+    expect(submitMock).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveRefresh(ok(report(false, [
+        connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+      ])))
+    })
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
+  })
+})
+
+describe("holds the dialog open while a retry resend is in flight", () => {
+  it("holds the dialog open while a retry resend is in flight", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(new Error("closed"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    let resolveRetry: () => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((res) => { resolveRetry = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    const beforeDismiss = latestState
+
+    // Escape and the window's own close control both run the same guard.
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape", code: "Escape" })
+    fireEvent.click(screen.getByRole("button", { name: "Close" }))
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(latestState).toEqual(beforeDismiss)
+
+    await act(async () => { resolveRetry() })
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+  })
+})
