@@ -31,7 +31,10 @@ logger = logging.getLogger(__name__)
 # Metadata keys the engine writes as run facts. Client input reaches
 # ``context.metadata`` verbatim through two surfaces -- the top-level metadata
 # dict and the nested request_context -- so both are filtered at the single
-# merge point rather than defended again at each reader.
+# merge point rather than defended again at each reader. The restored branch of
+# that merge point reaches neither surface: it carries only the modality
+# preference over and drops the rest of the current run's metadata, so no client
+# key reaches a context rebuilt from a checkpoint.
 RESERVED_ENGINE_METADATA_KEYS = frozenset({TOOL_EVIDENCE_REMOVED_METADATA_KEY})
 
 

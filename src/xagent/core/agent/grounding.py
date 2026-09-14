@@ -17,7 +17,7 @@ This is the proposal-A mitigation from issue #1235. It forbids unsourced values
 by default and makes reporting the gap the instructed response, but it cannot
 repair a session whose evidence compaction already discarded. ReAct's forced
 answer turn no longer compacts, so that turn's tool observations survive to be
-answered from; every other turn still compacts unconditionally, and
+answered from; no other turn's compaction behavior is changed, and
 ``EVIDENCE_REMOVED_FACTS`` below is what a prompt states once a compaction on
 this context has removed observations. Proposal C (provenance tracking and a
 data-source gate) remains open.

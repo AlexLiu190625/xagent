@@ -319,7 +319,7 @@ def test_grounding_module_docstring_states_the_default_as_a_prohibition() -> Non
     # its evidence. The docstring states that behaviour rather than claiming
     # the proposal landed, and still says what remains open.
     assert "ReAct's forced answer turn no longer compacts" in normalized_doc
-    assert "every other turn still compacts unconditionally" in normalized_doc
+    assert "no other turn's compaction behavior is changed" in normalized_doc
     assert (
         "Proposal C (provenance tracking and a data-source gate) remains open."
         in normalized_doc
