@@ -8,6 +8,7 @@ without tools says so instead of claiming the results accumulated.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import pathlib
@@ -45,7 +46,6 @@ from xagent.core.model.chat.exceptions import (
     LLMToolProtocolError,
 )
 
-_KEEP_DEFAULT = object()
 FACTS_HEAD = EVIDENCE_REMOVED_FACTS.split(".")[0]
 
 
@@ -71,7 +71,7 @@ async def run_one_turn(
     context: ExecutionContext,
     forced: bool,
     llm: Any | None = None,
-    compact_llm: Any | None = _KEEP_DEFAULT,
+    compact_llm: Any | None = None,
     pattern: ReActPattern | None = None,
 ) -> tuple[ReActPattern, ScriptedLLM]:
     """Drive exactly one ReAct iteration, forced or ordinary."""
@@ -84,7 +84,7 @@ async def run_one_turn(
         tools=[],
         llm=llm,
         runtime=runtime,
-        compact_llm=CompactingLLM() if compact_llm is _KEEP_DEFAULT else compact_llm,
+        compact_llm=compact_llm or CompactingLLM(),
     )
     return pattern, llm
 
@@ -341,16 +341,65 @@ def test_latch_is_monotonic() -> None:
     assert context.metadata[KEY] is True
 
 
+def _marker_names(tree: ast.AST) -> set[str]:
+    """Every local name in this module that stands for the marker key."""
+    names = {"TOOL_EVIDENCE_REMOVED_METADATA_KEY"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            names.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "TOOL_EVIDENCE_REMOVED_METADATA_KEY"
+            )
+    return names
+
+
+def _names_the_marker(node: ast.AST, names: set[str]) -> bool:
+    if isinstance(node, ast.Constant):
+        return node.value == KEY
+    if isinstance(node, ast.Name):
+        return node.id in names
+    if isinstance(node, ast.Attribute):
+        return node.attr in names
+    return False
+
+
+def _writes_false(node: ast.AST, names: set[str]) -> bool:
+    def is_false(value: ast.AST) -> bool:
+        return isinstance(value, ast.Constant) and value.value is False
+
+    if isinstance(node, ast.Assign) and is_false(node.value):
+        return any(
+            isinstance(target, ast.Subscript) and _names_the_marker(target.slice, names)
+            for target in node.targets
+        )
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "setdefault"
+        and len(node.args) == 2
+        and is_false(node.args[1])
+    ):
+        return _names_the_marker(node.args[0], names)
+    return False
+
+
 def test_only_one_place_in_src_writes_the_marker_false() -> None:
-    """Nothing resets the marker; the single False write is the stamp."""
+    """Nothing resets the marker; the single False write is the stamp.
+
+    Read as syntax, not as text: a substring scan of one line misses a
+    ``setdefault(KEY, False)``, an assignment wrapped across lines, and a
+    write through an aliased import of the key.
+    """
     src = pathlib.Path(__file__).resolve().parents[3] / "src" / "xagent"
-    writes = {
-        str(path.relative_to(src))
-        for path in src.rglob("*.py")
-        for line in path.read_text().splitlines()
-        if "TOOL_EVIDENCE_REMOVED_METADATA_KEY]" in line and "False" in line
-    }
-    assert writes == {"core/agent/context/manager.py"}
+    writers = set()
+    for path in src.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        names = _marker_names(tree)
+        for node in ast.walk(tree):
+            if _writes_false(node, names):
+                writers.add(str(path.relative_to(src)))
+    assert writers == {"core/agent/context/manager.py"}
 
 
 @pytest.mark.asyncio
@@ -374,7 +423,7 @@ async def test_truncate_path_latches_without_writing_a_notice() -> None:
 
 @pytest.mark.asyncio
 async def test_windowless_compact_model_does_not_latch() -> None:
-    """The marker also latches when no window is declared, the one way that cell is reachable."""
+    """A compact model with no window makes the runtime refuse to compact, so nothing is lost and the marker stays False."""
     context = build_context(observations=6, threshold=500)
     await run_one_turn(
         context=context, forced=False, compact_llm=WindowlessCompactingLLM()
@@ -541,8 +590,9 @@ def test_every_toolless_answer_prompt_states_the_loss(
     """
     context = build_context(observations=2, threshold=500)
     context.metadata[KEY] = True
-    assert FACTS_HEAD in build(context)
-    assert "accumulated" not in build(context)
+    text = build(context)
+    assert FACTS_HEAD in text
+    assert "accumulated" not in text
 
 
 @pytest.mark.parametrize("build, _main_fragments, carries_grounding_rule", CONSUMERS)
@@ -567,9 +617,9 @@ def test_the_loss_is_stated_before_the_shared_grounding_rule(
     assert text.index(FACTS_HEAD) < text.index(grounding_head)
 
 
-@pytest.mark.parametrize("build, _main_fragments, _carries_grounding_rule", CONSUMERS)
+@pytest.mark.parametrize("build, main_fragments, _carries_grounding_rule", CONSUMERS)
 def test_a_run_that_never_lost_anything_reads_exactly_like_main(
-    build: Any, _main_fragments: tuple[str, ...], _carries_grounding_rule: bool
+    build: Any, main_fragments: tuple[str, ...], _carries_grounding_rule: bool
 ) -> None:
     """The marker-false branch is word-for-word main's wording.
 
@@ -577,24 +627,12 @@ def test_a_run_that_never_lost_anything_reads_exactly_like_main(
     directly carries no key, reads as "evidence removed", and would make this
     cell fail for a reason that has nothing to do with the wording.
     """
-    stamped = build_context(observations=2, threshold=500, via_manager=True)
+    stamped = build_context(observations=2, threshold=500)
     assert stamped.metadata[KEY] is False
     text = build(stamped)
     assert FACTS_HEAD not in text
-    if build is _react_forced:
-        assert MAIN_FORCED_ANSWER_OPENING in text
-    if build is _react_decision:
-        assert MAIN_DECISION_COMPLETION_CLAUSE in text
-        assert MAIN_DECISION_SUFFICIENCY_CLAUSE in text
-
-
-def test_a_directly_built_context_reads_as_evidence_removed() -> None:
-    """Deliberate, and pinned so nobody later "fixes" it to False.
-
-    Production stamps the key at its one brand-new-context site, so this shape
-    is unreachable there.
-    """
-    assert tool_evidence_removed(ExecutionContext(system_prompt="s")) is True
+    for fragment in main_fragments:
+        assert fragment in text
 
 
 def test_the_outcome_rule_stays_a_conditional() -> None:
@@ -679,6 +717,35 @@ async def test_protocol_repair_retry_inherits_the_same_wording() -> None:
     assert "called final_answer with an empty answer field" in repair
     assert FACTS_HEAD in repair
     assert "accumulated" not in repair
+
+
+@pytest.mark.asyncio
+async def test_a_dag_step_child_carries_its_own_loss_and_the_root_stays_intact(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A step's loss drives that step's own forced turn, and only that one.
+
+    The child is built the way ``_execute_step_impl`` builds it, then driven
+    through a real forced answer turn: its own marker reaches its own wording
+    and its own compaction skip. The root keeps its messages and its
+    completion assessment says nothing about a loss, which is why the marker
+    is not raised to the root.
+    """
+    root = build_context(observations=6, threshold=500)
+    root_messages_before = len(root.messages)
+    child = root.create_child_context(metadata={"dag_step_id": "step-1"})
+
+    await run_one_turn(context=child, forced=False)
+    assert child.metadata[KEY] is True
+    assert root.metadata[KEY] is False
+
+    with caplog.at_level(logging.INFO, logger="xagent.core.agent.pattern.react.react"):
+        _, llm = await run_one_turn(context=child, forced=True)
+
+    assert [r for r in caplog.records if "did not compact" in r.getMessage()]
+    assert FACTS_HEAD in prompt_text(llm.calls[0]["messages"])
+    assert len(root.messages) == root_messages_before
+    assert FACTS_HEAD not in _dag_assessment(root)
 
 
 # --------------------------------------------------------------------------

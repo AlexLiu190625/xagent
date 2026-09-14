@@ -2176,22 +2176,27 @@ def test_resume_migration_reaches_a_nested_auto_pattern_child_context() -> None:
     assert OUTPUT_LANGUAGE_METADATA_KEY not in nested["metadata"]
 
 
-@pytest.mark.parametrize("client_value", [True, False, "true", 1])
+@pytest.mark.parametrize(
+    "client_value, engine_value",
+    [(True, False), ("true", False), (1, False), (False, True)],
+    ids=["client_true", "client_string", "client_one", "client_false_on_latched_run"],
+)
 @pytest.mark.parametrize("surface", ["top_level", "request_context"])
 def test_a_client_cannot_set_the_tool_evidence_marker(
-    tmp_path: Path, surface: str, client_value: object
+    tmp_path: Path, surface: str, client_value: object, engine_value: bool
 ) -> None:
     """Both surfaces that carry client input into metadata refuse this key.
 
-    Client keys reach ``context.metadata`` twice -- the top-level dict is
-    copied wholesale, then request_context is merged key by key -- and nothing
-    in the code says the first of those is engine-only.
+    Each cell sends the opposite of what the engine currently holds, so a cell
+    goes red if the client's value lands -- including the dangerous direction,
+    a client sending False to clear a run that really did lose observations.
     """
     runner = AgentRunner(
         agent=Agent(name="writer", patterns=[StatefulPattern()]),
         workspace_manager=FakeWorkspaceManager(tmp_path),
     )
     context = ContextManager().create_context(execution_id="exec-reserved-key")
+    context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = engine_value
     client_keys = {
         TOOL_EVIDENCE_REMOVED_METADATA_KEY: client_value,
         "some_client_key": "kept",
@@ -2204,10 +2209,39 @@ def test_a_client_cannot_set_the_tool_evidence_marker(
 
     runner._merge_context_metadata(context, metadata)
 
-    assert context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] is False
+    assert context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] is engine_value
     # Proves the merge actually ran; without it, the line above could pass
     # simply because nothing was merged at all.
     assert context.metadata["some_client_key"] == "kept"
+
+
+def test_a_restored_context_takes_no_client_metadata_at_all(tmp_path: Path) -> None:
+    """The restore branch returns before both filters because it merges nothing.
+
+    A run rebuilt from a checkpoint keeps what it latched: the current turn's
+    metadata contributes only the modality preference, so neither surface that
+    carries client input reaches it.
+    """
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ContextManager().create_context(execution_id="exec-restored-key")
+    context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = True
+    client_keys = {
+        TOOL_EVIDENCE_REMOVED_METADATA_KEY: False,
+        "some_client_key": "kept",
+    }
+
+    runner._merge_context_metadata(
+        context,
+        {**client_keys, "request_context": dict(client_keys)},
+        restored=True,
+    )
+
+    assert context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] is True
+    assert "some_client_key" not in context.metadata
+    assert "request_context" not in context.metadata
 
 
 def test_the_marker_is_stamped_before_any_client_metadata_is_merged(

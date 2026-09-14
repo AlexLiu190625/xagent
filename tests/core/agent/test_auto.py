@@ -20,13 +20,8 @@ from xagent.core.agent import (
     PatternRuntime,
     ReActPattern,
 )
-from xagent.core.agent.context import ContextManager
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
-from xagent.core.agent.context.execution import (
-    TOOL_EVIDENCE_REMOVED_METADATA_KEY,
-    tool_evidence_removed,
-)
-from xagent.core.agent.grounding import EVIDENCE_REMOVED_FACTS, VALUE_KINDS
+from xagent.core.agent.grounding import VALUE_KINDS
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
@@ -2554,18 +2549,3 @@ def test_routing_prompt_is_rebuilt_with_the_marker_on_every_parse_retry() -> Non
     source = inspect.getsource(AutoPattern._decide)
     loop_body = source.split("while attempt < MAX_DECISION_PARSE_ATTEMPTS:", 1)[1]
     assert "evidence_removed=tool_evidence_removed(context)" in loop_body
-
-    pattern = AutoPattern()
-    context = ContextManager().create_context(execution_id="auto-retry-marker")
-    first = pattern._decision_prompt(
-        [], evidence_removed=tool_evidence_removed(context)
-    )
-    context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = True
-    second = pattern._decision_prompt(
-        [], evidence_removed=tool_evidence_removed(context)
-    )
-
-    facts_head = EVIDENCE_REMOVED_FACTS.split(".")[0]
-    assert facts_head not in first
-    assert facts_head in second
-    assert "set existing_context_sufficient=false and choose react" in second

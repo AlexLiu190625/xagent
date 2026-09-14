@@ -14,7 +14,6 @@ from xagent.core.agent import ExecutionContext
 from xagent.core.agent.context import ContextManager
 
 OBSERVATION_MARKER = "CLIENT_ROW_MARKER_{index}"
-SUMMARY_MARKER = "COMPACTION_SUMMARY_MARKER"
 
 
 class ScriptedLLM:
@@ -34,10 +33,8 @@ class ScriptedLLM:
 class CompactingLLM(ScriptedLLM):
     """A compact model that declares a window, so compaction is not refused."""
 
-    def __init__(self, context_window: int = 200_000, summary: str | None = None):
-        super().__init__()
-        self.context_window = context_window
-        self.summary = summary or f"{SUMMARY_MARKER}: the agent listed clients."
+    context_window = 200_000
+    summary = "COMPACTION_SUMMARY_MARKER: the agent listed clients."
 
     async def chat(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
@@ -55,26 +52,13 @@ class WindowlessCompactingLLM(ScriptedLLM):
 def build_context(
     *,
     observations: int = 6,
-    execution_id: str = "exec-forced-answer",
     threshold: int | None = None,
-    max_messages: int = 4,
-    via_manager: bool = True,
 ) -> ExecutionContext:
-    """A context holding ``observations`` tool results, each uniquely marked.
-
-    ``via_manager`` defaults to True: a context built directly carries no
-    marker key and reads as "evidence was removed", which is right as a
-    fail-safe and wrong as a starting point for a cell asserting main's wording.
-    """
-    if via_manager:
-        context = ContextManager().create_context(
-            execution_id=execution_id,
-            system_prompt="You are helpful.",
-        )
-    else:
-        context = ExecutionContext(
-            system_prompt="You are helpful.", execution_id=execution_id
-        )
+    """A context holding ``observations`` tool results, each uniquely marked."""
+    context = ContextManager().create_context(
+        execution_id="exec-forced-answer",
+        system_prompt="You are helpful.",
+    )
     context.add_user_message("List every client and their shifts.")
     for index in range(observations):
         context.add_assistant_message(
@@ -95,7 +79,7 @@ def build_context(
                 "rows": [OBSERVATION_MARKER.format(index=index)] * 40,
             },
         )
-    context.compact_config.max_messages = max_messages
+    context.compact_config.max_messages = 4
     if threshold is not None:
         context.compact_config.threshold = threshold
     return context
