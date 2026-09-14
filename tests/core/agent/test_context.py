@@ -2663,30 +2663,34 @@ _MARKER = execution_module.TOOL_EVIDENCE_REMOVED_METADATA_KEY
 @pytest.mark.parametrize(
     "stored, expected",
     [
-        ({}, True),
-        ({_MARKER: False}, False),
-        ({_MARKER: True}, True),
-        ({_MARKER: None}, True),
-        ({_MARKER: 0}, True),
-        ({_MARKER: 1}, True),
-        ({_MARKER: "false"}, True),
-        ({_MARKER: ""}, True),
-        ({_MARKER: []}, True),
+        ({}, "unknown"),
+        ({_MARKER: False}, "intact"),
+        ({_MARKER: True}, "removed"),
+        ({_MARKER: None}, "removed"),
+        ({_MARKER: 0}, "removed"),
+        ({_MARKER: 1}, "removed"),
+        ({_MARKER: "false"}, "removed"),
+        ({_MARKER: ""}, "removed"),
+        ({_MARKER: []}, "removed"),
+        ({"other": 1}, "unknown"),
     ],
     ids="absent literal_false literal_true none zero one string_false "
-    "empty_string empty_list".split(),
+    "empty_string empty_list other_keys_only_no_marker".split(),
 )
-def test_tool_evidence_removed_reads_only_literal_false_as_intact(
-    stored: dict[str, object], expected: bool
+def test_tool_evidence_state_separates_absent_from_corrupt(
+    stored: dict[str, object], expected: str
 ) -> None:
-    """Anything not literally False degrades toward caution.
+    """Absence and corruption are different facts, so they read differently.
 
-    ``bool(metadata.get(KEY, True))`` reads ``0`` and ``""`` as intact, which
-    is the direction that puts the fabricated answer back.
+    Absence means a payload that never carried the key -- an older build that
+    did not track this, about which neither "removed" nor "intact" can be
+    said. A key that is present but not literally False means a build that
+    did track this recorded something other than "nothing was removed", and
+    that reads as removed regardless of what shape the value takes.
     """
     context = ExecutionContext(execution_id="marker-read")
     context.metadata.update(stored)
-    assert execution_module.tool_evidence_removed(context) is expected
+    assert execution_module.tool_evidence_state(context) == expected
 
 
 @pytest.mark.parametrize(
@@ -2697,8 +2701,14 @@ def test_tool_evidence_removed_reads_only_literal_false_as_intact(
 def test_marker_helpers_tolerate_a_context_without_dict_metadata(
     context: object,
 ) -> None:
-    """A stand-in object degrades to caution and never raises."""
-    assert execution_module.tool_evidence_removed(context) is True
+    """A stand-in object degrades to removed, never to unknown, and never raises.
+
+    "Unknown" states a fact about a payload's provenance -- a build old
+    enough to predate this key. A malformed object carries no provenance to
+    state that fact about, so it takes the same fail-safe reading as any
+    other value that is not literally False, rather than the weaker one.
+    """
+    assert execution_module.tool_evidence_state(context) == "removed"
     execution_module.note_compaction_evidence_loss(
         context, execution_module.CompactResult(True, 2, 1, "truncate", {})
     )
@@ -2722,12 +2732,18 @@ def test_the_marker_survives_a_checkpoint_round_trip() -> None:
     assert restored.metadata[_MARKER] is True
 
 
-def test_a_checkpoint_written_without_the_key_reads_as_removed() -> None:
-    """Older builds dropped observations on the truncate path silently."""
+def test_a_checkpoint_written_without_the_key_reads_as_unknown() -> None:
+    """An older build's payload carries no key, and neither answer is available.
+
+    Those builds dropped observations on the truncate path without leaving a
+    word in the context, and they also completed runs that lost nothing; the
+    payload does not say which happened, so this reads as unknown rather than
+    as either "removed" or "intact".
+    """
     payload = ContextManager().create_context(execution_id="marker-old").to_dict()
     payload["metadata"].pop(_MARKER, None)
     restored = ExecutionContext.from_dict(json.loads(json.dumps(payload)))
-    assert execution_module.tool_evidence_removed(restored) is True
+    assert execution_module.tool_evidence_state(restored) == "unknown"
 
 
 def test_a_later_question_on_the_same_context_keeps_the_marker() -> None:
@@ -2740,7 +2756,7 @@ def test_a_later_question_on_the_same_context_keeps_the_marker() -> None:
         ),
     )
     context.add_user_message("and what about last week?")
-    assert execution_module.tool_evidence_removed(context) is True
+    assert execution_module.tool_evidence_state(context) == "removed"
 
 
 def test_a_child_context_inherits_the_marker_and_keeps_its_own_copy() -> None:
@@ -2758,7 +2774,7 @@ def test_a_child_context_inherits_the_marker_and_keeps_its_own_copy() -> None:
     child_a = root.create_child_context()
     child_b = root.create_child_context()
     assert child_a.metadata is not child_b.metadata
-    assert execution_module.tool_evidence_removed(child_a) is False
+    assert execution_module.tool_evidence_state(child_a) == "intact"
 
     execution_module.note_compaction_evidence_loss(
         child_a,
@@ -2769,9 +2785,9 @@ def test_a_child_context_inherits_the_marker_and_keeps_its_own_copy() -> None:
     child_a.compact_config.max_messages = 1
     child_a.compact_if_needed()
 
-    assert execution_module.tool_evidence_removed(child_a) is True
-    assert execution_module.tool_evidence_removed(child_b) is False
-    assert execution_module.tool_evidence_removed(root) is False
+    assert execution_module.tool_evidence_state(child_a) == "removed"
+    assert execution_module.tool_evidence_state(child_b) == "intact"
+    assert execution_module.tool_evidence_state(root) == "intact"
     assert len(root.messages) == root_messages_before
 
     inherited = root.create_child_context()
@@ -2781,5 +2797,15 @@ def test_a_child_context_inherits_the_marker_and_keeps_its_own_copy() -> None:
             True, 9, 2, "truncate", {"dropped_tool_result_count": 1}
         ),
     )
-    assert execution_module.tool_evidence_removed(inherited) is False
-    assert execution_module.tool_evidence_removed(root.create_child_context()) is True
+    assert execution_module.tool_evidence_state(inherited) == "intact"
+    assert (
+        execution_module.tool_evidence_state(root.create_child_context()) == "removed"
+    )
+
+    # A child created from a root whose key is absent inherits absence too:
+    # create_child_context copies metadata rather than sharing it, so a
+    # missing key stays missing rather than being filled in along the way.
+    unknown_root = ContextManager().create_context(execution_id="marker-unknown-root")
+    unknown_root.metadata.pop(_MARKER, None)
+    unknown_child = unknown_root.create_child_context()
+    assert execution_module.tool_evidence_state(unknown_child) == "unknown"

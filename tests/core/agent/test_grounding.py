@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import pytest
+
 import xagent.core.agent.grounding as grounding
 from xagent.core.agent.grounding import (
     EVIDENCE_REMOVED_FACTS,
+    EVIDENCE_UNKNOWN_FACTS,
     VALUE_KINDS,
+    evidence_facts,
     grounding_rule,
 )
 
@@ -345,3 +349,43 @@ def test_evidence_removed_facts_states_the_loss_and_forbids_reconstruction() -> 
         "reconstruct, estimate, or illustrate a removed value, and do not "
         "present one as an example. "
     )
+
+
+def test_evidence_unknown_facts_states_the_uncertainty_and_forbids_reconstruction() -> (
+    None
+):
+    """The sentence a payload with no marker key carries, pinned once.
+
+    Mirrors the pin on ``EVIDENCE_REMOVED_FACTS`` above: the wording lives
+    here, so rewording it is one deliberate edit rather than a sweep across
+    every suite that quotes it. It states uncertainty rather than an
+    engine-version self-reference: nothing here tells the model which build
+    wrote the payload, only that this context does not record the answer.
+    """
+    assert EVIDENCE_UNKNOWN_FACTS == (
+        "This context carries no record of whether compaction removed tool "
+        "observations from it, so that cannot be determined. Treat any "
+        "value not literally present in the context -- "
+        f"{VALUE_KINDS} -- as unavailable rather than recalled. Do not "
+        "reconstruct, estimate, or illustrate such a value, and do not "
+        "present one as an example. "
+    )
+
+
+@pytest.mark.parametrize(
+    "state, expected",
+    [
+        ("intact", ""),
+        ("removed", EVIDENCE_REMOVED_FACTS),
+        ("unknown", EVIDENCE_UNKNOWN_FACTS),
+        ("corrupted-or-unrecognized", EVIDENCE_REMOVED_FACTS),
+    ],
+    ids=["intact", "removed", "unknown", "unrecognized_falls_to_removed"],
+)
+def test_evidence_facts_selects_by_state(state: str, expected: str) -> None:
+    """An unrecognized state falls to the removed wording, not to silence.
+
+    Silence is the branch that puts the fabricated answer back, so a state
+    string this function does not recognize must not be treated as intact.
+    """
+    assert evidence_facts(state) == expected

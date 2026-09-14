@@ -33,9 +33,14 @@ from xagent.core.agent.context.execution import (
 from xagent.core.agent.context.execution import (
     CompactResult,
     note_compaction_evidence_loss,
-    tool_evidence_removed,
+    tool_evidence_state,
 )
-from xagent.core.agent.grounding import EVIDENCE_REMOVED_FACTS, grounding_rule
+from xagent.core.agent.grounding import (
+    EVIDENCE_REMOVED_FACTS,
+    EVIDENCE_UNKNOWN_FACTS,
+    evidence_facts,
+    grounding_rule,
+)
 from xagent.core.agent.pattern.auto.auto import (
     DECISION_TOOL_NAME,
     AutoAction,
@@ -48,6 +53,30 @@ from xagent.core.model.chat.exceptions import (
 )
 
 FACTS_HEAD = EVIDENCE_REMOVED_FACTS.split(".")[0]
+UNKNOWN_FACTS_HEAD = EVIDENCE_UNKNOWN_FACTS.split(".")[0]
+
+STATES = [
+    pytest.param("intact", id="intact"),
+    pytest.param("removed", id="removed"),
+    pytest.param("unknown", id="unknown"),
+]
+
+
+def apply_state(context: ExecutionContext, state: str) -> None:
+    """Put a context into one evidence state, absence included."""
+    if state == "unknown":
+        context.metadata.pop(KEY, None)
+    else:
+        context.metadata[KEY] = state == "removed"
+
+
+def facts_head(state: str) -> str:
+    """The head fragment expected in text for one evidence state, empty for intact."""
+    if state == "intact":
+        return ""
+    if state == "unknown":
+        return UNKNOWN_FACTS_HEAD
+    return FACTS_HEAD
 
 
 def tool_call(name: str, arguments: str = "{}") -> dict[str, Any]:
@@ -539,7 +568,7 @@ def _dag_assessment(context: ExecutionContext) -> str:
 
 def _auto_decision(context: ExecutionContext) -> str:
     return AutoPattern()._decision_prompt(
-        [], evidence_removed=tool_evidence_removed(context)
+        [], evidence_state=tool_evidence_state(context)
     )
 
 
@@ -599,33 +628,47 @@ RULE_LEAD_INS = {
 
 
 @pytest.mark.parametrize("build, _main_fragments, _carries_grounding_rule", CONSUMERS)
+@pytest.mark.parametrize("state", STATES)
 def test_every_toolless_answer_prompt_states_the_loss(
-    build: Any, _main_fragments: tuple[str, ...], _carries_grounding_rule: bool
+    build: Any,
+    _main_fragments: tuple[str, ...],
+    _carries_grounding_rule: bool,
+    state: str,
 ) -> None:
-    """Every tool-less answer prompt carries the facts, and none of them claims accumulated results.
+    """Every tool-less answer prompt carries the facts for its state.
 
-    The scope of the second assertion is the prompt this builder writes for
-    this turn, not the whole payload: a guidance line written into the context
-    on an earlier turn can still carry main's wording, which is an acknowledged
-    gap no per-turn builder can reach.
+    None of the three non-intact states claims accumulated results. The scope
+    of that assertion is the prompt this builder writes for this turn, not
+    the whole payload: a guidance line written into the context on an earlier
+    turn can still carry main's wording, which is an acknowledged gap no
+    per-turn builder can reach.
     """
     context = build_context(observations=2, threshold=500)
-    context.metadata[KEY] = True
+    apply_state(context, state)
     text = build(context)
-    assert FACTS_HEAD in text
-    assert "accumulated" not in text
+    assert evidence_facts(state) == "" or facts_head(state) in text
+    if state == "intact":
+        assert FACTS_HEAD not in text
+        assert UNKNOWN_FACTS_HEAD not in text
+    else:
+        assert "accumulated" not in text
 
 
 @pytest.mark.parametrize("build, _main_fragments, carries_grounding_rule", CONSUMERS)
+@pytest.mark.parametrize("state", ["removed", "unknown"])
 def test_the_loss_is_stated_before_the_shared_grounding_rule(
-    build: Any, _main_fragments: tuple[str, ...], carries_grounding_rule: bool
+    build: Any,
+    _main_fragments: tuple[str, ...],
+    carries_grounding_rule: bool,
+    state: str,
 ) -> None:
     """Which of the two comes first is a decision, so it is pinned at every site.
 
     The three prompts that carry both state what is no longer readable before
-    the wider rule about answering from sources. The fourth builder carries no
-    shared rule at all; that exclusion is asserted rather than left silent, so
-    adding the rule there without picking an order reddens this cell.
+    the wider rule about answering from sources, in either non-intact state.
+    The fourth builder carries no shared rule at all; that exclusion is
+    asserted rather than left silent, so adding the rule there without
+    picking an order reddens this cell.
 
     For the two sites with a colon lead-in into the shared rule, nothing may
     be spliced between that colon and the rule it introduces -- moving the
@@ -634,20 +677,21 @@ def test_the_loss_is_stated_before_the_shared_grounding_rule(
     colon points at.
     """
     context = build_context(observations=2, threshold=500)
-    context.metadata[KEY] = True
+    apply_state(context, state)
     text = build(context)
+    head = facts_head(state)
     grounding_head = grounding_rule(can_call_tools=False).split(".")[0]
-    assert FACTS_HEAD in text
+    assert head in text
     if not carries_grounding_rule:
         assert grounding_head not in text
         return
-    assert text.index(FACTS_HEAD) < text.index(grounding_head)
+    assert text.index(head) < text.index(grounding_head)
 
     lead_in = RULE_LEAD_INS.get(build)
     if lead_in is None:
         return
     # The colon introduces the shared rule; nothing may be spliced between them.
-    assert text.index(FACTS_HEAD) < text.index(lead_in)
+    assert text.index(head) < text.index(lead_in)
     after = text[text.index(lead_in) + len(lead_in) :]
     assert after.lstrip().startswith(grounding_head)
 
@@ -670,24 +714,31 @@ def test_a_run_that_never_lost_anything_reads_exactly_like_main(
         assert fragment in text
 
 
-def test_the_outcome_rule_stays_a_conditional() -> None:
-    """A dropped result message is not a dropped action."""
+@pytest.mark.parametrize("state", ["removed", "unknown"])
+def test_the_outcome_rule_stays_a_conditional(state: str) -> None:
+    """A dropped result message is not a dropped action, in either non-intact state."""
     context = build_context(observations=2, threshold=500)
-    context.metadata[KEY] = True
+    apply_state(context, state)
     text = _react_forced(context)
     assert "outcome=completed" in text
     assert "Do not rest an outcome=completed claim on an observation" in text
     assert "outcome=completed is unavailable" not in text
+    if state == "unknown":
+        assert "you cannot read in this context" in text
+        assert "that was removed" not in text
+    else:
+        assert "that was removed" in text
+        assert "you cannot read in this context" not in text
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("removed", [True, False], ids=["removed", "intact"])
+@pytest.mark.parametrize("state", ["removed", "intact", "unknown"])
 async def test_the_guidance_written_into_the_context_matches_the_marker(
-    removed: bool,
+    state: str,
 ) -> None:
     """This guidance is history, so it must agree with the next prompt."""
     context = build_context(observations=2, threshold=500)
-    context.metadata[KEY] = removed
+    apply_state(context, state)
     pattern = ReActPattern()
     pattern.repeated_tool_decision = {
         "tool_name": "list_clients",
@@ -704,11 +755,17 @@ async def test_the_guidance_written_into_the_context_matches_the_marker(
     )
     guidance = context.messages[-1].content
     assert guidance.startswith("Repeated tool decision completion guidance")
-    if removed:
+    if state == "removed":
         assert "accumulated" not in guidance
         assert "Compaction has removed tool observations from this run" in guidance
         # End to end: the forced turn that reads this message back must not
         # find main's claim sitting in its own payload.
+        _, llm = await run_one_turn(context=context, forced=True)
+        assert "accumulated" not in prompt_text(llm.calls[0]["messages"])
+    elif state == "unknown":
+        assert "accumulated" not in guidance
+        assert "cannot be determined" in guidance
+        assert "Compaction has removed" not in guidance
         _, llm = await run_one_turn(context=context, forced=True)
         assert "accumulated" not in prompt_text(llm.calls[0]["messages"])
     else:
@@ -724,7 +781,8 @@ async def test_the_guidance_written_into_the_context_matches_the_marker(
 
 
 @pytest.mark.asyncio
-async def test_protocol_repair_retry_inherits_the_same_wording() -> None:
+@pytest.mark.parametrize("state", ["removed", "unknown"])
+async def test_protocol_repair_retry_inherits_the_same_wording(state: str) -> None:
     """The repair retry inside a forced turn carries the same wording.
 
     The retry is reached, not simulated: the first response calls
@@ -734,7 +792,7 @@ async def test_protocol_repair_retry_inherits_the_same_wording() -> None:
     the ordinary forced prompt could not pass as this one.
     """
     context = build_context(observations=2, threshold=500)
-    context.metadata[KEY] = True
+    apply_state(context, state)
     llm = ScriptedLLM([empty_final_answer_call(), final_answer_call()])
     pattern = ReActPattern(max_iterations=1)
     pattern.force_final_answer_next = True
@@ -750,7 +808,7 @@ async def test_protocol_repair_retry_inherits_the_same_wording() -> None:
     assert len(llm.calls) == 2
     repair = prompt_text(llm.calls[1]["messages"])
     assert "called final_answer with an empty answer field" in repair
-    assert FACTS_HEAD in repair
+    assert facts_head(state) in repair
     assert "accumulated" not in repair
 
 

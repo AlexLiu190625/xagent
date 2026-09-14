@@ -2548,16 +2548,16 @@ def test_routing_prompt_is_rebuilt_with_the_marker_on_every_parse_retry() -> Non
     """
     source = inspect.getsource(AutoPattern._decide)
     loop_body = source.split("while attempt < MAX_DECISION_PARSE_ATTEMPTS:", 1)[1]
-    assert "evidence_removed=tool_evidence_removed(context)" in loop_body
+    assert "evidence_state=tool_evidence_state(context)" in loop_body
 
 
 def test_the_routing_prompt_has_no_second_default_for_the_marker() -> None:
     """The read function holds the default, so the prompt builder must not.
 
     Two holders of the same default drift: a caller that forgets to pass the
-    flag renders main's wording on a run that really did lose observations.
+    state renders main's wording on a run that really did lose observations.
     """
     parameter = inspect.signature(AutoPattern._decision_prompt).parameters[
-        "evidence_removed"
+        "evidence_state"
     ]
     assert parameter.default is inspect.Parameter.empty

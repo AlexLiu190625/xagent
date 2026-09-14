@@ -19,8 +19,9 @@ from ...context.enrichment import (
     enrich_context_with_memory,
 )
 from ...context.execution import (
+    EvidenceState,
     note_compaction_evidence_loss,
-    tool_evidence_removed,
+    tool_evidence_state,
 )
 from ...context.skill_tool import (
     LOAD_SKILL_TOOL_NAME,
@@ -30,7 +31,7 @@ from ...context.skill_tool import (
     build_load_skill_tool,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
-from ...grounding import EVIDENCE_REMOVED_FACTS, VALUE_KINDS, grounding_rule
+from ...grounding import VALUE_KINDS, evidence_facts, grounding_rule
 from ...language import (
     final_answer_language_rule,
     reset_metadata_output_language,
@@ -819,10 +820,10 @@ class AutoPattern(AgentPattern):
                 tools,
                 memory_tools_available=memory_tools_available,
                 skill_loading_available=skill_loading_available,
-                # Recomputed on every parse retry on purpose: the marker only
-                # ever moves from False to True, so a compaction between two
+                # Recomputed on every parse retry on purpose: the state only
+                # ever moves toward removed, so a compaction between two
                 # attempts must not be missed.
-                evidence_removed=tool_evidence_removed(context),
+                evidence_state=tool_evidence_state(context),
             )
             routing_tools = [self._decision_tool_schema()]
             if skill_loading_available and load_skill_tool is not None:
@@ -1254,7 +1255,7 @@ class AutoPattern(AgentPattern):
         *,
         memory_tools_available: bool = False,
         skill_loading_available: bool = False,
-        evidence_removed: bool,
+        evidence_state: EvidenceState,
     ) -> str:
         memory_rule = (
             "If the latest user message asks to remember, store, forget, or "
@@ -1311,7 +1312,7 @@ class AutoPattern(AgentPattern):
             "when action is final_answer, you must include a complete non-empty "
             "answer field in the same tool call. Put action before answer in the "
             "tool arguments. "
-            f"{EVIDENCE_REMOVED_FACTS if evidence_removed else ''}"
+            f"{evidence_facts(evidence_state)}"
             f"When writing that answer field: {grounding_rule(can_call_tools=False)} "
             "If the answer would need any value the rule above forbids you to "
             f"supply -- {VALUE_KINDS} -- that no source here supports, set "

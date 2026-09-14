@@ -19,9 +19,9 @@ from ...context.enrichment import (
     pending_user_response_marker,
     top_level_user_request,
 )
-from ...context.execution import tool_evidence_removed
+from ...context.execution import tool_evidence_state
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
-from ...grounding import EVIDENCE_REMOVED_FACTS, grounding_rule
+from ...grounding import evidence_facts, grounding_rule
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     effective_output_language,
@@ -1566,7 +1566,7 @@ class DAGPattern(AgentPattern):
         # anything back, and its payload filters out system messages -- so the
         # compaction summary never reaches it and this is the only place the
         # loss can be stated.
-        evidence_rule = EVIDENCE_REMOVED_FACTS if tool_evidence_removed(context) else ""
+        evidence_rule = evidence_facts(tool_evidence_state(context))
         return [
             {
                 "role": "system",

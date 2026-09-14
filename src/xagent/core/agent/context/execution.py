@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -262,19 +262,37 @@ def note_compaction_evidence_loss(context: Any, result: Any) -> None:
         metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = True
 
 
-def tool_evidence_removed(context: Any) -> bool:
-    """Whether a compaction on this context has removed tool observations.
+EvidenceState = Literal["intact", "removed", "unknown"]
 
-    Absent reads as True. Every context this build creates carries the key from
-    ``ContextManager.create_context``, so an absent key means a payload written
-    by a build that did not track this -- and those builds drop tool
-    observations on the truncate path without leaving a word in the context.
-    Anything that is not literally ``False`` reads as True for the same reason.
+
+def tool_evidence_state(context: Any) -> EvidenceState:
+    """Whether a compaction on this context removed tool observations.
+
+    Three states, because two cannot tell "nothing was removed" apart from
+    "no one was keeping track". ``ContextManager.create_context`` stamps the
+    key False on every context this build creates, so:
+
+    - the key literally ``False`` is this build saying nothing was removed;
+    - the key absent is a payload written by a build that did not track this,
+      about which neither answer can be given -- those builds drop tool
+      observations on the truncate path without leaving a word in the context,
+      and they also complete runs that lost nothing, and the payload does not
+      say which one happened;
+    - anything else -- ``True``, a corrupt value, or a context object whose
+      metadata is not a dict -- reads as removed. A corrupt or malformed
+      payload is not an old payload: "unknown" states a fact about the
+      writer's provenance, and stating it about a payload that does carry the
+      key would be a claim this function cannot support. Removed is both the
+      fail-safe direction and the only one that asserts nothing false.
     """
     metadata = getattr(context, "metadata", None)
     if not isinstance(metadata, dict):
-        return True
-    return metadata.get(TOOL_EVIDENCE_REMOVED_METADATA_KEY, True) is not False
+        return "removed"
+    if TOOL_EVIDENCE_REMOVED_METADATA_KEY not in metadata:
+        return "unknown"
+    return (
+        "intact" if metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] is False else "removed"
+    )
 
 
 @dataclass

@@ -46,8 +46,8 @@ class ContextManager:
             system_prompt=system_prompt,
         )
         # Stamped on every context this build creates, so that an absent key
-        # means "written by a build that did not track this" and reads
-        # fail-safe. See tool_evidence_removed.
+        # means "written by a build that did not track this" and reads as
+        # unknown. See tool_evidence_state.
         context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = False
         if any(
             value is not None
