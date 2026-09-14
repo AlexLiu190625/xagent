@@ -137,7 +137,9 @@ class CurrentTimeTool(AbstractBaseTool):
             "date-and-time line to get local time alongside UTC. This reports "
             "only the present moment: to turn some other local date and time "
             "into UTC, or to check whether one exists in a zone that changes "
-            "its clocks, call the validate_local_time tool if it is available."
+            "its clocks, call the validate_local_time tool if it is available. "
+            "To turn a date or time the user wrote in words into an exact "
+            "date-time, call the resolve_datetime tool if it is available."
         )
 
     def args_type(self) -> Type[BaseModel]:
@@ -322,7 +324,9 @@ class ValidateLocalTimeTool(AbstractBaseTool):
             "abbreviation from each mapping rather than recalling which one the "
             "zone uses in a given season, and note that only the local clock "
             "jumps at such a change -- UTC itself runs continuously. For the "
-            "time right now use get_current_time instead."
+            "time right now use get_current_time instead. To resolve a spoken "
+            "or relative expression such as 'tomorrow at 3pm' use "
+            "resolve_datetime."
         )
 
     def args_type(self) -> Type[BaseModel]:
@@ -886,3 +890,80 @@ def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
     return ResolveDatetimeResult(
         resolved=resolved, has_time=has_time, timezone=zone.key
     ).model_dump()
+
+
+class ResolveDatetimeArgs(BaseModel):
+    phrase: str = Field(
+        description=(
+            "The user's exact words for the date or time, copied verbatim from "
+            "a user message: for example 'tomorrow at 3pm', 'next Friday', "
+            "'1 Jan 1990', '下周三上午十点'. Do not rephrase, translate, or "
+            "shorten it."
+        )
+    )
+    # Field name is the wire contract; it locally shadows the datetime.timezone
+    # import, which this class body does not use.
+    timezone: str = Field(
+        description=(
+            "IANA zone name in Region/City form the phrase should be read in, "
+            "for example 'Australia/Sydney', or 'UTC'. Copy the zone named in "
+            "the system prompt's date-and-time line unless the user named "
+            "another zone. An abbreviation ('EST'), a bare city ('Sydney'), or "
+            "an 'Etc/*' name is an error, not a fallback to UTC."
+        )
+    )
+
+
+class ResolveDatetimeTool(AbstractBaseTool):
+    """Turns a date or time the user wrote in words into an exact ISO
+    date-time with a UTC offset, deterministically from the clock and tzdata;
+    anything the grammar cannot read is refused rather than guessed."""
+
+    category = ToolCategory.OTHER
+    read_only = True  # reads a clock and tzdata ⇒ concurrency-safe
+
+    def __init__(self) -> None:
+        self._visibility = ToolVisibility.PUBLIC
+
+    @property
+    def name(self) -> str:
+        return "resolve_datetime"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Turn a date or time the user wrote in words into an exact ISO "
+            "8601 date-time with a UTC offset, computed from the real clock "
+            "and the IANA zone database. Use it before filling a date or "
+            "date-time field from a relative or spoken expression such as "
+            "'tomorrow at 3pm', 'next Friday', 'in 3 days', '3pm', "
+            "'1 Jan 1990', '下周三上午十点'. Pass the user's exact words as "
+            "phrase. Pass the zone named in the system prompt's date-and-time "
+            "line as timezone. An expression outside the supported forms, a "
+            "date that reads two ways (day-first or month-first), or a local "
+            "time that does not exist or occurs twice at a daylight-saving "
+            "change is refused with a reason instead of guessed: then ask the "
+            "user. For the time right now use get_current_time; to check a "
+            "specific wall-clock time in a zone use validate_local_time."
+        )
+
+    def args_type(self) -> Type[BaseModel]:
+        return ResolveDatetimeArgs
+
+    def return_type(self) -> Type[BaseModel]:
+        return ResolveDatetimeResult
+
+    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+        parsed = ResolveDatetimeArgs.model_validate(args)
+        # Already a dict: a success is the result model dumped, a refusal is
+        # the framework-shaped failure mapping.
+        return resolve_datetime(parsed.phrase, parsed.timezone)
+
+    async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        return self.run_json_sync(args)
+
+
+@register_tool(selection_gate="intrinsic")
+async def create_resolve_datetime_tool(config: WebToolConfig) -> list[AbstractBaseTool]:
+    """Create the date-time resolution tool."""
+    return [ResolveDatetimeTool()]

@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timezone
 
 import pytest
+from pydantic import ValidationError
 
+from tests.core.tools.test_current_time_tool import _FakeConfig
 from xagent.core.tools.adapters.vibe import current_time_tool as module
+from xagent.core.tools.adapters.vibe.base import ToolCategory
 from xagent.core.tools.adapters.vibe.current_time_tool import (
     GRAMMAR_FORMS,
     RESOLUTION_REASONS,
+    CurrentTimeTool,
     ResolveDatetimeResult,
+    ResolveDatetimeTool,
+    ValidateLocalTimeTool,
     resolve_datetime,
     validate_local_time,
 )
+from xagent.core.tools.adapters.vibe.factory import ToolFactory, ToolRegistry
+from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
 # Tuesday 2026-09-15 12:30 in Sydney (AEST), 10:30 in Shanghai.
 FROZEN = datetime(2026, 9, 15, 2, 30, 0, tzinfo=timezone.utc)
@@ -160,3 +169,72 @@ def test_phrase_zone_name_is_refused() -> None:
 
     assert result["success"] is False
     assert result["resolution"] == "unsupported_expression"
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        (ToolSelectionSpec.from_raw(tool_categories=None), 1),  # ALL
+        (ToolSelectionSpec.from_raw(tool_categories=["web_search"]), 1),  # non-basic
+        (ToolSelectionSpec.from_raw(tool_categories=[]), 0),  # explicit NONE
+    ],
+)
+async def test_resolve_datetime_is_intrinsic(
+    spec: ToolSelectionSpec, expected: int
+) -> None:
+    """The full factory pipeline assembles exactly one usable
+    resolve_datetime for any non-NONE selection -- including one that
+    never picks the basic category -- and none for an explicit NONE."""
+    tools = await ToolFactory.create_all_tools(
+        _FakeConfig(spec), apply_user_override_filter=False
+    )
+
+    assert [t.name for t in tools].count("resolve_datetime") == expected
+
+
+async def test_resolve_datetime_creator_is_skipped_for_explicit_none() -> None:
+    """The registry gate must not even build the intrinsic tool for an
+    explicit zero-tools agent: the NONE contract wins over always-on."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=[])
+
+    tools = await ToolRegistry.create_registered_tools(_FakeConfig(spec))
+
+    assert "resolve_datetime" not in [getattr(t, "name", None) for t in tools]
+
+
+def test_tool_declares_read_only_other_identity() -> None:
+    metadata = ResolveDatetimeTool().metadata
+
+    assert metadata.name == "resolve_datetime"
+    assert metadata.read_only is True
+    assert metadata.concurrency_safe is True
+    assert metadata.category is ToolCategory.OTHER
+
+
+def test_time_tools_cross_reference() -> None:
+    description = ResolveDatetimeTool().description
+
+    assert "get_current_time" in description
+    assert "validate_local_time" in description
+    assert "resolve_datetime" in CurrentTimeTool().description
+    assert "resolve_datetime" in ValidateLocalTimeTool().description
+    # The description promises only what the engine does at this point: no
+    # verbatim-span refusal and no instruction to quote the result as a source.
+    assert "refused when that text" not in description
+    assert "Quote the result" not in description
+
+
+def test_tool_runs_through_the_json_surface() -> None:
+    tool = ResolveDatetimeTool()
+
+    assert tool.run_json_sync({"phrase": "tomorrow at 3pm", "timezone": SYDNEY}) == {
+        "resolved": "2026-09-16T15:00:00+10:00",
+        "has_time": True,
+        "timezone": SYDNEY,
+    }
+
+    refused = asyncio.run(tool.run_json_async({"phrase": "soon", "timezone": "UTC"}))
+    assert refused["resolution"] == "unsupported_expression"
+
+    with pytest.raises(ValidationError):
+        tool.run_json_sync({"phrase": "tomorrow"})
