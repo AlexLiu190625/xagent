@@ -12,6 +12,7 @@ import ast
 import json
 import logging
 import pathlib
+import re
 from typing import Any
 
 import pytest
@@ -267,9 +268,13 @@ async def test_the_skip_is_logged_with_numbers_only(
     """One info line per skipped compaction, ids and numbers only.
 
     ``over_threshold`` is what separates a skip that mattered from one on a
-    turn that was never going to compact anyway.
+    turn that was never going to compact anyway. The logged ``context_tokens``
+    number is asserted to be this turn's real payload -- the persisted
+    messages plus the tool schemas and forced-answer system prompt actually
+    sent -- and not just the persisted message list, which undercounts it.
     """
     context = build_context(observations=6, threshold=threshold)
+    persisted_only = context.estimate_context_tokens()
     with caplog.at_level(logging.INFO, logger="xagent.core.agent.pattern.react.react"):
         await run_one_turn(context=context, forced=forced)
 
@@ -286,6 +291,10 @@ async def test_the_skip_is_logged_with_numbers_only(
     assert expected in lines[0]
     assert OBSERVATION_MARKER.format(index=0) not in lines[0]
     assert "list_clients" not in lines[0]
+
+    logged = int(re.search(r"context_tokens=(\d+)", lines[0]).group(1))
+    # The logged number is this turn's real payload, not the persisted list.
+    assert logged > persisted_only
 
 
 # --------------------------------------------------------------------------
@@ -577,6 +586,18 @@ CONSUMERS = [
 ]
 
 
+# The colon that introduces the shared grounding rule at each site. Kept out
+# of CONSUMERS so the two cells with no lead-in are not forced to carry an
+# empty placeholder value.
+RULE_LEAD_INS = {
+    _dag_assessment: (
+        "When writing the answer field, including any content carried over "
+        "from candidate_output or step_results:"
+    ),
+    _auto_decision: "When writing that answer field:",
+}
+
+
 @pytest.mark.parametrize("build, _main_fragments, _carries_grounding_rule", CONSUMERS)
 def test_every_toolless_answer_prompt_states_the_loss(
     build: Any, _main_fragments: tuple[str, ...], _carries_grounding_rule: bool
@@ -605,6 +626,12 @@ def test_the_loss_is_stated_before_the_shared_grounding_rule(
     the wider rule about answering from sources. The fourth builder carries no
     shared rule at all; that exclusion is asserted rather than left silent, so
     adding the rule there without picking an order reddens this cell.
+
+    For the two sites with a colon lead-in into the shared rule, nothing may
+    be spliced between that colon and the rule it introduces -- moving the
+    lead-in ahead of the facts (rather than reordering facts and rule) would
+    satisfy the plain ordering check above while still breaking what the
+    colon points at.
     """
     context = build_context(observations=2, threshold=500)
     context.metadata[KEY] = True
@@ -615,6 +642,14 @@ def test_the_loss_is_stated_before_the_shared_grounding_rule(
         assert grounding_head not in text
         return
     assert text.index(FACTS_HEAD) < text.index(grounding_head)
+
+    lead_in = RULE_LEAD_INS.get(build)
+    if lead_in is None:
+        return
+    # The colon introduces the shared rule; nothing may be spliced between them.
+    assert text.index(FACTS_HEAD) < text.index(lead_in)
+    after = text[text.index(lead_in) + len(lead_in) :]
+    assert after.lstrip().startswith(grounding_head)
 
 
 @pytest.mark.parametrize("build, main_fragments, _carries_grounding_rule", CONSUMERS)
