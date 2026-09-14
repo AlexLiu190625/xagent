@@ -221,8 +221,8 @@ def _mapping(local: datetime, utc: datetime) -> LocalTimeMapping:
     )
 
 
-def validate_local_time(local_time: str, timezone_name: str) -> ValidateLocalTimeResult:
-    """Resolve a wall-clock time in a zone to every UTC instant it names."""
+def _require_region_city_zone(timezone_name: str) -> ZoneInfo:
+    """Resolve a zone whose offset is part of the answer: Region/City or UTC only."""
     zone = _resolve_zone(timezone_name)
     if zone is None:
         raise ValueError(f"Unknown IANA timezone: {timezone_name!r}")
@@ -237,6 +237,12 @@ def validate_local_time(local_time: str, timezone_name: str) -> ValidateLocalTim
             "timezone must be a Region/City IANA name such as "
             f"'Australia/Sydney' or 'UTC', not {timezone_name!r}"
         )
+    return zone
+
+
+def validate_local_time(local_time: str, timezone_name: str) -> ValidateLocalTimeResult:
+    """Resolve a wall-clock time in a zone to every UTC instant it names."""
+    zone = _require_region_city_zone(timezone_name)
     # Matched strictly rather than left to fromisoformat, which also accepts
     # forms this contract does not offer: a bare date would silently be read
     # as midnight, and on 3.14 '24:00' as the next day's midnight, answering
