@@ -126,12 +126,14 @@ type SessionConversationState =
   | { phase: "reload_required"; connectionIdentity: string | null; taskId: null }
 
 // The stop control's own state. The server sends no acknowledgement frame for
-// a stop, so "stopping" ends in one of four ways: this task's terminal frame,
-// the local timeout above, a codeless agent_error for this task, or a
-// reconnect -- the button's own state is per-connection and cannot outlive the
-// connection it was set on. The codeless agent_error only returns the control
-// to pressable. It does not say whether the stop was applied: the server sends
-// the same frame for any other external-scope command that fails on this task.
+// a stop, so "stopping" ends in one of five ways: this task's terminal frame,
+// the local timeout above, a codeless agent_error for this task, a reconnect
+// (the button's own state is per-connection and cannot outlive the connection
+// it was set on), or the control ceasing to be available while the run pauses
+// without ending (see the effect keyed on canStopTask). The codeless
+// agent_error only returns the control to pressable. It does not say whether
+// the stop was applied: the server sends the same frame for any other
+// external-scope command that fails on this task.
 export type SessionStopState = "idle" | "stopping" | "timed_out" | "not_sent"
 
 type SessionConversationAction =
@@ -2418,6 +2420,15 @@ export function AppProvider({
     state.taskId,
   ])
 
+  // The control's own state lasts only as long as the control is available,
+  // and availability is wider than "this run is over": a task that pauses to
+  // ask the visitor a question also stops counting as processing, so a stop
+  // still outstanding at that moment loses its "stopping" state and its
+  // unconfirmed-timeout window, and the control returns pressable with no
+  // record of the earlier press. Accepted as it stands: the per-task stop
+  // intent lives in a ref this effect does not touch, so the turn still
+  // renders as a stopped turn when its own terminal frame arrives — what is
+  // lost is the button's memory of the press, not the outcome of the stop.
   useEffect(() => {
     if (canStopTask) return
     clearStopTimeout()
@@ -6920,7 +6931,6 @@ export function AppProvider({
     // has no bound task to attribute it to.
     if (lifecycle.phase !== "bound") return
     const boundTaskId = lifecycle.taskId
-    clearStopTimeout()
     // No try/catch here, unlike startNewConversation above: sendMessage in
     // use-websocket already wraps socket.send and returns "not_sent" instead of
     // throwing, and a stop owns no promise and no session state to roll back.
@@ -6934,6 +6944,11 @@ export function AppProvider({
     }
     stopIntentTaskIdRef.current = boundTaskId
     setStopState("stopping")
+    // Cleared here, next to the arm, rather than on the way in: a call that
+    // sends no frame must leave an earlier attempt's window running, so the
+    // request that did leave the socket can still reach its unconfirmed
+    // timeout instead of ending in a state nothing ever advances.
+    clearStopTimeout()
     stopTimeoutRef.current = setTimeout(() => {
       stopTimeoutRef.current = null
       setStopState("timed_out")

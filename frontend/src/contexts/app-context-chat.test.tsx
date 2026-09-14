@@ -6356,6 +6356,38 @@ describe("AppProvider websocket message routing", () => {
       vi.useRealTimers()
     }
   })
+
+  it("keeps an armed stop window alive when a later attempt sends nothing", () => {
+    vi.useFakeTimers()
+    try {
+      render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(1501)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+
+      act(() => getSessionControls().stopTask())
+      expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+
+      act(() => { vi.advanceTimersByTime(10_000) })
+      sendRawMessageMock.mockReturnValueOnce("not_sent")
+      act(() => getSessionControls().stopTask())
+      expect(screen.getByTestId("stop-state").textContent).toBe("not_sent")
+
+      // The first attempt did leave the socket, so its own 30s window is what
+      // decides that request's outcome; a second attempt that sent nothing
+      // cancels nothing, so the window is still running here.
+      act(() => { vi.advanceTimersByTime(19_999) })
+      expect(screen.getByTestId("stop-state").textContent).toBe("not_sent")
+
+      act(() => { vi.advanceTimersByTime(2) })
+      expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 describe("terminal error frames", () => {

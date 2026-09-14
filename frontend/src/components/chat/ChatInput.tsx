@@ -677,9 +677,14 @@ export function ChatInput({
       };
     }
   }, [currentInteractionRequestId, hasDraft]);
+  const isStopInFlight = stopState === "stopping";
   const canSubmit = () => {
     const isUploadingFiles = uploadingFiles.size > 0;
-    return hasDraft && !isInputBusy && !isUploadingFiles;
+    // A stop request the server has not answered yet still owns this turn, so
+    // the composer accepts nothing new until it resolves: the send control
+    // stays in its slot, dimmed and inert, instead of delivering a message
+    // into the run the visitor has just asked to end.
+    return hasDraft && !isInputBusy && !isUploadingFiles && !isStopInFlight;
   };
   const canPauseTask =
     !!isLoading &&
@@ -688,13 +693,17 @@ export function ChatInput({
   const shouldShowPauseButton = canPauseTask && !hasDraft;
   const reactId = useId();
   const stopHintId = `${reactId}-stop-hint`;
-  // The stop control lives only in the compact toolbar, and it steps aside for
+  // The stop control lives only in the compact toolbar. That is deliberate:
+  // the compact toolbar is the only layout that offers it, and the wider
+  // toolbar below carries the pause control instead, so a caller that passes
+  // `onStop` without `compact` gets no stop control at all. It steps aside for
   // the send button whenever there is a draft — the same rule the pause button
-  // already follows above. The not-sent and timed-out hints both explain that
+  // already follows above — but a send button shown while a stop is in flight
+  // is inert (see canSubmit), so stepping aside never opens a way into the
+  // turn being stopped. The not-sent and timed-out hints both explain that
   // control, so each is gated on exactly the same condition; a hint with no
   // visible control on screen would have nothing to refer to.
   const showStopButton = compact && !!onStop && !hasDraft;
-  const isStopInFlight = stopState === "stopping";
   // The stop control and the send control take turns in the same slot, so the
   // size and the box styling come from here instead of each of them carrying
   // its own copy: the slot keeps one shape whichever control is on screen.
@@ -1021,7 +1030,7 @@ export function ChatInput({
 
   return (
     <div className="space-y-3">
-      {showStopButton && stopHintKey !== null && (
+      {showStopHint && (
         <p
           id={stopHintId}
           role="status"
