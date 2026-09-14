@@ -1,9 +1,11 @@
 import re
-from datetime import datetime, timedelta, timezone
+import unicodedata
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
-from typing import Any, Literal, Mapping, Optional, Type
+from typing import Any, Callable, Literal, Mapping, Optional, Type
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
+from dateutil import parser as dateutil_parser
 from pydantic import BaseModel, Field
 
 from .....web.tools.config import WebToolConfig
@@ -343,3 +345,544 @@ async def create_validate_local_time_tool(
 ) -> list[AbstractBaseTool]:
     """Create the local-time validation tool."""
     return [ValidateLocalTimeTool()]
+
+
+RESOLUTION_REASONS: frozenset[str] = frozenset(
+    {
+        "unsupported_expression",
+        "ambiguous_date",
+        "nonexistent_local_time",
+        "ambiguous_local_time",
+        "invalid_timezone",
+    }
+)
+
+# One line per grammar form, listed in a refusal so the caller can rephrase.
+# Form names only: no date literal and no four-digit number may appear here,
+# because the refusal is rendered to the model and must not offer a value
+# it could quote as a date.
+GRAMMAR_FORMS: tuple[str, ...] = (
+    "ISO date YYYY-MM-DD, optionally with HH:MM[:SS] and a UTC offset",
+    "an English calendar date, optionally with a time (e.g. day month year)",
+    "a Chinese calendar date: <year>年<month>月<day>日, optionally with a "
+    "Chinese time of day",
+    "today / tomorrow / yesterday / day after tomorrow, optionally at a time",
+    "今天 / 明天 / 后天 / 昨天 / 前天, optionally with a Chinese time of day",
+    "next / last / this <weekday>, optionally at a time",
+    "<weekday>, optionally at a time",
+    "下周X / 上周X / 周X (also 星期, 礼拜), optionally with a Chinese time of day",
+    "in N days / in N weeks",
+    "in N hours / in N minutes",
+    "N天后 / N周后",
+    "N小时后 / N分钟后",
+    "a bare time of day: H:MM, Ham/pm, or a Chinese time of day",
+)
+
+
+class ResolveDatetimeResult(BaseModel):
+    resolved: str = Field(
+        description=(
+            "ISO 8601 date-time with UTC offset, e.g. YYYY-MM-DDTHH:MM:SS+HH:MM; "
+            "the first ten characters are the calendar date."
+        )
+    )
+    has_time: bool = Field(
+        description=(
+            "False when the phrase named a day only; resolved is then that "
+            "day's 00:00:00 and its time part is not something the user said."
+        )
+    )
+    # Field name is the wire contract; it locally shadows the datetime.timezone
+    # import, which this class body does not use.
+    timezone: str = Field(
+        description="Canonical IANA zone key the offset was taken from."
+    )
+
+
+# A reading of the phrase before the zone is applied: either a naive local
+# wall-clock (validated against the zone afterwards) or an aware instant
+# (already exact, only converted into the zone). The flag says whether the
+# phrase named a time of day.
+_Reading = tuple[datetime, bool]
+
+_WEEKDAYS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+_WEEKDAY = "|".join(_WEEKDAYS)
+_ZH_WEEKDAYS = "一二三四五六日天"
+_ZH_DIGITS = {
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_ZH_NUMERAL = r"[一二两三四五六七八九十]{1,3}"
+_ZH_TIME = (
+    r"(?P<zh_period>上午|早上|中午|下午|晚上)?"
+    rf"(?P<zh_hour>[0-9]{{1,2}}|{_ZH_NUMERAL})(?:点|时)"
+    rf"(?:(?P<zh_half>半)|(?P<zh_minute>[0-9]{{1,2}}|{_ZH_NUMERAL})分)?"
+)
+_ZH_COUNT = rf"(?P<count>[0-9]+|{_ZH_NUMERAL})"
+_EN_TIME = (
+    r"(?P<en_hour>[0-9]{1,2})(?::(?P<en_minute>[0-9]{2}))? ?(?P<en_period>am|pm)?"
+)
+_EN_TIME_TAIL = rf"(?: (?:at )?{_EN_TIME})?"
+_ZH_TIME_TAIL = rf"(?: ?{_ZH_TIME})?"
+
+_ISO_RE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}"
+    r"(?:[ T](?P<clock>[0-9]{2}:[0-9]{2}(?::[0-9]{2})?)(?P<offset>Z|[+-][0-9]{2}:[0-9]{2})?)?"
+)
+_ZH_DATE_RE = re.compile(
+    r"(?P<year>[0-9]{4})年(?P<month>[0-9]{1,2})月(?P<day>[0-9]{1,2})(?:日|号)"
+    + _ZH_TIME_TAIL
+)
+_ZH_RELATIVE_DAYS = {
+    "今天": 0,
+    "今日": 0,
+    "明天": 1,
+    "明日": 1,
+    "后天": 2,
+    "昨天": -1,
+    "昨日": -1,
+    "前天": -2,
+}
+_ZH_RELATIVE_RE = re.compile(
+    r"(?P<day>" + "|".join(_ZH_RELATIVE_DAYS) + ")" + _ZH_TIME_TAIL
+)
+_ZH_WEEKDAY_RE = re.compile(
+    r"(?P<shift>下|上|这|本)?(?:周|星期|礼拜)(?P<weekday>[一二三四五六日天])"
+    + _ZH_TIME_TAIL
+)
+_ZH_DAYS_LATER_RE = re.compile(
+    _ZH_COUNT + r"(?P<unit>天|日|周|个星期|星期)(?:后|之后|以后)"
+)
+_ZH_HOURS_LATER_RE = re.compile(
+    _ZH_COUNT + r"(?P<unit>小时|个小时|分钟)(?:后|之后|以后)"
+)
+_ZH_TIME_RE = re.compile(_ZH_TIME)
+_EN_RELATIVE_DAYS = {
+    "today": 0,
+    "tomorrow": 1,
+    "yesterday": -1,
+    "day after tomorrow": 2,
+}
+_EN_RELATIVE_RE = re.compile(
+    r"(?P<day>" + "|".join(_EN_RELATIVE_DAYS) + ")" + _EN_TIME_TAIL
+)
+_EN_SHIFTED_WEEKDAY_RE = re.compile(
+    rf"(?P<shift>next|last|this) (?P<weekday>{_WEEKDAY})" + _EN_TIME_TAIL
+)
+_EN_WEEKDAY_RE = re.compile(rf"(?:on )?(?P<weekday>{_WEEKDAY})" + _EN_TIME_TAIL)
+_EN_DAYS_LATER_RE = re.compile(r"in (?P<count>[0-9]+) (?P<unit>day|days|week|weeks)")
+_EN_HOURS_LATER_RE = re.compile(
+    r"in (?P<count>[0-9]+) (?P<unit>hour|hours|minute|minutes)"
+)
+_EN_TIME_RE = re.compile(_EN_TIME)
+
+# Two defaults that differ in every field a phrase may leave out (year, month,
+# day, hour). A field that follows the default was not in the phrase.
+_DEFAULT_A = datetime(2000, 1, 1, 0, 0, 0)
+_DEFAULT_B = datetime(2001, 2, 2, 1, 0, 0)
+
+
+class _AmbiguousDate(ValueError):
+    """The phrase reads as two different dates depending on day/month order."""
+
+
+def _reject_zone_in_phrase(name: Optional[str], offset: Optional[int]) -> None:
+    # The zone comes from the timezone argument only. dateutil calls this for
+    # every parse, with (None, None) when the phrase names no zone; a zone
+    # name or offset inside the phrase would otherwise be dropped silently
+    # or turned into an offset the caller never asked for.
+    if name is None and offset is None:
+        return None
+    raise ValueError(f"time zone inside the phrase is not supported: {name!r}")
+
+
+def _parse_number(token: str) -> Optional[int]:
+    """Read an Arabic numeral or a Chinese numeral from one to ninety-nine."""
+    if token.isascii() and token.isdigit():
+        return int(token)
+    if token == "两":
+        return 2
+    match = re.fullmatch(
+        r"(?P<tens>[一二三四五六七八九])?(?P<ten>十)?(?P<units>[一二三四五六七八九])?",
+        token,
+    )
+    if match is None:
+        return None
+    tens, ten, units = match.group("tens"), match.group("ten"), match.group("units")
+    if ten is None:
+        # A single digit; two digits without the tens marker are not a numeral.
+        if tens is not None and units is not None:
+            return None
+        digit = tens or units
+        return _ZH_DIGITS[digit] if digit else None
+    value = 10 * (_ZH_DIGITS[tens] if tens else 1)
+    return value + (_ZH_DIGITS[units] if units else 0)
+
+
+def _en_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
+    """Hour and minute from an English time; None when the branch does not hold."""
+    hour = int(match.group("en_hour"))
+    minute_text = match.group("en_minute")
+    period = match.group("en_period")
+    if period is None:
+        # Without am/pm the minutes are required: a bare number is not a time.
+        if minute_text is None or not 0 <= hour <= 23:
+            return None
+    else:
+        if not 1 <= hour <= 12:
+            return None
+        if hour == 12:
+            hour = 0
+        if period == "pm":
+            hour += 12
+    minute = int(minute_text) if minute_text is not None else 0
+    if not 0 <= minute <= 59:
+        return None
+    return hour, minute
+
+
+def _zh_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
+    """Hour and minute from a Chinese time; None when the branch does not hold."""
+    hour = _parse_number(match.group("zh_hour"))
+    if hour is None:
+        return None
+    if match.group("zh_half") is not None:
+        minute: Optional[int] = 30
+    elif match.group("zh_minute") is not None:
+        minute = _parse_number(match.group("zh_minute"))
+    else:
+        minute = 0
+    if minute is None:
+        return None
+    period = match.group("zh_period")
+    if period in ("下午", "晚上") and hour < 12:
+        hour += 12
+    elif period == "中午" and hour < 11:
+        hour += 12
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return None
+    return hour, minute
+
+
+def _wall(day: date, clock: Optional[tuple[int, int]]) -> _Reading:
+    if clock is None:
+        return datetime(day.year, day.month, day.day), False
+    return datetime(day.year, day.month, day.day, clock[0], clock[1]), True
+
+
+_ClockOf = Callable[[re.Match[str]], Optional[tuple[int, int]]]
+
+
+def _day_reading(
+    match: re.Match[str], day: date, clock_of: _ClockOf
+) -> Optional[_Reading]:
+    """Combine a day with the optional time group of the match.
+
+    Without a time group the reading is that day's midnight; with one it is
+    the day at that time, or None when the group is present but not a time.
+    """
+    groups = match.groupdict()
+    if groups.get("en_hour") is None and groups.get("zh_hour") is None:
+        return _wall(day, None)
+    clock = clock_of(match)
+    return _wall(day, clock) if clock is not None else None
+
+
+def _read_iso(text: str, now_local: datetime) -> Optional[_Reading]:
+    match = _ISO_RE.fullmatch(text)
+    if match is None:
+        return None
+    moment = datetime.fromisoformat(text)
+    return moment, match.group("clock") is not None
+
+
+def _read_zh_date(text: str, now_local: datetime) -> Optional[_Reading]:
+    match = _ZH_DATE_RE.fullmatch(text)
+    if match is None:
+        return None
+    day = date(
+        int(match.group("year")), int(match.group("month")), int(match.group("day"))
+    )
+    return _day_reading(match, day, _zh_time)
+
+
+def _read_zh_relative_day(text: str, now_local: datetime) -> Optional[_Reading]:
+    match = _ZH_RELATIVE_RE.fullmatch(text)
+    if match is None:
+        return None
+    day = now_local.date() + timedelta(days=_ZH_RELATIVE_DAYS[match.group("day")])
+    return _day_reading(match, day, _zh_time)
+
+
+def _read_zh_weekday(text: str, now_local: datetime) -> Optional[_Reading]:
+    match = _ZH_WEEKDAY_RE.fullmatch(text)
+    if match is None:
+        return None
+    today = now_local.date()
+    # Weeks run Monday to Sunday: the next-week prefix moves a week ahead,
+    # the previous-week prefix a week back, and no prefix (or either
+    # this-week prefix) stays in the week containing today.
+    monday = today - timedelta(days=today.weekday())
+    # Both spellings of Sunday sit at the end of the table and share index 6.
+    weekday = min(_ZH_WEEKDAYS.index(match.group("weekday")), 6)
+    shift = {"下": 7, "上": -7}.get(match.group("shift") or "", 0)
+    day = monday + timedelta(days=shift + weekday)
+    return _day_reading(match, day, _zh_time)
+
+
+def _read_zh_days_later(text: str, now_local: datetime) -> Optional[_Reading]:
+    match = _ZH_DAYS_LATER_RE.fullmatch(text)
+    if match is None:
+        return None
+    count = _parse_number(match.group("count"))
+    if count is None:
+        return None
+    days = count * (7 if match.group("unit") in ("周", "个星期", "星期") else 1)
+    return _wall(now_local.date() + timedelta(days=days), None)
+
+
+def _read_zh_hours_later(text: str, now_local: datetime) -> Optional[_Reading]:
+    match = _ZH_HOURS_LATER_RE.fullmatch(text)
+    if match is None:
+        return None
+    count = _parse_number(match.group("count"))
+    if count is None:
+        return None
+    if match.group("unit") == "分钟":
+        delta = timedelta(minutes=count)
+    else:
+        delta = timedelta(hours=count)
+    # Added in UTC: adding to the local reading would shift the wall clock
+    # across a daylight-saving change instead of the instant.
+    return now_local.astimezone(timezone.utc) + delta, True
+
+
+def _read_zh_time(text: str, now_local: datetime) -> Optional[_Reading]:
+    match = _ZH_TIME_RE.fullmatch(text)
+    if match is None:
+        return None
+    return _day_reading(match, now_local.date(), _zh_time)
+
+
+def _read_en_relative_day(text: str, now_local: datetime) -> Optional[_Reading]:
+    match = _EN_RELATIVE_RE.fullmatch(text)
+    if match is None:
+        return None
+    day = now_local.date() + timedelta(days=_EN_RELATIVE_DAYS[match.group("day")])
+    return _day_reading(match, day, _en_time)
+
+
+def _read_en_shifted_weekday(text: str, now_local: datetime) -> Optional[_Reading]:
+    match = _EN_SHIFTED_WEEKDAY_RE.fullmatch(text)
+    if match is None:
+        return None
+    today = now_local.date()
+    weekday = _WEEKDAYS.index(match.group("weekday"))
+    shift = match.group("shift")
+    if shift == "next":
+        # The coming one; when today is that weekday, a full week ahead.
+        day = today + timedelta(days=(weekday - today.weekday()) % 7 or 7)
+    elif shift == "last":
+        # The previous one; when today is that weekday, a full week back.
+        day = today - timedelta(days=(today.weekday() - weekday) % 7 or 7)
+    else:
+        day = today - timedelta(days=today.weekday()) + timedelta(days=weekday)
+    return _day_reading(match, day, _en_time)
+
+
+def _read_en_weekday(text: str, now_local: datetime) -> Optional[_Reading]:
+    match = _EN_WEEKDAY_RE.fullmatch(text)
+    if match is None:
+        return None
+    today = now_local.date()
+    weekday = _WEEKDAYS.index(match.group("weekday"))
+    # The coming one, today included when today is that weekday.
+    day = today + timedelta(days=(weekday - today.weekday()) % 7)
+    return _day_reading(match, day, _en_time)
+
+
+def _read_en_days_later(text: str, now_local: datetime) -> Optional[_Reading]:
+    match = _EN_DAYS_LATER_RE.fullmatch(text)
+    if match is None:
+        return None
+    count = int(match.group("count"))
+    days = count * (7 if match.group("unit").startswith("week") else 1)
+    return _wall(now_local.date() + timedelta(days=days), None)
+
+
+def _read_en_hours_later(text: str, now_local: datetime) -> Optional[_Reading]:
+    match = _EN_HOURS_LATER_RE.fullmatch(text)
+    if match is None:
+        return None
+    count = int(match.group("count"))
+    if match.group("unit").startswith("minute"):
+        delta = timedelta(minutes=count)
+    else:
+        delta = timedelta(hours=count)
+    # Added in UTC: adding to the local reading would shift the wall clock
+    # across a daylight-saving change instead of the instant.
+    return now_local.astimezone(timezone.utc) + delta, True
+
+
+def _read_en_time(text: str, now_local: datetime) -> Optional[_Reading]:
+    match = _EN_TIME_RE.fullmatch(text)
+    if match is None:
+        return None
+    return _day_reading(match, now_local.date(), _en_time)
+
+
+def _read_en_calendar_date(text: str, now_local: datetime) -> Optional[_Reading]:
+    """Read an English calendar date with dateutil, refusing anything it guessed.
+
+    The phrase is parsed against two defaults and, for each, all four
+    day-first / year-first combinations. Any zone name or offset inside the
+    phrase raises. Readings that differ across the four combinations are an
+    ambiguous date. A date that follows the default is missing a component.
+    An hour that follows the default means the phrase named no time of day.
+    """
+    readings: dict[datetime, list[datetime]] = {}
+    for default in (_DEFAULT_A, _DEFAULT_B):
+        for dayfirst in (False, True):
+            for yearfirst in (False, True):
+                readings.setdefault(default, []).append(
+                    dateutil_parser.parse(
+                        text,
+                        default=default,
+                        dayfirst=dayfirst,
+                        yearfirst=yearfirst,
+                        fuzzy=False,
+                        tzinfos=_reject_zone_in_phrase,
+                    )
+                )
+    for parsed in readings.values():
+        if any(reading != parsed[0] for reading in parsed[1:]):
+            raise _AmbiguousDate(
+                f"date reads two ways (day-first or month-first): {text!r}"
+            )
+    first, second = readings[_DEFAULT_A][0], readings[_DEFAULT_B][0]
+    if first.tzinfo is not None or second.tzinfo is not None:
+        return None
+    if first.date() != second.date():
+        return None
+    if first.hour != second.hour:
+        return _wall(first.date(), None)
+    return first.replace(microsecond=0), True
+
+
+_READERS = (
+    _read_iso,
+    _read_zh_date,
+    _read_zh_relative_day,
+    _read_zh_weekday,
+    _read_zh_days_later,
+    _read_zh_hours_later,
+    _read_zh_time,
+)
+_LOWERCASE_READERS = (
+    _read_en_relative_day,
+    _read_en_shifted_weekday,
+    _read_en_weekday,
+    _read_en_days_later,
+    _read_en_hours_later,
+    _read_en_time,
+)
+
+
+def _read_phrase(text: str, now_local: datetime) -> Optional[_Reading]:
+    """Match the phrase against the grammar; the first form that holds wins."""
+    for reader in _READERS:
+        reading = reader(text, now_local)
+        if reading is not None:
+            return reading
+    lowered = text.lower()
+    for reader in _LOWERCASE_READERS:
+        reading = reader(lowered, now_local)
+        if reading is not None:
+            return reading
+    return _read_en_calendar_date(text, now_local)
+
+
+def _refusal(reason: str, error: str) -> dict[str, Any]:
+    # success=False routes the call through the framework's failure branch;
+    # the reason is carried under 'resolution' because 'status' is the
+    # framework's control channel.
+    refusal: dict[str, Any] = {
+        "success": False,
+        "tool_name": "resolve_datetime",
+        "error": error,
+        "resolution": reason,
+    }
+    if reason == "unsupported_expression":
+        refusal["supported"] = list(GRAMMAR_FORMS)
+    return refusal
+
+
+def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
+    """Turn a spoken date or time into an exact ISO date-time in a zone.
+
+    The result depends only on the phrase, the zone, the clock and tzdata:
+    the same three inputs under the same clock reading always give the same
+    result. A phrase outside the grammar, a date that reads two ways, or a
+    wall-clock time the zone skips or repeats is refused with a reason
+    rather than guessed.
+    """
+    try:
+        zone = _require_region_city_zone(timezone_name)
+    except ValueError as exc:
+        return _refusal("invalid_timezone", str(exc))
+    text = re.sub(r"\s+", " ", unicodedata.normalize("NFC", phrase)).strip()
+    if not text:
+        return _refusal("unsupported_expression", "phrase is empty")
+    now_local = _now().astimezone(zone)
+    try:
+        reading = _read_phrase(text, now_local)
+    except _AmbiguousDate as exc:
+        return _refusal("ambiguous_date", str(exc))
+    except (ValueError, OverflowError):
+        reading = None
+    if reading is None:
+        return _refusal(
+            "unsupported_expression",
+            f"unsupported date or time expression: {text!r}",
+        )
+    moment, has_time = reading
+    if moment.tzinfo is not None:
+        resolved = moment.astimezone(zone).isoformat(timespec="seconds")
+    else:
+        stamp = moment.isoformat(sep=" ", timespec="seconds")
+        try:
+            check = validate_local_time(stamp, zone.key)
+        except ValueError as exc:
+            return _refusal("unsupported_expression", str(exc))
+        if check.local_time_status == "nonexistent":
+            return _refusal(
+                "nonexistent_local_time",
+                f"local time {stamp} does not exist in {zone.key}: "
+                "clocks skip it at a daylight-saving change",
+            )
+        if check.local_time_status == "ambiguous":
+            return _refusal(
+                "ambiguous_local_time",
+                f"local time {stamp} occurs twice in {zone.key} "
+                "at a daylight-saving change",
+            )
+        resolved = moment.replace(tzinfo=zone).isoformat(timespec="seconds")
+    return ResolveDatetimeResult(
+        resolved=resolved, has_time=has_time, timezone=zone.key
+    ).model_dump()
