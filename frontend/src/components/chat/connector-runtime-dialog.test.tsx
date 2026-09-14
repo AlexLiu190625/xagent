@@ -1316,3 +1316,18 @@ describe("stays usable when StrictMode remounts it", () => {
     expect(screen.getByLabelText("token")).toBeInTheDocument()
   })
 })
+
+describe("warns when a resend fails", () => {
+  it("warns when a resend fails", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(new Error("closed"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    // The same fixed prefix the read path logs, and nothing else: the
+    // rejection value is arbitrary and could carry message content.
+    expect(warnSpy.mock.calls).toEqual([["[connector-runtime] resend failed"]])
+  })
+})

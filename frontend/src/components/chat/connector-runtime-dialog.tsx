@@ -327,6 +327,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       await sendMessage(snapshot.text, { clientMessageId: generateClientMessageId() }, snapshot.files)
       return true
     } catch {
+      // Matches the read path's warn so a failing resend leaves the same
+      // diagnostic signal. Carries the fixed prefix alone: unlike the read
+      // path there is no closed-set status to report here, and the rejection
+      // value is arbitrary, so logging it could carry message content.
+      console.warn("[connector-runtime] resend failed")
       return false
     }
   }
