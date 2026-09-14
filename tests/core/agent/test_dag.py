@@ -5784,28 +5784,42 @@ def test_a_step_compaction_does_not_change_what_the_assessment_is_handed() -> No
     assert "CHILD_ROW" not in after
 
 
-def test_a_restored_step_context_keeps_the_marker() -> None:
+@pytest.mark.parametrize("state", ["intact", "removed", "unknown"])
+def test_a_restored_step_context_keeps_the_marker(state: str) -> None:
     """Pausing inside a step and resuming must not forget what it lost.
 
     Resuming runs ``_refresh_restored_step_runtime_metadata`` over the context
     read back from the checkpoint, so that call is part of the round trip and
     is made here. Today it touches one named key; that it is selective rather
     than a wholesale refresh is what keeps the marker alive, and "today it is
-    selective" is a fact nothing else holds in place.
+    selective" is a fact nothing else holds in place. For the unknown state
+    this also proves the refresh does not backfill an absent key -- a refresh
+    that turned into a wholesale overlay would fill it in and erase the third
+    state on the very first resume.
     """
     root = ContextManager().create_context(execution_id="dag-step-resume")
     root.add_user_message("Build a KPI report")
     child = root.create_child_context()
-    child.metadata[execution_module.TOOL_EVIDENCE_REMOVED_METADATA_KEY] = True
+    key = execution_module.TOOL_EVIDENCE_REMOVED_METADATA_KEY
+    if state == "unknown":
+        child.metadata.pop(key, None)
+    else:
+        child.metadata[key] = state == "removed"
 
     restored = ExecutionContext.from_dict(json.loads(json.dumps(child.to_dict())))
-    assert execution_module.tool_evidence_removed(restored) is True
+    assert execution_module.tool_evidence_state(restored) == state
 
     DAGPattern._refresh_restored_step_runtime_metadata(restored, root)
 
-    # The stored value, not only what the reader returns: a refresh that wiped
-    # the key would still read True, because a missing key is read as a loss.
-    assert restored.metadata[execution_module.TOOL_EVIDENCE_REMOVED_METADATA_KEY] is (
-        True
-    )
-    assert execution_module.tool_evidence_removed(restored) is True
+    if state == "unknown":
+        # The stored shape, not only what the reader returns: a refresh that
+        # backfilled the key would still read "unknown" if the reader alone
+        # were checked with a naive default, which is why the raw dict is
+        # asserted directly.
+        assert key not in restored.metadata
+    else:
+        # The stored value, not only what the reader returns: a refresh that
+        # wiped the key would still read removed, because a missing key does
+        # not read as intact.
+        assert restored.metadata[key] is (state == "removed")
+    assert execution_module.tool_evidence_state(restored) == state

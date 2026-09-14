@@ -19,7 +19,10 @@ from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointUnavailableError,
 )
-from xagent.core.agent.context.execution import TOOL_EVIDENCE_REMOVED_METADATA_KEY
+from xagent.core.agent.context.execution import (
+    TOOL_EVIDENCE_REMOVED_METADATA_KEY,
+    tool_evidence_state,
+)
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
@@ -2242,6 +2245,64 @@ def test_a_restored_context_takes_no_client_metadata_at_all(tmp_path: Path) -> N
     assert context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] is True
     assert "some_client_key" not in context.metadata
     assert "request_context" not in context.metadata
+
+
+def test_a_restored_context_with_no_marker_key_is_never_backfilled(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint written before this key existed must stay keyless on resume.
+
+    Backfilling either value here would erase the distinction the third state
+    exists to carry: False would tell a run that really did lose observations
+    that nothing was removed, and True would tell a run that lost nothing
+    that something was. The restore branch returns before either client-input
+    filter runs, so nothing it does can write this key in either direction.
+    """
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ContextManager().create_context(execution_id="exec-restored-no-key")
+    context.metadata.pop(TOOL_EVIDENCE_REMOVED_METADATA_KEY, None)
+    client_keys = {
+        TOOL_EVIDENCE_REMOVED_METADATA_KEY: True,
+        "some_client_key": "kept",
+    }
+
+    runner._merge_context_metadata(
+        context,
+        {**client_keys, "request_context": dict(client_keys)},
+        restored=True,
+    )
+
+    assert TOOL_EVIDENCE_REMOVED_METADATA_KEY not in context.metadata
+    assert tool_evidence_state(context) == "unknown"
+
+
+@pytest.mark.parametrize("stored", [True, False], ids=["removed", "intact"])
+def test_a_restored_context_with_a_marker_key_keeps_its_stored_value(
+    tmp_path: Path, stored: bool
+) -> None:
+    """A checkpoint that does carry the key is never recomputed on restore."""
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ContextManager().create_context(execution_id="exec-restored-has-key")
+    context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = stored
+    client_keys = {
+        TOOL_EVIDENCE_REMOVED_METADATA_KEY: not stored,
+        "some_client_key": "kept",
+    }
+
+    runner._merge_context_metadata(
+        context,
+        {**client_keys, "request_context": dict(client_keys)},
+        restored=True,
+    )
+
+    assert context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] is stored
+    assert tool_evidence_state(context) == ("removed" if stored else "intact")
 
 
 def test_the_marker_is_stamped_before_any_client_metadata_is_merged(
