@@ -759,23 +759,23 @@ class ReActPattern(AgentPattern):
             if force_final_answer_now:
                 # Measures the one new failure mode this change introduces,
                 # so it carries no switch. Numbers and ids only -- never
-                # message text, a tool name, or a tool argument.
-                estimate = getattr(context, "estimate_context_tokens", None)
-                context_tokens = estimate() if callable(estimate) else None
-                threshold = getattr(
-                    getattr(context, "compact_config", None), "threshold", None
+                # message text, a tool name, or a tool argument. The estimate
+                # counts what this turn actually sends -- the same messages
+                # and the one tool schema handed to the call below -- so it is
+                # comparable with the threshold logged beside it.
+                context_tokens = context.estimate_context_tokens(
+                    route_messages, tool_schemas
                 )
+                threshold = context.compact_config.threshold
                 logger.info(
                     "Forced-answer turn did not compact. execution_id=%s "
                     "iteration=%s context_tokens=%s threshold=%s "
                     "over_threshold=%s",
-                    getattr(context, "execution_id", None),
+                    context.execution_id,
                     iteration,
                     context_tokens,
                     threshold,
-                    isinstance(context_tokens, int)
-                    and isinstance(threshold, int)
-                    and context_tokens > threshold,
+                    context_tokens > threshold,
                 )
             else:
                 compact_result = await runtime.compact_context_if_needed(
