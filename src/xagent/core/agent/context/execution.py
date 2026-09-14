@@ -280,10 +280,11 @@ def tool_evidence_state(context: Any) -> EvidenceState:
       say which one happened;
     - anything else -- ``True``, a corrupt value, or a context object whose
       metadata is not a dict -- reads as removed. A corrupt or malformed
-      payload is not an old payload: "unknown" states a fact about the
-      writer's provenance, and stating it about a payload that does carry the
-      key would be a claim this function cannot support. Removed is both the
-      fail-safe direction and the only one that asserts nothing false.
+      payload is not an old payload: "unknown" states that the context
+      carries no record either way, and a payload that does carry the key
+      has a record, so that statement would be false about it. Removed is
+      both the fail-safe direction and the only one that asserts nothing
+      false.
     """
     metadata = getattr(context, "metadata", None)
     if not isinstance(metadata, dict):
