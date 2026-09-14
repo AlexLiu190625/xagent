@@ -1537,9 +1537,12 @@ class CollectionInfo(BaseModel):
         # Do not persist owners; they are computed from user_id when listing
         data["owners"] = "[]"
 
-        # Serialize ingestion_config if present
-        if data.get("ingestion_config"):
-            data["ingestion_config"] = json.dumps(data["ingestion_config"])
+        # model_dump_json() serializes ingestion_config's enum fields to their
+        # .value per the type annotation, unlike json.dumps() on the
+        # model_dump()'d dict above (which left them as ParseMethod/
+        # ChunkStrategy instances and crashed on any non-null ingestion_config).
+        if self.ingestion_config is not None:
+            data["ingestion_config"] = self.ingestion_config.model_dump_json()
         else:
             # Use empty string sentinel instead of None to prevent LanceDB non-null schema errors
             data["ingestion_config"] = LANCEDB_NULL_STR_SENTINEL
