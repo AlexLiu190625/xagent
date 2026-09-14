@@ -888,13 +888,25 @@ describe("clears the stash when the dialog closes", () => {
     expect((latestState.payload as { clientMessageId: string } | null)?.clientMessageId).toBe("late")
     cleanup()
 
-    // Resent: the stash now holds the just-resent turn, not null.
+    // Resent: the stash now holds the just-resent turn under its own fresh
+    // id, not the id of the turn that failed. The stub writes the delivery
+    // back the way production does (sendMessage -> addOptimisticUserMessage
+    // -> recordDelivery); without that write-back there is no stash to keep
+    // and this row could not tell a preserved stash from a cleared one.
     await openSimpleDialog()
+    let resentId: string | undefined
+    sendMessageMock.mockImplementationOnce(async (text, config) => {
+      resentId = config?.clientMessageId
+      latestActions.recordDelivery({ taskId: 1, clientMessageId: resentId as string, text })
+    })
     fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
     submitMock.mockResolvedValueOnce(ok(report(true, [])))
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
-    expect((latestState.payload as { clientMessageId: string } | null)?.clientMessageId).not.toBeNull()
+    expect(resentId).toBeTruthy()
+    expect(resentId).not.toBe("orig-1")
+    expect(latestState.payload).toEqual({ taskId: 1, clientMessageId: resentId, text: "hi", files: [] })
+    expect(latestState.request).toBeNull()
     cleanup()
 
     // Submitting in progress: X is ignored, nothing changes.
