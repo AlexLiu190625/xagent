@@ -758,8 +758,9 @@ describe("resends the snapshot under a fresh id", () => {
     sendMessageMock.mockClear()
     submitMock.mockClear()
 
-    // Only a save-only path is offered without a snapshot; resolving 200
-    // with a still-blocking-only-secrets outcome sends first, then closes.
+    // Saving the last context value while a required secret stays missing:
+    // the turn would fail on that secret again, so the message is not
+    // resent, the dialog says so and closes.
     fetchMock.mockResolvedValueOnce(ok(report(false, [
       connector(REF_A, "A", [
         input({ section: "context", key: "token", type: "string", required: true }),
@@ -767,11 +768,6 @@ describe("resends the snapshot under a fresh id", () => {
       ]),
     ])))
     renderHarness()
-    // Spy installed right after the first render, before anything reads
-    // `close` off the shared actions object: a component that already
-    // destructured the pre-spy function from an earlier render would call
-    // that captured reference straight through the spy.
-    const closeSpy = vi.spyOn(latestActions, "close")
     await recordThenOpen({ taskId: 1, clientMessageId: "orig-3", text: "hi" })
     await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
     fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
@@ -782,16 +778,17 @@ describe("resends the snapshot under a fresh id", () => {
       ]),
     ])))
     sendMessageMock.mockClear()
+    toastMock.mockClear()
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
-    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
-    const sendOrder = sendMessageMock.mock.invocationCallOrder[0]
-    await waitFor(() => expect(closeSpy).toHaveBeenCalled())
-    const closeOrder = closeSpy.mock.invocationCallOrder[closeSpy.mock.invocationCallOrder.length - 1]
-    expect(sendOrder).toBeLessThan(closeOrder)
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expect(sendMessageMock).not.toHaveBeenCalled()
+    expect(toastMock.mock.calls).toEqual([
+      ['connectorRuntime.savedNotResentUnsupported:{"keys":"s1"}'],
+    ])
     cleanup()
     sendMessageMock.mockClear()
     submitMock.mockClear()
+    toastMock.mockClear()
 
     // A hung resend must not fire twice from a double click on the retry
     // button.
@@ -1382,5 +1379,40 @@ describe("holds the dialog open while a retry resend is in flight", () => {
 
     await act(async () => { resolveRetry() })
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+  })
+})
+
+describe("tells the user when save and resend did not resend", () => {
+  it("tells the user when save and resend did not resend", async () => {
+    // Saved, but the server still reports the connector unavailable with
+    // nothing left for this dialog to collect: the turn would fail on the
+    // same gate, so it is not resent. Without the toast the primary button
+    // would have done half of what it promised, silently.
+    const stillUnavailable = () => ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "token", type: "string", required: true, satisfied: true }),
+        input({ section: "secrets", key: "s1", type: "string", required: false }),
+      ]),
+    ]))
+
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(stillUnavailable())
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeInTheDocument())
+    expect(sendMessageMock).not.toHaveBeenCalled()
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentUnavailable"]])
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    cleanup()
+    toastMock.mockClear()
+    sendMessageMock.mockClear()
+
+    // "Save only" on the same outcome promised no resend, so it says nothing.
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(stillUnavailable())
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeInTheDocument())
+    expect(toastMock).not.toHaveBeenCalled()
   })
 })

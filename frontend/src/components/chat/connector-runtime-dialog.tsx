@@ -378,6 +378,24 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
 
     setReport(result.report)
     const newOutcome = resolveDialogOutcome(result.report)
+    // Only a met report can carry the resend the primary button promised.
+    // `unsupported_only` still lacks a required secret this dialog cannot
+    // collect, and `nothing_fillable` is a connector the server still reports
+    // unavailable with nothing left for the user to fill; the backend rejects
+    // either while it builds the turn's tool list, so a resend would fail on
+    // the same gate and put a second failure in the conversation. Neither
+    // resends, and because the button promised one, both say so.
+    const canResendNow = newOutcome.kind === "met"
+
+    if (newOutcome.kind === "unsupported_only") {
+      const keys = uniqueKeys(newOutcome.blocking).join(", ")
+      toast(alsoResend
+        ? t("connectorRuntime.savedNotResentUnsupported", { keys })
+        : t("connectorRuntime.onlyUnsupportedRemaining", { keys }))
+    } else if (alsoResend && newOutcome.kind === "nothing_fillable") {
+      toast(t("connectorRuntime.savedNotResentUnavailable"))
+    }
+
     if (newOutcome.kind === "fillable" || newOutcome.kind === "nothing_fillable") {
       // Still blocked on something this dialog can collect (or, for
       // nothing_fillable, on nothing the user can act on beyond "Got it"):
@@ -387,12 +405,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       return
     }
 
-    if (newOutcome.kind === "unsupported_only") {
-      const keys = uniqueKeys(newOutcome.blocking)
-      toast(t("connectorRuntime.onlyUnsupportedRemaining", { keys: keys.join(", ") }))
-    }
-
-    if (alsoResend) {
+    if (alsoResend && canResendNow) {
       const sent = await doResend()
       if (!aliveRef.current) return
       if (requestRef.current.seq !== seqAtStart) {
@@ -409,7 +422,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       }
     }
     setSubmitting(false)
-    close(alsoResend ? "resent" : "dismissed")
+    close(alsoResend && canResendNow ? "resent" : "dismissed")
   }
 
   const handleRetryResend = async () => {
