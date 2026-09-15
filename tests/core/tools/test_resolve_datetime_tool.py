@@ -127,6 +127,25 @@ CASES: list[tuple[str, str, tuple[str, object]]] = [
     ("see you next friday ok", SYDNEY, ("REFUSED", "unsupported_expression")),
     ("let's meet in 3 days ok", SYDNEY, ("REFUSED", "unsupported_expression")),
     ("call me in 2 hours please", SYDNEY, ("REFUSED", "unsupported_expression")),
+    # An English calendar date carrying a time is parsed whole by dateutil,
+    # which reads 12 pm as noon and 12 am as midnight on its own; the same
+    # refusal that a bare "12 pm" gets must reach this path too.
+    ("15 Sep 2026 12 pm", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("15 Sep 2026 12 am", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("15 Sep 2026 12:30 pm", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("15 Sep 2026 12:30 am", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("Sep 15 2026 12pm", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("January 1st, 1990 12 am", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("1 Jan 1990 12:00:00 pm", SYDNEY, ("REFUSED", "unsupported_expression")),
+    # The digit 12 elsewhere in the phrase -- a day, an unrelated hour, or no
+    # am/pm at all -- does not trip the hour-twelve refusal.
+    ("12 Dec 2026 3 pm", SYDNEY, ("2026-12-12T15:00:00+11:00", True)),
+    ("12 Sep 2026 11am", SYDNEY, ("2026-09-12T11:00:00+10:00", True)),
+    ("12 January 2026", SYDNEY, ("2026-01-12T00:00:00+11:00", False)),
+    ("15 Sep 2026 12:00", SYDNEY, ("2026-09-15T12:00:00+10:00", True)),
+    ("15 Sep 2026 10am", SYDNEY, ("2026-09-15T10:00:00+10:00", True)),
+    ("15 Sep 2026 11:59 pm", SYDNEY, ("2026-09-15T23:59:00+10:00", True)),
+    ("15 Sep 2026 3:12 pm", SYDNEY, ("2026-09-15T15:12:00+10:00", True)),
 ]
 
 
@@ -163,7 +182,7 @@ def test_resolve_datetime_returns_the_validated_fold(
 
 
 def test_grammar_table_has_every_case() -> None:
-    assert len(CASES) == 68
+    assert len(CASES) == 82
 
 
 @pytest.mark.parametrize(
@@ -305,6 +324,19 @@ def test_phrase_zone_name_is_refused() -> None:
 
     assert result["success"] is False
     assert result["resolution"] == "unsupported_expression"
+
+
+def test_hour_twelve_refusal_is_the_same_with_and_without_a_date() -> None:
+    """The refusal is a property of writing hour twelve with am or pm, not of
+    which reader saw the phrase: the calendar path and the bare-time path
+    must answer with the same reason code and the same words, in either
+    letter case dateutil accepts."""
+    bare = resolve_datetime("12 pm", SYDNEY)
+    dated = resolve_datetime("15 Sep 2026 12 pm", SYDNEY)
+    dated_upper = resolve_datetime("15 Sep 2026 12 PM", SYDNEY)
+
+    assert bare["resolution"] == dated["resolution"] == "unsupported_expression"
+    assert bare["error"] == dated["error"] == dated_upper["error"]
 
 
 @pytest.mark.parametrize(

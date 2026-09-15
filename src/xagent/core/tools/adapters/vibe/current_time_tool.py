@@ -2,7 +2,7 @@ import re
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
-from typing import Any, Callable, Literal, Mapping, Optional, Type
+from typing import Any, Callable, Literal, Mapping, NoReturn, Optional, Type
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from dateutil import parser as dateutil_parser
@@ -577,13 +577,30 @@ def _parse_number(token: str) -> Optional[int]:
     return value + (_ZH_DIGITS[units] if units else 0)
 
 
+_EN_HOUR_TWELVE_RE = re.compile(
+    r"(?<![0-9:])12(?::[0-9]{2}){0,2} ?(?P<period>am|pm)(?![a-z])", re.IGNORECASE
+)
+
+
+def _refuse_hour_twelve_with_period(period: str) -> NoReturn:
+    """Refuse an English hour twelve carrying am or pm, whichever reader saw it.
+
+    Both English readers reach this: the time sub-grammar, which has the hour
+    parsed, and the calendar-date reader, where dateutil parses the time
+    itself and would otherwise accept the combination the sub-grammar
+    refuses. Keeping the decision and its wording here is what makes a
+    phrase with a date and a phrase without return the same refusal.
+    """
+    raise _AmbiguousHour(f"'12{period.lower()}' names both midnight and noon")
+
+
 def _en_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
     """Hour and minute from an English time; None when the branch does not hold.
 
-    Raises _AmbiguousHour for '12am' / '12pm': am/pm otherwise disambiguates
-    the hour, but at twelve it does not (some speakers take 12pm as noon and
-    12am as midnight; others get the two backwards), so this one hour value
-    is refused rather than picked either way.
+    Raises _AmbiguousHour for '12am' / '12pm', via _refuse_hour_twelve_with_period:
+    am/pm otherwise disambiguates the hour, but at twelve it does not (some
+    speakers take 12pm as noon and 12am as midnight; others get the two
+    backwards), so this one hour value is refused rather than picked either way.
     """
     hour = int(match.group("en_hour"))
     minute_text = match.group("en_minute")
@@ -596,7 +613,7 @@ def _en_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
         if not 1 <= hour <= 12:
             return None
         if hour == 12:
-            raise _AmbiguousHour(f"'12{period}' names both midnight and noon")
+            _refuse_hour_twelve_with_period(period)
         if period == "pm":
             hour += 12
     minute = int(minute_text) if minute_text is not None else 0
@@ -829,6 +846,8 @@ def _read_en_calendar_date(text: str, now_local: datetime) -> Optional[_Reading]
     phrase raises. Readings that differ across the four combinations are an
     ambiguous date. A date that follows the default is missing a component.
     An hour that follows the default means the phrase named no time of day.
+    An hour written as 12 with am or pm is refused through the same rule and
+    the same wording as the bare time sub-grammar (_refuse_hour_twelve_with_period).
     """
     readings: dict[datetime, list[datetime]] = {}
     for default in (_DEFAULT_A, _DEFAULT_B):
@@ -856,6 +875,12 @@ def _read_en_calendar_date(text: str, now_local: datetime) -> Optional[_Reading]
         return None
     if first.hour != second.hour:
         return _wall(first.date(), None)
+    twelve = _EN_HOUR_TWELVE_RE.search(text)
+    if twelve is not None:
+        # dateutil reads 12 pm as noon and 12 am as midnight without ever
+        # asking whether the writer meant that; the hour is spelled here,
+        # not parsed out of a match, so the phrase itself is what says so.
+        _refuse_hour_twelve_with_period(twelve.group("period"))
     return first.replace(microsecond=0), True
 
 
