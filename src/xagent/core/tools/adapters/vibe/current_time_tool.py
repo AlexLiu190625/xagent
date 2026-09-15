@@ -587,13 +587,13 @@ def _en_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
 def _zh_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
     """Hour and minute from a Chinese time; None when the branch does not hold.
 
-    Raises _AmbiguousHour for hour twelve paired with the morning, dawn,
-    afternoon, or evening period word: the period word tells you which
-    half of the day the hour is in for every other hour, but at twelve the
-    half-day boundary itself is what's in question (an evening or
-    afternoon reading could mean tonight's midnight, i.e. today ending, or
-    tomorrow beginning; a morning or dawn reading could mean midnight or,
-    taken as bare digits, noon). The noon period word is unaffected by
+    Raises _AmbiguousHour for hour twelve paired with 上午, 早上, 下午, or
+    晚上 (morning, morning, afternoon, or evening): the period word tells
+    you which half of the day the hour is in for every other hour, but at
+    twelve the half-day boundary itself is what's in question (an evening
+    or afternoon reading could mean tonight's midnight, i.e. today ending,
+    or tomorrow beginning; a morning reading could mean midnight or, taken
+    as bare digits, noon). The noon period word (中午) is unaffected by
     that check: it already names hour twelve unambiguously. It raises the
     same exception for a narrower reason instead: paired with any hour
     other than 11, 12, or 13 it names an hour nowhere near noon (e.g.
@@ -656,6 +656,11 @@ def _read_iso(text: str, now_local: datetime) -> Optional[_Reading]:
     match = _ISO_RE.fullmatch(text)
     if match is None:
         return None
+    # fromisoformat is deliberately given the whole phrase, not
+    # match.group(0): the two calls are equal today because the fullmatch
+    # above already requires the whole phrase to match, but this keeps a
+    # second, independent whole-phrase check in place should that
+    # fullmatch above ever be loosened.
     moment = datetime.fromisoformat(text)
     return moment, match.group("clock") is not None
 
@@ -890,9 +895,10 @@ def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
     the same three inputs under the same clock reading always give the same
     result. A phrase outside the grammar, a date that reads two ways, an
     hour twelve whose half-day word does not settle which side of midnight
-    or noon it is on, a wall-clock time the zone skips or repeats, or a
-    resulting UTC offset with a fractional minute is refused with a reason
-    rather than guessed or approximated.
+    or noon it is on, a noon word (中午) paired with an hour outside 11, 12,
+    or 13, a wall-clock time the zone skips or repeats, or a resulting UTC
+    offset with a fractional minute is refused with a reason rather than
+    guessed or approximated.
     """
     try:
         zone = _require_region_city_zone(timezone_name)
