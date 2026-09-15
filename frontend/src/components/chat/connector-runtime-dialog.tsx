@@ -165,7 +165,14 @@ function locateFieldError(
   if (!connector) return { scope: "dialog" }
   const connectorKey = connectorKeyOf(connectorRef)
   if (key === undefined) return { scope: "connector", connectorKey }
-  const input = connector.inputs.find(i => i.key === key)
+  // Every key-bearing failure reason this locates is section-scoped to
+  // "context" (type_mismatch.context., empty_value.context., conflict.context.
+  // in connector-runtime-api.ts), and the draft key below is keyed by section.
+  // Matching key alone would let a same-named row in another section (e.g.
+  // "secrets") win the find, producing a draft key that no context row
+  // holds — the error would then attach to nothing instead of falling back
+  // to the whole-dialog scope this function otherwise guarantees.
+  const input = connector.inputs.find(i => i.section === "context" && i.key === key)
   if (!input) return { scope: "dialog" }
   return {
     scope: "field",

@@ -797,6 +797,31 @@ describe("locates a field error by connector and key", () => {
     // Falls back to whole-dialog scope, which renders without the {key} var.
     await waitFor(() => expect(screen.getByText("connectorRuntime.errors.typeString")).toBeInTheDocument())
   })
+
+  it("locates a same-named key's error in the context row when a secrets row with that key comes first in the report", async () => {
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "secrets", key: "shared", type: "string", required: false }),
+        input({ section: "context", key: "shared", type: "string", required: true }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+
+    // The secrets row above renders as plain unsupported-note text, not a
+    // labelled control, so this is the context row's own input.
+    fireEvent.change(screen.getByLabelText("shared"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 400, code: "invalid_runtime_context",
+      reason: "type_mismatch.context.shared", connectorRef: REF_A,
+    })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    // The secrets-section row shares the key but not the section; if the
+    // locator matched on key alone it would bind to that row's draft key
+    // instead, and this error would render nowhere.
+    await waitFor(() => expect(screen.getByText("connectorRuntime.errors.typeString:{\"key\":\"shared\"}")).toBeInTheDocument())
+  })
 })
 
 describe("resends the snapshot under a fresh id", () => {
