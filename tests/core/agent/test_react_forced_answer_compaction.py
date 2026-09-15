@@ -549,29 +549,26 @@ def _enclosing_function(
 
 
 def test_every_real_compaction_call_site_latches_the_marker() -> None:
-    """Every function that actually calls compaction also latches the marker.
+    """What this guard proves, and the gap it leaves open.
 
-    The two production call sites are not enforced by calling them and
-    checking a result; they are the only source ``dropped_tool_result_count``
-    has, so a third call site added later with the write left out would carry
-    no mechanical objection without a rule like this one. The latch itself
-    stays the caller's job rather than moving inside the compaction method:
-    that method only produces the dropped-count value this design reads, it
-    is not the thing that decides what a run does with it.
-
-    A forwarding wrapper (a pattern's own ``compact_context_if_needed`` that
-    relays to ``self.parent.compact_context_if_needed(...)``) is excluded by
-    name alone: its enclosing function is itself named
-    ``compact_context_if_needed``, the same exclusion that keeps the real
-    method's own definition out of ``call_sites``. There is deliberately no
-    separate exclusion keyed on the receiver being named ``parent`` -- that
-    would also hide a genuine, unlatched call written through a
-    ``self.parent.`` receiver inside an ordinarily named function, which is
-    exactly the shape this test exists to catch.
+    (1) It proves that within any one function body, the number of latch
+    calls is never fewer than the number of compaction calls -- a call-count
+    floor, not a zero/non-zero check.
+    (2) It does not prove call-by-call pairing: two compaction calls and two
+    latch calls in the same function still pass even if both latches actually
+    follow the same one compaction call while the other compaction call's
+    loss goes unlatched -- counts alone cannot tell those two shapes apart.
+    (3) Any function literally named ``compact_context_if_needed`` is skipped
+    entirely, which is what lets the two forwarding wrappers
+    (``dag.py:287-294`` and ``auto.py:355-362``, both of which relay to
+    ``self.parent.compact_context_if_needed(...)``) through; being skipped by
+    name is not evidence that those two functions latch correctly, only that
+    this guard does not check them.
     """
     src = pathlib.Path(__file__).resolve().parents[3] / "src" / "xagent"
     call_sites: set[tuple[str, str]] = set()
-    missing: set[tuple[str, str]] = set()
+    compaction_counts: dict[tuple[str, str], int] = {}
+    latch_counts: dict[tuple[str, str], int] = {}
     for path in src.rglob("*.py"):
         tree = ast.parse(path.read_text())
         functions = [
@@ -581,23 +578,27 @@ def test_every_real_compaction_call_site_latches_the_marker() -> None:
         ]
         rel = str(path.relative_to(src))
         for node in ast.walk(tree):
-            if not _is_compaction_call(node):
-                continue
-            owner = _enclosing_function(functions, node.lineno)
-            if owner is None or owner.name == "compact_context_if_needed":
-                continue
-            key = (rel, owner.name)
-            call_sites.add(key)
-            latches = [
-                latch
-                for latch in ast.walk(tree)
-                if _is_latch_call(latch)
-                and _enclosing_function(functions, latch.lineno) is owner
-            ]
-            if not latches:
-                missing.add(key)
+            if _is_compaction_call(node):
+                owner = _enclosing_function(functions, node.lineno)
+                if owner is None or owner.name == "compact_context_if_needed":
+                    continue
+                key = (rel, owner.name)
+                call_sites.add(key)
+                compaction_counts[key] = compaction_counts.get(key, 0) + 1
+            elif _is_latch_call(node):
+                owner = _enclosing_function(functions, node.lineno)
+                if owner is None or owner.name == "compact_context_if_needed":
+                    continue
+                key = (rel, owner.name)
+                latch_counts[key] = latch_counts.get(key, 0) + 1
 
-    assert missing == set()
+    under_latched = {
+        key: (count, latch_counts.get(key, 0))
+        for key, count in compaction_counts.items()
+        if latch_counts.get(key, 0) < count
+    }
+
+    assert under_latched == {}
     assert call_sites >= {
         ("core/agent/pattern/react/react.py", "_run_tool_calling_loop"),
         ("core/agent/pattern/auto/auto.py", "_decide"),
