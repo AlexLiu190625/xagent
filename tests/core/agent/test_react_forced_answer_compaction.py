@@ -496,21 +496,31 @@ def _writes_false(node: ast.AST, names: set[str]) -> bool:
 
 
 def test_only_one_place_in_src_writes_the_marker_false() -> None:
-    """Nothing resets the marker; the single False write is the stamp.
+    """Exactly one write node in the whole tree sets the marker to False.
+
+    Recorded as ``(file, lineno)`` rather than just the file, because the
+    invariant is about write actions, not files: a second ``False`` write
+    added later in ``manager.py`` -- above or below the existing one -- would
+    otherwise collapse into the same one-file set and pass unnoticed. Line
+    numbers are not asserted literally (any edit above ``manager.py``'s write
+    would shift the number and make the assertion fragile for no reason);
+    only the file each write node lands in is checked, after the count of
+    distinct write nodes has already been pinned to one.
 
     Read as syntax, not as text: a substring scan of one line misses a
     ``setdefault(KEY, False)``, an assignment wrapped across lines, and a
     write through an aliased import of the key.
     """
     src = pathlib.Path(__file__).resolve().parents[3] / "src" / "xagent"
-    writers = set()
+    writers: set[tuple[str, int]] = set()
     for path in src.rglob("*.py"):
         tree = ast.parse(path.read_text())
         names = _marker_names(tree)
         for node in ast.walk(tree):
             if _writes_false(node, names):
-                writers.add(str(path.relative_to(src)))
-    assert writers == {"core/agent/context/manager.py"}
+                writers.add((str(path.relative_to(src)), node.lineno))
+    assert len(writers) == 1, sorted(writers)
+    assert {path for path, _ in writers} == {"core/agent/context/manager.py"}
 
 
 def _is_compaction_call(node: ast.AST) -> bool:
