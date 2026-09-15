@@ -275,7 +275,7 @@ def _forced_next(pattern: ReActPattern) -> ReActPattern:
         "single_call_after_escape",
     ],
 )
-async def test_skip_never_spans_more_than_one_turn(
+async def test_the_skip_lasts_exactly_as_long_as_its_source_forces(
     caplog: pytest.LogCaptureFixture,
     make_llm: Any,
     make_pattern: Any,
@@ -283,7 +283,7 @@ async def test_skip_never_spans_more_than_one_turn(
     skips_expected: int,
     compactions_expected: int,
 ) -> None:
-    """The skipped compaction never spans a second turn from the same source.
+    """The skip lasts exactly as long as its source keeps forcing -- one turn or two.
 
     Two turns are offered to every shape. What is asserted is how many turns
     skipped compaction -- counted off the production log line, one per skip --
