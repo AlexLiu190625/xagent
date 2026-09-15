@@ -954,6 +954,56 @@ async def test_a_dag_step_child_carries_its_own_loss_and_the_root_stays_intact(
     assert FACTS_HEAD not in _dag_assessment(root)
 
 
+@pytest.mark.asyncio
+async def test_a_lossy_step_result_reaches_the_root_under_the_shared_rule() -> None:
+    """A step's lost evidence travels to the root as step output, not as the marker.
+
+    The root's own messages are untouched, so the root still does not latch --
+    that half of the invariant above still holds. But the step's forced-turn
+    answer reaches the root's completion-assessment payload through
+    ``step_results`` and ``candidate_output``, which are read unconditionally
+    and are not filtered by the marker. What stands between that carried-over
+    content and the assessment model treating it as fresh accumulated
+    evidence is not the marker -- the root has none set -- it is the
+    unconditional rule about content carried over from candidate_output or
+    step_results. This test pins that as the current shape of this known
+    limit, not as a guarantee that nothing can go wrong here.
+    """
+    root = build_context(observations=6, threshold=500)
+    child = root.create_child_context(metadata={"dag_step_id": "step-1"})
+    await run_one_turn(context=child, forced=False)
+    assert child.metadata[KEY] is True
+
+    step_answer_llm = ScriptedLLM(
+        [
+            tool_call(
+                "final_answer",
+                '{"answer": "STEP_OUTPUT_MARKER_7f3", "outcome": "partial"}',
+            )
+        ]
+    )
+    await run_one_turn(context=child, forced=True, llm=step_answer_llm)
+    step_output = child.messages[-1].content
+    assert step_output == "STEP_OUTPUT_MARKER_7f3"
+
+    pattern = DAGPattern(lambda **_: None)
+    pattern.step_results = {"step-1": step_output}
+    messages = pattern._completion_assessment_messages(root)
+    system, payload = messages[0]["content"], messages[1]["content"]
+
+    assert step_output in payload
+    assert '"candidate_output"' in payload
+    assert '"step_results"' in payload
+    assert root.metadata[KEY] is False
+    assert FACTS_HEAD not in system
+    assert UNKNOWN_FACTS_HEAD not in system
+    assert (
+        "When writing the answer field, including any content carried over "
+        "from candidate_output or step_results:" in system
+    )
+    assert grounding_rule(can_call_tools=False).split(".")[0] in system
+
+
 # --------------------------------------------------------------------------
 # Failure path
 # --------------------------------------------------------------------------
