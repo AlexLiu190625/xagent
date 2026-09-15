@@ -76,6 +76,28 @@ CASES: list[tuple[str, str, tuple[str, object]]] = [
     ("下午三点", SHANGHAI, ("2026-09-15T15:00:00+08:00", True)),
     ("十点半", SHANGHAI, ("2026-09-15T10:30:00+08:00", True)),
     ("noon", SYDNEY, ("REFUSED", "unsupported_expression")),
+    # Hour twelve with a half-day word is refused rather than picked one of
+    # two ways: it could be midnight (today ending or tomorrow beginning)
+    # or, read as bare digits, noon.
+    ("晚上12点", SHANGHAI, ("REFUSED", "unsupported_expression")),
+    ("12 pm", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("上午12点", SHANGHAI, ("REFUSED", "unsupported_expression")),
+    ("12 am", SYDNEY, ("REFUSED", "unsupported_expression")),
+    # A supported form with extra words around it is the whole phrase
+    # failing to match, not the supported word inside it being found.
+    ("call me back tomorrow if you can", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("我昨天见过他", SHANGHAI, ("REFUSED", "unsupported_expression")),
+    ("tomorrow at 3pm please", SYDNEY, ("REFUSED", "unsupported_expression")),
+    # "this <weekday>" stays within the current calendar week, including
+    # when today already is that weekday.
+    ("this friday", SYDNEY, ("2026-09-18T00:00:00+10:00", False)),
+    ("this tuesday", SYDNEY, ("2026-09-15T00:00:00+10:00", False)),
+    # The minute half of "N hours/minutes later" (English and Chinese).
+    ("in 30 minutes", SYDNEY, ("2026-09-15T13:00:00+10:00", True)),
+    ("30分钟后", SHANGHAI, ("2026-09-15T11:00:00+08:00", True)),
+    # The alternate character for Sunday folds to the same weekday
+    # position as the other spelling.
+    ("周天", SHANGHAI, ("2026-09-20T00:00:00+08:00", False)),
 ]
 
 
@@ -95,7 +117,7 @@ def test_validate_local_time_unchanged_after_helper_extraction() -> None:
 
 
 def test_grammar_table_has_every_case() -> None:
-    assert len(CASES) == 44
+    assert len(CASES) == 56
 
 
 @pytest.mark.parametrize(
@@ -112,6 +134,7 @@ def test_resolve_datetime_grammar(
         assert result["tool_name"] == "resolve_datetime"
         assert result["resolution"] == reason
         assert reason in RESOLUTION_REASONS
+        assert result["error"]
         assert "status" not in result
         assert ("supported" in result) == (reason == "unsupported_expression")
     else:
@@ -139,6 +162,18 @@ def test_resolve_result_has_no_quotable_clock() -> None:
         "ambiguous_local_time",
         "invalid_timezone",
     }
+
+
+def test_resolve_datetime_rejects_sub_minute_offset() -> None:
+    """Africa/Monrovia used a -00:44:30 offset before it standardised in
+    1972, which RFC 3339 / JSON Schema 'date-time' cannot represent (only a
+    ±HH:MM offset is legal). The value is refused rather than truncated or
+    rounded into an approximation."""
+    result = resolve_datetime("1 Jan 1970", "Africa/Monrovia")
+
+    assert result["success"] is False
+    assert result["resolution"] == "unsupported_expression"
+    assert result["error"]
 
 
 def test_resolve_datetime_dst_and_zone() -> None:

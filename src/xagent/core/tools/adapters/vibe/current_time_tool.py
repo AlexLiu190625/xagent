@@ -506,6 +506,18 @@ class _AmbiguousDate(ValueError):
     """The phrase reads as two different dates depending on day/month order."""
 
 
+class _AmbiguousHour(ValueError):
+    """Hour twelve paired with a half-day word names both endpoints of a day.
+
+    '12' is the hour at which a half-day label flips, in English (am/pm) and
+    in Chinese alike, without telling you which side of midnight or noon it
+    is on, so a period word attached to it is read one way by some speakers
+    and the other way by others. Guessing either reading can land the
+    result a full day off, so the phrase is refused instead of resolved to
+    one of them.
+    """
+
+
 def _reject_zone_in_phrase(name: Optional[str], offset: Optional[int]) -> None:
     # The zone comes from the timezone argument only. dateutil calls this for
     # every parse, with (None, None) when the phrase names no zone; a zone
@@ -540,7 +552,13 @@ def _parse_number(token: str) -> Optional[int]:
 
 
 def _en_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
-    """Hour and minute from an English time; None when the branch does not hold."""
+    """Hour and minute from an English time; None when the branch does not hold.
+
+    Raises _AmbiguousHour for '12am' / '12pm': am/pm otherwise disambiguates
+    the hour, but at twelve it does not (some speakers take 12pm as noon and
+    12am as midnight; others get the two backwards), so this one hour value
+    is refused rather than picked either way.
+    """
     hour = int(match.group("en_hour"))
     minute_text = match.group("en_minute")
     period = match.group("en_period")
@@ -552,7 +570,7 @@ def _en_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
         if not 1 <= hour <= 12:
             return None
         if hour == 12:
-            hour = 0
+            raise _AmbiguousHour(f"'12{period}' names both midnight and noon")
         if period == "pm":
             hour += 12
     minute = int(minute_text) if minute_text is not None else 0
@@ -562,7 +580,17 @@ def _en_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
 
 
 def _zh_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
-    """Hour and minute from a Chinese time; None when the branch does not hold."""
+    """Hour and minute from a Chinese time; None when the branch does not hold.
+
+    Raises _AmbiguousHour for hour twelve paired with the morning, dawn,
+    afternoon, or evening period word: the period word tells you which
+    half of the day the hour is in for every other hour, but at twelve the
+    half-day boundary itself is what's in question (an evening or
+    afternoon reading could mean tonight's midnight, i.e. today ending, or
+    tomorrow beginning; a morning or dawn reading could mean midnight or,
+    taken as bare digits, noon). The noon period word is unaffected: it
+    already names hour twelve unambiguously.
+    """
     hour = _parse_number(match.group("zh_hour"))
     if hour is None:
         return None
@@ -575,6 +603,11 @@ def _zh_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
     if minute is None:
         return None
     period = match.group("zh_period")
+    if hour == 12 and period in ("上午", "早上", "下午", "晚上"):
+        raise _AmbiguousHour(
+            f"'{period}12点' could mean today ending at "
+            "midnight, tomorrow beginning at midnight, or noon"
+        )
     if period in ("下午", "晚上") and hour < 12:
         hour += 12
     elif period == "中午" and hour < 11:
@@ -842,9 +875,11 @@ def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
 
     The result depends only on the phrase, the zone, the clock and tzdata:
     the same three inputs under the same clock reading always give the same
-    result. A phrase outside the grammar, a date that reads two ways, or a
-    wall-clock time the zone skips or repeats is refused with a reason
-    rather than guessed.
+    result. A phrase outside the grammar, a date that reads two ways, an
+    hour twelve whose half-day word does not settle which side of midnight
+    or noon it is on, a wall-clock time the zone skips or repeats, or a
+    resulting UTC offset with a fractional minute is refused with a reason
+    rather than guessed or approximated.
     """
     try:
         zone = _require_region_city_zone(timezone_name)
@@ -858,6 +893,8 @@ def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
         reading = _read_phrase(text, now_local)
     except _AmbiguousDate as exc:
         return _refusal("ambiguous_date", str(exc))
+    except _AmbiguousHour as exc:
+        return _refusal("unsupported_expression", str(exc))
     except (ValueError, OverflowError):
         reading = None
     if reading is None:
@@ -867,7 +904,7 @@ def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
         )
     moment, has_time = reading
     if moment.tzinfo is not None:
-        resolved = moment.astimezone(zone).isoformat(timespec="seconds")
+        aware = moment.astimezone(zone)
     else:
         stamp = moment.isoformat(sep=" ", timespec="seconds")
         try:
@@ -886,7 +923,20 @@ def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
                 f"local time {stamp} occurs twice in {zone.key} "
                 "at a daylight-saving change",
             )
-        resolved = moment.replace(tzinfo=zone).isoformat(timespec="seconds")
+        aware = moment.replace(tzinfo=zone)
+    # A handful of zones carried a sub-minute UTC offset before their
+    # jurisdiction standardised its clock (e.g. Africa/Monrovia until 1972,
+    # -00:44:30). RFC 3339 / JSON Schema 'date-time' only allow a ±HH:MM
+    # offset, so such an instant has no valid representation here; rather
+    # than truncate or round it into an approximation, refuse it.
+    offset = aware.utcoffset()
+    if offset is None or offset.total_seconds() % 60:
+        return _refusal(
+            "unsupported_expression",
+            f"{zone.key} has a UTC offset with a fractional minute at "
+            f"{aware.isoformat()}: not representable as a date-time offset",
+        )
+    resolved = aware.isoformat(timespec="seconds")
     return ResolveDatetimeResult(
         resolved=resolved, has_time=has_time, timezone=zone.key
     ).model_dump()
