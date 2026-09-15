@@ -342,11 +342,13 @@ def tool_evidence_state(context: Any) -> EvidenceState:
       unchanged across a compaction of its own that removed observations, and
       what survives that round trip states nothing (see
       ``EVIDENCE_MARKER_WRITER_FIELD``);
-    - the key absent is a payload written by a build that did not track this,
-      about which neither answer can be given -- those builds drop tool
-      observations on the truncate path without leaving a word in the context,
-      and they also complete runs that lost nothing, and the payload does not
-      say which one happened;
+    - the key absent means one of two things, and both read as unknown: a
+      payload written by a build that did not track this, or a marker
+      ``from_dict`` dropped because the payload named no attested writer.
+      Neither answer can be given for the first case -- those builds drop
+      tool observations on the truncate path without leaving a word in the
+      context, and they also complete runs that lost nothing, and the
+      payload does not say which one happened;
     - anything else -- ``True``, a corrupt value, or a context object whose
       metadata is not a dict -- reads as removed. A corrupt or malformed
       payload is not an old payload: "unknown" states that the context
