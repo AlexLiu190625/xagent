@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import json
+import logging
 from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -2721,7 +2723,14 @@ def test_a_new_context_starts_from_not_removed() -> None:
 
 
 def test_the_marker_survives_a_checkpoint_round_trip() -> None:
-    """Metadata travels whole, so no serialization code is needed."""
+    """Metadata travels whole; the one serialized field beside it is the writer seal.
+
+    This covers the same-build round trip (shape (a) in the ``from_dict``
+    contract): the payload carries both the marker and this build's writer
+    seal, so the marker rides across unchanged. The cross-build shape, where
+    a payload carries the marker but no attested seal, is covered by
+    ``test_an_unsealed_payload_cannot_hand_back_an_intact_marker``.
+    """
     context = ContextManager().create_context(execution_id="marker-roundtrip")
     context.metadata[_MARKER] = True
 
@@ -2809,3 +2818,203 @@ def test_a_child_context_inherits_the_marker_and_keeps_its_own_copy() -> None:
     unknown_root.metadata.pop(_MARKER, None)
     unknown_child = unknown_root.create_child_context()
     assert execution_module.tool_evidence_state(unknown_child) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "carried_value",
+    [False, True],
+    ids=["carried_false", "carried_true"],
+)
+def test_an_unsealed_payload_cannot_hand_back_an_intact_marker(
+    carried_value: bool,
+) -> None:
+    """A payload with the marker but no attested writer seal reads as unknown.
+
+    Simulates a build old enough to predate the writer seal: it does not
+    silently drop the field, it rebuilds a fresh dict of known keys and never
+    emits one (``git show origin/main:src/xagent/core/agent/context/execution.py``
+    shows today's ``to_dict`` doing exactly that), so the seal this build
+    wrote is the one that goes missing across such a round trip, not the
+    marker beside it. Deleting the seal from the payload, rather than
+    importing the old ``to_dict``, is the correct way to reproduce that: the
+    old build's source is gone from this checkout, only its observable
+    behavior -- no seal in the dict -- is reproducible here.
+
+    Covers both a marker of ``False`` and one of ``True``: an old build's
+    lossy compaction on a checkpoint that already carried ``True`` must not
+    upgrade the outcome to "removed" -- it drops the record either way,
+    because it cannot tell which value it is discarding without becoming a
+    second holder of that reading.
+    """
+    context = ContextManager().create_context(execution_id="marker-unsealed")
+    context.metadata[_MARKER] = carried_value
+
+    payload = context.to_dict()
+    payload.pop(execution_module.EVIDENCE_MARKER_WRITER_FIELD)
+
+    restored = ExecutionContext.from_dict(json.loads(json.dumps(payload)))
+
+    assert execution_module.tool_evidence_state(restored) == "unknown"
+    assert _MARKER not in restored.metadata
+
+
+@pytest.mark.parametrize(
+    "carried_value, expected",
+    [(True, "removed"), (False, "intact")],
+    ids=["removed", "intact"],
+)
+def test_a_same_build_round_trip_still_reads_the_marker_it_wrote(
+    carried_value: bool, expected: str
+) -> None:
+    """A payload this build wrote carries its own seal and reads back unchanged."""
+    context = ContextManager().create_context(execution_id="marker-samebuild")
+    context.metadata[_MARKER] = carried_value
+
+    payload = context.to_dict()
+    restored = ExecutionContext.from_dict(json.loads(json.dumps(payload)))
+
+    assert execution_module.tool_evidence_state(restored) == expected
+
+
+_MISSING_SEAL = object()
+
+
+@pytest.mark.parametrize(
+    "seal_value, expected",
+    [
+        ("1", "unknown"),
+        (0, "unknown"),
+        (True, "unknown"),
+        (None, "unknown"),
+        ({"generation": 1}, "unknown"),
+        (_MISSING_SEAL, "unknown"),
+        (2, "intact"),
+    ],
+    ids=[
+        "string_one",
+        "zero",
+        "bool_true",
+        "none",
+        "dict",
+        "missing",
+        "generation_two",
+    ],
+)
+def test_a_malformed_writer_seal_attests_nothing(
+    seal_value: object, expected: str
+) -> None:
+    """Only a real, sufficiently high generation number attests a writer.
+
+    ``True`` is excluded on purpose even though ``True == 1`` in Python: a
+    hand-edited or JSON-mangled boolean must not attest itself. Generation 2
+    (a stand-in for a future writer) attests today's marker too, because the
+    predicate accepts any generation at or above the one this build writes --
+    the forward-compatible half of the rule.
+    """
+    context = ContextManager().create_context(execution_id="marker-malformed-seal")
+    context.metadata[_MARKER] = False
+
+    payload = context.to_dict()
+    if seal_value is _MISSING_SEAL:
+        payload.pop(execution_module.EVIDENCE_MARKER_WRITER_FIELD)
+    else:
+        payload[execution_module.EVIDENCE_MARKER_WRITER_FIELD] = seal_value
+
+    restored = ExecutionContext.from_dict(json.loads(json.dumps(payload)))
+
+    assert execution_module.tool_evidence_state(restored) == expected
+
+
+def test_from_dict_does_not_modify_the_payload_it_was_given() -> None:
+    """Restoring from an unsealed payload must not mutate the payload itself.
+
+    ``to_dict`` hands out the live ``metadata`` object by reference (see
+    ``test_the_marker_survives_a_checkpoint_round_trip``), so a payload
+    reaching ``from_dict`` can be aliased to a caller's checkpoint dict or to
+    another live context's metadata. Popping the marker key in place would
+    silently edit that shared state as a side effect of reading it.
+    """
+    context = ContextManager().create_context(execution_id="marker-no-mutate")
+    payload = context.to_dict()
+    payload.pop(execution_module.EVIDENCE_MARKER_WRITER_FIELD)
+    snapshot = copy.deepcopy(payload)
+
+    restored = ExecutionContext.from_dict(payload)
+
+    assert payload == snapshot
+    assert _MARKER in payload["metadata"]
+    assert restored.metadata is not payload["metadata"]
+
+
+def test_every_payload_this_build_writes_carries_the_writer_seal() -> None:
+    """The seal is unconditional: it proves the writer, not the marker's value.
+
+    Written regardless of whether ``metadata`` carries the tool-evidence
+    marker at all -- the seal is about who wrote this payload, not about
+    what it says.
+    """
+    managed = ContextManager().create_context(execution_id="marker-seal-managed")
+    assert (
+        managed.to_dict()[execution_module.EVIDENCE_MARKER_WRITER_FIELD]
+        == execution_module.EVIDENCE_MARKER_WRITER_GENERATION
+    )
+
+    bare = ExecutionContext(execution_id="marker-seal-bare")
+    assert (
+        bare.to_dict()[execution_module.EVIDENCE_MARKER_WRITER_FIELD]
+        == execution_module.EVIDENCE_MARKER_WRITER_GENERATION
+    )
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "sealed_with_marker",
+        "unsealed_with_marker",
+        "sealed_without_marker",
+        "no_seal_no_marker",
+    ],
+)
+def test_dropping_an_unattested_marker_is_logged_with_ids_only(
+    shape: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The one warning this path emits names the execution id and nothing else.
+
+    Shape (b)/(e) -- a marker with no attested seal -- is the only case that
+    logs: it is the only crossing whose record lives nowhere else. Shapes
+    (a) (sealed, marker present), (c) (sealed, marker absent), and (d) (no
+    seal, no marker -- an old checkpoint predating the key) log nothing. The
+    message must not leak the value being dropped -- only that a drop
+    happened, and to which execution.
+    """
+    execution_id = f"marker-logged-{shape}"
+    context = ContextManager().create_context(execution_id=execution_id)
+    payload = context.to_dict()
+    payload["metadata"] = dict(payload["metadata"])
+
+    if shape == "unsealed_with_marker":
+        payload.pop(execution_module.EVIDENCE_MARKER_WRITER_FIELD)
+    elif shape == "sealed_without_marker":
+        payload["metadata"].pop(_MARKER, None)
+    elif shape == "no_seal_no_marker":
+        payload.pop(execution_module.EVIDENCE_MARKER_WRITER_FIELD)
+        payload["metadata"].pop(_MARKER, None)
+    # "sealed_with_marker" is shape (a): left exactly as `to_dict` wrote it.
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.context.execution"):
+        ExecutionContext.from_dict(payload)
+
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.core.agent.context.execution"
+    ]
+
+    if shape == "unsealed_with_marker":
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert execution_id in message
+        assert "False" not in message
+        assert "True" not in message
+    else:
+        assert len(records) == 0

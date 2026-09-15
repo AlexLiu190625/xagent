@@ -78,7 +78,22 @@ TRANSCRIPT_WATERMARK_METADATA_KEY = "transcript_watermark"
 # That refusal covers the effective value only -- a refused key still sits
 # under ``metadata["request_context"]`` and rides into every checkpoint from
 # there, so nothing may read that copy as authoritative.
+# A value under this key is only trusted when the payload it arrived in also
+# carried ``EVIDENCE_MARKER_WRITER_FIELD``; see ``ExecutionContext.from_dict``.
 TOOL_EVIDENCE_REMOVED_METADATA_KEY = "tool_evidence_removed"
+# Serialized writer seal, a sibling of ``metadata`` in ``to_dict``'s payload.
+# ``from_dict`` refuses to carry ``TOOL_EVIDENCE_REMOVED_METADATA_KEY`` in
+# from a payload that arrives without it: a build that does not know that key
+# round-trips it unchanged (``git show origin/main`` rebuilds a fresh dict of
+# known keys and never sees it) across a compaction of its own that removed
+# tool observations, so the value that survives such a round trip is not a
+# statement about anything. A generation is a promise that this writer latches
+# the marker on every lossy compaction, and generations only ever add to the
+# promise before them -- which is why any generation at or above this one is
+# attested. A future build that stops latching must write no seal at all
+# rather than a higher number.
+EVIDENCE_MARKER_WRITER_FIELD = "evidence_marker_writer"
+EVIDENCE_MARKER_WRITER_GENERATION = 1
 # Written onto ``CompactResult.metadata`` (and from there onto the compact
 # trace event) when an LLM summary replaces the history. The message-dropping
 # backstop never sets them: a dropped-message result stands in for nothing and
@@ -296,6 +311,23 @@ def note_compaction_evidence_loss(context: Any, result: Any) -> None:
 EvidenceState = Literal["intact", "removed", "unknown"]
 
 
+def _evidence_marker_writer_attested(data: Any) -> bool:
+    """Whether a serialized payload names a writer that latches the marker.
+
+    ``True`` is not a generation: Python makes ``True == 1``, so a hand-edited
+    or JSON-mangled boolean would otherwise attest itself. A storage layer that
+    stringified the number attests nothing either, and the marker beside it then
+    reads unknown -- the same JSON-fidelity dependency ``tool_evidence_state``
+    documents for the marker itself, and in the same fail-safe direction.
+    """
+    if not isinstance(data, dict):
+        return False
+    seal = data.get(EVIDENCE_MARKER_WRITER_FIELD)
+    if isinstance(seal, bool) or not isinstance(seal, int):
+        return False
+    return seal >= EVIDENCE_MARKER_WRITER_GENERATION
+
+
 def tool_evidence_state(context: Any) -> EvidenceState:
     """Whether a compaction on this context removed tool observations.
 
@@ -303,7 +335,13 @@ def tool_evidence_state(context: Any) -> EvidenceState:
     "no one was keeping track". ``ContextManager.create_context`` stamps the
     key False on every context this build creates, so:
 
-    - the key literally ``False`` is this build saying nothing was removed;
+    - the key literally ``False`` is a latching build saying nothing was
+      removed, and it is only ever read off a payload that also carried this
+      build's writer seal: ``from_dict`` drops the key from any payload
+      without one, because a build that does not know the key round-trips it
+      unchanged across a compaction of its own that removed observations, and
+      what survives that round trip states nothing (see
+      ``EVIDENCE_MARKER_WRITER_FIELD``);
     - the key absent is a payload written by a build that did not track this,
       about which neither answer can be given -- those builds drop tool
       observations on the truncate path without leaving a word in the context,
@@ -325,6 +363,11 @@ def tool_evidence_state(context: Any) -> EvidenceState:
     ``JSON`` type on most dialects and ``JSONB`` on PostgreSQL. A storage
     layer that did not preserve JSON boolean fidelity would make every
     restored marker read as removed.
+
+    The writer seal is bound by the same fidelity requirement: a seal that
+    storage stringified is not attested, and the marker beside it then reads
+    unknown rather than intact -- the same fail-safe direction as a
+    stringified marker itself.
     """
     metadata = getattr(context, "metadata", None)
     if not isinstance(metadata, dict):
@@ -1188,6 +1231,17 @@ class ExecutionContext:
             ],
             "system_prompt": self.system_prompt,
             "metadata": self.metadata,
+            # A sibling of ``metadata``, deliberately not a member of it:
+            # ``request_context`` keys land inside ``metadata`` verbatim
+            # (``runner.py:1001`` writes ``context.metadata[key] = value``), so
+            # a client can put any key there, while a top-level field of this
+            # payload has no client-reachable writer at all -- no API accepts a
+            # serialized context, and every dict that reaches ``from_dict``
+            # comes from this method (``runner.py:159``, ``runner.py:551``,
+            # ``dag.py:960``, ``dag.py:1948``). That asymmetry is the whole
+            # reason this field, and not the marker beside it, is the thing
+            # ``from_dict`` trusts.
+            EVIDENCE_MARKER_WRITER_FIELD: EVIDENCE_MARKER_WRITER_GENERATION,
             "created_at": self.created_at.isoformat(),
             "llm_calls": [
                 {
@@ -1270,6 +1324,30 @@ class ExecutionContext:
             else:
                 components[name] = GenericComponent(data=payload)
 
+        metadata = data.get("metadata", {})
+        if (
+            isinstance(metadata, dict)
+            and TOOL_EVIDENCE_REMOVED_METADATA_KEY in metadata
+            and not _evidence_marker_writer_attested(data)
+        ):
+            logger.warning(
+                "Restored context carries a tool-evidence marker with no "
+                "attested writer seal; dropping it so the state reads unknown. "
+                "execution_id=%s",
+                data.get("execution_id"),
+            )
+            # Built fresh rather than popped in place: ``to_dict`` hands out
+            # the live ``metadata`` object (``tests/core/agent/test_context.py``
+            # pins ``payload["metadata"] is context.metadata``), so a payload
+            # reaching here can be aliased to a caller's checkpoint dict or to
+            # another live context's metadata. Deleting the key would edit
+            # someone else's state as a side effect of reading.
+            metadata = {
+                key: value
+                for key, value in metadata.items()
+                if key != TOOL_EVIDENCE_REMOVED_METADATA_KEY
+            }
+
         context = cls(
             execution_id=data.get("execution_id", str(uuid4())),
             user_id=data.get("user_id"),
@@ -1277,7 +1355,7 @@ class ExecutionContext:
             components=components,
             messages=messages,
             system_prompt=data.get("system_prompt"),
-            metadata=data.get("metadata", {}),
+            metadata=metadata,
             created_at=created_at,
             llm_calls=llm_calls,
             compact_config=compact_config,

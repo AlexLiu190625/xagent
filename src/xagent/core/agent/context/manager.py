@@ -45,9 +45,11 @@ class ContextManager:
             session_id=session_id,
             system_prompt=system_prompt,
         )
-        # Stamped on every context this build creates, so that an absent key
-        # means "written by a build that did not track this" and reads as
-        # unknown. See tool_evidence_state.
+        # Stamped on every context this build creates. An absent key therefore
+        # means one of two things, and both read as unknown: a payload written by
+        # a build that did not track this, or a marker ``from_dict`` dropped because
+        # the payload named no writer. See tool_evidence_state and
+        # EVIDENCE_MARKER_WRITER_FIELD.
         context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = False
         if any(
             value is not None
