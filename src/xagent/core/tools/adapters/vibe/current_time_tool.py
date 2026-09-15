@@ -507,14 +507,19 @@ class _AmbiguousDate(ValueError):
 
 
 class _AmbiguousHour(ValueError):
-    """Hour twelve paired with a half-day word names both endpoints of a day.
+    """A spoken hour paired with a half-day word that does not settle on,
+    or flatly contradicts, one correct time of day.
 
-    '12' is the hour at which a half-day label flips, in English (am/pm) and
-    in Chinese alike, without telling you which side of midnight or noon it
-    is on, so a period word attached to it is read one way by some speakers
-    and the other way by others. Guessing either reading can land the
-    result a full day off, so the phrase is refused instead of resolved to
-    one of them.
+    Two shapes raise this. Hour twelve paired with any half-day word
+    (English am/pm, Chinese 上午/早上/下午/晚上) names both endpoints of a
+    day: '12' is the hour at which the label flips, without telling you
+    which side of midnight or noon it is on, so a period word attached to
+    it is read one way by some speakers and the other way by others.
+    '中午' (noon) paired with any hour other than 11, 12, or 13 has the
+    opposite problem: instead of leaving the hour ambiguous, it names an
+    hour nowhere near noon, contradicting the period word it came with.
+    Guessing a reading in either case can land the result hours or a full
+    day off, so the phrase is refused instead of resolved to one.
     """
 
 
@@ -588,8 +593,12 @@ def _zh_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
     half-day boundary itself is what's in question (an evening or
     afternoon reading could mean tonight's midnight, i.e. today ending, or
     tomorrow beginning; a morning or dawn reading could mean midnight or,
-    taken as bare digits, noon). The noon period word is unaffected: it
-    already names hour twelve unambiguously.
+    taken as bare digits, noon). The noon period word is unaffected by
+    that check: it already names hour twelve unambiguously. It raises the
+    same exception for a narrower reason instead: paired with any hour
+    other than 11, 12, or 13 it names an hour nowhere near noon (e.g.
+    '中午10点' names 10 in the morning), so those combinations are refused
+    too.
     """
     hour = _parse_number(match.group("zh_hour"))
     if hour is None:
@@ -608,9 +617,11 @@ def _zh_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
             f"'{period}12点' could mean today ending at "
             "midnight, tomorrow beginning at midnight, or noon"
         )
+    if period == "中午" and hour not in (11, 12, 13):
+        raise _AmbiguousHour(
+            f"'中午{hour}点' names an hour nowhere near noon: only 11, 12, or 13 do"
+        )
     if period in ("下午", "晚上") and hour < 12:
-        hour += 12
-    elif period == "中午" and hour < 11:
         hour += 12
     if not 0 <= hour <= 23 or not 0 <= minute <= 59:
         return None
@@ -855,7 +866,9 @@ def _read_phrase(text: str, now_local: datetime) -> Optional[_Reading]:
     return _read_en_calendar_date(text, now_local)
 
 
-def _refusal(reason: str, error: str) -> dict[str, Any]:
+def _refusal(
+    reason: str, error: str, *, include_grammar: bool = True
+) -> dict[str, Any]:
     # success=False routes the call through the framework's failure branch;
     # the reason is carried under 'resolution' because 'status' is the
     # framework's control channel.
@@ -865,7 +878,7 @@ def _refusal(reason: str, error: str) -> dict[str, Any]:
         "error": error,
         "resolution": reason,
     }
-    if reason == "unsupported_expression":
+    if reason == "unsupported_expression" and include_grammar:
         refusal["supported"] = list(GRAMMAR_FORMS)
     return refusal
 
@@ -931,10 +944,14 @@ def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
     # than truncate or round it into an approximation, refuse it.
     offset = aware.utcoffset()
     if offset is None or offset.total_seconds() % 60:
+        # The phrase itself matched the grammar; the problem is the zone's
+        # historical offset, so the grammar list would only mislead a
+        # caller into rewriting an already-supported phrase.
         return _refusal(
             "unsupported_expression",
-            f"{zone.key} has a UTC offset with a fractional minute at "
-            f"{aware.isoformat()}: not representable as a date-time offset",
+            f"{zone.key} used a UTC offset with a fractional minute at "
+            "this date, which is not representable as a date-time offset",
+            include_grammar=False,
         )
     resolved = aware.isoformat(timespec="seconds")
     return ResolveDatetimeResult(

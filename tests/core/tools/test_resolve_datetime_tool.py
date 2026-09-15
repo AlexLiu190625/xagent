@@ -98,6 +98,30 @@ CASES: list[tuple[str, str, tuple[str, object]]] = [
     # The alternate character for Sunday folds to the same weekday
     # position as the other spelling.
     ("周天", SHANGHAI, ("2026-09-20T00:00:00+08:00", False)),
+    # "中午" (noon) only names an hour within one of noon: 11, 12, or 13.
+    # Any other hour contradicts the period word instead of merely leaving
+    # it ambiguous, so it is refused the same way hour twelve with a
+    # half-day word is. There is no frozen-design reading for "中午1点",
+    # so it is refused rather than guessed.
+    ("中午10点", SHANGHAI, ("REFUSED", "unsupported_expression")),
+    ("中午12点", SHANGHAI, ("2026-09-15T12:00:00+08:00", True)),
+    ("中午1点", SHANGHAI, ("REFUSED", "unsupported_expression")),
+    # A supported form with extra words around it, for every fullmatch
+    # point that isn't already covered above: the whole phrase failing to
+    # match, not the supported word inside it being found.
+    (
+        "please renew by 2026-09-20 thanks",
+        SYDNEY,
+        ("REFUSED", "unsupported_expression"),
+    ),
+    ("合同到2026年9月20日为止", SHANGHAI, ("REFUSED", "unsupported_expression")),
+    ("下周三我请假", SHANGHAI, ("REFUSED", "unsupported_expression")),
+    ("我们大概3天后见", SHANGHAI, ("REFUSED", "unsupported_expression")),
+    ("我们两小时后再聊", SHANGHAI, ("REFUSED", "unsupported_expression")),
+    ("我们下午三点在楼下见吧", SHANGHAI, ("REFUSED", "unsupported_expression")),
+    ("see you next friday ok", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("let's meet in 3 days ok", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("call me in 2 hours please", SYDNEY, ("REFUSED", "unsupported_expression")),
 ]
 
 
@@ -117,7 +141,7 @@ def test_validate_local_time_unchanged_after_helper_extraction() -> None:
 
 
 def test_grammar_table_has_every_case() -> None:
-    assert len(CASES) == 56
+    assert len(CASES) == 68
 
 
 @pytest.mark.parametrize(
@@ -173,7 +197,8 @@ def test_resolve_datetime_rejects_sub_minute_offset() -> None:
 
     assert result["success"] is False
     assert result["resolution"] == "unsupported_expression"
-    assert result["error"]
+    assert "fractional minute" in result["error"]
+    assert "supported" not in result
 
 
 def test_resolve_datetime_dst_and_zone() -> None:
