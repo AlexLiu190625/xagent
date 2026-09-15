@@ -1394,6 +1394,52 @@ describe("holds the dialog open while a retry resend is in flight", () => {
   })
 })
 
+describe("keeps the submit gate closed while a retry resend is in flight, even after a same-task refresh reopens it", () => {
+  it("keeps the submit gate closed while a retry resend is in flight, even after a same-task refresh reopens it", async () => {
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(new Error("closed"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    // Click retry with the resend held open: `resending` stays true until
+    // this resolves.
+    sendMessageMock.mockClear()
+    let resolveRetry: () => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((res) => { resolveRetry = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+
+    // Same task, another terminal frame arrives while that resend is still
+    // in flight -- e.g. a second tab's own broadcast of the same failure.
+    // openForTask bumps the request's seq, the read effect re-fetches, and
+    // installs a fresh fillable report: `sendFailed` clears and the
+    // footer's save buttons come back.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "y" } })
+
+    const saveOnly = screen.getByText("connectorRuntime.actions.saveOnly")
+    const saveAndResend = screen.getByText("connectorRuntime.actions.saveAndResend")
+    expect(saveOnly).toBeDisabled()
+    expect(saveAndResend).toBeDisabled()
+
+    // Even a click against the (disabled) button must not let a second send
+    // go out under a fresh message id while the first retry is still
+    // unaccounted for.
+    fireEvent.click(saveAndResend)
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(submitMock).toHaveBeenCalledTimes(1)
+
+    await act(async () => { resolveRetry() })
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled())
+  })
+})
+
 describe("tells the user when save and resend did not resend", () => {
   it("tells the user when save and resend did not resend", async () => {
     // Saved, but the server still reports the connector unavailable with

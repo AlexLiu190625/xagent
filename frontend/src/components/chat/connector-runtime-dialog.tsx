@@ -273,6 +273,17 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     connector.inputs.some(input => hasLiveInvalidObjectMark(connector, input, invalidDraftKeys)),
   )
   const canSubmit = isSubmitEnabled(submitItems, hasInvalidObjectDraft)
+  // Whether any submission-shaped action is in flight: an explicit save
+  // (`submitting`) or a resend retried directly off a failed send
+  // (`resending`). A same-task terminal frame that arrives while a retry
+  // resend is still awaiting `doResend` -- for example, a second tab's own
+  // broadcast of the same failure -- runs the read effect above, which
+  // clears `sendFailed` and brings the footer's save buttons back before
+  // that resend settles. `canSubmitNow` must stay gated on this combined
+  // value rather than `submitting` alone, or those buttons would let a
+  // second send go out under a fresh message id while the first is still
+  // unaccounted for.
+  const busy = submitting || resending
   // The one value every entry point into a submission reads: both footer
   // save buttons, the retry button a retryable failure offers, and
   // handleSave itself. The retry button used to be rendered off
@@ -284,7 +295,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // stored context value is immutable, so there is no correcting it
   // afterwards. handleSave re-checks rather than trusting its callers, so a
   // fourth entry point cannot reintroduce the same bypass.
-  const canSubmitNow = canSubmit && !submitting
+  const canSubmitNow = canSubmit && !busy
   const hasResendPayload = request.resendPayload !== null
   const actions = outcome ? resolveDialogActions(outcome, hasResendPayload) : []
   // Whether this shape offers any way to submit. The row renderer asks this
@@ -451,12 +462,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // dismissing mid-send drops the request (and with it the snapshot the retry
   // button reads), leaving nothing to retry from if that send fails.
   const handleDismiss = () => {
-    if (submitting || resending) return
+    if (busy) return
     close("dismissed")
   }
 
   const handleOpenChange = (open: boolean) => {
-    if (open || submitting || resending) return
+    if (open || busy) return
     handleDismiss()
   }
 
