@@ -391,6 +391,7 @@ class DAGPattern(AgentPattern):
         self.active_step_contexts: dict[str, dict[str, Any]] = {}
         self.step_results: dict[str, Any] = {}
         self.planned_user_message_count = 0
+        self.replan_owed_step_ids: list[str] = []
         self.memory_input_text: str | None = None
         self.completion_feedback: str | None = None
         self.completion_replan_count = 0
@@ -501,15 +502,6 @@ class DAGPattern(AgentPattern):
                 )
                 if interrupted is not None:
                     return interrupted
-            elif self._needs_replan(context):
-                if not self._forward_user_response_to_waiting_step(context):
-                    await self._generate_plan(
-                        context=context,
-                        tools=tools,
-                        llm=llm,
-                        runtime=runtime,
-                        replan=True,
-                    )
         except PlanValidationError as exc:
             return await self._fail(
                 context=context,
@@ -534,15 +526,21 @@ class DAGPattern(AgentPattern):
                 context=context,
                 runtime=runtime,
                 error=str(exc),
-                failure_reason=(
-                    "replan_generation_error"
-                    if self.status == "replanning"
-                    else "plan_generation_error"
-                ),
+                failure_reason="plan_generation_error",
                 checkpoint_label="dag_plan_generation_failed",
             )
 
         while True:
+            if self._reply_replan_owed():
+                # The branch below may reach _generate_plan, which clears
+                # the interrupt; a real Stop must be reported first.
+                interrupted = await self._interrupt_if_requested(
+                    runtime=runtime,
+                    context=context,
+                    label="dag_before_owed_replan",
+                )
+                if interrupted is not None:
+                    return interrupted
             if self._needs_replan(context):
                 if not self._forward_user_response_to_waiting_step(context):
                     try:
@@ -773,6 +771,7 @@ class DAGPattern(AgentPattern):
                 if available_slots <= 0:
                     break
 
+        hold_scheduling = False
         try:
             while pending:
                 done, pending = await asyncio.wait(
@@ -905,13 +904,15 @@ class DAGPattern(AgentPattern):
                         )
                     return winner_result
 
-                if self._needs_replan(root_context):
-                    await cancel_all()
-                    return None
+                if self._reply_awaiting_replan():
+                    # An owed replan reuses whatever this batch finishes, so
+                    # let it drain and only stop scheduling new steps.
+                    hold_scheduling = True
                 if self.status in {"interrupted", "waiting_for_user"}:
                     await cancel_all()
                     return None
-                schedule_ready_steps()
+                if not hold_scheduling:
+                    schedule_ready_steps()
         except BaseException:
             # A sibling that already completed by this point is not in
             # `pending`, so cancel_all() below never clears its active-step
@@ -1170,6 +1171,7 @@ class DAGPattern(AgentPattern):
             "active_step_contexts": dict(self.active_step_contexts),
             "step_results": dict(self.step_results),
             "planned_user_message_count": self.planned_user_message_count,
+            "replan_owed_step_ids": list(self.replan_owed_step_ids),
             "memory_input_text": self.memory_input_text,
             "max_concurrency": self.max_concurrency,
             "completion_feedback": self.completion_feedback,
@@ -1225,6 +1227,7 @@ class DAGPattern(AgentPattern):
             active_frame_ids=active_frame_ids,
             control_state={
                 "planned_user_message_count": self.planned_user_message_count,
+                "replan_owed_step_ids": list(self.replan_owed_step_ids),
                 "max_concurrency": self.max_concurrency,
             },
         ).to_dict()
@@ -1262,6 +1265,11 @@ class DAGPattern(AgentPattern):
         self.planned_user_message_count = int(
             state.get("planned_user_message_count", 0)
         )
+        owed_step_ids: list[str] = []
+        for owed_step_id in state.get("replan_owed_step_ids") or []:
+            if owed_step_id and str(owed_step_id) not in owed_step_ids:
+                owed_step_ids.append(str(owed_step_id))
+        self.replan_owed_step_ids = owed_step_ids
         stored_memory_input = state.get("memory_input_text")
         if stored_memory_input:
             self.memory_input_text = str(stored_memory_input)
@@ -1389,6 +1397,7 @@ class DAGPattern(AgentPattern):
         if assessment.complete:
             self.status = "completed"
             self.completion_feedback = None
+            self.replan_owed_step_ids = []
             output = assessment.answer or self._final_output()
             await runtime.checkpoint("dag_completed", context=context, pattern=self)
             return PatternResult(
@@ -1810,6 +1819,7 @@ class DAGPattern(AgentPattern):
         runtime: PatternRuntime,
         replan: bool,
     ) -> None:
+        reply_driven = self._reply_awaiting_replan()
         self.status = "replanning" if replan else "planning"
         if replan:
             self._clear_all_active_steps()
@@ -1829,6 +1839,7 @@ class DAGPattern(AgentPattern):
             previous_plan=self.plan,
             available_tool_names=[self._tool_name(tool) for tool in tools],
             completion_feedback=self.completion_feedback,
+            reply_driven=reply_driven,
         )
         self.plan = await self.plan_generator.generate_plan(
             request=request,
@@ -1837,6 +1848,7 @@ class DAGPattern(AgentPattern):
         self.plan.validate()
         self._apply_completed_results_to_plan()
         self.planned_user_message_count = self._user_message_count(context)
+        self.replan_owed_step_ids = []
         if replan:
             runtime.clear_interrupt()
         await runtime.checkpoint(
@@ -1891,7 +1903,23 @@ class DAGPattern(AgentPattern):
                 step.status = "completed"
                 step.result = self.step_results[step.id]
 
+    def _reply_awaiting_replan(self) -> bool:
+        """A consumed reply no plan has answered yet; unlike the owed check it
+        ignores plan completion, so a completion replan still sees it."""
+        return any(
+            step_id in self.step_results for step_id in self.replan_owed_step_ids
+        )
+
+    def _reply_replan_owed(self) -> bool:
+        return (
+            self._reply_awaiting_replan()
+            and not self._all_steps_completed()
+            and not self.active_step_ids
+        )
+
     def _needs_replan(self, context: Any) -> bool:
+        if self._reply_replan_owed():
+            return True
         if self.status not in {"interrupted", "waiting_for_user", "replanning"}:
             return False
         return self._user_message_count(context) > self.planned_user_message_count
@@ -1925,6 +1953,9 @@ class DAGPattern(AgentPattern):
             else None
         )
         marker = pending_user_response_marker(waiting_request)
+        if marker is not None:
+            # The answer belongs to this step; the planner reads the pairing.
+            marker = {**marker, "step_id": step_id}
         raw_response_metadata = getattr(response_message, "metadata", None)
         response_metadata = (
             dict(raw_response_metadata)
@@ -1956,6 +1987,9 @@ class DAGPattern(AgentPattern):
 
         self._set_active_step_context(step_id, child_context.to_dict())
         self.planned_user_message_count = len(root_user_messages)
+        # Every consumed reply stays listed until a plan absorbs them all.
+        if step_id not in self.replan_owed_step_ids:
+            self.replan_owed_step_ids.append(step_id)
         self.status = "running"
         return True
 
