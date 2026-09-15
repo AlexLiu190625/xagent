@@ -45,6 +45,7 @@ TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
 ENCRYPTION_KEY = "ENCRYPTION_KEY"
 # Public development fallback; runtime credential storage must reject it.
 DEV_FALLBACK_ENCRYPTION_KEY = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
+TASK_REPLY_WAIT_TIMEOUT_SECONDS = "XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
@@ -141,6 +142,8 @@ TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS = (
 )
 CHECKPOINT_ENCODING_V2 = "XAGENT_CHECKPOINT_ENCODING_V2"
 CHECKPOINT_HISTORY_LIMIT = "XAGENT_CHECKPOINT_HISTORY_LIMIT"
+ASYNC_TRACE_DB_ENABLED = "XAGENT_ASYNC_TRACE_DB_ENABLED"
+TRACE_DB_MAX_INFLIGHT = "XAGENT_TRACE_DB_MAX_INFLIGHT"
 COMPACT_THRESHOLD_RATIO = "XAGENT_COMPACT_THRESHOLD_RATIO"
 COMPACT_THRESHOLD_DEFAULT = "XAGENT_COMPACT_THRESHOLD_DEFAULT"
 REDIS_URL = "XAGENT_REDIS_URL"
@@ -342,6 +345,21 @@ def get_default_task_execution_mode(
     if runtime == "v1":
         return "think"
     return "auto"
+
+
+def get_task_reply_wait_timeout_seconds() -> int:
+    """Get the shared reply preparation wait timeout (env override, default 30s)."""
+    value = os.getenv(TASK_REPLY_WAIT_TIMEOUT_SECONDS, "30")
+    try:
+        seconds = int(value)
+        if seconds > 0:
+            return seconds
+    except ValueError:
+        pass
+    logger.warning(
+        "Invalid %s=%r; falling back to 30", TASK_REPLY_WAIT_TIMEOUT_SECONDS, value
+    )
+    return 30
 
 
 def get_task_lease_ttl_seconds() -> int:
@@ -2639,6 +2657,26 @@ def get_db_pool_size() -> int:
         Number of persistent connections kept in the pool per process.
     """
     return _get_positive_int_env(DB_POOL_SIZE, 10)
+
+
+def get_async_trace_db_enabled() -> bool:
+    """Async PostgreSQL/file-SQLite trace writes; restart to change backend.
+
+    Private memory databases and custom session-only hosts retain bounded sync
+    writes so a second engine cannot change database identity.
+    """
+    return _get_bool_env(ASYNC_TRACE_DB_ENABLED, True)
+
+
+def get_trace_db_max_inflight() -> int:
+    """Bound trace writes before thread/connection acquisition, per event loop.
+
+    Defaults to a conservative four, not the throughput benchmark's optimum.
+    The PostgreSQL async trace pool has this cap and no overflow; SQLite uses
+    one trace writer per loop in either mode. Sync PostgreSQL writes also
+    clamp to leave one shared pooled connection where pool size permits.
+    """
+    return _get_positive_int_env(TRACE_DB_MAX_INFLIGHT, 4)
 
 
 def get_db_max_overflow() -> int:

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+from datetime import date
 from typing import Any
 
 import requests
@@ -141,7 +142,7 @@ def _date_range_body(date_range: dict[str, Any]) -> dict[str, Any]:
     if not date_range.get("start_date") or not date_range.get("end_date"):
         raise ValueError(
             'Each date range needs "start_date" and "end_date" (YYYY-MM-DD or '
-            'GA4 relative terms like "7daysAgo"/"today")'
+            'GA4 relative terms like "7daysAgo"/"yesterday")'
         )
     body = {
         "startDate": date_range["start_date"],
@@ -150,6 +151,102 @@ def _date_range_body(date_range: dict[str, Any]) -> dict[str, Any]:
     if date_range.get("name"):
         body["name"] = date_range["name"]
     return body
+
+
+def _ends_today(date_range: dict[str, Any]) -> bool:
+    return str(date_range.get("end_date", "")).strip().lower() == "today"
+
+
+_RELATIVE_DATE_PATTERN = re.compile(r"^(\d+)daysAgo$", re.IGNORECASE)
+
+
+def _relative_day_offset(value: str) -> int | None:
+    """Days before "today" a GA4 relative date term refers to (0 for
+    "today", 1 for "yesterday", N for "NdaysAgo"), or None if `value` isn't
+    one of those recognized relative terms (e.g. an explicit YYYY-MM-DD)."""
+    normalized = value.strip().lower()
+    if normalized == "today":
+        return 0
+    if normalized == "yesterday":
+        return 1
+    match = _RELATIVE_DATE_PATTERN.match(normalized)
+    return int(match.group(1)) if match else None
+
+
+def _date_range_span(
+    date_range: dict[str, Any],
+) -> tuple[int, int] | tuple[date, date] | None:
+    """(start, end) in a comparable, ordered form: either two GA4 relative
+    day offsets (both counted as days before "today", so start >= end) or
+    two explicit `date` objects -- whichever bound type start_date/end_date
+    both share. None if a bound is unrecognized, or one bound is a relative
+    term and the other an explicit date -- comparable only by knowing
+    "today"'s actual date, which this tool never resolves itself."""
+    start = str(date_range.get("start_date", ""))
+    end = str(date_range.get("end_date", ""))
+    start_offset = _relative_day_offset(start)
+    end_offset = _relative_day_offset(end)
+    if start_offset is not None and end_offset is not None:
+        return (start_offset, end_offset)
+    if start_offset is None and end_offset is None:
+        try:
+            return (date.fromisoformat(start), date.fromisoformat(end))
+        except ValueError:
+            return None
+    return None
+
+
+def _date_range_day_count(date_range: dict[str, Any]) -> int | None:
+    """Inclusive day span of a date_range (e.g. 2 for "yesterday"/"today",
+    7 for "7daysAgo"/"yesterday"), or None if _date_range_span can't
+    resolve it."""
+    span = _date_range_span(date_range)
+    if span is None:
+        return None
+    start, end = span
+    # _date_range_span only ever returns same-type pairs, but its return
+    # type (tuple[int, int] | tuple[date, date]) doesn't tell mypy that
+    # start and end are correlated -- narrow both explicitly per branch.
+    if isinstance(start, int) and isinstance(end, int):
+        count = start - end + 1
+    elif isinstance(start, date) and isinstance(end, date):
+        count = (end - start).days + 1
+    else:
+        return None
+    return count if count > 0 else None
+
+
+def _date_ranges_overlap(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """True if two date_ranges share at least one calendar day. Only
+    comparable when both resolve to the same bound kind via
+    _date_range_span (both relative offsets, or both explicit dates);
+    returns False rather than guessing otherwise."""
+    span_a = _date_range_span(a)
+    span_b = _date_range_span(b)
+    if span_a is None or span_b is None:
+        return False
+    a_start, a_end = span_a
+    b_start, b_end = span_b
+    if (
+        isinstance(a_start, int)
+        and isinstance(a_end, int)
+        and isinstance(b_start, int)
+        and isinstance(b_end, int)
+    ):
+        # Relative offsets count "days before today", so they run
+        # backwards -- negate onto a normal ascending axis before the
+        # standard interval-overlap comparison.
+        a_lo, a_hi = -a_start, -a_end
+        b_lo, b_hi = -b_start, -b_end
+        return a_lo <= b_hi and b_lo <= a_hi
+    if (
+        isinstance(a_start, date)
+        and isinstance(a_end, date)
+        and isinstance(b_start, date)
+        and isinstance(b_end, date)
+    ):
+        return a_start <= b_end and b_start <= a_end
+    return False
 
 
 @mcp.tool()
@@ -282,10 +379,14 @@ def google_analytics_run_report(
     metrics: metric names, e.g. ["sessions", "conversions", "totalRevenue"].
     date_ranges: one dict per period to compare (max 4), each with
       "start_date" and "end_date" (YYYY-MM-DD, or GA4 relative terms like
-      "7daysAgo"/"today"), and an optional "name" to label the period
+      "7daysAgo"/"yesterday"), and an optional "name" to label the period
       (e.g. "current", "previous") — pass two date_ranges to compare a
       period against a prior one in a single call; the response's rows are
-      tagged with the matching name.
+      tagged with the matching name. Both bounds are inclusive, so use
+      "yesterday" rather than "today" as the end_date to match the GA UI's
+      "Last N days", and give every compared date_range the same number of
+      non-overlapping days — the response's "note" field flags it if either
+      isn't the case.
     dimensions: dimension names, e.g. ["sessionDefaultChannelGroup",
       "landingPagePlusQueryString"]. Use google_analytics_get_metadata to
       discover valid names for this property.
@@ -293,7 +394,10 @@ def google_analytics_run_report(
       (e.g. to one campaign or landing page). Optional.
     metric_filter: a raw GA4 FilterExpression dict applied to metric values
       (e.g. "sessions > 100"). Optional.
-    order_bys: a raw GA4 OrderBy list, e.g. to sort by a metric descending.
+    order_bys: a raw GA4 OrderBy list, e.g. to sort by sessions descending:
+      [{"metric": {"metricName": "sessions"}, "desc": true}]. Note the field
+      is "metricName" (camelCase); for a dimension it's
+      [{"dimension": {"dimensionName": "date"}, "desc": true}].
     limit: max rows to return (default 100, max 150 — keeps a wide report's
       serialized response under the MCP output size limit).
     offset: row offset for paging — if row_count in the response exceeds
@@ -341,6 +445,60 @@ def google_analytics_run_report(
         rows = result.get("rows") or []
         row_count = result.get("rowCount") or 0
 
+        # Surface two gotchas in the result itself, so the LLM catches them
+        # even if it never reads the docstring.
+        notes: list[str] = []
+        if any(_ends_today(dr) for dr in date_ranges):
+            # A date_range ending at "today" pulls in a partial,
+            # still-processing day that the GA UI's equivalent "last N
+            # days" report excludes.
+            notes.append(
+                'One or more date_ranges end at "today", which includes '
+                "partial, still-processing data for the current day. This "
+                "will not exactly match a GA UI report for the same nominal "
+                "period, which uses only complete days. To match GA UI's "
+                '"Last N days", use "yesterday" as the end_date instead.'
+            )
+        day_counts = [
+            (dr.get("name") or f"range {i + 1}", _date_range_day_count(dr))
+            for i, dr in enumerate(date_ranges)
+        ]
+        known_spans = {count for _, count in day_counts if count is not None}
+        if len(known_spans) > 1:
+            # Comparing date_ranges of different lengths (e.g. an 8-day
+            # "this_week" against a 7-day "last_week") makes any
+            # percentage change between them meaningless, independent of
+            # whether either range touches "today".
+            detail = ", ".join(
+                f"{name}={count}d" for name, count in day_counts if count is not None
+            )
+            notes.append(
+                f"date_ranges span different numbers of days ({detail}) -- "
+                "a percentage change between periods of unequal length "
+                "isn't meaningful. Make every compared date_range cover "
+                "the same number of days."
+            )
+        overlapping_pairs = [
+            (day_counts[i][0], day_counts[j][0])
+            for i in range(len(date_ranges))
+            for j in range(i + 1, len(date_ranges))
+            if _date_ranges_overlap(date_ranges[i], date_ranges[j])
+        ]
+        if overlapping_pairs:
+            # Equal-length, non-overlapping is necessary for a meaningful
+            # comparison but not sufficient: e.g. "7daysAgo"/"today" and
+            # "14daysAgo"/"7daysAgo" are both 8 days but share day -7.
+            detail = ", ".join(f'"{a}" and "{b}"' for a, b in overlapping_pairs)
+            notes.append(
+                f"date_ranges {detail} overlap (share at least one day) -- "
+                "a period comparison should use non-overlapping date_ranges."
+            )
+        extra_kwargs: dict[str, Any] = {}
+        if notes:
+            # Prepended (not appended) so it isn't the first thing an
+            # output-length truncation cuts off a large report's response.
+            extra_kwargs["note"] = " ".join(notes)
+
         # RUN_REPORT_MAX_LIMIT bounds row count, not bytes: several long
         # dimension values (e.g. full URLs) at once can still cross the
         # platform's output truncation threshold. Halve the returned rows
@@ -349,6 +507,7 @@ def google_analytics_run_report(
         max_output_length = get_tool_max_output_length()
         original_row_count = len(rows)
         response = _success(
+            **extra_kwargs,
             dimension_headers=dimension_headers,
             metric_headers=metric_headers,
             rows=rows,
@@ -358,6 +517,7 @@ def google_analytics_run_report(
         while len(response) > max_output_length and len(rows) > 1:
             rows = rows[: len(rows) // 2]
             response = _success(
+                **extra_kwargs,
                 dimension_headers=dimension_headers,
                 metric_headers=metric_headers,
                 rows=rows,

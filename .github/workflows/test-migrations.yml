@@ -29,6 +29,12 @@ on:
       - 'tests/web/services/test_user_preferences_lock_postgres.py'
       - 'src/xagent/web/services/task_start_protocol.py'
       - 'tests/web/services/test_task_start_protocol.py'
+      - 'src/xagent/web/services/task_start_consumer.py'
+      - 'src/xagent/web/services/task_orchestrator.py'
+      - 'tests/web/services/test_shared_execution_postgresql.py'
+      - 'src/xagent/web/services/task_coordinator_runtime.py'
+      - 'src/xagent/web/services/task_coordinator_service.py'
+      - 'tests/web/services/test_task_coordinator_commands.py'
       - 'src/xagent/web/services/task_command_transport.py'
       - 'tests/web/services/test_task_command_transport.py'
       - 'src/xagent/web/models/task.py'
@@ -72,6 +78,13 @@ on:
       - 'src/xagent/web/api/mcp.py'
       - 'src/xagent/core/tools/core/mcp/model.py'
       - 'tests/web/services/test_connector_hook_session_boundary.py'
+      - 'src/xagent/web/services/trace_message_storage.py'
+      - 'tests/web/services/test_trace_blob_upsert_postgresql.py'
+      - 'src/xagent/web/services/trace_database.py'
+      - 'src/xagent/web/services/trace_event_staging.py'
+      - 'src/xagent/config.py'
+      - 'src/xagent/web/services/trace_handlers.py'
+      - 'tests/web/services/test_trace_database_postgresql.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -137,6 +150,12 @@ jobs:
             tests/web/services/test_user_preferences_lock_postgres.py
             src/xagent/web/services/task_start_protocol.py
             tests/web/services/test_task_start_protocol.py
+            src/xagent/web/services/task_start_consumer.py
+            src/xagent/web/services/task_orchestrator.py
+            tests/web/services/test_shared_execution_postgresql.py
+            src/xagent/web/services/task_coordinator_runtime.py
+            src/xagent/web/services/task_coordinator_service.py
+            tests/web/services/test_task_coordinator_commands.py
             src/xagent/web/services/task_command_transport.py
             tests/web/services/test_task_command_transport.py
             src/xagent/web/models/task.py
@@ -180,6 +199,13 @@ jobs:
             src/xagent/web/api/mcp.py
             src/xagent/core/tools/core/mcp/model.py
             tests/web/services/test_connector_hook_session_boundary.py
+            src/xagent/web/services/trace_message_storage.py
+            tests/web/services/test_trace_blob_upsert_postgresql.py
+            src/xagent/web/services/trace_database.py
+            src/xagent/web/services/trace_event_staging.py
+            src/xagent/config.py
+            src/xagent/web/services/trace_handlers.py
+            tests/web/services/test_trace_database_postgresql.py
           )
 
           case "$EVENT_NAME" in
@@ -438,7 +464,7 @@ jobs:
       - name: Test task command staging concurrency (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          pytest tests/web/services/test_task_command_transport.py tests/web/services/test_task_start_protocol.py -m postgresql -q
+          pytest tests/web/services/test_task_command_transport.py tests/web/services/test_task_start_protocol.py tests/web/services/test_shared_execution_postgresql.py tests/web/services/test_task_coordinator_commands.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
@@ -567,6 +593,14 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_connector_hook_session_boundary.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test checkpoint blob upserts (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_trace_blob_upsert_postgresql.py -m postgresql -q
+          pytest tests/web/services/test_trace_database_postgresql.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

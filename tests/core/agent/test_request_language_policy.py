@@ -258,7 +258,9 @@ def test_dag_pending_response_is_symmetric(question: str) -> None:
     restored_child = ExecutionContext.from_dict(pattern.active_step_contexts["draft"])
     response = pending_user_response(restored_child.messages[-2])
     expected = (
-        PendingUserResponse("Spanish", question, "question") if question else None
+        PendingUserResponse("Spanish", question, "question", "draft")
+        if question
+        else None
     )
     assert response == expected
     assert pending_user_response_lifecycle(restored_child.messages[-2]) is not None

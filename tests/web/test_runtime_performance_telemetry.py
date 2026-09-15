@@ -81,20 +81,92 @@ async def test_broadcast_records_one_payload_for_multiple_connections(
 
 @pytest.mark.asyncio
 async def test_database_trace_handler_emits_write_outcome(monkeypatch, metric_reader):
+    # Own the runtime as well as the writer: changing the backend flag alone
+    # still reads process-global DB state left by unrelated app/config tests.
     from xagent.core.agent.trace import TASK_START_GENERAL, TraceEvent
+    from xagent.web.services import trace_database, trace_handlers
+    from xagent.web.services.trace_database import TraceDatabaseRuntime
     from xagent.web.services.trace_handlers import DatabaseTraceHandler
 
+    runtime = TraceDatabaseRuntime(None, use_async=False, limit=1)
+    monkeypatch.setattr(trace_handlers, "get_trace_database_runtime", lambda: runtime)
+    # Reproduce the invalid ambient engine from the CI failure. This unit test
+    # must not inspect it or open any database connection.
+    monkeypatch.setattr(trace_database, "get_engine", lambda: object())
     handler = DatabaseTraceHandler(42)
     saved = []
     monkeypatch.setattr(handler, "_sync_save_to_database", saved.append)
-    event = TraceEvent(event_type=TASK_START_GENERAL, task_id="42", data={})
-    await handler.handle_event(event)
+    event = TraceEvent(
+        event_type=TASK_START_GENERAL, task_id="42", data={}, require_persisted=True
+    )
+    try:
+        await handler.handle_event(event)
+    finally:
+        await runtime.close()
     assert saved == [event]
     point = collected_metrics(metric_reader)[
         "xagent.trace.database.writes"
     ].data.data_points[0]
     assert point.value == 1
     assert point.attributes["outcome"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_async_trace_records_one_serialization_and_write(
+    tmp_path, monkeypatch, metric_reader
+):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from xagent.core.agent.trace import TASK_START_GENERAL, TraceEvent
+    from xagent.web.models.database import Base
+    from xagent.web.models.task import Task
+    from xagent.web.models.user import User
+    from xagent.web.services import trace_handlers
+    from xagent.web.services.trace_database import TraceDatabaseRuntime
+
+    source = create_engine(f"sqlite:///{tmp_path / 'metrics.db'}")
+    Base.metadata.create_all(source)
+    with Session(source) as db:
+        user = User(username="trace-metrics", password_hash="unused")
+        db.add(user)
+        db.flush()
+        task = Task(user_id=user.id, title="Metrics")
+        db.add(task)
+        db.flush()
+        task_id = task.id
+        db.commit()
+    runtime = TraceDatabaseRuntime(source, use_async=True, limit=4)
+    monkeypatch.setattr(trace_handlers, "get_trace_database_runtime", lambda: runtime)
+    try:
+        await trace_handlers.DatabaseTraceHandler(task_id).handle_event(
+            TraceEvent(
+                TASK_START_GENERAL,
+                task_id=str(task_id),
+                data={},
+                require_persisted=True,
+            )
+        )
+        metrics = collected_metrics(metric_reader)
+        assert (
+            metrics["xagent.trace.database.serialization.duration"]
+            .data.data_points[0]
+            .count
+            == 1
+        )
+        assert (
+            metrics["xagent.trace.database.preparation.duration"]
+            .data.data_points[0]
+            .count
+            == 1
+        )
+        writes = metrics["xagent.trace.database.writes"].data.data_points
+        assert len(writes) == 1
+        assert writes[0].value == 1
+        assert writes[0].attributes["outcome"] == "succeeded"
+    finally:
+        await runtime.close()
+        source.dispose()
 
 
 @pytest.mark.asyncio

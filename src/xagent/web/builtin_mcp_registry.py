@@ -617,7 +617,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "hubspot",
             "name": "HubSpot",
-            "description": "Connect to HubSpot CRM and Marketing Hub to search, create, and update contacts and companies, read deals, log notes, read forms and submissions, pull traffic analytics reports, and read marketing emails and campaigns.",
+            "description": "Connect to HubSpot CRM and Marketing Hub to search, create, and update contacts and companies, create and update deals, log notes, read forms and submissions, pull traffic analytics reports, and read marketing emails and campaigns.",
             "icon": "https://www.google.com/s2/favicons?domain=hubspot.com&sz=128",
             "transport": "oauth",
             "provider_name": "hubspot",
@@ -628,6 +628,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "crm.objects.companies.read",
                 "crm.objects.companies.write",
                 "crm.objects.deals.read",
+                "crm.objects.deals.write",
                 "forms",
             ],
             # All three are tier-gated, each confirmed against HubSpot's own
@@ -768,6 +769,22 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.instagram"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "meta-ads",
+            "name": "Meta Ads",
+            "description": "Connect to Meta Ads to list ad accounts, inspect campaigns, ad sets, and ads, and pull performance insights.",
+            "icon": "https://www.google.com/s2/favicons?domain=facebook.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "meta",
+            "category": "Marketing",
+            "oauth_scopes": ["ads_read"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.meta_ads"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -1085,7 +1102,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # can access, not just ones the user picks) rather than leaving
             # it implicit, since this is an OAuth App with no per-repository
             # allowlist (unlike a GitHub App's repository-selection step).
-            "description": "Connect to GitHub to search repositories and code, read and create issues and pull requests, comment, and browse file contents and commit history. Grants access to every repository (public and private) the connected account can access -- there is no per-repository selection.",
+            "description": "Connect to GitHub to search repositories and code, read and create issues and pull requests, comment, browse file contents and commit history, and create branches and commit file changes. Grants access to every repository (public and private) the connected account can access -- there is no per-repository selection.",
             "icon": "https://www.google.com/s2/favicons?domain=github.com&sz=128",
             "transport": "oauth",
             "provider_name": "github",

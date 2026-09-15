@@ -83,8 +83,11 @@ class FakeWorkspaceManager:
 
 
 class FakeTool:
-    def __init__(self, name: str = "calculator") -> None:
+    def __init__(
+        self, name: str = "calculator", events: list[Any] | None = None
+    ) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.events = events
         self.metadata = type(
             "Metadata",
             (),
@@ -107,7 +110,12 @@ class FakeTool:
 
     async def run_json_async(self, args: dict[str, Any]) -> Any:
         self.calls.append(args)
-        return {"result": eval(args["expression"])}  # noqa: S307
+        if self.events is not None:
+            self.events.append(self.metadata.name)
+        expression = args.get("expression")
+        if expression is None:
+            return {"result": None}
+        return {"result": eval(expression)}  # noqa: S307
 
 
 class FakeWriteFileTool:
@@ -277,11 +285,11 @@ class FakeSkillManager:
 
 
 def current_step_task(messages: list[dict[str, Any]]) -> str:
-    content = str(messages[-1]["content"])
-    for line in content.splitlines():
-        if line.startswith("Current DAG step title: "):
-            return line.removeprefix("Current DAG step title: ").strip()
-    return content
+    for message in reversed(messages):
+        for line in str(message.get("content", "")).splitlines():
+            if line.startswith("Current DAG step title: "):
+                return line.removeprefix("Current DAG step title: ").strip()
+    return str(messages[-1]["content"])
 
 
 def plan_tool_response(
@@ -467,6 +475,8 @@ def test_dag_waiting_response_preserves_active_step_state() -> None:
 
     assert forwarded is True
     assert pattern.status == "running"
+    assert pattern.replan_owed_step_ids == ["confirm"]
+    assert pattern._reply_replan_owed() is False
     assert pattern.step_results == {"collect": "Options A and B collected"}
     assert [step.id for step in pattern.plan.steps] == ["collect", "confirm"]
     restored_child = ExecutionContext.from_dict(pattern.active_step_contexts["confirm"])
@@ -476,6 +486,944 @@ def test_dag_waiting_response_preserves_active_step_state() -> None:
     assert forwarded_message.metadata["response_to_waiting_for_user"]["question"] == (
         "Choose A or B"
     )
+
+
+class ConfirmThenPublishLLM:
+    def __init__(self, events: list[Any]) -> None:
+        self.events = events
+        self.confirm_calls = 0
+
+    async def chat(self, **kwargs: Any) -> dict[str, Any]:
+        if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+            return default_completion_assessment_response(kwargs)
+        messages = list(kwargs.get("messages", []))
+        title = current_step_task(messages)
+        self.events.append(("step", title))
+        if title == "Confirm publish":
+            self.confirm_calls += 1
+            if self.confirm_calls == 1:
+                return {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "ask-confirm",
+                            "function": {
+                                "name": "send_message",
+                                "arguments": json.dumps(
+                                    {
+                                        "message": "Publish the post?",
+                                        "message_type": "question",
+                                        "expect_response": True,
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                    "done": False,
+                }
+            return {"content": "Confirmation handled.", "done": True}
+        if any(message.get("role") == "tool" for message in messages):
+            return {"content": "Published.", "done": True}
+        return {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "do-publish",
+                    "function": {"name": "publish_post", "arguments": "{}"},
+                }
+            ],
+            "done": False,
+        }
+
+
+class RecordingPlanGenerator:
+    def __init__(self, step_factories: list[Any], events: list[Any]) -> None:
+        self.step_factories = step_factories
+        self.events = events
+        self.calls = 0
+        self.reply_driven_calls: list[bool] = []
+        self.completed_step_results: list[dict[str, Any]] = []
+
+    def __call__(self, *, request: PlanGenerationRequest, llm: Any) -> ExecutionPlan:
+        del llm
+        self.events.append(("plan", request.replan))
+        self.reply_driven_calls.append(request.reply_driven)
+        self.completed_step_results.append(dict(request.completed_step_results))
+        factory = self.step_factories[min(self.calls, len(self.step_factories) - 1)]
+        self.calls += 1
+        return build_plan(*factory())
+
+
+def confirm_publish_steps() -> list[PlanStep]:
+    return [
+        PlanStep(id="confirm", task="Confirm publish"),
+        PlanStep(
+            id="publish",
+            task="Publish post",
+            dependencies=["confirm"],
+            tool_names=["publish_post"],
+        ),
+    ]
+
+
+def confirm_only_steps() -> list[PlanStep]:
+    return [PlanStep(id="confirm", task="Confirm publish")]
+
+
+async def run_confirm_then_reply_dag(
+    step_factories: list[Any], reply: str
+) -> tuple[DAGPattern, dict[str, Any], list[Any], FakeTool, RecordingPlanGenerator]:
+    events: list[Any] = []
+    tool = FakeTool(name="publish_post", events=events)
+    llm = ConfirmThenPublishLLM(events)
+    generator = RecordingPlanGenerator(step_factories, events)
+    pattern = DAGPattern(generator)
+
+    context = ExecutionContext(execution_id="dag-replan-after-reply")
+    context.add_user_message("Publish my post")
+    first = await pattern.run(context=context, tools=[tool], llm=llm)
+    assert first["status"] == "waiting_for_user", first
+
+    resumed = ExecutionContext.from_dict(context.to_dict())
+    resumed.add_user_message(reply)
+    result = await pattern.run(context=resumed, tools=[tool], llm=llm)
+    return pattern, result, events, tool, generator
+
+
+@pytest.mark.asyncio
+async def test_dag_replans_after_waiting_step_consumes_user_reply() -> None:
+    """The incident: a "Cancel" reply resumed the waiting step but left the
+    pre-answer plan running, so the publish step still fired. The remaining
+    plan must be re-planned against the reply before any of it is scheduled.
+    """
+
+    pattern, result, events, tool, generator = await run_confirm_then_reply_dag(
+        [confirm_publish_steps, confirm_only_steps], "Cancel"
+    )
+
+    assert result["success"] is True, result
+    assert events.count(("plan", True)) == 1
+    assert "publish_post" not in events
+    assert tool.calls == []
+    assert ("step", "Publish post") not in events
+    # The initial plan predates the question; only the replan answers a reply.
+    assert generator.reply_driven_calls == [False, True]
+    assert pattern._reply_replan_owed() is False
+    assert pattern.replan_owed_step_ids == []
+
+
+@pytest.mark.asyncio
+async def test_dag_owed_replan_reuses_completed_step_and_runs_rest() -> None:
+    """When the replanner returns the same plan, the replan is a no-op for
+    the user: the confirmed step is not re-executed and the remaining step
+    still runs exactly once, after the replan."""
+
+    pattern, result, events, tool, generator = await run_confirm_then_reply_dag(
+        [confirm_publish_steps, confirm_publish_steps], "Go ahead"
+    )
+
+    assert result["success"] is True, result
+    assert len(tool.calls) == 1
+    assert events.count(("plan", True)) == 1
+    assert events.index(("plan", True)) < events.index("publish_post")
+    assert events.count(("step", "Confirm publish")) == 2
+    assert pattern.step_results["confirm"] == "Confirmation handled."
+    assert pattern._reply_replan_owed() is False
+    assert pattern.replan_owed_step_ids == []
+
+
+@pytest.mark.asyncio
+async def test_dag_owed_replan_survives_checkpoint_between_reply_and_step_end() -> None:
+    """The reply is forwarded in one process and the step finishes in
+    another: the owed id has to travel through get_state/load_state, or
+    the restored run silently keeps the pre-answer plan."""
+
+    events: list[Any] = []
+    tool = FakeTool(name="publish_post", events=events)
+    llm = ConfirmThenPublishLLM(events)
+    generator = RecordingPlanGenerator(
+        [confirm_publish_steps, confirm_only_steps], events
+    )
+    pattern = DAGPattern(generator)
+
+    context = ExecutionContext(execution_id="dag-replan-checkpoint")
+    context.add_user_message("Publish my post")
+    first = await pattern.run(context=context, tools=[tool], llm=llm)
+    assert first["status"] == "waiting_for_user", first
+
+    resumed = ExecutionContext.from_dict(context.to_dict())
+    resumed.add_user_message("Cancel")
+    assert pattern._forward_user_response_to_waiting_step(resumed) is True
+    assert pattern.replan_owed_step_ids == ["confirm"]
+
+    restored = DAGPattern(generator)
+    restored.load_state(pattern.get_state())
+    assert restored.replan_owed_step_ids == ["confirm"]
+
+    result = await restored.run(context=resumed, tools=[tool], llm=llm)
+
+    assert result["success"] is True, result
+    assert events.count(("plan", True)) == 1
+    assert "publish_post" not in events
+    assert tool.calls == []
+    assert restored.replan_owed_step_ids == []
+
+
+class ConfirmAndSiblingLLM:
+    """Confirm finishes first; the sibling is still mid-tool-call when the
+    replan becomes owed, so it is the one a cancel would destroy."""
+
+    def __init__(self, events: list[Any]) -> None:
+        self.events = events
+        self.confirm_done = asyncio.Event()
+        self.sibling_cancelled = asyncio.Event()
+
+    async def chat(self, **kwargs: Any) -> dict[str, Any]:
+        if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+            return default_completion_assessment_response(kwargs)
+        messages = list(kwargs.get("messages", []))
+        title = current_step_task(messages)
+        self.events.append(("step", title))
+        if title == "Confirm publish":
+            self.confirm_done.set()
+            return {"content": "Confirmation handled.", "done": True}
+        if title == "Audit task":
+            if not any(message.get("role") == "tool" for message in messages):
+                return {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "audit-call",
+                            "function": {"name": "audit_post", "arguments": "{}"},
+                        }
+                    ],
+                    "done": False,
+                }
+            try:
+                await self.confirm_done.wait()
+            except asyncio.CancelledError:
+                self.sibling_cancelled.set()
+                raise
+            return {"content": "Audit done.", "done": True}
+        return {"content": "Published.", "done": True}
+
+
+@pytest.mark.asyncio
+async def test_dag_owed_replan_drains_the_batch_instead_of_cancelling() -> None:
+    """The resumed step finishes inside a multi-step batch. The batch must
+    hand control back for the replan without enqueuing the now-unblocked
+    downstream step -- and without cancelling the in-flight sibling, whose
+    result the replan can reuse."""
+
+    events: list[Any] = []
+    publish_tool = FakeTool(name="publish_post", events=events)
+    audit_tool = FakeTool(name="audit_post", events=events)
+    llm = ConfirmAndSiblingLLM(events)
+    generator = RecordingPlanGenerator([confirm_audit_steps], events)
+    pattern = DAGPattern(generator)
+
+    confirm = PlanStep(id="confirm", task="Confirm publish")
+    confirm.status = "running"
+    audit = PlanStep(id="audit", task="Audit task", tool_names=["audit_post"])
+    audit.status = "running"
+    publish = PlanStep(
+        id="publish",
+        task="Publish post",
+        dependencies=["confirm"],
+        tool_names=["publish_post"],
+    )
+    pattern.plan = build_plan(confirm, audit, publish)
+    pattern.status = "waiting_for_user"
+    pattern.planned_user_message_count = 1
+    pattern.active_step_ids = ["confirm", "audit"]
+    pattern.active_step_pattern_states = {
+        "confirm": {
+            "status": "waiting_for_user",
+            "waiting_for_user_request": {"message": "Publish the post?"},
+        }
+    }
+
+    root_context = ExecutionContext(execution_id="dag-replan-batch")
+    root_context.add_user_message("Publish my post")
+    for step in (confirm, audit):
+        child = ExecutionContext(execution_id=f"dag-replan-batch:{step.id}")
+        child.add_user_message(
+            pattern._step_instruction(root_context=root_context, step=step),
+            metadata={"kind": "dag_step_instruction", "dag_step_id": step.id},
+        )
+        pattern.active_step_contexts[step.id] = child.to_dict()
+    pattern._sync_legacy_active_step()
+
+    root_context.add_user_message("Cancel")
+
+    result = await asyncio.wait_for(
+        pattern.run(context=root_context, tools=[publish_tool, audit_tool], llm=llm),
+        timeout=5,
+    )
+
+    assert result["success"] is True, result
+    assert events.count(("plan", True)) == 1
+    # The downstream step is unblocked the moment confirm completes; the
+    # replan, not this batch, decides whether it still belongs in the plan.
+    assert ("step", "Publish post") not in events
+    assert publish_tool.calls == []
+    assert llm.sibling_cancelled.is_set() is False
+    assert len(audit_tool.calls) == 1
+    assert pattern.step_results["audit"] == "Audit done."
+    assert events.index(("step", "Audit task")) < events.index(("plan", True))
+
+
+class InterruptAtStepEndRuntime(PatternRuntime):
+    def __init__(self, step_id: str) -> None:
+        super().__init__()
+        self.interrupt_at_step_id = step_id
+
+    async def on_dag_step_end(
+        self,
+        *,
+        context: Any,
+        step_id: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        if step_id == self.interrupt_at_step_id:
+            self.request_interrupt("stopped by user")
+        await super().on_dag_step_end(context=context, step_id=step_id, data=data)
+
+
+async def run_until_reply_consumed_then_interrupt(
+    runtime_factory: Any = InterruptAtStepEndRuntime,
+    execution_id: str = "dag-replan-interrupt",
+) -> tuple[
+    DAGPattern,
+    dict[str, Any],
+    list[Any],
+    FakeTool,
+    RecordingPlanGenerator,
+    ExecutionContext,
+]:
+    """Resume a waiting step with a reply and press Stop just as the step
+    finishes, i.e. inside the window between the reply being consumed and
+    the replan being issued."""
+
+    events: list[Any] = []
+    tool = FakeTool(name="publish_post", events=events)
+    llm = ConfirmThenPublishLLM(events)
+    generator = RecordingPlanGenerator(
+        [confirm_publish_steps, confirm_only_steps], events
+    )
+    pattern = DAGPattern(generator)
+
+    context = ExecutionContext(execution_id=execution_id)
+    context.add_user_message("Publish my post")
+    first = await pattern.run(context=context, tools=[tool], llm=llm)
+    assert first["status"] == "waiting_for_user", first
+
+    resumed = ExecutionContext.from_dict(context.to_dict())
+    resumed.add_user_message("Cancel")
+    result = await pattern.run(
+        context=resumed,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime_factory("confirm"),
+    )
+    return pattern, result, events, tool, generator, resumed
+
+
+@pytest.mark.asyncio
+async def test_dag_interrupt_outranks_owed_replan() -> None:
+    """The replan triggered by a consumed reply runs ahead of the loop's
+    own interrupt check and clears the interrupt inside _generate_plan, so
+    a Stop pressed while the consuming step finishes would otherwise be
+    swallowed and the run would report success."""
+
+    (
+        pattern,
+        result,
+        events,
+        tool,
+        _,
+        _,
+    ) = await run_until_reply_consumed_then_interrupt()
+
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    assert ("plan", True) not in events
+    assert tool.calls == []
+    assert pattern._reply_replan_owed() is True
+
+
+class InterruptAndMessageAtStepEndRuntime(InterruptAtStepEndRuntime):
+    async def on_dag_step_end(
+        self,
+        *,
+        context: Any,
+        step_id: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        if step_id == self.interrupt_at_step_id:
+            context.add_user_message("Also add a footnote")
+        await super().on_dag_step_end(context=context, step_id=step_id, data=data)
+
+
+@pytest.mark.asyncio
+async def test_dag_interrupt_outranks_owed_replan_with_new_message() -> None:
+    """A new user message arriving in the same window must not route the
+    replan around the interrupt check: either way _generate_plan clears the
+    interrupt, so the Stop has to win first."""
+
+    (
+        pattern,
+        result,
+        events,
+        tool,
+        _,
+        resumed,
+    ) = await run_until_reply_consumed_then_interrupt(
+        InterruptAndMessageAtStepEndRuntime,
+        execution_id="dag-replan-interrupt-message",
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    assert ("plan", True) not in events
+    assert tool.calls == []
+    assert pattern._reply_replan_owed() is True
+    assert pattern._user_message_count(resumed) > pattern.planned_user_message_count
+
+
+@pytest.mark.asyncio
+async def test_dag_owed_replan_survives_state_round_trip() -> None:
+    """The owed replan is raised in one process and acted on in another:
+    the owed id and the step result it is derived from both have to travel
+    through get_state/load_state, or the restored run keeps the pre-answer
+    plan."""
+
+    (
+        pattern,
+        _,
+        events,
+        tool,
+        generator,
+        resumed,
+    ) = await run_until_reply_consumed_then_interrupt()
+
+    control_state = pattern.get_execution_snapshot(resumed)["control_state"]
+    assert control_state["replan_owed_step_ids"] == ["confirm"]
+
+    restored = DAGPattern(generator)
+    restored.load_state(pattern.get_state())
+    assert restored.replan_owed_step_ids == ["confirm"]
+    assert restored._reply_replan_owed() is True
+
+    result = await restored.run(
+        context=resumed,
+        tools=[tool],
+        llm=ConfirmThenPublishLLM(events),
+    )
+
+    assert result["success"] is True, result
+    assert events.count(("plan", True)) == 1
+    assert "publish_post" not in events
+    assert tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dag_restored_owed_replan_reports_a_pending_interrupt() -> None:
+    """A run that starts with the replan already owed must still honour an
+    interrupt requested before it: the replan is issued from the loop head,
+    behind the interrupt guard, not from an unguarded pre-loop branch."""
+
+    (
+        pattern,
+        _,
+        events,
+        tool,
+        generator,
+        resumed,
+    ) = await run_until_reply_consumed_then_interrupt()
+
+    restored = DAGPattern(generator)
+    restored.load_state(pattern.get_state())
+    assert restored._reply_replan_owed() is True
+
+    runtime = PatternRuntime(execution_id="dag-replan-interrupt")
+    runtime.request_interrupt("stopped before resume")
+    result = await restored.run(
+        context=resumed,
+        tools=[tool],
+        llm=ConfirmThenPublishLLM(events),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    assert ("plan", True) not in events
+    assert tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dag_last_step_consuming_a_reply_owes_no_replan() -> None:
+    """Nothing is left to re-validate against the answer when the step that
+    consumed it was the last one, so the reply must not buy a planner call."""
+
+    pattern, result, events, tool, generator = await run_confirm_then_reply_dag(
+        [confirm_only_steps], "Go ahead"
+    )
+
+    assert result["success"] is True, result
+    assert ("plan", True) not in events
+    assert pattern._reply_replan_owed() is False
+    assert tool.calls == []
+    # No replan cleared the list here, so the completion branch must.
+    assert pattern.get_state()["replan_owed_step_ids"] == []
+
+
+class ConfirmThenIncompleteLLM:
+    def __init__(self, events: list[Any]) -> None:
+        self.events = events
+        self.confirm_calls = 0
+        self.assessments = 0
+
+    async def chat(self, **kwargs: Any) -> dict[str, Any]:
+        if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+            self.assessments += 1
+            if self.assessments == 1:
+                return completion_assessment_response(
+                    status="incomplete",
+                    answer="",
+                    missing_work="The footnote is missing.",
+                    replan_instruction="Add a footnote step.",
+                )
+            return default_completion_assessment_response(kwargs)
+        title = current_step_task(list(kwargs.get("messages", [])))
+        self.events.append(("step", title))
+        if title == "Confirm publish":
+            self.confirm_calls += 1
+            if self.confirm_calls == 1:
+                return {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "ask-confirm",
+                            "function": {
+                                "name": "send_message",
+                                "arguments": json.dumps(
+                                    {
+                                        "message": "Publish the post?",
+                                        "message_type": "question",
+                                        "expect_response": True,
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                    "done": False,
+                }
+            return {"content": "Confirmation handled.", "done": True}
+        return {"content": "Footnote added.", "done": True}
+
+
+def confirm_audit_steps() -> list[PlanStep]:
+    return [
+        PlanStep(id="confirm", task="Confirm publish"),
+        PlanStep(id="audit", task="Audit task", tool_names=["audit_post"]),
+    ]
+
+
+def confirm_footnote_steps() -> list[PlanStep]:
+    return [
+        PlanStep(id="confirm", task="Confirm publish"),
+        PlanStep(id="footnote", task="Add footnote", dependencies=["confirm"]),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dag_completion_replan_after_a_last_step_reply_is_reply_driven() -> None:
+    """A reply consumed by the last step owes no plan-loop replan, but the
+    completion assessment can still ask for one -- and that plan is written
+    against the same unanswered reply, so it must be flagged as such."""
+
+    events: list[Any] = []
+    llm = ConfirmThenIncompleteLLM(events)
+    generator = RecordingPlanGenerator(
+        [confirm_only_steps, confirm_footnote_steps], events
+    )
+    pattern = DAGPattern(generator)
+
+    context = ExecutionContext(execution_id="dag-completion-reply-driven")
+    context.add_user_message("Publish my post")
+    first = await pattern.run(context=context, tools=[], llm=llm)
+    assert first["status"] == "waiting_for_user", first
+
+    resumed = ExecutionContext.from_dict(context.to_dict())
+    resumed.add_user_message("Go ahead")
+    result = await pattern.run(context=resumed, tools=[], llm=llm)
+
+    assert result["success"] is True, result
+    assert generator.reply_driven_calls == [False, True]
+    assert events.count(("plan", True)) == 1
+    assert ("step", "Add footnote") in events
+    assert pattern.replan_owed_step_ids == []
+
+
+class AnswerRecordingLLM:
+    def __init__(self, events: list[Any]) -> None:
+        self.events = events
+        self.saw_answer = False
+
+    async def chat(self, **kwargs: Any) -> dict[str, Any]:
+        if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+            return default_completion_assessment_response(kwargs)
+        messages = list(kwargs.get("messages", []))
+        title = current_step_task(messages)
+        self.events.append(("step", title))
+        if any("Option B" in str(message.get("content", "")) for message in messages):
+            self.saw_answer = True
+        if title == "Ask which option":
+            return {"content": "Option B recorded.", "done": True}
+        return {"content": "Published.", "done": True}
+
+
+@pytest.mark.asyncio
+async def test_dag_forwarding_a_reply_keeps_earlier_owed_replans() -> None:
+    """A checkpoint can carry a completed reply-consumer and a still-waiting
+    sibling at once. Forwarding the sibling's answer must add to the older
+    obligation rather than replace it, and no replan may run before that
+    sibling finishes -- it would clear the forwarded answer."""
+
+    events: list[Any] = []
+    tool = FakeTool(name="publish_post", events=events)
+    llm = AnswerRecordingLLM(events)
+    generator = RecordingPlanGenerator([confirm_publish_steps], events)
+    pattern = DAGPattern(generator)
+
+    confirm = PlanStep(id="confirm", task="Confirm publish")
+    confirm.status = "completed"
+    confirm.result = "Confirmation handled."
+    ask_b = PlanStep(id="ask_b", task="Ask which option")
+    ask_b.status = "running"
+    publish = PlanStep(
+        id="publish",
+        task="Publish post",
+        dependencies=["confirm"],
+        tool_names=["publish_post"],
+    )
+    pattern.plan = build_plan(confirm, ask_b, publish)
+    pattern.status = "waiting_for_user"
+    pattern.step_results = {"confirm": "Confirmation handled."}
+    pattern.planned_user_message_count = 2
+    pattern.replan_owed_step_ids = ["confirm"]
+    pattern.active_step_ids = ["ask_b"]
+    pattern.active_step_pattern_states = {
+        "ask_b": {
+            "status": "waiting_for_user",
+            "waiting_for_user_request": {"message": "Option A or B?"},
+        }
+    }
+
+    root_context = ExecutionContext(execution_id="dag-stale-owed-replan")
+    root_context.add_user_message("Publish my post")
+    root_context.add_user_message("Cancel")
+    child = ExecutionContext(execution_id="dag-stale-owed-replan:ask_b")
+    child.add_user_message(
+        pattern._step_instruction(root_context=root_context, step=ask_b),
+        metadata={"kind": "dag_step_instruction", "dag_step_id": "ask_b"},
+    )
+    pattern.active_step_contexts["ask_b"] = child.to_dict()
+    pattern._sync_legacy_active_step()
+
+    root_context.add_user_message("Option B")
+
+    assert pattern._reply_replan_owed() is False
+    assert pattern._forward_user_response_to_waiting_step(root_context) is True
+    assert pattern.replan_owed_step_ids == ["confirm", "ask_b"]
+
+    result = await asyncio.wait_for(
+        pattern.run(context=root_context, tools=[tool], llm=llm),
+        timeout=5,
+    )
+
+    assert result["success"] is True, result
+    assert llm.saw_answer is True
+    assert pattern.step_results["ask_b"] == "Option B recorded."
+    # The replan belongs after the answered step, not ahead of it.
+    assert generator.calls == 1
+    assert generator.reply_driven_calls == [True]
+    assert events.index(("step", "Ask which option")) < events.index(("plan", True))
+    replan_results = generator.completed_step_results[0]
+    assert set(replan_results) == {"confirm", "ask_b"}
+
+
+class ResumedSiblingLLM:
+    def __init__(self, events: list[Any]) -> None:
+        self.events = events
+
+    async def chat(self, **kwargs: Any) -> dict[str, Any]:
+        if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+            return default_completion_assessment_response(kwargs)
+        messages = list(kwargs.get("messages", []))
+        title = current_step_task(messages)
+        self.events.append(("step", title))
+        if title == "Audit task" and not any(
+            message.get("role") == "tool" for message in messages
+        ):
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "audit-call",
+                        "function": {"name": "audit_post", "arguments": "{}"},
+                    }
+                ],
+                "done": False,
+            }
+        if title == "Audit task":
+            return {"content": "Audit done.", "done": True}
+        return {"content": "Published.", "done": True}
+
+
+@pytest.mark.asyncio
+async def test_dag_owed_replan_waits_for_a_restored_active_sibling() -> None:
+    """A crash between the consumer's dag_after_step checkpoint and the
+    replan leaves the sibling active with its saved state. The owed replan
+    must wait for it to finish instead of clearing it away."""
+
+    events: list[Any] = []
+    publish_tool = FakeTool(name="publish_post", events=events)
+    audit_tool = FakeTool(name="audit_post", events=events)
+    llm = ResumedSiblingLLM(events)
+    generator = RecordingPlanGenerator([confirm_audit_steps], events)
+    pattern = DAGPattern(generator)
+
+    confirm = PlanStep(id="confirm", task="Confirm publish")
+    confirm.status = "completed"
+    confirm.result = "Confirmation handled."
+    audit = PlanStep(id="audit", task="Audit task", tool_names=["audit_post"])
+    audit.status = "running"
+    publish = PlanStep(
+        id="publish",
+        task="Publish post",
+        dependencies=["confirm"],
+        tool_names=["publish_post"],
+    )
+    pattern.plan = build_plan(confirm, audit, publish)
+    pattern.status = "running"
+    pattern.step_results = {"confirm": "Confirmation handled."}
+    pattern.planned_user_message_count = 2
+    pattern.replan_owed_step_ids = ["confirm"]
+    pattern.active_step_ids = ["audit"]
+    pattern.active_step_pattern_states = {"audit": {"status": "running"}}
+
+    root_context = ExecutionContext(execution_id="dag-restored-sibling")
+    root_context.add_user_message("Publish my post")
+    root_context.add_user_message("Cancel")
+    child = ExecutionContext(execution_id="dag-restored-sibling:audit")
+    child.add_user_message(
+        pattern._step_instruction(root_context=root_context, step=audit),
+        metadata={"kind": "dag_step_instruction", "dag_step_id": "audit"},
+    )
+    pattern.active_step_contexts["audit"] = child.to_dict()
+    pattern._sync_legacy_active_step()
+
+    assert pattern._reply_awaiting_replan() is True
+    assert pattern._reply_replan_owed() is False
+
+    result = await asyncio.wait_for(
+        pattern.run(context=root_context, tools=[publish_tool, audit_tool], llm=llm),
+        timeout=5,
+    )
+
+    assert result["success"] is True, result
+    assert len(audit_tool.calls) == 1
+    assert pattern.step_results["audit"] == "Audit done."
+    assert events.count(("plan", True)) == 1
+    assert events.index("audit_post") < events.index(("plan", True))
+    assert events.index(("step", "Audit task")) < events.index(("plan", True))
+
+
+@pytest.mark.asyncio
+async def test_dag_forwarding_a_reply_keeps_an_unconsumed_owed_id() -> None:
+    """An owed id whose step never produced a result (invalidated, or
+    re-planned away) must survive the next forward: dropping it would lose
+    the obligation if that step is restored and completes later."""
+
+    events: list[Any] = []
+    tool = FakeTool(name="publish_post", events=events)
+    llm = AnswerRecordingLLM(events)
+    generator = RecordingPlanGenerator([confirm_publish_steps], events)
+    pattern = DAGPattern(generator)
+
+    ask_a = PlanStep(id="ask_a", task="Ask first option")
+    ask_a.status = "clarification_invalidated"
+    ask_b = PlanStep(id="ask_b", task="Ask which option")
+    ask_b.status = "running"
+    publish = PlanStep(id="publish", task="Publish post", tool_names=["publish_post"])
+    pattern.plan = build_plan(ask_a, ask_b, publish)
+    pattern.status = "waiting_for_user"
+    pattern.planned_user_message_count = 1
+    pattern.replan_owed_step_ids = ["ask_a"]
+    pattern.active_step_ids = ["ask_b"]
+    pattern.active_step_pattern_states = {
+        "ask_b": {
+            "status": "waiting_for_user",
+            "waiting_for_user_request": {"message": "Option A or B?"},
+        }
+    }
+
+    root_context = ExecutionContext(execution_id="dag-unconsumed-owed-id")
+    root_context.add_user_message("Publish my post")
+    child = ExecutionContext(execution_id="dag-unconsumed-owed-id:ask_b")
+    child.add_user_message(
+        pattern._step_instruction(root_context=root_context, step=ask_b),
+        metadata={"kind": "dag_step_instruction", "dag_step_id": "ask_b"},
+    )
+    pattern.active_step_contexts["ask_b"] = child.to_dict()
+    pattern._sync_legacy_active_step()
+
+    root_context.add_user_message("Option B")
+
+    assert pattern._reply_awaiting_replan() is False
+    assert pattern._forward_user_response_to_waiting_step(root_context) is True
+    assert pattern.replan_owed_step_ids == ["ask_a", "ask_b"]
+
+    result = await asyncio.wait_for(
+        pattern.run(context=root_context, tools=[tool], llm=llm),
+        timeout=5,
+    )
+
+    assert result["success"] is True, result
+    assert generator.calls == 1
+    assert generator.reply_driven_calls == [True]
+    assert events.index(("step", "Ask which option")) < events.index(("plan", True))
+
+
+@pytest.mark.asyncio
+async def test_dag_owed_replan_defers_while_a_question_is_live() -> None:
+    """Same restored shape as above, but no answer has arrived yet. The
+    owed replan must stay dormant: replanning here calls
+    _clear_all_active_steps() and the sibling's pending question is gone."""
+
+    events: list[Any] = []
+    generator = RecordingPlanGenerator([confirm_publish_steps], events)
+    pattern = DAGPattern(generator)
+
+    confirm = PlanStep(id="confirm", task="Confirm publish")
+    confirm.status = "completed"
+    confirm.result = "Confirmation handled."
+    ask_b = PlanStep(id="ask_b", task="Ask which option")
+    ask_b.status = "running"
+    publish = PlanStep(
+        id="publish",
+        task="Publish post",
+        dependencies=["confirm"],
+        tool_names=["publish_post"],
+    )
+    pattern.plan = build_plan(confirm, ask_b, publish)
+    pattern.status = "waiting_for_user"
+    pattern.step_results = {"confirm": "Confirmation handled."}
+    pattern.planned_user_message_count = 2
+    pattern.replan_owed_step_ids = ["confirm"]
+    pattern.active_step_ids = ["ask_b"]
+    pattern.active_step_pattern_states = {
+        "ask_b": {
+            "status": "waiting_for_user",
+            "waiting_for_user_request": {"message": "Option A or B?"},
+        }
+    }
+
+    root_context = ExecutionContext(execution_id="dag-live-question")
+    root_context.add_user_message("Publish my post")
+    root_context.add_user_message("Cancel")
+    child = ExecutionContext(execution_id="dag-live-question:ask_b")
+    child.add_user_message(
+        pattern._step_instruction(root_context=root_context, step=ask_b),
+        metadata={"kind": "dag_step_instruction", "dag_step_id": "ask_b"},
+    )
+    pattern.active_step_contexts["ask_b"] = child.to_dict()
+    pattern._sync_legacy_active_step()
+
+    assert pattern._reply_awaiting_replan() is True
+    assert pattern._reply_replan_owed() is False
+    assert pattern._needs_replan(root_context) is False
+
+    # Once the answer lands, the status+count branch takes over and routes
+    # it to the waiting sibling rather than to a replan.
+    root_context.add_user_message("Option B")
+    assert pattern._needs_replan(root_context) is True
+    assert pattern._forward_user_response_to_waiting_step(root_context) is True
+    assert generator.calls == 0
+    forwarded = ExecutionContext.from_dict(pattern.active_step_contexts["ask_b"])
+    assert forwarded.messages[-1].content == "Option B"
+
+
+class FailingConfirmLLM:
+    def __init__(self, events: list[Any], mode: str) -> None:
+        self.events = events
+        self.mode = mode
+        self.confirm_calls = 0
+
+    async def chat(self, **kwargs: Any) -> dict[str, Any]:
+        if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+            return default_completion_assessment_response(kwargs)
+        title = current_step_task(list(kwargs.get("messages", [])))
+        self.events.append(("step", title))
+        if title != "Confirm publish":
+            return {"content": "done", "done": True}
+        self.confirm_calls += 1
+        if self.confirm_calls == 1:
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "ask-confirm",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": json.dumps(
+                                {
+                                    "message": "Publish the post?",
+                                    "message_type": "question",
+                                    "expect_response": True,
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            }
+        if self.mode == "raise":
+            raise RuntimeError("step blew up")
+        return {"content": "not done", "done": False}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["raise", "unfinished"])
+async def test_dag_failed_consuming_step_owes_no_replan(mode: str) -> None:
+    """A step that consumed the reply and then failed records no result,
+    so the owed replan stays unowed through both failure exits and the
+    failure is reported instead."""
+
+    events: list[Any] = []
+    tool = FakeTool(name="publish_post", events=events)
+    llm = FailingConfirmLLM(events, mode)
+    pattern = DAGPattern(
+        RecordingPlanGenerator([confirm_publish_steps], events),
+        react_max_iterations=1,
+    )
+
+    context = ExecutionContext(execution_id=f"dag-failed-consumer-{mode}")
+    context.add_user_message("Publish my post")
+    first = await pattern.run(context=context, tools=[tool], llm=llm)
+    assert first["status"] == "waiting_for_user", first
+
+    resumed = ExecutionContext.from_dict(context.to_dict())
+    resumed.add_user_message("Go ahead")
+    result = await pattern.run(context=resumed, tools=[tool], llm=llm)
+
+    assert result["success"] is False, result
+    assert result["failed_step_id"] == "confirm"
+    assert "confirm" not in pattern.step_results
+    assert pattern._reply_replan_owed() is False
+    assert ("plan", True) not in events
 
 
 @pytest.mark.asyncio
@@ -3482,6 +4430,8 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     assert "response_language" in system_prompt
     assert "Emit response_language before steps" in system_prompt
     assert "Determine it from latest_user_request" in system_prompt
+    assert "pending_responses are the user's authoritative" not in system_prompt
+    assert "do not re-emit work an answer rejected" not in system_prompt
     assert "output_language_policy field" in system_prompt
     assert "Plan language rules" in system_prompt
     assert "Simplified Chinese" in system_prompt
@@ -3517,6 +4467,141 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     assert llm.calls[0]["tool_choice"] == "required"
     assert llm.calls[0]["thinking"] == {"type": "disabled", "enable": False}
     assert "response_format" not in llm.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_llm_plan_generator_adds_reply_rule_only_for_reply_driven_replan() -> (
+    None
+):
+    """The sentence steers the planner away from work the user's answer
+    rejected; on a replan that no answer triggered it is noise."""
+
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-llm-plan-reply")
+    context.add_user_message("Create a short plan")
+    response = plan_tool_response(
+        [
+            {
+                "id": "draft",
+                "task": "Draft answer",
+                "termination_condition": "Stop after the draft exists.",
+                "completion_evidence": "The draft has been returned.",
+                "tool_names": [],
+                "dependencies": [],
+            }
+        ]
+    )
+
+    prompts: dict[bool, str] = {}
+    for reply_driven in (False, True):
+        llm = PlanLLM(response)
+        await generator.generate_plan(
+            request=PlanGenerationRequest(
+                context=context,
+                execution_id="dag-llm-plan-reply",
+                replan=True,
+                reply_driven=reply_driven,
+            ),
+            llm=llm,
+        )
+        prompts[reply_driven] = llm.calls[0]["messages"][0]["content"]
+
+    assert "pending_responses are the user's authoritative" in prompts[True]
+    assert "do not re-emit work an answer rejected" in prompts[True]
+    assert "pending_responses are the user's authoritative" not in prompts[False]
+    assert "do not re-emit work an answer rejected" not in prompts[False]
+
+
+@pytest.mark.asyncio
+async def test_llm_plan_generator_payload_carries_every_pending_response() -> None:
+    """A replan after several answered questions must see all of them, not
+    only the newest: an earlier "cancel" still governs the plan."""
+
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-llm-plan-pending")
+    context.add_user_message("Publish my post")
+    context.add_user_message(
+        "Cancel",
+        metadata={
+            "response_to_waiting_for_user": {
+                "question": "Publish the post?",
+                "message_type": "question",
+                "step_id": "confirm",
+            }
+        },
+    )
+    context.add_user_message(
+        "Option B",
+        metadata={
+            "response_to_waiting_for_user": {
+                "question": "Option A or B?",
+                "message_type": "question",
+                "step_id": "ask_b",
+            }
+        },
+    )
+    llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "draft",
+                    "task": "Draft answer",
+                    "termination_condition": "Stop after the draft exists.",
+                    "completion_evidence": "The draft has been returned.",
+                    "tool_names": [],
+                    "dependencies": [],
+                }
+            ]
+        )
+    )
+
+    await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id="dag-llm-plan-pending",
+            replan=True,
+            reply_driven=True,
+        ),
+        llm=llm,
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert payload["pending_responses"] == [
+        {
+            "step_id": "confirm",
+            "question": "Publish the post?",
+            "answer": "Cancel",
+        },
+        {"step_id": "ask_b", "question": "Option A or B?", "answer": "Option B"},
+    ]
+    assert payload["pending_response"]["question"] == "Option A or B?"
+    assert "step_id" not in payload["pending_response"]
+
+    plain_llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "draft",
+                    "task": "Draft answer",
+                    "termination_condition": "Stop after the draft exists.",
+                    "completion_evidence": "The draft has been returned.",
+                    "tool_names": [],
+                    "dependencies": [],
+                }
+            ]
+        )
+    )
+    await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id="dag-llm-plan-pending",
+            replan=True,
+        ),
+        llm=plain_llm,
+    )
+    plain_payload = json.loads(plain_llm.calls[0]["messages"][1]["content"])
+    assert plain_payload["pending_responses"] == []
+    assert plain_payload["pending_response"]["question"] == "Option A or B?"
 
 
 @pytest.mark.asyncio

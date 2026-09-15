@@ -46,6 +46,7 @@ store silently, so a new writer is worth checking by hand.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -61,7 +62,44 @@ from ...core.agent.checkpoint import (
 from ..models.task import TraceEvent as DatabaseTraceEvent
 from ..utils.json_payload_sanitizer import sanitize_json_payload
 from .task_lease_service import TASK_RUN_ID_TRACE_FIELD, TaskLease
-from .trace_message_storage import encode_checkpoint_data_for_storage
+from .trace_message_storage import (
+    PreparedCheckpoint,
+    PreparedJSON,
+    encode_checkpoint_data_for_storage,
+    prepare_checkpoint_data,
+    store_prepared_checkpoint,
+)
+
+
+@dataclass(frozen=True)
+class PreparedTracePayload:
+    """Owned CPU-prepared values, for the async engine's trace_json_dumps only.
+
+    Carries no Session or ORM instances. The handler prepares and consumes this
+    once under the same cancellation-drained task and captured lease context.
+    """
+
+    data: Any
+    checkpoint: PreparedCheckpoint | None
+    bind_value: PreparedJSON
+
+
+def prepare_trace_payload(
+    *, task_id: int, event_type: str, data: Any, checkpoint_lease: TaskLease | None
+) -> PreparedTracePayload:
+    """CPU-only preparation; all lease/row validation stays in the transaction."""
+    data = sanitize_json_payload(data)
+    checkpoint = None
+    if (
+        event_type == "system_update_general"
+        and isinstance(data, dict)
+        and data.get("checkpoint_type") == CHECKPOINT_TYPE
+    ):
+        if checkpoint_lease is not None:
+            data = {**data, TASK_RUN_ID_TRACE_FIELD: checkpoint_lease.run_id}
+        checkpoint = prepare_checkpoint_data(task_id, data)
+        data = checkpoint.data
+    return PreparedTracePayload(data, checkpoint, PreparedJSON(json.dumps(data)))
 
 
 @dataclass(frozen=True)
@@ -111,6 +149,7 @@ def stage_trace_event_row(
     parent_event_id: str | None,
     data: Any,
     checkpoint_lease: TaskLease | None,
+    prepared: PreparedTracePayload | None = None,
 ) -> StagedTraceRow:
     """Add one trace row to ``db`` and, on the live-lease checkpoint path,
     flush it to stage its exact-row anchor. See the module docstring for
@@ -120,26 +159,35 @@ def stage_trace_event_row(
     result, already gated on ``build_id is None`` before this is called --
     a sub-agent checkpoint (``build_id`` set) must be passed
     ``checkpoint_lease=None`` regardless of whether a lease is live.
+
+    ``prepared`` is internal to the async trace handler: its JSON binds require
+    that engine's trace_json_dumps serializer. Synchronous/shared-transaction
+    callers omit it and retain the existing sanitize/encode path.
     """
     # Sanitize before anything derives from the payload: the checkpoint
     # branches below hash and deduplicate blob rows out of ``data``, and the
     # stored hash must be computed over what actually lands in the column.
     # PostgreSQL's jsonb rejects NUL and unpaired-surrogate code points at
     # INSERT (#1248); on other dialects the same cleaning keeps stored
-    # payloads identical across backends.
-    data = sanitize_json_payload(data)
+    # payloads identical across backends. The prepared path already sanitized
+    # in prepare_trace_payload before encoding and hashing.
+    data = prepared.data if prepared is not None else sanitize_json_payload(data)
 
     is_checkpoint = (
         event_type == "system_update_general"
         and isinstance(data, dict)
         and data.get("checkpoint_type") == CHECKPOINT_TYPE
     )
-    if is_checkpoint and checkpoint_lease is not None:
+    if prepared is None and is_checkpoint and checkpoint_lease is not None:
         data = {
             **data,
             TASK_RUN_ID_TRACE_FIELD: checkpoint_lease.run_id,
         }
-    if is_checkpoint:
+    if prepared is not None and prepared.checkpoint is not None:
+        data = store_prepared_checkpoint(
+            db, task_id=task_id, prepared=prepared.checkpoint
+        )
+    elif is_checkpoint:
         data = encode_checkpoint_data_for_storage(
             db,
             task_id=task_id,
@@ -154,7 +202,7 @@ def stage_trace_event_row(
         timestamp=timestamp,
         step_id=step_id,
         parent_event_id=parent_event_id,
-        data=data,
+        data=prepared.bind_value if prepared is not None else data,
     )
     db.add(trace_event)
 

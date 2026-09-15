@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -28,7 +30,6 @@ from ...core.runtime_performance import (
 from ...core.runtime_performance import (
     observe_duration,
     observe_value,
-    run_in_thread_with_telemetry,
 )
 from ...core.tools.adapters.vibe.connector_runtime import (
     redact_runtime_sensitive_payload,
@@ -57,7 +58,9 @@ from ...web.services.task_lease_service import (
     lock_task_lease_no_commit,
     task_lease_attempt_predicate,
 )
+from ...web.services.trace_database import get_trace_database_runtime
 from ...web.services.trace_event_staging import (
+    PreparedTracePayload,
     checkpoint_run_partition_filter,
     failed_checkpoint_row_conditions,
     stage_trace_event_row,
@@ -70,6 +73,15 @@ from ...web.services.trace_message_storage import (
 )
 
 logger = logging.getLogger(__name__)
+
+_REDACTED_TOOL_EVENT_TYPES = frozenset(
+    {"tool_execution_start", "tool_execution_end", "tool_execution_failed"}
+)
+
+# Preserve the existing control-character policy without a Python iteration
+# for every character in LLM/tool output. JSONB-specific normalization still
+# belongs to stage_trace_event_row, after this serializer.
+_TRACE_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 # Page size for one batch of the checkpoint read scan. A read does not stop
 # at the first page: it keeps paging through the matching set (see
@@ -224,10 +236,10 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # A cancelled caller must wait for the instrumented worker to
             # release its transaction before task settlement can begin.
             worker = asyncio.create_task(
-                run_in_thread_with_telemetry(
-                    "trace_database_write",
-                    self._sync_save_to_database,
-                    event,
+                get_trace_database_runtime().run(
+                    lambda: self._sync_save_to_database(event),
+                    lambda db: self._save_trace_event(db, event),
+                    prepare=lambda: self._prepare_async_trace_transaction(event),
                 )
             )
             await drain_async_task_cancellation_safe(worker)
@@ -995,7 +1007,32 @@ class DatabaseTraceHandler(BaseTraceHandler):
         finally:
             db.close()
 
-    def _save_trace_event(self, db: Session, event: CoreTraceEvent) -> None:
+    def _prepare_async_trace_transaction(
+        self, event: CoreTraceEvent
+    ) -> Callable[[Session], None]:
+        from .task_event_trace_handler import get_event_type_mapping
+        from .trace_event_staging import prepare_trace_payload
+
+        event_type = get_event_type_mapping(event)
+        with observe_duration("xagent.trace.database.serialization.duration"):
+            data = self._serialize_data_for_json(event.data or {})
+        if event_type in _REDACTED_TOOL_EVENT_TYPES:
+            data = redact_runtime_sensitive_payload(data)
+        prepared = prepare_trace_payload(
+            task_id=self.task_id,
+            event_type=event_type,
+            data=data,
+            checkpoint_lease=current_task_lease() if self.build_id is None else None,
+        )
+        return lambda db: self._save_trace_event(db, event, prepared=prepared)
+
+    def _save_trace_event(
+        self,
+        db: Session,
+        event: CoreTraceEvent,
+        *,
+        prepared: PreparedTracePayload | None = None,
+    ) -> None:
         """Save trace event in unified format to database."""
         from .task_event_trace_handler import get_event_type_mapping
 
@@ -1007,8 +1044,11 @@ class DatabaseTraceHandler(BaseTraceHandler):
             timestamp = _convert_float_to_datetime(event.timestamp)
 
             # Serialize data to ensure JSON compatibility
-            with observe_duration("xagent.trace.database.serialization.duration"):
-                data = self._serialize_data_for_json(event.data or {})
+            if prepared is not None:
+                data = prepared.data
+            else:
+                with observe_duration("xagent.trace.database.serialization.duration"):
+                    data = self._serialize_data_for_json(event.data or {})
             lease = current_task_lease() if self.build_id is None else None
             is_legacy_checkpoint = (
                 event_type_str == "system_update_general"
@@ -1032,11 +1072,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                             return
                         raise RuntimeError(f"Task {self.task_id} no longer exists")
                     raise RuntimeError("Trace event producer lost its task lease")
-            if event_type_str in {
-                "tool_execution_start",
-                "tool_execution_end",
-                "tool_execution_failed",
-            }:
+            if prepared is None and event_type_str in _REDACTED_TOOL_EVENT_TYPES:
                 data = redact_runtime_sensitive_payload(data)
             if self._is_duplicate_user_message_turn(db, event_type_str, data):
                 logger.debug(
@@ -1067,6 +1103,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 parent_event_id=str(event.parent_id) if event.parent_id else None,
                 data=data,
                 checkpoint_lease=checkpoint_lease,
+                prepared=prepared,
             )
             data = staged.stored_data
 
@@ -1403,14 +1440,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
             if not isinstance(value, str):
                 return value
 
-            # Remove NULL characters and other problematic control characters
-            cleaned = value.replace("\x00", "")  # Remove NULL character
-            cleaned = cleaned.replace("\u0000", "")  # Remove Unicode NULL
-            # Remove other control characters that might cause issues
-            cleaned = "".join(
-                char for char in cleaned if ord(char) >= 32 or char in "\n\r\t"
-            )
-            return cleaned
+            return _TRACE_CONTROL_CHARACTERS.sub("", value)
 
         def serialize_value(value: Any) -> Any:
             # Handle Pydantic models (BaseModel)

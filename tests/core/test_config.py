@@ -2858,6 +2858,23 @@ def test_toby_personal_stdio_is_disabled_by_default(monkeypatch):
     assert config.get_toby_personal_stdio_enabled() is False
 
 
+def test_trace_database_defaults_and_opt_in(monkeypatch):
+    monkeypatch.delenv(config.ASYNC_TRACE_DB_ENABLED, raising=False)
+    monkeypatch.delenv(config.TRACE_DB_MAX_INFLIGHT, raising=False)
+    assert config.get_async_trace_db_enabled() is True
+    assert config.get_trace_db_max_inflight() == 4
+    monkeypatch.setenv(config.ASYNC_TRACE_DB_ENABLED, "true")
+    monkeypatch.setenv(config.TRACE_DB_MAX_INFLIGHT, "8")
+    assert config.get_async_trace_db_enabled() is True
+    assert config.get_trace_db_max_inflight() == 8
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_trace_database_invalid_admission_limit_falls_back(monkeypatch, value):
+    monkeypatch.setenv(config.TRACE_DB_MAX_INFLIGHT, value)
+    assert config.get_trace_db_max_inflight() == 4
+
+
 @pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
 def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
     monkeypatch.setenv(config.TOBY_PERSONAL_STDIO_ENABLED, value)
@@ -2905,3 +2922,15 @@ def test_task_runtime_secrets_use_explicit_key(monkeypatch):
     key = Fernet.generate_key().decode()
     monkeypatch.setenv(config.ENCRYPTION_KEY, key)
     assert config.get_task_runtime_secrets_encryption_key() == key
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 30), ("12", 12), ("0", 30), ("-1", 30), ("bad", 30)]
+)
+def test_task_reply_wait_timeout(value, expected, monkeypatch):
+    from xagent.config import get_task_reply_wait_timeout_seconds
+
+    monkeypatch.delenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", raising=False)
+    if value is not None:
+        monkeypatch.setenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", value)
+    assert get_task_reply_wait_timeout_seconds() == expected

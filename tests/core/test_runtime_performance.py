@@ -88,8 +88,17 @@ def _metrics(reader: InMemoryMetricReader) -> dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize(
+    "metric_name",
+    [
+        "xagent.trace.dispatch.duration",
+        "xagent.trace.database.admission_wait.duration",
+        "xagent.trace.database.preparation.duration",
+    ],
+)
 def test_records_counter_and_explicit_bucket_histogram_in_otel(
     otel_backend: tuple[RuntimePerformanceTelemetry, InMemoryMetricReader],
+    metric_name: str,
 ) -> None:
     telemetry, reader = otel_backend
 
@@ -98,14 +107,14 @@ def test_records_counter_and_explicit_bucket_histogram_in_otel(
         attributes={"event.type": "task_start_general"},
     )
     telemetry.observe(
-        "xagent.trace.dispatch.duration",
+        metric_name,
         6.0,
         unit="ms",
     )
 
     metrics = _metrics(reader)
     counter_point = metrics["xagent.trace.events"].data.data_points[0]
-    histogram_point = metrics["xagent.trace.dispatch.duration"].data.data_points[0]
+    histogram_point = metrics[metric_name].data.data_points[0]
     assert counter_point.value == 1
     assert counter_point.attributes == {"event.type": "task_start_general"}
     assert histogram_point.count == 1

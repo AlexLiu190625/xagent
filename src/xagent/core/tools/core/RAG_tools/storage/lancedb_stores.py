@@ -28,7 +28,11 @@ from ..core.config import (
 )
 from ..core.schemas import CollectionInfo, IndexResult
 from ..LanceDB.schema_manager import ensure_documents_table
-from ..utils.lancedb_query_utils import list_table_names, query_to_list
+from ..utils.lancedb_query_utils import (
+    build_fts_query,
+    list_table_names,
+    query_to_list,
+)
 from ..utils.string_utils import (
     build_lancedb_filter_expression,
     build_user_id_filter_for_table,
@@ -2342,12 +2346,12 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 filters, user_id=None, is_admin=False
             )
 
-            # Build FTS search query
-            # Note: LanceDB async API supports query_type="fts"
-            search_query = table.search(
-                query_text,
-                query_type="fts",
-            )
+            fts_query = build_fts_query(query_text, text_column_name)
+            if fts_query is None:
+                return []
+            # AsyncTable.search is a coroutine; the builder chain starts on its
+            # result, not on the call.
+            search_query = await table.search(fts_query, query_type="fts")
 
             if backend_filter:
                 search_query = search_query.where(backend_filter)

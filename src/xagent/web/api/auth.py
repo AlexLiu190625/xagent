@@ -43,6 +43,7 @@ from ...core.runtime_performance import (
     observe_duration,
     observe_value,
 )
+from ...core.utils.security import host_matches_suffix
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     JWT_ALGORITHM,
@@ -67,7 +68,6 @@ from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
 from ..oauth_provider_quirks import (
-    host_matches_suffix,
     matches_provider_family,
     requires_json_accept_header,
     requires_pkce,
@@ -392,7 +392,47 @@ def _merged_oauth_scopes(
     return scopes, scope_str
 
 
-def _meta_login_config_id() -> str:
+# Under Facebook Login for Business (config_id mode), the Meta Login
+# Configuration named by config_id is the *sole* source of truth for granted
+# permissions -- see _generic_oauth_login below, which sends config_id
+# instead of scope/optional_scope entirely. Every provider="meta" app that
+# doesn't have its own entry here falls back to the one shared META_CONFIG_ID,
+# so a deployment that adds a new permission to that shared Login
+# Configuration for one app (e.g. ads_read for Meta Ads) hands that same
+# permission to every other meta app's authorize request too -- not merely
+# offered, since the resulting token is capable of it regardless of which app
+# the user thought they were connecting. Give an app its own env var here (a
+# dedicated Login Configuration scoped to just its own permissions) to avoid
+# sharing a token's capability across connectors that don't ask for it.
+_META_APP_CONFIG_ID_ENV_VARS = {
+    "facebook": "META_FACEBOOK_CONFIG_ID",
+    "instagram": "META_INSTAGRAM_CONFIG_ID",
+    "meta-ads": "META_ADS_CONFIG_ID",
+}
+
+
+def _meta_login_config_id(app_id: str | None = None) -> str:
+    if app_id:
+        # Normalized the same way requires_app_scoped_oauth_grant resolves
+        # app_id (mcp_apps._normalize_oauth_grant_key), not a bare .lower() --
+        # an admin-created app_id like "Meta Ads" normalizes to "meta-ads"
+        # there but not here, which would silently miss this override and
+        # fall back to the shared META_CONFIG_ID for that app, reintroducing
+        # the exact cross-app capability sharing this override exists to
+        # avoid. Imported locally to match this module's existing lazy-import
+        # convention for mcp_apps (see requires_app_scoped_oauth_grant above).
+        from ..mcp_apps import _normalize_oauth_grant_key
+
+        normalized_app_id = _normalize_oauth_grant_key(app_id)
+        app_env_var = (
+            _META_APP_CONFIG_ID_ENV_VARS.get(normalized_app_id)
+            if normalized_app_id
+            else None
+        )
+        if app_env_var:
+            app_config_id = os.environ.get(app_env_var)
+            if app_config_id:
+                return app_config_id
     return os.environ.get("META_CONFIG_ID", "")
 
 
@@ -2563,7 +2603,7 @@ def _generic_oauth_login(
         # consent screen. Without this, the callback's businessId guard
         # (see _normalize_myob_business_id) would reject every connection.
         params["prompt"] = "consent"
-    meta_config_id = _meta_login_config_id() if provider.lower() == "meta" else ""
+    meta_config_id = _meta_login_config_id(app_id) if provider.lower() == "meta" else ""
     if meta_config_id:
         params["config_id"] = meta_config_id
     else:
