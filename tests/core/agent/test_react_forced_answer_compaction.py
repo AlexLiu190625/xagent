@@ -440,6 +440,99 @@ def test_only_one_place_in_src_writes_the_marker_false() -> None:
     assert writers == {"core/agent/context/manager.py"}
 
 
+def _is_compaction_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "compact_context_if_needed"
+    )
+
+
+def _is_forwarded_compaction_call(node: ast.Call) -> bool:
+    """A ``self.parent.compact_context_if_needed(...)`` relay, not a real call site."""
+    value = node.func.value  # type: ignore[union-attr]
+    return isinstance(value, ast.Attribute) and value.attr == "parent"
+
+
+def _is_latch_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "note_compaction_evidence_loss"
+    )
+
+
+def _enclosing_function(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef], lineno: int
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    """The innermost function definition whose range holds this line.
+
+    A function nested inside another both hold the line, and the nested one
+    always starts later, so the containing definition with the largest start
+    line is the innermost one.
+    """
+    holding = [
+        func
+        for func in functions
+        if func.lineno <= lineno <= (func.end_lineno or func.lineno)
+    ]
+    if not holding:
+        return None
+    return max(holding, key=lambda func: func.lineno)
+
+
+def test_every_real_compaction_call_site_latches_the_marker() -> None:
+    """Every function that actually calls compaction also latches the marker.
+
+    The two production call sites are not enforced by calling them and
+    checking a result; they are the only source ``dropped_tool_result_count``
+    has, so a third call site added later with the write left out would carry
+    no mechanical objection without a rule like this one. The latch itself
+    stays the caller's job rather than moving inside the compaction method:
+    that method only produces the dropped-count value this design reads, it
+    is not the thing that decides what a run does with it.
+
+    Forwarding wrappers (a pattern's own ``compact_context_if_needed`` that
+    relays to ``self.parent``) are excluded on both sides: they are not where
+    a real call happens, and their own name matches the callee's, so walking
+    into their body would otherwise credit them for a latch call that lives
+    in the parent they forward to.
+    """
+    src = pathlib.Path(__file__).resolve().parents[3] / "src" / "xagent"
+    call_sites: set[tuple[str, str]] = set()
+    missing: set[tuple[str, str]] = set()
+    for path in src.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        functions = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        rel = str(path.relative_to(src))
+        for node in ast.walk(tree):
+            if not _is_compaction_call(node) or _is_forwarded_compaction_call(node):
+                continue
+            owner = _enclosing_function(functions, node.lineno)
+            if owner is None or owner.name == "compact_context_if_needed":
+                continue
+            key = (rel, owner.name)
+            call_sites.add(key)
+            latches = [
+                latch
+                for latch in ast.walk(tree)
+                if _is_latch_call(latch)
+                and _enclosing_function(functions, latch.lineno) is owner
+            ]
+            if not latches:
+                missing.add(key)
+
+    assert missing == set()
+    assert call_sites >= {
+        ("core/agent/pattern/react/react.py", "_run_tool_calling_loop"),
+        ("core/agent/pattern/auto/auto.py", "_decide"),
+    }
+
+
 @pytest.mark.asyncio
 async def test_truncate_path_latches_without_writing_a_notice() -> None:
     """The truncate path stays silent; the marker is what carries it.
