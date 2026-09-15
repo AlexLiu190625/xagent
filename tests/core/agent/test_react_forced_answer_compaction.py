@@ -420,7 +420,9 @@ def test_latch_reads_dropped_observations_not_compacted(
     ``dropped_tool_result_count`` at all -- the first because the metadata is
     genuinely empty, the second because a ``None`` result never reaches that
     metadata check in the first place -- and neither warns: absence is an
-    ordinary outcome of this call, not a malformed one.
+    ordinary outcome of this call, not a malformed one. Each malformed-count
+    row also pins what the warning may and may not say: it names the value's
+    type and the execution id, and it never repeats the value itself.
     """
     context = ContextManager().create_context(execution_id="latch")
     with caplog.at_level(logging.WARNING, logger="xagent.core.agent.context.execution"):
@@ -434,6 +436,12 @@ def test_latch_reads_dropped_observations_not_compacted(
         and r.levelno == logging.WARNING
     ]
     assert len(warnings) == (1 if warns else 0)
+    if warns:
+        message = warnings[0].getMessage()
+        dropped_value = result.metadata["dropped_tool_result_count"]
+        assert type(dropped_value).__name__ in message
+        assert f"execution_id={context.execution_id}" in message
+        assert str(dropped_value) not in message
 
 
 def test_latch_is_monotonic() -> None:
