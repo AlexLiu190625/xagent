@@ -353,6 +353,16 @@ def test_zh_half_day_word_hour_compatibility(
         ("上午0点", "write 0点 without a half-day word"),
         ("上午13点", "which names hours 1 to 11"),
         ("下午20点", "which names hours 1 to 11 or 13 to 18"),
+        ("晚上15点", "which names hours 1 to 11 or 18 to 23"),
+        # Hour twelve keeps its own wording, which names the three readings
+        # it cannot choose between rather than a range of admitted hours.
+        # Without these two cells the twelve-hour check can lose its
+        # afternoon and evening members unnoticed: those inputs then fall
+        # through to the compatibility table, which also refuses them, so
+        # every reason-code assertion stays green while the reason the
+        # caller is given changes.
+        ("下午12点", "could mean today ending at"),
+        ("晚上12点", "could mean today ending at"),
     ],
 )
 def test_zh_half_day_refusal_names_the_hours_the_word_admits(

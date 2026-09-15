@@ -531,7 +531,7 @@ class _AmbiguousHour(ValueError):
     """A spoken hour paired with a half-day word that does not settle on,
     or flatly contradicts, one correct time of day.
 
-    Two shapes raise this. Hour twelve paired with any half-day word
+    Three shapes raise this. Hour twelve paired with any half-day word
     (English am/pm, Chinese 上午/早上/下午/晚上) names both endpoints of a
     day: '12' is the hour at which the label flips, without telling you
     which side of midnight or noon it is on, so a period word attached to
@@ -539,8 +539,13 @@ class _AmbiguousHour(ValueError):
     '中午' (noon) paired with any hour other than 11, 12, or 13 has the
     opposite problem: instead of leaving the hour ambiguous, it names an
     hour nowhere near noon, contradicting the period word it came with.
-    Guessing a reading in either case can land the result hours or a full
-    day off, so the phrase is refused instead of resolved to one.
+    The third shape generalises the second to the other Chinese words: each
+    of 上午/早上/下午/晚上 admits only its own half of the day, in either
+    the twelve-hour or the twenty-four-hour spelling, so an hour outside
+    both -- including hour zero, which belongs to no half-day word --
+    contradicts the word it came with.
+    Guessing a reading in any of the three cases can land the result hours
+    or a full day off, so the phrase is refused instead of resolved to one.
     """
 
 
