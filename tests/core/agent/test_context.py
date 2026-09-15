@@ -2684,9 +2684,11 @@ def test_tool_evidence_state_separates_absent_from_corrupt(
 ) -> None:
     """Absence and corruption are different facts, so they read differently.
 
-    Absence means a payload that never carried the key -- an older build that
-    did not track this, about which neither "removed" nor "intact" can be
-    said. A key that is present but not literally False means a build that
+    Absence means one of two things, and both read as unknown: a payload that
+    never carried the key -- an older build that did not track this, about
+    which neither "removed" nor "intact" can be said -- or a marker
+    ``from_dict`` dropped because the payload named no attested writer. A key
+    that is present but not literally False means a build that
     did track this recorded something other than "nothing was removed", and
     that reads as removed regardless of what shape the value takes.
     """
