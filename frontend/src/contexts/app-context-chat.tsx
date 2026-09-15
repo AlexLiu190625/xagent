@@ -66,7 +66,7 @@ type TaskControlEnvelope = {
   status?: TaskStatus
 }
 
-const VERSIONED_TASK_EVENT_TYPES = new Set([
+export const VERSIONED_TASK_EVENT_TYPES = new Set([
   "task_stream_snapshot",
   "agent_error",
   "error",

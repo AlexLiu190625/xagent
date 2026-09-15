@@ -1241,6 +1241,39 @@ describe("never renders server text as HTML", () => {
   })
 })
 
+describe("renders a hostile connector name and key as plain text, not markup", () => {
+  it("renders a hostile connector name and key as plain text, not markup", async () => {
+    // The source-shape guard above only covers the three new production
+    // files, and is blind to a comment or refactor tripping its own string
+    // search. This is the behavior-level complement: a connector name and a
+    // key name are the only server-controlled strings this dialog renders
+    // (the key name reaches here even when the per-turn gate would reject
+    // it, precisely so a rejected key still renders instead of silently
+    // vanishing from the report -- schemas/connector_runtime.py's own
+    // docstring), so both are exercised here with markup-shaped text.
+    const hostileName = "<img src=x onerror=\"window.__connectorRuntimeHostile = true\">"
+    const hostileKey = "<script>window.__connectorRuntimeHostile = true</script>"
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, hostileName, [
+        input({ section: "context", key: hostileKey, type: "string", required: true }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+
+    const dialog = screen.getByRole("dialog")
+    expect(dialog.querySelector("img")).toBeNull()
+    expect(dialog.querySelector("script")).toBeNull()
+    expect(screen.getByText(hostileName)).toBeInTheDocument()
+    expect(screen.getByText(hostileName).textContent).toBe(hostileName)
+    const keyLabel = screen.getByText(hostileKey)
+    expect(keyLabel.textContent).toBe(hostileKey)
+    expect((window as unknown as { __connectorRuntimeHostile?: boolean }).__connectorRuntimeHostile)
+      .toBeUndefined()
+  })
+})
+
 function leafTranslationPaths(obj: Record<string, unknown>, prefix: string): string[] {
   return Object.entries(obj).flatMap(([k, v]) =>
     typeof v === "string" ? [`${prefix}${k}`] : leafTranslationPaths(v as Record<string, unknown>, `${prefix}${k}.`),

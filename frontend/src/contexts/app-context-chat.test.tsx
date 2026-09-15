@@ -1,6 +1,4 @@
 import React from "react"
-import { readFileSync } from "node:fs"
-import path from "node:path"
 import { flushSync } from "react-dom"
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
@@ -153,6 +151,7 @@ vi.mock("sonner", () => ({
 
 import {
   AppProvider,
+  VERSIONED_TASK_EVENT_TYPES,
   extractTaskControlEnvelope,
   projectErrorFrameForDisplay,
   type AppProviderTransportConfig,
@@ -7435,13 +7434,10 @@ describe("connector runtime dialog trigger", () => {
 
   it("forgets the stash on every settlement frame of the viewed task", async () => {
     // Binds the tested frame-type set to the production source's own
-    // VERSIONED_TASK_EVENT_TYPES rather than a hand-typed list, so a future
-    // addition to that set is caught here rather than silently untested.
-    const source = readFileSync(path.resolve(__dirname, "./app-context-chat.tsx"), "utf8")
-    expect(source).toContain("const VERSIONED_TASK_EVENT_TYPES = new Set([")
-    const setBody = source.split("const VERSIONED_TASK_EVENT_TYPES = new Set([")[1].split("])")[0]
-    const sourceTypes = Array.from(setBody.matchAll(/"([a-z_]+)"/g)).map(m => m[1])
-    expect(sourceTypes.sort()).toEqual([
+    // VERSIONED_TASK_EVENT_TYPES (imported directly, not re-typed by hand),
+    // so a future addition to that set is caught here rather than silently
+    // untested.
+    expect(Array.from(VERSIONED_TASK_EVENT_TYPES).sort()).toEqual([
       "agent_error", "error", "task_completed", "task_error", "task_pause_requested",
       "task_paused", "task_resumed", "task_started", "task_stream_snapshot",
       "task_waiting_for_user",
