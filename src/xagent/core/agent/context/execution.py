@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -61,6 +62,8 @@ from .skill_tool import (
     LOADED_SKILLS_METADATA_KEY,
     SKILL_INDEX_METADATA_KEY,
 )
+
+logger = logging.getLogger(__name__)
 
 READ_FILE_CONTEXT_LIMIT = 12_000
 # Set by the web layer into ``ExecutionContext.metadata`` at turn start: the
@@ -255,8 +258,34 @@ def note_compaction_evidence_loss(context: Any, result: Any) -> None:
     result_metadata = getattr(result, "metadata", None)
     if not isinstance(result_metadata, dict):
         return
-    dropped = result_metadata.get("dropped_tool_result_count")
+    # The key is absent, not malformed, whenever this call did not compact at
+    # all -- compaction disabled, the context already under threshold, or a
+    # context object with no compaction protocol. Every one of those is an
+    # ordinary result of this call, so it stays silent and unlatched exactly
+    # as before: nothing here is a warning-worthy shape.
+    if "dropped_tool_result_count" not in result_metadata:
+        return
+    dropped = result_metadata["dropped_tool_result_count"]
+    # A malformed count here is treated the opposite way from a malformed
+    # marker in tool_evidence_state below, and that asymmetry is deliberate.
+    # tool_evidence_state reads a context that already carries some value for
+    # a decision already made, so reading a corrupt one as "removed" only
+    # adds a cautious word to a prompt -- it asserts nothing false. This
+    # function instead reads the return value of one compaction call:
+    # latching True for a malformed count would assert that this run's
+    # compaction removed observations when it may have removed none at all,
+    # which is a false claim, not a cautious one. So a malformed count here
+    # is left unlatched instead. Both compaction paths in this codebase
+    # write a real int under this key whenever they write the key at all, so
+    # this branch is not known to be reachable in production; the warning
+    # below exists to find out if it ever is.
     if isinstance(dropped, bool) or not isinstance(dropped, int):
+        logger.warning(
+            "Compaction returned a non-integer dropped_tool_result_count of "
+            "type %s; leaving the evidence marker unlatched. execution_id=%s",
+            type(dropped).__name__,
+            getattr(context, "execution_id", None),
+        )
         return
     if dropped > 0:
         metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = True

@@ -424,6 +424,42 @@ def test_latch_is_monotonic() -> None:
     assert context.metadata[KEY] is True
 
 
+def test_a_malformed_dropped_count_warns_instead_of_latching(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-integer dropped count is logged, not silently left unlatched."""
+    context = ContextManager().create_context(execution_id="latch-malformed")
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.context.execution"):
+        note_compaction_evidence_loss(context, _result(dropped_tool_result_count="3"))
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "str" in message
+    assert f"execution_id={context.execution_id}" in message
+    assert "3" not in message
+    assert context.metadata[KEY] is False
+
+
+def test_a_result_with_no_dropped_count_key_stays_silent_and_unlatched(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A call that did not compact at all carries no count key, and that is ordinary.
+
+    Compaction disabled, the context already under threshold, and a context
+    object with no compaction protocol all reach this function with an empty
+    ``metadata``. None of those is a malformed count -- there was no count to
+    report -- so this must warn exactly as much as it always has: not at all.
+    """
+    context = ContextManager().create_context(execution_id="latch-no-key")
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.context.execution"):
+        note_compaction_evidence_loss(context, CompactResult(False, 3, 3, "none", {}))
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == []
+    assert context.metadata[KEY] is False
+
+
 def _marker_names(tree: ast.AST) -> set[str]:
     """Every local name in this module that stands for the marker key."""
     names = {"TOOL_EVIDENCE_REMOVED_METADATA_KEY"}
