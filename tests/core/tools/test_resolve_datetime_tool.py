@@ -443,13 +443,35 @@ def test_hour_twelve_refusal_is_the_same_with_and_without_a_date() -> None:
     """The refusal is a property of writing hour twelve with am or pm, not of
     which reader saw the phrase: the calendar path and the bare-time path
     must answer with the same reason code and the same words, in either
-    letter case dateutil accepts."""
+    letter case dateutil accepts. On the calendar-date path, which is the
+    only path that pattern is consulted on, the same wording must also
+    survive the other spellings the widened _EN_HOUR_TWELVE_RE recognises;
+    a spelling it does not recognise ("12h30 pm") must fall back to the
+    generic refusal there rather than silently losing its wording. Those
+    out-of-grammar spellings have no bare-path reading to match: the bare
+    grammar requires a colon, so it never parses an hour from them at
+    all."""
     bare = resolve_datetime("12 pm", SYDNEY)
     dated = resolve_datetime("15 Sep 2026 12 pm", SYDNEY)
     dated_upper = resolve_datetime("15 Sep 2026 12 PM", SYDNEY)
 
     assert bare["resolution"] == dated["resolution"] == "unsupported_expression"
     assert bare["error"] == dated["error"] == dated_upper["error"]
+
+    for spelling in ("12.30 pm", "12 p.m.", "012 pm"):
+        assert (
+            resolve_datetime(f"15 Sep 2026 {spelling}", SYDNEY)["error"]
+            == "'12pm' names both midnight and noon"
+        )
+
+    # "12h30 pm" folds to hour 12 and spells a twelve, but the "h" separator
+    # is not one of the spellings _EN_HOUR_TWELVE_RE recognises, so it gets
+    # the generic refusal instead: the hour-twelve wording above is not
+    # promised for every spelling dateutil accepts.
+    assert (
+        resolve_datetime("15 Sep 2026 12h30 pm", SYDNEY)["error"]
+        == "unsupported date or time expression: '15 Sep 2026 12h30 pm'"
+    )
 
 
 def test_implicit_pm_hour_zero_refuses_with_the_same_shape_as_the_bare_form() -> None:

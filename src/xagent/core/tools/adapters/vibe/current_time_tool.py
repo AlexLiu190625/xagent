@@ -584,11 +584,13 @@ def _parse_number(token: str) -> Optional[int]:
 
 # On the calendar-date path this pattern only chooses which refusal message
 # to raise, once the parsed hour has already decided that a refusal is due
-# (see _read_en_calendar_date): does the phrase spell a twelve at all, in any
-# of the ways dateutil accepts one? A leading-zero run, a "." minute
-# separator, and the dotted "a.m."/"p.m." form are all safe to recognise
-# here, because being generous only affects the wording, never whether the
-# phrase is refused.
+# (see _read_en_calendar_date): does the phrase spell a twelve at all, in
+# one of the ways this pattern covers? dateutil accepts more spellings than
+# this ("12h30", "12,30"), and those fall through to the generic refusal
+# rather than being named. A leading-zero run, a "." minute separator, and
+# the dotted "a.m."/"p.m." form are all safe to recognise here, because
+# being generous only affects the wording, never whether the phrase is
+# refused.
 _EN_HOUR_TWELVE_RE = re.compile(
     r"(?<![0-9:.])0*12(?:[:.][0-9]{2}){0,2} ?(?:a|p)\.?m\.?(?![a-z])",
     re.IGNORECASE,
@@ -891,10 +893,12 @@ def _read_en_calendar_date(text: str, now_local: datetime) -> Optional[_Reading]
     ambiguous date. A date that follows the default is missing a component.
     An hour that follows the default means the phrase named no time of day.
     Whether an hour with am or pm is refused is decided by the hour dateutil
-    actually parsed, not by how the writer spelled it: only an hour-twelve
-    reading can land on 0 or 12 while a period word is present, so that is
-    refused through the same rule and the same wording as the bare time
-    sub-grammar (_refuse_hour_twelve_with_period). A period word paired with
+    actually parsed, not by how the writer spelled it. Its own parsed hour
+    is the reliable witness: an hour written as 1 through 11 never folds
+    onto 0 or 12, so a folded 0 or 12 means the writer wrote a twelve or a
+    zero, and neither can be placed on a twelve-hour clock. The
+    written-twelve reading is refused through the same rule and the same
+    wording as the bare time sub-grammar (_refuse_hour_twelve_with_period). A period word paired with
     that folded hour but no spelled-out twelve (e.g. "0:30 am") is refused
     too, but generically: the bare time sub-grammar already refuses that
     same reading (_en_time's `if not 1 <= hour <= 12: return None`), so this
@@ -932,14 +936,17 @@ def _read_en_calendar_date(text: str, now_local: datetime) -> Optional[_Reading]
     if marker is not None and first.hour in (0, 12):
         # dateutil reads 12 pm as noon and 12 am as midnight without ever
         # asking whether the writer meant that. Its own parsed hour is the
-        # reliable witness: with a period word present, only an hour-twelve
-        # reading can land on 0 or 12, whichever way it was written.
+        # reliable witness: an hour written as 1 through 11 never folds
+        # onto 0 or 12, so a folded 0 or 12 means the writer wrote a twelve
+        # or a zero, and neither can be placed on a twelve-hour clock.
         if _EN_HOUR_TWELVE_RE.search(text) is not None:
             _refuse_hour_twelve_with_period(marker.group("period") + "m")
-        # The phrase never spells a twelve (e.g. "0:30 am"), so naming an
-        # hour it never wrote would misdirect; fall through to the generic
-        # refusal, matching what the bare time sub-grammar already does with
-        # this same folded hour.
+        # The wording pattern does not recognise a twelve here, either
+        # because the phrase wrote a zero ("0:30 am") or because it spelled
+        # the twelve a way the pattern does not cover ("12h30 pm"). Naming
+        # an hour the message cannot vouch for would misdirect, so fall
+        # through to the generic refusal, matching what the bare time
+        # sub-grammar already does with this same folded hour.
         return None
     return first.replace(microsecond=0), True
 
