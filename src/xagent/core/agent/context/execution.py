@@ -314,6 +314,15 @@ def tool_evidence_state(context: Any) -> EvidenceState:
       has a record, so that statement would be false about it. Removed is
       both the fail-safe direction and the only one that asserts nothing
       false.
+
+    Telling "intact" apart from "removed" here is a literal ``is False``
+    check on the stored key, which depends on a checkpoint round trip
+    handing back the same JSON boolean it was given rather than a
+    stringified one. Checkpoint payloads land in the ``TRACE_PAYLOAD_JSON``
+    column defined in ``src/xagent/web/models/task.py``, which is a plain
+    ``JSON`` type on most dialects and ``JSONB`` on PostgreSQL. A storage
+    layer that did not preserve JSON boolean fidelity would make every
+    restored marker read as removed.
     """
     metadata = getattr(context, "metadata", None)
     if not isinstance(metadata, dict):
