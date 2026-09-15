@@ -598,6 +598,19 @@ MAIN_DECISION_SUFFICIENCY_CLAUSE = (
     "Choose final_answer when the conversation and accumulated tool results "
     "are sufficient to answer the latest user request."
 )
+# For these two the quote is not the whole prompt but main's two sentences
+# that sit adjacent across this change's insertion point: whatever the marker
+# renders goes between them, so the pair is present verbatim exactly when the
+# marker renders nothing. It stops at the colon for the same reason as above --
+# the shared rule after it is not this change's text.
+MAIN_DAG_ASSESSMENT_SPLICE = (
+    "Put status before answer in the tool arguments. When writing the answer "
+    "field, including any content carried over from candidate_output or "
+    "step_results:"
+)
+MAIN_AUTO_DECISION_SPLICE = (
+    "Put action before answer in the tool arguments. When writing that answer field:"
+)
 
 
 CONSUMERS = [
@@ -610,8 +623,15 @@ CONSUMERS = [
         False,
         id="react_repeated_tool_decision",
     ),
-    pytest.param(_dag_assessment, (), True, id="dag_completion_assessment"),
-    pytest.param(_auto_decision, (), True, id="auto_routing_decision"),
+    pytest.param(
+        _dag_assessment,
+        (MAIN_DAG_ASSESSMENT_SPLICE,),
+        True,
+        id="dag_completion_assessment",
+    ),
+    pytest.param(
+        _auto_decision, (MAIN_AUTO_DECISION_SPLICE,), True, id="auto_routing_decision"
+    ),
 ]
 
 
