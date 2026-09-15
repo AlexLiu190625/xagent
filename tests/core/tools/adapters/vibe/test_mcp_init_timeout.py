@@ -88,12 +88,9 @@ async def test_bounded_load_returns_even_when_cleanup_hangs():
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
-async def test_burst_larger_than_gate_does_not_fan_out(monkeypatch):
-    """A burst of concurrent loads for the same hung server must not create
-    more underlying load tasks (transports/sockets) than the per-server cap:
-    callers beyond the cap fail fast at the gate without starting a load."""
-    monkeypatch.setattr(mcp_adapter_module, "_MAX_INFLIGHT_LOADS_PER_SERVER", 2)
-
+async def test_concurrent_loads_for_one_server_are_not_capped():
+    """Concurrent callers for the same server each start their own load and
+    are bounded only by their own timeout; none waits on another."""
     started_loads = 0
     release_cleanup = asyncio.Event()
 
@@ -116,16 +113,7 @@ async def test_burst_larger_than_gate_does_not_fan_out(monkeypatch):
 
     await asyncio.gather(*(one_caller() for _ in range(6)))
 
-    # Only cap-many loads (transports) ever started; the abandoned
-    # ones keep holding their slots so the other four callers failed fast
-    # at the gate.
-    assert started_loads == 2
-
-    # A follow-up caller while both slots are still held by abandoned loads
-    # also fails fast without starting a load.
-    with pytest.raises(TimeoutError):
-        await _load_server_tools_bounded("burst-server", uncancellable_load(), 1)
-    assert started_loads == 2
+    assert started_loads == 6
 
     # Let the abandoned tasks finish so loop teardown doesn't hang.
     release_cleanup.set()
@@ -133,12 +121,10 @@ async def test_burst_larger_than_gate_does_not_fan_out(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_caller_cancellation_cancels_child_and_frees_slot(monkeypatch):
-    """Cancelling the caller must propagate to the owned load task —
-    asyncio.wait doesn't do it — or cancelled requests would strand live
-    loads that hold gate slots and transports forever."""
-    monkeypatch.setattr(mcp_adapter_module, "_MAX_INFLIGHT_LOADS_PER_SERVER", 1)
-
+async def test_caller_cancellation_cancels_child():
+    """Cancelling the caller must propagate to the owned load task --
+    asyncio.wait doesn't do it -- or cancelled requests would strand live
+    loads that hold transports forever."""
     load_started = asyncio.Event()
     child_cancelled = asyncio.Event()
 
@@ -159,56 +145,8 @@ async def test_caller_cancellation_cancels_child_and_frees_slot(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await caller
 
-    # The child observed the cancellation (it would previously run forever)...
+    # The child observed the cancellation (it would previously run forever).
     await asyncio.wait_for(child_cancelled.wait(), timeout=5)
-
-    # ...and released its slot: with a cap of 1, a fresh load on the same
-    # server can start and complete.
-    async def quick_load():
-        return ["tool"]
-
-    assert await _load_server_tools_bounded("cancel-server", quick_load(), 5) == [
-        "tool"
-    ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("timeout_seconds", [0, 30])
-async def test_cancel_while_queued_at_gate_closes_unstarted_coro(
-    monkeypatch, timeout_seconds
-):
-    """Cancelling a caller that is still waiting for a gate slot must close
-    the never-started load coroutine (no 'was never awaited' at GC), in both
-    the timed and the timeout-disabled branches."""
-    import inspect as inspect_mod
-
-    monkeypatch.setattr(mcp_adapter_module, "_MAX_INFLIGHT_LOADS_PER_SERVER", 1)
-    server = f"queued-cancel-{timeout_seconds}"
-
-    release_holder = asyncio.Event()
-
-    async def slot_holder_load():
-        await release_holder.wait()
-        return []
-
-    holder = asyncio.create_task(
-        _load_server_tools_bounded(server, slot_holder_load(), 30)
-    )
-    await asyncio.sleep(0.05)  # holder occupies the single slot
-
-    queued_coro = slot_holder_load()
-    queued = asyncio.create_task(
-        _load_server_tools_bounded(server, queued_coro, timeout_seconds)
-    )
-    await asyncio.sleep(0.05)  # queued caller is waiting at the gate
-    queued.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await queued
-
-    assert inspect_mod.getcoroutinestate(queued_coro) == "CORO_CLOSED"
-
-    release_holder.set()
-    assert await holder == []
 
 
 @pytest.mark.asyncio
