@@ -417,7 +417,7 @@ class TestSearchSparse:
                 response = search_sparse_module.search_sparse(
                     collection="test_col",
                     model_tag="test_model",
-                    query_text="no matches",
+                    query_text="zero matches",
                     top_k=5,
                     user_id=None,
                     is_admin=True,
@@ -429,7 +429,7 @@ class TestSearchSparse:
         assert response.warnings == []
 
         mock_vector_store.open_embeddings_table.assert_called_once_with("test_model")
-        assert _searched_terms(mock_table) == ["no", "matches"]
+        assert _searched_terms(mock_table) == ["zero", "matches"]
         mock_search.limit.assert_called_once_with(5)
 
     def test_search_sparse_triggers_fallback_with_results(

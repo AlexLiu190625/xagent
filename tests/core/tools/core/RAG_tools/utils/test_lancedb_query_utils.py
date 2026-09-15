@@ -6,7 +6,10 @@ import logging
 
 import pytest
 
-from xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils import build_fts_query
+from xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils import (
+    _FTS_STOP_WORDS,
+    build_fts_query,
+)
 
 
 def _terms(query_text: str, text_column: str = "text"):
@@ -92,3 +95,36 @@ def test_build_fts_query_keeps_single_term_and_column():
 def test_build_fts_query_returns_none_without_terms(query_text: str):
     """No terms means no FTS query: the space token matches every chunk holding one."""
     assert build_fts_query(query_text) is None
+
+
+def test_build_fts_query_drops_english_stop_words():
+    assert _terms("how do I print an incident report") == [
+        ("how", "text"),
+        ("do", "text"),
+        ("I", "text"),
+        ("print", "text"),
+        ("incident", "text"),
+        ("report", "text"),
+    ]
+
+
+@pytest.mark.parametrize("query_text", ["the a an of to", "THE", "  to  "])
+def test_build_fts_query_returns_none_for_stop_words_only(query_text: str):
+    assert build_fts_query(query_text) is None
+
+
+def test_stop_word_list_is_intact():
+    """A missing space in the literal silently concatenates two words into one."""
+    assert len(_FTS_STOP_WORDS) == 33
+
+
+def test_build_fts_query_caps_the_terms_left_after_dropping_stop_words(caplog):
+    """Stop words go before the cap, so they never eat a slot from a real term."""
+    with caplog.at_level(logging.WARNING):
+        built = build_fts_query(" ".join(f"the term{i}" for i in range(200)))
+
+    assert built is not None
+    assert [match.query for _, match in built.queries] == [
+        f"term{i}" for i in range(64)
+    ]
+    assert "truncated to 64 terms" in caplog.text

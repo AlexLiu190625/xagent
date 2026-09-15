@@ -155,6 +155,12 @@ _FTS_TERM_CHUNKS = re.compile(rf"[^{_FTS_SEPARATORS}]+")
 _FTS_TERM_EDGES = re.compile(r"^[^\w+#]+|[^\w+#]+$")
 # Guards against a pasted document arriving as one query.
 _FTS_MAX_TERMS = 64
+# Tantivy strips these at index time, so a clause holding one matches nothing and
+# lance fails the whole search on the empty token list.
+_FTS_STOP_WORDS = frozenset(
+    "a an and are as at be but by for if in into is it no not of on or such that"
+    " the their then there these they this to was will with".split()
+)
 
 
 def build_fts_query(
@@ -165,18 +171,23 @@ def build_fts_query(
     Separators and edge ASCII punctuation are indexed tokens of their own (lance
     folds ``，`` onto ASCII ``,``), so a term carrying them matches every chunk
     that contains one. Punctuation inside a term stays: ``COVID-19`` and ``3.5``
-    are single tokens in the index.
+    are single tokens in the index. English stop words are dropped: tantivy
+    removes them at index time, so a clause holding one matches nothing and
+    makes lance fail the entire search. That removes the most common trigger,
+    not the class -- any clause whose term tokenizes to nothing fails the same
+    way, for instance a term longer than lance's ``max_token_length``.
     """
     terms: Dict[str, str] = {}
     truncated = False
     for chunk in _FTS_TERM_CHUNKS.finditer(query_text):
         term = _FTS_TERM_EDGES.sub("", chunk.group())
-        if not re.search(r"\w", term) or term.casefold() in terms:
+        folded = term.casefold()
+        if not re.search(r"\w", term) or folded in terms or folded in _FTS_STOP_WORDS:
             continue
         if len(terms) == _FTS_MAX_TERMS:
             truncated = True
             break
-        terms[term.casefold()] = term
+        terms[folded] = term
 
     if truncated:
         logger.warning("FTS query truncated to %d terms", _FTS_MAX_TERMS)
