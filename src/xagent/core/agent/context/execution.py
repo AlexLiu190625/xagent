@@ -265,7 +265,10 @@ def note_compaction_evidence_loss(context: Any, result: Any) -> None:
     reports ``compacted=True`` while keeping every message it was handed, and a
     summary can replace a transcript that held no tool observation at all. Only
     ever writes True -- a later lossless compaction must not clear it, because
-    the hole the earlier one left is still in ``messages``.
+    the hole the earlier one left is still in ``messages``. A cross-build
+    restore can still discard the marker entirely (``from_dict`` drops it when
+    the payload names no attested writer); that is not a compaction and does
+    not contradict this rule.
     """
     metadata = getattr(context, "metadata", None)
     if not isinstance(metadata, dict):

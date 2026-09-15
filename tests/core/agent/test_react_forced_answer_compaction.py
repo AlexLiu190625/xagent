@@ -574,6 +574,10 @@ def test_every_real_compaction_call_site_latches_the_marker() -> None:
     ``self.parent.compact_context_if_needed(...)``) through; being skipped by
     name is not evidence that those two functions latch correctly, only that
     this guard does not check them.
+    (4) There is deliberately no separate exclusion keyed on the receiver
+    being named ``parent``: that would also hide a genuine, unlatched call
+    written through a ``self.parent.`` receiver inside an ordinarily named
+    function, which is exactly the shape this test exists to catch.
     """
     src = pathlib.Path(__file__).resolve().parents[3] / "src" / "xagent"
     call_sites: set[tuple[str, str]] = set()

@@ -2743,16 +2743,31 @@ def test_the_marker_survives_a_checkpoint_round_trip() -> None:
     assert restored.metadata[_MARKER] is True
 
 
-def test_a_checkpoint_written_without_the_key_reads_as_unknown() -> None:
-    """An older build's payload carries no key, and neither answer is available.
+@pytest.mark.parametrize("shape", ["sealed_marker_popped", "old_build_payload"])
+def test_a_checkpoint_written_without_the_key_reads_as_unknown(shape: str) -> None:
+    """A missing marker reads as unknown, for either of two different reasons.
 
-    Those builds dropped observations on the truncate path without leaving a
-    word in the context, and they also completed runs that lost nothing; the
-    payload does not say which happened, so this reads as unknown rather than
-    as either "removed" or "intact".
+    ``sealed_marker_popped`` is shape (c): a payload this build wrote, so it
+    still carries this build's writer seal, with only the marker key
+    removed from ``metadata`` afterward. There is no marker here for
+    ``from_dict`` to drop -- it was never present -- so this shape is not
+    the "``from_dict`` dropped it" half of ``tool_evidence_state``'s
+    absent-key bullet either; it is simply a record nobody wrote.
+
+    ``old_build_payload`` is shape (d): a genuine older build's payload,
+    carrying neither the marker nor the seal -- the case that same bullet
+    and ``manager.py``'s stamping comment both call "a payload written by a
+    build that did not track this," about which "neither answer can be
+    given": those builds dropped observations on the truncate path without
+    leaving a word in the context, and they also completed runs that lost
+    nothing, and the payload does not say which happened.
+
+    Both read as unknown rather than as either "removed" or "intact".
     """
     payload = ContextManager().create_context(execution_id="marker-old").to_dict()
     payload["metadata"].pop(_MARKER, None)
+    if shape == "old_build_payload":
+        payload.pop(execution_module.EVIDENCE_MARKER_WRITER_FIELD)
     restored = ExecutionContext.from_dict(json.loads(json.dumps(payload)))
     assert execution_module.tool_evidence_state(restored) == "unknown"
 
@@ -2912,6 +2927,13 @@ def test_a_malformed_writer_seal_attests_nothing(
     (a stand-in for a future writer) attests today's marker too, because the
     predicate accepts any generation at or above the one this build writes --
     the forward-compatible half of the rule.
+
+    The ``missing`` case (no seal field at all) constructs the same payload
+    shape as ``test_an_unsealed_payload_cannot_hand_back_an_intact_marker``'s
+    ``carried_false`` case; it is kept here as the boundary of this sweep --
+    "no seal" belongs beside the other ways a seal can fail to attest -- not
+    because this test is the one that owns that behaviour. That behaviour is
+    pinned by ``test_an_unsealed_payload_cannot_hand_back_an_intact_marker``.
     """
     context = ContextManager().create_context(execution_id="marker-malformed-seal")
     context.metadata[_MARKER] = False
