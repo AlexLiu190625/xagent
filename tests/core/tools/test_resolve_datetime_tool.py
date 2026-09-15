@@ -296,6 +296,95 @@ def test_both_conversion_paths_refuse_an_unrepresentable_instant_alike() -> None
     assert aware["success"] is naive["success"] is False
 
 
+# The half-day-word compatibility table, typed out as literal hours rather
+# than derived from the module: the test states the ruling, the module states
+# the implementation, and the parametrization compares them cell by cell for
+# all twenty-four hours of every period, including the no-word row.
+# (period, hours the word shifts past noon, hours it keeps as written)
+ZH_PERIOD_TABLE: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = [
+    ("上午", (), (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)),
+    ("早上", (), (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)),
+    ("中午", (), (11, 12, 13)),
+    ("下午", (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11), (13, 14, 15, 16, 17, 18)),
+    ("晚上", (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11), (18, 19, 20, 21, 22, 23)),
+    ("", (), tuple(range(24))),
+]
+# (period, hour as written, hour the tool must resolve to, or None to refuse)
+ZH_PERIOD_CASES: list[tuple[str, int, object]] = [
+    (
+        period,
+        hour,
+        hour + 12 if hour in shifted else hour if hour in kept else None,
+    )
+    for period, shifted, kept in ZH_PERIOD_TABLE
+    for hour in range(24)
+]
+
+
+def test_zh_period_table_has_every_cell() -> None:
+    assert len(ZH_PERIOD_CASES) == 144
+
+
+@pytest.mark.parametrize(
+    ("period", "hour", "expected_hour"),
+    ZH_PERIOD_CASES,
+    ids=[f"{p or 'bare'}{h}" for p, h, _ in ZH_PERIOD_CASES],
+)
+def test_zh_half_day_word_hour_compatibility(
+    period: str, hour: int, expected_hour: object
+) -> None:
+    result = resolve_datetime(f"{period}{hour}点", SHANGHAI)
+
+    if expected_hour is None:
+        assert result["success"] is False
+        assert result["resolution"] == "unsupported_expression"
+        assert result["error"]
+    else:
+        assert result == {
+            "resolved": f"2026-09-15T{expected_hour:02d}:00:00+08:00",
+            "has_time": True,
+            "timezone": SHANGHAI,
+        }
+
+
+@pytest.mark.parametrize(
+    ("phrase", "must_contain"),
+    [
+        ("上午0点", "write 0点 without a half-day word"),
+        ("上午13点", "which names hours 1 to 11"),
+        ("下午20点", "which names hours 1 to 11 or 13 to 18"),
+    ],
+)
+def test_zh_half_day_refusal_names_the_hours_the_word_admits(
+    phrase: str, must_contain: str
+) -> None:
+    """The model reads this text: a refusal that does not say which hours the
+    word admits leaves it guessing at a second wrong phrasing."""
+    result = resolve_datetime(phrase, SHANGHAI)
+
+    assert result["resolution"] == "unsupported_expression"
+    assert must_contain in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_resolution"),
+    [
+        ("周三上午13点", "unsupported_expression"),
+        ("2026年9月20日 晚上0点", "unsupported_expression"),
+    ],
+)
+def test_zh_half_day_rule_reaches_rows_other_than_a_bare_time(
+    phrase: str, expected_resolution: str
+) -> None:
+    """The rule lives in the Chinese time sub-grammar, which the calendar-date,
+    relative-day, weekday and bare-time rows all read their time through, so a
+    contradictory hour is refused however the day was named."""
+    result = resolve_datetime(phrase, SHANGHAI)
+
+    assert result["success"] is False
+    assert result["resolution"] == expected_resolution
+
+
 def test_resolve_datetime_dst_and_zone() -> None:
     skipped = resolve_datetime("2026-10-04 02:30", SYDNEY)
     assert skipped["success"] is False

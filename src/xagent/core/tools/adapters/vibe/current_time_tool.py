@@ -622,13 +622,26 @@ def _en_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
     return hour, minute
 
 
+# Each half-day word admits two spellings of its own half of the day: the
+# twelve-hour hours, which the word shifts past noon, and the twenty-four-hour
+# spelling of the same clock positions, which it keeps as written. An hour in
+# neither range contradicts the word instead of qualifying it. Hour zero is in
+# no word's ranges: midnight is written 0点 on its own.
+_ZH_HALF_DAY_HOURS: dict[str, tuple[range, range]] = {
+    "上午": (range(0, 0), range(1, 12)),
+    "早上": (range(0, 0), range(1, 12)),
+    "下午": (range(1, 12), range(13, 19)),
+    "晚上": (range(1, 12), range(18, 24)),
+}
+
+
 def _zh_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
     """Hour and minute from a Chinese time; None when the branch does not hold.
 
-    Raises _AmbiguousHour for hour twelve paired with 上午, 早上, 下午, or
-    晚上 (morning, morning, afternoon, or evening): the period word tells
-    you which half of the day the hour is in for every other hour, but at
-    twelve the half-day boundary itself is what's in question (an evening
+    Three shapes raise _AmbiguousHour. Hour twelve paired with 上午, 早上,
+    下午, or 晚上 (morning, morning, afternoon, or evening): the period word
+    tells you which half of the day the hour is in for every other hour, but
+    at twelve the half-day boundary itself is what's in question (an evening
     or afternoon reading could mean tonight's midnight, i.e. today ending,
     or tomorrow beginning; a morning reading could mean midnight or, taken
     as bare digits, noon). The noon period word (中午) is unaffected by
@@ -636,7 +649,11 @@ def _zh_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
     same exception for a narrower reason instead: paired with any hour
     other than 11, 12, or 13 it names an hour nowhere near noon (e.g.
     '中午10点' names 10 in the morning), so those combinations are refused
-    too.
+    too. Third, each of 上午/早上/下午/晚上 admits only the hours in
+    _ZH_HALF_DAY_HOURS for that word (its own twelve-hour hours, shifted past
+    noon, and the matching twenty-four-hour hours, kept as written); an hour
+    outside both -- including hour zero, which belongs to no half-day word --
+    contradicts the word and is refused, naming the hours it does admit.
     """
     hour = _parse_number(match.group("zh_hour"))
     if hour is None:
@@ -659,8 +676,22 @@ def _zh_time(match: re.Match[str]) -> Optional[tuple[int, int]]:
         raise _AmbiguousHour(
             f"'中午{hour}点' names an hour nowhere near noon: only 11, 12, or 13 do"
         )
-    if period in ("下午", "晚上") and hour < 12:
-        hour += 12
+    if period in _ZH_HALF_DAY_HOURS:
+        shifted, kept = _ZH_HALF_DAY_HOURS[period]
+        if hour in shifted:
+            hour += 12
+        elif hour == 0:
+            raise _AmbiguousHour(
+                f"'{period}0点' pairs a half-day word with hour zero: "
+                "write 0点 without a half-day word for midnight"
+            )
+        elif hour not in kept:
+            spans = " or ".join(
+                f"{span.start} to {span.stop - 1}" for span in (shifted, kept) if span
+            )
+            raise _AmbiguousHour(
+                f"'{period}{hour}点' contradicts {period}, which names hours {spans}"
+            )
     if not 0 <= hour <= 23 or not 0 <= minute <= 59:
         return None
     return hour, minute
@@ -942,9 +973,10 @@ def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
     result. A phrase outside the grammar, a date that reads two ways, an
     hour twelve whose half-day word does not settle which side of midnight
     or noon it is on, a noon word (中午) paired with an hour outside 11, 12,
-    or 13, a wall-clock time the zone skips or repeats, a resulting UTC
-    offset with a fractional minute, or an instant outside the representable
-    date range is refused with a reason rather than guessed or approximated.
+    or 13, a half-day word contradicted by the hour it came with, a
+    wall-clock time the zone skips or repeats, a resulting UTC offset with a
+    fractional minute, or an instant outside the representable date range is
+    refused with a reason rather than guessed or approximated.
     """
     try:
         zone = _require_region_city_zone(timezone_name)
