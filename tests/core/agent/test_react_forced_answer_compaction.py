@@ -19,6 +19,7 @@ import pytest
 
 from tests.core.agent.forced_answer_harness import (
     OBSERVATION_MARKER,
+    CalculatorTool,
     CompactingLLM,
     ScriptedLLM,
     WindowlessCompactingLLM,
@@ -205,27 +206,64 @@ class ProtocolErrorOnFirstCallLLM(ScriptedLLM):
         return self.responses.pop(0)
 
 
+def _forced_next(pattern: ReActPattern) -> ReActPattern:
+    """Force the next turn through ``force_final_answer_next`` directly."""
+    pattern.force_final_answer_next = True
+    return pattern
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     # Built per run rather than held in this list: a scripted model is spent
     # once it has replayed its queue.
-    "make_llm, compactions_expected",
+    "make_llm, make_pattern, tools, skips_expected, compactions_expected",
     [
-        (lambda: ScriptedLLM([final_answer_call()]), 0),
-        (lambda: ScriptedLLM([{"content": "plain text answer", "tool_calls": []}]), 0),
+        (
+            lambda: ScriptedLLM([final_answer_call()]),
+            lambda: _forced_next(ReActPattern(max_iterations=2)),
+            [],
+            1,
+            0,
+        ),
+        (
+            lambda: ScriptedLLM([{"content": "plain text answer", "tool_calls": []}]),
+            lambda: _forced_next(ReActPattern(max_iterations=2)),
+            [],
+            1,
+            0,
+        ),
         (
             lambda: ScriptedLLM([empty_final_answer_call(), empty_final_answer_call()]),
+            lambda: _forced_next(ReActPattern(max_iterations=2)),
+            [],
+            1,
             0,
         ),
         (
             lambda: ScriptedLLM([tool_call("list_clients"), tool_call("list_clients")]),
+            lambda: _forced_next(ReActPattern(max_iterations=2)),
+            [],
+            1,
             1,
         ),
         (
             lambda: ProtocolErrorOnFirstCallLLM(
                 [tool_call("list_clients")], code="unavailable_tool_call"
             ),
+            lambda: _forced_next(ReActPattern(max_iterations=2)),
+            [],
             1,
+            1,
+        ),
+        (
+            lambda: ProtocolErrorOnFirstCallLLM(
+                [tool_call("calculator", '{"expression": "1+1"}')],
+                code="unavailable_tool_call",
+            ),
+            lambda: ReActPattern(max_iterations=4, finalize_after_tool_result=True),
+            [CalculatorTool()],
+            2,
+            0,
         ),
     ],
     ids=[
@@ -234,14 +272,18 @@ class ProtocolErrorOnFirstCallLLM(ScriptedLLM):
         "empty_answer_then_repair_fails",
         "out_of_schema_tool",
         "unavailable_tool_call",
+        "single_call_after_escape",
     ],
 )
 async def test_skip_never_spans_more_than_one_turn(
     caplog: pytest.LogCaptureFixture,
     make_llm: Any,
+    make_pattern: Any,
+    tools: list[Any],
+    skips_expected: int,
     compactions_expected: int,
 ) -> None:
-    """The skipped compaction covers one turn and never a second.
+    """The skipped compaction never spans a second turn from the same source.
 
     Two turns are offered to every shape. What is asserted is how many turns
     skipped compaction -- counted off the production log line, one per skip --
@@ -253,6 +295,10 @@ async def test_skip_never_spans_more_than_one_turn(
 
     The two exits that clear the flag are separate lines in separate handlers,
     so they get one shape each; deleting either one leaves the other green.
+    That guarantee is scoped to ``force_final_answer_next``: the last shape
+    forces through ``finalize_after_tool_result`` (single_call mode) instead,
+    which those two exits do not clear, so a turn that escapes the narrowed
+    schema can still be forced again immediately after -- two skips, not one.
     """
     context = build_context(observations=6, threshold=500)
     runtime = PatternRuntime(execution_id=context.execution_id)
@@ -264,20 +310,19 @@ async def test_skip_never_spans_more_than_one_turn(
         return await compact(**kwargs)
 
     runtime.compact_context_if_needed = counted  # type: ignore[method-assign]
-    pattern = ReActPattern(max_iterations=2)
-    pattern.force_final_answer_next = True
+    pattern = make_pattern()
 
     with caplog.at_level(logging.INFO, logger="xagent.core.agent.pattern.react.react"):
         await pattern.run(
             context=context,
-            tools=[],
+            tools=tools,
             llm=make_llm(),
             runtime=runtime,
             compact_llm=CompactingLLM(),
         )
 
     skipped = [r for r in caplog.records if "did not compact" in r.getMessage()]
-    assert len(skipped) == 1
+    assert len(skipped) == skips_expected
     assert len(compactions) == compactions_expected
 
 

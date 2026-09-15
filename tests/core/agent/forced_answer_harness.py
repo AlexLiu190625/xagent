@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic import BaseModel
+
 from xagent.core.agent import ExecutionContext
 from xagent.core.agent.context import ContextManager
 
@@ -88,3 +90,29 @@ def build_context(
 def prompt_text(messages: list[dict[str, Any]]) -> str:
     """Flatten one prompt's messages into a single searchable string."""
     return "\n".join(str(message.get("content", "")) for message in messages)
+
+
+class _CalculatorArgs(BaseModel):
+    expression: str = ""
+
+
+class CalculatorTool:
+    """A minimal tool whose call always succeeds.
+
+    Used for the turns that must go through a real tool call rather than
+    ending on ``final_answer`` right away; the result is a fixed value, not
+    an evaluated expression, since nothing here depends on the arithmetic.
+    """
+
+    def __init__(self) -> None:
+        class Metadata:
+            name = "calculator"
+            description = "Evaluate a simple arithmetic expression."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return _CalculatorArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        return {"success": True, "result": 4}
