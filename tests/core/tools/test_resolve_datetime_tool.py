@@ -223,6 +223,60 @@ def test_resolve_datetime_rejects_sub_minute_offset() -> None:
     assert "supported" not in result
 
 
+@pytest.mark.parametrize(
+    ("phrase", "zone", "expected"),
+    [
+        # The conversion to the UTC instant itself leaves the range: an hour
+        # before 0001-01-01T00:00 is year zero, an hour after
+        # 9999-12-31T23:59:59 is year ten thousand. No target zone avoids it.
+        ("0001-01-01T00:00:00+01:00", "UTC", None),
+        ("9999-12-31T23:59:59-01:00", "UTC", None),
+        # The UTC instant is representable, but rendering it in the target
+        # zone is not: Pacific/Kiritimati was 10:29:20 behind UTC in year one
+        # and is 14:00 ahead today, so each end of the calendar falls out on
+        # the far side.
+        ("0001-01-01T00:00:00Z", "Pacific/Kiritimati", None),
+        ("9999-12-31T23:59:59+01:00", "Pacific/Kiritimati", None),
+        # Neither end is about the year written in the phrase: the same year
+        # one and year 9999 phrases resolve when the instant they name stays
+        # inside the range.
+        ("0001-01-01T00:00:00-01:00", "UTC", "0001-01-01T01:00:00+00:00"),
+        ("9999-12-31T23:59:59+01:00", "UTC", "9999-12-31T22:59:59+00:00"),
+    ],
+)
+def test_resolve_datetime_refuses_instants_it_cannot_represent(
+    phrase: str, zone: str, expected: object
+) -> None:
+    result = resolve_datetime(phrase, zone)
+
+    if expected is None:
+        assert result["success"] is False
+        assert result["resolution"] == "unsupported_expression"
+        # The phrase itself matched the grammar, so listing the grammar would
+        # only misdirect a caller into rewriting an already-supported phrase.
+        assert "supported" not in result
+        assert result["error"]
+    else:
+        assert result["resolved"] == expected
+        assert result["has_time"] is True
+
+
+def test_both_conversion_paths_refuse_an_unrepresentable_instant_alike() -> None:
+    """The offset-bearing path and the wall-clock path convert different
+    things and fail in different places, but agree on the reason code: one
+    failure class, one code. They differ on the grammar list: the
+    offset-bearing phrase already matched the grammar, so listing it would
+    misdirect, while the wall-clock path's stamp is derived and keeps the
+    list it has always carried for this failure."""
+    aware = resolve_datetime("0001-01-01T00:00:00+01:00", "UTC")
+    naive = resolve_datetime("0001-01-01", "Africa/Addis_Ababa")
+
+    assert aware["resolution"] == naive["resolution"] == "unsupported_expression"
+    assert "supported" not in aware
+    assert "supported" in naive
+    assert aware["success"] is naive["success"] is False
+
+
 def test_resolve_datetime_dst_and_zone() -> None:
     skipped = resolve_datetime("2026-10-04 02:30", SYDNEY)
     assert skipped["success"] is False

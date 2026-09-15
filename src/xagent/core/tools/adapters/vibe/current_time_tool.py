@@ -917,9 +917,9 @@ def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
     result. A phrase outside the grammar, a date that reads two ways, an
     hour twelve whose half-day word does not settle which side of midnight
     or noon it is on, a noon word (中午) paired with an hour outside 11, 12,
-    or 13, a wall-clock time the zone skips or repeats, or a resulting UTC
-    offset with a fractional minute is refused with a reason rather than
-    guessed or approximated.
+    or 13, a wall-clock time the zone skips or repeats, a resulting UTC
+    offset with a fractional minute, or an instant outside the representable
+    date range is refused with a reason rather than guessed or approximated.
     """
     try:
         zone = _require_region_city_zone(timezone_name)
@@ -944,7 +944,23 @@ def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
         )
     moment, has_time = reading
     if moment.tzinfo is not None:
-        aware = moment.astimezone(zone)
+        try:
+            aware = moment.astimezone(zone)
+        except (OverflowError, OSError):
+            # Two conversions can leave the representable range: subtracting
+            # an offset to reach the UTC instant, which no target zone can
+            # avoid, and rendering that instant in the target zone, which a
+            # zone far from UTC reaches at either end of the calendar. The
+            # phrase itself matched the grammar, so the grammar list would
+            # only misdirect a caller into rewriting an already-supported
+            # phrase.
+            return _refusal(
+                "unsupported_expression",
+                f"{text!r} names an instant outside the range this tool can "
+                "represent, which ends at year 1 and year 9999 in "
+                f"{zone.key} and in UTC",
+                include_grammar=False,
+            )
     else:
         stamp = moment.isoformat(sep=" ", timespec="seconds")
         try:
