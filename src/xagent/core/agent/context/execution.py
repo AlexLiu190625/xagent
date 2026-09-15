@@ -259,10 +259,12 @@ def note_compaction_evidence_loss(context: Any, result: Any) -> None:
     if not isinstance(result_metadata, dict):
         return
     # The key is absent, not malformed, whenever this call did not compact at
-    # all -- compaction disabled, the context already under threshold, or a
-    # context object with no compaction protocol. Every one of those is an
-    # ordinary result of this call, so it stays silent and unlatched exactly
-    # as before: nothing here is a warning-worthy shape.
+    # all -- compaction disabled, or the context already under threshold. A
+    # context object with no compaction protocol at all does not reach here
+    # either: it makes the call above return None, which the guard two lines
+    # up already stops. Every case that does reach this line is an ordinary
+    # result of this call, so it stays silent and unlatched exactly as
+    # before: nothing here is a warning-worthy shape.
     if "dropped_tool_result_count" not in result_metadata:
         return
     dropped = result_metadata["dropped_tool_result_count"]

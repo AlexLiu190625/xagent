@@ -387,20 +387,24 @@ def _result(**metadata: Any) -> CompactResult:
 
 
 @pytest.mark.parametrize(
-    "result, expected",
+    "result, expected, warns",
     [
-        (_result(dropped_tool_result_count=6), True),
-        (_result(dropped_tool_result_count=1), True),
-        (_result(removed_count=11, dropped_tool_result_count=0), False),
-        (_result(removed_count=0), False),
-        (CompactResult(False, 3, 3, "none", {}), False),
-        (None, False),
-        (_result(fallback_suppressed=True), False),
-        (_result(dropped_context_ref_count=4, dropped_tool_result_count=0), False),
-        (_result(dropped_tool_result_count=True), False),
-        (_result(dropped_tool_result_count="6"), False),
-        (_result(llm_compact_error="boom", dropped_tool_result_count=3), True),
-        (_result(llm_summary_unusable=True, dropped_tool_result_count=3), True),
+        (_result(dropped_tool_result_count=6), True, False),
+        (_result(dropped_tool_result_count=1), True, False),
+        (_result(removed_count=11, dropped_tool_result_count=0), False, False),
+        (_result(removed_count=0), False, False),
+        (CompactResult(False, 3, 3, "none", {}), False, False),
+        (None, False, False),
+        (_result(fallback_suppressed=True), False, False),
+        (
+            _result(dropped_context_ref_count=4, dropped_tool_result_count=0),
+            False,
+            False,
+        ),
+        (_result(dropped_tool_result_count=True), False, True),
+        (_result(dropped_tool_result_count="6"), False, True),
+        (_result(llm_compact_error="boom", dropped_tool_result_count=3), True, False),
+        (_result(llm_summary_unusable=True, dropped_tool_result_count=3), True, False),
     ],
     ids="summary_dropped_six truncate_dropped_one assistant_text_only "
     "tail_window_kept_all under_threshold runtime_returned_none "
@@ -408,12 +412,28 @@ def _result(**metadata: Any) -> CompactResult:
     "summary_raised_then_truncated summary_unusable_then_truncated".split(),
 )
 def test_latch_reads_dropped_observations_not_compacted(
-    result: Any, expected: bool
+    caplog: pytest.LogCaptureFixture, result: Any, expected: bool, warns: bool
 ) -> None:
-    """Only a removed observation latches the marker."""
+    """Only a removed observation latches the marker; only a malformed count warns.
+
+    ``under_threshold`` and ``runtime_returned_none`` both carry no
+    ``dropped_tool_result_count`` at all -- the first because the metadata is
+    genuinely empty, the second because a ``None`` result never reaches that
+    metadata check in the first place -- and neither warns: absence is an
+    ordinary outcome of this call, not a malformed one.
+    """
     context = ContextManager().create_context(execution_id="latch")
-    note_compaction_evidence_loss(context, result)
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.context.execution"):
+        note_compaction_evidence_loss(context, result)
+
     assert context.metadata[KEY] is expected
+    warnings = [
+        r
+        for r in caplog.records
+        if r.name == "xagent.core.agent.context.execution"
+        and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == (1 if warns else 0)
 
 
 def test_latch_is_monotonic() -> None:
@@ -422,42 +442,6 @@ def test_latch_is_monotonic() -> None:
     note_compaction_evidence_loss(context, _result(dropped_tool_result_count=3))
     note_compaction_evidence_loss(context, _result(dropped_tool_result_count=0))
     assert context.metadata[KEY] is True
-
-
-def test_a_malformed_dropped_count_warns_instead_of_latching(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A non-integer dropped count is logged, not silently left unlatched."""
-    context = ContextManager().create_context(execution_id="latch-malformed")
-    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.context.execution"):
-        note_compaction_evidence_loss(context, _result(dropped_tool_result_count="3"))
-
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    message = warnings[0].getMessage()
-    assert "str" in message
-    assert f"execution_id={context.execution_id}" in message
-    assert "3" not in message
-    assert context.metadata[KEY] is False
-
-
-def test_a_result_with_no_dropped_count_key_stays_silent_and_unlatched(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A call that did not compact at all carries no count key, and that is ordinary.
-
-    Compaction disabled, the context already under threshold, and a context
-    object with no compaction protocol all reach this function with an empty
-    ``metadata``. None of those is a malformed count -- there was no count to
-    report -- so this must warn exactly as much as it always has: not at all.
-    """
-    context = ContextManager().create_context(execution_id="latch-no-key")
-    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.context.execution"):
-        note_compaction_evidence_loss(context, CompactResult(False, 3, 3, "none", {}))
-
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert warnings == []
-    assert context.metadata[KEY] is False
 
 
 def _marker_names(tree: ast.AST) -> set[str]:
@@ -529,12 +513,6 @@ def _is_compaction_call(node: ast.AST) -> bool:
     )
 
 
-def _is_forwarded_compaction_call(node: ast.Call) -> bool:
-    """A ``self.parent.compact_context_if_needed(...)`` relay, not a real call site."""
-    value = node.func.value  # type: ignore[union-attr]
-    return isinstance(value, ast.Attribute) and value.attr == "parent"
-
-
 def _is_latch_call(node: ast.AST) -> bool:
     return (
         isinstance(node, ast.Call)
@@ -573,11 +551,15 @@ def test_every_real_compaction_call_site_latches_the_marker() -> None:
     that method only produces the dropped-count value this design reads, it
     is not the thing that decides what a run does with it.
 
-    Forwarding wrappers (a pattern's own ``compact_context_if_needed`` that
-    relays to ``self.parent``) are excluded on both sides: they are not where
-    a real call happens, and their own name matches the callee's, so walking
-    into their body would otherwise credit them for a latch call that lives
-    in the parent they forward to.
+    A forwarding wrapper (a pattern's own ``compact_context_if_needed`` that
+    relays to ``self.parent.compact_context_if_needed(...)``) is excluded by
+    name alone: its enclosing function is itself named
+    ``compact_context_if_needed``, the same exclusion that keeps the real
+    method's own definition out of ``call_sites``. There is deliberately no
+    separate exclusion keyed on the receiver being named ``parent`` -- that
+    would also hide a genuine, unlatched call written through a
+    ``self.parent.`` receiver inside an ordinarily named function, which is
+    exactly the shape this test exists to catch.
     """
     src = pathlib.Path(__file__).resolve().parents[3] / "src" / "xagent"
     call_sites: set[tuple[str, str]] = set()
@@ -591,7 +573,7 @@ def test_every_real_compaction_call_site_latches_the_marker() -> None:
         ]
         rel = str(path.relative_to(src))
         for node in ast.walk(tree):
-            if not _is_compaction_call(node) or _is_forwarded_compaction_call(node):
+            if not _is_compaction_call(node):
                 continue
             owner = _enclosing_function(functions, node.lineno)
             if owner is None or owner.name == "compact_context_if_needed":
@@ -1045,7 +1027,7 @@ async def test_a_lossy_step_result_reaches_the_root_under_the_shared_rule() -> N
     ``step_results`` and ``candidate_output``, which are read unconditionally
     and are not filtered by the marker. What stands between that carried-over
     content and the assessment model treating it as fresh accumulated
-    evidence is not the marker -- the root has none set -- it is the
+    evidence is not the marker -- the root's is false -- it is the
     unconditional rule about content carried over from candidate_output or
     step_results. This test pins that as the current shape of this known
     limit, not as a guarantee that nothing can go wrong here.

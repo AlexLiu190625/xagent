@@ -115,4 +115,4 @@ class CalculatorTool:
         return _CalculatorArgs
 
     async def run_json_async(self, args: dict[str, Any]) -> Any:
-        return {"success": True, "result": 4}
+        return {"success": True, "result": 2}
