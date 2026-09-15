@@ -137,6 +137,13 @@ CASES: list[tuple[str, str, tuple[str, object]]] = [
     ("Sep 15 2026 12pm", SYDNEY, ("REFUSED", "unsupported_expression")),
     ("January 1st, 1990 12 am", SYDNEY, ("REFUSED", "unsupported_expression")),
     ("1 Jan 1990 12:00:00 pm", SYDNEY, ("REFUSED", "unsupported_expression")),
+    # Other spellings of the same hour-twelve-with-am/pm combination: a "."
+    # minute separator, the dotted "p.m." form, and a leading-zero hour. The
+    # calendar path must catch these by reading the hour dateutil parsed, not
+    # by matching only the spelling the grammar's own examples use.
+    ("15 Sep 2026 12.30 pm", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("15 Sep 2026 12 p.m.", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("15 Sep 2026 012 pm", SYDNEY, ("REFUSED", "unsupported_expression")),
     # The digit 12 elsewhere in the phrase -- a day, an unrelated hour, or no
     # am/pm at all -- does not trip the hour-twelve refusal.
     ("12 Dec 2026 3 pm", SYDNEY, ("2026-12-12T15:00:00+11:00", True)),
@@ -146,6 +153,7 @@ CASES: list[tuple[str, str, tuple[str, object]]] = [
     ("15 Sep 2026 10am", SYDNEY, ("2026-09-15T10:00:00+10:00", True)),
     ("15 Sep 2026 11:59 pm", SYDNEY, ("2026-09-15T23:59:00+10:00", True)),
     ("15 Sep 2026 3:12 pm", SYDNEY, ("2026-09-15T15:12:00+10:00", True)),
+    ("15 Sep 2026 11 p.m.", SYDNEY, ("2026-09-15T23:00:00+10:00", True)),
 ]
 
 
@@ -182,7 +190,7 @@ def test_resolve_datetime_returns_the_validated_fold(
 
 
 def test_grammar_table_has_every_case() -> None:
-    assert len(CASES) == 82
+    assert len(CASES) == 86
 
 
 @pytest.mark.parametrize(
@@ -284,9 +292,12 @@ def test_both_conversion_paths_refuse_an_unrepresentable_instant_alike() -> None
     """The offset-bearing path and the wall-clock path convert different
     things and fail in different places, but agree on the reason code: one
     failure class, one code. They differ on the grammar list: the
-    offset-bearing phrase already matched the grammar, so listing it would
-    misdirect, while the wall-clock path's stamp is derived and keeps the
-    list it has always carried for this failure."""
+    offset-bearing refusal was ruled to withhold it, while the wall-clock
+    path keeps the list it has always carried for this failure. Both phrases
+    match the grammar, so the difference is not a property of the phrase --
+    it is an asymmetry left in place because changing the wall-clock side
+    would alter the public output of 269 reachable zone/date pairs in a
+    review-fix commit."""
     aware = resolve_datetime("0001-01-01T00:00:00+01:00", "UTC")
     naive = resolve_datetime("0001-01-01", "Africa/Addis_Ababa")
 
@@ -356,13 +367,16 @@ def test_zh_half_day_word_hour_compatibility(
         ("晚上15点", "which names hours 1 to 11 or 18 to 23"),
         # Hour twelve keeps its own wording, which names the three readings
         # it cannot choose between rather than a range of admitted hours.
-        # Without these two cells the twelve-hour check can lose its
-        # afternoon and evening members unnoticed: those inputs then fall
-        # through to the compatibility table, which also refuses them, so
-        # every reason-code assertion stays green while the reason the
-        # caller is given changes.
+        # Without all four cells the twelve-hour check can lose any subset of
+        # its members unnoticed: those inputs then fall through to the
+        # compatibility table, which also refuses them, so every reason-code
+        # assertion stays green while the reason the caller is given changes.
+        # The four words split into two guard branches (上午/早上 vs 下午/晚上),
+        # so both must be pinned for either direction of that split to show.
         ("下午12点", "could mean today ending at"),
         ("晚上12点", "could mean today ending at"),
+        ("上午12点", "could mean today ending at"),
+        ("早上12点", "could mean today ending at"),
     ],
 )
 def test_zh_half_day_refusal_names_the_hours_the_word_admits(
@@ -436,6 +450,22 @@ def test_hour_twelve_refusal_is_the_same_with_and_without_a_date() -> None:
 
     assert bare["resolution"] == dated["resolution"] == "unsupported_expression"
     assert bare["error"] == dated["error"] == dated_upper["error"]
+
+
+def test_implicit_pm_hour_zero_refuses_with_the_same_shape_as_the_bare_form() -> None:
+    """dateutil folds "0:30 am" to hour zero -- the same folded hour an
+    hour-twelve reading produces, but this phrase never spells a twelve. The
+    bare time sub-grammar already refuses it generically (_en_time's
+    `if not 1 <= hour <= 12: return None`), so the calendar-date reader must
+    land on that same generic shape -- reason unsupported_expression, the
+    grammar list attached -- instead of naming an hour the phrase never
+    wrote."""
+    for phrase in ("0:30 am", "15 Sep 2026 0:30 am"):
+        result = resolve_datetime(phrase, SYDNEY)
+
+        assert result["resolution"] == "unsupported_expression"
+        assert result["error"] == f"unsupported date or time expression: {phrase!r}"
+        assert "supported" in result
 
 
 @pytest.mark.parametrize(
