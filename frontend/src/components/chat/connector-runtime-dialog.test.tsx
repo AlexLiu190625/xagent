@@ -514,6 +514,12 @@ describe("couples the invalid-object error to the submit gate", () => {
     await waitFor(() => expect(screen.getByLabelText("objKey").tagName).toBe("INPUT"))
 
     expect(screen.queryByText("connectorRuntime.objectInvalid")).not.toBeInTheDocument()
+    // The draft is keyed by declared type along with connector and key name,
+    // so the "{oops" text recorded while this row was object-typed lives
+    // under a different key than the one this now-string row reads: it does
+    // not resurface as a value the user never actually typed against the new
+    // type.
+    expect(screen.getByLabelText("objKey")).toHaveValue("")
 
     fireEvent.change(screen.getByLabelText("strKey"), { target: { value: "value" } })
     const saveButton = screen.getByText("connectorRuntime.actions.saveOnly")
@@ -524,12 +530,96 @@ describe("couples the invalid-object error to the submit gate", () => {
     await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(1))
     const items = submitMock.mock.calls[0][1] as Array<{ context: Record<string, unknown> }>
     expect(items).toHaveLength(1)
-    // `buildSubmitItems` types each draft from what the *current* report
-    // declares, not from what the mark was recorded against: once `objKey`
-    // reads as a plain string, its stale "{oops" text is a perfectly valid
-    // string value and is submitted verbatim, with no residual JSON check
-    // left over from when the row was object-typed.
-    expect(items[0].context).toEqual({ objKey: "{oops", strKey: "value" })
+    // `objKey`'s draft never carried over (see above), so buildSubmitItems
+    // has nothing recorded for it and only submits the field the user
+    // actually filled in under the new report.
+    expect(items[0].context).toEqual({ strKey: "value" })
+  })
+
+  it("drops a stale non-object draft once the key's declared type becomes object", async () => {
+    // The reverse of the object -> string case above: a plain string typed
+    // against a string-typed key must not resurface as that key's value once
+    // the connector owner redeclares it object-typed -- a stray string is
+    // not valid JSON either, and reusing it would either submit garbage or
+    // (worse) parse by coincidence into something the user never intended.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("cfg"), { target: { value: "plain text" } })
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", required: true })]),
+    ])))
+    await openForTask() // same task: a second request, not a remount
+    await waitFor(() => expect(screen.getByLabelText("cfg").tagName).toBe("TEXTAREA"))
+
+    expect(screen.getByLabelText("cfg")).toHaveValue("")
+    expect(screen.queryByText("connectorRuntime.objectInvalid")).not.toBeInTheDocument()
+    // Nothing submittable: the only context key has no draft under its new
+    // type, so there is nothing for the save button to send.
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeDisabled()
+  })
+})
+
+describe("re-reads the report on a type mismatch so a changed declaration takes over immediately", () => {
+  it("re-reads the report on a type mismatch so a changed declaration takes over immediately", async () => {
+    // The connector owner can flip a key's declared type between the report
+    // this dialog read and the write it submits against; the server 400s
+    // with type_mismatch. Refreshing here (rather than leaving the stale
+    // report in place) means the row picks up the new type -- and because
+    // drafts and field errors are now keyed by type too, the stale control,
+    // its stale value and its now-wrong-type error message all fall away on
+    // their own rather than needing a separate reset.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", required: true })]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("cfg"), { target: { value: '{"a":1}' } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 400, code: "invalid_runtime_context",
+      reason: "type_mismatch.context.cfg", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "string", required: true })]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByLabelText("cfg").tagName).toBe("INPUT"))
+
+    expect(screen.getByLabelText("cfg")).toHaveValue("")
+    expect(screen.queryByText(/connectorRuntime\.errors\.type/)).not.toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText("cfg"), { target: { value: "plain text" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(2))
+    expect(submitMock.mock.calls[1][1]).toEqual([{ connector_ref: REF_A, context: { cfg: "plain text" } }])
+  })
+})
+
+describe("keeps distinct row identity for a key name legitimately reused across sections", () => {
+  it("keeps distinct row identity for a key name legitimately reused across sections", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "shared", type: "string", required: true }),
+        input({ section: "secrets", key: "shared", type: "string", required: true }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+
+    const duplicateKeyWarning = errorSpy.mock.calls.some(call =>
+      typeof call[0] === "string" && call[0].includes("Encountered two children with the same key"),
+    )
+    expect(duplicateKeyWarning).toBe(false)
   })
 })
 

@@ -380,10 +380,17 @@ export function classifySubmitFailure(
     if (reason.startsWith(TYPE_MISMATCH_CONTEXT_PREFIX)) {
       const key = reason.slice(TYPE_MISMATCH_CONTEXT_PREFIX.length)
       const declaredType = findDeclaredInputType(report, connectorRef, key)
+      // The connector's own edit endpoint writes a new declaration in place,
+      // with no version and no snapshot held by the task -- so the type this
+      // dialog read and the type the write endpoint just checked against can
+      // differ. Refreshing here is what lets the row (and the message key
+      // above, next render) pick up the new declaration; without it every
+      // retry keeps failing the same way and the message stays keyed to the
+      // stale type.
       return {
         messageKey: declaredType === "object" ? "typeObject" : "typeString",
         retry: false,
-        refresh: false,
+        refresh: true,
         locate: { connectorRef, key },
       }
     }
@@ -544,10 +551,26 @@ export function resolveDialogActions(
   return ["acknowledge"]
 }
 
-/** Shared by the dialog's draft state and buildSubmitItems so a draft value
- *  written under one key is always read back under the same key. */
-export function connectorRuntimeInputDraftKey(ref: ConnectorRuntimeRef, key: string): string {
-  return `${ref.connector_type}:${ref.connector_id}:${key}`
+/**
+ * Shared by the dialog's draft state and buildSubmitItems so a draft value
+ * written under one key is always read back under the same key. Keyed by the
+ * input's full identity -- connector, section, key name and declared type --
+ * not just connector and key name: the connector's own edit endpoint can
+ * change a key's declared type in place between the report a draft was
+ * written against and the next one the dialog reads (no version, no
+ * per-task snapshot), and two different sections of the same connector may
+ * legitimately reuse a key name. Including type means a stale draft cannot
+ * silently survive a type change under a new, unrelated meaning; including
+ * section means two same-named rows in different sections never collide,
+ * including as React list keys (the dialog reuses this same string there).
+ */
+export function connectorRuntimeInputDraftKey(
+  ref: ConnectorRuntimeRef,
+  section: ConnectorRuntimeSection,
+  key: string,
+  type: ConnectorRuntimeType,
+): string {
+  return `${ref.connector_type}:${ref.connector_id}:${section}:${key}:${type}`
 }
 
 /**
@@ -571,7 +594,7 @@ export function buildSubmitItems(
     const context: Record<string, unknown> = {}
     for (const input of connector.inputs) {
       if (input.section !== "context" || input.satisfied) continue
-      const rawValue = drafts[connectorRuntimeInputDraftKey(connector.connector_ref, input.key)]
+      const rawValue = drafts[connectorRuntimeInputDraftKey(connector.connector_ref, input.section, input.key, input.type)]
       if (rawValue === undefined) continue
       if (input.type === "string") {
         // Submit the trimmed value, not the raw one. The server's merge makes

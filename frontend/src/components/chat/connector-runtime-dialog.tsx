@@ -139,7 +139,7 @@ function hasLiveInvalidObjectMark(
     input.section === "context"
     && !input.satisfied
     && input.type === "object"
-    && invalidDraftKeys.has(connectorRuntimeInputDraftKey(connector.connector_ref, input.key))
+    && invalidDraftKeys.has(connectorRuntimeInputDraftKey(connector.connector_ref, input.section, input.key, input.type))
   )
 }
 
@@ -167,7 +167,11 @@ function locateFieldError(
   if (key === undefined) return { scope: "connector", connectorKey }
   const input = connector.inputs.find(i => i.key === key)
   if (!input) return { scope: "dialog" }
-  return { scope: "field", connectorKey, draftKey: connectorRuntimeInputDraftKey(connectorRef, key) }
+  return {
+    scope: "field",
+    connectorKey,
+    draftKey: connectorRuntimeInputDraftKey(connectorRef, input.section, key, input.type),
+  }
 }
 
 function uniqueKeys(locations: Array<{ key: string }>): string[] {
@@ -307,13 +311,13 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // disagree about whether saving is possible.
   const hasSaveEntryPoint = actions.includes("saveOnly")
 
-  const handleDraftChange =(connector: ConnectorRuntimeConnector, key: string, value: string) => {
-    const draftKey = connectorRuntimeInputDraftKey(connector.connector_ref, key)
+  const handleDraftChange =(connector: ConnectorRuntimeConnector, input: ConnectorRuntimeInput, value: string) => {
+    const draftKey = connectorRuntimeInputDraftKey(connector.connector_ref, input.section, input.key, input.type)
     setDrafts(prev => ({ ...prev, [draftKey]: value }))
   }
 
-  const handleObjectBlur = (connector: ConnectorRuntimeConnector, key: string, value: string) => {
-    const draftKey = connectorRuntimeInputDraftKey(connector.connector_ref, key)
+  const handleObjectBlur = (connector: ConnectorRuntimeConnector, input: ConnectorRuntimeInput, value: string) => {
+    const draftKey = connectorRuntimeInputDraftKey(connector.connector_ref, input.section, input.key, input.type)
     let invalid = false
     if (value.trim() !== "") {
       try {
@@ -521,7 +525,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
                     </p>
                   )}
                   {connector.inputs.map((input) => {
-                    const draftKey = connectorRuntimeInputDraftKey(connector.connector_ref, input.key)
+                    // Doubles as this row's React key: it carries the
+                    // input's full identity (connector, section, key name,
+                    // declared type), so two rows that legitimately share a
+                    // key name across sections never collide, and a row
+                    // whose declared type changes across a refresh is
+                    // treated as a new row rather than reusing the old
+                    // one's draft and error state under a new meaning.
+                    const draftKey = connectorRuntimeInputDraftKey(connector.connector_ref, input.section, input.key, input.type)
                     const acceptedKeyName = input.section !== "context" || isAcceptedRuntimeKeyName(input.key)
                     const markLive = hasLiveInvalidObjectMark(connector, input, invalidDraftKeys)
                     const fieldLevelError =
@@ -533,7 +544,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
 
                     if (input.section === "context" && input.satisfied) {
                       return (
-                        <div key={input.key} className="text-sm">
+                        <div key={draftKey} className="text-sm">
                           <span className="font-medium">{input.key}</span>{" "}
                           <span className="text-muted-foreground">{t("connectorRuntime.filled")}</span>
                         </div>
@@ -542,7 +553,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
 
                     if (input.section !== "context") {
                       return (
-                        <div key={input.key} className="text-sm">
+                        <div key={draftKey} className="text-sm">
                           <div className="font-medium">{input.key}</div>
                           <p className="text-muted-foreground">{t("connectorRuntime.unsupportedNote")}</p>
                         </div>
@@ -554,7 +565,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
                     // hint, since there is no save entry point in this shape.
                     if (!hasSaveEntryPoint) {
                       return (
-                        <div key={input.key} className="text-sm">
+                        <div key={draftKey} className="text-sm">
                           <span className="font-medium">{input.key}</span>
                           {!acceptedKeyName && (
                             <p className="text-destructive">{t("connectorRuntime.keyNameWarning")}</p>
@@ -564,22 +575,22 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
                     }
 
                     return (
-                      <div key={input.key} className="space-y-1">
+                      <div key={draftKey} className="space-y-1">
                         <Label htmlFor={`connector-runtime-${draftKey}`}>{input.key}</Label>
                         {input.type === "object" ? (
                           <Textarea
                             id={`connector-runtime-${draftKey}`}
                             value={drafts[draftKey] ?? ""}
                             aria-invalid={markLive}
-                            onChange={e => handleDraftChange(connector, input.key, e.target.value)}
-                            onBlur={e => handleObjectBlur(connector, input.key, e.target.value)}
+                            onChange={e => handleDraftChange(connector, input, e.target.value)}
+                            onBlur={e => handleObjectBlur(connector, input, e.target.value)}
                           />
                         ) : (
                           <Input
                             id={`connector-runtime-${draftKey}`}
                             type="text"
                             value={drafts[draftKey] ?? ""}
-                            onChange={e => handleDraftChange(connector, input.key, e.target.value)}
+                            onChange={e => handleDraftChange(connector, input, e.target.value)}
                           />
                         )}
                         {markLive && (
