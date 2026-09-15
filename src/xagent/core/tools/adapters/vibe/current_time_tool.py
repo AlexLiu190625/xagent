@@ -225,6 +225,44 @@ def _mapping(local: datetime, utc: datetime) -> LocalTimeMapping:
     )
 
 
+def _instants_for_wall_time(
+    naive: datetime, zone: ZoneInfo, wall_text: str
+) -> list[datetime]:
+    """Every instant this wall time names in this zone, earliest first.
+
+    PEP 495: fold 0 and 1 are the two candidate readings. Each is kept only
+    if it converts back to the requested wall time -- a candidate that does
+    not is the zone telling us this reading does not exist. Trusting one
+    fold's offset instead would misreport zones whose fold=0 reading returns
+    an offset they never have (America/Nuuk under tzdata 2025c).
+
+    The list is empty for a wall time the zone skips at a daylight-saving
+    change, holds one entry for an ordinary wall time, and two where the
+    zone repeats it. Each entry carries the zone and therefore the offset
+    that applies at its own instant, so a caller needs no second conversion
+    to learn it.
+
+    A wall time at the edge of the calendar has no instant to name: the
+    conversion leaves the range datetime can represent, and this raises
+    ValueError naming wall_text, which is how the caller spelled the wall
+    time. The caller passes that spelling rather than formatting it here
+    because the two callers spell it differently.
+    """
+    by_instant: dict[datetime, datetime] = {}
+    for fold in (0, 1):
+        local = naive.replace(fold=fold, tzinfo=zone)
+        try:
+            utc = local.astimezone(timezone.utc)
+            round_trip = utc.astimezone(zone).replace(tzinfo=None)
+        except (OverflowError, OSError) as exc:
+            raise ValueError(
+                f"local_time converts outside the representable date range: {wall_text!r}"
+            ) from exc
+        if round_trip == naive:
+            by_instant.setdefault(utc, local)
+    return [by_instant[utc] for utc in sorted(by_instant)]
+
+
 def _require_region_city_zone(timezone_name: str) -> ZoneInfo:
     """Resolve a zone whose offset is part of the answer: Region/City or UTC only."""
     zone = _resolve_zone(timezone_name)
@@ -266,25 +304,8 @@ def validate_local_time(local_time: str, timezone_name: str) -> ValidateLocalTim
     except ValueError as exc:
         raise ValueError(f"local_time is not a real date and time: {text!r}") from exc
 
-    # PEP 495: fold 0 and 1 are the two candidate readings. Each is kept only
-    # if it converts back to the requested wall time -- a candidate that does
-    # not is the zone telling us this reading does not exist. Trusting one
-    # fold's offset instead would misreport zones whose fold=0 reading returns
-    # an offset they never have (America/Nuuk under tzdata 2025c).
-    by_instant: dict[datetime, datetime] = {}
-    for fold in (0, 1):
-        local = naive.replace(fold=fold, tzinfo=zone)
-        try:
-            utc = local.astimezone(timezone.utc)
-            round_trip = utc.astimezone(zone).replace(tzinfo=None)
-        except (OverflowError, OSError) as exc:
-            raise ValueError(
-                f"local_time converts outside the representable date range: {text!r}"
-            ) from exc
-        if round_trip == naive:
-            by_instant.setdefault(utc, local)
-
-    mappings = [_mapping(by_instant[utc], utc) for utc in sorted(by_instant)]
+    instants = _instants_for_wall_time(naive, zone, text)
+    mappings = [_mapping(local, local.astimezone(timezone.utc)) for local in instants]
     status: Literal["unique", "nonexistent", "ambiguous"] = (
         "nonexistent"
         if not mappings
@@ -927,22 +948,22 @@ def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
     else:
         stamp = moment.isoformat(sep=" ", timespec="seconds")
         try:
-            check = validate_local_time(stamp, zone.key)
+            instants = _instants_for_wall_time(moment, zone, stamp)
         except ValueError as exc:
             return _refusal("unsupported_expression", str(exc))
-        if check.local_time_status == "nonexistent":
+        if not instants:
             return _refusal(
                 "nonexistent_local_time",
                 f"local time {stamp} does not exist in {zone.key}: "
                 "clocks skip it at a daylight-saving change",
             )
-        if check.local_time_status == "ambiguous":
+        if len(instants) > 1:
             return _refusal(
                 "ambiguous_local_time",
                 f"local time {stamp} occurs twice in {zone.key} "
                 "at a daylight-saving change",
             )
-        aware = moment.replace(tzinfo=zone)
+        aware = instants[0]
     # A handful of zones carried a sub-minute UTC offset before their
     # jurisdiction standardised its clock (e.g. Africa/Monrovia until 1972,
     # -00:44:30). RFC 3339 / JSON Schema 'date-time' only allow a ±HH:MM

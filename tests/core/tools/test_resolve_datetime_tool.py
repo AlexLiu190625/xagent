@@ -8,6 +8,11 @@ import pytest
 from pydantic import ValidationError
 
 from tests.core.tools.test_current_time_tool import _FakeConfig
+
+# The sibling suite owns this fixture; both tools read the same tz database.
+from tests.core.tools.test_validate_local_time_tool import (  # noqa: F401
+    bundled_tzdata_only,
+)
 from xagent.core.tools.adapters.vibe import current_time_tool as module
 from xagent.core.tools.adapters.vibe.base import ToolCategory
 from xagent.core.tools.adapters.vibe.current_time_tool import (
@@ -130,6 +135,7 @@ def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(module, "_now", lambda: FROZEN)
 
 
+# This also pins the wall-time-to-instants extraction: the same error text.
 def test_validate_local_time_unchanged_after_helper_extraction() -> None:
     with pytest.raises(ValueError) as exc:
         validate_local_time("2026-10-04T02:30", "EST")
@@ -138,6 +144,22 @@ def test_validate_local_time_unchanged_after_helper_extraction() -> None:
         "timezone must be a Region/City IANA name such as "
         "'Australia/Sydney' or 'UTC', not 'EST'"
     )
+
+
+def test_resolve_datetime_returns_the_validated_fold(
+    bundled_tzdata_only: None,  # noqa: F811
+) -> None:
+    """America/Nuuk has no daylight-saving change on 2023-10-28, so -02:00 is
+    the only offset it has at this instant; the fold-0 reading claims -01:00,
+    an offset the zone never has, and does not convert back to 23:30. The
+    resolver must return the reading that does."""
+    result = resolve_datetime("2023-10-28 23:30", "America/Nuuk")
+
+    assert result == {
+        "resolved": "2023-10-28T23:30:00-02:00",
+        "has_time": True,
+        "timezone": "America/Nuuk",
+    }
 
 
 def test_grammar_table_has_every_case() -> None:
