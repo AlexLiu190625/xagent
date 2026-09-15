@@ -5,11 +5,13 @@ implementing a three-tier fallback pattern for maximum compatibility.
 """
 
 import logging
+import re
 from collections.abc import Callable, Iterable
 from typing import Any, Dict, List, Literal, Optional
 
 import pandas as pd
 import pyarrow as pa  # type: ignore
+from lancedb.query import BooleanQuery, MatchQuery, Occur
 
 logger = logging.getLogger(__name__)
 
@@ -144,3 +146,42 @@ def list_table_names(conn: Any) -> list[str]:
 def list_embeddings_table_names(conn: Any, prefix: str = "embeddings_") -> list[str]:
     """List embeddings table names (default prefix: `embeddings_`)."""
     return [name for name in list_table_names(conn) if str(name).startswith(prefix)]
+
+
+# Whitespace and CJK punctuation: indexed tokens of their own, never part of one.
+_FTS_SEPARATORS = r"\s，。！？；：、（）【】「」『』《》〈〉“”‘’—…～"
+_FTS_TERM_CHUNKS = re.compile(rf"[^{_FTS_SEPARATORS}]+")
+# ``+`` and ``#`` survive at a term edge so C++ and C# keep matching.
+_FTS_TERM_EDGES = re.compile(r"^[^\w+#]+|[^\w+#]+$")
+# Guards against a pasted document arriving as one query.
+_FTS_MAX_TERMS = 64
+
+
+def build_fts_query(
+    query_text: str, text_column: str = "text"
+) -> Optional[BooleanQuery]:
+    """Build an OR-of-terms FTS query, or ``None`` when the text has no terms.
+
+    Separators and edge ASCII punctuation are indexed tokens of their own (lance
+    folds ``，`` onto ASCII ``,``), so a term carrying them matches every chunk
+    that contains one. Punctuation inside a term stays: ``COVID-19`` and ``3.5``
+    are single tokens in the index.
+    """
+    terms: Dict[str, str] = {}
+    truncated = False
+    for chunk in _FTS_TERM_CHUNKS.finditer(query_text):
+        term = _FTS_TERM_EDGES.sub("", chunk.group())
+        if not re.search(r"\w", term) or term.casefold() in terms:
+            continue
+        if len(terms) == _FTS_MAX_TERMS:
+            truncated = True
+            break
+        terms[term.casefold()] = term
+
+    if truncated:
+        logger.warning("FTS query truncated to %d terms", _FTS_MAX_TERMS)
+    if not terms:
+        return None
+    return BooleanQuery(
+        [(Occur.SHOULD, MatchQuery(term, text_column)) for term in terms.values()]
+    )

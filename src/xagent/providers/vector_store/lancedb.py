@@ -8,6 +8,7 @@ lancedb_client.py and a separate vector store implementation.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 import os
@@ -20,6 +21,9 @@ import lancedb
 from lancedb.db import DBConnection
 
 from ...config import get_lancedb_path, get_storage_root
+from ...core.tools.core.RAG_tools.LanceDB.jieba_dictionary import (
+    ensure_jieba_dictionary_once,
+)
 from ...core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from .base import VectorStore
 
@@ -73,6 +77,7 @@ async def get_async_connection_from_env(env_var: str = "LANCEDB_DIR") -> Any:
     always agree on it without this having to open a sync connection first.
     """
     uri = LanceDBConnectionManager().resolve_dir_from_env(env_var)
+    await asyncio.to_thread(ensure_jieba_dictionary_once)
 
     with _async_cache_lock:
         cached = _async_connection_cache.get(uri)
@@ -205,6 +210,7 @@ class LanceDBConnectionManager:
 
         normalized = self._normalize_dirpath(db_dir)
         self._ensure_dir(normalized)
+        ensure_jieba_dictionary_once()
 
         current_time = time.time()
 

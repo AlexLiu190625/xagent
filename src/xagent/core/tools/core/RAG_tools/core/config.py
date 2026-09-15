@@ -36,18 +36,19 @@ DEFAULT_IVFPQ_PARAMS: Final[Dict[str, Any]] = {}
 """Default IVFPQ index parameters. Uses LanceDB defaults if empty."""
 
 DEFAULT_FTS_PARAMS: Final[Dict[str, Any]] = {
-    "base_tokenizer": "ngram",
-    "ngram_min_length": 2,
-    "prefix_only": True,
+    "base_tokenizer": "jieba/default",
     "with_position": True,
 }
-"""
-Default FTS index parameters tuned for East Asian text.
+"""Default FTS index parameters: jieba segments CJK, whitespace splits Latin.
 
-We use n-gram tokenization (min length 2, prefix-only) so that contiguous
-Chinese/Japanese/Korean strings can still be matched
-efficiently without requiring word-segmentation libraries. LanceDB falls back
-to its defaults for any unspecified options (e.g. stemming, stop-word removal).
+The previous ``ngram`` + ``prefix_only`` setting indexed prefixes of the whole
+chunk instead of per-word tokens, so only queries matching a chunk's opening
+characters hit anything -- a chunk containing "incident" never matched the
+query ``incident``. Needs lancedb >= 0.32.0 and
+``<LANCE_LANGUAGE_MODEL_HOME>/jieba/default/dict.txt``, which
+``ensure_jieba_dictionary`` installs from the PyPI jieba package when a
+connection is opened: only the macOS wheel embeds a dictionary, and on Linux
+both index creation and querying fail without the file.
 """
 
 DEFAULT_LANCEDB_SCAN_BATCH_SIZE: Final[int] = 2048
