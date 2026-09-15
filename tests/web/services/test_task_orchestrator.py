@@ -24,6 +24,7 @@ from threading import Barrier, Event, get_ident
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
@@ -4362,12 +4363,43 @@ async def test_leased_auto_failure_preserves_client_classification(db_session) -
     assert "private model binding details" not in json.dumps(frames)
 
 
+@pytest_asyncio.fixture
+async def cancellation_trace_runtime(db_session, monkeypatch, async_trace):
+    from xagent.web.services import trace_handlers
+    from xagent.web.services.trace_database import TraceDatabaseRuntime
+
+    runtime = TraceDatabaseRuntime(
+        db_session.get_bind(), use_async=async_trace, limit=1
+    )
+    monkeypatch.setattr(trace_handlers, "get_trace_database_runtime", lambda: runtime)
+    try:
+        yield runtime
+    finally:
+        await runtime.close()
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["checkpoint", "trace", "outbound"])
+@pytest.mark.parametrize(
+    ("kind", "async_trace"),
+    [
+        ("checkpoint", False),
+        ("trace", False),
+        ("outbound", False),
+        ("checkpoint", True),
+        ("trace", True),
+    ],
+)
 @pytest.mark.parametrize("write_fails", [False, True])
 async def test_cancelled_runner_drains_persistence_before_settlement(
-    db_session, monkeypatch, kind, write_fails
+    db_session, monkeypatch, kind, write_fails, async_trace, cancellation_trace_runtime
 ):
+    # Exercise settlement through both real file-SQLite driver paths. The
+    # async commit barrier yields through run_sync, never blocks the loop.
+    from functools import partial
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.util.concurrency import await_only
+
     from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
     from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
     from xagent.web.api import websocket
@@ -4377,6 +4409,7 @@ async def test_cancelled_runner_drains_persistence_before_settlement(
     turn_id = f"cancel-persist-{kind}-{write_fails}"
     user, task, payload, lease = _finalize_turn_fixture(db_session, turn_id=turn_id)
     started, release, closed, rolled_back = Event(), Event(), Event(), Event()
+    async_release = asyncio.Event()
     heartbeat_stopped = asyncio.Event()
     settlement_started = Event()
     error = RuntimeError("persistence failed during cancellation")
@@ -4385,7 +4418,10 @@ async def test_cancelled_runner_drains_persistence_before_settlement(
         def commit(self):
             self.flush()
             started.set()
-            assert release.wait(8)
+            if async_trace:
+                await_only(asyncio.wait_for(async_release.wait(), 8))
+            else:
+                assert release.wait(8)
             if write_fails:
                 raise error
             return super().commit()
@@ -4400,6 +4436,15 @@ async def test_cancelled_runner_drains_persistence_before_settlement(
             closed.set()
 
     factory = sessionmaker(db_session.get_bind(), class_=WriterSession)
+    if async_trace:
+        from xagent.web.services import trace_database
+
+        assert cancellation_trace_runtime.engine is not None
+        monkeypatch.setattr(
+            trace_database,
+            "AsyncSession",
+            partial(AsyncSession, sync_session_class=WriterSession),
+        )
     monkeypatch.setattr(trace_handlers, "get_db", lambda: iter([factory()]))
     monkeypatch.setattr(task_execution, "get_db", lambda: iter([factory()]))
     broadcast = AsyncMock()
@@ -4464,6 +4509,7 @@ async def test_cancelled_runner_drains_persistence_before_settlement(
                 assert not heartbeat_stopped.is_set()
         finally:
             release.set()
+            async_release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(bg_task, 5)
 

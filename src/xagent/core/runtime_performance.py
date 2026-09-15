@@ -111,6 +111,8 @@ _DURATION_METRICS = frozenset(
         "xagent.thread_pool.queue_wait.duration",
         "xagent.thread_pool.total.duration",
         "xagent.trace.database.commit.duration",
+        "xagent.trace.database.admission_wait.duration",
+        "xagent.trace.database.preparation.duration",
         "xagent.trace.database.serialization.duration",
         "xagent.trace.dispatch.duration",
         "xagent.trace.handler.duration",
