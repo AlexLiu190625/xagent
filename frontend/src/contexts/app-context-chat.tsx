@@ -126,14 +126,16 @@ type SessionConversationState =
   | { phase: "reload_required"; connectionIdentity: string | null; taskId: null }
 
 // The stop control's own state. The server sends no acknowledgement frame for
-// a stop, so "stopping" ends in one of five ways: this task's terminal frame,
+// a stop, so "stopping" ends in one of six ways: this task's terminal frame,
 // the local timeout above, a codeless agent_error for this task, a reconnect
 // (the button's own state is per-connection and cannot outlive the connection
-// it was set on), or the control ceasing to be available while the run pauses
-// without ending (see the effect keyed on canStopTask). The codeless
-// agent_error only returns the control to pressable. It does not say whether
-// the stop was applied: the server sends the same frame for any other
-// external-scope command that fails on this task.
+// it was set on), the control ceasing to be available while the run pauses
+// without ending (see the effect keyed on canStopTask), or a later stop
+// attempt that the socket refuses, which moves the state straight to
+// "not_sent" (see stopTask). The codeless agent_error only returns the
+// control to pressable. It does not say whether the stop was applied: the
+// server sends the same frame for any other external-scope command that
+// fails on this task.
 export type SessionStopState = "idle" | "stopping" | "timed_out" | "not_sent"
 
 type SessionConversationAction =
