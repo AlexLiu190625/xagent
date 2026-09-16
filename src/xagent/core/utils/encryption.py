@@ -1,6 +1,8 @@
 """Encryption utilities for sensitive data."""
 
 import base64
+import hashlib
+import hmac
 import logging
 import os
 from functools import lru_cache
@@ -31,6 +33,22 @@ def get_cipher() -> Fernet:
     return Fernet(
         encryption_key.encode() if isinstance(encryption_key, str) else encryption_key
     )
+
+
+_SECRET_HMAC_KDF_DOMAIN = b"xagent:secret-hmac-subkey:v1\0"
+
+
+def derive_secret_hmac(value: str, *, purpose: bytes) -> str:
+    """Return a deterministic HMAC under a purpose-derived protected subkey."""
+    if not purpose:
+        raise ValueError("Secret HMAC purpose must not be empty")
+    # Read the configured key through the module's own public path rather than
+    # a Fernet instance's private attributes, which carry no compatibility
+    # guarantee across cryptography releases. The bytes are the same: a Fernet
+    # key is the concatenated signing and encryption halves.
+    master_key = base64.urlsafe_b64decode(_get_encryption_key())
+    subkey = hmac.digest(master_key, _SECRET_HMAC_KDF_DOMAIN + purpose, "sha256")
+    return hmac.new(subkey, value.encode(), hashlib.sha256).hexdigest()
 
 
 def _is_encrypted(value: str) -> bool:
