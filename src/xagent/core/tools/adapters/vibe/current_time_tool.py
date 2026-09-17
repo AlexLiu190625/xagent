@@ -518,56 +518,66 @@ _EN_HOURS_LATER_RE = re.compile(
 _EN_TIME_RE = re.compile(_EN_TIME)
 
 # Grammar row 2 (an English calendar date, optionally with a time) is matched
-# whole here, the way the other twelve rows match theirs. dateutil then only
-# does the date arithmetic for a phrase this pattern has already accepted: it
-# never decides what the grammar accepts. Written out, the accepted shapes are
-#   <day> <month name>[.] <year>   |   <month name>[.] <day>[,] <year>
+# whole here, the way the other twelve rows match theirs. dateutil then does
+# the date arithmetic for a phrase this pattern has already accepted; which
+# strings pass this gate is decided here, by the pattern, not by dateutil --
+# though, as the paragraph below explains, dateutil's own zone-name heuristic
+# still decides whether four particular am/pm spellings succeed once past the
+# gate. Written out, the accepted shapes are
+#   <day> <month name>[.][,] <year>   |   <month name>[.] <day>[,] <year>
 #   <day>/<month>/<year> or <day>-<month>-<year>
 # the year always four digits and never starting with zero, in every branch,
 # each optionally followed by one space and a time, which is one of
-#   HH:MM[:SS]                                        (24-hour, no am/pm)
-#   H[:MM[:SS]] am/pm                                 (am/pm mandatory here)
-#   a literal twelve, one or two ".NN" groups, am/pm  (am/pm mandatory here too)
+#   HH:MM[:SS]                                     (24-hour, no am/pm)
+#   H[:MM[:SS]] am/pm, hour one through eleven      (am/pm mandatory here)
+#   a literal twelve, zero to two ":" or "." groups, am/pm   (mandatory too)
 # The am/pm half of the second and third alternatives admits the sixteen
 # spellings that write the letter and the "m" together (am, a.m, am., a.m.
 # and the p forms, in either letter case) -- the same set _EN_HOUR_TWELVE_RE
-# covers. Twelve of those sixteen resolve normally at every hour other than
-# twelve and reach the hour-twelve guard below when the hour is twelve; the
-# other four ("A.M", "A.M.", "P.M", "P.M.") are refused at every hour, not
-# only at twelve, because dateutil reads a solitary uppercase "M" split from
-# its letter by a period as a candidate timezone name rather than the second
-# half of a meridian marker -- "15 Sep 2026 11 p.m." resolves, "15 Sep 2026
-# 11 P.M." does not, same phrase, capitalisation only. At hour twelve those
-# four still reach the guard's callback, just through the zone-name path
-# instead of the wording path, and get the generic refusal instead of the
-# named one.
+# covers. Twelve of those sixteen resolve normally at hours one through
+# eleven and reach the hour-twelve guard below, getting its named wording, at
+# hour twelve. The other four ("A.M", "A.M.", "P.M", "P.M.") never resolve at
+# any hour and never reach that guard either, at hour twelve or any other:
+# dateutil reads a solitary uppercase "M" split from its letter by a period
+# as a candidate timezone name rather than the second half of a meridian
+# marker, and the tzinfos callback below raises for it inside
+# dateutil_parser.parse itself, before this function ever computes an hour to
+# check -- "15 Sep 2026 11 p.m." resolves, "15 Sep 2026 11 P.M." does not,
+# same phrase, capitalisation only, and the second phrase is refused before
+# the guard runs, not through it.
 # The third alternative exists solely so the hour-twelve spellings that must
 # keep the named wording still reach the guard: it matches nothing but a
-# literal twelve, so nothing it admits can ever resolve (verified by
-# enumerating every hour-string, dot-group count, and period spelling it
-# covers, not by sampling).
+# literal twelve, so nothing it admits can ever resolve (verified over
+# leading zeros zero through five, both group counts zero through two across
+# the full two-digit range, all sixteen period spellings, and both
+# separators, across seven date branches, not by sampling -- 0*12 admits
+# unboundedly many leading-zero counts, so this is a wide explicit range
+# rather than literally every one).
 # What the door refuses that dateutil would otherwise have accepted includes,
 # at least: a weekday name, fractional seconds, an eight-digit run, a "."
 # date separator, a year written first, a year under four digits or starting
 # with zero, a "T" or "h" time separator, a space-separated numeric date, a
 # bare hour with no am/pm, a single-digit minute or second, a "." between an
 # hour and its minutes anywhere but the literal-twelve spelling, a leading
-# "on", trailing punctuation, full-width digits, and any am/pm spelling whose
-# letters are split by whitespace or reduced to one letter.
+# "on", trailing punctuation, full-width digits, any am/pm spelling whose
+# letters are split by whitespace or reduced to one letter, and an hour
+# outside one through twelve paired with am/pm (the second alternative's own
+# range keeps this out; a zero-padded run like "023" is a 24-hour hour, not a
+# twelve-hour one, and the pattern no longer admits it next to am/pm).
 _EN_MONTH = (
     "january|february|march|april|may|june|july|august|september|october|"
     "november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec"
 )
 _EN_CALENDAR_DAY = r"[0-9]{1,2}(?:st|nd|rd|th)?"
 _EN_CALENDAR_DATE = (
-    rf"(?:{_EN_CALENDAR_DAY} (?:{_EN_MONTH})\.? [1-9][0-9]{{3}}"
+    rf"(?:{_EN_CALENDAR_DAY} (?:{_EN_MONTH})\.?,? [1-9][0-9]{{3}}"
     rf"|(?:{_EN_MONTH})\.? {_EN_CALENDAR_DAY},? [1-9][0-9]{{3}}"
     r"|[0-9]{1,2}[/-][0-9]{1,2}[/-][1-9][0-9]{3})"
 )
 _EN_CALENDAR_CLOCK = (
     r"(?:[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?"
-    r"|[0-9]{1,3}(?::[0-9]{2}){0,2} ?(?:a|p)\.?m\.?"
-    r"|0*12(?:\.[0-9]{2}){1,2} ?(?:a|p)\.?m\.?)"
+    r"|(?:0?[1-9]|1[01])(?::[0-9]{2}){0,2} ?(?:a|p)\.?m\.?"
+    r"|0*12(?:[:.][0-9]{2}){0,2} ?(?:a|p)\.?m\.?)"
 )
 _EN_CALENDAR_RE = re.compile(
     rf"{_EN_CALENDAR_DATE}(?: {_EN_CALENDAR_CLOCK})?", re.IGNORECASE
@@ -963,13 +973,16 @@ def _read_en_calendar_date(text: str, now_local: datetime) -> Optional[_Reading]
     accepted, and every shape that pattern admits keeps that computation
     equal to what the phrase wrote: the year is four digits not starting
     with zero, so dateutil's own century substitution for a shorter year is
-    never reached, and the pattern's only "." time spelling is restricted to
-    a literal twelve, which never resolves (verified by exhaustive
-    enumeration over every hour-string and dot-group combination it admits,
-    not by sampling). Readings that differ across the four combinations are
-    an ambiguous date. A date that
-    follows the default is missing a component. An hour that follows the
-    default means the phrase named no time of day. An hour folded onto 0 or
+    never reached; the am/pm alternative admits only hours one through
+    eleven, so dateutil can never read a zero-padded 24-hour value (e.g.
+    "023") and silently discard the am/pm word that came with it; and the
+    pattern's only "." time spelling is restricted to a literal twelve,
+    which never resolves (verified over a wide, explicit range of leading
+    zeros, dot-group counts, and period spellings, not literally every
+    hour-string -- 0*12 admits unboundedly many). Readings that differ
+    across the four combinations are an ambiguous date. A date that follows
+    the default is missing a component. An hour that follows the default
+    means the phrase named no time of day. An hour folded onto 0 or
     12 with am/pm and matching _EN_HOUR_TWELVE_RE is refused through the same
     rule and the same wording as the bare time sub-grammar
     (_refuse_hour_twelve_with_period); a period word paired with that folded
