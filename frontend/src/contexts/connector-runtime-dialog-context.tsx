@@ -29,6 +29,9 @@ import { useAuth } from "@/contexts/auth-context"
 
 export interface ConnectorRuntimeResendPayload {
   taskId: number
+  // Written on every recordDelivery call but not read anywhere today -- a
+  // resend always mints its own fresh id instead. Reserved for per-turn
+  // attribution on a terminal frame, see xorbitsai/xagent#2465.
   clientMessageId: string
   text: string
   files: File[]

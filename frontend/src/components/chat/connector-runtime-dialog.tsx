@@ -405,19 +405,39 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     })
   }
 
-  const doResend = async (): Promise<boolean> => {
+  type ResendOutcome = "sent" | "failed" | "nothing-to-send"
+
+  const doResend = async (): Promise<ResendOutcome> => {
     const snapshot = requestRef.current.resendPayload
-    if (!snapshot) return true
+    if (!snapshot) {
+      // Unreachable today: both callers only reach this after a precondition
+      // that implies a snapshot exists -- handleSave's canResendNow (which
+      // itself requires the "met" outcome the saveAndResend button promised
+      // to be resendable) and handleRetryResend's sendFailed precondition
+      // (set only right after a resend that read a snapshot). Kept distinct
+      // from "sent" and "failed" so a future caller that does reach it is
+      // not misreported as either a completed resend or a failed one.
+      console.warn("[connector-runtime] resend attempted with no snapshot to send")
+      return "nothing-to-send"
+    }
     try {
-      await sendMessage(snapshot.text, { clientMessageId: generateClientMessageId() }, snapshot.files)
-      return true
+      // Matches every other programmatic resend call site in the app
+      // (clarification-form.tsx, workforce-builder.tsx, agent-builder.tsx):
+      // without force, a duplicate of this exact text still pending from an
+      // earlier send on this same connection throws instead of sending.
+      await sendMessage(
+        snapshot.text,
+        { clientMessageId: generateClientMessageId(), force: true },
+        snapshot.files,
+      )
+      return "sent"
     } catch {
       // Matches the read path's warn so a failing resend leaves the same
       // diagnostic signal. Carries the fixed prefix alone: unlike the read
       // path there is no closed-set status to report here, and the rejection
       // value is arbitrary, so logging it could carry message content.
       console.warn("[connector-runtime] resend failed")
-      return false
+      return "failed"
     }
   }
 
@@ -433,6 +453,13 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // A newer request retargeted this same dialog instance while the save
       // was in flight; the result is stale, but `submitting` must still
       // reset or the save buttons and close handlers stay stuck forever.
+      // A successful "save and resend" whose resend never got to run needs
+      // to say so, matching the other two "did not resend" paths below --
+      // this one only fires when the save itself landed, since a rejected
+      // save has nothing that was "saved but not resent" to report.
+      if (alsoResend && result.ok) {
+        toast(t("connectorRuntime.savedNotResentSuperseded"))
+      }
       setSubmitting(false)
       return
     }
@@ -491,7 +518,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     }
 
     if (alsoResend && canResendNow) {
-      const sent = await doResend()
+      const resendOutcome = await doResend()
       if (!aliveRef.current) return
       if (requestRef.current.seq !== seqAtStart) {
         // Same reason as the earlier seq check: a newer request retargeted
@@ -500,7 +527,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         setSubmitting(false)
         return
       }
-      if (!sent) {
+      if (resendOutcome !== "sent") {
         setSubmitting(false)
         setSendFailed(true)
         return
@@ -516,7 +543,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     if (resending) return
     const seqAtStart = request.seq
     setResending(true)
-    const sent = await doResend()
+    const resendOutcome = await doResend()
     if (!aliveRef.current) return
     if (requestRef.current.seq !== seqAtStart) {
       // A newer request retargeted this same dialog instance while the
@@ -526,7 +553,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       return
     }
     setResending(false)
-    if (sent) {
+    if (resendOutcome === "sent") {
       setSendFailed(false)
       close("resent")
     }

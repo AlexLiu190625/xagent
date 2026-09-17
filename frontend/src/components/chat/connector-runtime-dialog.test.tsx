@@ -16,7 +16,7 @@ import {
 const pathnameRef = vi.hoisted(() => ({ current: "/task/1" as string | null }))
 const appStateRef = vi.hoisted(() => ({ taskId: 1 as number | null }))
 const sendMessageMock = vi.hoisted(() =>
-  vi.fn<(message: string, config?: { clientMessageId?: string }, files?: File[]) => Promise<void>>(
+  vi.fn<(message: string, config?: { clientMessageId?: string; force?: boolean }, files?: File[]) => Promise<void>>(
     async () => {},
   ),
 )
@@ -976,6 +976,10 @@ describe("resends the snapshot under a fresh id", () => {
     await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
     expect(sendMessageMock.mock.calls[0][0]).toBe("hello")
     expect(sendMessageMock.mock.calls[0][1]?.clientMessageId).not.toBe("orig-1")
+    // Matches every other programmatic resend call site in the app: without
+    // this, a duplicate of this exact text still pending on this connection
+    // throws instead of sending.
+    expect(sendMessageMock.mock.calls[0][1]?.force).toBe(true)
     expect(sendMessageMock.mock.calls[0][2]).toEqual([])
     expect(submitMock).toHaveBeenCalledTimes(1)
     cleanup()
@@ -1102,6 +1106,40 @@ describe("ignores a resend result superseded by a new request", () => {
     await act(async () => { resolveRetry() })
     expect(screen.getByRole("dialog")).toBeInTheDocument()
     expect(closeSpy).not.toHaveBeenCalledWith("resent")
+  })
+})
+
+describe("reports a superseded save-and-resend whose save still landed", () => {
+  it("reports a superseded save-and-resend whose save still landed", async () => {
+    // A same-task terminal frame retargets this dialog instance (bumps seq)
+    // while the save half of "save and resend" is still in flight, before
+    // its own result comes back. Unlike the resend-only race above, the
+    // save here does land server-side -- the other two "did not resend"
+    // paths already say so with a toast, and this one must too.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-1", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    let resolveSubmit: (value: unknown) => void = () => {}
+    submitMock.mockReturnValueOnce(new Promise((res) => { resolveSubmit = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask() // retargets this same dialog instance mid-save
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    toastMock.mockClear()
+    sendMessageMock.mockClear()
+    await act(async () => { resolveSubmit(ok(report(true, []))) })
+
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentSuperseded"]])
+    expect(sendMessageMock).not.toHaveBeenCalled()
   })
 })
 
