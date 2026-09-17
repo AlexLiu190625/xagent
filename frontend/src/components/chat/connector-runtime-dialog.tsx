@@ -228,11 +228,23 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // route gate runs before the request even goes out, and again right
   // before the dialog would become visible, since the user is free to
   // navigate away from a host page while this read is in flight.
+  //
+  // `visible` is read at the moment this effect starts, which is exactly
+  // right here: setVisible is only ever called with `true` in this
+  // component, so if the dialog was already showing something when this
+  // request came in, it is still showing it by the time the fetch below
+  // resolves (any path that would make it stop -- unmount, a task switch, a
+  // host-page departure -- clears `request` and is caught by the seq/alive
+  // checks first). A once-visible dialog must not vanish out from under a
+  // user who is mid-draft: a re-read for the same task only happens because
+  // another terminal frame retargeted this instance, not because the user
+  // did anything, so it must never read as a decision the user made.
   useEffect(() => {
     if (!isConnectorRuntimeDialogHostPath(pathnameRef.current)) {
       close("not-shown")
       return
     }
+    const wasVisible = visible
     const seqAtStart = request.seq
     let cancelled = false
     fetchTaskConnectorRuntimeRequirements(request.taskId).then((result) => {
@@ -242,7 +254,9 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
           "[connector-runtime] requirements read failed",
           result.kind === "http" ? result.status : result.kind,
         )
-        close("not-shown")
+        // Keep whatever the user is already looking at (report and draft)
+        // rather than discarding it over a transient read failure.
+        if (!wasVisible) close("not-shown")
         return
       }
       if (!isConnectorRuntimeDialogHostPath(pathnameRef.current)) {
@@ -251,7 +265,15 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       }
       const outcome = resolveDialogOutcome(result.report)
       if (outcome.kind === "met") {
-        close("not-shown")
+        if (!wasVisible) {
+          close("not-shown")
+          return
+        }
+        // Same path handleSave's post-save refresh already takes when a
+        // refresh finds nothing left to fill (see "leaves a way out..."
+        // below): install the report and let the footer collapse to "Got
+        // it" instead of silently discarding the user's in-progress draft.
+        setReport(result.report)
         return
       }
       setReport(result.report)

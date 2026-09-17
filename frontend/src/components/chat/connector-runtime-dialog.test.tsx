@@ -684,13 +684,13 @@ describe("refreshes after a conflict and drops newly satisfied keys", () => {
 
 describe("leaves a way out when a refresh reports the whole report satisfied", () => {
   it("leaves a way out when a refresh reports the whole report satisfied", async () => {
-    // The one path that can install a satisfied report into an already-open
-    // dialog: every other place that installs one closes first. The first
-    // read closes on met before anything renders, and a successful save
-    // closes after its optional resend. A failed save whose disposition
-    // asks for a refresh does neither, so whatever that refresh returns is
-    // rendered -- and a concurrent writer can have satisfied everything
-    // between the read and the save.
+    // A failed save whose disposition asks for a refresh renders whatever
+    // that refresh returns without closing -- a concurrent writer can have
+    // satisfied everything between the read and the save. The requirements
+    // read effect takes the same path when a same-task re-request finds
+    // nothing missing while the dialog is already visible (see the
+    // "already-visible" describe block below); the first read and a
+    // successful save's optional resend are the two places that do close.
     fetchMock.mockResolvedValueOnce(ok(report(false, [
       connector(REF_A, "A", [
         input({ section: "context", key: "a", type: "string", required: true }),
@@ -733,6 +733,58 @@ describe("leaves a way out when a refresh reports the whole report satisfied", (
     // Acknowledging must not resend the failed turn: the save it followed
     // was rejected, and a resend is a billed model call.
     expect(sendMessageMock).not.toHaveBeenCalled()
+  })
+})
+
+describe("does not close a dialog the user is already looking at", () => {
+  it("keeps it open, keeps the draft, and shows only Got it when a same-task re-request reads met", async () => {
+    // A second terminal frame for the same task (a retry from another tab,
+    // or the SDK/an external API) bumps request.seq while this dialog is
+    // already visible. If the re-read finds nothing missing, the report
+    // must be installed and rendered -- not discarded by closing the dialog
+    // out from under a user who may still be mid-draft.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "token", type: "string", required: true }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "half-typed-secret" } })
+
+    fetchMock.mockResolvedValueOnce(ok(report(true, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "token", type: "string", required: true, satisfied: true }),
+      ]),
+    ])))
+    await openForTask() // same task: a second request, not a remount
+
+    await waitFor(() => expect(screen.getByText("connectorRuntime.filled")).toBeInTheDocument())
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.saveOnly")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.saveAndResend")).not.toBeInTheDocument()
+  })
+
+  it("keeps it open with the current report when a same-task re-request's read fails", async () => {
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "token", type: "string", required: true }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "half-typed-2" } })
+
+    fetchMock.mockResolvedValueOnce({ ok: false, kind: "transport" })
+    await openForTask() // same task: a second request, not a remount
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(screen.getByLabelText("token")).toHaveValue("half-typed-2")
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeInTheDocument()
   })
 })
 
