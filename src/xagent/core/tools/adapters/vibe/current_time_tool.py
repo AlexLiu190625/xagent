@@ -587,7 +587,14 @@ def _reject_zone_in_phrase(name: Optional[str], offset: Optional[int]) -> None:
     # The zone comes from the timezone argument only. dateutil calls this for
     # every parse, with (None, None) when the phrase names no zone; a zone
     # name or offset inside the phrase would otherwise be dropped silently
-    # or turned into an offset the caller never asked for.
+    # or turned into an offset the caller never asked for. The whole-phrase
+    # calendar pattern in _EN_CALENDAR_RE refuses every spelling that
+    # deliberately names a zone (e.g. "EST"), but that does not make this
+    # callback unreachable: dateutil reads a solitary uppercase "M" split
+    # from its letter by a period (as in "12 A.M") as a candidate zone name
+    # rather than the second half of a meridian marker, so a phrase spelling
+    # am/pm that way is called in here with name="M", not (None, None), and
+    # still raises below.
     if name is None and offset is None:
         return None
     raise ValueError(f"time zone inside the phrase is not supported: {name!r}")
@@ -619,12 +626,17 @@ def _parse_number(token: str) -> Optional[int]:
 # On the calendar-date path this pattern only chooses which refusal message
 # to raise, once the parsed hour has already decided that a refusal is due
 # (see _read_en_calendar_date): does the phrase spell a twelve at all, in
-# one of the ways this pattern covers? dateutil accepts more spellings than
-# this ("12h30", "12,30"), and those fall through to the generic refusal
-# rather than being named. A leading-zero run, a "." minute separator, and
-# the dotted "a.m."/"p.m." form are all safe to recognise here, because
-# being generous only affects the wording, never whether the phrase is
-# refused.
+# one of the ways this pattern covers? The whole-phrase calendar pattern
+# above (_EN_CALENDAR_RE) now refuses most of what used to reach here
+# unrecognised before dateutil ever saw it -- "12h30 pm" and "12,30 pm" are
+# refused at that door, not here. What still reaches this point without a
+# literal twelve in the text is a folded hour spelled some other way, such
+# as "0:30 am" folding to hour zero: that case falls through to the generic
+# refusal rather than being named, which is the existing, intended behaviour
+# (see _read_en_calendar_date's docstring). A leading-zero run, a "." minute
+# separator, and the dotted "a.m."/"p.m." form are all safe to recognise
+# here, because being generous only affects the wording, never whether the
+# phrase is refused.
 _EN_HOUR_TWELVE_RE = re.compile(
     r"(?<![0-9:.])0*12(?:[:.][0-9]{2}){0,2} ?(?:a|p)\.?m\.?(?![a-z])",
     re.IGNORECASE,
@@ -940,10 +952,14 @@ def _read_en_calendar_date(text: str, now_local: datetime) -> Optional[_Reading]
     rather than dropped, as a second, independent check: the pattern above
     already refuses fractional seconds, so this is unreachable today, the
     same way _read_iso keeps its own second whole-phrase check. A zone name
-    or offset inside the phrase is refused by the tzinfos callback below;
-    the pattern above already refuses every spelling that could carry one,
-    so this too is a second, independent check rather than the phrase's
-    actual gate.
+    or offset the phrase deliberately writes (e.g. "EST") is refused by the
+    tzinfos callback below, and the pattern above already refuses every such
+    spelling on its own; that callback is still reachable for an unrelated
+    reason, though, since dateutil separately reads a solitary uppercase "M"
+    split from its letter by a period (as in "12 A.M") as a candidate zone
+    name rather than the second half of a meridian marker, so that spelling
+    reaches the same callback and the same generic refusal instead of the
+    hour-twelve guard's wording.
     """
     if _EN_CALENDAR_RE.fullmatch(text) is None:
         return None
