@@ -12,7 +12,10 @@ from __future__ import annotations
 import builtins
 import json
 import os
+from collections import ChainMap
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -1051,6 +1054,81 @@ def test_spill_empty_containers_are_never_truncated_after_items_zero(
     )
     for record in records:
         assert record["truncated_after_items"] != 0
+
+
+# --- I-52: a non-dict Mapping is spilled like a dict, not stringified -----
+
+
+class _ShortReprMapping(Mapping):
+    """A Mapping whose repr is unrelated to its actual size.
+
+    Used to separate "how big this looks by repr" from "how big this is
+    once serialized as a JSON object" -- the gap the size accounting must
+    not fall into.
+    """
+
+    def __init__(self, data):
+        self._data = data
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __repr__(self):
+        return "<m>"
+
+
+@pytest.mark.parametrize(
+    "case", ["mapping_proxy", "chainmap", "short_repr", "oversized_child"]
+)
+def test_non_dict_mapping_spills_like_dict(tmp_path, monkeypatch, case):
+    if case == "mapping_proxy":
+        value = MappingProxyType({f"k{i:03d}": "v" * 200 for i in range(300)})
+        target = _target(tmp_path, max_chars=1000)
+    elif case == "chainmap":
+        value = ChainMap({"a": "x" * 30000}, {"b": "y" * 30000})
+        target = _target(tmp_path, max_chars=40000)
+    elif case == "oversized_child":
+        # One child of the mapping ("child") is itself larger than
+        # max_chars. The walk must not descend into the mapping's items --
+        # only _copy_and_set's dict/list/tuple containers may be descended
+        # into on the write-back path -- so the whole mapping is the one
+        # transfer point, not "child" alone.
+        value = MappingProxyType({"child": "w" * 5000, "s": "t"})
+        target = _target(tmp_path, max_chars=1000)
+    else:
+        value = _ShortReprMapping({f"k{i:03d}": "v" * 200 for i in range(300)})
+        monkeypatch.setattr(spill_module, "SPILL_MAX_FILE_BYTES", 300)
+        target = _target(tmp_path, max_chars=1000)
+
+    result = {"data": value}
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+
+    assert records
+    record = records[0]
+    assert record["kind"] == "object"
+    path = Path(target.spill_dir) / record["relative_path"].split("/")[-1]
+    written = path.read_bytes()
+    parsed = json.loads(written)
+
+    if case == "short_repr":
+        assert len(written) <= 300
+        assert record["truncated_after_items"] == len(parsed)
+    elif case == "oversized_child":
+        assert len(records) == 1
+        assert record["item_count"] == 2
+        assert record["value_path"] == "data"
+        assert parsed == dict(value)
+    else:
+        assert parsed == dict(value)
+        assert record["item_count"] == len(value)
 
 
 # --- stage 1-g: render_spill_notice (pure rendering, not yet wired in) -----

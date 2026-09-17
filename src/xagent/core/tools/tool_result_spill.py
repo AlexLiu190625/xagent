@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -293,7 +294,22 @@ def strip_reserved_spill_key(result: Any) -> Any:
     return {k: v for k, v in result.items() if k != SPILL_RESERVED_RESULT_KEY}
 
 
+def _plain_mapping(value: Any) -> Any:
+    """Materialize a non-dict Mapping to a dict; pass everything else through.
+
+    A Mapping that is not a dict (MappingProxyType, ChainMap, UserDict) is
+    materialized to a dict once, at the point where a value becomes a spill
+    point, so size accounting, payload and prefix counting all see the same
+    object. Nested mappings that are not themselves spill points still go
+    through json.dumps(default=str) unchanged.
+    """
+    if isinstance(value, Mapping) and not isinstance(value, dict):
+        return dict(value)
+    return value
+
+
 def _serialized_length(value: Any) -> int:
+    value = _plain_mapping(value)
     if isinstance(value, str):
         return len(value)
     return len(json.dumps(value, ensure_ascii=False, default=str))
@@ -305,7 +321,9 @@ def _spill_children(value: Any) -> list[tuple[Any, Any]] | None:
     A string is always a leaf here even when its content happens to parse as
     JSON: the walk operates on the Python object tree the tool returned,
     before any parsing of string content. A set is also a leaf -- its
-    unordered elements have no stable path segment to report.
+    unordered elements have no stable path segment to report. A non-dict
+    Mapping is a leaf here as well: it is materialized to a dict only when
+    it becomes a spill point itself.
     """
     if isinstance(value, dict):
         return list(value.items())
@@ -461,6 +479,7 @@ def _render_field_list(names: list[Any]) -> str:
 
 def _spill_payload_for_value(value: Any) -> tuple[str, str, Any]:
     """Return (payload written verbatim, kind, parsed value for metadata)."""
+    value = _plain_mapping(value)
     if isinstance(value, str):
         kind, parsed = _spill_kind_of(value)
         return value, kind, parsed
