@@ -186,8 +186,12 @@ CASES: list[tuple[str, str, tuple[str, object]]] = [
     # The day-first branch's own comma, a shape a person ordinarily writes.
     ("1 Jan, 1990", SYDNEY, ("1990-01-01T00:00:00+11:00", False)),
     # The four-digit-year rule holds in the slash/dash branch too, not only
-    # in the two month-name branches: without it dateutil would substitute a
-    # century from the machine's real clock, the same hole closed above.
+    # in the two month-name branches. "25/12/90" is the same century-
+    # substitution hole closed above: without the rule, dateutil reads the
+    # two-digit "90" as 1990 off the machine's real clock. "15-09-0055" is a
+    # different failure the same rule also blocks: the year is already four
+    # digits, so there is no substitution -- without the rule dateutil takes
+    # it literally and returns the year 0055.
     ("25/12/90", SYDNEY, ("REFUSED", "unsupported_expression")),
     ("15-09-0055", SYDNEY, ("REFUSED", "unsupported_expression")),
     # The general am/pm alternative admits only hours one through eleven; a

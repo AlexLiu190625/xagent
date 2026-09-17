@@ -550,7 +550,7 @@ _EN_TIME_RE = re.compile(_EN_TIME)
 # literal twelve, so nothing it admits can ever resolve (verified over
 # leading zeros zero through five, both group counts zero through two across
 # the full two-digit range, all sixteen period spellings, and both
-# separators, across seven date branches, not by sampling -- 0*12 admits
+# separators, across nine date branches, not by sampling -- 0*12 admits
 # unboundedly many leading-zero counts, so this is a wide explicit range
 # rather than literally every one).
 # What the door refuses that dateutil would otherwise have accepted includes,
@@ -561,9 +561,11 @@ _EN_TIME_RE = re.compile(_EN_TIME)
 # hour and its minutes anywhere but the literal-twelve spelling, a leading
 # "on", trailing punctuation, full-width digits, any am/pm spelling whose
 # letters are split by whitespace or reduced to one letter, and an hour
-# outside one through twelve paired with am/pm (the second alternative's own
-# range keeps this out; a zero-padded run like "023" is a 24-hour hour, not a
-# twelve-hour one, and the pattern no longer admits it next to am/pm).
+# written with three digits and paired with am/pm -- the general branch
+# admits one or two digits, one through eleven, only, so both a 24-hour
+# value like "023" and a padded twelve-hour value like "010" are refused;
+# only a literal twelve may be written with extra leading zeros, and that
+# spelling never resolves anyway.
 _EN_MONTH = (
     "january|february|march|april|may|june|july|august|september|october|"
     "november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec"
@@ -982,9 +984,9 @@ def _read_en_calendar_date(text: str, now_local: datetime) -> Optional[_Reading]
     hour-string -- 0*12 admits unboundedly many). Readings that differ
     across the four combinations are an ambiguous date. A date that follows
     the default is missing a component. An hour that follows the default
-    means the phrase named no time of day. An hour folded onto 0 or
-    12 with am/pm and matching _EN_HOUR_TWELVE_RE is refused through the same
-    rule and the same wording as the bare time sub-grammar
+    means the phrase named no time of day. An hour folded onto 0 or 12 with
+    am/pm and matching _EN_HOUR_TWELVE_RE is refused through the same rule
+    and the same wording as the bare time sub-grammar
     (_refuse_hour_twelve_with_period); a period word paired with that folded
     hour but no spelled-out twelve (e.g. "0:30 am") is refused too, but
     generically: the bare time sub-grammar already refuses that same reading
