@@ -481,10 +481,11 @@ def test_hour_twelve_refusal_is_the_same_with_and_without_a_date() -> None:
             == "'12pm' names both midnight and noon"
         )
 
-    # "12h30 pm" folds to hour 12 and spells a twelve, but the "h" separator
-    # is not one of the spellings _EN_HOUR_TWELVE_RE recognises, so it gets
-    # the generic refusal instead: the hour-twelve wording above is not
-    # promised for every spelling dateutil accepts.
+    # "12h30 pm" never reaches dateutil at all: the "h" separator is not one
+    # of the shapes the whole-phrase calendar pattern admits, so the phrase
+    # fails that match and is refused at the door, generically -- the
+    # hour-twelve wording above is not promised for every spelling dateutil
+    # would otherwise have accepted.
     assert (
         resolve_datetime("15 Sep 2026 12h30 pm", SYDNEY)["error"]
         == "unsupported date or time expression: '15 Sep 2026 12h30 pm'"
@@ -539,16 +540,14 @@ _EN_PERIOD_CONNECTED_RE = re.compile(r"[ap]\.?m\.?", re.IGNORECASE)
 # dateutil ever finishes parsing an hour to check. The phrase is still
 # refused either way; only the wording differs.
 _EN_PERIOD_ZONE_MISREAD = {"A.M", "A.M.", "P.M", "P.M."}
+EN_PERIOD_CASES: list[tuple[str, str]] = [
+    (sep, spelling) for spelling in EN_PERIOD_SPELLINGS for sep in ("", " ")
+]
 
 
 def test_en_period_spellings_table_has_every_cell() -> None:
     assert len(EN_PERIOD_SPELLINGS) == 60
     assert len(EN_PERIOD_CASES) == 120
-
-
-EN_PERIOD_CASES: list[tuple[str, str]] = [
-    (sep, spelling) for spelling in EN_PERIOD_SPELLINGS for sep in ("", " ")
-]
 
 
 @pytest.mark.parametrize(

@@ -528,11 +528,16 @@ _EN_TIME_RE = re.compile(_EN_TIME)
 # The am/pm half admits the sixteen spellings that write the letter and the
 # "m" together (am, a.m, am., a.m. and the p forms, in either letter case) --
 # the same set _EN_HOUR_TWELVE_RE covers -- and a leading-zero hour and a "."
-# minute separator, so every spelling that reaches the hour-twelve guard below
-# still reaches it. What it refuses at the door is everything dateutil would
-# additionally have accepted on its own: a weekday name, fractional seconds,
-# an eight-digit run, a "." date separator, a year written first, a "T" or "h"
-# separator, and any am/pm spelling whose letters are split by whitespace.
+# minute separator. Twelve of those sixteen reach the hour-twelve guard below
+# and get its named wording; the other four ("A.M", "A.M.", "P.M", "P.M.")
+# are intercepted first by the pre-existing zone-name rejection, because
+# dateutil reads a solitary uppercase "M" split from its letter by a period
+# as a candidate timezone name -- they are refused all the same, just with
+# the generic wording instead of the named one. What it refuses at the door
+# is everything dateutil would additionally have accepted on its own: a
+# weekday name, fractional seconds, an eight-digit run, a "." date
+# separator, a year written first, a "T" or "h" separator, and any am/pm
+# spelling whose letters are split by whitespace.
 _EN_MONTH = (
     "january|february|march|april|may|june|july|august|september|october|"
     "november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec"
@@ -1000,12 +1005,15 @@ def _read_en_calendar_date(text: str, now_local: datetime) -> Optional[_Reading]
         # or a zero, and neither can be placed on a twelve-hour clock.
         if _EN_HOUR_TWELVE_RE.search(text) is not None:
             _refuse_hour_twelve_with_period(marker.group("period") + "m")
-        # The wording pattern does not recognise a twelve here, either
-        # because the phrase wrote a zero ("0:30 am") or because it spelled
-        # the twelve a way the pattern does not cover ("12h30 pm"). Naming
-        # an hour the message cannot vouch for would misdirect, so fall
-        # through to the generic refusal, matching what the bare time
-        # sub-grammar already does with this same folded hour.
+        # The wording pattern does not recognise a twelve here because the
+        # phrase wrote a zero, not a twelve ("0:30 am" folds to hour 0, and
+        # "0:30 pm" folds to hour 12 the same way "12" would). A spelling of
+        # twelve the pattern itself does not cover, such as "12h30 pm", no
+        # longer reaches this line at all: the whole-phrase gate above
+        # refuses it before dateutil ever parses it. Naming an hour the
+        # message cannot vouch for would misdirect, so fall through to the
+        # generic refusal, matching what the bare time sub-grammar already
+        # does with this same folded hour.
         return None
     if first.microsecond:
         # Unreachable while the whole-phrase pattern above refuses fractional
