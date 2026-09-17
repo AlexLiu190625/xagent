@@ -1,0 +1,868 @@
+"""Spill oversized tool results to a workspace file instead of truncating them.
+
+This module is the single owner of the tool-result-spill mechanism: the two
+path primitives shared by the writer, the engine's registration gate, and the
+read tool (``normalize_spilled_relative_path`` / ``resolve_spilled_under``),
+plus the constants that describe the on-disk and in-context contract. Later
+stages in this same module add the walk/write path and the read-side
+helpers; nothing here depends on them.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+from .artifacts import is_file_ref_like
+from .user_interaction import tool_result_waits_for_user
+
+logger = logging.getLogger(__name__)
+
+SPILL_DIR_NAME = "tool-results"
+SPILL_RESERVED_RESULT_KEY = "_xagent_spilled_results"
+SPILL_PLACEHOLDER_TEXT = "[large result stored by the engine; see the notice below]"
+SPILL_UNAVAILABLE_NOTICE = (
+    "[A large value in this result was stored in a workspace file that is no "
+    "longer available. Treat it as unavailable and do not reconstruct its "
+    "contents.]"
+)
+SPILL_FIELD_NAME_MAX_CHARS = 40
+SPILL_MAX_FIELD_NAMES = 20
+SPILL_MAX_FILE_BYTES = 8 * 1024 * 1024
+SPILL_MAX_FILES_PER_RESULT = 8
+SPILL_MAX_FILES_PER_RUN = 64
+SPILL_READ_TOOL_NAME = "read_tool_result"
+SPILL_READ_MAX_CHARS = 12_000
+SPILL_READ_TRUNCATED_INSTRUCTION = (
+    "Call read_tool_result again with a narrower start/end range."
+)
+SPILL_READ_UNAVAILABLE_MESSAGES = {
+    "invalid_path": (
+        "That is not one of the stored result paths. Copy a path from the "
+        "notice exactly as written."
+    ),
+    "not_found": (
+        "That stored result is no longer available: report the value as "
+        "unavailable and do not reconstruct it."
+    ),
+    "invalid_range": (
+        "start and end are 1-based item numbers: both must be 1 or "
+        "greater, and start must not exceed end."
+    ),
+}
+
+# The union of every key the two OutputFilteredToolWrapper bypass branches
+# write back (output_filter_wrapper.py's waiting-for-user and
+# classified-failure branches), plus the two reserved control keys
+# core/context_ref.py splits out of a tool result. Whole-root spill (the
+# second tier) copies whichever of these are present on the original root
+# before replacing "output" with the placeholder, so neither bypass branch
+# loses the fields it reads.
+SPILL_ENVELOPE_KEYS = (
+    "status",
+    "interaction_id",
+    "message_type",
+    "message",
+    "interactions",
+    "success",
+    "is_error",
+    "failure_code",
+    "error",
+    "output",
+    "response",
+    "_xagent_supersedes_scope",
+    "_xagent_context_refs",
+)
+
+_SPILL_FILENAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}\.(json|txt)$")
+
+
+@dataclass(frozen=True)
+class SpillTarget:
+    """Where oversized tool-result values get written.
+
+    Holds only a plain directory path and the existing max_chars threshold
+    -- never a TaskWorkspace. Writing, locating, and registering a spilled
+    file all need nothing more than a directory string (see
+    resolve_spilled_under), so this stays a data holder with no behavior.
+    """
+
+    spill_dir: str
+    max_chars: int
+
+
+@dataclass
+class SpillRunBudget:
+    """Mutable file count shared by every wrapped tool in one construction.
+
+    SpillTarget stays a frozen (spill_dir, max_chars) pair with no state of
+    its own; the 64-file run cap is a different lifetime -- it accumulates
+    across every tool result produced while one set of tools is in use, not
+    per SpillTarget or per call -- so it lives in its own small mutable
+    object that every OutputFilteredToolWrapper built in the same
+    ToolFactory._apply_output_filters call shares by reference.
+    """
+
+    files_written: int = 0
+
+
+def is_classified_tool_failure(result: Any) -> bool:
+    """Return whether ``result`` is a classified structured tool failure.
+
+    Matches on the ``success is False`` **and** ``is_error is True`` pair that
+    the shared classified-failure contract always carries, rather than on any
+    dict with an ``is_error`` key — a plain MCP error result
+    (``{"content": [...], "is_error": True}``) has no ``success`` key and is
+    left to ordinary recursive filtering.
+
+    Unavailable-MCP results do carry both keys and are matched deliberately:
+    they carry a ``failure_code``, and the restore below is purely additive,
+    so their ``content``/``reason`` fields keep whatever ordinary filtering
+    left them while the classification keys are guaranteed to survive
+    field-count truncation.
+    """
+    return (
+        isinstance(result, dict)
+        and result.get("is_error") is True
+        and result.get("success") is False
+    )
+
+
+def normalize_spilled_relative_path(raw: Any) -> str | None:
+    """Canonicalize one spilled-result selector, or None if it is not one.
+
+    Takes a string and returns a string; it touches no workspace, no
+    filesystem, and no database. The canonical spelling is exactly
+    ``tool-results/<name>`` -- the same spelling the spill writer registers.
+    Only the rewrites that ordinary File Operation resolution would have
+    applied anyway are accepted: backslash separators, a leading ``./``, and
+    one leading ``output/`` (core/workspace.py strips exactly that prefix
+    set). Nothing else: no fuzzy stem matching, no filename normalization,
+    no file-id lookup.
+    """
+    if not isinstance(raw, str):
+        return None
+    candidate = raw.strip()
+    if not candidate:
+        return None
+    if "\x00" in candidate:
+        return None
+    candidate = candidate.replace("\\", "/")
+    while candidate.startswith("./"):
+        candidate = candidate[2:]
+    if candidate.startswith("output/"):
+        candidate = candidate[len("output/") :]
+    if candidate.startswith("/"):
+        return None
+    segments = candidate.split("/")
+    if len(segments) != 2:
+        return None
+    if any(segment in ("", ".", "..") for segment in segments):
+        return None
+    directory, filename = segments
+    if directory != SPILL_DIR_NAME:
+        return None
+    if not _SPILL_FILENAME_RE.match(filename):
+        return None
+    return f"{SPILL_DIR_NAME}/{filename}"
+
+
+def resolve_spilled_under(
+    spill_dir: str | Path | None, name: str | None
+) -> Path | None:
+    """Locate one spilled-result file directly under ``spill_dir``.
+
+    Takes a directory path and a canonical name; returns the resolved file or
+    None. Needs no TaskWorkspace, creates no directory, opens no database
+    session, and raises nothing -- so the engine, the tool, and the writer
+    can all share this one implementation.
+    """
+    if not spill_dir:
+        return None
+    if name is None or name != normalize_spilled_relative_path(name):
+        return None
+    base = Path(spill_dir).resolve()
+    if not base.is_dir():
+        return None
+    resolved = (base / name.split("/", 1)[1]).resolve()
+    if not resolved.is_relative_to(base):
+        return None
+    if resolved.parent != base:
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def _spill_kind_of(content: str) -> tuple[str, Any]:
+    """Decide how to address this file from its content alone.
+
+    The registry and the file extension are never consulted: a spilled file
+    is addressed by what json.loads makes of it right now, so a file whose
+    content was replaced out of band (or a ``.json`` extension on non-JSON
+    content) is still addressed correctly.
+    """
+    try:
+        value = json.loads(content)
+    except ValueError:
+        return "text", None
+    if isinstance(value, list):
+        return "array", value
+    if isinstance(value, dict):
+        return "object", value
+    return "text", None
+
+
+def _spill_text_lines(content: str) -> list[str]:
+    r"""Split on \n only, keeping the separator.
+
+    str.splitlines also breaks on \r, \x0b, \f and U+2028, which would make
+    the line count disagree with the item_count the notice states. A file
+    holding CRLF text must read back as the same number of lines the notice
+    promised, so the split has to be this narrow.
+    """
+    if not content:
+        return []
+    parts = content.split("\n")
+    if parts[-1] == "":
+        parts.pop()
+        return [part + "\n" for part in parts]
+    return [part + "\n" for part in parts[:-1]] + [parts[-1]]
+
+
+def _spill_item_count(kind: str, value: Any, content: str) -> int:
+    if kind in ("array", "object"):
+        return len(value)
+    return len(_spill_text_lines(content))
+
+
+def _spill_slice(kind: str, value: Any, content: str, first: int, last: int) -> str:
+    if kind == "array":
+        return json.dumps(value[first - 1 : last], ensure_ascii=False, default=str)
+    if kind == "object":
+        return json.dumps(
+            dict(list(value.items())[first - 1 : last]),
+            ensure_ascii=False,
+            default=str,
+        )
+    return "".join(_spill_text_lines(content)[first - 1 : last])
+
+
+def spill_read_unavailable(
+    reason: str, item_count: int | None = None
+) -> dict[str, Any]:
+    """Build a classified-failure result for one read_tool_result rejection.
+
+    Returned, not raised: the caller records this dict as the tool
+    observation the model reads, so an exception here would hand the model
+    a framework traceback instead of an explanation it can act on.
+    """
+    if reason == "invalid_range" and item_count is not None:
+        message = f"start exceeds the item count ({item_count})."
+    else:
+        message = SPILL_READ_UNAVAILABLE_MESSAGES[reason]
+    return {"success": False, "is_error": True, "status": "error", "output": message}
+
+
+def strip_reserved_spill_key(result: Any) -> Any:
+    """Drop a caller-supplied spill report before the wrapper can write its own.
+
+    The key is written only by this module. A tool that returns one is either
+    confused or hostile; either way its report must never reach the engine,
+    which cannot tell the two apart. Top level only, matching the two existing
+    reserved-key splitters in core/context_ref.py.
+    """
+    if not isinstance(result, dict) or SPILL_RESERVED_RESULT_KEY not in result:
+        return result
+    logger.warning("Tool returned the reserved spill key; dropping it.")
+    return {k: v for k, v in result.items() if k != SPILL_RESERVED_RESULT_KEY}
+
+
+def _serialized_length(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value)
+    return len(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _spill_children(value: Any) -> list[tuple[Any, Any]] | None:
+    """Return this node's (key, child) pairs, or None if it has no children.
+
+    A string is always a leaf here even when its content happens to parse as
+    JSON: the walk operates on the Python object tree the tool returned,
+    before any parsing of string content. A set is also a leaf -- its
+    unordered elements have no stable path segment to report.
+    """
+    if isinstance(value, dict):
+        return list(value.items())
+    if isinstance(value, (list, tuple)):
+        return list(enumerate(value))
+    return None
+
+
+def _find_spill_points(
+    value: Any, *, max_chars: int, max_recursion: int, depth: int
+) -> list[tuple[tuple[Any, ...], Any]]:
+    """Find the transfer points under one oversized node.
+
+    Called only on a node already known to be oversized. Recurses into
+    children that are themselves oversized; when none are (or the recursion
+    depth or a non-container leaf stops descent), this node itself is the
+    transfer point.
+    """
+    children = _spill_children(value)
+    if children is None or depth >= max_recursion:
+        return [((), value)]
+    oversized_children = [
+        (key, child) for key, child in children if _serialized_length(child) > max_chars
+    ]
+    if not oversized_children:
+        return [((), value)]
+    points: list[tuple[tuple[Any, ...], Any]] = []
+    for key, child in oversized_children:
+        for sub_path, sub_value in _find_spill_points(
+            child, max_chars=max_chars, max_recursion=max_recursion, depth=depth + 1
+        ):
+            points.append(((key, *sub_path), sub_value))
+    return points
+
+
+def _first_tier_spill_points(
+    root: dict[str, Any], *, max_chars: int, max_recursion: int
+) -> list[tuple[tuple[Any, ...], Any]]:
+    """Walk from the root's children -- the root itself is never a point here.
+
+    A root whose children are all individually small but which is still
+    oversized in aggregate (e.g. 400 keys of 400 chars each) produces no
+    points here; that shape is the second tier's job.
+    """
+    points: list[tuple[tuple[Any, ...], Any]] = []
+    for key, child in root.items():
+        if _serialized_length(child) <= max_chars:
+            continue
+        for sub_path, sub_value in _find_spill_points(
+            child, max_chars=max_chars, max_recursion=max_recursion, depth=1
+        ):
+            points.append(((key, *sub_path), sub_value))
+    return points
+
+
+def _dedupe_content_vs_structured(
+    points: list[tuple[tuple[Any, ...], Any]],
+) -> list[tuple[tuple[Any, ...], Any]]:
+    """Only spill the ``content`` subtree when ``structured_content`` mirrors it.
+
+    An MCP result commonly carries the same payload twice, once as the
+    ``content`` text blob and once as ``structured_content``. Content-addressed
+    naming cannot deduplicate them (their encodings differ byte-for-byte), so
+    the choice is made by path instead: drop any point under
+    ``structured_content`` once a point under ``content`` exists.
+    """
+    has_content = any(path and path[0] == "content" for path, _ in points)
+    if not has_content:
+        return points
+    return [
+        (path, value)
+        for path, value in points
+        if not (path and path[0] == "structured_content")
+    ]
+
+
+def _format_value_path(path: tuple[Any, ...]) -> str:
+    if not path:
+        return "(whole result)"
+    parts: list[str] = []
+    for index, segment in enumerate(path):
+        if isinstance(segment, int):
+            parts.append(f"[{segment}]")
+        elif index == 0:
+            parts.append(_sanitize_field_name(segment))
+        else:
+            parts.append(f".{_sanitize_field_name(segment)}")
+    return "".join(parts)
+
+
+def _sanitize_field_name(name: Any) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.\-\[\] ]+", "", str(name))
+    return cleaned[:SPILL_FIELD_NAME_MAX_CHARS]
+
+
+def _sanitize_field_names(names: list[Any] | None) -> list[str] | None:
+    if names is None:
+        return None
+    cleaned = [c for c in (_sanitize_field_name(n) for n in names) if c]
+    return cleaned or None
+
+
+def _spill_payload_for_value(value: Any) -> tuple[str, str, Any]:
+    """Return (payload written verbatim, kind, parsed value for metadata)."""
+    if isinstance(value, str):
+        kind, parsed = _spill_kind_of(value)
+        return value, kind, parsed
+    if isinstance(value, set):
+        value = sorted(value, key=str)
+    if isinstance(value, (list, tuple)):
+        materialized = list(value)
+        payload = json.dumps(materialized, ensure_ascii=False, default=str)
+        return payload, "array", materialized
+    payload = json.dumps(value, ensure_ascii=False, default=str)
+    return payload, "object", value
+
+
+def _record_fields_for(kind: str, parsed: Any) -> list[str] | None:
+    if kind == "array":
+        if parsed and isinstance(parsed[0], dict):
+            return _sanitize_field_names(list(parsed[0].keys()))
+        return None
+    if kind == "object":
+        keys = list(parsed.keys())[:SPILL_MAX_FIELD_NAMES]
+        return _sanitize_field_names(keys)
+    return None
+
+
+def _spill_fitting_prefix(value: Any, limit: int) -> int:
+    """How many leading items fit under `limit` bytes once serialized.
+
+    One pass, no retry: the byte count is accumulated with exactly the
+    separators json.dumps(ensure_ascii=False, default=str) will write, so
+    the count is the final file size, not an estimate. A proportional guess
+    plus backoff was rejected: on a skewed collection (a few large items
+    followed by many small ones) it lands far from the truth, and any fixed
+    retry budget can run out while still over the limit.
+    """
+    item_sep = 2  # json.dumps' default item separator ", "
+    total = 2  # the two enclosing brackets or braces
+    kept = 0
+    entries = value.items() if isinstance(value, dict) else value
+    for entry in entries:
+        if isinstance(value, dict):
+            # Dump the one-pair object and drop its two braces: exact for any
+            # key type, including the int keys json.dumps coerces to strings.
+            piece = (
+                len(
+                    json.dumps(
+                        {entry[0]: entry[1]}, ensure_ascii=False, default=str
+                    ).encode("utf-8")
+                )
+                - 2
+            )
+        else:
+            piece = len(
+                json.dumps(entry, ensure_ascii=False, default=str).encode("utf-8")
+            )
+        step = piece + (item_sep if kept else 0)
+        if total + step > limit:
+            break
+        total += step
+        kept += 1
+    return kept
+
+
+def _truncate_text_bytes(content: str, limit: int) -> bytes:
+    """Truncate UTF-8 text to at most `limit` bytes, staying valid UTF-8.
+
+    Cuts at the last newline within the limit when there is one, so the
+    file keeps ending on a complete line; when there is none, drops the
+    trailing incomplete multi-byte sequence instead of raising.
+    """
+    raw = content.encode("utf-8")
+    if len(raw) <= limit:
+        return raw
+    head = raw[:limit]
+    newline_index = head.rfind(b"\n")
+    if newline_index >= 0:
+        return head[: newline_index + 1]
+    return head.decode("utf-8", errors="ignore").encode("utf-8")
+
+
+def _write_spill_file(spill_dir: str, tool_name: str, payload: str, kind: str) -> str:
+    """Write payload content-addressed under spill_dir; return its relative path.
+
+    Raises OSError on any filesystem failure -- the caller decides how to
+    fall back; this function does not catch.
+    """
+    ext = "json" if kind in ("array", "object") else "txt"
+    sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", tool_name)[:64] or "tool"
+    payload_bytes = payload.encode("utf-8")
+    digest = hashlib.sha256(payload_bytes).hexdigest()[:12]
+    filename = f"{sanitized}-{digest}.{ext}"
+    directory = Path(spill_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / filename
+    if not (target.exists() and target.stat().st_size == len(payload_bytes)):
+        # The tmp name carries a per-call suffix (pid + random hex) so two
+        # concurrent writers of the same content never share one tmp path:
+        # os.replace onto the same target is then just two atomic
+        # overwrites of identical bytes, not a race on who moves it first.
+        tmp = directory / f"{filename}.{os.getpid()}.{uuid4().hex[:8]}.tmp"
+        tmp.write_bytes(payload_bytes)
+        os.replace(tmp, target)
+    return f"{SPILL_DIR_NAME}/{filename}"
+
+
+def _build_spill_record(
+    spill_dir: str, tool_name: str, path: tuple[Any, ...], value: Any
+) -> dict[str, Any] | None:
+    """Build one report record, writing its file.
+
+    Returns None when the point should not be spilled at all: nothing fit
+    under the 8 MiB cap (a single oversized item), or the write itself
+    failed. Both are the caller's cue to leave that value untouched rather
+    than replace it with a placeholder that points nowhere.
+    """
+    original_chars = _serialized_length(value)
+    payload, kind, parsed = _spill_payload_for_value(value)
+    truncated_after_items: int | None = None
+    if len(payload.encode("utf-8")) > SPILL_MAX_FILE_BYTES:
+        if kind == "text":
+            truncated_bytes = _truncate_text_bytes(payload, SPILL_MAX_FILE_BYTES)
+            payload = truncated_bytes.decode("utf-8")
+            truncated_after_items = len(_spill_text_lines(payload))
+        else:
+            kept = _spill_fitting_prefix(parsed, SPILL_MAX_FILE_BYTES)
+            if kept == 0:
+                logger.warning(
+                    "Tool %s produced a single value too large to spill even "
+                    "truncated (kind=%s); leaving it to ordinary truncation.",
+                    tool_name,
+                    kind,
+                )
+                return None
+            parsed = (
+                parsed[:kept] if kind == "array" else dict(list(parsed.items())[:kept])
+            )
+            payload = json.dumps(parsed, ensure_ascii=False, default=str)
+            truncated_after_items = kept
+    try:
+        relative_path = _write_spill_file(spill_dir, tool_name, payload, kind)
+    except OSError:
+        logger.warning(
+            "Failed to write spill file for tool %s; leaving this value to "
+            "ordinary truncation.",
+            tool_name,
+            exc_info=True,
+        )
+        return None
+    item_count = _spill_item_count(kind, parsed, payload)
+    record_fields = _record_fields_for(kind, parsed)
+    return {
+        "relative_path": relative_path,
+        "kind": kind,
+        "item_count": item_count,
+        "original_chars": original_chars,
+        "value_path": _format_value_path(path),
+        "record_fields": record_fields,
+        "truncated_after_items": truncated_after_items,
+    }
+
+
+def _copy_and_set(container: Any, path: tuple[Any, ...], placeholder: Any) -> Any:
+    """Shallow-copy `container` along `path`, replacing the value at `path`.
+
+    Only containers on the path itself are copied; every sibling subtree not
+    on the path keeps its original reference -- the "spill only its own
+    path" half of the no-original-mutation contract.
+    """
+    if not path:
+        return placeholder
+    key, rest = path[0], path[1:]
+    if isinstance(container, dict):
+        new_dict = dict(container)
+        new_dict[key] = _copy_and_set(container[key], rest, placeholder)
+        return new_dict
+    if isinstance(container, list):
+        new_list = list(container)
+        new_list[key] = _copy_and_set(container[key], rest, placeholder)
+        return new_list
+    if isinstance(container, tuple):
+        new_items = list(container)
+        new_items[key] = _copy_and_set(container[key], rest, placeholder)
+        return tuple(new_items)
+    raise TypeError(f"Cannot descend into {type(container)!r} at segment {key!r}")
+
+
+def _second_tier_result(
+    result: dict[str, Any],
+    target: SpillTarget,
+    tool_name: str,
+    budget: SpillRunBudget,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Whole-root spill: the root itself is the one transfer point.
+
+    Applies only when no first-tier point exists and the root is still
+    oversized. The guard makes this tier inapplicable, not merely
+    unwritten, for a waiting-for-user or classified-failure envelope: those
+    shapes are returned byte-identical, with zero files written. A write
+    failure or an exhausted run budget falls back the same way: the whole
+    root is left untouched rather than half-replaced.
+    """
+    if _serialized_length(result) <= target.max_chars:
+        return result, []
+    if tool_result_waits_for_user(result) or is_classified_tool_failure(result):
+        return result, []
+    if budget.files_written >= SPILL_MAX_FILES_PER_RUN:
+        logger.warning(
+            "Spill run budget of %d files reached; leaving this result to "
+            "ordinary truncation.",
+            SPILL_MAX_FILES_PER_RUN,
+        )
+        return result, []
+    record = _build_spill_record(target.spill_dir, tool_name, (), result)
+    if record is None:
+        return result, []
+    budget.files_written += 1
+    new_result: dict[str, Any] = {}
+    for key in SPILL_ENVELOPE_KEYS:
+        if key in result:
+            new_result[key] = result[key]
+    new_result["output"] = SPILL_PLACEHOLDER_TEXT
+    new_result[SPILL_RESERVED_RESULT_KEY] = [record]
+    return new_result, [record]
+
+
+def spill_oversized_values(
+    result: Any,
+    target: SpillTarget | None,
+    *,
+    tool_name: str,
+    max_recursion: int,
+    run_budget: SpillRunBudget | None = None,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Replace oversized values in `result` with a file-backed placeholder.
+
+    `result` itself is never mutated; the return value is either the
+    original object (no spill target, non-dict result, or nothing oversized)
+    or a new object built by copying only the containers on each spilled
+    path (see _copy_and_set). Returns (possibly-new result, report records)
+    -- the records are not yet validated against a registry; that happens at
+    the engine's four gates, not here.
+
+    `run_budget`, when omitted, defaults to a fresh one-call budget: callers
+    that need the 64-file cap to hold across an entire run (every tool
+    result produced while one set of tools is in use) pass the same
+    SpillRunBudget instance to every call.
+    """
+    if target is None or not isinstance(result, dict):
+        return result, []
+    if is_file_ref_like(result):
+        # The public-context sanitizer already reduces a file-ref-shaped
+        # root to SAFE_FILE_REF_KEYS before the model ever sees it, so a
+        # report attached here would be dropped by that same whitelist on
+        # its way out -- an orphaned file with no record pointing at it.
+        # Leaving the root untouched matches what the sanitizer already did
+        # to this shape today.
+        return result, []
+    budget = run_budget if run_budget is not None else SpillRunBudget()
+    first_tier = _dedupe_content_vs_structured(
+        _first_tier_spill_points(
+            result, max_chars=target.max_chars, max_recursion=max_recursion
+        )
+    )
+    if first_tier:
+        new_result: Any = result
+        records: list[dict[str, Any]] = []
+        for index, (path, value) in enumerate(first_tier):
+            if index >= SPILL_MAX_FILES_PER_RESULT:
+                logger.warning(
+                    "Tool %s produced more than %d spill points in one "
+                    "result; the rest are left to ordinary truncation.",
+                    tool_name,
+                    SPILL_MAX_FILES_PER_RESULT,
+                )
+                break
+            if budget.files_written >= SPILL_MAX_FILES_PER_RUN:
+                logger.warning(
+                    "Spill run budget of %d files reached; leaving the "
+                    "remaining values in this result to ordinary truncation.",
+                    SPILL_MAX_FILES_PER_RUN,
+                )
+                break
+            record = _build_spill_record(target.spill_dir, tool_name, path, value)
+            if record is None:
+                continue
+            records.append(record)
+            budget.files_written += 1
+            new_result = _copy_and_set(new_result, path, SPILL_PLACEHOLDER_TEXT)
+        if records:
+            # The report travels with the result itself: add_tool_result's
+            # registration gate reads it from the result dict the wrapper
+            # returns, the same way it does for the whole-root tier.
+            new_result = {**new_result, SPILL_RESERVED_RESULT_KEY: records}
+        return new_result, records
+    return _second_tier_result(result, target, tool_name, budget)
+
+
+def spill_record_shape_is_valid(record: Any) -> bool:
+    """Gate 1: is this a well-formed report record, regardless of truth.
+
+    Checks only the seven-field shape a genuine record always has -- string
+    types, non-negative ints, the three-value kind enum. It says nothing
+    about whether the path is canonical (gate 2) or the file actually
+    exists (gate 3); those are separate, deliberately unmerged checks so a
+    variance in one gate cannot be mistaken for a variance in another.
+    """
+    if not isinstance(record, dict):
+        return False
+    if not isinstance(record.get("relative_path"), str):
+        return False
+    if record.get("kind") not in ("array", "object", "text"):
+        return False
+    for key in ("item_count", "original_chars"):
+        value = record.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return False
+    if not isinstance(record.get("value_path"), str):
+        return False
+    record_fields = record.get("record_fields")
+    if record_fields is not None and not (
+        isinstance(record_fields, list)
+        and all(isinstance(item, str) for item in record_fields)
+    ):
+        return False
+    truncated_after_items = record.get("truncated_after_items")
+    if truncated_after_items is not None and (
+        not isinstance(truncated_after_items, int)
+        or isinstance(truncated_after_items, bool)
+        or truncated_after_items < 0
+    ):
+        return False
+    return True
+
+
+SPILL_OBSERVATION_NOTICE_MAX_CHARS = 1_024
+SPILL_OBSERVATION_NOTICE_MAX_ENTRIES = 8
+COMPACT_SPILL_NOTICE_MAX_CHARS = 1_536
+COMPACT_SPILL_NOTICE_MAX_ENTRIES = 12
+COMPACT_SPILL_NOTICE_PATH_MAX_CHARS = 128
+
+_SPILL_OBSERVATION_NOTICE_HEADER = (
+    "[Large values in this result were stored by the engine instead of being "
+    "truncated. Read one with read_tool_result, using start and end to take "
+    "a range of items; do not state a total, a count, or any per-record "
+    "value you have not actually read.]"
+)
+_SPILL_COMPACTION_NOTICE_HEADER = (
+    "Large tool results from this run were stored by the engine. Read one "
+    "with read_tool_result, using start and end to take a range of items. "
+    "The observations themselves may no longer be in context. Stored "
+    "results:"
+)
+
+
+def _spill_kind_sentence(kind: str, item_count: int) -> str:
+    if kind == "array":
+        return f"a JSON array of {item_count} items"
+    if kind == "object":
+        return f"a JSON object with {item_count} top-level entries"
+    return f"plain text, {item_count} lines"
+
+
+def _spill_record_fields_sentence(kind: str, record_fields: Any) -> str:
+    names = _sanitize_field_names(record_fields)
+    if not names:
+        return ""
+    if kind == "array":
+        label = "Item fields"
+    elif kind == "object":
+        label = "Top-level keys"
+    else:
+        return ""
+    shown = names[:SPILL_MAX_FIELD_NAMES]
+    suffix = ", ..." if len(names) > SPILL_MAX_FIELD_NAMES else ""
+    return f" {label}: {', '.join(shown)}{suffix}."
+
+
+def _render_spill_record_line(
+    record: dict[str, Any], *, path_max_chars: int | None
+) -> str:
+    """Render one report record as a notice line, re-sanitizing at render time.
+
+    Renders from whatever the record claims -- a record reaching here has
+    already passed the engine's four registration gates (or, for the
+    observation notice's own tool result, was just built by this run's own
+    writer) -- but record_fields still goes back through the character
+    whitelist here: a record replayed from an older checkpoint may predate a
+    stricter whitelist, so sanitizing only once at write time is not enough.
+    """
+    relative_path = str(record.get("relative_path", ""))
+    if path_max_chars is not None:
+        relative_path = relative_path[:path_max_chars]
+    value_path = str(record.get("value_path", ""))
+    if value_path != "(whole result)":
+        # The literal marker for the second tier's one transfer point is a
+        # framework constant, never attacker data, and its parentheses fall
+        # outside the field-name character set; only a path built from
+        # dict/list segments (untrusted keys) needs the whitelist pass.
+        value_path = _sanitize_field_name(value_path)
+    kind = record.get("kind", "text")
+    item_count = record.get("item_count", 0)
+    original_chars = record.get("original_chars", 0)
+    line = (
+        f"- {relative_path} at {value_path}: "
+        f"{_spill_kind_sentence(kind, item_count)}, {original_chars} source "
+        "characters."
+    )
+    line += _spill_record_fields_sentence(kind, record.get("record_fields"))
+    truncated_after_items = record.get("truncated_after_items")
+    if truncated_after_items is not None:
+        line += (
+            f" Only the first {truncated_after_items} items were stored; "
+            "the rest did not fit."
+        )
+    return line
+
+
+def render_spill_notice(records: Any, style: str = "observation") -> str:
+    """Render a length-limited notice listing spilled-result files.
+
+    A general "given a set of records, describe them" renderer: the two
+    styles differ only in their prefix sentence and their two limits
+    (entries and characters), so a future caller with its own limits and
+    prefix can reuse this shape. Deduplicates by relative_path, since the
+    same file can appear in more than one caller-supplied record list.
+    """
+    if not records:
+        return ""
+    if style == "compaction":
+        header = _SPILL_COMPACTION_NOTICE_HEADER
+        max_chars = COMPACT_SPILL_NOTICE_MAX_CHARS
+        max_entries = COMPACT_SPILL_NOTICE_MAX_ENTRIES
+        path_max_chars: int | None = COMPACT_SPILL_NOTICE_PATH_MAX_CHARS
+    else:
+        header = _SPILL_OBSERVATION_NOTICE_HEADER
+        max_chars = SPILL_OBSERVATION_NOTICE_MAX_CHARS
+        max_entries = SPILL_OBSERVATION_NOTICE_MAX_ENTRIES
+        path_max_chars = None
+
+    seen_paths: set[Any] = set()
+    deduped: list[dict[str, Any]] = []
+    for record in records:
+        path = record.get("relative_path")
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        deduped.append(record)
+
+    lines = [header]
+    total_chars = len(header)
+    omitted = 0
+    for index, record in enumerate(deduped):
+        if index >= max_entries:
+            omitted = len(deduped) - index
+            break
+        line = _render_spill_record_line(record, path_max_chars=path_max_chars)
+        candidate_total = total_chars + 1 + len(line)
+        if candidate_total > max_chars:
+            omitted = len(deduped) - index
+            break
+        lines.append(line)
+        total_chars = candidate_total
+    if omitted:
+        lines.append(f"- ... {omitted} more stored file(s) omitted")
+    return "\n".join(lines)
