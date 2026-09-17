@@ -12,6 +12,7 @@ from __future__ import annotations
 import builtins
 import json
 import os
+import re
 from collections import ChainMap
 from collections.abc import Mapping
 from pathlib import Path
@@ -40,8 +41,8 @@ from xagent.core.tools.tool_result_spill import (
     strip_reserved_spill_key,
 )
 
-LONG_80 = "a" * 80
-LONG_81 = "a" * 81
+LONG_112 = "a" * 112
+LONG_113 = "a" * 113
 
 NORMALIZE_CASES = [
     (
@@ -77,8 +78,8 @@ NORMALIZE_CASES = [
     ("tool-results/x.json.txt", None),
     ("tool-results/.json", None),
     ("tool-results/a b.json", None),
-    (f"tool-results/{LONG_80}.json", f"tool-results/{LONG_80}.json"),
-    (f"tool-results/{LONG_81}.json", None),
+    (f"tool-results/{LONG_112}.json", f"tool-results/{LONG_112}.json"),
+    (f"tool-results/{LONG_113}.json", None),
     ("tool-results/x\x00.json", None),
     ("", None),
     ("   ", None),
@@ -770,10 +771,12 @@ def test_spill_filename_sanitizes_the_tool_name(tmp_path, tool_name, expected_pr
     )
     filename = records[0]["relative_path"].split("/")[-1]
     assert filename.startswith(expected_prefix + "-")
-    # The rest of the filename is exactly a 12-hex-digit hash + extension.
+    # The rest of the filename is exactly a 32-hex-digit hash + extension.
     suffix = filename[len(expected_prefix) + 1 :]
-    assert len(suffix) == len("012345678910.json")
+    assert len(suffix) == len("0" * 32 + ".json")
     assert suffix.endswith(".json")
+    digest = suffix[: -len(".json")]
+    assert re.fullmatch(r"[0-9a-f]{32}", digest)
 
 
 def test_spill_same_content_reuses_the_same_filename(tmp_path):
@@ -789,6 +792,28 @@ def test_spill_same_content_reuses_the_same_filename(tmp_path):
     assert records_a[0]["relative_path"] == records_b[0]["relative_path"]
     files = list(Path(target.spill_dir).glob("*.json"))
     assert len(files) == 1
+
+
+def test_spill_existing_target_is_not_rewritten(tmp_path):
+    """An existing target is taken as the same content (128-bit content
+    address) and is never rewritten -- even if its bytes were changed after
+    the fact, e.g. by a hash collision or a crash-corrupted leftover."""
+    target = _target(tmp_path)
+    result = {"rows": list(range(60))}
+    _, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    relative_path = records[0]["relative_path"]
+    written_file = Path(target.spill_dir) / relative_path.split("/")[-1]
+    tampered_bytes = b"tampered content, not the real payload"
+    written_file.write_bytes(tampered_bytes)
+
+    _, records_again = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+
+    assert records_again[0]["relative_path"] == relative_path
+    assert written_file.read_bytes() == tampered_bytes
 
 
 def test_spill_different_content_gets_different_filenames(tmp_path):

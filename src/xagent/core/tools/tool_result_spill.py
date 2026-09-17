@@ -47,6 +47,8 @@ SPILL_FIELD_LIST_MAX_CHARS = 400
 SPILL_MAX_FILE_BYTES = 8 * 1024 * 1024
 SPILL_MAX_FILES_PER_RESULT = 8
 SPILL_MAX_FILES_PER_RUN = 64
+# 128-bit prefix; a 48-bit prefix was collidable in seconds.
+SPILL_DIGEST_HEX_CHARS = 32
 SPILL_READ_TOOL_NAME = "read_tool_result"
 SPILL_READ_MAX_CHARS = 12_000
 SPILL_READ_TRUNCATED_INSTRUCTION = (
@@ -90,7 +92,8 @@ SPILL_ENVELOPE_KEYS = (
     "_xagent_context_refs",
 )
 
-_SPILL_FILENAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}\.(json|txt)$")
+# 112 = 64 (tool name) + 1 (separator) + 32 (digest) + slack.
+_SPILL_FILENAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,112}\.(json|txt)$")
 
 
 @dataclass(frozen=True)
@@ -563,18 +566,21 @@ def _truncate_text_bytes(content: str, limit: int) -> bytes:
 def _write_spill_file(spill_dir: str, tool_name: str, payload: str, kind: str) -> str:
     """Write payload content-addressed under spill_dir; return its relative path.
 
+    An existing target is taken as the same content (128-bit content
+    address) and is never rewritten.
+
     Raises OSError on any filesystem failure -- the caller decides how to
     fall back; this function does not catch.
     """
     ext = "json" if kind in ("array", "object") else "txt"
     sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", tool_name)[:64] or "tool"
     payload_bytes = payload.encode("utf-8")
-    digest = hashlib.sha256(payload_bytes).hexdigest()[:12]
+    digest = hashlib.sha256(payload_bytes).hexdigest()[:SPILL_DIGEST_HEX_CHARS]
     filename = f"{sanitized}-{digest}.{ext}"
     directory = Path(spill_dir)
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / filename
-    if not (target.exists() and target.stat().st_size == len(payload_bytes)):
+    if not target.exists():
         # The tmp name carries a per-call suffix (pid + random hex) so two
         # concurrent writers of the same content never share one tmp path:
         # os.replace onto the same target is then just two atomic
