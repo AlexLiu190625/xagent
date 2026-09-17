@@ -170,6 +170,17 @@ CASES: list[tuple[str, str, tuple[str, object]]] = [
     ("2026/09/15", SYDNEY, ("REFUSED", "unsupported_expression")),
     ("15 Sep 2026 T 10:00", SYDNEY, ("REFUSED", "unsupported_expression")),
     ("15 Sep 2026 10h30", SYDNEY, ("REFUSED", "unsupported_expression")),
+    # The 24-hour clock's own optional seconds group, previously unpinned.
+    ("15 Sep 2026 10:00:00", SYDNEY, ("2026-09-15T10:00:00+10:00", True)),
+    # A year under four digits, or a four-digit year starting with zero,
+    # would otherwise let dateutil substitute a century from the machine's
+    # real clock instead of the phrase (see _EN_CALENDAR_DATE's year group).
+    ("1 Jan 90", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("1 Jan 0001", SYDNEY, ("REFUSED", "unsupported_expression")),
+    # "Sept" is one of dateutil's own three September tokens, and a trailing
+    # period on any month name is a spelling dateutil already accepted.
+    ("15 Sept 2026", SYDNEY, ("2026-09-15T00:00:00+10:00", False)),
+    ("15 Sep. 2026", SYDNEY, ("2026-09-15T00:00:00+10:00", False)),
 ]
 
 
@@ -206,7 +217,7 @@ def test_resolve_datetime_returns_the_validated_fold(
 
 
 def test_grammar_table_has_every_case() -> None:
-    assert len(CASES) == 96
+    assert len(CASES) == 101
 
 
 @pytest.mark.parametrize(
@@ -492,6 +503,86 @@ def test_hour_twelve_refusal_is_the_same_with_and_without_a_date() -> None:
     )
 
 
+# All eleven spellings the ruling names as having to keep the *named*
+# hour-twelve wording, not just its reason code: (phrase, expected error).
+# Pinning only the reason code (as CASES does) would let any of these
+# silently drop to the generic wording with a green suite -- confirmed by
+# mutating away the ":SS" group of the 24-hour clock branch, which does
+# exactly that to the seventh entry below.
+EN_HOUR_TWELVE_NAMED_WORDING_CASES: list[tuple[str, str]] = [
+    ("15 Sep 2026 12 pm", "'12pm' names both midnight and noon"),
+    ("15 Sep 2026 12 am", "'12am' names both midnight and noon"),
+    ("15 Sep 2026 12:30 pm", "'12pm' names both midnight and noon"),
+    ("15 Sep 2026 12:30 am", "'12am' names both midnight and noon"),
+    ("Sep 15 2026 12pm", "'12pm' names both midnight and noon"),
+    ("January 1st, 1990 12 am", "'12am' names both midnight and noon"),
+    ("1 Jan 1990 12:00:00 pm", "'12pm' names both midnight and noon"),
+    ("15 Sep 2026 12.30 pm", "'12pm' names both midnight and noon"),
+    ("15 Sep 2026 12 p.m.", "'12pm' names both midnight and noon"),
+    ("15 Sep 2026 012 pm", "'12pm' names both midnight and noon"),
+    ("15 Sep 2026 12 PM", "'12pm' names both midnight and noon"),
+]
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_error"),
+    EN_HOUR_TWELVE_NAMED_WORDING_CASES,
+    ids=[phrase for phrase, _ in EN_HOUR_TWELVE_NAMED_WORDING_CASES],
+)
+def test_hour_twelve_named_wording_for_every_ruled_spelling(
+    phrase: str, expected_error: str
+) -> None:
+    result = resolve_datetime(phrase, SYDNEY)
+
+    assert result["error"] == expected_error
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    ["15 Sep 2026 10 A.M", "15 Sep 2026 11 P.M."],
+)
+def test_zone_misread_am_pm_spelling_is_refused_at_every_hour(phrase: str) -> None:
+    """The zone-name callback, not the whole-phrase pattern, is what refuses
+    these two spellings: dateutil reads the isolated uppercase "M" as a
+    candidate timezone name at any hour, not only at twelve, so
+    _reject_zone_in_phrase raises regardless of what hour precedes it. Their
+    lowercase twins ("10 a.m", "11 p.m.") resolve normally -- this is the
+    same phrase, capitalisation only, reaching a different outcome."""
+    result = resolve_datetime(phrase, SYDNEY)
+
+    assert result["success"] is False
+    assert result["error"] == f"unsupported date or time expression: {phrase!r}"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "15 Sep 2026 10.30 pm",
+        "15 Sep 2026 10.05 am",
+        "15 Sep 2026 10:30.15 pm",
+    ],
+)
+def test_calendar_date_dot_minute_separator_is_refused_off_twelve(
+    phrase: str,
+) -> None:
+    """The "." minute separator survives only for a literal twelve (the
+    third alternative of _EN_CALENDAR_CLOCK): at any other hour dateutil
+    reads the digits after the dot as something other than a minute count --
+    "10.30 pm" would silently drop the 30, "10:30.15 pm" would silently drop
+    the 15 -- so the whole phrase is refused off twelve rather than risk
+    returning a value it never wrote."""
+    result = resolve_datetime(phrase, SYDNEY)
+
+    assert result["success"] is False
+    assert result["error"] == f"unsupported date or time expression: {phrase!r}"
+
+
+def test_calendar_date_dot_minute_separator_still_names_hour_twelve() -> None:
+    result = resolve_datetime("15 Sep 2026 12.30 pm", SYDNEY)
+
+    assert result["error"] == "'12pm' names both midnight and noon"
+
+
 def test_implicit_pm_hour_zero_refuses_with_the_same_shape_as_the_bare_form() -> None:
     """dateutil folds "0:30 am" to hour zero -- the same folded hour an
     hour-twelve reading produces, but this phrase never spells a twelve. The
@@ -564,18 +655,19 @@ def test_calendar_hour_twelve_am_pm_spelling_never_succeeds(
     write down. The sixteen spellings that write the letter and the "m" with
     no whitespace between them reach the hour-twelve guard and get its named
     wording, except the four in _EN_PERIOD_ZONE_MISREAD, which are
-    intercepted earlier by the pre-existing zone-name rejection (see the
-    comment above); every other spelling never reaches the guard at all --
-    the whole-phrase calendar pattern does not admit it, so it gets the
-    generic refusal instead -- but still never succeeds."""
+    intercepted earlier by the pre-existing zone-name rejection and get its
+    generic wording instead (pinned exactly, not merely skipped, so a
+    dateutil upgrade that changed the quirk would be noticed); every other
+    spelling never reaches the guard at all -- the whole-phrase calendar
+    pattern does not admit it, so it gets the generic refusal instead -- but
+    still never succeeds."""
     phrase = f"15 Sep 2026 12{sep}{spelling}"
     result = resolve_datetime(phrase, SYDNEY)
 
     assert result["success"] is False
-    if (
-        _EN_PERIOD_CONNECTED_RE.fullmatch(spelling)
-        and spelling not in _EN_PERIOD_ZONE_MISREAD
-    ):
+    if spelling in _EN_PERIOD_ZONE_MISREAD:
+        assert result["error"] == f"unsupported date or time expression: {phrase!r}"
+    elif _EN_PERIOD_CONNECTED_RE.fullmatch(spelling):
         period = "pm" if spelling[0].lower() == "p" else "am"
         assert result["error"] == f"'12{period}' names both midnight and noon"
 
