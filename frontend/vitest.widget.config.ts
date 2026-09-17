@@ -11,6 +11,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/chat/ChatInput.tsx",
         "src/components/chat/ChatMessage.tsx",
         "src/components/chat/clarification-form.tsx",
+        "src/components/chat/connector-runtime-dialog.tsx",
         "src/components/chat/TraceEventRenderer.tsx",
         "src/components/file/file-preview-content.tsx",
         "src/components/file/file-viewer.tsx",
@@ -30,6 +31,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/hooks/use-websocket.ts",
         "src/lib/api-wrapper.ts",
         "src/lib/auth-cache.ts",
+        "src/lib/connector-runtime-api.ts",
         "src/lib/files-disabled-presentation.ts",
         "src/lib/remark-currency-safe-math.ts",
         "src/lib/remark-preserve-table-content.ts",
@@ -62,6 +64,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/app/widget/chat/[[]token[]]/page-client.tsx": {
           statements: 90, branches: 75, functions: 90, lines: 90,
         },
+        "src/components/chat/connector-runtime-dialog.tsx": {
+          statements: 90, branches: 85, functions: 95, lines: 90,
+        },
         "src/components/widget/session-agent-chat-page.tsx": {
           statements: 90, branches: 85, functions: 75, lines: 90,
         },
@@ -78,6 +83,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
           statements: 85, branches: 80, functions: 90, lines: 85,
         },
         "src/lib/auth-cache.ts": { statements: 90, branches: 80, functions: 90, lines: 90 },
+        "src/lib/connector-runtime-api.ts": {
+          statements: 95, branches: 85, functions: 95, lines: 95,
+        },
         "src/lib/remark-currency-safe-math.ts": {
           statements: 100, branches: 100, functions: 100, lines: 100,
         },
