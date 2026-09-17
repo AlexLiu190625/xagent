@@ -521,36 +521,53 @@ _EN_TIME_RE = re.compile(_EN_TIME)
 # whole here, the way the other twelve rows match theirs. dateutil then only
 # does the date arithmetic for a phrase this pattern has already accepted: it
 # never decides what the grammar accepts. Written out, the accepted shapes are
-#   <day> <month name>[,] <year>   |   <month name> <day>[,] <year>
-#   <day>/<month>/<year> or <day>-<month>-<year>, the year four digits last
-# each optionally followed by one space and a time, which is either
-#   HH:MM[:SS]                     |   H[:MM[:SS]] [am/pm]
-# The am/pm half admits the sixteen spellings that write the letter and the
-# "m" together (am, a.m, am., a.m. and the p forms, in either letter case) --
-# the same set _EN_HOUR_TWELVE_RE covers -- and a leading-zero hour and a "."
-# minute separator. Twelve of those sixteen reach the hour-twelve guard below
-# and get its named wording; the other four ("A.M", "A.M.", "P.M", "P.M.")
-# are intercepted first by the pre-existing zone-name rejection, because
-# dateutil reads a solitary uppercase "M" split from its letter by a period
-# as a candidate timezone name -- they are refused all the same, just with
-# the generic wording instead of the named one. What it refuses at the door
-# is everything dateutil would additionally have accepted on its own: a
-# weekday name, fractional seconds, an eight-digit run, a "." date
-# separator, a year written first, a "T" or "h" separator, and any am/pm
-# spelling whose letters are split by whitespace.
+#   <day> <month name>[.] <year>   |   <month name>[.] <day>[,] <year>
+#   <day>/<month>/<year> or <day>-<month>-<year>
+# the year always four digits and never starting with zero, in every branch,
+# each optionally followed by one space and a time, which is one of
+#   HH:MM[:SS]                                        (24-hour, no am/pm)
+#   H[:MM[:SS]] am/pm                                 (am/pm mandatory here)
+#   a literal twelve, one or two ".NN" groups, am/pm  (am/pm mandatory here too)
+# The am/pm half of the second and third alternatives admits the sixteen
+# spellings that write the letter and the "m" together (am, a.m, am., a.m.
+# and the p forms, in either letter case) -- the same set _EN_HOUR_TWELVE_RE
+# covers. Twelve of those sixteen resolve normally at every hour other than
+# twelve and reach the hour-twelve guard below when the hour is twelve; the
+# other four ("A.M", "A.M.", "P.M", "P.M.") are refused at every hour, not
+# only at twelve, because dateutil reads a solitary uppercase "M" split from
+# its letter by a period as a candidate timezone name rather than the second
+# half of a meridian marker -- "15 Sep 2026 11 p.m." resolves, "15 Sep 2026
+# 11 P.M." does not, same phrase, capitalisation only. At hour twelve those
+# four still reach the guard's callback, just through the zone-name path
+# instead of the wording path, and get the generic refusal instead of the
+# named one.
+# The third alternative exists solely so the hour-twelve spellings that must
+# keep the named wording still reach the guard: it matches nothing but a
+# literal twelve, so nothing it admits can ever resolve (verified by
+# enumerating every hour-string, dot-group count, and period spelling it
+# covers, not by sampling).
+# What the door refuses that dateutil would otherwise have accepted includes,
+# at least: a weekday name, fractional seconds, an eight-digit run, a "."
+# date separator, a year written first, a year under four digits or starting
+# with zero, a "T" or "h" time separator, a space-separated numeric date, a
+# bare hour with no am/pm, a single-digit minute or second, a "." between an
+# hour and its minutes anywhere but the literal-twelve spelling, a leading
+# "on", trailing punctuation, full-width digits, and any am/pm spelling whose
+# letters are split by whitespace or reduced to one letter.
 _EN_MONTH = (
     "january|february|march|april|may|june|july|august|september|october|"
-    "november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec"
+    "november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec"
 )
 _EN_CALENDAR_DAY = r"[0-9]{1,2}(?:st|nd|rd|th)?"
 _EN_CALENDAR_DATE = (
-    rf"(?:{_EN_CALENDAR_DAY} (?:{_EN_MONTH}),? [0-9]{{4}}"
-    rf"|(?:{_EN_MONTH}) {_EN_CALENDAR_DAY},? [0-9]{{4}}"
-    r"|[0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{4})"
+    rf"(?:{_EN_CALENDAR_DAY} (?:{_EN_MONTH})\.? [1-9][0-9]{{3}}"
+    rf"|(?:{_EN_MONTH})\.? {_EN_CALENDAR_DAY},? [1-9][0-9]{{3}}"
+    r"|[0-9]{1,2}[/-][0-9]{1,2}[/-][1-9][0-9]{3})"
 )
 _EN_CALENDAR_CLOCK = (
     r"(?:[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?"
-    r"|[0-9]{1,3}(?:[:.][0-9]{2}){0,2} ?(?:a|p)\.?m\.?)"
+    r"|[0-9]{1,3}(?::[0-9]{2}){0,2} ?(?:a|p)\.?m\.?"
+    r"|0*12(?:\.[0-9]{2}){1,2} ?(?:a|p)\.?m\.?)"
 )
 _EN_CALENDAR_RE = re.compile(
     rf"{_EN_CALENDAR_DATE}(?: {_EN_CALENDAR_CLOCK})?", re.IGNORECASE
@@ -943,8 +960,14 @@ def _read_en_calendar_date(text: str, now_local: datetime) -> Optional[_Reading]
     gate, the phrase is parsed eight times: against two defaults and, for
     each, all four day-first / year-first combinations. dateutil only
     computes the date and time from a phrase the pattern above has already
-    accepted; it no longer decides what counts as a date. Readings that
-    differ across the four combinations are an ambiguous date. A date that
+    accepted, and every shape that pattern admits keeps that computation
+    equal to what the phrase wrote: the year is four digits not starting
+    with zero, so dateutil's own century substitution for a shorter year is
+    never reached, and the pattern's only "." time spelling is restricted to
+    a literal twelve, which never resolves (verified by exhaustive
+    enumeration over every hour-string and dot-group combination it admits,
+    not by sampling). Readings that differ across the four combinations are
+    an ambiguous date. A date that
     follows the default is missing a component. An hour that follows the
     default means the phrase named no time of day. An hour folded onto 0 or
     12 with am/pm and matching _EN_HOUR_TWELVE_RE is refused through the same
