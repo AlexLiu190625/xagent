@@ -171,6 +171,17 @@ type FieldErrorLocation =
  * connector's declaration changed, or a 409 refresh already collapsed the row
  * into "already filled") falls back to the whole dialog rather than being
  * silently dropped.
+ *
+ * Called fresh from render against whatever report the dialog currently
+ * holds, never cached alongside the disposition that produced it. Every
+ * disposition that asks for a refresh (`refresh: true`) is followed by
+ * exactly one `setReport` call from one of three places -- the failed
+ * save's own post-refresh install, the read effect's same-task re-request,
+ * or that same effect's already-visible "met" branch -- and none of them
+ * needs to also re-derive or clear a location: recomputing this on every
+ * render against whatever `report` state currently holds means all three
+ * land on the right answer without any of them knowing this function
+ * exists.
  */
 function locateFieldError(
   report: ConnectorRuntimeReport,
@@ -190,7 +201,13 @@ function locateFieldError(
   // holds — the error would then attach to nothing instead of falling back
   // to the whole-dialog scope this function otherwise guarantees.
   const input = connector.inputs.find(i => i.section === "context" && i.key === key)
-  if (!input) return { scope: "dialog" }
+  // A row the current report already reports satisfied renders the
+  // "already filled" shortcut below instead of an editable control (or any
+  // field-level error), most often because a refresh this same disposition
+  // asked for just collapsed it: attaching here would pick a draft key
+  // nothing on screen renders, so this falls back to the whole dialog
+  // instead, same as a row it cannot find at all.
+  if (!input || input.satisfied) return { scope: "dialog" }
   return {
     scope: "field",
     connectorKey,
@@ -204,7 +221,6 @@ function uniqueKeys(locations: Array<{ key: string }>): string[] {
 
 interface FieldErrorState {
   disposition: ConnectorRuntimeFailureDisposition
-  location: FieldErrorLocation
 }
 
 function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDialogRequest }) {
@@ -310,6 +326,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   }, [visible, pathname, close])
 
   const outcome: DialogOutcome | null = report ? resolveDialogOutcome(report) : null
+  // Re-derived every render against the report currently on screen, rather
+  // than resolved once into `fieldError` and cached there -- see
+  // locateFieldError's own docstring for why a cached location goes stale
+  // the moment any of this dialog's three setReport call sites installs a
+  // fresher report.
+  const activeFieldError = fieldError && report
+    ? { disposition: fieldError.disposition, location: locateFieldError(report, fieldError.disposition) }
+    : null
   const submitItems = report ? buildSubmitItems(report, drafts) : []
   // Only a mark on a row the current report still renders an editable control
   // for may gate submission. A key a refreshed report reports satisfied loses
@@ -415,7 +439,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
 
     if (!result.ok) {
       const disposition = classifySubmitFailure(result, report)
-      setFieldError({ disposition, location: locateFieldError(report, disposition) })
+      setFieldError({ disposition })
       if (!disposition.refresh) {
         setSubmitting(false)
         return
@@ -521,7 +545,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     handleDismiss()
   }
 
-  const dialogFieldError = fieldError && fieldError.location.scope === "dialog" ? fieldError.disposition : null
+  const dialogFieldError = activeFieldError?.location.scope === "dialog" ? activeFieldError.disposition : null
 
   if (!visible || !report || !outcome) return null
 
@@ -553,10 +577,10 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
             {report.connectors.map((connector) => {
               const connectorKey = connectorKeyOf(connector.connector_ref)
               const connectorError =
-                fieldError
-                && fieldError.location.scope === "connector"
-                && fieldError.location.connectorKey === connectorKey
-                  ? fieldError.disposition
+                activeFieldError
+                && activeFieldError.location.scope === "connector"
+                && activeFieldError.location.connectorKey === connectorKey
+                  ? activeFieldError.disposition
                   : null
               const stillMissing =
                 outcome.kind === "fillable"
@@ -582,10 +606,10 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
                     const acceptedKeyName = input.section !== "context" || isAcceptedRuntimeKeyName(input.key)
                     const markLive = hasLiveInvalidObjectMark(connector, input, invalidDraftKeys)
                     const fieldLevelError =
-                      fieldError
-                      && fieldError.location.scope === "field"
-                      && fieldError.location.draftKey === draftKey
-                        ? fieldError.disposition
+                      activeFieldError
+                      && activeFieldError.location.scope === "field"
+                      && activeFieldError.location.draftKey === draftKey
+                        ? activeFieldError.disposition
                         : null
 
                     if (input.section === "context" && input.satisfied) {

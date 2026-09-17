@@ -383,10 +383,13 @@ export function classifySubmitFailure(
       // The connector's own edit endpoint writes a new declaration in place,
       // with no version and no snapshot held by the task -- so the type this
       // dialog read and the type the write endpoint just checked against can
-      // differ. Refreshing here is what lets the row (and the message key
-      // above, next render) pick up the new declaration; without it every
-      // retry keeps failing the same way and the message stays keyed to the
-      // stale type.
+      // differ. Refreshing here is what lets the row pick up the new
+      // declaration on its next render, rather than staying keyed to the
+      // stale one. The messageKey below is still chosen against the
+      // pre-refresh report passed into this call and is not itself
+      // recomputed after the refresh; a submit that fails again against the
+      // new declaration produces a freshly classified disposition either
+      // way, so this only leaves a stale-typed hint on screen until then.
       return {
         messageKey: declaredType === "object" ? "typeObject" : "typeString",
         retry: false,

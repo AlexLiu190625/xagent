@@ -593,13 +593,46 @@ describe("re-reads the report on a type mismatch so a changed declaration takes 
     await waitFor(() => expect(screen.getByLabelText("cfg").tagName).toBe("INPUT"))
 
     expect(screen.getByLabelText("cfg")).toHaveValue("")
-    expect(screen.queryByText(/connectorRuntime\.errors\.type/)).not.toBeInTheDocument()
+    // The rejection itself must still be visible after the refresh installs
+    // the new report: "cfg" is still a context row under the same key, so
+    // the field error re-locates onto it (attached to the row, not dropped)
+    // even though its identity's draft key now embeds the new type.
+    expect(screen.getByText("connectorRuntime.errors.typeObject:{\"key\":\"cfg\"}")).toBeInTheDocument()
 
     fireEvent.change(screen.getByLabelText("cfg"), { target: { value: "plain text" } })
     submitMock.mockResolvedValueOnce(ok(report(true, [])))
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
     await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(2))
     expect(submitMock.mock.calls[1][1]).toEqual([{ connector_ref: REF_A, context: { cfg: "plain text" } }])
+  })
+
+  it("falls back to the whole dialog when a refresh's report drops the row the error was on", async () => {
+    // Same failure as above, but the refresh reports a declaration that no
+    // longer has this key at all (not just a different type): locateFieldError
+    // cannot find any row to attach to, and must fall back to dialog scope
+    // rather than rendering the rejection nowhere.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", required: true })]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("cfg"), { target: { value: '{"a":1}' } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 400, code: "invalid_runtime_context",
+      reason: "type_mismatch.context.cfg", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "other", type: "string", required: true })]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByLabelText("other")).toBeInTheDocument())
+
+    // Whole-dialog scope renders without the {key} interpolation.
+    expect(screen.getByText("connectorRuntime.errors.typeObject")).toBeInTheDocument()
+    expect(screen.queryByText(/connectorRuntime\.errors\.typeObject:/)).not.toBeInTheDocument()
   })
 })
 
@@ -675,10 +708,63 @@ describe("refreshes after a conflict and drops newly satisfied keys", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     await waitFor(() => expect(screen.getByText("connectorRuntime.filled")).toBeInTheDocument())
 
+    // The row the conflict was rejected on just collapsed into "already
+    // filled" and no longer renders a field-level error slot at all; the
+    // rejection must still be visible, re-located onto the whole dialog
+    // instead of disappearing along with the row.
+    expect(screen.getByText("connectorRuntime.errors.conflict")).toBeInTheDocument()
+    expect(screen.queryByText(/connectorRuntime\.errors\.conflict:/)).not.toBeInTheDocument()
+
     submitMock.mockResolvedValueOnce(ok(report(true, [])))
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
     await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(2))
     expect(submitMock.mock.calls[1][1]).toEqual([{ connector_ref: REF_A, context: { b: "2" } }])
+  })
+})
+
+describe("re-locates an existing field error when an already-visible dialog re-reads a met report", () => {
+  it("re-locates an existing field error when an already-visible dialog re-reads a met report", async () => {
+    // Uses a disposition with refresh: false (empty_value) so the only
+    // report swap in this test comes from the read effect's own same-task
+    // re-request below, not from handleSave's own post-failure refresh --
+    // isolating the "does an already-visible dialog re-derive a stale field
+    // error" question this test is about.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "token", type: "string", required: true }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    // A non-empty draft, so the submit gate lets the click through; the
+    // server-side rejection this mocks below is what actually classifies as
+    // empty_value, not a client-side empty draft (buildSubmitItems already
+    // excludes those before a request is even sent).
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 400, code: "invalid_runtime_context",
+      reason: "empty_value.context.token", connectorRef: REF_A,
+    })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.errors.emptyValue:{\"key\":\"token\"}")).toBeInTheDocument())
+
+    // A second terminal frame for the same task finds the report now met
+    // while the field error above is still active.
+    fetchMock.mockResolvedValueOnce(ok(report(true, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "token", type: "string", required: true, satisfied: true }),
+      ]),
+    ])))
+    await openForTask() // same task: a second request, not a remount
+
+    await waitFor(() => expect(screen.getByText("connectorRuntime.filled")).toBeInTheDocument())
+    // The stale field error re-derives against the fresh report instead of
+    // continuing to point at a row identity the refresh folded away: it now
+    // attaches to the whole dialog rather than rendering nowhere.
+    expect(screen.getByText("connectorRuntime.errors.emptyValue")).toBeInTheDocument()
+    expect(screen.queryByText(/connectorRuntime\.errors\.emptyValue:/)).not.toBeInTheDocument()
   })
 })
 
