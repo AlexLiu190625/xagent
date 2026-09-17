@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import re
 from datetime import datetime, timezone
 
@@ -154,6 +155,21 @@ CASES: list[tuple[str, str, tuple[str, object]]] = [
     ("15 Sep 2026 11:59 pm", SYDNEY, ("2026-09-15T23:59:00+10:00", True)),
     ("15 Sep 2026 3:12 pm", SYDNEY, ("2026-09-15T15:12:00+10:00", True)),
     ("15 Sep 2026 11 p.m.", SYDNEY, ("2026-09-15T23:00:00+10:00", True)),
+    # The frozen design's other three calendar-date shapes: month-name-first,
+    # an ordinal day, and both date separators.
+    ("Jan 1 1990", SYDNEY, ("1990-01-01T00:00:00+11:00", False)),
+    ("January 1st, 1990", SYDNEY, ("1990-01-01T00:00:00+11:00", False)),
+    ("25/12/1990", SYDNEY, ("1990-12-25T00:00:00+11:00", False)),
+    ("15-09-2026", SYDNEY, ("2026-09-15T00:00:00+10:00", False)),
+    # Shapes dateutil would accept on its own but the whole-phrase pattern
+    # does not declare: a year written first, an eight-digit run, a "." date
+    # separator, a "T" separator, and an "h" time separator.
+    ("2026 Sep 15", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("20260915", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("15.09.2026", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("2026/09/15", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("15 Sep 2026 T 10:00", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("15 Sep 2026 10h30", SYDNEY, ("REFUSED", "unsupported_expression")),
 ]
 
 
@@ -190,7 +206,7 @@ def test_resolve_datetime_returns_the_validated_fold(
 
 
 def test_grammar_table_has_every_case() -> None:
-    assert len(CASES) == 86
+    assert len(CASES) == 96
 
 
 @pytest.mark.parametrize(
@@ -443,14 +459,15 @@ def test_hour_twelve_refusal_is_the_same_with_and_without_a_date() -> None:
     """The refusal is a property of writing hour twelve with am or pm, not of
     which reader saw the phrase: the calendar path and the bare-time path
     must answer with the same reason code and the same words, in either
-    letter case dateutil accepts. On the calendar-date path, which is the
-    only path that pattern is consulted on, the same wording must also
-    survive the other spellings the widened _EN_HOUR_TWELVE_RE recognises;
-    a spelling it does not recognise ("12h30 pm") must fall back to the
-    generic refusal there rather than silently losing its wording. Those
-    out-of-grammar spellings have no bare-path reading to match: the bare
-    grammar requires a colon, so it never parses an hour from them at
-    all."""
+    letter case dateutil accepts. On the calendar-date path, the same
+    wording must also survive the other spellings _EN_HOUR_TWELVE_RE
+    recognises -- but only for the spellings that reach that guard at all: a
+    spelling the whole-phrase calendar pattern does not admit ("12h30 pm")
+    never gets there. That phrase fails the whole-phrase match itself and is
+    refused generically at the door, not by falling through the hour-twelve
+    guard unrecognised. Those out-of-grammar spellings have no bare-path
+    reading to match either: the bare grammar requires a colon, so it never
+    parses an hour from them at all."""
     bare = resolve_datetime("12 pm", SYDNEY)
     dated = resolve_datetime("15 Sep 2026 12 pm", SYDNEY)
     dated_upper = resolve_datetime("15 Sep 2026 12 PM", SYDNEY)
@@ -488,6 +505,177 @@ def test_implicit_pm_hour_zero_refuses_with_the_same_shape_as_the_bare_form() ->
         assert result["resolution"] == "unsupported_expression"
         assert result["error"] == f"unsupported date or time expression: {phrase!r}"
         assert "supported" in result
+
+
+def _en_period_spellings() -> list[str]:
+    """Every dot/space/letter combination the am/pm half of an English time
+    can be spelled, doubled for letter case: a/p, an optional ".", optional
+    whitespace, an optional "m", and another optional "."."""
+    letters = ("a", "p")
+    seen = {
+        f"{letter}{dot1}{space}{m}{dot2}"
+        for letter, dot1, space, m, dot2 in itertools.product(
+            letters, ("", "."), ("", " "), ("", "m"), ("", ".")
+        )
+    }
+    return sorted(seen | {spelling.upper() for spelling in seen})
+
+
+EN_PERIOD_SPELLINGS = _en_period_spellings()
+# The spellings that write the letter and the "m" with no whitespace between
+# them: the same set _EN_HOUR_TWELVE_RE recognises, and (with one verified
+# exception below) the ones that reach the hour-twelve guard rather than the
+# whole-phrase door refusing them first.
+_EN_PERIOD_CONNECTED_RE = re.compile(r"[ap]\.?m\.?", re.IGNORECASE)
+# Four of the sixteen connected spellings never reach the hour-twelve guard
+# at all: dateutil.parser.parse reads a solitary uppercase "M" split from its
+# letter by a period as a candidate military-timezone name rather than the
+# second half of a meridian marker -- lowercase "m" is never read that way,
+# confirmed directly by calling dateutil with a tzinfos probe ("A.M" invokes
+# it with name="M"; "a.m" invokes it with (None, None)). That routes these
+# four through the pre-existing _reject_zone_in_phrase rejection, which
+# resolve_datetime's generic `except (ValueError, OverflowError)` turns into
+# the same generic refusal every out-of-grammar spelling gets, before
+# dateutil ever finishes parsing an hour to check. The phrase is still
+# refused either way; only the wording differs.
+_EN_PERIOD_ZONE_MISREAD = {"A.M", "A.M.", "P.M", "P.M."}
+
+
+def test_en_period_spellings_table_has_every_cell() -> None:
+    assert len(EN_PERIOD_SPELLINGS) == 60
+    assert len(EN_PERIOD_CASES) == 120
+
+
+EN_PERIOD_CASES: list[tuple[str, str]] = [
+    (sep, spelling) for spelling in EN_PERIOD_SPELLINGS for sep in ("", " ")
+]
+
+
+@pytest.mark.parametrize(
+    ("sep", "spelling"),
+    EN_PERIOD_CASES,
+    ids=[f"{spelling}|sep={sep!r}" for sep, spelling in EN_PERIOD_CASES],
+)
+def test_calendar_hour_twelve_am_pm_spelling_never_succeeds(
+    sep: str, spelling: str
+) -> None:
+    """Hour twelve with am or pm is refused for every dot/space/case spelling
+    of the period word, not only the ones the frozen-design examples use:
+    the refusal must not depend on which sixteen spellings anyone thought to
+    write down. The sixteen spellings that write the letter and the "m" with
+    no whitespace between them reach the hour-twelve guard and get its named
+    wording, except the four in _EN_PERIOD_ZONE_MISREAD, which are
+    intercepted earlier by the pre-existing zone-name rejection (see the
+    comment above); every other spelling never reaches the guard at all --
+    the whole-phrase calendar pattern does not admit it, so it gets the
+    generic refusal instead -- but still never succeeds."""
+    phrase = f"15 Sep 2026 12{sep}{spelling}"
+    result = resolve_datetime(phrase, SYDNEY)
+
+    assert result["success"] is False
+    if (
+        _EN_PERIOD_CONNECTED_RE.fullmatch(spelling)
+        and spelling not in _EN_PERIOD_ZONE_MISREAD
+    ):
+        period = "pm" if spelling[0].lower() == "p" else "am"
+        assert result["error"] == f"'12{period}' names both midnight and noon"
+
+
+_EN_WEEKDAY_CALENDAR_WEEKDAYS = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+_EN_WEEKDAY_CALENDAR_MONTHS = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
+_EN_WEEKDAY_CALENDAR_YEARS = (2025, 2026, 2027)
+EN_WEEKDAY_CALENDAR_PHRASES: list[str] = [
+    f"{weekday} {month} {year}"
+    for weekday in _EN_WEEKDAY_CALENDAR_WEEKDAYS
+    for month in _EN_WEEKDAY_CALENDAR_MONTHS
+    for year in _EN_WEEKDAY_CALENDAR_YEARS
+]
+
+
+def test_en_weekday_calendar_phrases_table_has_every_cell() -> None:
+    assert len(EN_WEEKDAY_CALENDAR_PHRASES) == 252
+
+
+@pytest.mark.parametrize("phrase", EN_WEEKDAY_CALENDAR_PHRASES)
+def test_calendar_date_with_a_weekday_name_never_resolves(phrase: str) -> None:
+    """A weekday name is not one of the day-month-year / month-day-year /
+    slash-or-dash calendar shapes this grammar row declares. Without the
+    whole-phrase gate, dateutil would fold the day the phrase never wrote
+    onto the nearest date matching that weekday relative to whichever
+    default it was parsed against, and the two defaults' folded days would
+    then agree with each other by construction -- so the missing-component
+    check that would normally catch a phrase with no day never fires."""
+    result = resolve_datetime(phrase, SYDNEY)
+
+    assert "resolved" not in result
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Monday 15 Sep 2026",
+        "Tuesday 15 Sep 2026",
+        "Mon 15 Sep 2026",
+        "15 Sep 2026 Monday",
+        "Monday, 15 Sep 2026",
+    ],
+)
+def test_calendar_date_with_a_weekday_name_and_a_day_is_refused(phrase: str) -> None:
+    result = resolve_datetime(phrase, SYDNEY)
+
+    assert result["success"] is False
+    assert result["resolution"] == "unsupported_expression"
+
+
+def test_calendar_date_weekday_only_does_not_invent_the_seventh() -> None:
+    """Without the whole-phrase gate, "Monday Sep 2026" parses against
+    _DEFAULT_A (2000-01-01) to 2026-09-07, the Monday nearest that default's
+    own day -- a date the phrase itself never wrote. The gate must keep that
+    date out of the result entirely, not merely out of a success reading."""
+    result = resolve_datetime("Monday Sep 2026", SYDNEY)
+
+    assert "2026-09-07" not in str(result)
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "15 Sep 2026 10:00:00.5",
+        "15 Sep 2026 10:00:00,5",
+        "15 Sep 2026 10:00:00.123456",
+        "15 Sep 2026 10:00:00.",
+    ],
+)
+def test_calendar_date_fractional_seconds_are_refused(phrase: str) -> None:
+    """A fractional-seconds component is a component the phrase itself
+    carried; dropping it silently would misreport the instant, so the whole
+    phrase is refused rather than rounded or truncated."""
+    result = resolve_datetime(phrase, SYDNEY)
+
+    assert result["success"] is False
+    assert result["resolution"] == "unsupported_expression"
+    assert result["error"] == f"unsupported date or time expression: {phrase!r}"
 
 
 @pytest.mark.parametrize(
