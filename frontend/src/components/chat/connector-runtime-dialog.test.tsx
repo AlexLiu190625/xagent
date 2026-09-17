@@ -1143,6 +1143,41 @@ describe("reports a superseded save-and-resend whose save still landed", () => {
   })
 })
 
+describe("clears a rejected save's error once a later save lands", () => {
+  it("does not show the first rejection after a save-and-resend succeeds and its resend fails", async () => {
+    // First save is rejected (empty_value); the dialog stays open showing
+    // that row's error and never resends. The user then fixes the value and
+    // saves again -- this time the save lands (report comes back met) and
+    // only the resend fails. The first rejection's error must not still be
+    // on screen next to the send-failed panel for a save that succeeded.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-1", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 400, code: "invalid_runtime_context",
+      reason: "empty_value.context.token", connectorRef: REF_A,
+    })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() =>
+      expect(screen.getByText("connectorRuntime.errors.emptyValue:{\"key\":\"token\"}")).toBeInTheDocument(),
+    )
+    expect(sendMessageMock).not.toHaveBeenCalled()
+
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "y" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(new Error("closed"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    expect(screen.queryByText(/connectorRuntime\.errors\.emptyValue/)).not.toBeInTheDocument()
+  })
+})
+
 async function openSimpleDialog(taskId = 1, withStash = true) {
   fetchMock.mockResolvedValueOnce(ok(report(false, [
     connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),

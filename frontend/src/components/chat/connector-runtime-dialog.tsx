@@ -489,6 +489,13 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     }
 
     setReport(result.report)
+    // A save that landed has no rejection left to show, even on the one path
+    // below that renders before this dialog settles (a "save and resend"
+    // whose report comes back met, which awaits the resend before closing):
+    // without this, that rejection would re-derive against the fresh report
+    // and land at whole-dialog scope, next to a send-failed panel for a save
+    // that in fact succeeded.
+    setFieldError(null)
     const newOutcome = resolveDialogOutcome(result.report)
     // Only a met report can carry the resend the primary button promised.
     // `unsupported_only` still lacks a required secret this dialog cannot

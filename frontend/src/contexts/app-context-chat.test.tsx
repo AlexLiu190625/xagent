@@ -7514,6 +7514,50 @@ describe("connector runtime dialog trigger", () => {
     expect(await deliverThenFeed({ type: "task_completed", task_id: 999, task: { id: 999, status: "completed" } })).toBe(false)
   })
 
+  it("still clears the stash for a version-less terminal frame whose text repeats within 30 seconds", async () => {
+    // Dialog/stash resolution runs unconditionally on every terminal frame,
+    // ahead of the bubble-dedup guard, precisely so a frame the guard
+    // collapses still settles the turn. A version-less task_error frame (no
+    // run_id/state_version) keys the guard on its rendered text alone, so a
+    // second one with identical text within the 30-second window is exactly
+    // the case the guard swallows -- if the stash-clearing call were moved
+    // back inside that guard, this second delivery's stash would survive it.
+    sendChatMessageMock.mockResolvedValue({ client_message_id: "turn-a", turn_id: "turn-a" })
+    let send: ((clientMessageId: string) => Promise<void>) | undefined
+    function SendProbe() {
+      const { sendMessage } = useApp()
+      send = (clientMessageId: string) => sendMessage("hello there", { clientMessageId })
+      return null
+    }
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+          <SendProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    const versionLessFrame = {
+      type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 1,
+      task: { id: 1, status: "failed" }, message: "x", error: "x",
+    } as unknown as TestWebSocketMessage
+
+    await act(async () => { await send?.("turn-a") })
+    expect(connectorRuntimeState.payload).not.toBeNull()
+    act(() => { onMessage?.(versionLessFrame) })
+    expect(connectorRuntimeState.payload).toBeNull()
+
+    // A second delivery, then the identical version-less frame again: same
+    // dedup text, still no run_id/state_version, well inside the 30-second
+    // window.
+    await act(async () => { await send?.("turn-b") })
+    expect(connectorRuntimeState.payload).not.toBeNull()
+    act(() => { onMessage?.(versionLessFrame) })
+    expect(connectorRuntimeState.payload).toBeNull()
+  })
+
   it("does not re-render the app tree on dialog state changes", async () => {
     stubConnectorRuntimeGet()
     let appRenderCount = 0
