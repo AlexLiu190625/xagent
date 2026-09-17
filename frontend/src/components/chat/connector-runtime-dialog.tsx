@@ -18,6 +18,7 @@ import { toast } from "@/components/ui/sonner"
 import { Textarea } from "@/components/ui/textarea"
 import { useApp } from "@/contexts/app-context-chat"
 import {
+  NOOP_ACTIONS,
   useConnectorRuntimeDialog,
   type ConnectorRuntimeDialogRequest,
 } from "@/contexts/connector-runtime-dialog-context"
@@ -86,18 +87,34 @@ export function ConnectorRuntimeDialog() {
   const cleanupRef = useRef(retainOnlyTask)
   cleanupRef.current = retainOnlyTask
 
+  // Widget and share pages mount this component with no
+  // ConnectorRuntimeDialogProvider above it by design (see the docstring
+  // above), so retainOnlyTask here is the shared no-op default -- reference-
+  // equal to the module's own constant, since a real provider's action is a
+  // distinct function from useMemo. Neither effect below calls it in that
+  // case: the call would be harmless, but it would also trip the dev-only
+  // "called outside provider" warning that exists to catch an actual wiring
+  // mistake, not this expected shape.
+  const hasProvider = retainOnlyTask !== NOOP_ACTIONS.retainOnlyTask
+  const hasProviderRef = useRef(hasProvider)
+  hasProviderRef.current = hasProvider
+
   // Task-switch cleanup: no cleanup function of its own. Combining this with
   // the unmount effect below into one effect would run the unmount cleanup
   // on every task change too, which would erase a same-render first-gate
   // snapshot before anything could read it.
   useEffect(() => {
+    if (!hasProvider) return
     retainOnlyTask(state.taskId)
-  }, [state.taskId, retainOnlyTask])
+  }, [state.taskId, retainOnlyTask, hasProvider])
 
   // Unmount cleanup: a separate effect with an empty dependency array, read
   // through a ref so it always calls the latest function without needing to
   // be in that array (matches the workforce pages' own unmount-cleanup shape).
-  useEffect(() => () => cleanupRef.current(null), [])
+  // hasProviderRef is read the same way for the same reason.
+  useEffect(() => () => {
+    if (hasProviderRef.current) cleanupRef.current(null)
+  }, [])
 
   if (!request) return null
   return <ConnectorRuntimeDialogBody key={request.taskId} request={request} />

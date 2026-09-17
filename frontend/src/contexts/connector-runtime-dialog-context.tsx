@@ -89,7 +89,11 @@ function warnCalledOutsideProvider(action: string): void {
   )
 }
 
-const NOOP_ACTIONS: ConnectorRuntimeDialogActions = {
+// Exported so a consumer that legitimately expects no provider above it (see
+// ConnectorRuntimeDialog's own mount effect) can tell that case apart from an
+// actual wiring mistake by reference identity, instead of adding a second,
+// provider-shaped field to the context value.
+export const NOOP_ACTIONS: ConnectorRuntimeDialogActions = {
   openForTask: () => warnCalledOutsideProvider("openForTask"),
   close: () => warnCalledOutsideProvider("close"),
   recordDelivery: () => warnCalledOutsideProvider("recordDelivery"),

@@ -1674,3 +1674,23 @@ describe("tells the user when save and resend did not resend", () => {
     expect(toastMock).not.toHaveBeenCalled()
   })
 })
+
+describe("stays quiet when mounted with no provider", () => {
+  it("does not warn when the widget/share shape (no ConnectorRuntimeDialogProvider) mounts and unmounts", async () => {
+    // A widget or share page mounts ConnectorRuntimeDialog with no
+    // ConnectorRuntimeDialogProvider above it by design (see the component's
+    // own docstring); its mount and unmount effects must not call the
+    // no-op default's actions, since doing so would trip the dev-only
+    // "called outside provider" warning that exists to catch an actual
+    // wiring mistake -- not this expected shape. This asserts the console
+    // stays silent through a full mount-then-unmount cycle. A caller that
+    // genuinely reaches an action from outside a provider by some other
+    // path still warns (layout.test.tsx's provider-boundary test covers
+    // that case for openForTask).
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const { unmount } = render(<ConnectorRuntimeDialog />)
+    unmount()
+    expect(warn).not.toHaveBeenCalled()
+    warn.mockRestore()
+  })
+})

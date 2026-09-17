@@ -7208,6 +7208,19 @@ export function AppProvider({
           }}
         >
           {children}
+          {/*
+            A second seam alongside the existing TASK_ERROR_EVENT /
+            TaskErrorController mechanism, not a replacement for it. Three
+            reasons it is not reused here: (1) that event only fires from the
+            task_completed branch above (see emitTaskError), while this
+            dialog is driven by the terminal task_error branch -- a
+            different frame entirely; (2) TaskErrorController is mounted as
+            a sibling of AppProvider (see application-shell.tsx), so it
+            cannot reach useApp() the way this component does; (3) that
+            controller's own file already documents itself as a seam an
+            app-layer overlay may replace, which is not this dialog's role.
+            Do not "consolidate" the two without re-checking all three.
+          */}
           <ConnectorRuntimeDialog />
           </AppContext.Provider>
         </FileAccessProvider>
