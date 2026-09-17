@@ -26,6 +26,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/widget/widget-chrome-controls.tsx",
         "src/contexts/app-context-chat.tsx",
         "src/contexts/auth-context.tsx",
+        "src/contexts/connector-runtime-dialog-context.tsx",
         "src/contexts/file-access-context.tsx",
         "src/hooks/use-file-mention.ts",
         "src/hooks/use-websocket.ts",
@@ -85,6 +86,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/lib/auth-cache.ts": { statements: 90, branches: 80, functions: 90, lines: 90 },
         "src/lib/connector-runtime-api.ts": {
           statements: 95, branches: 85, functions: 95, lines: 95,
+        },
+        "src/contexts/connector-runtime-dialog-context.tsx": {
+          statements: 95, branches: 85, functions: 75, lines: 95,
         },
         "src/lib/remark-currency-safe-math.ts": {
           statements: 100, branches: 100, functions: 100, lines: 100,
@@ -182,6 +186,7 @@ export default defineConfig({
       "src/components/widget/use-widget-session.test.tsx",
       "src/contexts/app-context-chat.test.tsx",
       "src/contexts/auth-context.test.tsx",
+      "src/contexts/connector-runtime-dialog-context.test.tsx",
       "src/contexts/file-access-context.test.tsx",
       "src/hooks/use-file-mention.test.tsx",
       "src/hooks/use-websocket.test.ts",
