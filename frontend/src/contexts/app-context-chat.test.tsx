@@ -7483,7 +7483,17 @@ describe("connector runtime dialog trigger", () => {
     expect(await deliverThenFeed({ type: "task_error", code: "invalid_runtime_context" })).toBe(true)
     expect(await deliverThenFeed({ type: "task_error" })).toBe(true)
     expect(await deliverThenFeed({ type: "error" })).toBe(false)
-    expect(await deliverThenFeed({ type: "agent_error" })).toBe(false)
+    // agent_error's task status is a live DB read from a command-execution
+    // rejection path, not a constant -- it settles the turn when that status
+    // is terminal (completed/failed) and must leave the stash alone when it
+    // only pauses processing (running/paused/waiting_for_user) for a turn
+    // that is still live.
+    for (const status of ["failed", "completed"]) {
+      expect(await deliverThenFeed({ type: "agent_error", task: { id: 1, status } })).toBe(true)
+    }
+    for (const status of ["running", "paused", "waiting_for_user"]) {
+      expect(await deliverThenFeed({ type: "agent_error", task: { id: 1, status } })).toBe(false)
+    }
     for (const type of ["task_paused", "task_waiting_for_user", "task_started", "task_resumed", "task_pause_requested"]) {
       expect(await deliverThenFeed({ type })).toBe(false)
     }

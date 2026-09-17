@@ -5606,10 +5606,14 @@ export function AppProvider({
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
         dispatch({ type: "SET_PROCESSING", payload: false })  // Stop processing on task completion
 
-        if (!isMessageForOtherTask && currentState.taskId) {
+        if (!isMessageForOtherTask && currentState.taskId && isTerminalTaskStatus(taskData.status)) {
           // A settled turn can no longer be resent, whether it succeeded or
           // failed for a reason other than a missing connector input; see
           // the stash lifecycle in connector-runtime-api.ts's docs.
+          // taskData.status is always "completed" or "failed" here
+          // (NormalizedTaskCompletion narrows it), so this reads the same
+          // terminal-status predicate the agent_error branch below reads,
+          // rather than assuming this frame type alone proves settlement.
           connectorRuntimeDialogRef.current.forgetDelivery(currentState.taskId)
         }
 
@@ -5968,6 +5972,18 @@ export function AppProvider({
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
+        if (!isMessageForOtherTask && currentState.taskId && isTerminalTaskStatus(agentErrorTaskStatus)) {
+          // Unlike task_completed and the terminal task_error frame, this
+          // frame type is not on its own proof that the turn is over: its
+          // status is a live DB read from a command-execution rejection path
+          // (see the stash lifecycle docs) and can just as easily be
+          // "running" as "failed". Read the same terminal-status check the
+          // task_completed branch above satisfies unconditionally, so a
+          // frame that only pauses processing (paused, waiting_for_user)
+          // leaves a still-resendable message's stash alone.
+          connectorRuntimeDialogRef.current.forgetDelivery(currentState.taskId)
+        }
+
         dispatch({
           type: "ADD_MESSAGE",
           payload: {
@@ -6016,6 +6032,16 @@ export function AppProvider({
             },
           })
 
+          // errorFrame.isTerminal (message.type === "task_error") is this
+          // family's terminal-status predicate: a task_error frame is only
+          // ever emitted after its lease owner commits a terminal status, so
+          // the frame type itself already reads as terminal here -- unlike
+          // agent_error above, which shares this branch's underlying
+          // task_status field with a live, possibly non-terminal DB read.
+          // The sibling `error` type carries the same task_status field for
+          // an unrelated meaning (a rejection while the turn is still
+          // running), which is why this checks the frame type and not the
+          // status value directly.
           if (errorFrame.isTerminal && !isMessageForOtherTask && currentState.taskId) {
             if (
               errorFrame.terminalErrorCode !== null
