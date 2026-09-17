@@ -517,6 +517,40 @@ _EN_HOURS_LATER_RE = re.compile(
 )
 _EN_TIME_RE = re.compile(_EN_TIME)
 
+# Grammar row 2 (an English calendar date, optionally with a time) is matched
+# whole here, the way the other twelve rows match theirs. dateutil then only
+# does the date arithmetic for a phrase this pattern has already accepted: it
+# never decides what the grammar accepts. Written out, the accepted shapes are
+#   <day> <month name>[,] <year>   |   <month name> <day>[,] <year>
+#   <day>/<month>/<year> or <day>-<month>-<year>, the year four digits last
+# each optionally followed by one space and a time, which is either
+#   HH:MM[:SS]                     |   H[:MM[:SS]] [am/pm]
+# The am/pm half admits the sixteen spellings that write the letter and the
+# "m" together (am, a.m, am., a.m. and the p forms, in either letter case) --
+# the same set _EN_HOUR_TWELVE_RE covers -- and a leading-zero hour and a "."
+# minute separator, so every spelling that reaches the hour-twelve guard below
+# still reaches it. What it refuses at the door is everything dateutil would
+# additionally have accepted on its own: a weekday name, fractional seconds,
+# an eight-digit run, a "." date separator, a year written first, a "T" or "h"
+# separator, and any am/pm spelling whose letters are split by whitespace.
+_EN_MONTH = (
+    "january|february|march|april|may|june|july|august|september|october|"
+    "november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec"
+)
+_EN_CALENDAR_DAY = r"[0-9]{1,2}(?:st|nd|rd|th)?"
+_EN_CALENDAR_DATE = (
+    rf"(?:{_EN_CALENDAR_DAY} (?:{_EN_MONTH}),? [0-9]{{4}}"
+    rf"|(?:{_EN_MONTH}) {_EN_CALENDAR_DAY},? [0-9]{{4}}"
+    r"|[0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{4})"
+)
+_EN_CALENDAR_CLOCK = (
+    r"(?:[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?"
+    r"|[0-9]{1,3}(?:[:.][0-9]{2}){0,2} ?(?:a|p)\.?m\.?)"
+)
+_EN_CALENDAR_RE = re.compile(
+    rf"{_EN_CALENDAR_DATE}(?: {_EN_CALENDAR_CLOCK})?", re.IGNORECASE
+)
+
 # Two defaults that differ in every field a phrase may leave out (year, month,
 # day, hour). A field that follows the default was not in the phrase.
 _DEFAULT_A = datetime(2000, 1, 1, 0, 0, 0)
@@ -885,25 +919,34 @@ def _read_en_time(text: str, now_local: datetime) -> Optional[_Reading]:
 
 
 def _read_en_calendar_date(text: str, now_local: datetime) -> Optional[_Reading]:
-    """Read an English calendar date with dateutil, refusing anything it guessed.
+    """Read an English calendar date, letting dateutil do only the arithmetic.
 
-    The phrase is parsed against two defaults and, for each, all four
-    day-first / year-first combinations. Any zone name or offset inside the
-    phrase raises. Readings that differ across the four combinations are an
-    ambiguous date. A date that follows the default is missing a component.
-    An hour that follows the default means the phrase named no time of day.
-    Whether an hour with am or pm is refused is decided by the hour dateutil
-    actually parsed, not by how the writer spelled it. Its own parsed hour
-    is the reliable witness: an hour written as 1 through 11 never folds
-    onto 0 or 12, so a folded 0 or 12 means the writer wrote a twelve or a
-    zero, and neither can be placed on a twelve-hour clock. The
-    written-twelve reading is refused through the same rule and the same
-    wording as the bare time sub-grammar (_refuse_hour_twelve_with_period). A period word paired with
-    that folded hour but no spelled-out twelve (e.g. "0:30 am") is refused
-    too, but generically: the bare time sub-grammar already refuses that
-    same reading (_en_time's `if not 1 <= hour <= 12: return None`), so this
-    reader must not resolve it either.
+    The whole phrase must first match _EN_CALENDAR_RE; a phrase that does not
+    is not this grammar row at all, and dateutil never sees it. Past that
+    gate, the phrase is parsed eight times: against two defaults and, for
+    each, all four day-first / year-first combinations. dateutil only
+    computes the date and time from a phrase the pattern above has already
+    accepted; it no longer decides what counts as a date. Readings that
+    differ across the four combinations are an ambiguous date. A date that
+    follows the default is missing a component. An hour that follows the
+    default means the phrase named no time of day. An hour folded onto 0 or
+    12 with am/pm and matching _EN_HOUR_TWELVE_RE is refused through the same
+    rule and the same wording as the bare time sub-grammar
+    (_refuse_hour_twelve_with_period); a period word paired with that folded
+    hour but no spelled-out twelve (e.g. "0:30 am") is refused too, but
+    generically: the bare time sub-grammar already refuses that same reading
+    (_en_time's `if not 1 <= hour <= 12: return None`), so this reader must
+    not resolve it either. A microsecond in the parsed result is refused
+    rather than dropped, as a second, independent check: the pattern above
+    already refuses fractional seconds, so this is unreachable today, the
+    same way _read_iso keeps its own second whole-phrase check. A zone name
+    or offset inside the phrase is refused by the tzinfos callback below;
+    the pattern above already refuses every spelling that could carry one,
+    so this too is a second, independent check rather than the phrase's
+    actual gate.
     """
+    if _EN_CALENDAR_RE.fullmatch(text) is None:
+        return None
     readings: dict[datetime, list[datetime]] = {}
     for default in (_DEFAULT_A, _DEFAULT_B):
         for dayfirst in (False, True):
@@ -948,7 +991,14 @@ def _read_en_calendar_date(text: str, now_local: datetime) -> Optional[_Reading]
         # through to the generic refusal, matching what the bare time
         # sub-grammar already does with this same folded hour.
         return None
-    return first.replace(microsecond=0), True
+    if first.microsecond:
+        # Unreachable while the whole-phrase pattern above refuses fractional
+        # seconds; kept as a second, independent check should that pattern
+        # ever be loosened, the same way _read_iso keeps its own second
+        # whole-phrase check. Replacing the microsecond with zero here would
+        # drop a component the phrase itself carried.
+        return None
+    return first, True
 
 
 _READERS = (
