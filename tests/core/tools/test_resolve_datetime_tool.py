@@ -178,9 +178,25 @@ CASES: list[tuple[str, str, tuple[str, object]]] = [
     ("1 Jan 90", SYDNEY, ("REFUSED", "unsupported_expression")),
     ("1 Jan 0001", SYDNEY, ("REFUSED", "unsupported_expression")),
     # "Sept" is one of dateutil's own three September tokens, and a trailing
-    # period on any month name is a spelling dateutil already accepted.
+    # period on any month name is a spelling dateutil already accepted, in
+    # either the day-first or the month-first branch.
     ("15 Sept 2026", SYDNEY, ("2026-09-15T00:00:00+10:00", False)),
     ("15 Sep. 2026", SYDNEY, ("2026-09-15T00:00:00+10:00", False)),
+    ("Sep. 15 2026", SYDNEY, ("2026-09-15T00:00:00+10:00", False)),
+    # The day-first branch's own comma, a shape a person ordinarily writes.
+    ("1 Jan, 1990", SYDNEY, ("1990-01-01T00:00:00+11:00", False)),
+    # The four-digit-year rule holds in the slash/dash branch too, not only
+    # in the two month-name branches: without it dateutil would substitute a
+    # century from the machine's real clock, the same hole closed above.
+    ("25/12/90", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("15-09-0055", SYDNEY, ("REFUSED", "unsupported_expression")),
+    # The general am/pm alternative admits only hours one through eleven; a
+    # zero-padded 24-hour value such as "023" is not one of them, so dateutil
+    # never gets the chance to read it as hour 23 and discard the am/pm word.
+    ("15 Sep 2026 023 am", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("15 Sep 2026 013 pm", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("023 am", SYDNEY, ("REFUSED", "unsupported_expression")),
+    ("013 pm", SYDNEY, ("REFUSED", "unsupported_expression")),
 ]
 
 
@@ -217,7 +233,7 @@ def test_resolve_datetime_returns_the_validated_fold(
 
 
 def test_grammar_table_has_every_case() -> None:
-    assert len(CASES) == 101
+    assert len(CASES) == 109
 
 
 @pytest.mark.parametrize(
