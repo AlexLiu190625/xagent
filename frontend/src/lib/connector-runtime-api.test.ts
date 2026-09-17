@@ -548,6 +548,25 @@ describe("classifySubmitFailure", () => {
       messageKey: "contactAdmin", retry: false, refresh: false, locate: {},
     })
   })
+
+  it("picks the context declaration's type, not a same-named secrets row that comes first in the report", () => {
+    // A secrets-section row named "shared" is listed before the context row
+    // sharing that name: findDeclaredInputType must not let the first
+    // match-by-key-alone win, or a type_mismatch on the context row would
+    // report the secrets row's type instead.
+    const reportWithSecretsFirst = report(false, [
+      connector(REF_A, "A", [
+        input({ section: "secrets", key: "shared", type: "object", required: false }),
+        input({ section: "context", key: "shared", type: "string", required: true }),
+      ]),
+    ])
+    expect(classifySubmitFailure(
+      coded(400, "invalid_runtime_context", "type_mismatch.context.shared", REF_A),
+      reportWithSecretsFirst,
+    )).toEqual({
+      messageKey: "typeString", retry: false, refresh: true, locate: { connectorRef: REF_A, key: "shared" },
+    })
+  })
 })
 
 describe("resolveDialogOutcome", () => {

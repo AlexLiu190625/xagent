@@ -101,6 +101,19 @@ export const NOOP_ACTIONS: ConnectorRuntimeDialogActions = {
   forgetDelivery: () => warnCalledOutsideProvider("forgetDelivery"),
 }
 
+// Silent counterpart to NOOP_ACTIONS: same do-nothing behavior, but without
+// the dev-only warning -- for a consumer that is not itself the wiring this
+// dialog depends on, and so cannot tell a genuine mistake apart from the
+// widget/share pages' expected no-provider shape. useConnectorRuntimeDialogActionsIfMounted
+// returns this instead of NOOP_ACTIONS in that case.
+const NOOP_ACTIONS_SILENT: ConnectorRuntimeDialogActions = {
+  openForTask: () => {},
+  close: () => {},
+  recordDelivery: () => {},
+  retainOnlyTask: () => {},
+  forgetDelivery: () => {},
+}
+
 const NOOP_VALUE: ConnectorRuntimeDialogValue = { request: null, payload: null }
 
 const ConnectorRuntimeDialogActionsContext =
@@ -209,4 +222,20 @@ export function useConnectorRuntimeDialog(): ConnectorRuntimeDialogActions & Con
   const actions = useContext(ConnectorRuntimeDialogActionsContext)
   const value = useContext(ConnectorRuntimeDialogStateContext)
   return { ...actions, ...value }
+}
+
+/**
+ * Same actions as useConnectorRuntimeDialogActions(), for a call site that
+ * may legitimately run with no ConnectorRuntimeDialogProvider above it and
+ * does not want the dev-only "called outside provider" warning that
+ * combination would otherwise trip -- the chat context is mounted on the
+ * widget/share pages, which intentionally omit this provider (see this
+ * module's own top-of-file docstring). A real provider's actions object is
+ * always distinct by reference from NOOP_ACTIONS (the useMemo below never
+ * recreates it), so this can tell the two cases apart without a second
+ * context value, and without every call site adding its own reference check.
+ */
+export function useConnectorRuntimeDialogActionsIfMounted(): ConnectorRuntimeDialogActions {
+  const actions = useContext(ConnectorRuntimeDialogActionsContext)
+  return actions === NOOP_ACTIONS ? NOOP_ACTIONS_SILENT : actions
 }

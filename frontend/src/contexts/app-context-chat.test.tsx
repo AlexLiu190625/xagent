@@ -7335,8 +7335,11 @@ describe("connector runtime dialog trigger", () => {
     })
     expect(apiRequestMock).not.toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
 
-    // A repeated occurrence (same run_id/state_version) is swallowed by the
-    // existing dedup and does not re-open.
+    // A repeated occurrence (same run_id/state_version, so the same bubble
+    // text and occurrence identity) is swallowed by the bubble dedup guard --
+    // but the dialog/stash resolution below it runs unconditionally on every
+    // terminal frame, the same as the task_completed and agent_error sibling
+    // call sites above, so it still re-opens.
     apiRequestMock.mockClear()
     const dup = {
       type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 1,
@@ -7347,7 +7350,9 @@ describe("connector runtime dialog trigger", () => {
     await waitFor(() => expect(apiRequestMock).toHaveBeenCalled())
     apiRequestMock.mockClear()
     act(() => { onMessage?.(dup) })
-    expect(apiRequestMock).not.toHaveBeenCalled()
+    await waitFor(() =>
+      expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+    )
   })
 
   it("stashes a delivered turn for the viewed task only", async () => {
@@ -7596,6 +7601,57 @@ describe("connector runtime dialog trigger", () => {
     await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalled())
     expect(sendChatMessageMock.mock.calls[0][0]).toBe("hello there")
   })
+
+  it("still resolves the dialog for a version-less terminal frame the bubble dedup guard collapses", async () => {
+    // Two frames with the same dedup text and no state_version: the second
+    // has no occurrenceIdentity, so the bubble dedup guard folds it and the
+    // ADD_MESSAGE it would have produced never dispatches. The dialog/stash
+    // resolution must still run for both, not only the first.
+    stubConnectorRuntimeGet()
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    const frame = {
+      type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 1,
+      task: { id: 1, status: "failed" }, message: "x", error: "x",
+      code: "missing_runtime_context", run_id: "run-1",
+      // No state_version: occurrenceIdentity is undefined below, so the
+      // dedup guard keys purely on dedup text.
+    } as TestWebSocketMessage
+
+    act(() => { onMessage?.(frame) })
+    await waitFor(() =>
+      expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+    )
+    apiRequestMock.mockClear()
+
+    // Same dedup text (same code, same generic message/error), a different
+    // run_id, still no state_version: this is exactly what the dedup guard
+    // collapses, and exactly the version-less shape production sees whenever
+    // the task's whole lifetime never emits a versioned control frame.
+    act(() => { onMessage?.({ ...frame, run_id: "run-2" }) })
+    await waitFor(() =>
+      expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+    )
+  })
+
+  // A companion assertion -- this context runs with no
+  // ConnectorRuntimeDialogProvider above it on widget/share pages, and that
+  // must never trip the dev-only "called outside provider" warning -- lives
+  // in connector-runtime-dialog-context.test.tsx instead of here: the
+  // warning is deduplicated by a module-level "already warned about this
+  // action" set (see warnCalledOutsideProvider), and this file's other
+  // suites already exercise plenty of AppProvider trees with no dialog
+  // provider above them, so the very first call here can land after that
+  // set already has every action name in it -- the assertion would pass
+  // whether or not this fix is in place. A dedicated test file gets its own
+  // fresh module instance and does not have that problem.
 })
 
 describe("error frame display projection", () => {

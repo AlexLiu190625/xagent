@@ -316,7 +316,11 @@ function findDeclaredInputType(
       || connector.connector_ref.connector_id !== connectorRef.connector_id
     ) continue
     for (const input of connector.inputs) {
-      if (input.key === key) return input.type
+      // Every type_mismatch reason this backs is section-scoped to "context"
+      // (see locateFieldError in connector-runtime-dialog.tsx, which filters
+      // the same way): without this filter a same-named "secrets" row could
+      // win the search and report that row's declared type instead.
+      if (input.section === "context" && input.key === key) return input.type
     }
   }
   return null

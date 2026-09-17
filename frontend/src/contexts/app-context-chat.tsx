@@ -19,7 +19,7 @@ import {
   FileAccessProvider,
   type FileAccessPolicy,
 } from "@/contexts/file-access-context"
-import { useConnectorRuntimeDialogActions } from "@/contexts/connector-runtime-dialog-context"
+import { useConnectorRuntimeDialogActionsIfMounted } from "@/contexts/connector-runtime-dialog-context"
 import { isConnectorRuntimeDialogTriggerCode } from "@/lib/connector-runtime-api"
 
 interface WebSocketMessage {
@@ -2173,8 +2173,12 @@ export function AppProvider({
   const startDelayedPlaybackRef = useRef<() => void>(() => {})
   // Read through a ref, not a useCallback dependency, so the dialog
   // provider's state changes never change handleMessage's or sendMessage's
-  // identity -- the same shape sessionMessageHandlerRef uses.
-  const connectorRuntimeDialogActions = useConnectorRuntimeDialogActions()
+  // identity -- the same shape sessionMessageHandlerRef uses. Uses the
+  // "if mounted" form, not useConnectorRuntimeDialogActions(): this context
+  // is mounted on the widget/share pages with no ConnectorRuntimeDialogProvider
+  // above it, and every call site below that reads connectorRuntimeDialogRef
+  // legitimately expects that shape rather than a wiring mistake.
+  const connectorRuntimeDialogActions = useConnectorRuntimeDialogActionsIfMounted()
   const connectorRuntimeDialogRef = useRef(connectorRuntimeDialogActions)
   useLayoutEffect(() => {
     connectorRuntimeDialogRef.current = connectorRuntimeDialogActions
@@ -6013,6 +6017,37 @@ export function AppProvider({
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
+        // errorFrame.isTerminal (message.type === "task_error") is this
+        // family's terminal-status predicate: a task_error frame is only
+        // ever emitted after its lease owner commits a terminal status, so
+        // the frame type itself already reads as terminal here -- unlike
+        // agent_error above, which shares this branch's underlying
+        // task_status field with a live, possibly non-terminal DB read.
+        // The sibling `error` type carries the same task_status field for
+        // an unrelated meaning (a rejection while the turn is still
+        // running), which is why this checks the frame type and not the
+        // status value directly.
+        //
+        // Kept outside the bubble-dedup guard below, matching the
+        // task_completed and agent_error settle-task call sites above: a
+        // terminal frame whose dedup text collapses into an existing bubble
+        // (most often a version-less frame, since a version makes the dedup
+        // key occurrence-specific) must still resolve this turn's dialog and
+        // stash even when the bubble it would have added does not render.
+        if (errorFrame.isTerminal && !isMessageForOtherTask && currentState.taskId) {
+          if (
+            errorFrame.terminalErrorCode !== null
+            && isConnectorRuntimeDialogTriggerCode(errorFrame.terminalErrorCode)
+          ) {
+            // Hands this tab's stash to the dialog request and clears it in
+            // the same update: this frame both opens the dialog and settles
+            // the turn. Never forget the stash before this call.
+            connectorRuntimeDialogRef.current.openForTask(currentState.taskId)
+          } else {
+            connectorRuntimeDialogRef.current.forgetDelivery(currentState.taskId)
+          }
+        }
+
         if (
           !isDuplicateMessageForViewedTask(
             errorFrame.dedupText,
@@ -6031,30 +6066,6 @@ export function AppProvider({
               isResult: errorFrame.isResult,
             },
           })
-
-          // errorFrame.isTerminal (message.type === "task_error") is this
-          // family's terminal-status predicate: a task_error frame is only
-          // ever emitted after its lease owner commits a terminal status, so
-          // the frame type itself already reads as terminal here -- unlike
-          // agent_error above, which shares this branch's underlying
-          // task_status field with a live, possibly non-terminal DB read.
-          // The sibling `error` type carries the same task_status field for
-          // an unrelated meaning (a rejection while the turn is still
-          // running), which is why this checks the frame type and not the
-          // status value directly.
-          if (errorFrame.isTerminal && !isMessageForOtherTask && currentState.taskId) {
-            if (
-              errorFrame.terminalErrorCode !== null
-              && isConnectorRuntimeDialogTriggerCode(errorFrame.terminalErrorCode)
-            ) {
-              // Hands this tab's stash to the dialog request and clears it in
-              // the same update: this frame both opens the dialog and settles
-              // the turn. Never forget the stash before this call.
-              connectorRuntimeDialogRef.current.openForTask(currentState.taskId)
-            } else {
-              connectorRuntimeDialogRef.current.forgetDelivery(currentState.taskId)
-            }
-          }
         }
         break
       }
