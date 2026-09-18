@@ -7590,6 +7590,9 @@ describe("connector runtime dialog trigger", () => {
     await waitFor(() => expect(connectorRuntimeState.request).not.toBeNull())
     expect(appRenderCount).toBe(0)
 
+    act(() => { dialogActions?.stagePendingDelivery({ taskId: 1, clientMessageId: "x", text: "hi" }) })
+    expect(appRenderCount).toBe(0)
+
     act(() => { dialogActions?.recordDelivery({ taskId: 1, clientMessageId: "x", text: "hi" }) })
     expect(appRenderCount).toBe(0)
 

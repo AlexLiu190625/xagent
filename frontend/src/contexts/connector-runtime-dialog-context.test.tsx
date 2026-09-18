@@ -2,19 +2,23 @@ import React from "react"
 import { act, cleanup, render } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
+const authUserRef = { current: { id: "u1" } as { id: string } | null }
 vi.mock("@/contexts/auth-context", () => ({
-  useAuth: () => ({ user: { id: "u1" } }),
+  useAuth: () => ({ user: authUserRef.current }),
 }))
 
 import {
   ConnectorRuntimeDialogProvider,
+  useConnectorRuntimeDialog,
   useConnectorRuntimeDialogActions,
   useConnectorRuntimeDialogActionsIfMounted,
   type ConnectorRuntimeDialogActions,
+  type ConnectorRuntimeDialogValue,
 } from "./connector-runtime-dialog-context"
 
 afterEach(() => {
   cleanup()
+  authUserRef.current = { id: "u1" }
 })
 
 describe("useConnectorRuntimeDialogActionsIfMounted", () => {
@@ -83,5 +87,151 @@ describe("useConnectorRuntimeDialogActionsIfMounted", () => {
       </ConnectorRuntimeDialogProvider>,
     )
     expect(ifMounted).toBe(plain)
+  })
+})
+
+describe("pending candidate state machine", () => {
+  let latestActions: ConnectorRuntimeDialogActions
+  let latestState: ConnectorRuntimeDialogValue
+
+  function Probe() {
+    latestActions = useConnectorRuntimeDialog()
+    latestState = useConnectorRuntimeDialog()
+    return null
+  }
+
+  function renderProbe() {
+    return render(
+      <ConnectorRuntimeDialogProvider>
+        <Probe />
+      </ConnectorRuntimeDialogProvider>,
+    )
+  }
+
+  it("promotes a staged candidate to the stash once its delivery is recorded (transition)", () => {
+    renderProbe()
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-1", text: "hi" })
+    })
+    expect(latestState.payload).toBeNull()
+    act(() => {
+      latestActions.recordDelivery({ taskId: 1, clientMessageId: "cm-1", text: "hi" })
+    })
+    expect(latestState.payload).toEqual({ taskId: 1, clientMessageId: "cm-1", text: "hi", files: [] })
+  })
+
+  it("withdraws a staged candidate on discard, so its late delivery is not recorded (cancellation)", () => {
+    renderProbe()
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-1", text: "hi" })
+    })
+    act(() => {
+      latestActions.discardPendingDelivery("cm-1")
+    })
+    // The send that staged this candidate threw or returned early; its
+    // delivery acknowledgement arriving late must not resurrect the stash --
+    // recordDelivery only redeems a ticket that is still outstanding.
+    act(() => {
+      latestActions.recordDelivery({ taskId: 1, clientMessageId: "cm-1", text: "hi" })
+    })
+    expect(latestState.payload).toBeNull()
+  })
+
+  it("drops a staged candidate when its task settles, so a late delivery is not recorded (settlement discard)", () => {
+    renderProbe()
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-1", text: "hi" })
+    })
+    // A non-triggering settlement frame (task_completed, or a task_error not
+    // in the trigger set) reaches forgetDelivery, not openForTask.
+    act(() => {
+      latestActions.forgetDelivery(1)
+    })
+    act(() => {
+      latestActions.recordDelivery({ taskId: 1, clientMessageId: "cm-1", text: "hi" })
+    })
+    expect(latestState.payload).toBeNull()
+  })
+
+  it("does not claim either of two in-flight candidates for the same task (T5)", () => {
+    renderProbe()
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-1", text: "first" })
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-2", text: "second" })
+    })
+    act(() => {
+      latestActions.openForTask(1)
+    })
+    expect(latestState.request?.resendPayload).toBeNull()
+  })
+
+  it("prefers a staged candidate over an already-confirmed stash (T6)", () => {
+    renderProbe()
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-old", text: "old" })
+    })
+    act(() => {
+      latestActions.recordDelivery({ taskId: 1, clientMessageId: "cm-old", text: "old" })
+    })
+    // A second turn sent afterward is staged but not yet acknowledged when
+    // the triggering terminal frame arrives.
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-new", text: "new" })
+    })
+    act(() => {
+      latestActions.openForTask(1)
+    })
+    expect(latestState.request?.resendPayload).toEqual({
+      taskId: 1, clientMessageId: "cm-new", text: "new", files: [],
+    })
+  })
+
+  it("never claims a candidate staged for a different task (T7)", () => {
+    renderProbe()
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-1", text: "hi" })
+    })
+    act(() => {
+      latestActions.openForTask(2)
+    })
+    expect(latestState.request?.resendPayload).toBeNull()
+    // Task 1's own candidate is untouched by task 2's settlement.
+    act(() => {
+      latestActions.openForTask(1)
+    })
+    expect(latestState.request?.resendPayload).toEqual({
+      taskId: 1, clientMessageId: "cm-1", text: "hi", files: [],
+    })
+  })
+
+  it("clears a pending candidate when the task it belongs to is switched away from (T8)", () => {
+    renderProbe()
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-1", text: "hi" })
+    })
+    act(() => {
+      latestActions.retainOnlyTask(2)
+    })
+    act(() => {
+      latestActions.openForTask(1)
+    })
+    expect(latestState.request?.resendPayload).toBeNull()
+  })
+
+  it("clears a pending candidate when the signed-in identity changes (T8)", () => {
+    const { rerender } = renderProbe()
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-1", text: "hi" })
+    })
+    authUserRef.current = { id: "u2" }
+    rerender(
+      <ConnectorRuntimeDialogProvider>
+        <Probe />
+      </ConnectorRuntimeDialogProvider>,
+    )
+    act(() => {
+      latestActions.openForTask(1)
+    })
+    expect(latestState.request?.resendPayload).toBeNull()
   })
 })

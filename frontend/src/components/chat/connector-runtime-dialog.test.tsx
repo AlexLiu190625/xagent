@@ -116,13 +116,27 @@ async function openForTask(taskId = 1) {
 // it), so this mirrors that with two acts rather than one -- batching both
 // into a single act would not exercise the same "read the already-committed
 // stash" path openForTask's handoff depends on.
+//
+// recordDelivery only writes the stash for a clientMessageId it has a
+// staged ticket for (production always stages before it ever records, in
+// sendMessage), so every direct recordDelivery call in this file goes
+// through stageThenRecord below instead of calling it bare.
+async function stageThenRecord(
+  delivery: { taskId: number; clientMessageId: string; text: string; files?: File[] },
+) {
+  await act(async () => {
+    latestActions.stagePendingDelivery(delivery)
+  })
+  await act(async () => {
+    latestActions.recordDelivery(delivery)
+  })
+}
+
 async function recordThenOpen(
   delivery: { taskId: number; clientMessageId: string; text: string; files?: File[] },
   taskId = delivery.taskId,
 ) {
-  await act(async () => {
-    latestActions.recordDelivery(delivery)
-  })
+  await stageThenRecord(delivery)
   await act(async () => {
     latestActions.openForTask(taskId)
   })
@@ -1269,15 +1283,14 @@ describe("clears the stash when the dialog closes", () => {
     // is the only way to put a non-null payload in front of the close click
     // below -- without it this assertion would pass even if closing stopped
     // clearing the stash).
-    await act(async () => {
-      latestActions.recordDelivery({ taskId: 1, clientMessageId: "late-clean", text: "hi" })
-    })
+    await stageThenRecord({ taskId: 1, clientMessageId: "late-clean", text: "hi" })
     fireEvent.click(screen.getByRole("button", { name: "Close" }))
     await waitFor(() => expect(latestState).toEqual({ request: null, payload: null }))
     cleanup()
 
     // Read failure while a delivery lands mid-read: the stash it wrote survives.
     fetchMock.mockImplementationOnce(async () => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "late", text: "hi" })
       latestActions.recordDelivery({ taskId: 1, clientMessageId: "late", text: "hi" })
       return { ok: false, kind: "http", status: 500 }
     })
@@ -1296,6 +1309,7 @@ describe("clears the stash when the dialog closes", () => {
     let resentId: string | undefined
     sendMessageMock.mockImplementationOnce(async (text, config) => {
       resentId = config?.clientMessageId
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: resentId as string, text })
       latestActions.recordDelivery({ taskId: 1, clientMessageId: resentId as string, text })
     })
     fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
@@ -1328,9 +1342,7 @@ describe("clears the stash at the task-switch and reset cleanup points", () => {
       // already claimed into the request on open -- without this, `payload`
       // would already be null before the switch below, and this assertion
       // would pass even if switching tasks stopped narrowing the stash.
-      await act(async () => {
-        latestActions.recordDelivery({ taskId: 1, clientMessageId: "still-here", text: "hi" })
-      })
+      await stageThenRecord({ taskId: 1, clientMessageId: "still-here", text: "hi" })
       await act(async () => { latestActions.retainOnlyTask(2) })
       expect(latestState).toEqual({ request: null, payload: null })
     }],
@@ -1346,7 +1358,10 @@ describe("clears the stash at the task-switch and reset cleanup points", () => {
       appStateRef.taskId = null
       const toggle = render(providerTree())
       toggle.rerender(<ConnectorRuntimeDialogProvider><Probe mounted={false} /></ConnectorRuntimeDialogProvider>)
-      await act(async () => { latestActions.recordDelivery({ taskId: 1, clientMessageId: "x", text: "hi" }) })
+      await act(async () => {
+        latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "x", text: "hi" })
+        latestActions.recordDelivery({ taskId: 1, clientMessageId: "x", text: "hi" })
+      })
       toggle.rerender(providerTree())
       await waitFor(() => expect(latestState.payload).toBeNull())
     }],
@@ -1635,7 +1650,7 @@ describe("does not open off the host routes", () => {
     const first = renderHarness()
     await openForTask()
     await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
-    await act(async () => { latestActions.recordDelivery({ taskId: 1, clientMessageId: "z", text: "hi" }) })
+    await stageThenRecord({ taskId: 1, clientMessageId: "z", text: "hi" })
     // "not-shown"/"resent" also keep the stash, so only a spy on the actual
     // argument proves this passed "left-host".
     const closeSpy = vi.spyOn(latestActions, "close")
