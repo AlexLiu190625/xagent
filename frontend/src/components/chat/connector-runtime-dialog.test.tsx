@@ -725,6 +725,34 @@ describe("flags a non-object JSON draft on blur and does not submit it", () => {
   })
 })
 
+describe("flags an empty JSON object on blur as invalid and disables submit with a reason", () => {
+  it("flags an empty JSON object on blur as invalid and disables submit with a reason", async () => {
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "config", type: "object", required: true })]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    const field = screen.getByLabelText("config")
+
+    // `{}` is valid JSON and an object, but buildSubmitItems drops it as the
+    // object-draft equivalent of a blank string, so this must mark the row
+    // invalid too -- with a message distinct from "not valid JSON" -- rather
+    // than leaving the row looking fine while the save button silently stays
+    // disabled with no explanation on screen.
+    fireEvent.change(field, { target: { value: "{}" } })
+    fireEvent.blur(field)
+    expect(screen.getByText("connectorRuntime.objectEmpty")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.objectInvalid")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeDisabled()
+
+    fireEvent.change(field, { target: { value: '{"a":1}' } })
+    fireEvent.blur(field)
+    expect(screen.queryByText("connectorRuntime.objectEmpty")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).not.toBeDisabled()
+  })
+})
+
 describe("refreshes after a conflict and drops newly satisfied keys", () => {
   it("refreshes after a conflict and drops newly satisfied keys", async () => {
     fetchMock.mockResolvedValueOnce(ok(report(false, [

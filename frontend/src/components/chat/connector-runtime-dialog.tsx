@@ -32,6 +32,7 @@ import {
   isAcceptedRuntimeKeyName,
   isConnectorRuntimeDialogHostPath,
   isSubmitEnabled,
+  isSubmittableObjectValue,
   isTypeMismatchDispositionStale,
   resolveDialogActions,
   resolveDialogOutcome,
@@ -139,6 +140,13 @@ function connectorKeyOf(ref: { connector_type: string; connector_id: number }): 
   return `${ref.connector_type}:${ref.connector_id}`
 }
 
+// Why a draft failed the object-field blur check: "invalid" for anything
+// that is not JSON-object-shaped, "empty" for `{}`, which parses fine but
+// isSubmittableObjectValue (connector-runtime-api.ts) rejects because the
+// server treats it as a blank context value. The row's error message reads
+// this to show the reason-specific hint instead of a generic one.
+type InvalidObjectDraftReason = "invalid" | "empty"
+
 /**
  * Whether an invalid-object mark for this input is still live. Only a
  * `context` row the current report leaves unsatisfied and still declares
@@ -151,7 +159,7 @@ function connectorKeyOf(ref: { connector_type: string; connector_id: number }): 
 function hasLiveInvalidObjectMark(
   connector: ConnectorRuntimeConnector,
   input: ConnectorRuntimeInput,
-  invalidDraftKeys: Set<string>,
+  invalidDraftKeys: Map<string, InvalidObjectDraftReason>,
 ): boolean {
   return (
     input.section === "context"
@@ -250,7 +258,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const [report, setReport] = useState<ConnectorRuntimeReport | null>(null)
   const [visible, setVisible] = useState(false)
   const [drafts, setDrafts] = useState<Record<string, string>>({})
-  const [invalidDraftKeys, setInvalidDraftKeys] = useState<Set<string>>(new Set())
+  const [invalidDraftKeys, setInvalidDraftKeys] = useState<Map<string, InvalidObjectDraftReason>>(new Map())
   const [submitting, setSubmitting] = useState(false)
   const [fieldError, setFieldError] = useState<FieldErrorState | null>(null)
   const [lastAlsoResend, setLastAlsoResend] = useState(false)
@@ -389,18 +397,25 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
 
   const handleObjectBlur = (connector: ConnectorRuntimeConnector, input: ConnectorRuntimeInput, value: string) => {
     const draftKey = connectorRuntimeInputDraftKey(connector.connector_ref, input.section, input.key, input.type)
-    let invalid = false
+    let reason: InvalidObjectDraftReason | null = null
     if (value.trim() !== "") {
       try {
         const parsed: unknown = JSON.parse(value)
-        invalid = typeof parsed !== "object" || parsed === null || Array.isArray(parsed)
+        // Same predicate buildSubmitItems filters on, so a draft this marks
+        // valid is never the one buildSubmitItems silently drops. A value
+        // that fails it for being array/null/non-object is "invalid"; one
+        // that is object-shaped but empty is "empty" -- the row's error
+        // message tells the two apart.
+        if (!isSubmittableObjectValue(parsed)) {
+          reason = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? "empty" : "invalid"
+        }
       } catch {
-        invalid = true
+        reason = "invalid"
       }
     }
     setInvalidDraftKeys((prev) => {
-      const next = new Set(prev)
-      if (invalid) next.add(draftKey)
+      const next = new Map(prev)
+      if (reason) next.set(draftKey, reason)
       else next.delete(draftKey)
       return next
     })
@@ -707,7 +722,13 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
                           />
                         )}
                         {markLive && (
-                          <p className="text-sm text-destructive">{t("connectorRuntime.objectInvalid")}</p>
+                          <p className="text-sm text-destructive">
+                            {t(
+                              invalidDraftKeys.get(draftKey) === "empty"
+                                ? "connectorRuntime.objectEmpty"
+                                : "connectorRuntime.objectInvalid",
+                            )}
+                          </p>
                         )}
                         <p className="text-sm text-muted-foreground">{t("connectorRuntime.contextNote")}</p>
                         {!acceptedKeyName && (

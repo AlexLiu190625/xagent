@@ -4943,6 +4943,7 @@ const zh = {
     unsupportedNote: "当前版本还不支持在网页聊天里填写这一类输入。",
     keyNameWarning: "这个键名不符合服务器的要求，保存会失败；请联系连接器的属主改名。在改名之前这个连接器每次都会失败。",
     objectInvalid: "请输入合法的 JSON 对象。",
+    objectEmpty: "不能是空对象。",
     onlyUnsupportedNotice: "这个连接器还缺少这个弹窗填不了的输入，当前版本请改用 SDK 或外部 API。",
     onlyUnsupportedRemaining: "这个连接器还需要 {keys}，当前版本请改用 SDK 或外部 API。",
     savedNotResentUnsupported: "值已保存，但这条消息没有重发：这个连接器还需要 {keys}，当前版本请改用 SDK 或外部 API。",

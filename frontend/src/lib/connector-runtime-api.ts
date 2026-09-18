@@ -605,6 +605,20 @@ export function connectorRuntimeInputDraftKey(
 }
 
 /**
+ * Whether a parsed JSON value is an object-typed context draft worth
+ * submitting: a plain object (not an array, not null) with at least one key.
+ * An empty object parses as valid JSON, but the server's own blank check
+ * (`not value` for an object-typed context field) treats `{}` as empty and
+ * 400s the whole submission, taking every other filled-in key in the same
+ * batch down with it -- so this is the one predicate both the dialog's blur
+ * validation and buildSubmitItems below read, instead of each hand-rolling
+ * its own "is this submittable" check and drifting apart on `{}`.
+ */
+export function isSubmittableObjectValue(parsed: unknown): boolean {
+  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) && Object.keys(parsed).length > 0
+}
+
+/**
  * The context-section items worth submitting: unsatisfied, non-blank. Reads
  * `section === "context"` explicitly rather than `!satisfied` alone --
  * `secrets`/`auth_selector` rows are also always `satisfied: false` in this
@@ -643,12 +657,7 @@ export function buildSubmitItems(
         } catch {
           continue
         }
-        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue
-        // An empty object is the object-draft equivalent of a blank string:
-        // the server's own blank check (`not value` for an object-typed
-        // context field) treats `{}` as empty and 400s the whole submission,
-        // taking every other filled-in key in the same batch down with it.
-        if (Object.keys(parsed).length === 0) continue
+        if (!isSubmittableObjectValue(parsed)) continue
         context[input.key] = parsed
       }
     }
