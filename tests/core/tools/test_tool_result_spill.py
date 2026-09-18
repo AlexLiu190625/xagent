@@ -688,6 +688,18 @@ def test_cycle_three_levels_down_is_left_to_the_output_filter(tmp_path):
     assert not Path(target.spill_dir).exists()
 
 
+def test_self_referential_root_is_left_untouched(tmp_path):
+    root: dict = {"pad": "x" * 10}
+    root["self"] = root
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        root, target, tool_name="acme", max_recursion=20
+    )
+    assert spilled is root
+    assert records == []
+    assert not Path(target.spill_dir).exists()
+
+
 def test_bytes_value_is_not_spilled_and_leaves_no_file(tmp_path, caplog):
     result = {"blob": b"\xff" * 200}
     target = _target(tmp_path)
@@ -703,8 +715,14 @@ def test_bytes_value_is_not_spilled_and_leaves_no_file(tmp_path, caplog):
     assert any("binary value" in message for message in caplog.messages)
 
 
-@pytest.mark.parametrize("blob", [bytearray(b"\xff" * 200), memoryview(b"\xff" * 200)])
-def test_bytearray_and_memoryview_are_not_spilled(tmp_path, blob):
+def test_bytearray_is_not_spilled_and_leaves_no_file(tmp_path):
+    # memoryview is deliberately not covered here: str(memoryview(...)) is a
+    # short pointer repr ("<memory at 0x...>") regardless of buffer size, so
+    # it can never make _serialized_length report it as oversized -- there is
+    # no input that gets a memoryview chosen as a spill point in the first
+    # place, so a parametrize case for it would never reach the code this
+    # test exists to cover.
+    blob = bytearray(b"\xff" * 200)
     result = {"blob": blob}
     target = _target(tmp_path)
     spilled, records = spill_oversized_values(
