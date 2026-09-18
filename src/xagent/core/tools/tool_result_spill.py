@@ -73,10 +73,15 @@ SPILL_READ_UNAVAILABLE_MESSAGES = {
 # The union of every key the two OutputFilteredToolWrapper bypass branches
 # write back (output_filter_wrapper.py's waiting-for-user and
 # classified-failure branches), plus the two reserved control keys
-# core/context_ref.py splits out of a tool result. Whole-root spill (the
-# second tier) copies whichever of these are present on the original root
-# before replacing "output" with the placeholder, so neither bypass branch
-# loses the fields it reads.
+# core/context_ref.py splits out of a tool result. Neither bypass shape ever
+# reaches whole-root spill itself: _spill_is_exempt_envelope excludes both at
+# the module entry point, before either tier runs. What does still reach the
+# second tier is a root that merely carries one or more of these same field
+# names without meeting that exemption test -- e.g. failure_code alone, with
+# no is_error/success pair (test_second_tier_applies_to_non_classified_envelope).
+# Whole-root spill copies whichever of these are present on such a root
+# before replacing "output" with the placeholder, so those fields are not
+# silently dropped along with everything else.
 SPILL_ENVELOPE_KEYS = (
     "status",
     "interaction_id",
@@ -916,11 +921,15 @@ def spill_oversized_values(
     """Replace oversized values in `result` with a file-backed placeholder.
 
     `result` itself is never mutated; the return value is either the
-    original object (no spill target, non-dict result, or nothing oversized)
-    or a new object built by copying only the containers on each spilled
-    path (see _copy_and_set). Returns (possibly-new result, report records)
-    -- the records are not yet validated against a registry; that happens at
-    the engine's four gates, not here.
+    original object -- unchanged, for any of: no spill target, a non-dict
+    result, a file-ref-shaped root, an exempt envelope (waiting-for-user or
+    classified failure, see _spill_is_exempt_envelope), a root that cannot
+    be measured (a reference cycle or nesting past the recursion limit), or
+    simply nothing oversized -- or a new object built by copying only the
+    containers on each spilled path (see _copy_and_set). Returns
+    (possibly-new result, report records) -- the records are not yet
+    validated against a registry; that happens at the engine's four gates,
+    not here.
 
     `run_budget`, when omitted, defaults to a fresh one-call budget: callers
     that need the 64-file cap to hold across an entire run (every tool

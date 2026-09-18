@@ -1,10 +1,11 @@
-"""Tests for the tool-result-spill path primitives.
+"""Tests for the tool-result-spill module.
 
-Covers the two pure path functions used by every caller that needs to
-address a spilled-result file: the writer, the engine's registration gate,
-and the read tool. Both functions are pure -- no filesystem access for
-``normalize_spilled_relative_path``, and a bounded, side-effect-free lookup
-for ``resolve_spilled_under``.
+Covers the whole module: the two pure path primitives shared by the writer,
+the engine's registration gate, and the read tool
+(``normalize_spilled_relative_path`` / ``resolve_spilled_under``); the
+walk/write path that decides what gets spilled and writes it to disk
+(``spill_oversized_values`` and its helpers); and the notice renderer
+(``render_spill_notice``).
 """
 
 from __future__ import annotations
