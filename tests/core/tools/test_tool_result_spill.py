@@ -198,6 +198,32 @@ def test_resolve_spilled_under_never_creates_the_spill_dir(tmp_path):
     assert not missing.exists()
 
 
+def test_resolve_spilled_under_symlink_loop_returns_none(spill_layout):
+    link_a = spill_layout / "a0000000000000000000000000000000.txt"
+    link_b = spill_layout / "b0000000000000000000000000000000.txt"
+    link_a.symlink_to(link_b)
+    link_b.symlink_to(link_a)
+    assert (
+        resolve_spilled_under(
+            spill_layout, "tool-results/a0000000000000000000000000000000.txt"
+        )
+        is None
+    )
+
+
+def test_resolve_spilled_under_unreadable_directory_returns_none(
+    spill_layout, monkeypatch
+):
+    def _forbidden(self):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "is_file", _forbidden)
+    assert (
+        resolve_spilled_under(spill_layout, "tool-results/acme-012345678910.json")
+        is None
+    )
+
+
 # --- stage 1-b: the four read-side helpers (pure functions) ---------------
 
 

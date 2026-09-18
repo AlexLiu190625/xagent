@@ -218,21 +218,35 @@ def resolve_spilled_under(
     Takes a directory path and a canonical name; returns the resolved file or
     None. Needs no TaskWorkspace, creates no directory, opens no database
     session, and raises nothing -- so the engine, the tool, and the writer
-    can all share this one implementation.
+    can all share this one implementation. Filesystem failures are part of
+    that promise, not an exception to it: a symlink loop (RuntimeError from
+    Path.resolve) and a permission or stat failure (OSError) both fold into
+    None, because a caller that got an exception here would bypass the
+    classified-unavailable result it is supposed to return.
     """
     if not spill_dir:
         return None
     if name is None or name != normalize_spilled_relative_path(name):
         return None
-    base = Path(spill_dir).resolve()
-    if not base.is_dir():
-        return None
-    resolved = (base / name.split("/", 1)[1]).resolve()
-    if not resolved.is_relative_to(base):
-        return None
-    if resolved.parent != base:
-        return None
-    if not resolved.is_file():
+    base = Path(spill_dir)
+    try:
+        base = base.resolve()
+        if not base.is_dir():
+            return None
+        resolved = (base / name.split("/", 1)[1]).resolve()
+        if not resolved.is_relative_to(base):
+            return None
+        if resolved.parent != base:
+            return None
+        if not resolved.is_file():
+            return None
+    except (OSError, RuntimeError):
+        # Path.resolve raises RuntimeError on a symlink loop and OSError on a
+        # permission or stat failure; is_dir/is_file raise OSError for the
+        # same reasons. Both fold into the same answer the rest of this
+        # function gives -- "not one of ours" -- so the no-raise promise holds
+        # and the caller still reaches its classified-unavailable result
+        # instead of a generic framework error.
         return None
     return resolved
 
