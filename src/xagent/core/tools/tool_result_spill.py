@@ -671,15 +671,24 @@ def _spill_target_holds(target: Path, payload_bytes: bytes) -> bool:
     Returns False -- "replace it" -- for anything that is not a regular file
     of exactly the right size, and for every filesystem error. The size check
     short-circuits before the read, so a tampered file of any size is never
-    read beyond len(payload_bytes) bytes. A directory, or a symlink pointing
-    at one, is not a regular file and is refused here; os.replace then
-    renames onto the link itself rather than following it, so a symlink out
-    of the directory is replaced, never written through, and replacing a real
-    directory raises IsADirectoryError, which the caller's OSError handler
-    turns into ordinary truncation.
+    read beyond len(payload_bytes) bytes.
+
+    Uses lstat, not stat: stat follows a symlink to whatever it points at,
+    so a symlink whose target happens to hold the exact payload bytes would
+    read as a match and be left in place, unreplaced -- even though
+    resolve_spilled_under resolves names against the spill directory itself,
+    never through a link, and would then report that same record as
+    unavailable. lstat reports the link itself, which is never a regular
+    file, so any symlink here is always refused and replaced -- regardless
+    of byte content, and regardless of what it points at. A directory is
+    refused the same way. os.replace then renames onto the link (or
+    directory-blocked write) itself rather than following it, so a symlink
+    out of the directory is replaced, never written through, and replacing a
+    real directory raises IsADirectoryError, which the caller's OSError
+    handler turns into ordinary truncation.
     """
     try:
-        stat_result = target.stat()
+        stat_result = target.lstat()
     except OSError:
         return False
     if not stat.S_ISREG(stat_result.st_mode):

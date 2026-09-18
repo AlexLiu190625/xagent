@@ -1021,6 +1021,34 @@ def test_spill_existing_target_with_wrong_bytes_is_replaced(tmp_path):
     assert list(Path(target.spill_dir).glob("*.tmp")) == []
 
 
+def test_same_size_tamper_of_an_existing_spill_file_is_replaced(tmp_path):
+    """Same byte length, different content: the size short-circuit alone
+    would wrongly call this a match. Only the full SHA-256 comparison over
+    the actual bytes catches it -- this is the format the other tamper test
+    (which uses a different-length payload) never exercises."""
+    target = _target(tmp_path)
+    result = {"rows": list(range(60))}
+    _, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    relative_path = records[0]["relative_path"]
+    written_file = Path(target.spill_dir) / relative_path.split("/")[-1]
+    original_bytes = written_file.read_bytes()
+    tampered = bytearray(original_bytes)
+    tampered[0] ^= 1  # flip one bit: identical length, different content
+    tampered_bytes = bytes(tampered)
+    assert len(tampered_bytes) == len(original_bytes)
+    assert tampered_bytes != original_bytes
+    written_file.write_bytes(tampered_bytes)
+
+    _, records_again = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+
+    assert records_again[0]["relative_path"] == relative_path
+    assert written_file.read_bytes() == original_bytes
+
+
 def test_spill_existing_target_with_matching_bytes_is_not_rewritten(tmp_path):
     target = _target(tmp_path)
     result = {"rows": list(range(60))}
@@ -1115,6 +1143,42 @@ def test_spill_target_symlink_out_of_the_directory_is_not_written_through(tmp_pa
     assert not written_file.is_symlink()
     assert json.loads(written_file.read_bytes()) == list(range(60))
     assert records_again[0]["relative_path"] == relative_path
+
+
+def test_symlink_target_with_matching_bytes_is_replaced_not_reused(tmp_path):
+    """A symlink whose linked-to file happens to hold the exact payload
+    bytes must still be replaced, not reused: target.stat() follows a
+    symlink to the file it points at, so a naive "does this look like our
+    file" check would call this a match, leave the link in place, and
+    resolve_spilled_under -- which resolves against the spill directory,
+    not through the link -- would then report the record unavailable."""
+    target = _target(tmp_path)
+    result = {"rows": list(range(60))}
+    _, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    relative_path = records[0]["relative_path"]
+    filename = relative_path.split("/")[-1]
+    written_file = Path(target.spill_dir) / filename
+    payload_bytes = written_file.read_bytes()
+    written_file.unlink()
+
+    outside = tmp_path / "outside_same_bytes.json"
+    outside.write_bytes(payload_bytes)
+    outside_mtime_before = outside.stat().st_mtime_ns
+    written_file.symlink_to(outside)
+
+    spilled, records_again = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+
+    assert not written_file.is_symlink()
+    assert written_file.read_bytes() == payload_bytes
+    assert outside.stat().st_mtime_ns == outside_mtime_before
+    assert outside.read_bytes() == payload_bytes
+    assert records_again[0]["relative_path"] == relative_path
+    resolved = resolve_spilled_under(target.spill_dir, relative_path)
+    assert resolved is not None
 
 
 def test_write_bytes_failure_leaves_no_temp_file(tmp_path, monkeypatch):
