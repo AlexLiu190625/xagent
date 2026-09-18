@@ -881,6 +881,7 @@ def test_spill_concurrent_writers_of_the_same_content_all_succeed(tmp_path):
         assert records[0]["value_path"] == "content[0].text"
     files = list(Path(target.spill_dir).glob("*.txt"))
     assert len(files) == 1
+    assert list(Path(target.spill_dir).glob("*.tmp")) == []
 
 
 # --- I-35: content-addressed naming ----------------------------------------
@@ -926,10 +927,10 @@ def test_spill_same_content_reuses_the_same_filename(tmp_path):
     assert len(files) == 1
 
 
-def test_spill_existing_target_is_not_rewritten(tmp_path):
-    """An existing target is taken as the same content (128-bit content
-    address) and is never rewritten -- even if its bytes were changed after
-    the fact, e.g. by a hash collision or a crash-corrupted leftover."""
+def test_spill_existing_target_with_wrong_bytes_is_replaced(tmp_path):
+    """A target that already exists but no longer holds the payload's bytes
+    (a workspace write_file overwrite, or a crash-corrupted leftover) is
+    replaced atomically back to the correct content, not trusted by name."""
     target = _target(tmp_path)
     result = {"rows": list(range(60))}
     _, records = spill_oversized_values(
@@ -937,15 +938,116 @@ def test_spill_existing_target_is_not_rewritten(tmp_path):
     )
     relative_path = records[0]["relative_path"]
     written_file = Path(target.spill_dir) / relative_path.split("/")[-1]
-    tampered_bytes = b"tampered content, not the real payload"
-    written_file.write_bytes(tampered_bytes)
+    written_file.write_bytes(b"TAMPERED")
 
     _, records_again = spill_oversized_values(
         result, target, tool_name="acme", max_recursion=20
     )
 
     assert records_again[0]["relative_path"] == relative_path
-    assert written_file.read_bytes() == tampered_bytes
+    assert written_file.read_bytes() != b"TAMPERED"
+    assert json.loads(written_file.read_bytes()) == list(range(60))
+    digest_in_name = written_file.name.split("-")[-1].split(".")[0]
+    assert (
+        __import__("hashlib").sha256(written_file.read_bytes()).hexdigest()[:32]
+        == digest_in_name
+    )
+    assert list(Path(target.spill_dir).glob("*.tmp")) == []
+
+
+def test_spill_existing_target_with_matching_bytes_is_not_rewritten(tmp_path):
+    target = _target(tmp_path)
+    result = {"rows": list(range(60))}
+    _, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    relative_path = records[0]["relative_path"]
+    written_file = Path(target.spill_dir) / relative_path.split("/")[-1]
+    stat_before = written_file.stat()
+
+    _, records_again = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+
+    stat_after = written_file.stat()
+    assert stat_after.st_ino == stat_before.st_ino
+    assert stat_after.st_mtime_ns == stat_before.st_mtime_ns
+    assert records_again[0]["relative_path"] == relative_path
+    files = list(Path(target.spill_dir).glob("*"))
+    assert len(files) == 1
+
+
+def test_spill_existing_target_of_wrong_size_is_not_read(tmp_path, monkeypatch):
+    target = _target(tmp_path)
+    result = {"rows": list(range(60))}
+    _, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    relative_path = records[0]["relative_path"]
+    written_file = Path(target.spill_dir) / relative_path.split("/")[-1]
+    written_file.write_bytes(b"x" * 50_000_000)
+
+    read_calls = {"n": 0}
+    original_read_bytes = Path.read_bytes
+
+    def _counting_read_bytes(self, *args, **kwargs):
+        if self == written_file:
+            read_calls["n"] += 1
+        return original_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", _counting_read_bytes)
+
+    _, records_again = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+
+    assert read_calls["n"] == 0
+    assert records_again[0]["relative_path"] == relative_path
+    assert json.loads(written_file.read_bytes()) == list(range(60))
+
+
+def test_spill_target_that_is_a_directory_falls_back_to_truncation(tmp_path):
+    target = _target(tmp_path)
+    result = {"rows": list(range(60))}
+    _, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    relative_path = records[0]["relative_path"]
+    written_file = Path(target.spill_dir) / relative_path.split("/")[-1]
+    written_file.unlink()
+    written_file.mkdir()
+
+    spilled, records_again = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+
+    assert records_again == []
+    assert spilled == result
+
+
+def test_spill_target_symlink_out_of_the_directory_is_not_written_through(tmp_path):
+    target = _target(tmp_path)
+    result = {"rows": list(range(60))}
+    _, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    relative_path = records[0]["relative_path"]
+    filename = relative_path.split("/")[-1]
+    written_file = Path(target.spill_dir) / filename
+    written_file.unlink()
+
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(b"ORIGINAL")
+    written_file.symlink_to(outside)
+
+    spilled, records_again = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+
+    assert outside.read_bytes() == b"ORIGINAL"
+    assert not written_file.is_symlink()
+    assert json.loads(written_file.read_bytes()) == list(range(60))
+    assert records_again[0]["relative_path"] == relative_path
 
 
 def test_spill_different_content_gets_different_filenames(tmp_path):

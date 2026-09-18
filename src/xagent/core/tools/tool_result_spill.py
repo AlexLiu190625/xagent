@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -622,31 +623,94 @@ def _truncate_text_bytes(content: str, limit: int) -> bytes:
     return head.decode("utf-8", errors="ignore").encode("utf-8")
 
 
+def _spill_file_name(tool_name: str, payload_bytes: bytes, kind: str) -> str:
+    """Build the content-addressed file name for one payload.
+
+    The tool name is only a readable prefix: it comes from remote MCP
+    configuration and is untrusted, so it is reduced to the filename
+    character set and cut to 64 characters. Uniqueness is carried entirely by
+    the 128-bit digest of the exact bytes that will be written -- after any
+    truncation, so the same value truncated and untruncated are two different
+    files that cannot overwrite each other.
+    """
+    ext = "json" if kind in ("array", "object") else "txt"
+    sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", tool_name)[:64] or "tool"
+    digest = hashlib.sha256(payload_bytes).hexdigest()[:SPILL_DIGEST_HEX_CHARS]
+    return f"{sanitized}-{digest}.{ext}"
+
+
+def _spill_target_holds(target: Path, payload_bytes: bytes) -> bool:
+    """Whether ``target`` right now holds exactly these bytes.
+
+    A content-addressed name authenticates the bytes only at the moment this
+    module creates them. The spill directory lives inside the task workspace,
+    where the model's own write_file resolves a relative path under ``output``
+    and creates missing parents (core/workspace_file_tool.py), so nothing
+    reserves this directory: a matching name afterwards proves nothing about
+    the current content. Only the content proves the content, so the bytes
+    are read back and their complete SHA-256 is compared with the payload's.
+
+    Returns False -- "replace it" -- for anything that is not a regular file
+    of exactly the right size, and for every filesystem error. The size check
+    short-circuits before the read, so a tampered file of any size is never
+    read beyond len(payload_bytes) bytes. A directory, or a symlink pointing
+    at one, is not a regular file and is refused here; os.replace then
+    renames onto the link itself rather than following it, so a symlink out
+    of the directory is replaced, never written through, and replacing a real
+    directory raises IsADirectoryError, which the caller's OSError handler
+    turns into ordinary truncation.
+    """
+    try:
+        stat_result = target.stat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(stat_result.st_mode):
+        return False
+    if stat_result.st_size != len(payload_bytes):
+        return False
+    try:
+        existing = target.read_bytes()
+    except OSError:
+        return False
+    return (
+        hashlib.sha256(existing).hexdigest()
+        == hashlib.sha256(payload_bytes).hexdigest()
+    )
+
+
+def _replace_spill_file(directory: Path, filename: str, payload_bytes: bytes) -> None:
+    """Write ``payload_bytes`` to ``filename`` under ``directory``, atomically.
+
+    The temporary name carries a per-call suffix (pid + random hex) so two
+    concurrent writers of the same content never share one temporary path:
+    os.replace onto the same target is then two atomic overwrites of
+    identical bytes, not a race over who moves it first.
+
+    Raises OSError on any filesystem failure; the caller decides how to fall
+    back.
+    """
+    tmp = directory / f"{filename}.{os.getpid()}.{uuid4().hex[:8]}.tmp"
+    tmp.write_bytes(payload_bytes)
+    os.replace(tmp, directory / filename)
+
+
 def _write_spill_file(spill_dir: str, tool_name: str, payload: str, kind: str) -> str:
     """Write payload content-addressed under spill_dir; return its relative path.
 
-    An existing target is taken as the same content (128-bit content
-    address) and is never rewritten.
+    An existing target is reused only when it still holds exactly this
+    payload; a target that was replaced, truncated, or created by something
+    else is overwritten atomically. The file a record points at therefore
+    always holds the bytes that record describes.
 
     Raises OSError on any filesystem failure -- the caller decides how to
     fall back; this function does not catch.
     """
-    ext = "json" if kind in ("array", "object") else "txt"
-    sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", tool_name)[:64] or "tool"
     payload_bytes = payload.encode("utf-8")
-    digest = hashlib.sha256(payload_bytes).hexdigest()[:SPILL_DIGEST_HEX_CHARS]
-    filename = f"{sanitized}-{digest}.{ext}"
+    filename = _spill_file_name(tool_name, payload_bytes, kind)
     directory = Path(spill_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    target = directory / filename
-    if not target.exists():
-        # The tmp name carries a per-call suffix (pid + random hex) so two
-        # concurrent writers of the same content never share one tmp path:
-        # os.replace onto the same target is then just two atomic
-        # overwrites of identical bytes, not a race on who moves it first.
-        tmp = directory / f"{filename}.{os.getpid()}.{uuid4().hex[:8]}.tmp"
-        tmp.write_bytes(payload_bytes)
-        os.replace(tmp, target)
+    if not _spill_target_holds(directory / filename, payload_bytes):
+        _replace_spill_file(directory, filename, payload_bytes)
     return f"{SPILL_DIR_NAME}/{filename}"
 
 
