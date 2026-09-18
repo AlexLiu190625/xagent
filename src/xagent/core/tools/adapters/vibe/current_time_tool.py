@@ -1130,6 +1130,14 @@ def _day_midnight_instants(
     day (Pacific/Kiritimati 1994-12-31). A conversion that leaves the range
     datetime can represent still raises ValueError out of the helper it calls,
     exactly as it does for a wall-clock time.
+
+    On a day the zone skips, the offset this returns is one the zone really
+    uses, but the instant it produces reads back, in this same zone, as a
+    moment on the previous calendar day (America/Santiago 2026-09-06 returns
+    2026-09-06T00:00:00-03:00, which is 2026-09-05T23:00:00-04:00 in
+    Santiago). Callers are expected to use the returned value as text, where
+    the requested date is its first ten characters, rather than convert it
+    back into a local time.
     """
     instants = _instants_for_wall_time(midnight, zone, wall_text)
     if instants:
@@ -1329,11 +1337,13 @@ class ResolveDatetimeTool(AbstractBaseTool):
             "'1 Jan 1990', '下周三上午十点'. Pass the user's exact words as "
             "phrase. Pass the zone named in the system prompt's date-and-time "
             "line as timezone. An expression outside the supported forms, a "
-            "date that reads two ways (day-first or month-first), or a time "
+            "date that reads two ways (day-first or month-first), a time "
             "of day that does not exist or occurs twice at a daylight-saving "
-            "change is refused with a reason instead of guessed: then ask the "
-            "user. For the time right now use get_current_time; to check a "
-            "specific wall-clock time in a zone use validate_local_time."
+            "change, or a calendar day a zone skipped entirely at a "
+            "date-line change, is refused with a reason instead of guessed: "
+            "then ask the user. For the time right now use get_current_time; "
+            "to check a specific wall-clock time in a zone use "
+            "validate_local_time."
         )
 
     def args_type(self) -> Type[BaseModel]:

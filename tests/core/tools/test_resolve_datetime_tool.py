@@ -4,7 +4,7 @@ import asyncio
 import itertools
 import re
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Callable, Optional
 
 import pytest
 from pydantic import ValidationError
@@ -275,8 +275,9 @@ def test_resolve_result_has_no_quotable_clock() -> None:
         assert not re.search(r"\d{4}-\d{2}-\d{2}", line)
         assert not re.search(r"\d{4}", line)
     # What a refusal sends is exactly this published list, in this order;
-    # test_every_reader_maps_to_a_grammar_line below is what checks that the
-    # list itself has one line per reader, which this equality cannot.
+    # test_reader_inventory_matches_the_grammar_lines below is what checks the
+    # reader inventory and its count against this same list, which this
+    # equality cannot.
     assert supported == list(GRAMMAR_FORMS)
 
     assert set(RESOLUTION_REASONS) == {
@@ -288,43 +289,45 @@ def test_resolve_result_has_no_quotable_clock() -> None:
     }
 
 
-# Every reader that can produce a reading, mapped to the GRAMMAR_FORMS index
-# of the line describing it. Two readers -- the English and Chinese bare-time
-# forms -- share line 12, so this has fourteen keys over thirteen values.
-_GRAMMAR_LINE_BY_READER: dict[Callable[[str, datetime], object], int] = {
-    module._read_iso: 0,
-    module._read_en_calendar_date: 1,
-    module._read_zh_date: 2,
-    module._read_en_relative_day: 3,
-    module._read_zh_relative_day: 4,
-    module._read_en_shifted_weekday: 5,
-    module._read_en_weekday: 6,
-    module._read_zh_weekday: 7,
-    module._read_en_days_later: 8,
-    module._read_en_hours_later: 9,
-    module._read_zh_days_later: 10,
-    module._read_zh_hours_later: 11,
-    module._read_en_time: 12,
-    module._read_zh_time: 12,
-}
+# Every reader function the module is expected to have: the seven functions
+# in _READERS, the six in _LOWERCASE_READERS, and the calendar-date fallback
+# the phrase reaches when none of those match -- fourteen in total.
+_ALL_READERS: frozenset[Callable[[str, datetime], object]] = frozenset(
+    {
+        module._read_iso,
+        module._read_en_calendar_date,
+        module._read_zh_date,
+        module._read_en_relative_day,
+        module._read_zh_relative_day,
+        module._read_en_shifted_weekday,
+        module._read_en_weekday,
+        module._read_zh_weekday,
+        module._read_en_days_later,
+        module._read_en_hours_later,
+        module._read_zh_days_later,
+        module._read_zh_hours_later,
+        module._read_en_time,
+        module._read_zh_time,
+    }
+)
 
 
-def test_every_reader_maps_to_a_grammar_line() -> None:
-    """Every reader in _READERS and _LOWERCASE_READERS, plus the calendar-date
-    fallback the phrase reaches when none of those match, must own one of the
-    GRAMMAR_FORMS lines the tool advertises in a refusal. The equality this
-    replaces (len(supported) == len(GRAMMAR_FORMS)) only compared
-    GRAMMAR_FORMS's length to itself and could not notice a reader added
-    without a line, or a line dropped without removing its reader; this maps
-    every reader by identity to a specific line and checks both the reader
-    set and the line-index set match."""
+def test_reader_inventory_matches_the_grammar_lines() -> None:
+    """Checks two properties of the reader inventory, not which GRAMMAR_FORMS
+    line a given reader owns -- that correspondence is not checked here.
+    First, _READERS, _LOWERCASE_READERS and the calendar-date fallback the
+    phrase reaches when none of those match together equal the fixed set
+    _ALL_READERS, so a reader can be added or removed only by editing that
+    set too. Second, the reader count is len(GRAMMAR_FORMS) + 1."""
     all_readers = (
         set(module._READERS)
         | set(module._LOWERCASE_READERS)
         | {module._read_en_calendar_date}
     )
-    assert set(_GRAMMAR_LINE_BY_READER) == all_readers
-    assert set(_GRAMMAR_LINE_BY_READER.values()) == set(range(len(GRAMMAR_FORMS)))
+    assert all_readers == _ALL_READERS
+    # +1 because the bare-time grammar line is the only line served by two
+    # readers, one per language: _read_en_time and _read_zh_time.
+    assert len(_ALL_READERS) == len(GRAMMAR_FORMS) + 1
 
 
 def test_resolve_datetime_rejects_sub_minute_offset() -> None:
@@ -514,14 +517,18 @@ def test_resolve_datetime_dst_and_zone() -> None:
 
 
 # (zone, day, what the zone does to that day's midnight,
-#  date-only expectation, expectation when the phrase also names 00:30)
-MIDNIGHT_TABLE: list[tuple[str, str, str, object, object]] = [
+#  date-only expectation, expectation when the phrase also names 00:30,
+#  a substring the date-only refusal's error message must contain, or None
+#  to check the reason code alone -- a row carrying None makes no claim at
+#  all about the message text)
+MIDNIGHT_TABLE: list[tuple[str, str, str, object, object, Optional[str]]] = [
     (
         "Australia/Sydney",
         "2026-09-15",
         "has it once",
         "2026-09-15T00:00:00+10:00",
         "2026-09-15T00:30:00+10:00",
+        None,
     ),
     (
         "America/Santiago",
@@ -529,6 +536,7 @@ MIDNIGHT_TABLE: list[tuple[str, str, str, object, object]] = [
         "skips it",
         "2026-09-06T00:00:00-03:00",
         ("REFUSED", "nonexistent_local_time"),
+        None,
     ),
     (
         "America/Havana",
@@ -536,6 +544,19 @@ MIDNIGHT_TABLE: list[tuple[str, str, str, object, object]] = [
         "repeats it",
         "2026-11-01T00:00:00-04:00",
         ("REFUSED", "ambiguous_local_time"),
+        None,
+    ),
+    (
+        # The scan that finds the day's first existing minute runs the whole
+        # day, not a short prefix of it: this gap is 420 minutes, well past
+        # an hour, so a scan cut short would refuse this day while every
+        # other row here stayed green.
+        "Antarctica/Vostok",
+        "1994-11-01",
+        "skips a gap longer than an hour",
+        "1994-11-01T00:00:00+07:00",
+        ("REFUSED", "nonexistent_local_time"),
+        None,
     ),
     (
         "Pacific/Kiritimati",
@@ -543,6 +564,7 @@ MIDNIGHT_TABLE: list[tuple[str, str, str, object, object]] = [
         "skips the whole day",
         ("REFUSED", "nonexistent_local_time"),
         ("REFUSED", "nonexistent_local_time"),
+        "moved across the date line and skipped the whole day",
     ),
     (
         "Africa/Johannesburg",
@@ -550,14 +572,22 @@ MIDNIGHT_TABLE: list[tuple[str, str, str, object, object]] = [
         "cannot be converted at all",
         ("REFUSED", "unsupported_expression"),
         ("REFUSED", "unsupported_expression"),
+        None,
     ),
 ]
 
 
 @pytest.mark.parametrize(
-    ("zone", "day", "behavior", "date_only_expected", "with_time_expected"),
+    (
+        "zone",
+        "day",
+        "behavior",
+        "date_only_expected",
+        "with_time_expected",
+        "date_only_error_substring",
+    ),
     MIDNIGHT_TABLE,
-    ids=[f"{zone}:{behavior}" for zone, _, behavior, _, _ in MIDNIGHT_TABLE],
+    ids=[f"{zone}:{behavior}" for zone, _, behavior, _, _, _ in MIDNIGHT_TABLE],
 )
 def test_date_only_phrase_across_midnight_behavior(
     zone: str,
@@ -565,6 +595,7 @@ def test_date_only_phrase_across_midnight_behavior(
     behavior: str,
     date_only_expected: object,
     with_time_expected: object,
+    date_only_error_substring: Optional[str],
 ) -> None:
     """A phrase naming only a day is answered for that day whichever way the
     zone treats its midnight -- has it once, skips it, repeats it, or (a
@@ -578,6 +609,8 @@ def test_date_only_phrase_across_midnight_behavior(
     if isinstance(date_only_expected, tuple):
         assert date_only_result["success"] is False
         assert date_only_result["resolution"] == date_only_expected[1]
+        if date_only_error_substring is not None:
+            assert date_only_error_substring in date_only_result["error"]
     else:
         assert date_only_result["resolved"] == date_only_expected
         assert date_only_result["has_time"] is False
