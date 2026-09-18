@@ -874,6 +874,21 @@ def _read_zh_days_later(text: str, now_local: datetime) -> Optional[_Reading]:
     return _wall(now_local.date() + timedelta(days=days), None)
 
 
+def _duration_later(count: int, minutes: bool, now_local: datetime) -> _Reading:
+    """`now` plus a duration, as an exact instant on a whole minute.
+
+    Added in UTC: adding to the local reading would shift the wall clock
+    across a daylight-saving change instead of the instant. The clock's own
+    seconds are dropped first -- the phrase said how long from now, not which
+    second -- so this form lands on a whole minute like every other form in
+    the grammar.
+    """
+    delta = timedelta(minutes=count) if minutes else timedelta(hours=count)
+    return now_local.astimezone(timezone.utc).replace(
+        second=0, microsecond=0
+    ) + delta, True
+
+
 def _read_zh_hours_later(text: str, now_local: datetime) -> Optional[_Reading]:
     match = _ZH_HOURS_LATER_RE.fullmatch(text)
     if match is None:
@@ -881,13 +896,7 @@ def _read_zh_hours_later(text: str, now_local: datetime) -> Optional[_Reading]:
     count = _parse_number(match.group("count"))
     if count is None:
         return None
-    if match.group("unit") == "分钟":
-        delta = timedelta(minutes=count)
-    else:
-        delta = timedelta(hours=count)
-    # Added in UTC: adding to the local reading would shift the wall clock
-    # across a daylight-saving change instead of the instant.
-    return now_local.astimezone(timezone.utc) + delta, True
+    return _duration_later(count, match.group("unit") == "分钟", now_local)
 
 
 def _read_zh_time(text: str, now_local: datetime) -> Optional[_Reading]:
@@ -948,13 +957,7 @@ def _read_en_hours_later(text: str, now_local: datetime) -> Optional[_Reading]:
     if match is None:
         return None
     count = int(match.group("count"))
-    if match.group("unit").startswith("minute"):
-        delta = timedelta(minutes=count)
-    else:
-        delta = timedelta(hours=count)
-    # Added in UTC: adding to the local reading would shift the wall clock
-    # across a daylight-saving change instead of the instant.
-    return now_local.astimezone(timezone.utc) + delta, True
+    return _duration_later(count, match.group("unit").startswith("minute"), now_local)
 
 
 def _read_en_time(text: str, now_local: datetime) -> Optional[_Reading]:

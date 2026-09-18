@@ -587,6 +587,29 @@ def test_every_date_only_grammar_line_answers_a_skipped_midnight(
     }
 
 
+# Unlike FROZEN, this clock's own seconds and microseconds are non-zero: the
+# form this pins (a duration counted from now) must drop them, which a clock
+# permanently parked on :00 could never catch.
+FROZEN_WITH_SECONDS = datetime(2026, 9, 15, 2, 30, 37, 123456, tzinfo=timezone.utc)
+
+
+def test_duration_later_forms_land_on_whole_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'in N hours/minutes' and its Chinese equivalents name a duration from
+    now, not a second within this minute, so the answer must land on :00
+    even when the clock read at call time carries live seconds. A phrase
+    this form does not touch (3pm) is unaffected by the same clock."""
+    monkeypatch.setattr(module, "_now", lambda: FROZEN_WITH_SECONDS)
+
+    for phrase in ("in 2 hours", "in 30 minutes", "两小时后", "30分钟后"):
+        result = resolve_datetime(phrase, SYDNEY)
+        assert result["resolved"][17:19] == "00", (phrase, result["resolved"])
+
+    unaffected = resolve_datetime("3pm", SYDNEY)
+    assert unaffected["resolved"] == "2026-09-15T15:00:00+10:00"
+
+
 @pytest.mark.parametrize("zone", ["EST", "Sydney", "Etc/GMT+10"])
 def test_resolve_datetime_rejects_non_region_city_zone(zone: str) -> None:
     result = resolve_datetime("tomorrow", zone)
