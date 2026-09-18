@@ -609,8 +609,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     if (requestRef.current.seq !== seqAtStart) {
       // A newer request retargeted this same dialog instance while the
       // resend was in flight; the result is stale, but `resending` must
-      // still reset or the retry button stays stuck forever.
+      // still reset or the retry button stays stuck forever. A resend that
+      // did go out needs to say so: the send-failed panel this button
+      // lives on is about to be replaced by whatever the fresher request
+      // renders next, and without a toast the user has no way to tell
+      // that clicking a resend button there would send this same turn a
+      // second time.
       setResending(false)
+      if (resendOutcome === "sent") toast(t("connectorRuntime.resendSupersededUnknown"))
       return
     }
     setResending(false)
@@ -651,7 +657,17 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
 
         {dialogFieldError && (
           <p className="text-sm text-destructive" role="alert">
-            {translateFailure(t, dialogFieldError.messageKey)}
+            {/* This scope has no row identity in hand -- it is where
+                locateFieldError falls back when the row a failure named is
+                gone or unrecognized, most often a 409 conflict whose
+                refresh just collapsed that row into "already filled". A
+                conflict is the only messageKey whose text carries a
+                {key} placeholder, and there is no key here to fill it
+                with, so it gets a placeholder-free variant instead of
+                going through translateFailure like every other reason. */}
+            {dialogFieldError.messageKey === "conflict"
+              ? t("connectorRuntime.errors.conflictNoKey")
+              : translateFailure(t, dialogFieldError.messageKey)}
           </p>
         )}
 

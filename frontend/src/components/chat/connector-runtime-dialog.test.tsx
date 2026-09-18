@@ -798,14 +798,68 @@ describe("refreshes after a conflict and drops newly satisfied keys", () => {
     // The row the conflict was rejected on just collapsed into "already
     // filled" and no longer renders a field-level error slot at all; the
     // rejection must still be visible, re-located onto the whole dialog
-    // instead of disappearing along with the row.
-    expect(screen.getByText("connectorRuntime.errors.conflict")).toBeInTheDocument()
-    expect(screen.queryByText(/connectorRuntime\.errors\.conflict:/)).not.toBeInTheDocument()
+    // instead of disappearing along with the row. At this scope there is no
+    // row identity left to name, so it renders the placeholder-free variant
+    // of the conflict message, not the keyed one the field-level scope uses
+    // (see "renders a placeholder-free conflict message at dialog scope"
+    // below for the real, interpolated text this stands in for).
+    expect(screen.getByText("connectorRuntime.errors.conflictNoKey")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.errors.conflict")).not.toBeInTheDocument()
 
     submitMock.mockResolvedValueOnce(ok(report(true, [])))
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
     await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(2))
     expect(submitMock.mock.calls[1][1]).toEqual([{ connector_ref: REF_A, context: { b: "2" } }])
+  })
+})
+
+describe("renders a placeholder-free conflict message at dialog scope", () => {
+  it("renders a placeholder-free conflict message at dialog scope", async () => {
+    // Same shape as "refreshes after a conflict and drops newly satisfied
+    // keys" above: a 409 conflict whose refresh collapses the named row
+    // into "already filled", re-locating the error onto the whole dialog.
+    // This file's own `t` stub always returns the key unchanged when no
+    // vars are given, so it cannot tell a resolved string that still
+    // carries a literal "{key}" apart from one that never had a
+    // placeholder to begin with. Swap in the real translation resolver for
+    // this one test so a regression here shows up as failing rendered
+    // text, not a passing vacuous stub.
+    const { resolveTranslation } = await import("@/i18n/translations")
+    const originalT = i18nValue.t
+    i18nValue.t = (key, vars) => resolveTranslation("en", key as never, vars)
+    try {
+      fetchMock.mockResolvedValueOnce(ok(report(false, [
+        connector(REF_A, "A", [
+          input({ section: "context", key: "a", type: "string", required: true }),
+          input({ section: "context", key: "b", type: "string", required: true }),
+        ]),
+      ])))
+      renderHarness()
+      await openForTask()
+      await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+
+      fireEvent.change(screen.getByLabelText("a"), { target: { value: "1" } })
+      fireEvent.change(screen.getByLabelText("b"), { target: { value: "2" } })
+
+      submitMock.mockResolvedValueOnce({
+        ok: false, kind: "coded", status: 409, code: "runtime_context_immutable",
+        reason: "conflict.context.a", connectorRef: REF_A,
+      })
+      fetchMock.mockResolvedValueOnce(ok(report(false, [
+        connector(REF_A, "A", [
+          input({ section: "context", key: "a", type: "string", required: true, satisfied: true }),
+          input({ section: "context", key: "b", type: "string", required: true }),
+        ]),
+      ])))
+      fireEvent.click(screen.getByText("Save only"))
+      await waitFor(() => expect(screen.getByText("Already filled")).toBeInTheDocument())
+
+      const alert = screen.getByRole("alert")
+      expect(alert.textContent).not.toContain("{key}")
+      expect(alert.textContent).toBe("Another window already filled in this value.")
+    } finally {
+      i18nValue.t = originalT
+    }
   })
 })
 
@@ -1189,10 +1243,14 @@ describe("ignores a resend result superseded by a new request", () => {
 
     // Now let the stale resend succeed: it must not close the new request's
     // dialog, and must not report "resent" for a turn that was never
-    // resent under this request.
+    // resent under this request. It did go out, though -- the fresher
+    // request may render its own resend button next, and without a toast
+    // the user has no way to tell that clicking it would send this same
+    // turn a second time.
     await act(async () => { resolveRetry() })
     expect(screen.getByRole("dialog")).toBeInTheDocument()
     expect(closeSpy).not.toHaveBeenCalledWith("resent")
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.resendSupersededUnknown"]])
   })
 })
 
