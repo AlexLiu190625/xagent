@@ -147,6 +147,24 @@ def is_classified_tool_failure(result: Any) -> bool:
     )
 
 
+def _spill_is_exempt_envelope(result: dict[str, Any]) -> bool:
+    """Whether this result must reach the output filter unspilled.
+
+    Two shapes carry their meaning in named fields rather than in their size.
+    A waiting-for-user envelope's ``interactions`` list is read for its
+    cardinality by the ReAct pause path, which publishes a default prompt
+    when it is not a list; a classified failure's ``error``/``output`` text is
+    the diagnostic the model is meant to act on immediately. Replacing any
+    part of either with a file-backed placeholder destroys that meaning, and
+    no later layer can restore it, so neither shape is ever spilled.
+
+    Checked once for the whole module rather than inside one tier: a guard
+    placed at the entry of a single branch leaves every other branch free to
+    do exactly what the guard forbids, which is what happened before.
+    """
+    return tool_result_waits_for_user(result) or is_classified_tool_failure(result)
+
+
 def normalize_spilled_relative_path(raw: Any) -> str | None:
     """Canonicalize one spilled-result selector, or None if it is not one.
 
@@ -681,15 +699,13 @@ def _second_tier_result(
     """Whole-root spill: the root itself is the one transfer point.
 
     Applies only when no first-tier point exists and the root is still
-    oversized. The guard makes this tier inapplicable, not merely
-    unwritten, for a waiting-for-user or classified-failure envelope: those
-    shapes are returned byte-identical, with zero files written. A write
-    failure or an exhausted run budget falls back the same way: the whole
-    root is left untouched rather than half-replaced.
+    oversized. The two envelope shapes this tier must not touch are already
+    excluded by the module entry point (``_spill_is_exempt_envelope``), which
+    runs before either tier is consulted, so this function never sees one. A
+    write failure or an exhausted run budget falls back the same way: the
+    whole root is left untouched rather than half-replaced.
     """
     if _serialized_length(result) <= target.max_chars:
-        return result, []
-    if tool_result_waits_for_user(result) or is_classified_tool_failure(result):
         return result, []
     if budget.files_written >= SPILL_MAX_FILES_PER_RUN:
         logger.warning(
@@ -742,6 +758,10 @@ def spill_oversized_values(
         # its way out -- an orphaned file with no record pointing at it.
         # Leaving the root untouched matches what the sanitizer already did
         # to this shape today.
+        return result, []
+    if _spill_is_exempt_envelope(result):
+        # Both tiers are inapplicable, not merely unwritten: the result goes
+        # to the filter byte-for-byte, with zero files and no reserved key.
         return result, []
     budget = run_budget if run_budget is not None else SpillRunBudget()
     first_tier = _dedupe_content_vs_structured(

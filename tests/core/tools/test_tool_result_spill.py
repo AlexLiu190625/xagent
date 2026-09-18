@@ -502,6 +502,52 @@ def test_second_tier_applies_to_non_classified_envelope(tmp_path):
     assert spilled["output"] == SPILL_PLACEHOLDER_TEXT
 
 
+def test_waiting_envelope_with_oversized_child_is_never_spilled(tmp_path):
+    result = {
+        "status": "waiting_for_user",
+        "interaction_id": "i1",
+        "message_type": "question",
+        "message": "m" * 30,
+        "interactions": [f"q{i}" for i in range(40)],
+    }
+    # Precondition: the interactions list alone is oversized, and the
+    # envelope is recognized as a waiting-for-user shape.
+    assert spill_module._serialized_length(result["interactions"]) > MAX_CHARS
+    assert spill_module.tool_result_waits_for_user(result)
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert spilled == result
+    assert spilled is result
+    assert records == []
+    assert SPILL_RESERVED_RESULT_KEY not in spilled
+    assert not (tmp_path / "output" / "tool-results").exists()
+    assert isinstance(spilled["interactions"], list)
+    assert len(spilled["interactions"]) == 40
+
+
+def test_classified_failure_with_oversized_child_is_never_spilled(tmp_path):
+    result = {
+        "success": False,
+        "is_error": True,
+        "status": "error",
+        "error": "e" * 150,
+        "output": "o" * 150,
+    }
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert spilled == result
+    assert spilled is result
+    assert records == []
+    assert SPILL_RESERVED_RESULT_KEY not in spilled
+    assert not (tmp_path / "output" / "tool-results").exists()
+    assert spilled["error"] == "e" * 150
+    assert spilled["output"] == "o" * 150
+
+
 # --- I-6: files are written verbatim ---------------------------------------
 
 
