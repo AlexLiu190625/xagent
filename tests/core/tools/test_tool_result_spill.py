@@ -13,6 +13,7 @@ import builtins
 import json
 import os
 import re
+import sys
 from collections import ChainMap
 from collections.abc import Mapping
 from pathlib import Path
@@ -784,6 +785,29 @@ def test_shared_non_cyclic_references_still_spill(tmp_path):
     )
     assert len(records) == 2
     assert records[0]["relative_path"] == records[1]["relative_path"]
+    files = list(Path(target.spill_dir).glob("*"))
+    assert len(files) == 1
+
+
+def test_deeply_nested_value_is_left_to_the_output_filter(tmp_path):
+    # Deeper than the interpreter's recursion limit: json.dumps raises
+    # RecursionError here the same way it raises ValueError for a cycle --
+    # both mean "cannot serialize this at all", not "cannot fit it". The
+    # C-accelerated encoder tolerates depths well past the Python recursion
+    # limit (empirically: 5,000 is fine, 10,000 raises), so this uses a
+    # depth with headroom rather than the limit itself.
+    depth = sys.getrecursionlimit() * 20
+    nested = "leaf"
+    for _ in range(depth):
+        nested = {"child": nested}
+    result = {"deep": nested, "pad": "x" * 150}
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert len(records) == 1
+    assert records[0]["value_path"] == "pad"
+    assert spilled["deep"] is nested
     files = list(Path(target.spill_dir).glob("*"))
     assert len(files) == 1
 

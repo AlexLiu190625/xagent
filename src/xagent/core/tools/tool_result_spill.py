@@ -354,28 +354,32 @@ def _serialized_length(value: Any) -> int | None:
 
     Returns the character length a spill file would hold for this value, so
     the size decision and the payload can never disagree. Returns None when
-    the value cannot be serialized at all: today the only such shape is a
-    reference cycle, which json.dumps reports as ValueError.
+    the value cannot be serialized at all: a reference cycle, which
+    json.dumps reports as ValueError, or nesting deeper than the
+    interpreter's recursion limit, which it reports as RecursionError.
 
     A None length is neither small nor oversized -- every caller skips the
     value entirely, leaving it inline for the existing OutputValueFilter,
-    which owns this shape (adapters/vibe/output_filter.py keeps a memo_set of
-    container ids and substitutes CIRCULAR_REFERENCE_MESSAGE). Narrowing the
-    filter's supported input domain is not this module's to do: it runs in
-    front of the filter, so anything it refuses to handle must pass through
-    untouched rather than become a failed tool call.
+    which owns both of these shapes (adapters/vibe/output_filter.py keeps a
+    memo_set of container ids and substitutes CIRCULAR_REFERENCE_MESSAGE for
+    a cycle, and enforces its own max_recursion depth independently of the
+    interpreter's limit). Narrowing the filter's supported input domain is
+    not this module's to do: it runs in front of the filter, so anything it
+    refuses to handle must pass through untouched rather than become a
+    failed tool call.
 
-    This is the only place the walk measures anything, which is why the
-    ValueError is caught here and nowhere else: a cycle at any depth under a
-    node makes that whole node unmeasurable, the node is then never chosen as
-    a spill point, and no later json.dumps in the write path can meet it.
+    This is the only place the walk measures anything, which is why both
+    exceptions are caught here and nowhere else: either one at any depth
+    under a node makes that whole node unmeasurable, the node is then never
+    chosen as a spill point, and no later json.dumps in the write path can
+    meet it.
     """
     value = _plain_mapping(value)
     if isinstance(value, str):
         return len(value)
     try:
         return len(json.dumps(value, ensure_ascii=False, default=str))
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
 
 
@@ -778,7 +782,8 @@ def _build_spill_record(
     if original_chars is None:
         logger.info(
             "Tool %s returned a value at %s that cannot be serialized "
-            "(reference cycle); leaving it to the output filter.",
+            "(reference cycle or nesting deeper than the recursion limit); "
+            "leaving it to the output filter.",
             tool_name,
             _format_value_path(path),
         )
