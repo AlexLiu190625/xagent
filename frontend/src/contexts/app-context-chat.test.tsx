@@ -7779,59 +7779,191 @@ describe("connector runtime dialog trigger", () => {
   })
 
   it("discards a staged candidate in the session transport path's finally, not only its catch (T4)", async () => {
-    // The session (taskless-chat) send path has its own early-return guard
-    // in addOptimisticUserMessage (this tab unmounted while the delivery
-    // acknowledgement was in flight) that is not a thrown error -- proving
-    // the discard sits in `finally`, matching the withdraw-on-early-return
-    // row of the stash lifecycle's exception table, not merely `catch`.
-    let resolveAck: ((v: { client_message_id: string; turn_id: string }) => void) | undefined
-    sendChatMessageMock.mockReturnValueOnce(
-      new Promise((resolve) => { resolveAck = resolve }),
-    )
+    // The session (taskless-chat) send path's replacement branch has its own
+    // early-return guard that is not a thrown error: once the delivery
+    // acknowledgement resolves, it checks whether this send still owns the
+    // in-flight replacement conversation and, if not, returns without ever
+    // reaching the write-back. AppProvider stays mounted throughout this
+    // test -- unlike unmounting it, which would clear every pending
+    // candidate through its own cleanup effect regardless of whether
+    // `finally` ran -- so only the send's own ownership check can explain
+    // what happens to the staged candidate below.
+    stubConnectorRuntimeGet()
+    const acknowledgement = deferred<{ client_message_id: string; turn_id: string }>()
+    sendChatMessageMock.mockReturnValueOnce(acknowledgement.promise)
     let dialogActions: ReturnType<typeof useConnectorRuntimeDialogActions> | undefined
     function DialogActionsProbe() {
       dialogActions = useConnectorRuntimeDialogActions()
       return null
     }
-    let send: (() => Promise<void>) | undefined
-    function SendProbe() {
-      const { sendMessage } = useApp()
-      send = () => sendMessage("hello there", { clientMessageId: "turn-a" })
-      return null
-    }
     const { rerender } = render(
       <ConnectorRuntimeDialogProvider>
-        <AppProvider token="token" transport={makeSessionTransport()}>
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("t4-old"))}>
           <DialogActionsProbe />
           <ConnectorRuntimeStateProbe />
-          <SendProbe />
+          <SessionControlsProbe />
         </AppProvider>
       </ConnectorRuntimeDialogProvider>
     )
-    const onMessage = webSocketOptions.current?.onMessage
-    act(() => onMessage?.(taskInfoMessage(97)))
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(97)))
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      webSocketOptions.current?.onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      await reset
+    })
+    // The reset drops the app's own taskId along with the session's, but the
+    // widget can still point sendMessage at an already-established task
+    // while a replacement conversation is pending -- the same setTaskId
+    // call the "select task" UI elsewhere in this file uses.
+    act(() => { getSessionControls().setTaskId(97, { navigate: false }) })
 
     let sendPromise: Promise<void> | undefined
-    act(() => { sendPromise = send?.() })
+    act(() => {
+      sendPromise = getSessionControls().sendMessage("hello there", { clientMessageId: "turn-a" })
+    })
 
-    // The AppProvider tree unmounts while the acknowledgement is still in
-    // flight. The dialog provider and probes stay mounted so the pending
-    // candidate's fate can still be observed afterward.
+    // The connection rebinds to a new identity while the acknowledgement is
+    // still in flight. AppProvider is rerendered with the new transport, not
+    // unmounted, so no unmount cleanup runs.
     rerender(
       <ConnectorRuntimeDialogProvider>
-        <DialogActionsProbe />
-        <ConnectorRuntimeStateProbe />
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("t4-new"))}>
+          <DialogActionsProbe />
+          <ConnectorRuntimeStateProbe />
+          <SessionControlsProbe />
+        </AppProvider>
       </ConnectorRuntimeDialogProvider>
     )
 
     await act(async () => {
-      resolveAck?.({ client_message_id: "turn-a", turn_id: "turn-a" })
+      acknowledgement.resolve({ client_message_id: "turn-a", turn_id: "turn-a" })
       await sendPromise?.catch(() => {})
     })
 
     act(() => { dialogActions?.openForTask(97) })
     const request = connectorRuntimeState.request as { resendPayload: unknown } | null
     expect(request?.resendPayload).toBeNull()
+    // Let the dialog's own requirements fetch (triggered by `request`
+    // becoming non-null) settle before the test ends, so it cannot resolve
+    // during a later test and corrupt its apiRequestMock call history.
+    await waitFor(() =>
+      expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+    )
+  })
+
+  it("stages a resend candidate on the session transport path before its delivery is acknowledged", async () => {
+    stubConnectorRuntimeGet()
+    let resolveAck: ((v: { client_message_id: string; turn_id: string }) => void) | undefined
+    sendChatMessageMock.mockReturnValueOnce(
+      new Promise((resolve) => { resolveAck = resolve }),
+    )
+    let send: (() => Promise<void>) | undefined
+    function SendProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage("hello there", { clientMessageId: "turn-a-stage" })
+      return null
+    }
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token" transport={makeSessionTransport()}>
+          <ConnectorRuntimeStateProbe />
+          <SendProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => onMessage?.(taskInfoMessage(197)))
+
+    let sendPromise: Promise<void> | undefined
+    act(() => { sendPromise = send?.() })
+    // Not yet acknowledged: nothing has been written to the confirmed stash.
+    expect(connectorRuntimeState.payload).toBeNull()
+
+    act(() => {
+      onMessage?.({
+        type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 197,
+        task: { id: 197, status: "failed" }, message: "x", error: "x",
+        code: "missing_runtime_context", run_id: "run-1", state_version: 2,
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => expect(connectorRuntimeState.request).not.toBeNull())
+    const request = connectorRuntimeState.request as { resendPayload: { clientMessageId: string } | null }
+    expect(request.resendPayload?.clientMessageId).toBe("turn-a-stage")
+    // Let the dialog's own requirements fetch settle before the test ends,
+    // so it cannot resolve during a later test and corrupt its
+    // apiRequestMock call history.
+    await waitFor(() =>
+      expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+    )
+
+    await act(async () => {
+      resolveAck?.({ client_message_id: "turn-a-stage", turn_id: "turn-a-stage" })
+      await sendPromise?.catch(() => {})
+    })
+  })
+
+  it("stages a resend candidate before a queued non-current-task delivery is acknowledged", async () => {
+    stubConnectorRuntimeGet()
+    let send: (() => Promise<void>) | undefined
+    let resetTask: (() => void) | undefined
+    function TargetTaskProbe() {
+      const { sendMessage, setTaskId } = useApp()
+      send = () => {
+        // Mirrors the widget's bootstrap (see the "rejects a queued
+        // message..." test above): taskId is set in the same tick the
+        // opening message is queued for it, so this send's own state.taskId
+        // closure is still stale/null and takes the non-current-task
+        // branch, while the task it stages for is the one actually being
+        // viewed by the time the terminal frame below arrives.
+        setTaskId(209, { navigate: false })
+        return sendMessage("hello there", { clientMessageId: "turn-b-stage", targetTaskId: 209 })
+      }
+      resetTask = () => setTaskId(null, { navigate: false })
+      return null
+    }
+    // The socket for task 209 never connects, so the queued message stays
+    // pending while the terminal frame below arrives.
+    wsHarness.isConnected = false
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <ConnectorRuntimeStateProbe />
+          <TargetTaskProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    let sendPromise: Promise<void | undefined> | undefined
+    await act(async () => {
+      sendPromise = Promise.resolve(send?.()).catch(() => undefined)
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => {
+      onMessage?.({
+        type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 209,
+        task: { id: 209, status: "failed" }, message: "x", error: "x",
+        code: "missing_runtime_context", run_id: "run-1", state_version: 2,
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => expect(connectorRuntimeState.request).not.toBeNull())
+    const request = connectorRuntimeState.request as { resendPayload: { clientMessageId: string } | null }
+    expect(request.resendPayload?.clientMessageId).toBe("turn-b-stage")
+    // Let the dialog's own requirements fetch settle before the test ends,
+    // so it cannot resolve during a later test and corrupt its
+    // apiRequestMock call history.
+    await waitFor(() =>
+      expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+    )
+
+    // Clean up the still-queued send so it does not linger past this test:
+    // nulling the viewed task makes the queue reject it instead of leaving it
+    // to sit out its own timeout.
+    await act(async () => {
+      resetTask?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    await act(async () => { await sendPromise })
   })
 
   it("still resolves the dialog for a version-less terminal frame the bubble dedup guard collapses", async () => {

@@ -70,7 +70,7 @@ import {
 const REF_A = { connector_type: "custom_api", connector_id: 1 }
 const REF_B = { connector_type: "mcp", connector_id: 2 }
 
-// Shared by the two source-scanning tests below instead of each re-reading.
+// Shared by the source-scanning test below instead of it re-reading twice.
 const libSource = readFileSync(path.resolve(__dirname, "../../lib/connector-runtime-api.ts"), "utf8")
 const dialogSource = readFileSync(path.resolve(__dirname, "./connector-runtime-dialog.tsx"), "utf8")
 
