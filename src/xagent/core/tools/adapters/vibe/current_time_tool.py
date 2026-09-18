@@ -246,7 +246,10 @@ def _instants_for_wall_time(
     conversion leaves the range datetime can represent, and this raises
     ValueError naming wall_text, which is how the caller spelled the wall
     time. The caller passes that spelling rather than formatting it here
-    because the two callers spell it differently.
+    because callers spell it differently: validate_local_time's caller wrote
+    it, resolve_datetime's wall-clock branch formats its own moment, and
+    _day_midnight_instants forwards that same formatted spelling on every
+    minute it tries, not a fresh one per minute.
     """
     by_instant: dict[datetime, datetime] = {}
     for fold in (0, 1):
@@ -1337,12 +1340,22 @@ class ResolveDatetimeTool(AbstractBaseTool):
         return ResolveDatetimeArgs
 
     def return_type(self) -> Type[BaseModel]:
+        # The success shape only. A refusal is a framework-shaped failure
+        # mapping (success/tool_name/error/resolution), not a narrower
+        # ResolveDatetimeResult, and nothing turns this class into a schema
+        # the engine validates results against: the two wrappers that read
+        # return_type() only pass it through, and the one consumer that would
+        # validate against it belongs to FunctionTool, which this tool does
+        # not go through.
         return ResolveDatetimeResult
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
         parsed = ResolveDatetimeArgs.model_validate(args)
         # Already a dict: a success is the result model dumped, a refusal is
-        # the framework-shaped failure mapping.
+        # the framework-shaped failure mapping. validate_local_time raises
+        # instead, because every way it can fail is a caller mistake; this
+        # tool's refusals are answers about the phrase the model must be able
+        # to read and act on, so they come back as a result with a reason.
         return resolve_datetime(parsed.phrase, parsed.timezone)
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
