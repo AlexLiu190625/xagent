@@ -575,6 +575,15 @@ def _spill_fitting_prefix(value: Any, limit: int) -> int:
     plus backoff was rejected: on a skewed collection (a few large items
     followed by many small ones) it lands far from the truth, and any fixed
     retry budget can run out while still over the limit.
+
+    CPU-bound and synchronous. The cost is one json.dumps plus one UTF-8
+    encode per item, over as many items as fit under ``limit`` bytes -- and
+    ``limit`` bounds bytes, not items, so the smaller the items the more of
+    them run. A list of 2,800,000 one-byte integers serializes to just over
+    the 8 MiB cap and takes about two seconds of straight CPU, measured on
+    one developer machine. A caller on an asyncio event loop must run the
+    spill entry point in a worker thread; called on the loop thread, this
+    blocks every other coroutine for that whole time.
     """
     item_sep = 2  # json.dumps' default item separator ", "
     total = 2  # the two enclosing brackets or braces
@@ -903,6 +912,12 @@ def spill_oversized_values(
     that need the 64-file cap to hold across an entire run (every tool
     result produced while one set of tools is in use) pass the same
     SpillRunBudget instance to every call.
+
+    Synchronous and CPU-bound: the walk serializes every node it measures,
+    and a value over the 8 MiB file cap is measured one item at a time (see
+    _spill_fitting_prefix, which can run for seconds on a collection of tiny
+    items). A caller running on an asyncio event loop must offload this call
+    to a worker thread rather than call it on the loop thread.
     """
     if target is None or not isinstance(result, dict):
         return result, []
