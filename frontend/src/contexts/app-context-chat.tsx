@@ -6510,6 +6510,17 @@ export function AppProvider({
         }
         beginSessionPreAdoptionBuffer(sessionDeliveryOwner.connectionIdentity)
       }
+      // Staged before the delivery acknowledgement is awaited, keyed by this
+      // turn's own clientMessageId, so a terminal frame that arrives first
+      // (the transport gives no ordering guarantee between the two) can
+      // still claim it in openForTask. Only staged when there is a task to
+      // attribute it to -- addOptimisticUserMessage below only records the
+      // delivery under the same condition.
+      if (typeof state.taskId === "number") {
+        connectorRuntimeDialogRef.current.stagePendingDelivery({
+          taskId: state.taskId, clientMessageId, text: message, files: files ?? [],
+        })
+      }
       beginSessionMessageDelivery()
       try {
         await sendChatMessage(
@@ -6566,18 +6577,31 @@ export function AppProvider({
         throw error
       } finally {
         endSessionMessageDelivery()
+        // A no-op if addOptimisticUserMessage already redeemed the ticket
+        // above (recordDelivery removes the pending entry on success): this
+        // only has anything to withdraw when the try block threw or
+        // returned early before reaching that call.
+        connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
       }
       return
     }
 
     if (targetTaskId !== null && state.taskId !== targetTaskId) {
-      await queuePendingMessage({
-        message,
-        files,
-        targetTaskId,
-        force: config?.force,
-        clientMessageId,
+      connectorRuntimeDialogRef.current.stagePendingDelivery({
+        taskId: targetTaskId, clientMessageId, text: message, files: files ?? [],
       })
+      try {
+        await queuePendingMessage({
+          message,
+          files,
+          targetTaskId,
+          force: config?.force,
+          clientMessageId,
+        })
+      } catch (error) {
+        connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
+        throw error
+      }
       addOptimisticUserMessage(targetTaskId)
       return
     }
@@ -6749,14 +6773,22 @@ export function AppProvider({
 
           // Do not clear the composer until the newly connected task socket
           // confirms that the message was durably accepted.
-          await queuePendingMessage({
-            message,
-            files,
-            targetTaskId: newTaskId,
-            force: config?.force,
-            clientMessageId,
-            requestId,
+          connectorRuntimeDialogRef.current.stagePendingDelivery({
+            taskId: newTaskId, clientMessageId, text: message, files: files ?? [],
           })
+          try {
+            await queuePendingMessage({
+              message,
+              files,
+              targetTaskId: newTaskId,
+              force: config?.force,
+              clientMessageId,
+              requestId,
+            })
+          } catch (error) {
+            connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
+            throw error
+          }
           addOptimisticUserMessage(newTaskId)
         } else {
           const parsed = await parseApiResponse(response)
@@ -6801,7 +6833,15 @@ export function AppProvider({
       // deliberately runs only after this succeeds - clearing dagExecution/
       // steps first and then throwing would remove the Progress panel and its
       // header toggle for a run that never actually changed.
-      await sendChatMessage(message, files, config?.force, clientMessageId, requestId)
+      connectorRuntimeDialogRef.current.stagePendingDelivery({
+        taskId: state.taskId, clientMessageId, text: message, files: files ?? [],
+      })
+      try {
+        await sendChatMessage(message, files, config?.force, clientMessageId, requestId)
+      } catch (error) {
+        connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
+        throw error
+      }
 
       // A prior turn's DAG plan/steps must not linger into this turn - otherwise
       // the Progress panel would auto-open (or stay open) showing stale steps

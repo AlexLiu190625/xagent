@@ -7649,6 +7649,191 @@ describe("connector runtime dialog trigger", () => {
     expect(sendChatMessageMock.mock.calls[0][0]).toBe("hello there")
   })
 
+  it("claims a pending candidate staged before the delivery acknowledgement resolves (T1)", async () => {
+    // The transport gives no ordering guarantee between a terminal frame and
+    // sendMessage's own delivery acknowledgement (see the stash lifecycle
+    // docs) -- this fires the terminal frame first, while the acknowledgement
+    // is still unresolved, to prove openForTask can still claim the turn via
+    // the staged candidate rather than the (not yet written) confirmed stash.
+    stubConnectorRuntimeGet()
+    let resolveAck: ((v: { client_message_id: string; turn_id: string }) => void) | undefined
+    sendChatMessageMock.mockReturnValueOnce(
+      new Promise((resolve) => { resolveAck = resolve }),
+    )
+    let send: (() => Promise<void>) | undefined
+    function SendProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage("hello there", { clientMessageId: "turn-a" })
+      return null
+    }
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+          <SendProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    let sendPromise: Promise<void> | undefined
+    act(() => { sendPromise = send?.() })
+    // Not yet acknowledged: nothing has been written to the confirmed stash.
+    expect(connectorRuntimeState.payload).toBeNull()
+
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => {
+      onMessage?.({
+        type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 1,
+        task: { id: 1, status: "failed" }, message: "x", error: "x",
+        code: "missing_runtime_context", run_id: "run-1", state_version: 2,
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => expect(connectorRuntimeState.request).not.toBeNull())
+    const request = connectorRuntimeState.request as { resendPayload: { clientMessageId: string } | null }
+    expect(request.resendPayload?.clientMessageId).toBe("turn-a")
+
+    // The late acknowledgement must not resurrect a stale candidate for the
+    // next failure: openForTask already consumed the ticket, so this finds
+    // nothing to redeem and the stash stays empty.
+    await act(async () => {
+      resolveAck?.({ client_message_id: "turn-a", turn_id: "turn-a" })
+      await sendPromise
+    })
+    expect(connectorRuntimeState.payload).toBeNull()
+  })
+
+  it("drops a staged candidate at a non-triggering settlement that arrives before the acknowledgement (T2)", async () => {
+    stubConnectorRuntimeGet()
+    let resolveAck: ((v: { client_message_id: string; turn_id: string }) => void) | undefined
+    sendChatMessageMock.mockReturnValueOnce(
+      new Promise((resolve) => { resolveAck = resolve }),
+    )
+    let send: (() => Promise<void>) | undefined
+    function SendProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage("hello there", { clientMessageId: "turn-a" })
+      return null
+    }
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+          <SendProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    let sendPromise: Promise<void> | undefined
+    act(() => { sendPromise = send?.() })
+
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => {
+      onMessage?.({
+        type: "task_completed", timestamp: "2026-05-27T05:00:02Z", task_id: 1,
+        task: { id: 1, status: "completed" },
+      } as unknown as TestWebSocketMessage)
+    })
+
+    // The settlement already dropped this task's pending candidate, so the
+    // late acknowledgement redeems no ticket and the stash stays empty --
+    // not the just-completed turn's text.
+    await act(async () => {
+      resolveAck?.({ client_message_id: "turn-a", turn_id: "turn-a" })
+      await sendPromise
+    })
+    expect(connectorRuntimeState.payload).toBeNull()
+  })
+
+  it("discards a staged candidate when the send itself throws, leaving nothing for a later failure to offer (T3)", async () => {
+    stubConnectorRuntimeGet()
+    sendChatMessageMock.mockRejectedValueOnce(new Error("network"))
+    let send: (() => Promise<void>) | undefined
+    function SendProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage("hello there", { clientMessageId: "turn-a" })
+      return null
+    }
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+          <SendProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    await act(async () => { await send?.().catch(() => {}) })
+    expect(connectorRuntimeState.payload).toBeNull()
+
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => {
+      onMessage?.({
+        type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 1,
+        task: { id: 1, status: "failed" }, message: "x", error: "x",
+        code: "missing_runtime_context", run_id: "run-1", state_version: 2,
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => expect(connectorRuntimeState.request).not.toBeNull())
+    const request = connectorRuntimeState.request as { resendPayload: unknown }
+    expect(request.resendPayload).toBeNull()
+  })
+
+  it("discards a staged candidate in the session transport path's finally, not only its catch (T4)", async () => {
+    // The session (taskless-chat) send path has its own early-return guard
+    // in addOptimisticUserMessage (this tab unmounted while the delivery
+    // acknowledgement was in flight) that is not a thrown error -- proving
+    // the discard sits in `finally`, matching the withdraw-on-early-return
+    // row of the stash lifecycle's exception table, not merely `catch`.
+    let resolveAck: ((v: { client_message_id: string; turn_id: string }) => void) | undefined
+    sendChatMessageMock.mockReturnValueOnce(
+      new Promise((resolve) => { resolveAck = resolve }),
+    )
+    let dialogActions: ReturnType<typeof useConnectorRuntimeDialogActions> | undefined
+    function DialogActionsProbe() {
+      dialogActions = useConnectorRuntimeDialogActions()
+      return null
+    }
+    let send: (() => Promise<void>) | undefined
+    function SendProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage("hello there", { clientMessageId: "turn-a" })
+      return null
+    }
+    const { rerender } = render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token" transport={makeSessionTransport()}>
+          <DialogActionsProbe />
+          <ConnectorRuntimeStateProbe />
+          <SendProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => onMessage?.(taskInfoMessage(97)))
+
+    let sendPromise: Promise<void> | undefined
+    act(() => { sendPromise = send?.() })
+
+    // The AppProvider tree unmounts while the acknowledgement is still in
+    // flight. The dialog provider and probes stay mounted so the pending
+    // candidate's fate can still be observed afterward.
+    rerender(
+      <ConnectorRuntimeDialogProvider>
+        <DialogActionsProbe />
+        <ConnectorRuntimeStateProbe />
+      </ConnectorRuntimeDialogProvider>
+    )
+
+    await act(async () => {
+      resolveAck?.({ client_message_id: "turn-a", turn_id: "turn-a" })
+      await sendPromise?.catch(() => {})
+    })
+
+    act(() => { dialogActions?.openForTask(97) })
+    const request = connectorRuntimeState.request as { resendPayload: unknown } | null
+    expect(request?.resendPayload).toBeNull()
+  })
+
   it("still resolves the dialog for a version-less terminal frame the bubble dedup guard collapses", async () => {
     // Two frames with the same dedup text and no state_version: the second
     // has no occurrenceIdentity, so the bubble dedup guard folds it and the
