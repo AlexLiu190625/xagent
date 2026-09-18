@@ -201,15 +201,12 @@ def test_resolve_spilled_under_never_creates_the_spill_dir(tmp_path):
 
 
 def test_resolve_spilled_under_symlink_loop_returns_none(spill_layout):
-    link_a = spill_layout / "a0000000000000000000000000000000.txt"
-    link_b = spill_layout / "b0000000000000000000000000000000.txt"
+    link_a = spill_layout / "loop_first_link.txt"
+    link_b = spill_layout / "loop_second_link.txt"
     link_a.symlink_to(link_b)
     link_b.symlink_to(link_a)
     assert (
-        resolve_spilled_under(
-            spill_layout, "tool-results/a0000000000000000000000000000000.txt"
-        )
-        is None
+        resolve_spilled_under(spill_layout, "tool-results/loop_first_link.txt") is None
     )
 
 
