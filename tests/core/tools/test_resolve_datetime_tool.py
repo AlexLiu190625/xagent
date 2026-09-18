@@ -4,6 +4,7 @@ import asyncio
 import itertools
 import re
 from datetime import datetime, timezone
+from typing import Callable
 
 import pytest
 from pydantic import ValidationError
@@ -273,7 +274,10 @@ def test_resolve_result_has_no_quotable_clock() -> None:
     for line in supported:
         assert not re.search(r"\d{4}-\d{2}-\d{2}", line)
         assert not re.search(r"\d{4}", line)
-    assert len(supported) == len(GRAMMAR_FORMS)
+    # What a refusal sends is exactly this published list, in this order;
+    # test_every_reader_maps_to_a_grammar_line below is what checks that the
+    # list itself has one line per reader, which this equality cannot.
+    assert supported == list(GRAMMAR_FORMS)
 
     assert set(RESOLUTION_REASONS) == {
         "unsupported_expression",
@@ -282,6 +286,45 @@ def test_resolve_result_has_no_quotable_clock() -> None:
         "ambiguous_local_time",
         "invalid_timezone",
     }
+
+
+# Every reader that can produce a reading, mapped to the GRAMMAR_FORMS index
+# of the line describing it. Two readers -- the English and Chinese bare-time
+# forms -- share line 12, so this has fourteen keys over thirteen values.
+_GRAMMAR_LINE_BY_READER: dict[Callable[[str, datetime], object], int] = {
+    module._read_iso: 0,
+    module._read_en_calendar_date: 1,
+    module._read_zh_date: 2,
+    module._read_en_relative_day: 3,
+    module._read_zh_relative_day: 4,
+    module._read_en_shifted_weekday: 5,
+    module._read_en_weekday: 6,
+    module._read_zh_weekday: 7,
+    module._read_en_days_later: 8,
+    module._read_en_hours_later: 9,
+    module._read_zh_days_later: 10,
+    module._read_zh_hours_later: 11,
+    module._read_en_time: 12,
+    module._read_zh_time: 12,
+}
+
+
+def test_every_reader_maps_to_a_grammar_line() -> None:
+    """Every reader in _READERS and _LOWERCASE_READERS, plus the calendar-date
+    fallback the phrase reaches when none of those match, must own one of the
+    GRAMMAR_FORMS lines the tool advertises in a refusal. The equality this
+    replaces (len(supported) == len(GRAMMAR_FORMS)) only compared
+    GRAMMAR_FORMS's length to itself and could not notice a reader added
+    without a line, or a line dropped without removing its reader; this maps
+    every reader by identity to a specific line and checks both the reader
+    set and the line-index set match."""
+    all_readers = (
+        set(module._READERS)
+        | set(module._LOWERCASE_READERS)
+        | {module._read_en_calendar_date}
+    )
+    assert set(_GRAMMAR_LINE_BY_READER) == all_readers
+    assert set(_GRAMMAR_LINE_BY_READER.values()) == set(range(len(GRAMMAR_FORMS)))
 
 
 def test_resolve_datetime_rejects_sub_minute_offset() -> None:
@@ -938,6 +981,27 @@ def test_calendar_date_fractional_seconds_are_refused(phrase: str) -> None:
     assert result["success"] is False
     assert result["resolution"] == "unsupported_expression"
     assert result["error"] == f"unsupported date or time expression: {phrase!r}"
+
+
+def test_mixed_separator_numeric_dates_read_like_consistent_ones() -> None:
+    """`12/05-2026` passes the whole-phrase gate: the numeric date branch
+    writes its two separators as independent character classes. No value is
+    wrong -- a mixed-separator phrase lands on exactly the same answer as the
+    same phrase written with one separator -- so this pins the acceptance
+    rather than narrowing it."""
+    assert (
+        resolve_datetime("25/12-1990", "UTC")["resolved"]
+        == resolve_datetime("25/12/1990", "UTC")["resolved"]
+        == "1990-12-25T00:00:00+00:00"
+    )
+    assert (
+        resolve_datetime("25-12/1990", "UTC")["resolved"] == "1990-12-25T00:00:00+00:00"
+    )
+    assert (
+        resolve_datetime("12/05-2026", "UTC")["resolution"]
+        == resolve_datetime("12/05/2026", "UTC")["resolution"]
+        == "ambiguous_date"
+    )
 
 
 @pytest.mark.parametrize(
