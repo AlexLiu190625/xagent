@@ -610,6 +610,17 @@ def test_duration_later_forms_land_on_whole_minute(
     assert unaffected["resolved"] == "2026-09-15T15:00:00+10:00"
 
 
+def test_refusal_rejects_a_code_outside_the_published_set() -> None:
+    """RESOLUTION_REASONS is the published contract a caller can act on: a
+    refusal code outside it would put a word into the model's context that
+    no caller can do anything with, so _refusal fails loudly on one instead
+    of shipping it, while every published reason still builds normally."""
+    with pytest.raises(ValueError):
+        module._refusal("bogus_code", "x")
+    for reason in RESOLUTION_REASONS:
+        assert module._refusal(reason, "x")["resolution"] == reason
+
+
 @pytest.mark.parametrize("zone", ["EST", "Sydney", "Etc/GMT+10"])
 def test_resolve_datetime_rejects_non_region_city_zone(zone: str) -> None:
     result = resolve_datetime("tomorrow", zone)

@@ -1147,6 +1147,13 @@ def _day_midnight_instants(
 def _refusal(
     reason: str, error: str, *, include_grammar: bool = True
 ) -> dict[str, Any]:
+    if reason not in RESOLUTION_REASONS:
+        # The reason set is the tool's published contract: a refusal carrying
+        # a code outside it would put a word into the model's context that no
+        # caller can act on. Nothing reachable passes one -- every call site
+        # writes a literal from the set -- so this fails loudly rather than
+        # shipping an unknown code.
+        raise ValueError(f"unknown resolution reason: {reason!r}")
     # success=False routes the call through the framework's failure branch;
     # the reason is carried under 'resolution' because 'status' is the
     # framework's control channel.
