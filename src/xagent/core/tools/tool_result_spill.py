@@ -686,12 +686,21 @@ def _replace_spill_file(directory: Path, filename: str, payload_bytes: bytes) ->
     os.replace onto the same target is then two atomic overwrites of
     identical bytes, not a race over who moves it first.
 
+    The temporary file is removed on every path. Without that, a failed
+    write or a failed replace leaves a complete, unregistered file in a
+    directory the model can list, and repeated failures accumulate them.
     Raises OSError on any filesystem failure; the caller decides how to fall
-    back.
+    back, and the cleanup does not mask that error.
     """
     tmp = directory / f"{filename}.{os.getpid()}.{uuid4().hex[:8]}.tmp"
-    tmp.write_bytes(payload_bytes)
-    os.replace(tmp, directory / filename)
+    try:
+        tmp.write_bytes(payload_bytes)
+        os.replace(tmp, directory / filename)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove the spill temp file %s", tmp)
 
 
 def _write_spill_file(spill_dir: str, tool_name: str, payload: str, kind: str) -> str:

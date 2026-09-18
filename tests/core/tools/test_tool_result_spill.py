@@ -822,6 +822,7 @@ def test_second_tier_write_failure_falls_back_whole(tmp_path, monkeypatch):
     )
     assert spilled == result
     assert records == []
+    assert list(Path(target.spill_dir).glob("*")) == []
 
 
 def test_first_tier_write_failure_leaves_that_node_untouched(tmp_path, monkeypatch):
@@ -847,6 +848,7 @@ def test_first_tier_write_failure_leaves_that_node_untouched(tmp_path, monkeypat
     # its write failed, so nothing spilled and the value is untouched.
     assert spilled["content"][0]["text"] == _big()
     assert records == []
+    assert list(Path(target.spill_dir).glob("*.tmp")) == []
 
 
 def test_spill_concurrent_writers_of_the_same_content_all_succeed(tmp_path):
@@ -1023,6 +1025,7 @@ def test_spill_target_that_is_a_directory_falls_back_to_truncation(tmp_path):
 
     assert records_again == []
     assert spilled == result
+    assert list(Path(target.spill_dir).glob("*.tmp")) == []
 
 
 def test_spill_target_symlink_out_of_the_directory_is_not_written_through(tmp_path):
@@ -1048,6 +1051,30 @@ def test_spill_target_symlink_out_of_the_directory_is_not_written_through(tmp_pa
     assert not written_file.is_symlink()
     assert json.loads(written_file.read_bytes()) == list(range(60))
     assert records_again[0]["relative_path"] == relative_path
+
+
+def test_write_bytes_failure_leaves_no_temp_file(tmp_path, monkeypatch):
+    target = _target(tmp_path)
+    original_write_bytes = Path.write_bytes
+
+    def _flaky_write_bytes(self, data, *args, **kwargs):
+        if self.name.endswith(".tmp"):
+            raise OSError("ENOSPC")
+        return original_write_bytes(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_bytes", _flaky_write_bytes)
+    result = {"rows": list(range(60))}
+
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+
+    assert records == []
+    assert spilled == result
+    assert (
+        not Path(target.spill_dir).exists()
+        or list(Path(target.spill_dir).glob("*")) == []
+    )
 
 
 def test_spill_different_content_gets_different_filenames(tmp_path):
