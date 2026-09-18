@@ -658,6 +658,92 @@ def test_spill_file_is_written_verbatim_empty_containers_are_not_spilled(tmp_pat
     assert records == []
 
 
+# --- D0-4: reference cycles and binary values do not raise, do not orphan --
+
+
+def test_self_referential_result_is_left_to_the_output_filter(tmp_path):
+    inner: dict = {}
+    inner["self"] = inner
+    result = {"big": "x" * 150, "cyc": inner}
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert len(records) == 1
+    assert records[0]["value_path"] == "big"
+    assert spilled["cyc"] is inner
+    files = list(Path(target.spill_dir).glob("*"))
+    assert len(files) == 1
+
+
+def test_cycle_three_levels_down_is_left_to_the_output_filter(tmp_path):
+    inner: dict = {}
+    inner["self"] = inner
+    result = {"a": {"b": {"c": inner, "pad": "x" * 150}}}
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert records == []
+    assert not Path(target.spill_dir).exists()
+
+
+def test_bytes_value_is_not_spilled_and_leaves_no_file(tmp_path, caplog):
+    result = {"blob": b"\xff" * 200}
+    target = _target(tmp_path)
+    with caplog.at_level("INFO"):
+        spilled, records = spill_oversized_values(
+            result, target, tool_name="acme", max_recursion=20
+        )
+    assert records == []
+    assert spilled["blob"] == b"\xff" * 200
+    assert not Path(target.spill_dir).exists() or not list(
+        Path(target.spill_dir).glob("*")
+    )
+    assert any("binary value" in message for message in caplog.messages)
+
+
+@pytest.mark.parametrize("blob", [bytearray(b"\xff" * 200), memoryview(b"\xff" * 200)])
+def test_bytearray_and_memoryview_are_not_spilled(tmp_path, blob):
+    result = {"blob": blob}
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert records == []
+    assert spilled["blob"] == blob
+    assert not Path(target.spill_dir).exists() or not list(
+        Path(target.spill_dir).glob("*")
+    )
+
+
+def test_metadata_is_computed_before_the_file_is_written(tmp_path, monkeypatch):
+    def _boom(kind, parsed):
+        raise RuntimeError("late metadata")
+
+    monkeypatch.setattr(spill_module, "_record_fields_for", _boom)
+    result = {"rows": list(range(60))}
+    target = _target(tmp_path)
+    with pytest.raises(RuntimeError):
+        spill_oversized_values(result, target, tool_name="acme", max_recursion=20)
+    assert not Path(target.spill_dir).exists() or not list(
+        Path(target.spill_dir).glob("*")
+    )
+
+
+def test_shared_non_cyclic_references_still_spill(tmp_path):
+    shared = {"k": "v" * 60}
+    result = {"x": shared, "y": shared}
+    target = _target(tmp_path, max_chars=50)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert len(records) == 2
+    assert records[0]["relative_path"] == records[1]["relative_path"]
+    files = list(Path(target.spill_dir).glob("*"))
+    assert len(files) == 1
+
+
 # --- I-10: reserved key stripped unconditionally ---------------------------
 
 

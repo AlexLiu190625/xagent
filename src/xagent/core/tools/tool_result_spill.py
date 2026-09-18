@@ -329,11 +329,34 @@ def _plain_mapping(value: Any) -> Any:
     return value
 
 
-def _serialized_length(value: Any) -> int:
+def _serialized_length(value: Any) -> int | None:
+    """Measure one value the way the writer would render it, or None.
+
+    Returns the character length a spill file would hold for this value, so
+    the size decision and the payload can never disagree. Returns None when
+    the value cannot be serialized at all: today the only such shape is a
+    reference cycle, which json.dumps reports as ValueError.
+
+    A None length is neither small nor oversized -- every caller skips the
+    value entirely, leaving it inline for the existing OutputValueFilter,
+    which owns this shape (adapters/vibe/output_filter.py keeps a memo_set of
+    container ids and substitutes CIRCULAR_REFERENCE_MESSAGE). Narrowing the
+    filter's supported input domain is not this module's to do: it runs in
+    front of the filter, so anything it refuses to handle must pass through
+    untouched rather than become a failed tool call.
+
+    This is the only place the walk measures anything, which is why the
+    ValueError is caught here and nowhere else: a cycle at any depth under a
+    node makes that whole node unmeasurable, the node is then never chosen as
+    a spill point, and no later json.dumps in the write path can meet it.
+    """
     value = _plain_mapping(value)
     if isinstance(value, str):
         return len(value)
-    return len(json.dumps(value, ensure_ascii=False, default=str))
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str))
+    except ValueError:
+        return None
 
 
 def _spill_children(value: Any) -> list[tuple[Any, Any]] | None:
@@ -353,6 +376,21 @@ def _spill_children(value: Any) -> list[tuple[Any, Any]] | None:
     return None
 
 
+def _is_spillable_value(value: Any) -> bool:
+    """Whether this value can become a spill file at all.
+
+    Binary values cannot. The existing output filter already owns them: it
+    decodes bytes with errors="replace" and truncates the resulting text
+    (adapters/vibe/output_filter.py's bytes branch). A spill file would have
+    to invent a second representation -- json.dumps(default=str) renders them
+    as a Python repr such as "b'\\xff\\xff'", which is neither the filter's
+    text nor the original bytes -- and the record would then describe a kind
+    the file does not hold. One representation for binary results is worth
+    more than a file nobody can interpret, so these are left inline.
+    """
+    return not isinstance(value, (bytes, bytearray, memoryview))
+
+
 def _find_spill_points(
     value: Any, *, max_chars: int, max_recursion: int, depth: int
 ) -> list[tuple[tuple[Any, ...], Any]]:
@@ -366,9 +404,11 @@ def _find_spill_points(
     children = _spill_children(value)
     if children is None or depth >= max_recursion:
         return [((), value)]
-    oversized_children = [
-        (key, child) for key, child in children if _serialized_length(child) > max_chars
-    ]
+    oversized_children: list[tuple[Any, Any]] = []
+    for key, child in children:
+        length = _serialized_length(child)
+        if length is not None and length > max_chars:
+            oversized_children.append((key, child))
     if not oversized_children:
         return [((), value)]
     points: list[tuple[tuple[Any, ...], Any]] = []
@@ -391,7 +431,8 @@ def _first_tier_spill_points(
     """
     points: list[tuple[tuple[Any, ...], Any]] = []
     for key, child in root.items():
-        if _serialized_length(child) <= max_chars:
+        length = _serialized_length(child)
+        if length is None or length <= max_chars:
             continue
         for sub_path, sub_value in _find_spill_points(
             child, max_chars=max_chars, max_recursion=max_recursion, depth=1
@@ -614,17 +655,48 @@ def _build_spill_record(
 ) -> dict[str, Any] | None:
     """Build one report record, writing its file.
 
-    Returns None when the point should not be spilled at all: nothing fit
-    under the 8 MiB cap (a single oversized item), or the write itself
-    failed. Both are the caller's cue to leave that value untouched rather
-    than replace it with a placeholder that points nowhere.
+    Returns None when the point must not be spilled at all: the value is
+    binary, it cannot be serialized (a cycle), nothing fits under the 8 MiB
+    cap, the text cut would land inside the first line, or the write itself
+    failed. Every one of those is the caller's cue to leave the value
+    untouched rather than replace it with a placeholder that points at
+    nothing, or at a file whose content the record misdescribes.
+
+    Every metadata field is computed from the final payload before the file
+    is written, so a failure while building the record cannot leave a file on
+    disk that no record points at.
     """
+    if not _is_spillable_value(value):
+        logger.info(
+            "Tool %s returned a binary value at %s; leaving it to the output "
+            "filter, which owns the representation of binary results.",
+            tool_name,
+            _format_value_path(path),
+        )
+        return None
     original_chars = _serialized_length(value)
+    if original_chars is None:
+        logger.info(
+            "Tool %s returned a value at %s that cannot be serialized "
+            "(reference cycle); leaving it to the output filter.",
+            tool_name,
+            _format_value_path(path),
+        )
+        return None
     payload, kind, parsed = _spill_payload_for_value(value)
     truncated_after_items: int | None = None
     if len(payload.encode("utf-8")) > SPILL_MAX_FILE_BYTES:
         if kind == "text":
             truncated_bytes = _truncate_text_bytes(payload, SPILL_MAX_FILE_BYTES)
+            if truncated_bytes is None:
+                logger.warning(
+                    "Tool %s produced text whose first line alone exceeds the "
+                    "%d byte file cap; leaving it to ordinary truncation "
+                    "rather than storing a partial first item.",
+                    tool_name,
+                    SPILL_MAX_FILE_BYTES,
+                )
+                return None
             payload = truncated_bytes.decode("utf-8")
             truncated_after_items = len(_spill_text_lines(payload))
         else:
@@ -642,6 +714,8 @@ def _build_spill_record(
             )
             payload = json.dumps(parsed, ensure_ascii=False, default=str)
             truncated_after_items = kept
+    item_count = _spill_item_count(kind, parsed, payload)
+    record_fields = _record_fields_for(kind, parsed)
     try:
         relative_path = _write_spill_file(spill_dir, tool_name, payload, kind)
     except OSError:
@@ -652,8 +726,6 @@ def _build_spill_record(
             exc_info=True,
         )
         return None
-    item_count = _spill_item_count(kind, parsed, payload)
-    record_fields = _record_fields_for(kind, parsed)
     return {
         "relative_path": relative_path,
         "kind": kind,
@@ -705,7 +777,8 @@ def _second_tier_result(
     write failure or an exhausted run budget falls back the same way: the
     whole root is left untouched rather than half-replaced.
     """
-    if _serialized_length(result) <= target.max_chars:
+    root_length = _serialized_length(result)
+    if root_length is None or root_length <= target.max_chars:
         return result, []
     if budget.files_written >= SPILL_MAX_FILES_PER_RUN:
         logger.warning(
