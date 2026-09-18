@@ -263,10 +263,16 @@ def _spill_kind_of(content: str) -> tuple[str, Any]:
     is addressed by what json.loads makes of it right now, so a file whose
     content was replaced out of band (or a ``.json`` extension on non-JSON
     content) is still addressed correctly.
+
+    Content that cannot be parsed at all -- not valid JSON, or valid JSON
+    nested deeper than the interpreter's recursion limit (json.loads raises
+    RecursionError the same way json.dumps does for a too-deep value) --
+    falls back to "text", which is this function's existing catch-all for
+    anything that is not an array or object.
     """
     try:
         value = json.loads(content)
-    except ValueError:
+    except (ValueError, RecursionError):
         return "text", None
     if isinstance(value, list):
         return "array", value

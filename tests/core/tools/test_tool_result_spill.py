@@ -813,6 +813,28 @@ def test_deeply_nested_value_is_left_to_the_output_filter(tmp_path):
     assert len(files) == 1
 
 
+def test_string_holding_too_deep_json_is_spilled_as_text(tmp_path):
+    # A plain string is measured by raw length (_serialized_length never
+    # calls json.dumps on it), so this string "measures" successfully and
+    # becomes a spill point regardless of what its content looks like. Only
+    # later, when the write path tries to classify it, does _spill_kind_of
+    # attempt json.loads on it to decide array/object/text -- and a string
+    # that happens to look like deeply nested JSON can blow the same
+    # recursion limit there.
+    depth = sys.getrecursionlimit() * 20
+    text = "[" * depth + "]" * depth
+    result = {"output": text}
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert len(records) == 1
+    assert records[0]["kind"] == "text"
+    path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
+    written = path.read_bytes()
+    assert written.decode("utf-8") == text
+
+
 # --- I-10: reserved key stripped unconditionally ---------------------------
 
 
