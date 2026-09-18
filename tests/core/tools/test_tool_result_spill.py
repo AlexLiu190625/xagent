@@ -1168,6 +1168,30 @@ def test_spill_truncated_content_gets_a_different_filename_than_untruncated(
 # --- I-37: two file caps ----------------------------------------------------
 
 
+def test_per_result_cap_counts_written_files_not_failed_candidates(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(spill_module, "SPILL_MAX_FILE_BYTES", 10)
+    result = {f"bad{i}": ["x" * 1000] for i in range(8)}
+    result["good"] = ["y"] * 400
+    # max_chars=1002 keeps each bad_i list (1004 serialized chars) as the
+    # spill point rather than descending into its one element (1000 raw
+    # chars, under 1002, so it is not itself oversized); the single element
+    # then cannot fit under the 10-byte file cap, so kept == 0 and the
+    # candidate produces no record. good's list (2000 serialized chars) is
+    # likewise a list-level point, but two of its tiny elements fit under
+    # the 10-byte cap, so it succeeds.
+    target = _target(tmp_path, max_chars=1002)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert len(records) == 1
+    assert records[0]["value_path"] == "good"
+    assert spilled["good"] == SPILL_PLACEHOLDER_TEXT
+    for i in range(8):
+        assert spilled[f"bad{i}"] == ["x" * 1000]
+
+
 def test_spill_stops_at_per_result_cap(tmp_path):
     # 9 independently-oversized top-level children in one result: only 8
     # spill, the 9th is left untouched (falls back to ordinary truncation).

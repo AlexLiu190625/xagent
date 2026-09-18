@@ -911,10 +911,10 @@ def spill_oversized_values(
     if first_tier:
         new_result: Any = result
         records: list[dict[str, Any]] = []
-        for index, (path, value) in enumerate(first_tier):
-            if index >= SPILL_MAX_FILES_PER_RESULT:
+        for path, value in first_tier:
+            if len(records) >= SPILL_MAX_FILES_PER_RESULT:
                 logger.warning(
-                    "Tool %s produced more than %d spill points in one "
+                    "Tool %s produced more than %d spillable values in one "
                     "result; the rest are left to ordinary truncation.",
                     tool_name,
                     SPILL_MAX_FILES_PER_RESULT,
