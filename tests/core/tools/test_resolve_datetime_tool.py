@@ -559,6 +559,20 @@ MIDNIGHT_TABLE: list[tuple[str, str, str, object, object, Optional[str]]] = [
         None,
     ),
     (
+        # The gap here is 600 minutes, the longest one anywhere in tzdata
+        # over any zone and year the scan can see. The Vostok row above
+        # already catches a scan cut down to 60 minutes, but a scan bound
+        # anywhere from 421 through 600 minutes would still pass that row
+        # while silently refusing this one, so this is the row that catches
+        # that remaining range.
+        "Antarctica/Macquarie",
+        "1948-03-25",
+        "skips the longest midnight gap in tzdata",
+        "1948-03-25T00:00:00+10:00",
+        ("REFUSED", "nonexistent_local_time"),
+        None,
+    ),
+    (
         "Pacific/Kiritimati",
         "1994-12-31",
         "skips the whole day",
@@ -607,7 +621,7 @@ def test_date_only_phrase_across_midnight_behavior(
     with_time_result = resolve_datetime(f"{day} 00:30", zone)
 
     if isinstance(date_only_expected, tuple):
-        assert date_only_result["success"] is False
+        assert date_only_result["success"] is False, behavior
         assert date_only_result["resolution"] == date_only_expected[1]
         if date_only_error_substring is not None:
             assert date_only_error_substring in date_only_result["error"]
@@ -629,6 +643,13 @@ def test_date_only_phrase_across_midnight_behavior(
 _SANTIAGO = "America/Santiago"
 
 
+# This zone and day are the same cell as the America/Santiago row in
+# MIDNIGHT_TABLE above, but the two pins check different things. That row
+# checks what the zone does to a midnight it skips, reached through the ISO
+# literal alone. The parametrized test below checks that every date-only
+# grammar form -- not just the ISO literal -- reaches this same cell, so a
+# reader that mis-parses one phrasing does not go unnoticed just because the
+# ISO literal still works. Both pins stay.
 @pytest.mark.parametrize(
     ("phrase", "now_utc"),
     [
