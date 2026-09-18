@@ -32,6 +32,7 @@ import {
   isAcceptedRuntimeKeyName,
   isConnectorRuntimeDialogHostPath,
   isSubmitEnabled,
+  isTypeMismatchDispositionStale,
   resolveDialogActions,
   resolveDialogOutcome,
   submitTaskConnectorRuntimeValues,
@@ -483,7 +484,15 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         setSubmitting(false)
         return
       }
-      if (refreshed.ok) setReport(refreshed.report)
+      if (refreshed.ok) {
+        setReport(refreshed.report)
+        // A type-mismatch hint names a specific declared type; once the
+        // refreshed report shows this row now declares the other type, that
+        // hint no longer describes the row it is attached to and must be
+        // cleared outright rather than left to describe a type this row no
+        // longer has.
+        if (isTypeMismatchDispositionStale(disposition, refreshed.report)) setFieldError(null)
+      }
       setSubmitting(false)
       return
     }

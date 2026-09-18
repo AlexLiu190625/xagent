@@ -565,14 +565,14 @@ describe("couples the invalid-object error to the submit gate", () => {
 })
 
 describe("re-reads the report on a type mismatch so a changed declaration takes over immediately", () => {
-  it("re-reads the report on a type mismatch so a changed declaration takes over immediately", async () => {
+  it("clears the type-specific hint once a refresh shows the row's type changed from object to string", async () => {
     // The connector owner can flip a key's declared type between the report
     // this dialog read and the write it submits against; the server 400s
     // with type_mismatch. Refreshing here (rather than leaving the stale
     // report in place) means the row picks up the new type -- and because
-    // drafts and field errors are now keyed by type too, the stale control,
-    // its stale value and its now-wrong-type error message all fall away on
-    // their own rather than needing a separate reset.
+    // the disposition's messageKey names a specific type ("typeObject"),
+    // that hint no longer describes this row once the refresh shows it now
+    // declares "string", so it must be cleared rather than reattached.
     fetchMock.mockResolvedValueOnce(ok(report(false, [
       connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", required: true })]),
     ])))
@@ -593,17 +593,63 @@ describe("re-reads the report on a type mismatch so a changed declaration takes 
     await waitFor(() => expect(screen.getByLabelText("cfg").tagName).toBe("INPUT"))
 
     expect(screen.getByLabelText("cfg")).toHaveValue("")
-    // The rejection itself must still be visible after the refresh installs
-    // the new report: "cfg" is still a context row under the same key, so
-    // the field error re-locates onto it (attached to the row, not dropped)
-    // even though its identity's draft key now embeds the new type.
-    expect(screen.getByText("connectorRuntime.errors.typeObject:{\"key\":\"cfg\"}")).toBeInTheDocument()
+    expect(screen.queryByText(/connectorRuntime\.errors\.typeObject/)).not.toBeInTheDocument()
 
     fireEvent.change(screen.getByLabelText("cfg"), { target: { value: "plain text" } })
     submitMock.mockResolvedValueOnce(ok(report(true, [])))
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
     await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(2))
     expect(submitMock.mock.calls[1][1]).toEqual([{ connector_ref: REF_A, context: { cfg: "plain text" } }])
+  })
+
+  it("clears the type-specific hint once a refresh shows the row's type changed from string to object", async () => {
+    // Same defect, opposite direction: a "typeString" hint must not survive
+    // a refresh that shows the row now declares "object".
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("cfg"), { target: { value: "hello" } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 400, code: "invalid_runtime_context",
+      reason: "type_mismatch.context.cfg", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", required: true })]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByLabelText("cfg").tagName).toBe("TEXTAREA"))
+
+    expect(screen.queryByText(/connectorRuntime\.errors\.typeString/)).not.toBeInTheDocument()
+  })
+
+  it("keeps the type-specific hint when a refresh shows the row's declared type is unchanged", async () => {
+    // Same failure, but the refresh reads back the same declared type: the
+    // hint still describes the row, so it must stay rather than being
+    // cleared on every refresh regardless of what changed.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", required: true })]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("cfg"), { target: { value: '{"a":1}' } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 400, code: "invalid_runtime_context",
+      reason: "type_mismatch.context.cfg", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", required: true })]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    expect(screen.getByText("connectorRuntime.errors.typeObject:{\"key\":\"cfg\"}")).toBeInTheDocument()
   })
 
   it("falls back to the whole dialog when a refresh's report drops the row the error was on", async () => {

@@ -389,11 +389,12 @@ export function classifySubmitFailure(
       // dialog read and the type the write endpoint just checked against can
       // differ. Refreshing here is what lets the row pick up the new
       // declaration on its next render, rather than staying keyed to the
-      // stale one. The messageKey below is still chosen against the
-      // pre-refresh report passed into this call and is not itself
-      // recomputed after the refresh; a submit that fails again against the
-      // new declaration produces a freshly classified disposition either
-      // way, so this only leaves a stale-typed hint on screen until then.
+      // stale one. The messageKey below is chosen against the pre-refresh
+      // report passed into this call and is not itself recomputed after the
+      // refresh; isTypeMismatchDispositionStale (below) is what the caller
+      // checks against the refreshed report to clear this hint outright
+      // when the row's type no longer matches it, instead of leaving a
+      // type-specific message attached to a row that has since changed type.
       return {
         messageKey: declaredType === "object" ? "typeObject" : "typeString",
         retry: false,
@@ -434,6 +435,29 @@ export function classifySubmitFailure(
   // ConnectorRuntimeError with any code/status of its own choosing, and it
   // lands here the same way.
   return GENERIC_DISPOSITION
+}
+
+/**
+ * Whether a type-mismatch disposition's hint no longer matches the row it
+ * would attach to, given a report re-read after the disposition's own
+ * `refresh: true` landed. `typeObject`/`typeString` are the only two
+ * messageKeys this disposition shape can carry that name a specific type;
+ * every other messageKey is never type-specific, so this always reads false
+ * for it. A `locate.key` this refreshed report no longer declares under
+ * "context" returns false here too -- that case is a dropped row, not a
+ * changed type, and the dialog's own field-error location already falls
+ * back to whole-dialog scope for it.
+ */
+export function isTypeMismatchDispositionStale(
+  disposition: ConnectorRuntimeFailureDisposition,
+  refreshedReport: ConnectorRuntimeReport,
+): boolean {
+  if (disposition.messageKey !== "typeObject" && disposition.messageKey !== "typeString") return false
+  const { connectorRef, key } = disposition.locate
+  if (key === undefined) return false
+  const expectedType = disposition.messageKey === "typeObject" ? "object" : "string"
+  const currentType = findDeclaredInputType(refreshedReport, connectorRef, key)
+  return currentType !== null && currentType !== expectedType
 }
 
 /**
