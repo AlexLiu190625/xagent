@@ -793,21 +793,41 @@ def test_reserved_spill_key_strip_only_touches_top_level():
     assert stripped["output"][SPILL_RESERVED_RESULT_KEY] == nested_forged
 
 
-# --- I-36: MCP content vs structured_content dedup -------------------------
+# --- I-36: content and structured_content are independent spill roots ------
 
 
-def test_spill_prefers_mcp_content_over_structured_when_both_oversized(tmp_path):
+def test_spill_records_content_and_structured_content_independently(tmp_path):
     result = {
-        "content": [{"type": "text", "text": _big()}],
-        "structured_content": {"clients": _big()},
+        "content": [{"type": "text", "text": "A" * 150}],
+        "structured_content": {"rows": "B" * 150},
     }
     target = _target(tmp_path)
     spilled, records = spill_oversized_values(
         result, target, tool_name="acme", max_recursion=20
     )
-    assert len(records) == 1
-    assert records[0]["value_path"] == "content[0].text"
-    assert spilled["structured_content"]["clients"] == _big()
+    assert len(records) == 2
+    assert {r["value_path"] for r in records} == {
+        "content[0].text",
+        "structured_content.rows",
+    }
+    assert spilled["content"][0]["text"] == SPILL_PLACEHOLDER_TEXT
+    assert spilled["structured_content"]["rows"] == SPILL_PLACEHOLDER_TEXT
+    files = list(Path(target.spill_dir).glob("*"))
+    assert len(files) == 2
+
+
+def test_identical_content_and_structured_payloads_share_one_file(tmp_path):
+    payload = "A" * 150
+    result = {"content": payload, "structured_content": payload}
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert len(records) == 2
+    assert records[0]["relative_path"] == records[1]["relative_path"]
+    files = list(Path(target.spill_dir).glob("*"))
+    assert len(files) == 1
+    assert render_spill_notice(records).count(records[0]["relative_path"]) == 1
 
 
 def test_spill_structured_content_spills_when_only_it_is_oversized(tmp_path):
@@ -856,7 +876,7 @@ def test_first_tier_write_failure_leaves_that_node_untouched(tmp_path, monkeypat
     monkeypatch.setattr(spill_module.os, "replace", _flaky)
     result = {
         "content": [{"type": "text", "text": _big()}],
-        "structured_content": {"clients": _big(90)},
+        "structured_content": {"clients": _big(50)},
     }
     target = _target(tmp_path)
     spilled, records = spill_oversized_values(

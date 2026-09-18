@@ -121,6 +121,11 @@ class SpillRunBudget:
     per SpillTarget or per call -- so it lives in its own small mutable
     object that every OutputFilteredToolWrapper built in the same
     ToolFactory._apply_output_filters call shares by reference.
+
+    It counts records, not distinct files: two independent spill points
+    whose payloads happen to be identical produce two records and one
+    content-addressed file, and both records count. That matches the
+    registry's own 64-record ceiling, which is what this budget protects.
     """
 
     files_written: int = 0
@@ -440,27 +445,6 @@ def _first_tier_spill_points(
         ):
             points.append(((key, *sub_path), sub_value))
     return points
-
-
-def _dedupe_content_vs_structured(
-    points: list[tuple[tuple[Any, ...], Any]],
-) -> list[tuple[tuple[Any, ...], Any]]:
-    """Only spill the ``content`` subtree when ``structured_content`` mirrors it.
-
-    An MCP result commonly carries the same payload twice, once as the
-    ``content`` text blob and once as ``structured_content``. Content-addressed
-    naming cannot deduplicate them (their encodings differ byte-for-byte), so
-    the choice is made by path instead: drop any point under
-    ``structured_content`` once a point under ``content`` exists.
-    """
-    has_content = any(path and path[0] == "content" for path, _ in points)
-    if not has_content:
-        return points
-    return [
-        (path, value)
-        for path, value in points
-        if not (path and path[0] == "structured_content")
-    ]
 
 
 def _elide_value_path(path: str) -> str:
@@ -910,10 +894,8 @@ def spill_oversized_values(
         # to the filter byte-for-byte, with zero files and no reserved key.
         return result, []
     budget = run_budget if run_budget is not None else SpillRunBudget()
-    first_tier = _dedupe_content_vs_structured(
-        _first_tier_spill_points(
-            result, max_chars=target.max_chars, max_recursion=max_recursion
-        )
+    first_tier = _first_tier_spill_points(
+        result, max_chars=target.max_chars, max_recursion=max_recursion
     )
     if first_tier:
         new_result: Any = result
