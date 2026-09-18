@@ -567,13 +567,13 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     if (alsoResend && canResendNow) {
       const resendOutcome = await doResend()
       if (!aliveRef.current) {
-        // doResend already ran to completion above -- the resend was
-        // attempted (sent or failed) regardless of whether this instance is
-        // still mounted, unlike the early return right after the save POST
-        // above, where the resend had not been attempted at all. There is
-        // nothing left here for a toast to report that doResend's own
-        // console.warn (on failure) or the message's own arrival in the
-        // transcript (on success) does not already cover.
+        // The save has landed and the resend has run to completion. A sent
+        // message shows up in the transcript on its own, so that outcome
+        // stays silent. A failed one would normally surface in this dialog's
+        // send-failed panel, which an unmounted instance can never render --
+        // and doResend's console.warn reaches no user -- so say it once,
+        // globally, without touching state or the provider.
+        if (resendOutcome !== "sent") toast(t("connectorRuntime.sendFailed"))
         return
       }
       if (requestRef.current.seq !== seqAtStart) {

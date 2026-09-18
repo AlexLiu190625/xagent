@@ -1252,6 +1252,38 @@ describe("ignores a resend result superseded by a new request", () => {
     expect(closeSpy).not.toHaveBeenCalledWith("resent")
     expect(toastMock.mock.calls).toEqual([["connectorRuntime.resendSupersededUnknown"]])
   })
+
+  it("stays silent when the superseded retry failed, since nothing went out", async () => {
+    // Same sequence, but the stale retry rejects. Telling the user the
+    // message "was sent, do not resend it" here would be false and would
+    // talk them out of the one resend they still need.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-7", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(new Error("closed"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    sendMessageMock.mockClear()
+    let rejectRetry: (e: Error) => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((_res, rej) => { rejectRetry = rej }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    toastMock.mockClear()
+
+    await act(async () => { rejectRetry(new Error("closed")) })
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(toastMock).not.toHaveBeenCalled()
+  })
 })
 
 describe("reports a superseded save-and-resend whose save still landed", () => {
@@ -1779,7 +1811,9 @@ describe("does nothing after unmount when a request settles", () => {
     cleanup()
 
     // Resend's sendMessage in flight when the tree unmounts: rejecting it
-    // afterward does nothing.
+    // afterward touches no state, but the save has landed and the message
+    // did not go out, and the send-failed panel that would normally say so
+    // can never render -- so it is said once, globally.
     fetchMock.mockResolvedValueOnce(ok(report(false, [
       connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
     ])))
@@ -1795,9 +1829,26 @@ describe("does nothing after unmount when a request settles", () => {
     third.rerender(<ConnectorRuntimeDialogProvider><Probe mounted={false} /></ConnectorRuntimeDialogProvider>)
     await act(async () => { rejectSend(new Error("closed")) })
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
-    // Unlike the save-POST case at the top of this test, doResend already
-    // ran (sendMessage was already called, above) by the time this
-    // rejection arrives -- there is nothing new to toast about here.
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendFailed"]])
+    cleanup()
+
+    // The same unmount with a resend that succeeds stays silent: the message
+    // arrives in the transcript on its own.
+    toastMock.mockClear()
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    let resolveSend: () => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise<void>((res) => { resolveSend = res }))
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    const fourth = render(<ConnectorRuntimeDialogProvider><Probe /></ConnectorRuntimeDialogProvider>)
+    await recordThenOpen({ taskId: 1, clientMessageId: "y", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalled())
+    fourth.rerender(<ConnectorRuntimeDialogProvider><Probe mounted={false} /></ConnectorRuntimeDialogProvider>)
+    await act(async () => { resolveSend() })
     expect(toastMock).not.toHaveBeenCalled()
   })
 })
