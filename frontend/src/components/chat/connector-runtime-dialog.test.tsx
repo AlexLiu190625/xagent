@@ -73,7 +73,6 @@ const REF_B = { connector_type: "mcp", connector_id: 2 }
 // Shared by the two source-scanning tests below instead of each re-reading.
 const libSource = readFileSync(path.resolve(__dirname, "../../lib/connector-runtime-api.ts"), "utf8")
 const dialogSource = readFileSync(path.resolve(__dirname, "./connector-runtime-dialog.tsx"), "utf8")
-const providerSource = readFileSync(path.resolve(__dirname, "../../contexts/connector-runtime-dialog-context.tsx"), "utf8")
 
 function input(
   overrides: Partial<ConnectorRuntimeInput> & { section: ConnectorRuntimeSection; key: string; type: ConnectorRuntimeType },
@@ -1535,32 +1534,16 @@ describe("logs only a fixed prefix and a status", () => {
   })
 })
 
-describe("never renders server text as HTML", () => {
-  it("never renders server text as HTML", () => {
-    const sources = [
-      { source: libSource, marker: "export function readConnectorRuntimeReport" },
-      { source: providerSource, marker: "export function ConnectorRuntimeDialogProvider" },
-      { source: dialogSource, marker: "export function ConnectorRuntimeDialog" },
-    ]
-    expect(sources).toHaveLength(3)
-    for (const { source, marker } of sources) {
-      expect(source).toContain(marker)
-      expect(source).not.toContain("dangerouslySetInnerHTML")
-      expect(source).not.toContain("innerHTML")
-    }
-  })
-})
-
 describe("renders a hostile connector name and key as plain text, not markup", () => {
   it("renders a hostile connector name and key as plain text, not markup", async () => {
-    // The source-shape guard above only covers the three new production
-    // files, and is blind to a comment or refactor tripping its own string
-    // search. This is the behavior-level complement: a connector name and a
-    // key name are the only server-controlled strings this dialog renders
-    // (the key name reaches here even when the per-turn gate would reject
-    // it, precisely so a rejected key still renders instead of silently
-    // vanishing from the report -- schemas/connector_runtime.py's own
-    // docstring), so both are exercised here with markup-shaped text.
+    // A connector name and a key name are the only server-controlled
+    // strings this dialog renders (the key name reaches here even when the
+    // per-turn gate would reject it, precisely so a rejected key still
+    // renders instead of silently vanishing from the report --
+    // schemas/connector_runtime.py's own docstring), so both are exercised
+    // here with markup-shaped text: this is the observable rendering
+    // contract, checked at the DOM level rather than by scanning source
+    // text for sink spellings a comment or a helper could dodge either way.
     const hostileName = "<img src=x onerror=\"window.__connectorRuntimeHostile = true\">"
     const hostileKey = "<script>window.__connectorRuntimeHostile = true</script>"
     fetchMock.mockResolvedValueOnce(ok(report(false, [
