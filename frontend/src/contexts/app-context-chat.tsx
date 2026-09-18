@@ -2766,6 +2766,24 @@ export function AppProvider({
     })
   }, [isConnected, state.taskId, connectionError])
 
+  // The single place that answers "this frame ends the turn -- now what?".
+  // Each of the three settlement call sites below (task_completed,
+  // agent_error, terminal task_error) keeps its own predicate for WHETHER a
+  // frame is terminal, because the three frame families prove terminality
+  // differently (see each call site's own comment). What they must NOT keep
+  // is their own idea of what to do once settled: that lives here, so a
+  // fourth frame family added later cannot settle a turn while quietly
+  // skipping the stash and pending-candidate cleanup that settlement
+  // requires (see the stash lifecycle docs on ConnectorRuntimePendingDelivery).
+  const settleConnectorRuntimeTurn = (taskId: number, opensDialog: boolean): void => {
+    // openForTask hands this tab's candidate (staged or already-confirmed)
+    // to the request and clears it in the same update: that frame both
+    // opens the dialog and settles the turn. Never call forgetDelivery
+    // before this for the same frame -- see its own misuse warning.
+    if (opensDialog) connectorRuntimeDialogRef.current.openForTask(taskId)
+    else connectorRuntimeDialogRef.current.forgetDelivery(taskId)
+  }
+
   const handleMessage = useCallback((
     message: WebSocketMessage,
     rawDispatch: React.Dispatch<AppAction>,
@@ -5618,7 +5636,8 @@ export function AppProvider({
           // (NormalizedTaskCompletion narrows it), so this reads the same
           // terminal-status predicate the agent_error branch below reads,
           // rather than assuming this frame type alone proves settlement.
-          connectorRuntimeDialogRef.current.forgetDelivery(currentState.taskId)
+          // This frame type never opens the dialog itself.
+          settleConnectorRuntimeTurn(currentState.taskId, false)
         }
 
         if (!taskData.success) {
@@ -5985,7 +6004,8 @@ export function AppProvider({
           // task_completed branch above satisfies unconditionally, so a
           // frame that only pauses processing (paused, waiting_for_user)
           // leaves a still-resendable message's stash alone.
-          connectorRuntimeDialogRef.current.forgetDelivery(currentState.taskId)
+          // This frame type never opens the dialog itself.
+          settleConnectorRuntimeTurn(currentState.taskId, false)
         }
 
         dispatch({
@@ -6035,17 +6055,14 @@ export function AppProvider({
         // key occurrence-specific) must still resolve this turn's dialog and
         // stash even when the bubble it would have added does not render.
         if (errorFrame.isTerminal && !isMessageForOtherTask && currentState.taskId) {
-          if (
+          // A trigger code both opens the dialog and settles the turn in
+          // the same call; any other terminal code just settles it. See
+          // settleConnectorRuntimeTurn's own docs for what "settles" means.
+          settleConnectorRuntimeTurn(
+            currentState.taskId,
             errorFrame.terminalErrorCode !== null
-            && isConnectorRuntimeDialogTriggerCode(errorFrame.terminalErrorCode)
-          ) {
-            // Hands this tab's stash to the dialog request and clears it in
-            // the same update: this frame both opens the dialog and settles
-            // the turn. Never forget the stash before this call.
-            connectorRuntimeDialogRef.current.openForTask(currentState.taskId)
-          } else {
-            connectorRuntimeDialogRef.current.forgetDelivery(currentState.taskId)
-          }
+              && isConnectorRuntimeDialogTriggerCode(errorFrame.terminalErrorCode),
+          )
         }
 
         if (
