@@ -590,21 +590,32 @@ def _spill_fitting_prefix(value: Any, limit: int) -> int:
     return kept
 
 
-def _truncate_text_bytes(content: str, limit: int) -> bytes:
-    """Truncate UTF-8 text to at most `limit` bytes, staying valid UTF-8.
+def _truncate_text_bytes(content: str, limit: int) -> bytes | None:
+    """Truncate UTF-8 text to at most ``limit`` bytes at a line boundary.
 
-    Cuts at the last newline within the limit when there is one, so the
-    file keeps ending on a complete line; when there is none, drops the
-    trailing incomplete multi-byte sequence instead of raising.
+    Returns the prefix up to and including the last newline that fits, or
+    None when no newline fits at all.
+
+    None means the cut would land inside the first line. Storing that prefix
+    would put a partial line in the file while every metadata field in this
+    module describes it as one complete item -- item_count 1,
+    truncated_after_items 1 -- and neither the record, the notice, nor the
+    read result has a field that says otherwise, so the model would read half
+    a value believing it read all of it. Ordinary truncation marks itself, so
+    the caller declines to spill and lets the existing filter handle it.
+
+    The returned prefix ends immediately after a newline, which is a
+    single-byte character, so it is always complete UTF-8 and decoding it
+    cannot raise.
     """
     raw = content.encode("utf-8")
     if len(raw) <= limit:
         return raw
     head = raw[:limit]
     newline_index = head.rfind(b"\n")
-    if newline_index >= 0:
-        return head[: newline_index + 1]
-    return head.decode("utf-8", errors="ignore").encode("utf-8")
+    if newline_index < 0:
+        return None
+    return head[: newline_index + 1]
 
 
 def _spill_file_name(tool_name: str, payload_bytes: bytes, kind: str) -> str:

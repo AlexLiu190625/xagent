@@ -1308,21 +1308,87 @@ def test_spill_text_truncated_ends_at_last_newline(tmp_path, monkeypatch):
     assert decoded.count("\n") == records[0]["item_count"]
 
 
-def test_spill_text_truncated_without_newline_drops_incomplete_tail(
-    tmp_path, monkeypatch
-):
+def test_spill_text_without_a_newline_is_not_spilled(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(spill_module, "SPILL_MAX_FILE_BYTES", 50)
     text = "第" * 200  # multi-byte, no newlines anywhere
+    result = {"output": text}
+    target = _target(tmp_path, max_chars=10)
+    with caplog.at_level("WARNING"):
+        spilled, records = spill_oversized_values(
+            result, target, tool_name="acme", max_recursion=20
+        )
+    assert records == []
+    assert spilled == result
+    assert not Path(target.spill_dir).exists() or not list(
+        Path(target.spill_dir).glob("*")
+    )
+    assert any("first line alone exceeds" in message for message in caplog.messages)
+
+
+def test_spill_text_without_a_newline_ascii_is_not_spilled(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setattr(spill_module, "SPILL_MAX_FILE_BYTES", 50)
+    text = "a" * 200  # ASCII, no newlines anywhere
+    result = {"output": text}
+    target = _target(tmp_path, max_chars=10)
+    with caplog.at_level("WARNING"):
+        spilled, records = spill_oversized_values(
+            result, target, tool_name="acme", max_recursion=20
+        )
+    assert records == []
+    assert spilled == result
+    assert not Path(target.spill_dir).exists() or not list(
+        Path(target.spill_dir).glob("*")
+    )
+    assert any("first line alone exceeds" in message for message in caplog.messages)
+
+
+def test_spill_text_whose_first_line_exactly_fills_the_cap_is_not_spilled(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(spill_module, "SPILL_MAX_FILE_BYTES", 10)
+    result = {"output": "A" * 10 + "\n" + "B" * 200}
+    target = _target(tmp_path, max_chars=10)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert records == []
+    assert not Path(target.spill_dir).exists() or not list(
+        Path(target.spill_dir).glob("*")
+    )
+
+
+def test_spill_text_whose_first_line_just_fits_is_spilled_as_one_complete_line(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(spill_module, "SPILL_MAX_FILE_BYTES", 10)
+    result = {"output": "A" * 9 + "\n" + "B" * 200}
+    target = _target(tmp_path, max_chars=10)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert len(records) == 1
+    assert records[0]["kind"] == "text"
+    assert records[0]["truncated_after_items"] == 1
+    path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
+    written = path.read_bytes()
+    assert written == b"A" * 9 + b"\n"
+    assert written.endswith(b"\n")
+
+
+def test_spill_eight_mib_single_line_text_is_not_spilled(tmp_path):
+    text = "x" * 8_393_608  # single line, no newline, over the real 8 MiB cap
     result = {"output": text}
     target = _target(tmp_path, max_chars=10)
     spilled, records = spill_oversized_values(
         result, target, tool_name="acme", max_recursion=20
     )
-    assert records[0]["kind"] == "text"
-    path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
-    written = path.read_bytes()
-    assert len(written) <= 50
-    written.decode("utf-8")  # must not raise UnicodeDecodeError
+    assert records == []
+    assert spilled == result
+    assert not Path(target.spill_dir).exists() or not list(
+        Path(target.spill_dir).glob("*")
+    )
 
 
 def test_spill_skewed_collection_keeps_the_largest_prefix(tmp_path, monkeypatch):
