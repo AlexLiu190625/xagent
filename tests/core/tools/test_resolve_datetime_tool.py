@@ -470,6 +470,123 @@ def test_resolve_datetime_dst_and_zone() -> None:
     assert utc["timezone"] == "UTC"
 
 
+# (zone, day, what the zone does to that day's midnight,
+#  date-only expectation, expectation when the phrase also names 00:30)
+MIDNIGHT_TABLE: list[tuple[str, str, str, object, object]] = [
+    (
+        "Australia/Sydney",
+        "2026-09-15",
+        "has it once",
+        "2026-09-15T00:00:00+10:00",
+        "2026-09-15T00:30:00+10:00",
+    ),
+    (
+        "America/Santiago",
+        "2026-09-06",
+        "skips it",
+        "2026-09-06T00:00:00-03:00",
+        ("REFUSED", "nonexistent_local_time"),
+    ),
+    (
+        "America/Havana",
+        "2026-11-01",
+        "repeats it",
+        "2026-11-01T00:00:00-04:00",
+        ("REFUSED", "ambiguous_local_time"),
+    ),
+    (
+        "Pacific/Kiritimati",
+        "1994-12-31",
+        "skips the whole day",
+        ("REFUSED", "nonexistent_local_time"),
+        ("REFUSED", "nonexistent_local_time"),
+    ),
+    (
+        "Africa/Johannesburg",
+        "0001-01-01",
+        "cannot be converted at all",
+        ("REFUSED", "unsupported_expression"),
+        ("REFUSED", "unsupported_expression"),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("zone", "day", "behavior", "date_only_expected", "with_time_expected"),
+    MIDNIGHT_TABLE,
+    ids=[f"{zone}:{behavior}" for zone, _, behavior, _, _ in MIDNIGHT_TABLE],
+)
+def test_date_only_phrase_across_midnight_behavior(
+    zone: str,
+    day: str,
+    behavior: str,
+    date_only_expected: object,
+    with_time_expected: object,
+) -> None:
+    """A phrase naming only a day is answered for that day whichever way the
+    zone treats its midnight -- has it once, skips it, repeats it, or (a
+    date-line crossing) skips the whole calendar day -- or is refused
+    unsupported_expression where the conversion cannot be done at all. A
+    phrase that also names 00:30 on the same day keeps the wall-clock guard's
+    existing refusals unchanged: only the date-only reading is new."""
+    date_only_result = resolve_datetime(day, zone)
+    with_time_result = resolve_datetime(f"{day} 00:30", zone)
+
+    if isinstance(date_only_expected, tuple):
+        assert date_only_result["success"] is False
+        assert date_only_result["resolution"] == date_only_expected[1]
+    else:
+        assert date_only_result["resolved"] == date_only_expected
+        assert date_only_result["has_time"] is False
+        # The time part of a date-only answer is this tool's own filler, not
+        # something the user wrote, whichever branch produced the instant.
+        assert date_only_result["resolved"][10:].startswith("T00:00:00")
+
+    if isinstance(with_time_expected, tuple):
+        assert with_time_result["success"] is False
+        assert with_time_result["resolution"] == with_time_expected[1]
+    else:
+        assert with_time_result["resolved"] == with_time_expected
+        assert with_time_result["has_time"] is True
+
+
+_SANTIAGO = "America/Santiago"
+
+
+@pytest.mark.parametrize(
+    ("phrase", "now_utc"),
+    [
+        ("tomorrow", datetime(2026, 9, 5, 16, 0, 0, tzinfo=timezone.utc)),
+        ("next sunday", datetime(2026, 9, 5, 16, 0, 0, tzinfo=timezone.utc)),
+        ("sunday", datetime(2026, 9, 5, 16, 0, 0, tzinfo=timezone.utc)),
+        ("in 3 days", datetime(2026, 9, 3, 16, 0, 0, tzinfo=timezone.utc)),
+        ("明天", datetime(2026, 9, 5, 16, 0, 0, tzinfo=timezone.utc)),
+        ("3天后", datetime(2026, 9, 3, 16, 0, 0, tzinfo=timezone.utc)),
+        ("6 Sep 2026", datetime(2026, 9, 6, 16, 0, 0, tzinfo=timezone.utc)),
+        ("2026-09-06", datetime(2026, 9, 6, 16, 0, 0, tzinfo=timezone.utc)),
+        ("2026年9月6日", datetime(2026, 9, 6, 16, 0, 0, tzinfo=timezone.utc)),
+    ],
+)
+def test_every_date_only_grammar_line_answers_a_skipped_midnight(
+    monkeypatch: pytest.MonkeyPatch, phrase: str, now_utc: datetime
+) -> None:
+    """America/Santiago skips 2026-09-06's midnight at a daylight-saving
+    change. Each of the nine date-only grammar rows reaches that day through
+    a different reader (ISO, English or Chinese calendar date, a relative
+    day, a weekday, or an N-days-later count), so this pins all nine rather
+    than only the ISO literal, which is the row the underlying defect would
+    otherwise leave unexercised."""
+    monkeypatch.setattr(module, "_now", lambda: now_utc)
+
+    result = resolve_datetime(phrase, _SANTIAGO)
+
+    assert result == {
+        "resolved": "2026-09-06T00:00:00-03:00",
+        "has_time": False,
+        "timezone": _SANTIAGO,
+    }
+
+
 @pytest.mark.parametrize("zone", ["EST", "Sydney", "Etc/GMT+10"])
 def test_resolve_datetime_rejects_non_region_city_zone(zone: str) -> None:
     result = resolve_datetime("tomorrow", zone)

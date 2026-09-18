@@ -1096,6 +1096,51 @@ def _read_phrase(text: str, now_local: datetime) -> Optional[_Reading]:
     return _read_en_calendar_date(text, now_local)
 
 
+_MINUTES_PER_DAY = 24 * 60
+
+
+def _day_midnight_instants(
+    midnight: datetime, zone: ZoneInfo, wall_text: str
+) -> list[datetime]:
+    """Midnight on this calendar day, carrying an offset the zone really used.
+
+    A date-only phrase names a day, not a wall-clock time: the 00:00:00 in
+    `midnight` is this function's own filler, not something the user wrote,
+    so the daylight-saving guard that protects a written clock reading must
+    not refuse the day. This collapses the day to at most one reading --
+    which is what the caller's three-way table expects -- in three ways:
+
+    * the zone has that midnight once: that instant, unchanged;
+    * the zone repeats it: the earlier of the two, which is where the day
+      starts;
+    * the zone skips it: midnight stamped with the offset in force at the
+      first minute of the day the zone did not skip, found by asking
+      `_instants_for_wall_time` minute by minute. The offset therefore comes
+      from a reading the zone check accepted, never from attaching the zone
+      to a wall time it rejected.
+
+    The list is empty only when no minute of the calendar day exists at all,
+    which happens where a zone moved across the date line and dropped a whole
+    day (Pacific/Kiritimati 1994-12-31). A conversion that leaves the range
+    datetime can represent still raises ValueError out of the helper it calls,
+    exactly as it does for a wall-clock time.
+    """
+    instants = _instants_for_wall_time(midnight, zone, wall_text)
+    if instants:
+        return instants[:1]
+    for minutes in range(1, _MINUTES_PER_DAY):
+        later = _instants_for_wall_time(
+            midnight + timedelta(minutes=minutes), zone, wall_text
+        )
+        if later:
+            offset = later[0].utcoffset()
+            # utcoffset() is None only for a naive value; every entry here
+            # carries the zone.
+            assert offset is not None
+            return [midnight.replace(tzinfo=timezone(offset))]
+    return []
+
+
 def _refusal(
     reason: str, error: str, *, include_grammar: bool = True
 ) -> dict[str, Any]:
@@ -1121,10 +1166,16 @@ def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
     result. A phrase outside the grammar, a date that reads two ways, an
     hour twelve whose half-day word does not settle which side of midnight
     or noon it is on, a noon word (中午) paired with an hour outside 11, 12,
-    or 13, a half-day word contradicted by the hour it came with, a
-    wall-clock time the zone skips or repeats, a resulting UTC offset with a
+    or 13, a half-day word contradicted by the hour it came with, a written
+    wall-clock time the zone skips or repeats, a calendar day the zone
+    skipped entirely at a date-line change, a resulting UTC offset with a
     fractional minute, or an instant outside the representable date range is
     refused with a reason rather than guessed or approximated.
+
+    A phrase that named a day only is answered for the day even where that
+    day's midnight is skipped or repeated: the 00:00:00 is this tool's own
+    filler, so it carries the offset of the first minute of the day the zone
+    did have, and the time part stays 00:00:00.
     """
     try:
         zone = _require_region_city_zone(timezone_name)
@@ -1169,14 +1220,24 @@ def resolve_datetime(phrase: str, timezone_name: str) -> dict[str, Any]:
     else:
         stamp = moment.isoformat(sep=" ", timespec="seconds")
         try:
-            instants = _instants_for_wall_time(moment, zone, stamp)
+            # A phrase that named a time of day is answered for that exact
+            # wall clock; a phrase that named a day only is answered for the
+            # day, because its 00:00:00 came from this tool, not the user.
+            instants = (
+                _instants_for_wall_time(moment, zone, stamp)
+                if has_time
+                else _day_midnight_instants(moment, zone, stamp)
+            )
         except ValueError as exc:
             return _refusal("unsupported_expression", str(exc))
         if not instants:
             return _refusal(
                 "nonexistent_local_time",
                 f"local time {stamp} does not exist in {zone.key}: "
-                "clocks skip it at a daylight-saving change",
+                "clocks skip it at a daylight-saving change"
+                if has_time
+                else f"{zone.key} has no {moment.date().isoformat()}: it "
+                "moved across the date line and skipped the whole day",
             )
         if len(instants) > 1:
             return _refusal(
@@ -1255,8 +1316,8 @@ class ResolveDatetimeTool(AbstractBaseTool):
             "'1 Jan 1990', '下周三上午十点'. Pass the user's exact words as "
             "phrase. Pass the zone named in the system prompt's date-and-time "
             "line as timezone. An expression outside the supported forms, a "
-            "date that reads two ways (day-first or month-first), or a local "
-            "time that does not exist or occurs twice at a daylight-saving "
+            "date that reads two ways (day-first or month-first), or a time "
+            "of day that does not exist or occurs twice at a daylight-saving "
             "change is refused with a reason instead of guessed: then ask the "
             "user. For the time right now use get_current_time; to check a "
             "specific wall-clock time in a zone use validate_local_time."
