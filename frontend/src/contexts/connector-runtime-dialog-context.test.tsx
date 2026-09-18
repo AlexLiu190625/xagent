@@ -165,6 +165,83 @@ describe("pending candidate state machine", () => {
     expect(latestState.request?.resendPayload).toBeNull()
   })
 
+  it("does not fall through to the confirmed stash on ambiguity (Major A)", () => {
+    renderProbe()
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-a", text: "AAA" })
+    })
+    act(() => {
+      latestActions.recordDelivery({ taskId: 1, clientMessageId: "cm-a", text: "AAA" })
+    })
+    // A second and third turn are staged after "AAA" was already delivered
+    // and confirmed -- the ambiguous pair must not make openForTask fall
+    // through the rest of the chain and hand out that older, already-sent
+    // turn instead of degrading to save-only, same as T5 above (which has
+    // no confirmed stash to fall through to in the first place).
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-b", text: "BBB" })
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-c", text: "CCC" })
+    })
+    act(() => {
+      latestActions.openForTask(1)
+    })
+    expect(latestState.request?.resendPayload).toBeNull()
+  })
+
+  it("keeps an already-open dialog's own snapshot through a later ambiguous frame", () => {
+    renderProbe()
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-a", text: "AAA" })
+    })
+    act(() => {
+      latestActions.recordDelivery({ taskId: 1, clientMessageId: "cm-a", text: "AAA" })
+    })
+    act(() => {
+      latestActions.openForTask(1)
+    })
+    expect(latestState.request?.resendPayload).toEqual({
+      taskId: 1, clientMessageId: "cm-a", text: "AAA", files: [],
+    })
+    // A newer turn is sent and confirmed while this dialog is still open...
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-x", text: "XXX" })
+    })
+    act(() => {
+      latestActions.recordDelivery({ taskId: 1, clientMessageId: "cm-x", text: "XXX" })
+    })
+    // ...and then two more turns are staged before a second terminal frame
+    // retargets this same open dialog.
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-b", text: "BBB" })
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-c", text: "CCC" })
+    })
+    act(() => {
+      latestActions.openForTask(1)
+    })
+    // Ambiguity discards the confirmed stash ("XXX") same as always, but
+    // must not make the button the user is already looking at disappear or
+    // switch to a different turn: it keeps carrying "AAA".
+    expect(latestState.request?.resendPayload).toEqual({
+      taskId: 1, clientMessageId: "cm-a", text: "AAA", files: [],
+    })
+  })
+
+  it("hands the confirmed stash to a plain single-turn resend with nothing staged", () => {
+    renderProbe()
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-a", text: "AAA" })
+    })
+    act(() => {
+      latestActions.recordDelivery({ taskId: 1, clientMessageId: "cm-a", text: "AAA" })
+    })
+    act(() => {
+      latestActions.openForTask(1)
+    })
+    expect(latestState.request?.resendPayload).toEqual({
+      taskId: 1, clientMessageId: "cm-a", text: "AAA", files: [],
+    })
+  })
+
   it("prefers a staged candidate over an already-confirmed stash (T6)", () => {
     renderProbe()
     act(() => {

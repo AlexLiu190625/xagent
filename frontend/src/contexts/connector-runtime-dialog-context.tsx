@@ -185,9 +185,16 @@ export function ConnectorRuntimeDialogProvider({ children }: { children: React.R
         // unambiguous single in-flight turn can be claimed, though -- the
         // terminal frame carries no turn identity (xorbitsai/xagent#2465),
         // so with two staged turns there is no way to tell which one
-        // failed. Offering save-only is the safe degradation; resending the
-        // wrong turn is not.
+        // failed. Ambiguity withholds the whole fallback chain, not just
+        // the staged pick: neither staged candidate nor the confirmed
+        // stash is offered. The one exception is a snapshot an
+        // already-open dialog for this task is already carrying (`kept`)
+        // -- that one survives, so a resend button already on screen does
+        // not disappear out from under the user. Offering save-only, or
+        // leaving that button alone, is the safe degradation; resending
+        // the wrong turn is not.
         const mine = prev.pending.filter(p => p.taskId === taskId)
+        const ambiguous = mine.length > 1
         const staged = mine.length === 1 ? mine[0] : null
         // Hand the stash to the request and clear it in the same update: the
         // frame that opens the dialog also settles the turn, so the handoff
@@ -203,7 +210,11 @@ export function ConnectorRuntimeDialogProvider({ children }: { children: React.R
         const seq = prev.seq + 1
         return {
           seq,
-          request: { taskId, seq, resendPayload: staged ?? stashed ?? kept },
+          request: {
+            taskId,
+            seq,
+            resendPayload: ambiguous ? (kept ?? null) : (staged ?? stashed ?? kept),
+          },
           payload: stashed ? null : prev.payload,
           pending: prev.pending.filter(p => p.taskId !== taskId),
         }
