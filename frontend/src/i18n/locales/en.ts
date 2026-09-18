@@ -4954,6 +4954,7 @@ Build when you need.`,
     savedNotResentUnsupported: "The values were saved, but this message was not resent: this connector still needs {keys}. For now, use the SDK or the external API instead.",
     savedNotResentUnavailable: "The values were saved, but this message was not resent: this connector is still unavailable.",
     savedNotResentSuperseded: "The values were saved, but this message was not resent: another failure reopened this dialog before the resend could go out.",
+    savedNotResentUnmounted: "The values were saved, but this message was not resent: this dialog closed before the resend could go out.",
     stillMissingAfterSave: "This connector will still be unavailable after saving; it still needs {keys}.",
     sendFailed: "The values were saved, but the message was not sent.",
     actions: {

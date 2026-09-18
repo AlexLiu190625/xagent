@@ -1680,10 +1680,14 @@ describe("does not open off the host routes", () => {
 
 describe("does nothing after unmount when a request settles", () => {
   it("does nothing after unmount when a request settles", async () => {
-    // POST in flight when the tree unmounts: resolving it afterward does
-    // nothing. Uses a resend snapshot and "save and resend" (not "save
-    // only") so a broken alive-after-unmount guard would show up as a
-    // spurious sendMessage call, not just a same-outcome no-op.
+    // POST in flight when the tree unmounts: resolving it afterward does not
+    // touch state, does not resend, and does not close the dialog -- it
+    // does, however, toast once, since the save landed server-side with no
+    // way left to run the resend the user asked for (see the dedicated
+    // describe block below for that toast and its two control cases). Uses
+    // a resend snapshot and "save and resend" (not "save only") so a broken
+    // alive-after-unmount guard would show up as a spurious sendMessage
+    // call, not just a same-outcome no-op.
     fetchMock.mockResolvedValueOnce(ok(report(false, [
       connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
     ])))
@@ -1698,7 +1702,8 @@ describe("does nothing after unmount when a request settles", () => {
     sendMessageMock.mockClear()
     await act(async () => { resolveSubmit(ok(report(true, []))) })
     expect(sendMessageMock).not.toHaveBeenCalled()
-    expect(toastMock).not.toHaveBeenCalled()
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentUnmounted"]])
+    toastMock.mockClear()
     cleanup()
 
     // GET in flight when the task is switched away from: resolving it does nothing.
@@ -1732,6 +1737,51 @@ describe("does nothing after unmount when a request settles", () => {
     third.rerender(<ConnectorRuntimeDialogProvider><Probe mounted={false} /></ConnectorRuntimeDialogProvider>)
     await act(async () => { rejectSend(new Error("closed")) })
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    // Unlike the save-POST case at the top of this test, doResend already
+    // ran (sendMessage was already called, above) by the time this
+    // rejection arrives -- there is nothing new to toast about here.
+    expect(toastMock).not.toHaveBeenCalled()
+  })
+})
+
+describe("toasts once for a landed save the tree is gone before it can resend", () => {
+  it("does not toast when the save itself failed before the tree unmounted", async () => {
+    // Same shape as the top of "does nothing after unmount when a request
+    // settles" above, but the save POST resolves with a failure instead of
+    // ok: nothing was written server-side, so there is no "saved but not
+    // resent" fact to report, and the toast must stay silent.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    let resolveSubmit: (v: unknown) => void = () => {}
+    submitMock.mockReturnValueOnce(new Promise((res) => { resolveSubmit = res }))
+    const first = render(<ConnectorRuntimeDialogProvider><Probe /></ConnectorRuntimeDialogProvider>)
+    await recordThenOpen({ taskId: 1, clientMessageId: "unmount-guard-failed-save", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    first.rerender(<ConnectorRuntimeDialogProvider><Probe mounted={false} /></ConnectorRuntimeDialogProvider>)
+    await act(async () => { resolveSubmit({ ok: false, kind: "malformed" }) })
+    expect(toastMock).not.toHaveBeenCalled()
+  })
+
+  it("does not toast when only 'save only' was requested before the tree unmounted", async () => {
+    // Same shape again, but the click is "Save only": the user never asked
+    // for a resend, so a save landing after unmount has nothing it failed
+    // to deliver on.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    let resolveSubmit: (v: unknown) => void = () => {}
+    submitMock.mockReturnValueOnce(new Promise((res) => { resolveSubmit = res }))
+    const first = render(<ConnectorRuntimeDialogProvider><Probe /></ConnectorRuntimeDialogProvider>)
+    await recordThenOpen({ taskId: 1, clientMessageId: "unmount-guard-save-only", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    first.rerender(<ConnectorRuntimeDialogProvider><Probe mounted={false} /></ConnectorRuntimeDialogProvider>)
+    await act(async () => { resolveSubmit(ok(report(true, []))) })
+    expect(toastMock).not.toHaveBeenCalled()
   })
 })
 

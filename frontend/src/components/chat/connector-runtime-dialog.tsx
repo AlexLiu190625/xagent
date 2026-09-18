@@ -464,7 +464,17 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     setSubmitting(true)
     setLastAlsoResend(alsoResend)
     const result = await submitTaskConnectorRuntimeValues(request.taskId, items)
-    if (!aliveRef.current) return
+    if (!aliveRef.current) {
+      // The dialog unmounted while the save was in flight (a task switch,
+      // or leaving the host pages) -- submitTaskConnectorRuntimeValues has
+      // no abort signal, so a result.ok here already wrote an immutable
+      // value server-side, and the resend the user asked for is never
+      // going to run. Nothing else in this render tree still holds the
+      // state to report that; this toast is the only place left to say
+      // so, matching the sibling "superseded" branch right below.
+      if (alsoResend && result.ok) toast(t("connectorRuntime.savedNotResentUnmounted"))
+      return
+    }
     if (requestRef.current.seq !== seqAtStart) {
       // A newer request retargeted this same dialog instance while the save
       // was in flight; the result is stale, but `submitting` must still
@@ -494,7 +504,13 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // stuck forever; only an unmounted instance skips it, since it has no
       // buttons left to re-enable.
       const refreshed = await fetchTaskConnectorRuntimeRequirements(request.taskId)
-      if (!aliveRef.current) return
+      if (!aliveRef.current) {
+        // This branch only runs after the save itself failed a few lines
+        // above, so nothing was written server-side -- there is no "saved
+        // but not resent" fact to report here, unlike the early return
+        // right after the save POST above.
+        return
+      }
       if (requestRef.current.seq !== seqAtStart) {
         setSubmitting(false)
         return
@@ -550,7 +566,16 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
 
     if (alsoResend && canResendNow) {
       const resendOutcome = await doResend()
-      if (!aliveRef.current) return
+      if (!aliveRef.current) {
+        // doResend already ran to completion above -- the resend was
+        // attempted (sent or failed) regardless of whether this instance is
+        // still mounted, unlike the early return right after the save POST
+        // above, where the resend had not been attempted at all. There is
+        // nothing left here for a toast to report that doResend's own
+        // console.warn (on failure) or the message's own arrival in the
+        // transcript (on success) does not already cover.
+        return
+      }
       if (requestRef.current.seq !== seqAtStart) {
         // Same reason as the earlier seq check: a newer request retargeted
         // this dialog instance while the resend was in flight, so this
@@ -575,7 +600,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     const seqAtStart = request.seq
     setResending(true)
     const resendOutcome = await doResend()
-    if (!aliveRef.current) return
+    if (!aliveRef.current) {
+      // Same reasoning as handleSave's post-doResend early return above:
+      // the resend was already attempted by the time doResend resolves, so
+      // there is nothing new for a toast to report here.
+      return
+    }
     if (requestRef.current.seq !== seqAtStart) {
       // A newer request retargeted this same dialog instance while the
       // resend was in flight; the result is stale, but `resending` must

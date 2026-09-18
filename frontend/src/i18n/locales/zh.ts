@@ -4949,6 +4949,7 @@ const zh = {
     savedNotResentUnsupported: "值已保存，但这条消息没有重发：这个连接器还需要 {keys}，当前版本请改用 SDK 或外部 API。",
     savedNotResentUnavailable: "值已保存，但这条消息没有重发：这个连接器仍然不可用。",
     savedNotResentSuperseded: "值已保存，但这条消息没有重发：重发之前，另一次失败把这个弹窗重新指向了别的请求。",
+    savedNotResentUnmounted: "值已保存，但这条消息没有重发：重发之前，这个弹窗已经关闭。",
     stillMissingAfterSave: "保存后这个连接器仍然不可用，还缺 {keys}。",
     sendFailed: "值已保存，但消息没有发出去。",
     actions: {
