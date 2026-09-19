@@ -14,7 +14,6 @@ import builtins
 import json
 import os
 import re
-import sys
 from collections import ChainMap
 from collections.abc import Mapping
 from pathlib import Path
@@ -874,39 +873,57 @@ def test_shared_non_cyclic_references_still_spill(tmp_path):
     assert len(files) == 1
 
 
+# --- depth: no dependency on the interpreter's recursion tolerance ---------
+
+
+class _UnserializableValue:
+    """A value whose JSON serialization always raises RecursionError.
+
+    Stands in for the real trigger -- nesting deeper than the JSON encoder
+    tolerates -- without depending on how deep that is. The depth at which
+    the C encoder gives up is an interpreter detail: the same construction
+    that raises on 3.11 and 3.12 did not on 3.14, which is how the two tests
+    below used to fail there.
+    """
+
+    def __str__(self) -> str:
+        raise RecursionError("maximum recursion depth exceeded")
+
+
 def test_deeply_nested_value_is_left_to_the_output_filter(tmp_path):
-    # Deeper than the interpreter's recursion limit: json.dumps raises
-    # RecursionError here the same way it raises ValueError for a cycle --
-    # both mean "cannot serialize this at all", not "cannot fit it". The
-    # C-accelerated encoder tolerates depths well past the Python recursion
-    # limit (empirically: 5,000 is fine, 10,000 raises), so this uses a
-    # depth with headroom rather than the limit itself.
-    depth = sys.getrecursionlimit() * 20
-    nested = "leaf"
-    for _ in range(depth):
-        nested = {"child": nested}
-    result = {"deep": nested, "pad": "x" * 150}
+    # _serialized_length folds RecursionError into "cannot serialize this at
+    # all" exactly as it folds ValueError for a cycle: the value is never a
+    # spill point and is left inline for the filter, which enforces its own
+    # depth limit independently of the interpreter's.
+    unserializable = _UnserializableValue()
+    result = {"deep": unserializable, "pad": "x" * 150}
     target = _target(tmp_path)
     spilled, records = spill_oversized_values(
         result, target, tool_name="acme", max_recursion=20
     )
     assert len(records) == 1
     assert records[0]["value_path"] == "pad"
-    assert spilled["deep"] is nested
-    files = list(Path(target.spill_dir).glob("*"))
-    assert len(files) == 1
+    assert spilled["deep"] is unserializable
+    assert len(list(Path(target.spill_dir).glob("*"))) == 1
 
 
-def test_string_holding_too_deep_json_is_spilled_as_text(tmp_path):
+def test_string_holding_too_deep_json_is_spilled_as_text(tmp_path, monkeypatch):
     # A plain string is measured by raw length (_serialized_length never
-    # calls json.dumps on it), so this string "measures" successfully and
-    # becomes a spill point regardless of what its content looks like. Only
-    # later, when the write path tries to classify it, does _spill_kind_of
-    # attempt json.loads on it to decide array/object/text -- and a string
-    # that happens to look like deeply nested JSON can blow the same
-    # recursion limit there.
-    depth = sys.getrecursionlimit() * 20
-    text = "[" * depth + "]" * depth
+    # calls json.dumps on it), so it becomes a spill point whatever its
+    # content looks like. Only _spill_kind_of parses it, to decide
+    # array/object/text -- and json.loads refusing that content must fall
+    # back to text rather than escape. The refusal is injected here for the
+    # one string under test, because how deep real JSON has to be before
+    # json.loads refuses it is an interpreter detail.
+    text = "[" * 40 + "]" * 40 + "x" * 150
+    real_loads = json.loads
+
+    def _loads_refusing_the_deep_text(payload, *args, **kwargs):
+        if payload == text:
+            raise RecursionError("maximum recursion depth exceeded")
+        return real_loads(payload, *args, **kwargs)
+
+    monkeypatch.setattr(spill_module.json, "loads", _loads_refusing_the_deep_text)
     result = {"output": text}
     target = _target(tmp_path)
     spilled, records = spill_oversized_values(
@@ -915,8 +932,7 @@ def test_string_holding_too_deep_json_is_spilled_as_text(tmp_path):
     assert len(records) == 1
     assert records[0]["kind"] == "text"
     path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
-    written = path.read_bytes()
-    assert written.decode("utf-8") == text
+    assert path.read_bytes().decode("utf-8") == text
 
 
 # --- I-10: reserved key stripped unconditionally ---------------------------
