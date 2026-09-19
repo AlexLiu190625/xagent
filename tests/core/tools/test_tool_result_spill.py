@@ -33,6 +33,7 @@ from xagent.core.tools.tool_result_spill import (
     SpillTarget,
     _spill_fitting_prefix,
     _spill_item_count,
+    _spill_json_default,
     _spill_kind_of,
     _spill_slice,
     _spill_text_lines,
@@ -629,6 +630,10 @@ def test_spill_file_bytes_match_ensure_ascii_false_exactly(tmp_path):
     this test compares the written bytes directly against that exact
     expression, with CJK and an emoji (outside the BMP, encoded as a
     surrogate pair under ensure_ascii=True) in the payload.
+
+    The default hook is the module's own: since this fixture holds no bytes
+    it renders identically to default=str, but the expression under test is
+    the one A-7 now specifies.
     """
     value = [{"note": "第" * 5 + "🎉", "id": i} for i in range(60)]
     result = {"rows": value}
@@ -638,7 +643,9 @@ def test_spill_file_bytes_match_ensure_ascii_false_exactly(tmp_path):
     )
     path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
     written = path.read_bytes()
-    expected = json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
+    expected = json.dumps(
+        value, ensure_ascii=False, default=_spill_json_default
+    ).encode("utf-8")
     assert written == expected
     assert b"\\u" not in written
     assert "第🎉".encode() in written
@@ -758,6 +765,86 @@ def test_bytearray_is_not_spilled_and_leaves_no_file(tmp_path):
     assert not Path(target.spill_dir).exists() or not list(
         Path(target.spill_dir).glob("*")
     )
+
+
+# --- nested bytes render exactly as the output filter renders them ---------
+
+
+def test_nested_bytes_are_decoded_like_the_output_filter(tmp_path):
+    result = {"output": [b"abc"] * 40}
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert len(records) == 1
+    path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
+    assert json.loads(path.read_text(encoding="utf-8")) == ["abc"] * 40
+
+
+def test_nested_non_utf8_bytes_use_the_filters_replacement_characters(tmp_path):
+    result = {"output": [b"\xff\xfe"] * 40}
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
+    expected = b"\xff\xfe".decode("utf-8", errors="replace")
+    assert json.loads(path.read_text(encoding="utf-8")) == [expected] * 40
+
+
+def test_bytes_deep_inside_a_container_are_decoded_too(tmp_path):
+    result = {"rows": [{"blob": [[b"deep"]], "id": i} for i in range(40)]}
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert [row["blob"] for row in written] == [[["deep"]]] * 40
+
+
+def test_spilled_bytes_match_what_the_output_filter_produces(tmp_path):
+    """The comparison is against the filter itself, not a hand-written string.
+
+    max_chars/max_fields/max_recursion are set out of reach so the filter
+    applies no truncation of its own: what is compared is the binary
+    representation, which is the part the two must agree on.
+    """
+    from xagent.core.tools.adapters.vibe.output_filter import OutputValueFilter
+
+    rows = [{"blob": b"abc", "raw": b"\xff\xfe", "id": i} for i in range(40)]
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        {"rows": rows}, target, tool_name="acme", max_recursion=20
+    )
+    path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
+    written = json.loads(path.read_text(encoding="utf-8"))
+    unlimited = OutputValueFilter(
+        max_chars=10**9, max_fields=10**9, max_recursion=10**9
+    )
+    assert written == unlimited.filter(rows, tool_name="acme")
+
+
+def test_nested_bytes_size_accounting_matches_the_written_payload(tmp_path):
+    # original_chars comes from _serialized_length, the file from
+    # _spill_payload_for_value: if only one of them got the hook, the record
+    # would describe a size the file does not have.
+    result = {"output": [b"abc"] * 40}
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
+    assert records[0]["original_chars"] == len(path.read_text(encoding="utf-8"))
+
+
+def test_spill_json_default_leaves_bytearray_and_memoryview_to_str():
+    # The filter has no branch for either, so str() is what it gives them and
+    # str() is what this hook must give them.
+    array = bytearray(b"abc")
+    view = memoryview(b"abc")
+    assert _spill_json_default(array) == str(array)
+    assert _spill_json_default(view) == str(view)
 
 
 def test_metadata_is_computed_before_the_file_is_written(tmp_path, monkeypatch):
@@ -1525,6 +1612,12 @@ def test_prefix_fitting_single_oversized_item_keeps_zero():
     assert _spill_fitting_prefix(value, 10) == 0
 
 
+def test_prefix_fitting_counts_nested_bytes_as_the_filter_renders_them():
+    value = [b"abcdefgh"] * 20
+    limit = len(json.dumps(["abcdefgh"] * 7, ensure_ascii=False).encode("utf-8"))
+    assert _spill_fitting_prefix(value, limit) == 7
+
+
 @pytest.mark.parametrize("shape", ["array", "object"])
 def test_spill_truncates_by_item_and_stays_parseable(tmp_path, monkeypatch, shape):
     monkeypatch.setattr(spill_module, "SPILL_MAX_FILE_BYTES", 300)
@@ -1547,6 +1640,25 @@ def test_spill_truncates_by_item_and_stays_parseable(tmp_path, monkeypatch, shap
         assert len(parsed) == record["item_count"] == record["truncated_after_items"]
     else:
         assert len(parsed) == record["item_count"] == record["truncated_after_items"]
+
+
+def test_truncated_bytes_payload_stays_parseable_under_the_file_cap(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(spill_module, "SPILL_MAX_FILE_BYTES", 300)
+    result = {"output": [b"abcdefgh"] * 200}
+    target = _target(tmp_path, max_chars=10)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
+    written = path.read_bytes()
+    assert len(written) <= 300
+    parsed = json.loads(written.decode("utf-8"))
+    assert parsed == ["abcdefgh"] * len(parsed)
+    assert (
+        len(parsed) == records[0]["item_count"] == records[0]["truncated_after_items"]
+    )
 
 
 def test_spill_json_text_truncated_stays_array_kind_not_downgraded_to_text(

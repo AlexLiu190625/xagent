@@ -294,6 +294,40 @@ def resolve_spilled_under(
     return resolved
 
 
+def _spill_json_default(value: Any) -> str:
+    """Render one value json.dumps cannot encode, the way the filter does.
+
+    Every json.dumps in this module that renders or measures a tool's own
+    value passes this as its ``default``, so the payload, the size
+    accounting, the per-item prefix scan, the re-serialization after
+    truncation and the read-side slice all render the same value the same
+    way. (_json_data is the one json.dumps that does not: it encodes an
+    engine-built value_path and field-name list, both already str, so json
+    never asks it for a default.)
+
+    ``bytes`` is decoded with errors="replace" because that is what the
+    existing OutputValueFilter does with a bytes value
+    (adapters/vibe/output_filter.py's bytes branch), and issue #2416
+    promises binary results keep the behaviour that filter already gives
+    them. Without this hook a bytes value nested inside a container that is
+    itself the spill point was written as a Python repr -- "b'abc'" where
+    the filter produces "abc". The filter then applies its own per-string
+    length cap to that text; a spill file deliberately does not, because
+    storing the value whole instead of truncating it is what this module is
+    for, so the two agree on the characters, not on how many of them
+    survive.
+
+    Everything else falls back to str(), which is both json.dumps' usual
+    default=str and the filter's own last-resort branch for a type it has
+    no rule for. bytearray and memoryview are deliberately not decoded: the
+    filter has no branch for either, so str() is what it renders them as,
+    and matching the filter is the whole point of this hook.
+    """
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 def _spill_kind_of(content: str) -> tuple[str, Any]:
     """Decide how to address this file from its content alone.
 
@@ -344,12 +378,14 @@ def _spill_item_count(kind: str, value: Any, content: str) -> int:
 
 def _spill_slice(kind: str, value: Any, content: str, first: int, last: int) -> str:
     if kind == "array":
-        return json.dumps(value[first - 1 : last], ensure_ascii=False, default=str)
+        return json.dumps(
+            value[first - 1 : last], ensure_ascii=False, default=_spill_json_default
+        )
     if kind == "object":
         return json.dumps(
             dict(list(value.items())[first - 1 : last]),
             ensure_ascii=False,
-            default=str,
+            default=_spill_json_default,
         )
     return "".join(_spill_text_lines(content)[first - 1 : last])
 
@@ -391,7 +427,7 @@ def _plain_mapping(value: Any) -> Any:
     materialized to a dict once, at the point where a value becomes a spill
     point, so size accounting, payload and prefix counting all see the same
     object. Nested mappings that are not themselves spill points still go
-    through json.dumps(default=str) unchanged.
+    through json.dumps(default=_spill_json_default) unchanged.
     """
     if isinstance(value, Mapping) and not isinstance(value, dict):
         return dict(value)
@@ -427,7 +463,7 @@ def _serialized_length(value: Any) -> int | None:
     if isinstance(value, str):
         return len(value)
     try:
-        return len(json.dumps(value, ensure_ascii=False, default=str))
+        return len(json.dumps(value, ensure_ascii=False, default=_spill_json_default))
     except (ValueError, RecursionError):
         return None
 
@@ -454,12 +490,14 @@ def _is_spillable_value(value: Any) -> bool:
 
     Binary values cannot. The existing output filter already owns them: it
     decodes bytes with errors="replace" and truncates the resulting text
-    (adapters/vibe/output_filter.py's bytes branch). A spill file would have
-    to invent a second representation -- json.dumps(default=str) renders them
-    as a Python repr such as "b'\\xff\\xff'", which is neither the filter's
-    text nor the original bytes -- and the record would then describe a kind
-    the file does not hold. One representation for binary results is worth
-    more than a file nobody can interpret, so these are left inline.
+    (adapters/vibe/output_filter.py's bytes branch). Spilling one would
+    replace a binary result with a file-backed placeholder, which is exactly
+    the change of behaviour issue #2416 rules out for binary results, and
+    the file would hold replacement characters the record still describes as
+    text. A bytes value nested inside a container that is itself the spill
+    point is a different case: that container is already being written as
+    JSON text, so the bytes inside it are rendered by _spill_json_default,
+    which reproduces the filter's own decoding rather than a Python repr.
     """
     return not isinstance(value, (bytes, bytearray, memoryview))
 
@@ -601,9 +639,11 @@ def _spill_payload_for_value(value: Any) -> tuple[str, str, Any]:
         value = sorted(value, key=str)
     if isinstance(value, (list, tuple)):
         materialized = list(value)
-        payload = json.dumps(materialized, ensure_ascii=False, default=str)
+        payload = json.dumps(
+            materialized, ensure_ascii=False, default=_spill_json_default
+        )
         return payload, "array", materialized
-    payload = json.dumps(value, ensure_ascii=False, default=str)
+    payload = json.dumps(value, ensure_ascii=False, default=_spill_json_default)
     return payload, "object", value
 
 
@@ -623,7 +663,8 @@ def _spill_fitting_prefix(value: Any, limit: int) -> int:
     """How many leading items fit under `limit` bytes once serialized.
 
     One pass, no retry: the byte count is accumulated with exactly the
-    separators json.dumps(ensure_ascii=False, default=str) will write, so
+    separators json.dumps(ensure_ascii=False, default=_spill_json_default)
+    will write, so
     the count is the final file size, not an estimate. A proportional guess
     plus backoff was rejected: on a skewed collection (a few large items
     followed by many small ones) it lands far from the truth, and any fixed
@@ -649,14 +690,18 @@ def _spill_fitting_prefix(value: Any, limit: int) -> int:
             piece = (
                 len(
                     json.dumps(
-                        {entry[0]: entry[1]}, ensure_ascii=False, default=str
+                        {entry[0]: entry[1]},
+                        ensure_ascii=False,
+                        default=_spill_json_default,
                     ).encode("utf-8")
                 )
                 - 2
             )
         else:
             piece = len(
-                json.dumps(entry, ensure_ascii=False, default=str).encode("utf-8")
+                json.dumps(
+                    entry, ensure_ascii=False, default=_spill_json_default
+                ).encode("utf-8")
             )
         step = piece + (item_sep if kept else 0)
         if total + step > limit:
@@ -866,7 +911,9 @@ def _build_spill_record(
             parsed = (
                 parsed[:kept] if kind == "array" else dict(list(parsed.items())[:kept])
             )
-            payload = json.dumps(parsed, ensure_ascii=False, default=str)
+            payload = json.dumps(
+                parsed, ensure_ascii=False, default=_spill_json_default
+            )
             truncated_after_items = kept
     item_count = _spill_item_count(kind, parsed, payload)
     record_fields = _record_fields_for(kind, parsed)
