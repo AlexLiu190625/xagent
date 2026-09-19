@@ -62,6 +62,28 @@ For a deliberate single-process local deployment, set
 `XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` and use the `combined` role.
 Shared execution requirements do not apply in that mode.
 
+## Command ownership upgrade
+
+Shared workers process and settle commands under the task coordinator's owner
+attempt. The Registry continues renewing task ownership in batches; shared
+commands no longer have an independent processing lease or heartbeat.
+`retry_available_at` records a business retry delay and is never heartbeat-renewed.
+
+Stop all old executors before applying `20260918_command_retry_at`. The migration
+copies pending commands' retry deadlines into `retry_available_at` and preserves
+processing commands, results, attempt counters, and input-delivery evidence.
+Do not reset processing commands to pending or clear task leases in bulk. On
+startup, task ownership follows the existing lease-recovery rules; recovered
+commands keep their identity and pass through their existing application/replay
+checks. A completed START or reply handoff is not replayed simply because its
+execution worker died. Expired RUNNING tasks retain the existing failure/recovery
+semantics rather than automatically rerunning external side effects.
+
+All executors against one database must use the same execution mode. The local
+`shared=false` mode retains command claims. Restoring an old binary after shared
+workers have processed commands is not a supported in-place rollback; stop the
+new processes and restore a consistent pre-upgrade backup instead.
+
 ## Sandbox ownership
 
 Every concurrent execution process using Docker or BoxLite must have its own

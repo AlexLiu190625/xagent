@@ -257,6 +257,17 @@ class TaskCoordinatorRegistry:
         finally:
             self._heartbeat_runner = None
 
+    def busy_command_tasks(self) -> tuple[int, ...]:
+        """Let queue scans serve other tasks while this owner applies a command."""
+        return tuple(
+            task_id
+            for task_id, coordinator in self._coordinators.items()
+            if coordinator._command_tasks
+            or not coordinator._healthy
+            or coordinator.state
+            not in (CoordinatorState.ACQUIRING, CoordinatorState.ACTIVE)
+        )
+
     async def ensure(self, task_id: int) -> TaskCoordinator | None:
         while True:
             if self._close_task is not None:
