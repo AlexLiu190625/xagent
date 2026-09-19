@@ -909,6 +909,143 @@ describe("re-locates an existing field error when an already-visible dialog re-r
   })
 })
 
+describe("keeps a live rejection across a same-task refresh that still needs filling", () => {
+  it("keeps a type-mismatch rejection when a same-task re-request re-reads a still-fillable report", async () => {
+    // Isolates the read effect's own same-task re-request (a duplicate or
+    // versioned terminal frame retargeting an already-open dialog) from
+    // handleSave's own post-failure refresh: both refreshes below read back
+    // the same declared type, so the hint survives handleSave's refresh for
+    // the reason already covered above, and this test is only about whether
+    // the read effect's *separate* re-request also leaves it alone.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", required: true })]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("cfg"), { target: { value: '{"a":1}' } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 400, code: "invalid_runtime_context",
+      reason: "type_mismatch.context.cfg", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", required: true })]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.errors.typeObject:{\"key\":\"cfg\"}")).toBeInTheDocument())
+
+    // A duplicate/versioned terminal frame for the same task retargets this
+    // already-open dialog; the re-read still finds the row unfilled and the
+    // same declared type.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", required: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+    expect(screen.getByText("connectorRuntime.errors.typeObject:{\"key\":\"cfg\"}")).toBeInTheDocument()
+  })
+
+  it("keeps a 409-conflict rejection when a same-task re-request re-reads a still-fillable report", async () => {
+    // A second required key ("b") keeps the report non-met after "a" is
+    // resolved by the conflict, so this reaches the same non-met read-effect
+    // branch as the type-mismatch case above instead of the met branch
+    // "leaves a way out..." below covers.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "a", type: "string", required: true }),
+        input({ section: "context", key: "b", type: "string", required: true }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("a"), { target: { value: "x" } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 409, code: "runtime_context_immutable",
+      reason: "conflict.context.a", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "a", type: "string", required: true, satisfied: true }),
+        input({ section: "context", key: "b", type: "string", required: true }),
+      ]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.errors.conflictNoKey")).toBeInTheDocument())
+
+    // Same-task re-request: "a" is still satisfied and "b" still unfilled,
+    // so this is still the non-met branch, not the met one.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "a", type: "string", required: true, satisfied: true }),
+        input({ section: "context", key: "b", type: "string", required: true }),
+      ]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+    expect(screen.getByText("connectorRuntime.errors.conflictNoKey")).toBeInTheDocument()
+  })
+
+  it("still clears a type-mismatch rejection once a same-task re-request shows the row's type changed", async () => {
+    // Confirms the existing staleness behavior is not broken by the same-task
+    // re-request now preserving everything else: the row's declared type
+    // changing is the one case that still clears the hint outright.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", required: true })]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("cfg"), { target: { value: '{"a":1}' } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 400, code: "invalid_runtime_context",
+      reason: "type_mismatch.context.cfg", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", required: true })]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.errors.typeObject:{\"key\":\"cfg\"}")).toBeInTheDocument())
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "string", required: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(screen.getByLabelText("cfg").tagName).toBe("INPUT"))
+    expect(screen.queryByText(/connectorRuntime\.errors\.typeObject/)).not.toBeInTheDocument()
+  })
+
+  it("keeps a live send-failed panel when a same-task re-request re-reads a still-fillable report", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-sendfailed", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(new Error("closed"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    // Another terminal frame for the same task retargets this already-open
+    // dialog while the "saved but not sent" panel is still up: nothing about
+    // a re-read can prove the send now somehow went out, so it must not be
+    // silently swapped out for the ordinary footer.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.resend")).toBeEnabled()
+  })
+})
+
 describe("leaves a way out when a refresh reports the whole report satisfied", () => {
   it("leaves a way out when a refresh reports the whole report satisfied", async () => {
     // A failed save whose disposition asks for a refresh renders whatever
@@ -1984,8 +2121,8 @@ describe("holds the dialog open while a retry resend is in flight", () => {
   })
 })
 
-describe("keeps the submit gate closed while a retry resend is in flight, even after a same-task refresh reopens it", () => {
-  it("keeps the submit gate closed while a retry resend is in flight, even after a same-task refresh reopens it", async () => {
+describe("keeps the send-failed panel up while a retry resend is in flight, even after a same-task refresh reopens it", () => {
+  it("keeps the send-failed panel up while a retry resend is in flight, even after a same-task refresh reopens it", async () => {
     await openSimpleDialog()
     fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
     submitMock.mockResolvedValueOnce(ok(report(true, [])))
@@ -2003,30 +2140,35 @@ describe("keeps the submit gate closed while a retry resend is in flight, even a
 
     // Same task, another terminal frame arrives while that resend is still
     // in flight -- e.g. a second tab's own broadcast of the same failure.
-    // openForTask bumps the request's seq, the read effect re-fetches, and
-    // installs a fresh fillable report: `sendFailed` clears and the
-    // footer's save buttons come back.
+    // openForTask bumps the request's seq and the read effect re-fetches,
+    // but the send-failed panel is a live "message still hasn't gone out"
+    // fact this refresh does not get to erase: it stays up, and its own
+    // retry button stays disabled for as long as this resend is in flight
+    // (the ordinary footer never reappears to need its own gating).
     fetchMock.mockResolvedValueOnce(ok(report(false, [
       connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
     ])))
     await openForTask()
-    await waitFor(() => expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument())
-    fireEvent.change(screen.getByLabelText("token"), { target: { value: "y" } })
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.resend")).toBeDisabled()
 
-    const saveOnly = screen.getByText("connectorRuntime.actions.saveOnly")
-    const saveAndResend = screen.getByText("connectorRuntime.actions.saveAndResend")
-    expect(saveOnly).toBeDisabled()
-    expect(saveAndResend).toBeDisabled()
-
-    // Even a click against the (disabled) button must not let a second send
-    // go out under a fresh message id while the first retry is still
-    // unaccounted for.
-    fireEvent.click(saveAndResend)
+    // Even a click against the (disabled) button must not fire a second
+    // resend while the first retry is still unaccounted for.
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
     expect(sendMessageMock).toHaveBeenCalledTimes(1)
-    expect(submitMock).toHaveBeenCalledTimes(1)
 
+    // The retry resolves as sent, but a fresher request retargeted this
+    // dialog instance while it was in flight, so it is reported as
+    // superseded rather than closing this instance's dialog -- same as
+    // "ignores a resend result superseded by a new request" above. The
+    // panel it resolved from is still the live one, not cleared by the
+    // refresh, so it re-enables rather than disappearing.
     await act(async () => { resolveRetry() })
-    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled())
+    await waitFor(() => expect(toastMock).toHaveBeenCalledWith("connectorRuntime.resendSupersededUnknown"))
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.resend")).toBeEnabled()
   })
 })
 

@@ -280,7 +280,10 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // checks first). A once-visible dialog must not vanish out from under a
   // user who is mid-draft: a re-read for the same task only happens because
   // another terminal frame retargeted this instance, not because the user
-  // did anything, so it must never read as a decision the user made.
+  // did anything, so it must never read as a decision the user made. The
+  // same reasoning covers a still-live rejection message and a still-live
+  // "saved but not sent" panel below: neither is cleared just because this
+  // re-read ran.
   useEffect(() => {
     if (!isConnectorRuntimeDialogHostPath(pathnameRef.current)) {
       close("not-shown")
@@ -319,8 +322,21 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         return
       }
       setReport(result.report)
-      setFieldError(null)
-      setSendFailed(false)
+      // This branch only runs because another terminal frame for the same
+      // task retargeted an already-open dialog (see this effect's opening
+      // comment) -- never because the user resolved anything -- so a live
+      // rejection or send failure must survive it. A type-mismatch hint is
+      // cleared only once this fresher report proves it stale (the row's
+      // declared type changed under it, via isTypeMismatchDispositionStale,
+      // the same check handleSave's own post-failure refresh uses below); a
+      // 409 conflict hint has no such report-derived staleness condition, so
+      // it is left alone here the same way handleSave's refresh already
+      // leaves it alone. The "saved but not sent" panel is not about the
+      // report at all -- nothing a re-read can show would make a send
+      // failure no longer have happened -- so it is never cleared here
+      // either; only a resend that actually completes (handleRetryResend)
+      // or unmounting clears it.
+      setFieldError(prev => (prev && isTypeMismatchDispositionStale(prev.disposition, result.report) ? null : prev))
       setVisible(true)
     })
     return () => { cancelled = true }
