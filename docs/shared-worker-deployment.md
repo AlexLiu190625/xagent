@@ -1,9 +1,13 @@
 # Shared worker deployment and upgrade
 
-Shared execution is enabled by default. A `combined` process serves HTTP/WebSocket
-requests and executes accepted tasks; a `web` process only accepts requests; a
-standalone `worker` executes them. Celery workers handle background jobs and are
-not substitutes for the standalone Agent worker.
+An unconfigured `combined` process serves HTTP/WebSocket requests and executes
+accepted tasks locally, so wheel installs can start without Redis. Published
+backend images are preconfigured with `XAGENT_WORKER_COUNT=2` and therefore use
+shared execution with Redis. Configuring `XAGENT_WORKER_COUNT`, or selecting the
+`web` or `worker` role, enables shared execution for compatibility with existing
+deployments. `XAGENT_SHARED_TASK_EXECUTION_ENABLED` can explicitly pin either
+mode. Celery workers handle background jobs and are not substitutes for the
+standalone Agent worker.
 
 ## Combined process launcher
 
@@ -12,6 +16,17 @@ Set `XAGENT_TASK_EXECUTION_ROLE=combined` and `XAGENT_WORKER_COUNT=4`, then run
 standalone Agent worker processes. The Docker backend uses this same entrypoint.
 Shared execution must be enabled. Redis, the database, encryption key and file
 storage configuration are inherited by every child process.
+
+Open-source backend images built from the current source default to two Agent
+workers. When `ENCRYPTION_KEY` is absent, the image entrypoint creates a private
+Fernet key in the persistent `xagent_secrets` volume and every Xagent service
+reuses it. Back up this volume with the database: deleting or replacing the key
+makes encrypted runtime values unreadable. An explicit `ENCRYPTION_KEY` always
+takes precedence. The checked-in Compose file uses fixed release tags, so this
+default takes effect after its backend image is bumped to a release containing
+this change. Set `XAGENT_WORKER_COUNT=` and
+`XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` together to opt that Compose
+deployment back into single-process local execution.
 
 The web process completes normal startup, including database migrations, before
 workers start. It serves HTTP/WebSocket and designated channel ingress without
@@ -36,8 +51,10 @@ when managing processes externally.
 1. Stop old application processes before upgrading the database. Back up the
    database and retain the existing private encryption key. Do not run old local
    executors alongside shared executors against the same database.
-2. Configure the same `DATABASE_URL`, `XAGENT_REDIS_URL`, private `ENCRYPTION_KEY`,
-   and `XAGENT_TASK_EVENT_CHANNEL_PREFIX` on web and execution hosts. Generate a
+2. Set `XAGENT_SHARED_TASK_EXECUTION_ENABLED=true` (recommended even though a
+   worker count or split role also selects it), then configure the same
+   `DATABASE_URL`, `XAGENT_REDIS_URL`, private `ENCRYPTION_KEY`, and
+   `XAGENT_TASK_EVENT_CHANNEL_PREFIX` on web and execution hosts. Generate a
    Fernet key for a new deployment with:
    `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
    The empty example value and published development keys are rejected. Preserve
@@ -58,9 +75,11 @@ when managing processes externally.
    This is an operational designation, not automatic leader election. If it is
    disabled everywhere, no bot connection starts; startup logs state this.
 
-For a deliberate single-process local deployment, set
-`XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` and use the `combined` role.
-Shared execution requirements do not apply in that mode.
+Single-process local deployment is the default when no shared topology is
+configured. Set
+`XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` explicitly if the deployment should
+pin that mode, and use the `combined` role. Shared execution requirements do not
+apply in local mode.
 
 ## Command ownership upgrade
 
