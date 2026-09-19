@@ -663,10 +663,9 @@ def _spill_fitting_prefix(value: Any, limit: int) -> int:
     """How many leading items fit under `limit` bytes once serialized.
 
     One pass, no retry: the byte count is accumulated with exactly the
-    separators json.dumps(ensure_ascii=False, default=_spill_json_default)
-    will write, so
-    the count is the final file size, not an estimate. A proportional guess
-    plus backoff was rejected: on a skewed collection (a few large items
+    separators json.dumps(ensure_ascii=False, default=_spill_json_default) will
+    write, so the count is the final file size, not an estimate. A proportional
+    guess plus backoff was rejected: on a skewed collection (a few large items
     followed by many small ones) it lands far from the truth, and any fixed
     retry budget can run out while still over the limit.
 

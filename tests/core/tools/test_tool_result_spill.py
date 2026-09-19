@@ -623,16 +623,15 @@ def test_spill_file_is_written_verbatim_unicode_and_newlines(tmp_path):
 def test_spill_file_bytes_match_ensure_ascii_false_exactly(tmp_path):
     """The design's own §A-7 table is explicit about the one json.dumps
     call a list/dict transfer point gets: ``json.dumps(value,
-    ensure_ascii=False, default=str)``. json.loads round-tripping (the
-    other tests in this file) cannot tell that call apart from
-    ensure_ascii=True -- both parse back to the same Python value -- so
-    this test compares the written bytes directly against that exact
-    expression, with CJK and an emoji (outside the BMP, encoded as a
+    ensure_ascii=False, default=_spill_json_default)``. json.loads
+    round-tripping (the other tests in this file) cannot tell that call
+    apart from ensure_ascii=True -- both parse back to the same Python
+    value -- so this test compares the written bytes directly against that
+    exact expression, with CJK and an emoji (outside the BMP, encoded as a
     surrogate pair under ensure_ascii=True) in the payload.
 
-    The default hook is the module's own: since this fixture holds no bytes
-    it renders identically to default=str, but the expression under test is
-    the one A-7 now specifies.
+    The fixture holds no bytes, so the hook renders it exactly as a bare
+    str() would.
     """
     value = [{"note": "第" * 5 + "🎉", "id": i} for i in range(60)]
     result = {"rows": value}
@@ -890,7 +889,9 @@ class _UnserializableValue:
         raise RecursionError("maximum recursion depth exceeded")
 
 
-def test_deeply_nested_value_is_left_to_the_output_filter(tmp_path):
+def test_value_whose_serialization_hits_recursion_limit_is_left_to_the_output_filter(
+    tmp_path,
+):
     # _serialized_length folds RecursionError into "cannot serialize this at
     # all" exactly as it folds ValueError for a cycle: the value is never a
     # spill point and is left inline for the filter, which enforces its own
@@ -907,7 +908,9 @@ def test_deeply_nested_value_is_left_to_the_output_filter(tmp_path):
     assert len(list(Path(target.spill_dir).glob("*"))) == 1
 
 
-def test_string_holding_too_deep_json_is_spilled_as_text(tmp_path, monkeypatch):
+def test_string_whose_json_parse_hits_recursion_limit_is_spilled_as_text(
+    tmp_path, monkeypatch
+):
     # A plain string is measured by raw length (_serialized_length never
     # calls json.dumps on it), so it becomes a spill point whatever its
     # content looks like. Only _spill_kind_of parses it, to decide
@@ -1597,6 +1600,47 @@ def test_whole_root_spill_gives_a_declined_slot_back(tmp_path, monkeypatch):
     assert records == []
     assert spilled is wide
     assert budget.files_written == SPILL_MAX_FILES_PER_RUN - 1
+
+
+def test_reserve_and_release_run_inside_the_budget_lock():
+    import threading
+
+    budget = SpillRunBudget()
+    entered: list[str] = []
+
+    class _RecordingLock:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            entered.append("in")
+            return self._inner.__enter__()
+
+        def __exit__(self, *exc):
+            return self._inner.__exit__(*exc)
+
+    budget._lock = _RecordingLock(threading.Lock())
+    assert budget.reserve() is True
+    budget.release()
+    assert entered == ["in", "in"]
+    assert budget.files_written == 0
+
+
+def test_whole_root_spill_when_the_run_budget_is_already_exhausted(tmp_path, caplog):
+    target = _target(tmp_path)
+    budget = SpillRunBudget(files_written=SPILL_MAX_FILES_PER_RUN)
+    wide = {f"k{i:03d}": "y" * 10 for i in range(40)}
+    with caplog.at_level("WARNING"):
+        spilled, records = spill_oversized_values(
+            wide, target, tool_name="acme", max_recursion=20, run_budget=budget
+        )
+    assert records == []
+    assert spilled is wide
+    assert budget.files_written == SPILL_MAX_FILES_PER_RUN
+    assert not Path(target.spill_dir).exists() or not list(
+        Path(target.spill_dir).glob("*")
+    )
+    assert any("Spill run budget of" in message for message in caplog.messages)
 
 
 # --- I-47: 8 MiB cap truncates by item, staying parseable -------------------
