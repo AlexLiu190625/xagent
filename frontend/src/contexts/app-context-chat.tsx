@@ -2738,7 +2738,32 @@ export function AppProvider({
         if (pendingTaskToExecuteRef.current) {
           const hasUserMessages = stateRef.current.messages.some(m => m.role === 'user')
           if (!hasUserMessages) {
-            sendChatMessage(pendingTaskToExecuteRef.current.description, [])
+            const description = pendingTaskToExecuteRef.current.description
+            const taskId = stateRef.current.taskId
+            const clientMessageId = generateClientMessageId()
+            // This auto-send bypasses sendMessage entirely (it predates the
+            // connector-runtime dialog and must keep this old path's own
+            // behavior unchanged, not gain sendMessage's optimistic bubble
+            // or send guards), so it never staged a resend candidate for
+            // itself. Stage/redeem/discard it here the same way sendMessage's
+            // own call sites do, or a terminal task_error this send provokes
+            // finds no candidate to offer.
+            if (typeof taskId === "number") {
+              connectorRuntimeDialogRef.current.stagePendingDelivery({
+                taskId, clientMessageId, text: description, files: [],
+              })
+            }
+            sendChatMessage(description, [], false, clientMessageId)
+              .then(() => {
+                if (typeof taskId === "number") {
+                  connectorRuntimeDialogRef.current.recordDelivery({
+                    taskId, clientMessageId, text: description, files: [],
+                  })
+                }
+              })
+              .catch(() => {
+                connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
+              })
             pendingTaskToExecuteRef.current = null
           }
         }

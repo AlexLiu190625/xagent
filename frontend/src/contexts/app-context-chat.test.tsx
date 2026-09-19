@@ -7355,6 +7355,82 @@ describe("connector runtime dialog trigger", () => {
     )
   })
 
+  it("stages a resend candidate for the pending-task auto-send", async () => {
+    stubConnectorRuntimeGet()
+    // The auto-send effect only fires its 1-second timer once the socket is
+    // connected and a stored pending-task description is already waiting --
+    // start disconnected so mounting this tree does not race that gate
+    // before the task_info below ever arrives.
+    wsHarness.isConnected = false
+    sendChatMessageMock.mockReset()
+    let resolveAck: ((v: { client_message_id: string; turn_id: string }) => void) | undefined
+    sendChatMessageMock.mockReturnValueOnce(new Promise((resolve) => { resolveAck = resolve }))
+    const buildTree = () => (
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    const { rerender } = render(buildTree())
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(1, {
+        status: "pending",
+        description: "run the pending task",
+      }))
+    })
+
+    vi.useFakeTimers()
+    try {
+      // Flips this effect's own `isConnected` dependency by re-rendering with
+      // a fresh element (reusing the same one bails out of the render
+      // entirely) rather than through the real hook's onopen handler. That
+      // handler also runs app-context-chat.tsx's own onConnect, whose
+      // "Auto-execute PENDING tasks" timer is registered first and clears
+      // the ref this effect reads. Driving the dependency directly keeps
+      // this case about this effect's own staging logic rather than about
+      // that timer.
+      act(() => {
+        wsHarness.isConnected = true
+        rerender(buildTree())
+      })
+      act(() => { vi.advanceTimersByTime(1000) })
+    } finally {
+      vi.useRealTimers()
+    }
+
+    expect(sendChatMessageMock).toHaveBeenCalledTimes(1)
+    const [sentText, sentFiles, sentForce, clientMessageId] = sendChatMessageMock.mock.calls[0]
+    expect(sentText).toBe("run the pending task")
+    expect(sentFiles).toEqual([])
+    expect(sentForce).toBe(false)
+    expect(typeof clientMessageId).toBe("string")
+
+    // The acknowledgement above is still unresolved -- the terminal frame
+    // this auto-send provokes arrives first, independently of it, which is
+    // exactly the ordering the staged candidate exists to survive.
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => {
+      onMessage?.({
+        type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 1,
+        task: { id: 1, status: "failed" }, message: "x", error: "x",
+        code: "missing_runtime_context", run_id: "run-1", state_version: 2,
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => expect(connectorRuntimeState.request).not.toBeNull())
+    const request = connectorRuntimeState.request as {
+      resendPayload: { clientMessageId: string; text: string } | null
+    }
+    expect(request.resendPayload?.clientMessageId).toBe(clientMessageId)
+    expect(request.resendPayload?.text).toBe("run the pending task")
+
+    await act(async () => {
+      resolveAck?.({ client_message_id: clientMessageId as string, turn_id: clientMessageId as string })
+    })
+  })
+
   it("stashes a delivered turn for the viewed task only", async () => {
     stubConnectorRuntimeGet()
     render(
