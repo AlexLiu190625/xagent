@@ -187,3 +187,32 @@ this lifetime. Reads reject expired credentials immediately, even before the
 cleanup sweep deletes them. Finished and replaced runs are also cleaned up.
 After expiration, submit fresh runtime credentials with a new request; an old
 run cannot silently reuse expired values.
+
+## A2A first-message retries
+
+Shared A2A requests without `taskId` retain the original acceptance under the
+Agent, authenticated owner's stable identity, API key identity, and `messageId`. Repeating the
+same text and explicit `contextId` returns the original task's current state,
+including a completed or failed state, without creating another task. Reusing
+that identity with different text or explicit context returns `INVALID_ARGUMENT`.
+A new message ID represents a new input even when its text is identical.
+Different API keys have independent retry histories; rotating a key starts a new
+history. The public key prefix identifies the key; the secret is never stored in
+the receipt. If the first request omits `contextId`, a retry may include the
+server-assigned context ID returned for that task. A different context still
+conflicts; an explicitly supplied initial context must be repeated unchanged.
+
+Apply `20260919_task_input_receipts` with all old application processes stopped.
+The receipt, task, message and START command commit together. Existing inputs
+cannot be backfilled because their original message IDs were not retained.
+Existing-task continuation and paused/waiting replies keep their current
+protocol; local execution with shared mode disabled is unchanged.
+
+Receipts have no heartbeat, processing state or automatic expiry. They retain
+only hashed input identity/content and task/command references, not message text
+or credentials. Deleting the task or command leaves a receipt tombstone; an
+identical retry returns `NOT_FOUND` rather than resurrecting work. Normal current
+authentication and task ownership checks still apply to replayed requests.
+Dropping this table, including migration downgrade, discards the retry history
+and removes the corresponding deduplication guarantee. This is acceptance
+idempotency, not an exactly-once guarantee for external tools or message sends.

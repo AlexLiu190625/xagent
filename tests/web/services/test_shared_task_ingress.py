@@ -96,6 +96,7 @@ async def test_a2a_create_commits_start_without_local_execution(ingress):
         agent_execution_mode="balanced",
         text="hello",
         message_id="message-1",
+        key_prefix="key-one",
         context_id=None,
         task_id=None,
     )
