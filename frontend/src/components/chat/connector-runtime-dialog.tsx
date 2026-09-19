@@ -3,6 +3,7 @@
 import React, { useEffect, useRef, useState } from "react"
 import { usePathname } from "next/navigation"
 
+import { readRetryWithNewId, readSendDisposition } from "@/components/chat/clarification-delivery"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -264,6 +265,10 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const [lastAlsoResend, setLastAlsoResend] = useState(false)
   const [sendFailed, setSendFailed] = useState(false)
   const [resending, setResending] = useState(false)
+  // The client message id the most recent unresolved resend attempt used, so
+  // a further retry can reuse it instead of minting a new one -- see
+  // doResend, which is the only reader and writer.
+  const resendMessageIdRef = useRef<string | null>(null)
 
   // Read on mount and on every subsequent request for this same task (the
   // dialog is already open and a new terminal frame retargeted it): the
@@ -452,23 +457,48 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       console.warn("[connector-runtime] resend attempted with no snapshot to send")
       return "nothing-to-send"
     }
+    // Reuse the id the last unresolved attempt for this snapshot used,
+    // unless that attempt's own outcome already proved it: the very first
+    // attempt (ref starts null on a fresh dialog instance) and any attempt
+    // an earlier one proved not delivered both mint fresh below. This is
+    // never the id of the original send that opened this dialog -- the
+    // server has recorded that one as FAILED and would bounce a same-id
+    // retry of it -- only ever an id this same doResend minted.
+    const clientMessageId = resendMessageIdRef.current ?? generateClientMessageId()
     try {
       // Matches every other programmatic resend call site in the app
       // (clarification-form.tsx, workforce-builder.tsx, agent-builder.tsx):
       // without force, a duplicate of this exact text still pending from an
       // earlier send on this same connection throws instead of sending.
+      // Still safe alongside id reuse below: a reused id is already covered
+      // by the backend's own (task_id, command_id) idempotency, so this
+      // guard only still does anything on the fresh-id branch.
       await sendMessage(
         snapshot.text,
-        { clientMessageId: generateClientMessageId(), force: true },
+        { clientMessageId, force: true },
         snapshot.files,
       )
+      resendMessageIdRef.current = null
       return "sent"
-    } catch {
+    } catch (error) {
       // Matches the read path's warn so a failing resend leaves the same
       // diagnostic signal. Carries the fixed prefix alone: unlike the read
       // path there is no closed-set status to report here, and the rejection
       // value is arbitrary, so logging it could carry message content.
       console.warn("[connector-runtime] resend failed")
+      // A definite not_sent/rejected disposition, or the server explicitly
+      // demanding a new id, means this id is spent -- the next retry mints
+      // fresh. Every other case, including an outcome_unknown disposition
+      // and a plain exception that carries no disposition at all, leaves the
+      // possibility open that the server already durably accepted this
+      // attempt, so the next retry reuses this same id rather than risking
+      // the same turn running twice under a second one.
+      const mustMintNewId = (
+        readRetryWithNewId(error)
+        || readSendDisposition(error) === "not_sent"
+        || readSendDisposition(error) === "rejected"
+      )
+      resendMessageIdRef.current = mustMintNewId ? null : clientMessageId
       return "failed"
     }
   }

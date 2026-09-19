@@ -93,6 +93,14 @@ export const readSendErrorCode = (error: unknown): ClientErrorCode | null =>
   readClientErrorCode(asRecord(error)?.errorCode)
 
 /**
+ * Whether the server told the sender a retry of this id will not be
+ * accepted -- the one signal that overrides id reuse even for an
+ * `outcome_unknown` disposition (see MessageDeliveryError.retryWithNewId).
+ */
+export const readRetryWithNewId = (error: unknown): boolean =>
+  asRecord(error)?.retryWithNewId === true
+
+/**
  * The hint that belongs with a disposition, as a key rather than a translated
  * string: the toast needs it once at failure time, while the persistent alert
  * has to re-resolve it on every render so a locale switch is not stuck behind

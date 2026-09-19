@@ -1287,7 +1287,14 @@ describe("resends the snapshot under a fresh id", () => {
     expect(submitMock).toHaveBeenCalledTimes(1)
     const firstId = sendMessageMock.mock.calls[0][1]?.clientMessageId
     const secondId = sendMessageMock.mock.calls[1][1]?.clientMessageId
-    expect(secondId).not.toBe(firstId)
+    // The first resend's rejection above (`new Error("closed")`) carries no
+    // disposition at all, so it never proves the server didn't receive that
+    // attempt -- the retry reuses its id rather than risking the same turn
+    // running twice under a second one. It is still not "orig-2": the very
+    // first resend off the original failed send always mints fresh (that
+    // send is already recorded FAILED server-side under "orig-2" and a
+    // same-id retry of it would be bounced).
+    expect(secondId).toBe(firstId)
     expect(secondId).not.toBe("orig-2")
     cleanup()
     sendMessageMock.mockClear()
@@ -1346,6 +1353,67 @@ describe("resends the snapshot under a fresh id", () => {
     await act(async () => { resolveRetry() })
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
     expect(sendMessageMock).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("reuses the resend id unless the previous attempt is proven not accepted", () => {
+  it("reuses the same id when the previous resend's outcome was unknown", async () => {
+    // The send-failed panel offers no way to distinguish "the server durably
+    // accepted this and only the acknowledgement was lost" from a definite
+    // failure -- retrying under the same id lets the backend's own
+    // (task_id, command_id) idempotency coalesce the two rather than risk
+    // running the same turn twice.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(Object.assign(new Error("ack lost"), { disposition: "outcome_unknown" }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    const firstId = sendMessageMock.mock.calls[0][1]?.clientMessageId
+
+    sendMessageMock.mockClear()
+    sendMessageMock.mockResolvedValueOnce(undefined)
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
+    expect(sendMessageMock.mock.calls[0][1]?.clientMessageId).toBe(firstId)
+    expect(sendMessageMock.mock.calls[0][1]?.force).toBe(true)
+  })
+
+  it("mints a new id when the previous resend is proven not accepted", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(Object.assign(new Error("never left the client"), { disposition: "not_sent" }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    const firstId = sendMessageMock.mock.calls[0][1]?.clientMessageId
+
+    sendMessageMock.mockClear()
+    sendMessageMock.mockResolvedValueOnce(undefined)
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
+    expect(sendMessageMock.mock.calls[0][1]?.clientMessageId).not.toBe(firstId)
+  })
+
+  it("mints a new id when the server demands one even for an outcome_unknown rejection", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(
+      Object.assign(new Error("id conflict"), { disposition: "outcome_unknown", retryWithNewId: true }),
+    )
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    const firstId = sendMessageMock.mock.calls[0][1]?.clientMessageId
+
+    sendMessageMock.mockClear()
+    sendMessageMock.mockResolvedValueOnce(undefined)
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
+    expect(sendMessageMock.mock.calls[0][1]?.clientMessageId).not.toBe(firstId)
   })
 })
 
