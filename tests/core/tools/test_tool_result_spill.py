@@ -1380,6 +1380,122 @@ def test_spill_run_budget_already_exhausted_spills_nothing(tmp_path):
     assert spilled["content"][0]["text"] == _big(150)
 
 
+# --- shared run-budget admission is atomic ----------------------------------
+
+
+def test_two_concurrent_calls_share_the_last_run_budget_slot(tmp_path, monkeypatch):
+    """Only one of two concurrent calls may take the run's last file slot.
+
+    The slow call is held inside _build_spill_record -- past the admission
+    check, before the counter would once have been incremented -- while the
+    second call runs its whole admission on this thread. That is the exact
+    window the old check-build-increment sequence left open, and it is
+    reproduced by events rather than by a sleep, so the test neither races
+    nor waits.
+    """
+    import threading
+
+    target = _target(tmp_path)
+    budget = SpillRunBudget(files_written=SPILL_MAX_FILES_PER_RUN - 1)
+    inside_build = threading.Event()
+    finish_build = threading.Event()
+    real_build = spill_module._build_spill_record
+
+    def _build_holding_the_slot(*args, **kwargs):
+        inside_build.set()
+        assert finish_build.wait(timeout=10)
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(spill_module, "_build_spill_record", _build_holding_the_slot)
+    held_records: list[list[dict]] = []
+
+    def _held_call():
+        _, records = spill_oversized_values(
+            {"held": _big(150)},
+            target,
+            tool_name="acme",
+            max_recursion=20,
+            run_budget=budget,
+        )
+        held_records.append(records)
+
+    held = threading.Thread(target=_held_call)
+    held.start()
+    assert inside_build.wait(timeout=10)
+    # Restore the real build before the second call: without the fix the
+    # second call reaches it too, and a second thread parked on the same
+    # event would hang instead of failing.
+    monkeypatch.setattr(spill_module, "_build_spill_record", real_build)
+    _, second_records = spill_oversized_values(
+        {"second": _big(151)},
+        target,
+        tool_name="acme",
+        max_recursion=20,
+        run_budget=budget,
+    )
+    finish_build.set()
+    held.join(timeout=10)
+    assert not held.is_alive()
+
+    assert len(held_records[0]) == 1
+    assert second_records == []
+    assert budget.files_written == SPILL_MAX_FILES_PER_RUN
+    assert len(list(Path(target.spill_dir).glob("*"))) == 1
+
+
+def test_a_declined_build_gives_its_run_budget_slot_back(tmp_path, monkeypatch):
+    target = _target(tmp_path)
+    budget = SpillRunBudget(files_written=SPILL_MAX_FILES_PER_RUN - 1)
+    monkeypatch.setattr(
+        spill_module, "_build_spill_record", lambda *args, **kwargs: None
+    )
+    _, records = spill_oversized_values(
+        {"a": _big(150)}, target, tool_name="acme", max_recursion=20, run_budget=budget
+    )
+    assert records == []
+    assert budget.files_written == SPILL_MAX_FILES_PER_RUN - 1
+
+    monkeypatch.undo()
+    _, records = spill_oversized_values(
+        {"a": _big(150)}, target, tool_name="acme", max_recursion=20, run_budget=budget
+    )
+    assert len(records) == 1
+    assert budget.files_written == SPILL_MAX_FILES_PER_RUN
+
+
+def test_a_raising_build_gives_its_run_budget_slot_back(tmp_path, monkeypatch):
+    def _boom(kind, parsed):
+        raise RuntimeError("late metadata")
+
+    target = _target(tmp_path)
+    budget = SpillRunBudget(files_written=SPILL_MAX_FILES_PER_RUN - 1)
+    monkeypatch.setattr(spill_module, "_record_fields_for", _boom)
+    with pytest.raises(RuntimeError):
+        spill_oversized_values(
+            {"a": _big(150)},
+            target,
+            tool_name="acme",
+            max_recursion=20,
+            run_budget=budget,
+        )
+    assert budget.files_written == SPILL_MAX_FILES_PER_RUN - 1
+
+
+def test_whole_root_spill_gives_a_declined_slot_back(tmp_path, monkeypatch):
+    target = _target(tmp_path)
+    budget = SpillRunBudget(files_written=SPILL_MAX_FILES_PER_RUN - 1)
+    monkeypatch.setattr(
+        spill_module, "_build_spill_record", lambda *args, **kwargs: None
+    )
+    wide = {f"k{i:03d}": "y" * 10 for i in range(40)}
+    spilled, records = spill_oversized_values(
+        wide, target, tool_name="acme", max_recursion=20, run_budget=budget
+    )
+    assert records == []
+    assert spilled is wide
+    assert budget.files_written == SPILL_MAX_FILES_PER_RUN - 1
+
+
 # --- I-47: 8 MiB cap truncates by item, staying parseable -------------------
 
 

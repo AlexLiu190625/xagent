@@ -16,8 +16,9 @@ import logging
 import os
 import re
 import stat
+import threading
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -131,9 +132,46 @@ class SpillRunBudget:
     whose payloads happen to be identical produce two records and one
     content-addressed file, and both records count. That matches the
     registry's own 64-record ceiling, which is what this budget protects.
+
+    Admission is serialized by the lock below: a caller takes a slot with
+    reserve() before the build-and-write work and gives it back with
+    release() when that work produces no record. The work in between is the
+    slowest step on this path, and the module's entry point requires a
+    caller on an event loop to run it in a worker thread, so two workers
+    that both read files_written before either increments would both be
+    admitted against the same remaining slot.
     """
 
     files_written: int = 0
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+
+    def reserve(self) -> bool:
+        """Take one of the run's file slots; False when none is left.
+
+        The check and the increment are one critical section. Incrementing
+        under a lock after the build would not be enough: by then both
+        workers have already been admitted and both files are already
+        written.
+        """
+        with self._lock:
+            if self.files_written >= SPILL_MAX_FILES_PER_RUN:
+                return False
+            self.files_written += 1
+            return True
+
+    def release(self) -> None:
+        """Give back a slot whose build produced no record.
+
+        A build that declines the value (binary, unserializable, nothing
+        fits under the file cap) or fails to write leaves no file behind, so
+        the budget must read exactly as it would have had the point never
+        been considered. Only ever called for a slot this same call
+        reserved, so it cannot drive the count below zero.
+        """
+        with self._lock:
+            self.files_written -= 1
 
 
 def is_classified_tool_failure(result: Any) -> bool:
@@ -853,6 +891,38 @@ def _build_spill_record(
     }
 
 
+def _build_spill_record_within_budget(
+    budget: SpillRunBudget,
+    spill_dir: str,
+    tool_name: str,
+    path: tuple[Any, ...],
+    value: Any,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Build one record against the run budget, reserving its slot first.
+
+    Returns (admitted, record). admitted is False only when the run budget
+    had no slot left -- the caller's cue to stop looking for further points
+    in this result rather than to skip this one. A (True, None) pair means
+    the slot was reserved, the build declined the value or failed to write
+    it, and the slot was handed back.
+
+    The reservation is taken before the build rather than after it because
+    the build is the blocking step: a caller on an event loop runs this
+    whole entry point in a worker thread, so two workers reach this point
+    concurrently and only a slot taken up front keeps them from both being
+    admitted against the same one.
+    """
+    if not budget.reserve():
+        return False, None
+    record: dict[str, Any] | None = None
+    try:
+        record = _build_spill_record(spill_dir, tool_name, path, value)
+    finally:
+        if record is None:
+            budget.release()
+    return True, record
+
+
 def _copy_and_set(container: Any, path: tuple[Any, ...], placeholder: Any) -> Any:
     """Shallow-copy `container` along `path`, replacing the value at `path`.
 
@@ -896,17 +966,18 @@ def _second_tier_result(
     root_length = _serialized_length(result)
     if root_length is None or root_length <= target.max_chars:
         return result, []
-    if budget.files_written >= SPILL_MAX_FILES_PER_RUN:
+    admitted, record = _build_spill_record_within_budget(
+        budget, target.spill_dir, tool_name, (), result
+    )
+    if not admitted:
         logger.warning(
             "Spill run budget of %d files reached; leaving this result to "
             "ordinary truncation.",
             SPILL_MAX_FILES_PER_RUN,
         )
         return result, []
-    record = _build_spill_record(target.spill_dir, tool_name, (), result)
     if record is None:
         return result, []
-    budget.files_written += 1
     new_result: dict[str, Any] = {}
     for key in SPILL_ENVELOPE_KEYS:
         if key in result:
@@ -978,18 +1049,19 @@ def spill_oversized_values(
                     SPILL_MAX_FILES_PER_RESULT,
                 )
                 break
-            if budget.files_written >= SPILL_MAX_FILES_PER_RUN:
+            admitted, record = _build_spill_record_within_budget(
+                budget, target.spill_dir, tool_name, path, value
+            )
+            if not admitted:
                 logger.warning(
                     "Spill run budget of %d files reached; leaving the "
                     "remaining values in this result to ordinary truncation.",
                     SPILL_MAX_FILES_PER_RUN,
                 )
                 break
-            record = _build_spill_record(target.spill_dir, tool_name, path, value)
             if record is None:
                 continue
             records.append(record)
-            budget.files_written += 1
             new_result = _copy_and_set(new_result, path, SPILL_PLACEHOLDER_TEXT)
         if records:
             # The report travels with the result itself: add_tool_result's
