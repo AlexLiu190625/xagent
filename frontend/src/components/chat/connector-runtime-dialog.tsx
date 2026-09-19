@@ -265,10 +265,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const [lastAlsoResend, setLastAlsoResend] = useState(false)
   const [sendFailed, setSendFailed] = useState(false)
   const [resending, setResending] = useState(false)
-  // The client message id the most recent unresolved resend attempt used, so
-  // a further retry can reuse it instead of minting a new one -- see
-  // doResend, which is the only reader and writer.
-  const resendMessageIdRef = useRef<string | null>(null)
+  // The client message id the most recent unresolved resend attempt used,
+  // together with the clientMessageId of the snapshot it was sent for, so a
+  // further retry can reuse the id only while it is still retrying that same
+  // snapshot -- see doResend, which is the only reader and writer.
+  const resendMessageIdRef = useRef<{ forSnapshotId: string, clientMessageId: string } | null>(null)
 
   // Read on mount and on every subsequent request for this same task (the
   // dialog is already open and a new terminal frame retargeted it): the
@@ -378,15 +379,15 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   )
   const canSubmit = isSubmitEnabled(submitItems, hasInvalidObjectDraft)
   // Whether any submission-shaped action is in flight: an explicit save
-  // (`submitting`) or a resend retried directly off a failed send
-  // (`resending`). A same-task terminal frame that arrives while a retry
-  // resend is still awaiting `doResend` -- for example, a second tab's own
-  // broadcast of the same failure -- runs the read effect above, which
-  // clears `sendFailed` and brings the footer's save buttons back before
-  // that resend settles. `canSubmitNow` must stay gated on this combined
-  // value rather than `submitting` alone, or those buttons would let a
-  // second send go out under a fresh message id while the first is still
-  // unaccounted for.
+  // (`submitting`, which may itself run a resend as part of "save and
+  // resend") or a standalone retry resend from the send-failed panel
+  // (`resending`). The footer `canSubmitNow` gates below is only ever
+  // rendered while `sendFailed` is false, and `resending` only runs while
+  // `sendFailed` is true -- its own button lives inside that panel -- so
+  // folding `resending` into `busy` makes no difference to the footer
+  // buttons today. What it does gate is `handleDismiss`/`handleOpenChange`
+  // further down, which must keep the dialog open while either kind of
+  // submission has not yet settled.
   const busy = submitting || resending
   // The one value every entry point into a submission reads: both footer
   // save buttons, the retry button a retryable failure offers, and
@@ -458,21 +459,34 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       return "nothing-to-send"
     }
     // Reuse the id the last unresolved attempt for this snapshot used,
-    // unless that attempt's own outcome already proved it: the very first
-    // attempt (ref starts null on a fresh dialog instance) and any attempt
-    // an earlier one proved not delivered both mint fresh below. This is
-    // never the id of the original send that opened this dialog -- the
-    // server has recorded that one as FAILED and would bounce a same-id
-    // retry of it -- only ever an id this same doResend minted.
-    const clientMessageId = resendMessageIdRef.current ?? generateClientMessageId()
+    // unless that attempt's own outcome already proved it, or the snapshot
+    // itself is not the one that id was minted for any more: the very first
+    // attempt (ref starts null on a fresh dialog instance), any attempt an
+    // earlier one proved not delivered, and any attempt whose carried id was
+    // minted for a different snapshot, all mint fresh below. The comparison
+    // is against the snapshot's own clientMessageId, not request.seq: a
+    // same-task retarget that leaves this snapshot in place (openForTask's
+    // "kept") bumps seq without invalidating this id, while one that swaps in
+    // a different snapshot (a newer candidate staged while this dialog was
+    // open, openForTask's "staged"/"stashed") must not let the old id carry
+    // over onto different text. This is never the id of the original send
+    // that opened this dialog -- the server has recorded that one as FAILED
+    // and would bounce a same-id retry of it -- only ever an id this same
+    // doResend minted.
+    const carriedId = resendMessageIdRef.current
+    const clientMessageId = carriedId && carriedId.forSnapshotId === snapshot.clientMessageId
+      ? carriedId.clientMessageId
+      : generateClientMessageId()
     try {
       // Matches every other programmatic resend call site in the app
       // (clarification-form.tsx, workforce-builder.tsx, agent-builder.tsx):
       // without force, a duplicate of this exact text still pending from an
-      // earlier send on this same connection throws instead of sending.
-      // Still safe alongside id reuse below: a reused id is already covered
-      // by the backend's own (task_id, command_id) idempotency, so this
-      // guard only still does anything on the fresh-id branch.
+      // earlier send on this same connection throws instead of sending. That
+      // duplicate check only ever matches a *different* clientMessageId than
+      // the one it is scanning for -- its own match condition excludes the
+      // id under retry -- so a same-id retry never reaches it either way and
+      // this flag changes nothing for it; force is what lets a fresh-id retry
+      // (the original send still pending, unacknowledged) go out at all.
       await sendMessage(
         snapshot.text,
         { clientMessageId, force: true },
@@ -498,7 +512,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         || readSendDisposition(error) === "not_sent"
         || readSendDisposition(error) === "rejected"
       )
-      resendMessageIdRef.current = mustMintNewId ? null : clientMessageId
+      resendMessageIdRef.current = mustMintNewId ? null : { forSnapshotId: snapshot.clientMessageId, clientMessageId }
       return "failed"
     }
   }

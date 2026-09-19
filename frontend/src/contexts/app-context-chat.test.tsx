@@ -7355,6 +7355,19 @@ describe("connector runtime dialog trigger", () => {
     )
   })
 
+  // This case drives the effect through `rerender` with `isConnected` flipped
+  // directly, in an order the real connection callback does not produce (see
+  // the comment on that `act` below). In the running app `use-websocket.ts`
+  // sets the connected flag and then synchronously invokes
+  // `app-context-chat.tsx`'s own `onConnect`, whose one-second timer is
+  // therefore always registered before this effect's and, when it finds
+  // `pendingTaskToExecuteRef` filled, clears it first. On a first connection
+  // the ref is not filled yet when this effect's guard runs, so this effect
+  // schedules no timer at all. This case therefore does not prove the
+  // auto-send below runs in the app; it pins the bookkeeping rule -- a
+  // pending candidate is staged before the send goes out, and settles the
+  // same way every other send in this dialog does -- so that rule holds
+  // wherever this effect's send line does get reached.
   it("stages a resend candidate for the pending-task auto-send", async () => {
     stubConnectorRuntimeGet()
     // The auto-send effect only fires its 1-second timer once the socket is
@@ -7426,9 +7439,118 @@ describe("connector runtime dialog trigger", () => {
     expect(request.resendPayload?.clientMessageId).toBe(clientMessageId)
     expect(request.resendPayload?.text).toBe("run the pending task")
 
+    // The task_error above already claimed this candidate through
+    // openForTask, which both hands it to the request as resendPayload and
+    // drops it from the pending list in the same update. The acknowledgement
+    // resolving after that finds no matching pending ticket, so recordDelivery
+    // is a no-op here -- it must not resurrect a stash for a candidate this
+    // tab already settled.
     await act(async () => {
       resolveAck?.({ client_message_id: clientMessageId as string, turn_id: clientMessageId as string })
     })
+    expect(connectorRuntimeState.payload).toBeNull()
+  })
+
+  it("records the delivery once the pending-task auto-send's acknowledgement resolves before anything else claims it", async () => {
+    stubConnectorRuntimeGet()
+    wsHarness.isConnected = false
+    sendChatMessageMock.mockReset()
+    let resolveAck: ((v: { client_message_id: string; turn_id: string }) => void) | undefined
+    sendChatMessageMock.mockReturnValueOnce(new Promise((resolve) => { resolveAck = resolve }))
+    const buildTree = () => (
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    const { rerender } = render(buildTree())
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(1, {
+        status: "pending",
+        description: "run the pending task",
+      }))
+    })
+
+    vi.useFakeTimers()
+    try {
+      act(() => {
+        wsHarness.isConnected = true
+        rerender(buildTree())
+      })
+      act(() => { vi.advanceTimersByTime(1000) })
+    } finally {
+      vi.useRealTimers()
+    }
+
+    expect(sendChatMessageMock).toHaveBeenCalledTimes(1)
+    const clientMessageId = sendChatMessageMock.mock.calls[0][3] as string
+
+    // Nothing has settled this task yet, so the staged candidate is still
+    // sitting in the pending list when the acknowledgement resolves --
+    // recordDelivery finds its ticket and writes the stash.
+    await act(async () => {
+      resolveAck?.({ client_message_id: clientMessageId, turn_id: clientMessageId })
+    })
+    const payload = connectorRuntimeState.payload as { clientMessageId: string; text: string } | null
+    expect(payload?.clientMessageId).toBe(clientMessageId)
+    expect(payload?.text).toBe("run the pending task")
+  })
+
+  it("discards the pending-task auto-send's staged candidate when the send throws", async () => {
+    stubConnectorRuntimeGet()
+    wsHarness.isConnected = false
+    sendChatMessageMock.mockReset()
+    let rejectAck: ((e: Error) => void) | undefined
+    sendChatMessageMock.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectAck = reject }))
+    const buildTree = () => (
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <SeedRunningTask />
+          <ConnectorRuntimeStateProbe />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    const { rerender } = render(buildTree())
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(1, {
+        status: "pending",
+        description: "run the pending task",
+      }))
+    })
+
+    vi.useFakeTimers()
+    try {
+      act(() => {
+        wsHarness.isConnected = true
+        rerender(buildTree())
+      })
+      act(() => { vi.advanceTimersByTime(1000) })
+    } finally {
+      vi.useRealTimers()
+    }
+
+    expect(sendChatMessageMock).toHaveBeenCalledTimes(1)
+
+    // The send throws before any terminal frame arrives -- discardPendingDelivery
+    // must withdraw the ticket rather than leaving it for a later,
+    // unrelated terminal frame to claim.
+    await act(async () => {
+      rejectAck?.(new Error("closed"))
+    })
+
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => {
+      onMessage?.({
+        type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: 1,
+        task: { id: 1, status: "failed" }, message: "x", error: "x",
+        code: "missing_runtime_context", run_id: "run-1", state_version: 2,
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => expect(connectorRuntimeState.request).not.toBeNull())
+    const request = connectorRuntimeState.request as { resendPayload: unknown }
+    expect(request.resendPayload).toBeNull()
   })
 
   it("stashes a delivered turn for the viewed task only", async () => {

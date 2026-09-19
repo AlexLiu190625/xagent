@@ -1417,6 +1417,81 @@ describe("reuses the resend id unless the previous attempt is proven not accepte
   })
 })
 
+describe("keeps a resend id bound to the snapshot it belongs to", () => {
+  it("mints a new id when a same-task retarget swaps in a different snapshot to resend", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-1", text: "TEXT-X" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(Object.assign(new Error("ack lost"), { disposition: "outcome_unknown" }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    expect(sendMessageMock.mock.calls[0][0]).toBe("TEXT-X")
+    const firstId = sendMessageMock.mock.calls[0][1]?.clientMessageId
+
+    // A different candidate for the same task is staged and acknowledged on
+    // this tab while the send-failed panel for the first one is still up,
+    // then a terminal frame retargets the dialog: the newer stash outranks
+    // the snapshot this instance had been holding (openForTask's
+    // staged/stashed/kept chain).
+    await stageThenRecord({ taskId: 1, clientMessageId: "orig-2", text: "TEXT-Y" })
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
+
+    sendMessageMock.mockClear()
+    sendMessageMock.mockResolvedValueOnce(undefined)
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
+    // The retargeted snapshot's own text is what goes out...
+    expect(sendMessageMock.mock.calls[0][0]).toBe("TEXT-Y")
+    // ...under a fresh id: the one carried over was minted for the snapshot
+    // that used to be "orig-1", not this one.
+    expect(sendMessageMock.mock.calls[0][1]?.clientMessageId).not.toBe(firstId)
+  })
+
+  it("reuses the same id when a same-task retarget leaves the snapshot unchanged", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-1", text: "TEXT-X" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(Object.assign(new Error("ack lost"), { disposition: "outcome_unknown" }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    const firstId = sendMessageMock.mock.calls[0][1]?.clientMessageId
+
+    // A terminal frame retargets the dialog with no new candidate staged for
+    // this task: openForTask keeps the same snapshot this instance already
+    // holds (the "kept" branch of its staged/stashed/kept chain).
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
+
+    sendMessageMock.mockClear()
+    sendMessageMock.mockResolvedValueOnce(undefined)
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
+    expect(sendMessageMock.mock.calls[0][0]).toBe("TEXT-X")
+    expect(sendMessageMock.mock.calls[0][1]?.clientMessageId).toBe(firstId)
+  })
+})
+
 describe("ignores a resend result superseded by a new request", () => {
   it("ignores a resend result superseded by a new request", async () => {
     // Get into "value already saved but message not sent": save-and-resend

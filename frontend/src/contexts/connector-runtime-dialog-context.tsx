@@ -31,9 +31,10 @@ import { useAuth } from "@/contexts/auth-context"
 
 export interface ConnectorRuntimeResendPayload {
   taskId: number
-  // Written on every recordDelivery call but not read anywhere today -- a
-  // resend always mints its own fresh id instead. Reserved for per-turn
-  // attribution on a terminal frame, see xorbitsai/xagent#2465.
+  // Written on every recordDelivery call. connector-runtime-dialog.tsx's
+  // doResend reads this to bind the id it carries between resend attempts to
+  // the snapshot that id was minted for, so a same-task retarget that swaps
+  // in a different snapshot cannot carry an old id over onto different text.
   clientMessageId: string
   text: string
   files: File[]
