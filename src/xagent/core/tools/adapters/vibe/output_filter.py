@@ -12,6 +12,10 @@ Rather than calculating total output size (which would be expensive), these
 limits work together to provide reasonable protection while maintaining good
 performance. For token safety, the combination of these limits is sufficient
 for most real-world scenarios.
+
+These three limits describe this filter alone. In front of it sits another
+layer that can store an oversized value in a workspace file instead of
+truncating it; see tool_result_spill.py.
 """
 
 import logging
