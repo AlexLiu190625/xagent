@@ -11,9 +11,12 @@ walk/write path that decides what gets spilled and writes it to disk
 from __future__ import annotations
 
 import builtins
+import copy
+import hashlib
 import json
 import os
 import re
+import threading
 from collections import ChainMap
 from collections.abc import Mapping
 from decimal import Decimal
@@ -1274,15 +1277,12 @@ def test_spill_concurrent_writers_of_the_same_content_all_succeed(tmp_path):
     """Three threads spilling identical content must not lose a record to a
     shared tmp filename collision: each gets its own record, and the
     content-addressed target ends up written exactly once."""
-    import threading
 
     target = _target(tmp_path)
     result_template = {"content": [{"type": "text", "text": _big()}]}
     results: list[list[dict]] = [[] for _ in range(3)]
 
     def _spill(index: int) -> None:
-        import copy
-
         _, records = spill_oversized_values(
             copy.deepcopy(result_template),
             target,
@@ -1369,10 +1369,7 @@ def test_spill_existing_target_with_wrong_bytes_is_replaced(tmp_path):
     assert written_file.read_bytes() != b"TAMPERED"
     assert json.loads(written_file.read_bytes()) == list(range(60))
     digest_in_name = written_file.name.split("-")[-1].split(".")[0]
-    assert (
-        __import__("hashlib").sha256(written_file.read_bytes()).hexdigest()[:32]
-        == digest_in_name
-    )
+    assert hashlib.sha256(written_file.read_bytes()).hexdigest()[:32] == digest_in_name
     assert list(Path(target.spill_dir).glob("*.tmp")) == []
 
 
@@ -1704,7 +1701,6 @@ def test_two_concurrent_calls_share_the_last_run_budget_slot(tmp_path, monkeypat
     reproduced by events rather than by a sleep, so the test neither races
     nor waits.
     """
-    import threading
 
     target = _target(tmp_path)
     budget = SpillRunBudget(files_written=SPILL_MAX_FILES_PER_RUN - 1)
@@ -1808,8 +1804,6 @@ def test_whole_root_spill_gives_a_declined_slot_back(tmp_path, monkeypatch):
 
 
 def test_reserve_and_release_run_inside_the_budget_lock():
-    import threading
-
     budget = SpillRunBudget()
     entered: list[str] = []
 
@@ -1959,28 +1953,15 @@ def test_spill_text_truncated_ends_at_last_newline(tmp_path, monkeypatch):
     assert decoded.count("\n") == records[0]["item_count"]
 
 
-def test_spill_text_without_a_newline_is_not_spilled(tmp_path, monkeypatch, caplog):
-    monkeypatch.setattr(spill_module, "SPILL_MAX_FILE_BYTES", 50)
-    text = "第" * 200  # multi-byte, no newlines anywhere
-    result = {"output": text}
-    target = _target(tmp_path, max_chars=10)
-    with caplog.at_level("WARNING"):
-        spilled, records = spill_oversized_values(
-            result, target, tool_name="acme", max_recursion=20
-        )
-    assert records == []
-    assert spilled == result
-    assert not Path(target.spill_dir).exists() or not list(
-        Path(target.spill_dir).glob("*")
-    )
-    assert any("first line alone exceeds" in message for message in caplog.messages)
-
-
-def test_spill_text_without_a_newline_ascii_is_not_spilled(
-    tmp_path, monkeypatch, caplog
+@pytest.mark.parametrize(
+    "text",
+    ["第" * 200, "a" * 200],  # no newlines anywhere, multi-byte and ASCII
+    ids=["multi-byte", "ascii"],
+)
+def test_spill_text_without_a_newline_is_not_spilled(
+    tmp_path, monkeypatch, caplog, text
 ):
     monkeypatch.setattr(spill_module, "SPILL_MAX_FILE_BYTES", 50)
-    text = "a" * 200  # ASCII, no newlines anywhere
     result = {"output": text}
     target = _target(tmp_path, max_chars=10)
     with caplog.at_level("WARNING"):
