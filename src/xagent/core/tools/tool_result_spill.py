@@ -100,8 +100,11 @@ SPILL_ENVELOPE_KEYS = (
     "_xagent_context_refs",
 )
 
-# 112 = 64 (tool name) + 1 (separator) + 32 (digest) + slack.
-_SPILL_FILENAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,112}\.(json|txt)$")
+# 112 = 64 (tool name) + 1 (separator) + 32 (digest) + slack. The tail is
+# \Z, not $: a bare $ also matches before a final newline, so the pattern
+# would have called "name.json\n" a legal name. That the selector is
+# stripped upstream is not the guarantee -- this pattern is.
+_SPILL_FILENAME_RE = re.compile(r"[A-Za-z0-9_-]{1,112}\.(json|txt)\Z")
 
 
 @dataclass(frozen=True)
@@ -249,7 +252,7 @@ def normalize_spilled_relative_path(raw: Any) -> str | None:
     directory, filename = segments
     if directory != SPILL_DIR_NAME:
         return None
-    if not _SPILL_FILENAME_RE.match(filename):
+    if not _SPILL_FILENAME_RE.fullmatch(filename):
         return None
     return f"{SPILL_DIR_NAME}/{filename}"
 
@@ -378,6 +381,22 @@ def _spill_item_count(kind: str, value: Any, content: str) -> int:
 
 
 def _spill_slice(kind: str, value: Any, content: str, first: int, last: int) -> str:
+    """Return items ``first`` through ``last`` of a stored result, 1-based.
+
+    The range is validated rather than trusted. Python slicing reads a 0 or
+    a negative index as a position counted from the end, so an unchecked
+    ``first=0`` returned an empty slice and an unchecked ``first=-2``
+    returned the last two items -- each of which reads as a real answer
+    about the stored result rather than as the rejected request it is. The
+    read tool turns a bad range into a classified failure of its own
+    (SPILL_READ_UNAVAILABLE_MESSAGES["invalid_range"]) before calling this,
+    so reaching here with one is a caller bug.
+    """
+    if first < 1 or last < first:
+        raise ValueError(
+            f"start and end are 1-based item numbers with start <= end; "
+            f"got start={first}, end={last}"
+        )
     if kind == "array":
         return json.dumps(
             value[first - 1 : last], ensure_ascii=False, default=_spill_json_default
@@ -396,10 +415,23 @@ def spill_read_unavailable(
 ) -> dict[str, Any]:
     """Build a classified-failure result for one read_tool_result rejection.
 
-    Returned, not raised: the caller records this dict as the tool
-    observation the model reads, so an exception here would hand the model
-    a framework traceback instead of an explanation it can act on.
+    The rejection is returned, not raised: the caller records this dict as
+    the tool observation the model reads, so an exception there would hand
+    the model a framework traceback instead of an explanation it can act
+    on. That promise covers the model's request, which is what this
+    function describes.
+
+    ``reason`` itself is not part of that request. It is chosen by this
+    engine from the table above, never by a tool and never by the model, so
+    a reason the table does not define is a bug in the caller and is
+    reported as one -- with a message naming the reason and the reasons
+    that do exist, rather than as a bare KeyError from a dict lookup.
     """
+    if reason not in SPILL_READ_UNAVAILABLE_MESSAGES:
+        raise ValueError(
+            f"Unknown read_tool_result rejection reason {reason!r}; "
+            f"expected one of {sorted(SPILL_READ_UNAVAILABLE_MESSAGES)}"
+        )
     if reason == "invalid_range" and item_count is not None:
         message = f"start exceeds the item count ({item_count})."
     else:
@@ -1319,7 +1351,23 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
     (entries and characters), so a future caller with its own limits and
     prefix can reuse this shape. Deduplicates by relative_path, since the
     same file can appear in more than one caller-supplied record list.
+
+    The rendered notice never exceeds the style's character budget --
+    including the trailing omitted-count line, which is as much part of
+    the notice as any entry.
+
+    ``style`` is engine-chosen and an unknown one is rejected: falling back
+    to the observation style would give a compaction summary the wrong
+    header and both of the wrong limits, silently. A record that is not a
+    dict is a different case and is dropped with a warning instead, since
+    a record list can be replayed from a checkpoint an older build wrote
+    and this renderer's own callers have a result to return.
     """
+    if style not in ("observation", "compaction"):
+        raise ValueError(
+            f"Unknown spill notice style {style!r}; "
+            "expected 'observation' or 'compaction'"
+        )
     if not records:
         return ""
     if style == "compaction":
@@ -1335,11 +1383,21 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
     seen_paths: set[Any] = set()
     deduped: list[dict[str, Any]] = []
     for record in records:
+        if not isinstance(record, dict):
+            logger.warning(
+                "Ignoring a spilled-result record that is not a dict: %r",
+                type(record),
+            )
+            continue
         path = record.get("relative_path")
         if path in seen_paths:
             continue
         seen_paths.add(path)
         deduped.append(record)
+    if not deduped:
+        # A header announcing stored files with no entry under it would
+        # tell the model files exist without naming one it can read.
+        return ""
 
     lines = [header]
     total_chars = len(header)
@@ -1356,5 +1414,16 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
         lines.append(line)
         total_chars = candidate_total
     if omitted:
-        lines.append(f"- ... {omitted} more stored file(s) omitted")
+        # The omitted-count line has to fit inside the same budget the
+        # entries were measured against, so rendered entries are given back
+        # from the tail until it does. Each one given back raises the count,
+        # which can lengthen the line again, so the length is recomputed
+        # every time round. The header is never given back: a notice with no
+        # header does not say what it is listing.
+        omitted_line = f"- ... {omitted} more stored file(s) omitted"
+        while len(lines) > 1 and total_chars + 1 + len(omitted_line) > max_chars:
+            total_chars -= 1 + len(lines.pop())
+            omitted += 1
+            omitted_line = f"- ... {omitted} more stored file(s) omitted"
+        lines.append(omitted_line)
     return "\n".join(lines)

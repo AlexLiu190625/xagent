@@ -31,6 +31,7 @@ from xagent.core.tools.tool_result_spill import (
     SPILL_MAX_FILES_PER_RESULT,
     SPILL_MAX_FILES_PER_RUN,
     SPILL_PLACEHOLDER_TEXT,
+    SPILL_READ_UNAVAILABLE_MESSAGES,
     SPILL_RESERVED_RESULT_KEY,
     SpillRunBudget,
     SpillTarget,
@@ -44,6 +45,7 @@ from xagent.core.tools.tool_result_spill import (
     render_spill_notice,
     resolve_spilled_under,
     spill_oversized_values,
+    spill_read_unavailable,
     strip_reserved_spill_key,
 )
 
@@ -87,6 +89,10 @@ NORMALIZE_CASES = [
     (f"tool-results/{LONG_112}.json", f"tool-results/{LONG_112}.json"),
     (f"tool-results/{LONG_113}.json", None),
     ("tool-results/x\x00.json", None),
+    # A trailing newline is stripped with the rest of the surrounding
+    # whitespace before the name is matched; the pattern refuses one on its
+    # own account too (test_spill_filename_pattern_refuses_a_trailing_newline).
+    ("tool-results/x.json\n", "tool-results/x.json"),
     ("", None),
     ("   ", None),
     (None, None),
@@ -108,6 +114,23 @@ def test_normalize_spilled_relative_path_grid(raw, expected, tmp_path, monkeypat
 
     assert normalize_spilled_relative_path(raw) == expected
     assert sorted(os.listdir(tmp_path)) == before
+
+
+@pytest.mark.parametrize(
+    "name", ["x.json\n", "x.txt\n", "x.json\nevil.json"], ids=["json", "txt", "forged"]
+)
+def test_spill_filename_pattern_refuses_a_trailing_newline(name):
+    """The pattern refuses a trailing newline whichever way it is applied.
+
+    A bare ``$`` matches before a final newline, so with ``.match()`` the
+    pattern used to accept ``x.json\\n``. Nothing reaches it with one today
+    -- normalize_spilled_relative_path strips its input first -- but which
+    names are legal is the pattern's statement to make, not a side effect
+    of an upstream strip that a later caller could drop.
+    """
+    assert spill_module._SPILL_FILENAME_RE.fullmatch(name) is None
+    assert spill_module._SPILL_FILENAME_RE.match(name) is None
+    assert spill_module._SPILL_FILENAME_RE.fullmatch(name.split("\n")[0]) is not None
 
 
 @pytest.fixture
@@ -312,6 +335,46 @@ def test_spill_slice_text_joins_lines_with_newlines():
     content = "a\nb\nc\n"
     out = _spill_slice("text", None, content, 2, 3)
     assert out == "b\nc\n"
+
+
+@pytest.mark.parametrize(
+    "first, last",
+    [(0, 3), (-1, 3), (-2, -1), (3, 2)],
+    ids=["zero-start", "negative-start", "both-negative", "start-past-end"],
+)
+@pytest.mark.parametrize("kind", ["array", "object", "text"])
+def test_spill_slice_rejects_a_range_outside_its_contract(kind, first, last):
+    """start and end are 1-based item numbers, so a 0 or a negative is a
+    caller bug, not a request for a short answer. Unchecked, ``first=0``
+    quietly returned an empty slice and a negative ``first`` returned a
+    wraparound slice -- both of which read as a real answer about the
+    stored result."""
+    value = {"array": [1, 2, 3], "object": {"a": 1, "b": 2}, "text": None}[kind]
+    with pytest.raises(ValueError):
+        _spill_slice(kind, value, "a\nb\nc\n", first, last)
+
+
+@pytest.mark.parametrize("reason", sorted(SPILL_READ_UNAVAILABLE_MESSAGES))
+def test_spill_read_unavailable_is_a_classified_failure(reason):
+    result = spill_read_unavailable(reason)
+    assert result["success"] is False
+    assert result["is_error"] is True
+    assert result["status"] == "error"
+    assert result["output"] == SPILL_READ_UNAVAILABLE_MESSAGES[reason]
+
+
+def test_spill_read_unavailable_names_the_item_count_for_a_range():
+    result = spill_read_unavailable("invalid_range", item_count=7)
+    assert "7" in result["output"]
+    assert result["is_error"] is True
+
+
+def test_spill_read_unavailable_rejects_an_undefined_reason():
+    # The reason is chosen by this engine, never by a tool or the model, so
+    # one the module does not define is a caller bug and says so, rather
+    # than surfacing a bare KeyError from the message table.
+    with pytest.raises(ValueError):
+        spill_read_unavailable("typo")
 
 
 # --- stage 1-c: walk, second tier, envelope, report construction ----------
@@ -2220,6 +2283,57 @@ TEXT_RECORD = {
 def test_render_spill_notice_empty_records_is_empty_string():
     assert render_spill_notice((), style="observation") == ""
     assert render_spill_notice((), style="compaction") == ""
+
+
+def test_render_spill_notice_rejects_an_unknown_style():
+    # The style is chosen by this engine, never by a tool or the model, so
+    # a name the renderer has no prefix and no limits for is a caller bug.
+    # Falling back to the observation style silently would hand a
+    # compaction summary the wrong header and the wrong two caps.
+    with pytest.raises(ValueError):
+        render_spill_notice((ARRAY_RECORD,), style="typo")
+
+
+def test_render_spill_notice_skips_a_record_that_is_not_a_dict(caplog):
+    # A record list can be replayed from a checkpoint written by an older
+    # build, so the renderer describes what it can and drops what it
+    # cannot, rather than raising AttributeError at a caller whose own
+    # contract is to return a result.
+    with caplog.at_level("WARNING"):
+        notice = render_spill_notice(["not a dict", ARRAY_RECORD], style="observation")
+    assert "tool-results/acme-812345678901.json" in notice
+    assert len(notice.splitlines()) == 2
+    assert any("not a dict" in message for message in caplog.messages)
+
+
+def test_render_spill_notice_with_no_usable_record_is_empty():
+    # A header that announces stored files, followed by no entry at all,
+    # would tell the model files exist without naming one.
+    assert render_spill_notice(["not a dict", None], style="observation") == ""
+
+
+def test_render_spill_notice_stays_inside_its_own_character_budget():
+    """The omitted-count line is part of the notice, so it fits too.
+
+    It used to be appended after the loop that enforces the character cap,
+    so a notice whose entries filled the budget came out over it -- by the
+    length of that whole line, not by a rounding error.
+    """
+    records = tuple(
+        {
+            **ARRAY_RECORD,
+            "relative_path": f"tool-results/r{i:02d}-000000000000.json",
+            "value_path": "ppp",
+        }
+        for i in range(12)
+    )
+    notice = render_spill_notice(records, style="observation")
+    body_lines = notice.splitlines()[1:]
+    rendered = len(body_lines) - 1
+
+    assert len(notice) <= spill_module.SPILL_OBSERVATION_NOTICE_MAX_CHARS
+    assert rendered >= 1
+    assert body_lines[-1] == f"- ... {12 - rendered} more stored file(s) omitted"
 
 
 def test_render_spill_notice_mentions_read_tool_result_not_read_file():
