@@ -12,10 +12,14 @@ them was once broken in a way no test could see:
 
 * every spill point is stored, whatever its type. A value that is neither
   a container nor a string -- a big int, a Decimal, an object with a long
-  ``__str__`` -- is one opaque item, and nothing in the walk raises.
-* whole-root spill keeps every key of the result. Only values longer than
-  the placeholder that would stand in for them are replaced, and envelope
-  fields are never replaced at all.
+  ``__str__`` -- is one opaque item, and stops raising TypeError or
+  AttributeError out of the record builder. A value whose own ``__str__``
+  raises still propagates that exception, here as before: the walk catches
+  only the three the output filter is meant to take over.
+* whole-root spill keeps every key of the result. A value is replaced only
+  when it costs more than the placeholder will cost in its place, counted
+  in the characters the serialized result holds, and envelope fields are
+  never replaced at all.
 * each notice cap is asserted against a number written out here rather
   than read from the module, so raising a cap in the module shows up as a
   failure instead of moving the expectation with it.
@@ -521,6 +525,50 @@ def test_whole_root_spill_keeps_unknown_keys_beside_content(tmp_path):
     assert all(spilled[f"k{index:03d}"] == "y" * 20 for index in range(60))
     path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
     assert json.loads(path.read_text(encoding="utf-8")) == result
+
+
+@pytest.mark.parametrize(
+    "value_chars, replaced",
+    [(58, False), (59, False), (60, True)],
+    ids=["one-under", "exactly-the-placeholder", "one-over"],
+)
+def test_whole_root_spill_never_grows_the_result(tmp_path, value_chars, replaced):
+    """The threshold is what the placeholder costs in the serialized result.
+
+    The placeholder is a string, so encoding it into the result adds two
+    quotes on top of its own length. Comparing a value against that bare
+    length let a 58-character value be swapped for a 59-character one: the
+    substitution that exists to shrink the result made it longer instead.
+    """
+    probe = ["x" * (value_chars - 4)]  # a list, so its measure is its JSON size
+    assert spill_module._serialized_length(probe) == value_chars
+    result = {"probe": probe}
+    for index in range(30):
+        result[f"pad{index:03d}"] = "y" * 10
+    target = _target(tmp_path, max_chars=200)
+    assert all(
+        spill_module._serialized_length(value) <= 200 for value in result.values()
+    )
+    before = spill_module._serialized_length(result)
+    assert before > 200
+
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+
+    assert len(records) == 1
+    assert records[0]["value_path"] == "(whole result)"
+    in_context = {
+        key: value for key, value in spilled.items() if key != SPILL_RESERVED_RESULT_KEY
+    }
+    after = spill_module._serialized_length(in_context)
+    assert after <= before
+    if replaced:
+        assert spilled["probe"] == SPILL_PLACEHOLDER_TEXT
+        assert after < before
+    else:
+        assert spilled["probe"] == probe
+        assert after == before
 
 
 def test_whole_root_spill_never_replaces_an_envelope_field(tmp_path):
