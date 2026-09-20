@@ -3225,7 +3225,7 @@ def test_execution_context_to_dict_is_unaffected_by_later_mutation() -> None:
     context.metadata["nested"]["inner"] = "after"
 
     assert snapshot["metadata"] == before
-# --- stage 1-f: registration gates, registry component, unavailable notice -
+# --- registration gates, registry component, unavailable notice ------------
 
 VALID_RECORD = {
     "relative_path": "tool-results/acme-012345678910.json",
@@ -3501,7 +3501,7 @@ def test_two_gate_three_failures_add_the_notice_only_once(tmp_path):
     assert tool.content.count(SPILL_UNAVAILABLE_NOTICE) == 1
 
 
-# --- stage 1-g: observation notice wiring + no-path-in-raw_result ----------
+# --- observation notice wiring + no-path-in-raw_result ---------------------
 
 
 def test_spill_notice_visible_alongside_output_key(tmp_path):
@@ -3649,9 +3649,9 @@ def test_spill_unavailable_notice_carries_no_path(tmp_path):
 
 
 def test_spill_replay_registers_when_the_file_is_still_there(tmp_path):
-    """I-42b, present-file half: replaying raw_result through a fresh
-    context (what runner.py does on task resume) must re-validate and
-    re-register the record, not just carry the bytes forward inertly."""
+    """Replaying raw_result through a fresh context (what runner.py does on
+    task resume) must re-validate and re-register the record, not just
+    carry the bytes forward inertly."""
     _spill_workspace(tmp_path)
     ctx = ExecutionContext()
     ctx.attach_workspace("ws-1", str(tmp_path))
@@ -3668,9 +3668,9 @@ def test_spill_replay_registers_when_the_file_is_still_there(tmp_path):
 
 
 def test_spill_replay_reports_unavailable_when_the_file_is_gone(tmp_path):
-    """I-42b, missing-file half: after the workspace that held the file is
-    gone (e.g. an external-credential task's per-turn rmtree), replaying the
-    same raw_result must fail gate 3 and say so without naming a path."""
+    """After the workspace that held the file is gone (e.g. an
+    external-credential task's per-turn rmtree), replaying the same
+    raw_result must fail gate 3 and say so without naming a path."""
     spill_dir = _spill_workspace(tmp_path)
     ctx = ExecutionContext()
     ctx.attach_workspace("ws-1", str(tmp_path))

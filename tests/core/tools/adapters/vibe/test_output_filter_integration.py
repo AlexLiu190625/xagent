@@ -167,7 +167,7 @@ async def test_hardcoded_truncation_message():
             break
 
 
-# --- stage 1-e: wrapper integration (strip / spill / bypass branches) -----
+# --- wrapper integration (strip / spill / bypass branches) ----------------
 
 
 def _wrapper(spill_target=None, max_chars=50, max_fields=1000, max_recursion=20):
@@ -332,7 +332,7 @@ def test_the_wrapper_module_keeps_no_private_failure_classifier():
     assert not hasattr(output_filter_wrapper, "_is_classified_tool_failure")
 
 
-# --- stage 2: the spill entry point runs off the event loop ----------------
+# --- the spill entry point runs off the event loop -------------------------
 
 
 def _thread_recording_stub(sink):
@@ -539,7 +539,7 @@ async def test_two_wrappers_accumulate_on_one_shared_budget_across_the_thread_ho
     assert budget.files_written == 2
 
 
-# --- stage 3: a failed spill degrades to plain filtering --------------------
+# --- a failed spill degrades to plain filtering -----------------------------
 
 
 class _SpillHostileValue:
@@ -662,7 +662,7 @@ def test_a_keyboard_interrupt_is_not_swallowed_by_the_spill_boundary(
     assert not any(r.levelname == "WARNING" for r in caplog.records)
 
 
-# --- stage 4: wiring the spill path in changes nothing yet ------------------
+# --- wiring the spill path in changes nothing yet ---------------------------
 
 
 @pytest.mark.asyncio

@@ -97,9 +97,9 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
             max_fields: Maximum number of fields/items in dict/list.
             max_recursion: Maximum recursion depth.
             spill_target: Where oversized values get written instead of
-                truncated. None disables spilling entirely (deployments with
-                no workspace-bound read_file tool), leaving this wrapper's
-                behavior identical to before spilling existed.
+                truncated. None disables spilling entirely -- when no spill
+                target was given, this wrapper's behavior is identical to
+                before spilling existed.
             spill_run_budget: Shared file-count budget across every wrapper
                 built in the same tool-set construction. None gives this
                 wrapper its own budget, which only matters when a single
@@ -277,8 +277,8 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
             # Nothing to offload. Without a target the spill step is a
             # dictionary-key strip, and the worker-thread hop would cost
             # more than the work it moves. This is the same None test
-            # _spill_oversized_values already makes, not a switch: a
-            # deployment that has a target always takes the hop.
+            # _spill_oversized_values already makes, not a switch: this
+            # path always hops when a spill target was given.
             return self._filter_result(result)
         spilled = await asyncio.to_thread(self._spill_only, result)
         return self._filter_after_spill(spilled)
@@ -344,9 +344,9 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
     def _spill_oversized_values(self, result: Any) -> Any:
         """Replace oversized values with a file-backed placeholder, if wired.
 
-        A None spill_target (no workspace-bound read_file tool in this tool
-        set) makes this a no-op, returning result unchanged -- the same
-        deployments this wrapper served before spilling existed.
+        When no spill target was given, this is a no-op, returning result
+        unchanged -- the same behavior this wrapper had before spilling
+        existed.
 
         Any failure of the spill step lands here and degrades to that same
         no-op, so a tool call that succeeds without this layer keeps

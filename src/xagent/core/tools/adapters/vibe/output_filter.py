@@ -14,8 +14,10 @@ performance. For token safety, the combination of these limits is sufficient
 for most real-world scenarios.
 
 These three limits describe this filter alone. In front of it sits another
-layer that can store an oversized value in a workspace file instead of
-truncating it; see tool_result_spill.py.
+layer, in output_filter_wrapper.py: when that wrapper is given a spill
+target, an oversized value is stored in a workspace file, via
+tool_result_spill.py, before it ever reaches this filter. Without a
+target, this filter is the only size control a result goes through.
 """
 
 import logging
