@@ -4,6 +4,7 @@ Output Filter Tool Wrapper
 Wraps any tool with output length filtering capabilities.
 """
 
+import asyncio
 import inspect
 import logging
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
@@ -154,7 +155,7 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute tool asynchronously with output filtering."""
         result = await self._target.run_json_async(args)
-        return self._filter_result(result)
+        return await self._filter_result_async(result)
 
     async def save_state_json(self) -> Mapping[str, Any]:
         """Save state (delegates to target tool)."""
@@ -231,7 +232,7 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
 
         async def wrapped_func_async(*args: Any, **kwargs: Any) -> Any:
             result = await original_func(*args, **kwargs)
-            return self._filter_result(result)
+            return await self._filter_result_async(result)
 
         return wrapped_func_async
 
@@ -248,6 +249,33 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         """
 
         return self._filter_after_spill(self._spill_only(result))
+
+    async def _filter_result_async(self, result: Any) -> Any:
+        """Filter one result without holding the event loop for the spill.
+
+        The whole spill entry point goes to a worker thread, not one inner
+        function of it: every CPU cost on this path -- each measuring pass,
+        the per-item prefix scan that enforces the file cap, and the writes
+        -- sits under that one call, so a boundary drawn anywhere inside it
+        leaves part of the cost on the loop. What stays here is dict work
+        and the pre-existing output filter, which this change does not move.
+
+        The run budget crosses the boundary by reference: to_thread receives
+        the bound method, so self._spill_run_budget is the same object in
+        the worker. It has to be -- it holds a lock and cannot be copied --
+        and its reserve() is what makes two workers landing on one budget
+        safe.
+        """
+
+        if self._spill_target is None:
+            # Nothing to offload. Without a target the spill step is a
+            # dictionary-key strip, and the worker-thread hop would cost
+            # more than the work it moves. This is the same None test
+            # _spill_oversized_values already makes, not a switch: a
+            # deployment that has a target always takes the hop.
+            return self._filter_result(result)
+        spilled = await asyncio.to_thread(self._spill_only, result)
+        return self._filter_after_spill(spilled)
 
     def _spill_only(self, result: Any) -> Any:
         """Strip a forged report key, then spill oversized values.

@@ -2,6 +2,7 @@
 Integration tests for output filter with tool factory.
 """
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,7 @@ from xagent.core.tools.adapters.vibe.output_filter_wrapper import (
 from xagent.core.tools.tool_result_spill import (
     SPILL_PLACEHOLDER_TEXT,
     SPILL_RESERVED_RESULT_KEY,
+    SpillRunBudget,
     SpillTarget,
 )
 from xagent.core.tools.user_interaction import WAITING_FOR_USER_STATUS
@@ -292,3 +294,210 @@ def test_the_wrapper_uses_the_spill_module_s_only_failure_classifier():
 
 def test_the_wrapper_module_keeps_no_private_failure_classifier():
     assert not hasattr(output_filter_wrapper, "_is_classified_tool_failure")
+
+
+# --- stage 2: the spill entry point runs off the event loop ----------------
+
+
+def _thread_recording_stub(sink):
+    """Stand in for spill_oversized_values, recording only which thread
+    called it and the run_budget it was handed -- not doing any real spill
+    work, so thread identity is the one thing these tests measure."""
+
+    def _record(result, target, *, tool_name, max_recursion, run_budget):
+        sink["thread"] = threading.get_ident()
+        sink["run_budget"] = run_budget
+        return result, []
+
+    return _record
+
+
+@pytest.mark.asyncio
+async def test_run_json_async_offloads_the_spill_entry_point_to_a_worker_thread(
+    monkeypatch, tmp_path
+):
+    sink = {}
+    monkeypatch.setattr(
+        output_filter_wrapper, "spill_oversized_values", _thread_recording_stub(sink)
+    )
+
+    async def run_json_async(args):
+        return {"output": "value"}
+
+    target = SimpleNamespace(name="acme", run_json_async=run_json_async)
+    wrapper = OutputFilteredToolWrapper(
+        target_tool=target,
+        max_chars=50,
+        max_fields=1000,
+        max_recursion=20,
+        spill_target=SpillTarget(
+            spill_dir=str(tmp_path / "output" / "tool-results"), max_chars=50
+        ),
+    )
+    caller_thread = threading.get_ident()
+    await wrapper.run_json_async({})
+    assert sink["thread"] != caller_thread
+
+
+@pytest.mark.asyncio
+async def test_async_func_wrapper_offloads_the_spill_entry_point_to_a_worker_thread(
+    monkeypatch, tmp_path
+):
+    sink = {}
+    monkeypatch.setattr(
+        output_filter_wrapper, "spill_oversized_values", _thread_recording_stub(sink)
+    )
+
+    async def original(*args, **kwargs):
+        return {"output": "value"}
+
+    target = SimpleNamespace(name="acme", func=original)
+    wrapper = OutputFilteredToolWrapper(
+        target_tool=target,
+        max_chars=50,
+        max_fields=1000,
+        max_recursion=20,
+        spill_target=SpillTarget(
+            spill_dir=str(tmp_path / "output" / "tool-results"), max_chars=50
+        ),
+    )
+    caller_thread = threading.get_ident()
+    await wrapper.func()
+    assert sink["thread"] != caller_thread
+
+
+def test_run_json_sync_keeps_the_spill_entry_point_on_the_calling_thread(
+    monkeypatch, tmp_path
+):
+    sink = {}
+    monkeypatch.setattr(
+        output_filter_wrapper, "spill_oversized_values", _thread_recording_stub(sink)
+    )
+
+    def run_json_sync(args):
+        return {"output": "value"}
+
+    target = SimpleNamespace(name="acme", run_json_sync=run_json_sync)
+    wrapper = OutputFilteredToolWrapper(
+        target_tool=target,
+        max_chars=50,
+        max_fields=1000,
+        max_recursion=20,
+        spill_target=SpillTarget(
+            spill_dir=str(tmp_path / "output" / "tool-results"), max_chars=50
+        ),
+    )
+    caller_thread = threading.get_ident()
+    wrapper.run_json_sync({})
+    assert sink["thread"] == caller_thread
+
+
+def test_sync_func_wrapper_keeps_the_spill_entry_point_on_the_calling_thread(
+    monkeypatch, tmp_path
+):
+    sink = {}
+    monkeypatch.setattr(
+        output_filter_wrapper, "spill_oversized_values", _thread_recording_stub(sink)
+    )
+
+    def original(*args, **kwargs):
+        return {"output": "value"}
+
+    target = SimpleNamespace(name="acme", func=original)
+    wrapper = OutputFilteredToolWrapper(
+        target_tool=target,
+        max_chars=50,
+        max_fields=1000,
+        max_recursion=20,
+        spill_target=SpillTarget(
+            spill_dir=str(tmp_path / "output" / "tool-results"), max_chars=50
+        ),
+    )
+    caller_thread = threading.get_ident()
+    wrapper.func()
+    assert sink["thread"] == caller_thread
+
+
+@pytest.mark.asyncio
+async def test_a_wrapper_without_a_target_does_not_hop_to_a_worker_thread(
+    monkeypatch,
+):
+    hop_calls = []
+    real_to_thread = output_filter_wrapper.asyncio.to_thread
+
+    async def _spy_to_thread(func, *args, **kwargs):
+        hop_calls.append(True)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(output_filter_wrapper.asyncio, "to_thread", _spy_to_thread)
+
+    async def run_json_async(args):
+        return {"output": "value"}
+
+    target = SimpleNamespace(name="acme", run_json_async=run_json_async)
+    wrapper = OutputFilteredToolWrapper(
+        target_tool=target,
+        max_chars=50,
+        max_fields=1000,
+        max_recursion=20,
+        spill_target=None,
+    )
+    await wrapper.run_json_async({})
+    assert hop_calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_run_budget_inside_the_worker_thread_is_the_same_object(
+    monkeypatch, tmp_path
+):
+    sink = {}
+    monkeypatch.setattr(
+        output_filter_wrapper, "spill_oversized_values", _thread_recording_stub(sink)
+    )
+
+    async def run_json_async(args):
+        return {"output": "value"}
+
+    target = SimpleNamespace(name="acme", run_json_async=run_json_async)
+    wrapper = OutputFilteredToolWrapper(
+        target_tool=target,
+        max_chars=50,
+        max_fields=1000,
+        max_recursion=20,
+        spill_target=SpillTarget(
+            spill_dir=str(tmp_path / "output" / "tool-results"), max_chars=50
+        ),
+    )
+    await wrapper.run_json_async({})
+    assert sink["run_budget"] is wrapper._spill_run_budget
+
+
+@pytest.mark.asyncio
+async def test_two_wrappers_accumulate_on_one_shared_budget_across_the_thread_hop(
+    tmp_path,
+):
+    spill_dir = tmp_path / "output" / "tool-results"
+    budget = SpillRunBudget()
+
+    async def run_json_async(args):
+        return {"content": [{"type": "text", "text": "x" * 100}]}
+
+    wrapper_one = OutputFilteredToolWrapper(
+        target_tool=SimpleNamespace(name="one", run_json_async=run_json_async),
+        max_chars=80,
+        max_fields=1000,
+        max_recursion=20,
+        spill_target=SpillTarget(spill_dir=str(spill_dir), max_chars=80),
+        spill_run_budget=budget,
+    )
+    wrapper_two = OutputFilteredToolWrapper(
+        target_tool=SimpleNamespace(name="two", run_json_async=run_json_async),
+        max_chars=80,
+        max_fields=1000,
+        max_recursion=20,
+        spill_target=SpillTarget(spill_dir=str(spill_dir), max_chars=80),
+        spill_run_budget=budget,
+    )
+    await wrapper_one.run_json_async({})
+    await wrapper_two.run_json_async({})
+    assert budget.files_written == 2
