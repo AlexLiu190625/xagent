@@ -566,11 +566,13 @@ export type ConnectorRuntimeDialogAction = "saveAndResend" | "saveOnly" | "ackno
  * disappear right after the handoff that is supposed to enable it.
  *
  * Every outcome maps to at least one button, `met` included. A met report
- * normally closes the dialog before it renders -- the first read does, and
- * so does a successful save -- but the refresh a failed save triggers can
- * install one into an already-open dialog, and returning no buttons there
- * left the footer empty with only the window chrome's close control to get
- * out of it.
+ * normally closes the dialog before it renders: the first read does, and so
+ * does a save, once any resend it promised has settled. Three paths still
+ * render one in an open dialog -- the refresh a failed save triggers, a
+ * same-task re-request's read that finds nothing missing, and a
+ * save-and-resend's own successful save while its resend is still in flight
+ * -- and returning no buttons there left the footer empty with only the
+ * window chrome's close control to get out of it.
  */
 export function resolveDialogActions(
   outcome: DialogOutcome,

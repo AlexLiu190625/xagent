@@ -4943,6 +4943,8 @@ Build when you need.`,
   connectorRuntime: {
     title: "This connector needs more information",
     description: "The last message could not run because a connector it uses is missing some required input.",
+    metTitle: "This connector has everything it needs",
+    metNotResent: "Nothing is missing for this connector any more. The message that failed was not sent again; send it once more from the message box when you want it to run.",
     contextNote: "Saved in this conversation and cannot be changed.",
     filled: "Already filled",
     unsupportedNote: "This kind of input cannot be filled in from web chat yet.",

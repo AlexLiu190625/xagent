@@ -1152,6 +1152,127 @@ describe("does not close a dialog the user is already looking at", () => {
   })
 })
 
+describe("stops asking for input once a satisfied report reaches an already-visible dialog", () => {
+  it("replaces the missing-input header once the report says nothing is missing", async () => {
+    // The request still carries the snapshot of the failed message (it was
+    // opened via recordThenOpen), and a same-task retarget reads a report
+    // that is now satisfied. The header must stop claiming input is
+    // missing and say instead that the failed message was not resent.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-1", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+
+    fetchMock.mockResolvedValueOnce(ok(report(true, [])))
+    await openForTask() // same-task retarget: reads a satisfied report
+
+    await waitFor(() => expect(screen.getByText("connectorRuntime.metNotResent")).toBeInTheDocument())
+    expect(screen.getByText("connectorRuntime.metTitle")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.description")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.saveAndResend")).not.toBeInTheDocument()
+  })
+
+  it("keeps the original header when the same report carries no snapshot", async () => {
+    // Opened with openForTask, not recordThenOpen: this request never held a
+    // resend snapshot, so a satisfied report must not claim one was not
+    // resent -- there was never anything here to resend.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+
+    fetchMock.mockResolvedValueOnce(ok(report(true, [])))
+    await openForTask() // same-task retarget: reads a satisfied report
+
+    await waitFor(() => expect(screen.getByText("connectorRuntime.description")).toBeInTheDocument())
+    expect(screen.queryByText("connectorRuntime.metNotResent")).not.toBeInTheDocument()
+  })
+
+  it("keeps the original header while the send-failed panel is up", async () => {
+    // The save-and-resend's own resend already failed and the send-failed
+    // panel is showing. The met-holding header must not appear alongside
+    // it: that panel already carries the "message not sent" fact and its
+    // own retry button, and the header is not what the retry button lives
+    // under.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-2", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(new Error("closed"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    expect(screen.queryByText("connectorRuntime.metNotResent")).not.toBeInTheDocument()
+  })
+
+  it("keeps the original header while the dialog's own resend is still in flight", async () => {
+    // The save half of save-and-resend landed on a now-satisfied report,
+    // but the resend it triggers has not settled yet. Saying the message
+    // "was not resent" here would be false -- it is on the wire right
+    // now -- and would read as an instruction to send it again from the
+    // message box, which would fire the same turn a second time.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-3", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    let resolveSend: () => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((res) => { resolveSend = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
+    expect(screen.queryByText("connectorRuntime.metNotResent")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.metTitle")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.description")).toBeInTheDocument()
+
+    await act(async () => { resolveSend() })
+  })
+
+  it("replaces the header when a rejected save's re-read comes back satisfied", async () => {
+    // The save itself was rejected by a 409 conflict, which triggers a
+    // re-read rather than a resend, and that re-read comes back fully
+    // satisfied. This is the other path (besides another terminal frame
+    // retargeting the dialog) that can install a met report into a
+    // request that still carries a resend snapshot, and no resend was
+    // attempted this time at all.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-4", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 409, code: "runtime_context_immutable",
+      reason: "conflict.context.token", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(ok(report(true, [])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+
+    await waitFor(() => expect(screen.getByText("connectorRuntime.metNotResent")).toBeInTheDocument())
+    expect(screen.getByText("connectorRuntime.metTitle")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.saveOnly")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.saveAndResend")).not.toBeInTheDocument()
+    expect(sendMessageMock).not.toHaveBeenCalled()
+  })
+})
+
 describe("locates a field error by connector and key", () => {
   it("locates a field error by connector and key", async () => {
     const twoConnectors = report(false, [

@@ -405,12 +405,31 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const actions = outcome ? resolveDialogActions(outcome, hasResendPayload) : []
   // Whether this shape offers any way to submit. The row renderer asks this
   // instead of listing the outcome kinds that offer none, because that list
-  // was one kind short: a `met` report reaches the render only through the
-  // refresh a failed save triggers, and an unfilled *optional* context key
-  // inside one was still drawn as an editable field with no button able to
-  // send it. Derived from the action set, so the rows and the footer cannot
-  // disagree about whether saving is possible.
+  // was one kind short: a `met` report reaches the render whenever one is
+  // installed into a dialog that stays open -- the refresh a failed save
+  // triggers, a same-task re-request's read that finds nothing missing, and
+  // a save-and-resend's own successful save for as long as its resend is in
+  // flight -- and an unfilled *optional* context key inside one was still
+  // drawn as an editable field with no button able to send it. Derived from
+  // the action set, so the rows and the footer cannot disagree about whether
+  // saving is possible.
   const hasSaveEntryPoint = actions.includes("saveOnly")
+  // A met report that reached the render still carries the snapshot of the
+  // message that failed, and this shape offers no way to send it: the
+  // footer collapses to "Got it", and the save-and-resend button a
+  // fillable report offers cannot be reused here because a met report
+  // produces no submittable items, which leaves it permanently disabled
+  // (isSubmitEnabled in connector-runtime-api.ts). Nothing is missing any
+  // more, so the header must stop saying one is and must say instead what
+  // did not happen and what the user can still do. Not while the
+  // send-failed panel is up: that panel is about a send this dialog
+  // already attempted and carries its own retry button, so pointing the
+  // user back at the message box there would contradict the button
+  // directly under it. Nor while this dialog's own save-and-resend is
+  // still sending that same message: saying it was not resent would be
+  // false and would invite a second send while the first is still on the
+  // wire.
+  const metHoldingSnapshot = outcome?.kind === "met" && hasResendPayload && !sendFailed && !busy
 
   const handleDraftChange =(connector: ConnectorRuntimeConnector, input: ConnectorRuntimeInput, value: string) => {
     const draftKey = connectorRuntimeInputDraftKey(connector.connector_ref, input.section, input.key, input.type)
@@ -737,8 +756,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     <Dialog open={visible} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{t("connectorRuntime.title")}</DialogTitle>
-          <DialogDescription>{t("connectorRuntime.description")}</DialogDescription>
+          <DialogTitle>
+            {t(metHoldingSnapshot ? "connectorRuntime.metTitle" : "connectorRuntime.title")}
+          </DialogTitle>
+          <DialogDescription>
+            {t(metHoldingSnapshot ? "connectorRuntime.metNotResent" : "connectorRuntime.description")}
+          </DialogDescription>
         </DialogHeader>
 
         {outcome.kind === "unsupported_only" && (
