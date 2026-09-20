@@ -1,0 +1,129 @@
+"""The engine-owned tool-results directory is invisible to every listing."""
+
+import pytest
+
+from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
+from xagent.core.tools.tool_result_spill import SPILL_DIR_NAME
+from xagent.core.workspace import TaskWorkspace
+
+
+@pytest.fixture
+def workspace(tmp_path):
+    return TaskWorkspace("task_w", str(tmp_path))
+
+
+@pytest.fixture
+def spilled(workspace):
+    """One engine file in the spill directory and one ordinary output file."""
+    spill_dir = workspace.output_dir / SPILL_DIR_NAME
+    spill_dir.mkdir(parents=True)
+    engine_file = spill_dir / "acme-0123456789ab.json"
+    engine_file.write_text("[]", encoding="utf-8")
+    user_file = workspace.output_dir / "report.txt"
+    user_file.write_text("report", encoding="utf-8")
+    return engine_file, user_file
+
+
+def test_get_all_files_omits_the_engine_directory(workspace, spilled):
+    engine_file, user_file = spilled
+    paths = {entry["file_path"] for entry in workspace.get_all_files()["output"]}
+    assert str(user_file) in paths
+    assert str(engine_file) not in paths
+
+
+def test_get_output_files_omits_the_engine_directory(workspace, spilled):
+    engine_file, user_file = spilled
+    paths = {entry["file_path"] for entry in workspace.get_output_files()}
+    assert str(user_file) in paths
+    assert str(engine_file) not in paths
+
+
+def test_scan_all_files_omits_the_engine_directory(workspace, spilled):
+    engine_file, user_file = spilled
+    scanned = workspace._scan_all_files()
+    assert user_file in scanned
+    assert engine_file not in scanned
+
+
+# A bare top-level segment such as "output" does not resolve to that
+# directory itself: the resolver behind the named-directory branch only reads
+# a leading "output"/"input"/"temp" segment when the string contains a slash,
+# so a lone "output" is instead treated as a name to look up inside the
+# resolver's own default output directory, and raises FileNotFoundError
+# because no such nested directory exists. The spellings below are the ones
+# that reach the scan for real.
+ROOT_OUTPUT_DIRECTORY_SPELLINGS = [
+    pytest.param("absolute", id="absolute-output-dir"),
+]
+
+
+def _root_output_directory_path(workspace: TaskWorkspace, spelling: str) -> str:
+    if spelling == "absolute":
+        return str(workspace.output_dir)
+    raise AssertionError(f"unhandled spelling: {spelling}")
+
+
+@pytest.mark.parametrize("spelling", ROOT_OUTPUT_DIRECTORY_SPELLINGS)
+@pytest.mark.parametrize("show_hidden", [False, True])
+def test_named_directory_listing_of_output_root_omits_the_engine_directory(
+    workspace, spilled, spelling, show_hidden
+):
+    engine_file, user_file = spilled
+    ops = WorkspaceFileOperations(workspace)
+    directory_path = _root_output_directory_path(workspace, spelling)
+    listing = ops.list_files(directory_path, show_hidden=show_hidden, recursive=True)
+    paths = {entry["path"] for entry in listing["files"]}
+    assert str(user_file) in paths
+    assert str(engine_file) not in paths
+    # The directory entry itself is gone too, which is what stops the descent.
+    assert str(workspace.output_dir / SPILL_DIR_NAME) not in paths
+
+
+@pytest.mark.parametrize("show_hidden", [False, True])
+def test_named_directory_listing_of_the_engine_directory_itself_is_empty(
+    workspace, spilled, show_hidden
+):
+    """Addressing the engine directory by its own path returns nothing."""
+    engine_file, _ = spilled
+    ops = WorkspaceFileOperations(workspace)
+    listing = ops.list_files(
+        f"output/{SPILL_DIR_NAME}", show_hidden=show_hidden, recursive=True
+    )
+    assert listing["files"] == []
+    assert engine_file.exists()
+
+
+def test_spill_temp_files_are_hidden_too(workspace):
+    """The writer's .tmp name is not a dotfile; the directory rule is what hides it."""
+    spill_dir = workspace.output_dir / SPILL_DIR_NAME
+    spill_dir.mkdir(parents=True)
+    leftover = spill_dir / "acme-0123456789ab.json.4242.deadbeef.tmp"
+    leftover.write_text("partial", encoding="utf-8")
+    assert leftover not in workspace._scan_all_files()
+
+
+def test_ordinary_output_subdirectory_is_still_listed(workspace):
+    """The rule is a directory rule, not a name-prefix rule."""
+    near_miss = workspace.output_dir / f"{SPILL_DIR_NAME}-mine"
+    near_miss.mkdir(parents=True)
+    mine = near_miss / "x.json"
+    mine.write_text("{}", encoding="utf-8")
+    assert mine in workspace._scan_all_files()
+    assert str(mine) in {e["file_path"] for e in workspace.get_output_files()}
+
+
+def test_auto_registration_ignores_the_engine_directory(workspace, mocker):
+    """A file the engine drops in its own directory never becomes a file record."""
+    registered: list[str] = []
+    mocker.patch.object(
+        TaskWorkspace,
+        "register_file",
+        lambda self, path, db_session=None: registered.append(str(path)) or "fid",
+    )
+    spill_dir = workspace.output_dir / SPILL_DIR_NAME
+    spill_dir.mkdir(parents=True)
+    with workspace.auto_register_files():
+        (spill_dir / "acme-0123456789ab.json").write_text("[]", encoding="utf-8")
+        (workspace.output_dir / "report.txt").write_text("report", encoding="utf-8")
+
+    assert registered == [str(workspace.output_dir / "report.txt")]
