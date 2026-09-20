@@ -344,8 +344,9 @@ const GENERIC_DISPOSITION: ConnectorRuntimeFailureDisposition = {
  * future call site must not loosen that check to "looks like English" --
  * that would misclassify a corrupted-selection failure as a fixable key name.
  * `report` is the dialog's own most recently read report, consulted only to
- * pick between the two field-type dispositions (`typeString`/`typeObject`)
- * for a mismatch reason that does not itself carry the field's declared type.
+ * pick among the field-type dispositions (`typeString`/`typeObject`/
+ * `typeUnknown`) for a mismatch reason that does not itself carry the
+ * field's declared type.
  */
 export function classifySubmitFailure(
   outcome: SubmitTaskConnectorRuntimeValuesFailure,
