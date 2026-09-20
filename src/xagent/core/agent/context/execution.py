@@ -573,6 +573,12 @@ class ExecutionContext:
         the record for this message's own observation text, the same way an
         already-registered relative_path is returned without being
         duplicated.
+
+        The registry component is only obtained once a record has passed
+        every gate and is actually about to be appended: a reserved key
+        whose list is empty, or whose every record is rejected, must leave
+        the checkpoint exactly as it would read with no reserved key at
+        all, not add an empty registry component to it.
         """
         if not isinstance(result, dict):
             return (), 0
@@ -580,8 +586,10 @@ class ExecutionContext:
         if not isinstance(raw_records, list):
             return (), 0
 
-        registry = self._spill_component()
-        known_paths = {record.get("relative_path") for record in registry.records}
+        existing = self.components.get("spilled_results")
+        registry = existing if isinstance(existing, SpillRegistryComponent) else None
+        known_records = registry.records if registry is not None else []
+        known_paths = {record.get("relative_path") for record in known_records}
         accepted: list[dict[str, Any]] = []
         unavailable_count = 0
         spill_dir = self._spill_dir()
@@ -601,13 +609,16 @@ class ExecutionContext:
             accepted.append(record)
             if relative_path in known_paths:
                 continue
-            if len(registry.records) >= SPILL_REGISTRY_MAX_RECORDS:
+            if len(known_records) >= SPILL_REGISTRY_MAX_RECORDS:
                 logger.warning(
                     "Spill registry at capacity (%d); not registering %s",
                     SPILL_REGISTRY_MAX_RECORDS,
                     relative_path,
                 )
                 continue
+            if registry is None:
+                registry = self._spill_component()
+                known_records = registry.records
             registry.records.append(record)
             known_paths.add(relative_path)
 

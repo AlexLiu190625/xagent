@@ -3270,6 +3270,32 @@ def test_spill_registry_not_writable_from_request_context():
     assert ctx.spilled_results == ()
 
 
+def test_registering_a_result_with_no_accepted_records_creates_no_component(
+    tmp_path,
+):
+    """Whether the reported list is empty or every record in it fails a
+    gate, zero records ever reach the registry -- so the checkpoint must
+    come out the same as if the reserved key had never been present."""
+    _spill_workspace(tmp_path)
+    baseline_ctx = ExecutionContext()
+    baseline_ctx.attach_workspace("ws-1", str(tmp_path))
+    baseline_ctx.add_tool_result("acme", {"output": "ok"})
+    baseline_keys = set(baseline_ctx.to_dict()["components"].keys())
+
+    for payload in (
+        {"output": "ok", SPILL_RESERVED_RESULT_KEY: []},
+        {
+            "output": "ok",
+            SPILL_RESERVED_RESULT_KEY: [{**VALID_RECORD, "kind": "records"}],
+        },
+    ):
+        ctx = ExecutionContext()
+        ctx.attach_workspace("ws-1", str(tmp_path))
+        ctx.add_tool_result("acme", payload)
+        assert set(ctx.to_dict()["components"].keys()) == baseline_keys
+        assert "spilled_results" not in ctx.to_dict()["components"]
+
+
 def test_gate_one_rejects_malformed_shapes(tmp_path):
     _spill_workspace(tmp_path)
     ctx = ExecutionContext()
