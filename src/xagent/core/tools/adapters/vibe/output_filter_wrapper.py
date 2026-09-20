@@ -69,8 +69,14 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
     """
     Wrapper that applies output filtering to any tool.
 
-    This wrapper intercepts the return value from run_json_sync/async
-    and applies length limiting before returning to the caller.
+    This wrapper intercepts the return value from run_json_sync/async.
+    Every result has the engine's reserved spill report key stripped
+    first, regardless of configuration. When this wrapper is given a
+    spill target, it then stores any oversized value in that target
+    before applying length limiting, and on the asynchronous paths that
+    storing step runs in a worker thread. With no target, the reserved-key
+    strip is the only extra step and the observed behavior is the output
+    filter alone.
     """
 
     def __init__(
@@ -364,8 +370,10 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
             # the same filter that handled it before spilling existed. That
             # is a genuine degradation with a log line, not a bug folded
             # into "resource unavailable" -- the result the caller gets is
-            # byte-for-byte the one this wrapper produced before this layer
-            # was added.
+            # identical to the one this wrapper's own output filter would
+            # have produced for the same input with the reserved report key
+            # already removed (that strip runs before this method is ever
+            # called, so it is not part of what this boundary changes).
             #
             # It has to be broad because the failures are not ours. The
             # entry point measures values by serializing them, json.dumps
