@@ -1326,10 +1326,23 @@ def spill_record_shape_is_valid(record: Any) -> bool:
     Two callers share it: the engine's registration gate, and
     render_spill_notice, which must not interpolate an unvalidated
     relative_path, item_count or original_chars into text the model reads.
+
+    relative_path also has to be a single line: render_spill_notice writes
+    it into a notice line verbatim, with no JSON encoding around it, so a
+    line break inside it -- any boundary str.splitlines() recognizes, not
+    only "\\n" -- would end that line early and start a forged one of its
+    own. value_path and record_fields carry the same tool-supplied text,
+    but render_spill_notice always passes them through _json_data first,
+    which escapes a line break rather than emitting it, so this gate leaves
+    them to the type checks below and does not require them to be single
+    lines too.
     """
     if not isinstance(record, dict):
         return False
-    if not isinstance(record.get("relative_path"), str):
+    relative_path = record.get("relative_path")
+    if not isinstance(relative_path, str):
+        return False
+    if relative_path.splitlines() != [relative_path]:
         return False
     if record.get("kind") not in ("array", "object", "text"):
         return False
@@ -1411,16 +1424,18 @@ def _render_spill_record_line(record: dict[str, Any]) -> str:
     Renders from whatever the record claims -- a record reaching here has
     already passed the engine's four registration gates (or, for the
     observation notice's own tool result, was just built by this run's own
-    writer). relative_path is engine-generated and gate-checked before it
-    reaches here (the second gate's path-syntax regex already rejects a
-    newline in it), so only the location and field names below are tool
-    data: they are copied verbatim from the tool's own data and never
-    filtered through a character whitelist; instead they are quoted as JSON
-    string values (via _json_data), so an embedded newline, quote, or line
-    separator is escaped rather than able to break out of the line or forge
-    a second entry. The three length caps (field name, value_path, field
-    list) are re-applied here at render time rather than trusted from a
-    record that may have been replayed from an older checkpoint.
+    writer). relative_path cannot carry a line break by the time it reaches
+    here: render_spill_notice's own shape gate (spill_record_shape_is_valid)
+    already rejects a record whose relative_path is not a single line,
+    since this function writes that field into the notice unescaped. The
+    location and field names below are tool data too, copied verbatim from
+    the tool's own data and never filtered through a character whitelist;
+    instead they are quoted as JSON string values (via _json_data), so an
+    embedded newline, quote, or line separator is escaped rather than able
+    to break out of the line or forge a second entry. The three length caps
+    (field name, value_path, field list) are re-applied here at render time
+    rather than trusted from a record that may have been replayed from an
+    older checkpoint.
     """
     relative_path = str(record.get("relative_path", ""))[:SPILL_NOTICE_PATH_MAX_CHARS]
     value_path = _elide_value_path(str(record.get("value_path", "")))
@@ -1495,13 +1510,13 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
         if not spill_record_shape_is_valid(record):
             # The two checks stay apart on purpose. The one above answers
             # "is this a record at all"; this one answers "is every field
-            # the shape the writer produces". Without it, relative_path,
-            # item_count and original_chars reach _render_spill_record_line
-            # unvalidated, and a relative_path carrying an embedded newline
-            # forges an entry line of its own inside the notice -- a path
-            # the model would then try to read. A record can arrive here
-            # unvalidated in two real ways: a checkpoint written by an
-            # older build, and a caller that renders before registering.
+            # the shape the writer produces" -- including relative_path
+            # being a single line, since this renderer writes it into the
+            # notice unescaped and a line break inside it would forge an
+            # entry line of its own, one the model would then try to read.
+            # A record can arrive here unvalidated in two real ways: a
+            # checkpoint written by an older build, and a caller that
+            # renders before registering.
             logger.warning(
                 "Ignoring a spilled-result record whose field shape is not "
                 "the one the spill writer produces."
