@@ -22,6 +22,7 @@ from ...file_ref import (
     safe_asset_filename,
 )
 from ...workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
+from ..tool_result_spill import SPILL_DIR_NAME
 from .document_parser import DocumentCapabilities, DocumentParseArgs, parse_document
 from .file_tool import (
     EditOperation,
@@ -348,7 +349,7 @@ class WorkspaceFileOperations:
             self.workspace.id,
         )
 
-        resolved_path = self._resolve_path(file_path, "output")
+        resolved_path = self._resolve_write_path(file_path, "output")
         logger.debug("Resolved path: %s", resolved_path)
 
         if create_dirs:
@@ -417,6 +418,7 @@ class WorkspaceFileOperations:
             and not resolved_target_dir.is_relative_to(output_root)
         ):
             raise ValueError("assets_subdir must resolve inside output")
+        self._reject_engine_owned_target(resolved_target_dir, assets_subdir)
 
         target_dir.mkdir(parents=True, exist_ok=True)
         target_path = self._build_unique_asset_path(target_dir / asset_name)
@@ -447,7 +449,7 @@ class WorkspaceFileOperations:
         if path.parts and path.parts[0] in {"input", "temp"}:
             raise ValueError("html_path must be inside output")
 
-        resolved_path = self._resolve_path(str(path), "output")
+        resolved_path = self._resolve_write_path(str(path), "output")
         output_root = self.workspace.output_dir.resolve()
         resolved_path = resolved_path.resolve()
         if resolved_path != output_root and not resolved_path.is_relative_to(
@@ -485,7 +487,7 @@ class WorkspaceFileOperations:
         create_dirs: bool = True,
     ) -> bool:
         """Append content to file in workspace"""
-        resolved_path = self._resolve_path_with_search(file_path)
+        resolved_path = self._resolve_existing_write_path(file_path)
 
         if create_dirs:
             resolved_path.parent.mkdir(parents=True, exist_ok=True)
@@ -496,7 +498,7 @@ class WorkspaceFileOperations:
 
     def delete_file(self, file_path: str) -> bool:
         """Delete file in workspace"""
-        resolved_path = self._resolve_path_with_search(file_path)
+        resolved_path = self._resolve_existing_write_path(file_path)
 
         if not resolved_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
@@ -576,7 +578,7 @@ class WorkspaceFileOperations:
 
     def create_directory(self, directory_path: str, parents: bool = True) -> bool:
         """Create directory in workspace"""
-        resolved_path = self._resolve_path(directory_path)
+        resolved_path = self._resolve_write_path(directory_path)
         resolved_path.mkdir(parents=parents, exist_ok=True)
         return True
 
@@ -625,7 +627,7 @@ class WorkspaceFileOperations:
         """Write JSON file in workspace"""
         from .file_tool import write_json_file as basic_write_json_file
 
-        resolved_path = self._resolve_path(file_path, "output")
+        resolved_path = self._resolve_write_path(file_path, "output")
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
         with self.workspace.auto_register_files():
@@ -667,7 +669,7 @@ class WorkspaceFileOperations:
         """Write CSV file in workspace"""
         from .file_tool import write_csv_file as basic_write_csv_file
 
-        resolved_path = self._resolve_path(file_path, "output")
+        resolved_path = self._resolve_write_path(file_path, "output")
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
         with self.workspace.auto_register_files():
@@ -764,7 +766,7 @@ class WorkspaceFileOperations:
         from .file_tool import edit_file as basic_edit_file
 
         # Resolve the file path within the workspace
-        resolved_path = self._resolve_path_with_search(file_path)
+        resolved_path = self._resolve_existing_write_path(file_path)
         logger.debug("Resolved path: %s", resolved_path)
 
         # Convert to string path for the basic edit_file function
@@ -798,7 +800,7 @@ class WorkspaceFileOperations:
         from .file_tool import find_and_replace as basic_find_and_replace
 
         # Resolve the file path within the workspace
-        resolved_path = self._resolve_path_with_search(file_path)
+        resolved_path = self._resolve_existing_write_path(file_path)
         logger.debug("Resolved path: %s", resolved_path)
 
         # Convert to string path for the basic find_and_replace function
@@ -811,6 +813,51 @@ class WorkspaceFileOperations:
 
         logger.debug("find_and_replace result: %s", result)
         return result
+
+    def _reject_engine_owned_target(self, resolved_path: Path, requested: str) -> Path:
+        """Refuse one resolved write target that lands in the engine's subtree.
+
+        The single place this class decides that question. Every write, edit,
+        delete and directory creation reaches it through
+        :meth:`_resolve_write_path` or :meth:`_resolve_existing_write_path`;
+        reads never reach it at all.
+
+        Raises ValueError, the same class ``_resolve_path`` already raises for
+        a target outside the workspace, so the model sees this refusal in the
+        shape it already sees path refusals in -- a readable sentence naming
+        the path and the reason, not a generic framework error.
+        """
+
+        if self.workspace.is_engine_owned_path(resolved_path):
+            raise ValueError(
+                f"Path '{requested}' is inside the engine-owned "
+                f"'{SPILL_DIR_NAME}' directory. The engine stores oversized "
+                "tool results there and that directory is read-only for file "
+                "tools: you can read those files, but you cannot write, edit, "
+                "delete or create anything inside it. Write your own files "
+                "somewhere else under output/."
+            )
+        return resolved_path
+
+    def _resolve_write_path(self, file_path: str, default_dir: str = "output") -> Path:
+        """Resolve a write target that need not exist yet, then apply the policy."""
+
+        return self._reject_engine_owned_target(
+            self._resolve_path(file_path, default_dir), file_path
+        )
+
+    def _resolve_existing_write_path(self, file_path: str) -> Path:
+        """Resolve an existing file this call is about to modify, then apply the policy.
+
+        The not-found failure comes first, from the underlying resolver: a
+        write tool aimed at a name that does not exist gets the ordinary
+        FileNotFoundError, and only a name that really resolves into the
+        engine's subtree reaches the refusal.
+        """
+
+        return self._reject_engine_owned_target(
+            self._resolve_path_with_search(file_path), file_path
+        )
 
     def _resolve_path_with_search(self, file_path: str) -> Path:
         """Intelligently resolve file path in workspace (first in input directory, then in output directory)"""

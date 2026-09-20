@@ -861,12 +861,12 @@ def _spill_target_holds(target: Path, payload_bytes: bytes) -> bool:
     """Whether ``target`` right now holds exactly these bytes.
 
     A content-addressed name authenticates the bytes only at the moment this
-    module creates them. The spill directory lives inside the task workspace,
-    where the model's own write_file resolves a relative path under ``output``
-    and creates missing parents (core/workspace_file_tool.py), so nothing
-    reserves this directory: a matching name afterwards proves nothing about
-    the current content. Only the content proves the content, so the bytes
-    are read back and their complete SHA-256 is compared with the payload's.
+    module creates them. The workspace file tools refuse to write anywhere in
+    this directory (core/workspace_file_tool.py), but that refusal covers only
+    those tools: the sandbox executors write the filesystem directly, so a
+    matching name afterwards still proves nothing about the current content.
+    Only the content proves the content, so the bytes are read back and their
+    complete SHA-256 is compared with the payload's.
 
     Returns False -- "replace it" -- for anything that is not a regular file
     of exactly the right size, and for every filesystem error. The size check
