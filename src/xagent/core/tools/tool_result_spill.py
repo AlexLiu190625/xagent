@@ -420,17 +420,26 @@ def strip_reserved_spill_key(result: Any) -> Any:
     return {k: v for k, v in result.items() if k != SPILL_RESERVED_RESULT_KEY}
 
 
-def _plain_mapping(value: Any) -> Any:
-    """Materialize a non-dict Mapping to a dict; pass everything else through.
+def _normalize_spill_point(value: Any) -> Any:
+    """Canonicalize a value that is about to be measured or written.
 
-    A Mapping that is not a dict (MappingProxyType, ChainMap, UserDict) is
-    materialized to a dict once, at the point where a value becomes a spill
-    point, so size accounting, payload and prefix counting all see the same
-    object. Nested mappings that are not themselves spill points still go
-    through json.dumps(default=_spill_json_default) unchanged.
+    A non-dict Mapping becomes a dict and a set or frozenset becomes a list
+    sorted by str(), which is exactly what the payload builder writes for
+    them. Both rewrites have to happen here as well, not only in the payload
+    builder: _serialized_length measures whatever this returns, so a set
+    measured through json.dumps' default hook (a Python repr, "{'a', 'b'}")
+    would report a different length than the sorted JSON array the file
+    actually holds.
+
+    Only the value at the point itself is rewritten. A set nested inside a
+    container that is the spill point is still rendered by
+    _spill_json_default in both the measurement and the payload, so those
+    two agree without this.
     """
     if isinstance(value, Mapping) and not isinstance(value, dict):
         return dict(value)
+    if isinstance(value, (set, frozenset)):
+        return sorted(value, key=str)
     return value
 
 
@@ -465,7 +474,7 @@ def _serialized_length(value: Any) -> int | None:
     then never chosen as a spill point, and no later json.dumps in the
     write path can meet it.
     """
-    value = _plain_mapping(value)
+    value = _normalize_spill_point(value)
     if isinstance(value, str):
         return len(value)
     try:
@@ -479,10 +488,14 @@ def _spill_children(value: Any) -> list[tuple[Any, Any]] | None:
 
     A string is always a leaf here even when its content happens to parse as
     JSON: the walk operates on the Python object tree the tool returned,
-    before any parsing of string content. A set is also a leaf -- its
-    unordered elements have no stable path segment to report. A non-dict
-    Mapping is a leaf here as well: it is materialized to a dict only when
-    it becomes a spill point itself.
+    before any parsing of string content. A set or frozenset is also a leaf
+    -- its unordered elements have no stable path segment to report. A
+    non-dict Mapping is a leaf here as well: it is materialized to a dict
+    only when it becomes a spill point itself.
+
+    Everything else -- an int, a Decimal, an arbitrary object -- is a leaf
+    too, and a leaf that is oversized becomes the spill point for its own
+    path. _spill_payload_for_value stores such a value as one opaque item.
     """
     if isinstance(value, dict):
         return list(value.items())
@@ -636,13 +649,32 @@ def _render_field_list(names: list[Any]) -> str:
 
 
 def _spill_payload_for_value(value: Any) -> tuple[str, str, Any]:
-    """Return (payload written verbatim, kind, parsed value for metadata)."""
-    value = _plain_mapping(value)
+    """Return (payload written verbatim, kind, parsed value for metadata).
+
+    Four kinds of spill point, and every value the walk can pick falls into
+    exactly one of them:
+
+    * a str is written byte-for-byte, and its kind comes from parsing its
+      own content (_spill_kind_of);
+    * a list, a tuple, a set or a frozenset is a JSON array (sets are
+      sorted by str() first, which _normalize_spill_point has already done);
+    * a dict -- including any Mapping _normalize_spill_point materialized
+      into one -- is a JSON object;
+    * anything else is a single opaque item: a big int, a Decimal, or any
+      object json.dumps renders through _spill_json_default. Its kind is
+      "text" and its parsed value is None, so the item count comes out as 1
+      and the record carries no field list. That is the only shape that
+      works: such a value has no members to count and no keys to name, and
+      calling len() or .keys() on it -- which the object branch used to do
+      -- raised out of a module whose contract is that a value it cannot
+      spill degrades to ordinary truncation instead of failing the call.
+      The kind also matches what the read side derives from the file, since
+      a lone JSON scalar parses as neither an array nor an object.
+    """
+    value = _normalize_spill_point(value)
     if isinstance(value, str):
         kind, parsed = _spill_kind_of(value)
         return value, kind, parsed
-    if isinstance(value, set):
-        value = sorted(value, key=str)
     if isinstance(value, (list, tuple)):
         materialized = list(value)
         payload = json.dumps(
@@ -650,7 +682,9 @@ def _spill_payload_for_value(value: Any) -> tuple[str, str, Any]:
         )
         return payload, "array", materialized
     payload = json.dumps(value, ensure_ascii=False, default=_spill_json_default)
-    return payload, "object", value
+    if isinstance(value, dict):
+        return payload, "object", value
+    return payload, "text", None
 
 
 def _record_fields_for(kind: str, parsed: Any) -> list[str] | None:

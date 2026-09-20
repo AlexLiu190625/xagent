@@ -16,6 +16,7 @@ import os
 import re
 from collections import ChainMap
 from collections.abc import Mapping
+from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
 
@@ -607,6 +608,91 @@ def test_spill_file_is_written_verbatim_set(tmp_path):
     )
     path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
     assert set(json.loads(path.read_text(encoding="utf-8"))) == value
+
+
+def test_spill_file_is_written_verbatim_frozenset(tmp_path):
+    # frozenset is not a subclass of set, so it reaches the payload builder
+    # through a different isinstance check than the test above; both must
+    # produce the same sorted JSON array.
+    value = frozenset(f"item-{i}" for i in range(40))
+    result = {"tags": value}
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert records[0]["kind"] == "array"
+    assert records[0]["item_count"] == 40
+    path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written == sorted(value)
+
+
+@pytest.mark.parametrize("make_collection", [set, frozenset], ids=["set", "frozenset"])
+def test_set_size_accounting_matches_the_written_payload(tmp_path, make_collection):
+    # _serialized_length is what decides the value is oversized and what
+    # original_chars reports; the payload builder is what writes the file.
+    # A set reaches the first through the JSON default hook (a Python repr)
+    # and the second as a sorted JSON array, so only a shared normalization
+    # keeps the two from describing different sizes.
+    value = make_collection(f"item-{i}" for i in range(40))
+    result = {"tags": value}
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
+    assert records[0]["original_chars"] == len(path.read_text(encoding="utf-8"))
+
+
+class _HugeStrObject:
+    """A value that is neither a container nor a str but serializes long.
+
+    json.dumps has no rule for it, so _spill_json_default renders it with
+    str() -- the same last-resort branch the output filter uses -- and the
+    result is over any realistic max_chars.
+    """
+
+    def __str__(self) -> str:
+        return "H" * 3000
+
+
+SCALAR_SPILL_POINTS = [
+    ("big_int", 10**3000),
+    ("decimal", Decimal("1." + "2" * 3000)),
+    ("custom_object", _HugeStrObject()),
+]
+
+
+@pytest.mark.parametrize(
+    "case_id, value", SCALAR_SPILL_POINTS, ids=[c for c, _ in SCALAR_SPILL_POINTS]
+)
+def test_non_container_spill_point_is_stored_as_one_opaque_item(
+    tmp_path, case_id, value
+):
+    """A spill point that is neither a container nor a str is one item.
+
+    Before this rule the walk handed such a value to the object branch of
+    the payload builder and then called len()/.keys() on it, which raised
+    TypeError for an int or a Decimal and AttributeError for a frozenset --
+    breaking the module's promise that a value it cannot spill degrades to
+    ordinary truncation rather than failing the tool call.
+    """
+    result = {"value": value}
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert len(records) == 1
+    record = records[0]
+    assert record["kind"] == "text"
+    assert record["item_count"] == 1
+    assert record["record_fields"] is None
+    assert record["value_path"] == "value"
+    assert spilled["value"] == SPILL_PLACEHOLDER_TEXT
+    path = Path(target.spill_dir) / record["relative_path"].split("/")[-1]
+    content = path.read_text(encoding="utf-8")
+    assert content == json.dumps(value, ensure_ascii=False, default=_spill_json_default)
+    assert record["original_chars"] == len(content)
 
 
 def test_spill_file_is_written_verbatim_unicode_and_newlines(tmp_path):
