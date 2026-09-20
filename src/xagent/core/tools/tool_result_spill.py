@@ -1438,6 +1438,11 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
     dict is a different case and is dropped with a warning instead, since
     a record list can be replayed from a checkpoint an older build wrote
     and this renderer's own callers have a result to return.
+
+    A record whose field shape is not the writer's is dropped the same way
+    and for the same reason: this renderer interpolates a record's own
+    fields into text the model reads, so the shape has to be checked here
+    and not only at the engine's registration gate.
     """
     if style not in ("observation", "compaction"):
         raise ValueError(
@@ -1462,6 +1467,21 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
             logger.warning(
                 "Ignoring a spilled-result record that is not a dict: %r",
                 type(record),
+            )
+            continue
+        if not spill_record_shape_is_valid(record):
+            # The two checks stay apart on purpose. The one above answers
+            # "is this a record at all"; this one answers "is every field
+            # the shape the writer produces". Without it, relative_path,
+            # item_count and original_chars reach _render_spill_record_line
+            # unvalidated, and a relative_path carrying an embedded newline
+            # forges an entry line of its own inside the notice -- a path
+            # the model would then try to read. A record can arrive here
+            # unvalidated in two real ways: a checkpoint written by an
+            # older build, and a caller that renders before registering.
+            logger.warning(
+                "Ignoring a spilled-result record whose field shape is not "
+                "the one the spill writer produces."
             )
             continue
         path = record.get("relative_path")
