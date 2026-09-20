@@ -236,10 +236,31 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         return wrapped_func_async
 
     def _filter_result(self, result: Any) -> Any:
+        """Filter one result on this thread; only for callers off the loop.
+
+        The spill step under _spill_only is synchronous and CPU-bound -- the
+        module's entry point can run for seconds on a collection of tiny
+        items -- so a caller on an asyncio event loop must use
+        _filter_result_async instead of this method. The two synchronous
+        callers (run_json_sync and the closure _make_sync_wrapper returns)
+        are already off the loop, and wrapping them in a worker thread would
+        only add a hop.
+        """
+
+        return self._filter_after_spill(self._spill_only(result))
+
+    def _spill_only(self, result: Any) -> Any:
+        """Strip a forged report key, then spill oversized values.
+
+        The CPU-bound half of filtering, kept in one method so the async
+        path has exactly one thing to offload.
+        """
+
+        return self._spill_oversized_values(strip_reserved_spill_key(result))
+
+    def _filter_after_spill(self, spilled: Any) -> Any:
         """Filter output without dropping a control or classification envelope."""
 
-        result = strip_reserved_spill_key(result)
-        spilled = self._spill_oversized_values(result)
         filtered = self._filter.filter(spilled, self._target.name)
         if not isinstance(filtered, dict) or not isinstance(spilled, dict):
             return filtered
