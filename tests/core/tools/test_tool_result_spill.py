@@ -68,6 +68,7 @@ from xagent.core.tools.tool_result_spill import (
     normalize_spilled_relative_path,
     render_spill_notice,
     resolve_spilled_under,
+    spill_dir_for_workspace,
     spill_oversized_values,
     spill_read_unavailable,
     spill_record_shape_is_valid,
@@ -273,6 +274,23 @@ def test_resolve_spilled_under_unreadable_directory_returns_none(
         resolve_spilled_under(spill_layout, "tool-results/acme-012345678910.json")
         is None
     )
+
+
+def test_spill_dir_for_workspace_joins_output_and_the_spill_dir_name():
+    assert spill_dir_for_workspace("/w") == "/w/output/tool-results"
+    assert spill_dir_for_workspace(Path("/w")) == "/w/output/tool-results"
+
+
+def test_spill_dir_for_workspace_agrees_with_the_path_normalizer():
+    # The module holds this directory name in two places: this function's
+    # own join, and the "output/" prefix normalize_spilled_relative_path
+    # strips. Nothing forces the two to agree except a test that checks
+    # both at once.
+    assert (
+        normalize_spilled_relative_path("output/tool-results/x.json")
+        == "tool-results/x.json"
+    )
+    assert spill_dir_for_workspace("/w").endswith("output/tool-results")
 
 
 # --- stage 1-b: the four read-side helpers (pure functions) ---------------

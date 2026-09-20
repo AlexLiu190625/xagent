@@ -29,6 +29,10 @@ from .user_interaction import tool_result_waits_for_user
 logger = logging.getLogger(__name__)
 
 SPILL_DIR_NAME = "tool-results"
+# The workspace subdirectory the spill directory sits in. It is the same
+# name core/workspace.py gives TaskWorkspace.output_dir, and the same one
+# normalize_spilled_relative_path accepts as an optional prefix.
+SPILL_WORKSPACE_OUTPUT_DIR_NAME = "output"
 SPILL_RESERVED_RESULT_KEY = "_xagent_spilled_results"
 SPILL_PLACEHOLDER_TEXT = "[large result stored by the engine; see the notice below]"
 SPILL_UNAVAILABLE_NOTICE = (
@@ -324,6 +328,25 @@ def resolve_spilled_under(
         # instead of a generic framework error.
         return None
     return resolved
+
+
+def spill_dir_for_workspace(workspace_dir: str | Path) -> str:
+    """This workspace's spill directory, as the plain string SpillTarget holds.
+
+    The one place the layout is built. Three callers need the same
+    directory from three different starting points -- the tool factory
+    holds a workspace object, the execution context holds only a workspace
+    path string, and the read tool holds a workspace object again -- and
+    before this function each of them joined the parts itself, in two
+    different spellings. A directory that three callers spell separately
+    is a directory that moves in two of the three places.
+
+    Takes the workspace root rather than its output directory so the whole
+    relative layout lives here, and returns a str rather than a Path
+    because that is what SpillTarget and resolve_spilled_under take.
+    """
+
+    return str(Path(workspace_dir) / SPILL_WORKSPACE_OUTPUT_DIR_NAME / SPILL_DIR_NAME)
 
 
 def _spill_json_default(value: Any) -> str:
