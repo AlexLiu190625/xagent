@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
+from xagent.core.tools.tool_result_spill import SPILL_DIR_NAME
 from xagent.core.workspace import TaskWorkspace
 
 # Relative inputs that resolve outside the workspace and must be rejected.
@@ -430,3 +431,139 @@ def test_ops_resolve_path_ignores_allowed_external_dirs(tmp_path):
     ops = WorkspaceFileOperations(workspace)
     with pytest.raises(ValueError):
         ops._resolve_path(str(target), "output")
+
+
+# --------------------------------------------------------------------------
+# SITE 3 — the engine-owned output subtree is refused by every write path
+# --------------------------------------------------------------------------
+
+ENGINE_SPELLINGS = [
+    pytest.param(f"{SPILL_DIR_NAME}/x.json", id="no-output-prefix"),
+    pytest.param(f"output/{SPILL_DIR_NAME}/x.json", id="output-prefix"),
+    pytest.param(f"./output/{SPILL_DIR_NAME}/x.json", id="dot-slash"),
+    pytest.param(f"output/sub/../{SPILL_DIR_NAME}/x.json", id="dotdot"),
+    pytest.param(f"output/{SPILL_DIR_NAME}/sub/x.json", id="nested"),
+    pytest.param(f"output/{SPILL_DIR_NAME}", id="directory-itself"),
+]
+
+
+@pytest.fixture
+def mock_workspace_db(mocker):
+    """Mock database operations for workspace to avoid DB access in tests."""
+
+    def mock_create_record(self, file_id, file_path, db_session=None):
+        path_str = str(file_path)
+        resolved_str = str(file_path.resolve())
+        self._recently_registered_files[path_str] = file_id
+        self._recently_registered_files[resolved_str] = file_id
+        self._file_id_to_path[file_id] = file_path
+
+    mocker.patch(
+        "xagent.core.workspace.TaskWorkspace._create_file_record", mock_create_record
+    )
+    return mocker
+
+
+@pytest.fixture
+def engine_file(workspace):
+    spill_dir = workspace.output_dir / SPILL_DIR_NAME
+    spill_dir.mkdir(parents=True)
+    target = spill_dir / "x.json"
+    target.write_text('["engine"]', encoding="utf-8")
+    return target
+
+
+@pytest.mark.parametrize("spelling", ENGINE_SPELLINGS)
+def test_write_file_refuses_the_engine_subtree(ops, workspace, spelling):
+    with pytest.raises(ValueError, match=SPILL_DIR_NAME):
+        ops.write_file(spelling, "planted")
+    # Nothing was created, not even the directory.
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+@pytest.mark.parametrize("spelling", ENGINE_SPELLINGS)
+def test_create_directory_refuses_the_engine_subtree(ops, workspace, spelling):
+    with pytest.raises(ValueError, match=SPILL_DIR_NAME):
+        ops.create_directory(spelling)
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+def test_write_json_file_refuses_the_engine_subtree(ops, workspace):
+    with pytest.raises(ValueError, match=SPILL_DIR_NAME):
+        ops.write_json_file(f"output/{SPILL_DIR_NAME}/x.json", {"planted": True})
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+def test_write_csv_file_refuses_the_engine_subtree(ops, workspace):
+    with pytest.raises(ValueError, match=SPILL_DIR_NAME):
+        ops.write_csv_file(f"output/{SPILL_DIR_NAME}/x.csv", [{"a": "1"}])
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+def test_delete_file_refuses_an_existing_engine_file(ops, engine_file):
+    with pytest.raises(ValueError, match=SPILL_DIR_NAME):
+        ops.delete_file(f"output/{SPILL_DIR_NAME}/x.json")
+    assert engine_file.exists()
+
+
+def test_append_file_refuses_an_existing_engine_file(ops, engine_file):
+    with pytest.raises(ValueError, match=SPILL_DIR_NAME):
+        ops.append_file(f"{SPILL_DIR_NAME}/x.json", "planted")
+    assert engine_file.read_text(encoding="utf-8") == '["engine"]'
+
+
+def test_edit_file_refuses_an_existing_engine_file(ops, engine_file):
+    with pytest.raises(ValueError, match=SPILL_DIR_NAME):
+        ops.edit_file(
+            f"{SPILL_DIR_NAME}/x.json",
+            [{"operation_type": "replace", "line_number": 1, "content": "planted"}],
+        )
+    assert engine_file.read_text(encoding="utf-8") == '["engine"]'
+
+
+def test_find_and_replace_refuses_an_existing_engine_file(ops, engine_file):
+    with pytest.raises(ValueError, match=SPILL_DIR_NAME):
+        ops.find_and_replace(f"{SPILL_DIR_NAME}/x.json", "engine", "planted")
+    assert engine_file.read_text(encoding="utf-8") == '["engine"]'
+
+
+@pytest.fixture
+def html_source(workspace):
+    """A real source file: prepare_html_asset resolves its source first."""
+    source = workspace.input_dir / "logo.png"
+    source.write_bytes(b"png")
+    return source
+
+
+def test_prepare_html_asset_refuses_the_engine_subtree_as_html_target(
+    ops, workspace, html_source
+):
+    with pytest.raises(ValueError, match=SPILL_DIR_NAME):
+        ops.prepare_html_asset("logo.png", f"{SPILL_DIR_NAME}/index.html")
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+def test_prepare_html_asset_refuses_the_engine_subtree_as_assets_dir(
+    ops, workspace, html_source
+):
+    with pytest.raises(ValueError, match=SPILL_DIR_NAME):
+        ops.prepare_html_asset("logo.png", "index.html", assets_subdir=SPILL_DIR_NAME)
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+def test_reads_are_unaffected(ops, engine_file):
+    assert ops.read_file(f"{SPILL_DIR_NAME}/x.json") == '["engine"]'
+    assert ops.read_file(f"output/{SPILL_DIR_NAME}/x.json") == '["engine"]'
+    assert ops.file_exists(f"{SPILL_DIR_NAME}/x.json") is True
+
+
+def test_a_near_miss_directory_is_still_writable(ops, workspace, mock_workspace_db):
+    result = ops.write_file(f"{SPILL_DIR_NAME}-mine/x.json", "mine")
+    assert result["success"] is True
+    assert (workspace.output_dir / f"{SPILL_DIR_NAME}-mine" / "x.json").exists()
+
+
+def test_a_missing_engine_file_still_reports_not_found(ops, workspace):
+    (workspace.output_dir / SPILL_DIR_NAME).mkdir(parents=True)
+    with pytest.raises(FileNotFoundError):
+        ops.delete_file(f"{SPILL_DIR_NAME}/nope.json")
