@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from xagent.core.tools import tool_result_spill
+from xagent.core.tools.adapters.vibe import output_filter_wrapper
 from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.output_filter import DEFAULT_TRUNCATION_MESSAGE
@@ -279,3 +281,14 @@ def test_wrapper_strips_a_forged_reserved_key_even_without_a_spill_target(caplog
         filtered = wrapper._filter_result(result)
     assert filtered.get(SPILL_RESERVED_RESULT_KEY) != forged
     assert SPILL_RESERVED_RESULT_KEY not in filtered
+
+
+def test_the_wrapper_uses_the_spill_module_s_only_failure_classifier():
+    assert (
+        output_filter_wrapper.is_classified_tool_failure
+        is tool_result_spill.is_classified_tool_failure
+    )
+
+
+def test_the_wrapper_module_keeps_no_private_failure_classifier():
+    assert not hasattr(output_filter_wrapper, "_is_classified_tool_failure")

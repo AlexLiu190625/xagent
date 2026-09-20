@@ -212,14 +212,9 @@ def is_classified_tool_failure(result: Any) -> bool:
     left them while the classification keys are guaranteed to survive
     field-count truncation.
 
-    adapters/vibe/output_filter_wrapper.py holds a private copy of this same
-    test. The two should become one, and this is the copy to keep: that
-    module is the caller this one is written to run in front of, so an
-    import the other way round would point a module at its own consumer --
-    and it would become a real import cycle the moment the wrapper imports
-    this module, which is what wiring the spill path in means. Folding the
-    two together therefore belongs to the change that edits the wrapper,
-    not here.
+    This is the only definition. adapters/vibe/output_filter_wrapper.py
+    imports it; an import in the other direction would point this module at
+    its own consumer and would be a cycle.
     """
     return (
         isinstance(result, dict)
