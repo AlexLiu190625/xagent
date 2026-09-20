@@ -487,10 +487,8 @@ export function isTypeMismatchDispositionStale(
  * owner-of-the-task check, and narrowing where the dialog appears can only
  * make it appear less, never grant it access it would not otherwise have.
  *
- * These are the same route shapes components/layout/sidebar.tsx already
- * matches off `usePathname()` to find the viewed conversation, and the
- * static-export server (frontend_static.py) maps the same three shapes to
- * a page shell -- a trailing slash and the `__shell__` placeholder id both
+ * The static-export server (frontend_static.py) maps all three shapes to a
+ * page shell -- a trailing slash and the `__shell__` placeholder id both
  * still match, so this holds under either deployment.
  */
 export const CONNECTOR_RUNTIME_DIALOG_HOST_PATTERNS = [
