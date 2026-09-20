@@ -80,9 +80,10 @@ SPILL_READ_UNAVAILABLE_MESSAGES = {
 # second tier is a root that merely carries one or more of these same field
 # names without meeting that exemption test -- e.g. failure_code alone, with
 # no is_error/success pair (test_second_tier_applies_to_non_classified_envelope).
-# Whole-root spill copies whichever of these are present on such a root
-# before replacing "output" with the placeholder, so those fields are not
-# silently dropped along with everything else.
+# This is not an allowlist of keys to keep: whole-root spill keeps every key
+# there is. It is the list of fields whose value that tier never replaces
+# with the placeholder, however long the value is, because each of them
+# carries its meaning in the field itself rather than in its size.
 SPILL_ENVELOPE_KEYS = (
     "status",
     "interaction_id",
@@ -1037,6 +1038,27 @@ def _copy_and_set(container: Any, path: tuple[Any, ...], placeholder: Any) -> An
     raise TypeError(f"Cannot descend into {type(container)!r} at segment {key!r}")
 
 
+def _is_kept_inline(key: Any, value: Any) -> bool:
+    """Whether the whole-root tier keeps this value instead of pointing at it.
+
+    Two reasons to keep one. An envelope field carries its meaning in the
+    field rather than in its size, so replacing it destroys something no
+    later layer can restore. And a value no longer than the placeholder
+    costs less to keep than the placeholder would cost to substitute, so
+    replacing it would grow the result rather than shrink it -- a real
+    shape, since this tier fires on a root that is oversized in aggregate
+    while every single value in it is under the threshold.
+
+    A value that cannot be measured at all is kept for the same reason
+    every other unmeasurable value is left alone: the output filter owns
+    those shapes (see _serialized_length).
+    """
+    if key in SPILL_ENVELOPE_KEYS:
+        return True
+    length = _serialized_length(value)
+    return length is None or length <= len(SPILL_PLACEHOLDER_TEXT)
+
+
 def _second_tier_result(
     result: dict[str, Any],
     target: SpillTarget,
@@ -1051,6 +1073,20 @@ def _second_tier_result(
     runs before either tier is consulted, so this function never sees one. A
     write failure or an exhausted run budget falls back the same way: the
     whole root is left untouched rather than half-replaced.
+
+    Every key of the original result survives. The file holds the complete
+    result, and the in-context copy keeps each key, substituting the
+    placeholder for a value only when the value is longer than the
+    placeholder itself -- so the substitution can only ever make the result
+    smaller, never larger, which is not true of a result whose values are
+    mostly short. Envelope fields are never substituted: they carry their
+    meaning in the field rather than in its size (see SPILL_ENVELOPE_KEYS).
+
+    This tier used to rebuild the result from the envelope field list
+    alone, which dropped every other key -- ``content``,
+    ``structured_content`` and anything a tool names for itself -- leaving
+    the model a result that had silently lost most of what the tool
+    returned. Nothing but the file said those keys had ever existed.
     """
     root_length = _serialized_length(result)
     if root_length is None or root_length <= target.max_chars:
@@ -1067,11 +1103,10 @@ def _second_tier_result(
         return result, []
     if record is None:
         return result, []
-    new_result: dict[str, Any] = {}
-    for key in SPILL_ENVELOPE_KEYS:
-        if key in result:
-            new_result[key] = result[key]
-    new_result["output"] = SPILL_PLACEHOLDER_TEXT
+    new_result: dict[str, Any] = {
+        key: value if _is_kept_inline(key, value) else SPILL_PLACEHOLDER_TEXT
+        for key, value in result.items()
+    }
     new_result[SPILL_RESERVED_RESULT_KEY] = [record]
     return new_result, [record]
 

@@ -392,8 +392,71 @@ def test_wide_dict_spills_the_whole_root_as_one_file(tmp_path):
     assert len(records) == 1
     assert records[0]["value_path"] == "(whole result)"
     assert records[0]["kind"] == "object"
-    assert spilled["output"] == SPILL_PLACEHOLDER_TEXT
+    # Every key of the original survives the whole-root tier. The file
+    # holds the complete result; the in-context copy keeps each key and
+    # replaces only the values that are longer than the placeholder that
+    # would stand in for them. These values are ten characters each, so
+    # every one of them stays verbatim.
+    assert set(spilled) == set(result) | {SPILL_RESERVED_RESULT_KEY}
+    assert all(spilled[key] == value for key, value in result.items())
     assert spilled[SPILL_RESERVED_RESULT_KEY] == records
+
+
+def test_whole_root_spill_keeps_unknown_keys_beside_content(tmp_path):
+    """Keys the module has no name for are kept, not dropped.
+
+    The shape is the one the whole-root tier is for: no child is oversized
+    on its own, the root is oversized in aggregate. Rebuilding the result
+    from a fixed key list dropped every key not on that list, including
+    ``content`` and ``structured_content``.
+    """
+    result = {
+        "content": [{"type": "text", "text": "c" * 80}],
+        "structured_content": {"rows": "s" * 80},
+        "cursor": "abc",
+    }
+    for index in range(60):
+        result[f"k{index:03d}"] = "y" * 20
+    target = _target(tmp_path, max_chars=1000)
+    assert all(
+        spill_module._serialized_length(value) <= 1000 for value in result.values()
+    )
+    assert spill_module._serialized_length(result) > 1000
+
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+
+    assert len(records) == 1
+    assert records[0]["value_path"] == "(whole result)"
+    assert set(spilled) == set(result) | {SPILL_RESERVED_RESULT_KEY}
+    assert spilled["content"] == SPILL_PLACEHOLDER_TEXT
+    assert spilled["structured_content"] == SPILL_PLACEHOLDER_TEXT
+    assert spilled["cursor"] == "abc"
+    assert all(spilled[f"k{index:03d}"] == "y" * 20 for index in range(60))
+    path = Path(target.spill_dir) / records[0]["relative_path"].split("/")[-1]
+    assert json.loads(path.read_text(encoding="utf-8")) == result
+
+
+def test_whole_root_spill_never_replaces_an_envelope_field(tmp_path):
+    # An envelope field carries its meaning in the field itself, so the
+    # whole-root tier keeps its value however long it is; an ordinary key
+    # of the same length is replaced by the placeholder.
+    result = {"failure_code": "boom", "message": "m" * 300, "rows": "r" * 300}
+    target = _target(tmp_path, max_chars=400)
+    assert all(
+        spill_module._serialized_length(value) <= 400 for value in result.values()
+    )
+    assert spill_module._serialized_length(result) > 400
+
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+
+    assert len(records) == 1
+    assert spilled["failure_code"] == "boom"
+    assert spilled["message"] == "m" * 300
+    assert spilled["rows"] == SPILL_PLACEHOLDER_TEXT
 
 
 def test_mcp_text_blob_spills_the_leaf_string(tmp_path):
@@ -525,7 +588,12 @@ def test_second_tier_applies_to_non_classified_envelope(tmp_path):
     )
     assert len(records) == 1
     assert spilled["failure_code"] == "boom"
-    assert spilled["output"] == SPILL_PLACEHOLDER_TEXT
+    # field_a and field_b are 60 characters, longer than the placeholder
+    # that replaces them; failure_code is an envelope field and is kept.
+    # No "output" key is invented for a result that never had one.
+    assert spilled["field_a"] == SPILL_PLACEHOLDER_TEXT
+    assert spilled["field_b"] == SPILL_PLACEHOLDER_TEXT
+    assert "output" not in spilled
 
 
 def test_waiting_envelope_with_oversized_child_is_never_spilled(tmp_path):
