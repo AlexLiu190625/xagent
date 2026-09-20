@@ -1274,29 +1274,60 @@ def test_first_tier_write_failure_leaves_that_node_untouched(tmp_path, monkeypat
 
 
 def test_spill_concurrent_writers_of_the_same_content_all_succeed(tmp_path):
-    """Three threads spilling identical content must not lose a record to a
-    shared tmp filename collision: each gets its own record, and the
-    content-addressed target ends up written exactly once."""
+    """Three threads spilling identical content must not lose a record.
 
+    The window this covers is inside _replace_spill_file, between writing
+    the temporary file and renaming it onto the content-addressed target.
+    Two writers of the same payload build the same target name, so if they
+    also shared one temporary name, the first rename would move the file
+    out from under the second, whose own rename (or whose cleanup) would
+    then fail and cost that caller its record. The per-call pid-and-random
+    suffix is what keeps the two temporary names apart.
+
+    A barrier inside os.replace is what proves all three writers are in
+    that window at once. Each thread reaches its own rename, waits there,
+    and no rename runs until the third arrives -- so no thread can find a
+    finished target and skip the write, and plain unsynchronized threads
+    (which is what this test used to start) can no longer serialize past
+    each other one at a time.
+    """
     target = _target(tmp_path)
     result_template = {"content": [{"type": "text", "text": _big()}]}
     results: list[list[dict]] = [[] for _ in range(3)]
+    failures: list[BaseException] = []
+    all_inside_the_rename_window = threading.Barrier(3)
+    real_replace = os.replace
+
+    def _replace_holding_the_window(*args, **kwargs):
+        all_inside_the_rename_window.wait(timeout=10)
+        return real_replace(*args, **kwargs)
 
     def _spill(index: int) -> None:
-        _, records = spill_oversized_values(
-            copy.deepcopy(result_template),
-            target,
-            tool_name="acme",
-            max_recursion=20,
-        )
+        try:
+            _, records = spill_oversized_values(
+                copy.deepcopy(result_template),
+                target,
+                tool_name="acme",
+                max_recursion=20,
+            )
+        except BaseException as error:  # pragma: no cover - reported below
+            failures.append(error)
+            return
         results[index] = records
 
-    threads = [threading.Thread(target=_spill, args=(i,)) for i in range(3)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(spill_module.os, "replace", _replace_holding_the_window)
+        threads = [threading.Thread(target=_spill, args=(i,)) for i in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        assert not [thread for thread in threads if thread.is_alive()]
 
+    assert failures == []
+    # The barrier released, so every writer really was inside the window.
+    assert all_inside_the_rename_window.n_waiting == 0
+    assert not all_inside_the_rename_window.broken
     for records in results:
         assert len(records) == 1
         assert records[0]["value_path"] == "content[0].text"
@@ -2400,10 +2431,63 @@ def test_render_spill_notice_dedupes_by_relative_path():
     assert notice.count("tool-results/acme-812345678901.json") == 1
 
 
-def test_render_spill_notice_caps_entries_for_observation_style():
-    many = tuple(
-        {**ARRAY_RECORD, "relative_path": f"tool-results/a{i}-000000000000.json"}
-        for i in range(20)
+SHORT_RECORD = {
+    "relative_path": "tool-results/logs-000000000000.txt",
+    "kind": "text",
+    "item_count": 3,
+    "original_chars": 90,
+    "value_path": "output",
+    "record_fields": None,
+    "truncated_after_items": None,
+}
+
+
+def _short_records(count):
+    """Records short enough that the entry cap binds before the char cap."""
+    return tuple(
+        {**SHORT_RECORD, "relative_path": f"tool-results/s{i:02d}-000000000000.txt"}
+        for i in range(count)
     )
-    notice = render_spill_notice(many, style="observation")
-    assert "more stored file(s) omitted" in notice
+
+
+def _style_caps(style):
+    if style == "compaction":
+        return (
+            spill_module.COMPACT_SPILL_NOTICE_MAX_ENTRIES,
+            spill_module.COMPACT_SPILL_NOTICE_MAX_CHARS,
+        )
+    return (
+        spill_module.SPILL_OBSERVATION_NOTICE_MAX_ENTRIES,
+        spill_module.SPILL_OBSERVATION_NOTICE_MAX_CHARS,
+    )
+
+
+@pytest.mark.parametrize(
+    "style, max_entries, max_chars",
+    [("observation", 8, 1536), ("compaction", 12, 2048)],
+)
+def test_render_spill_notice_caps_entries_per_style(style, max_entries, max_chars):
+    """Each style renders exactly its own number of entries, no more.
+
+    Asserting a substring is not enough: the omitted-count line appears
+    whichever of the two caps stopped the loop, so a test that only looks
+    for it stays green for any entry cap at all. The records here are
+    short on purpose, so the notice stays well inside the character budget
+    and the entry cap is the only thing that can bind -- which the length
+    assertion below states outright.
+
+    The two caps are written out as numbers rather than read from the
+    module, and compared with the module's own values first. Reading them
+    would make the expectation move with the constant, which is how a cap
+    ends up with no coverage at all: raise it and the test still passes.
+    """
+    assert (max_entries, max_chars) == _style_caps(style)
+    total = max_entries + 12
+    notice = render_spill_notice(_short_records(total), style=style)
+    body_lines = notice.splitlines()[1:]
+
+    assert len(notice) < max_chars
+    assert len(body_lines) == max_entries + 1
+    assert body_lines[-1] == f"- ... {total - max_entries} more stored file(s) omitted"
+    for line in body_lines[:-1]:
+        assert line.startswith("- tool-results/s")
