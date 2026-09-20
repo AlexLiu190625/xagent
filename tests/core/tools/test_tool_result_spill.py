@@ -56,6 +56,7 @@ from xagent.core.tools.tool_result_spill import (
     SPILL_PLACEHOLDER_TEXT,
     SPILL_READ_UNAVAILABLE_MESSAGES,
     SPILL_RESERVED_RESULT_KEY,
+    SPILL_UNAVAILABLE_NOTICE,
     SpillRunBudget,
     SpillTarget,
     _spill_fitting_prefix,
@@ -69,6 +70,7 @@ from xagent.core.tools.tool_result_spill import (
     resolve_spilled_under,
     spill_oversized_values,
     spill_read_unavailable,
+    spill_record_shape_is_valid,
     strip_reserved_spill_key,
 )
 
@@ -2336,6 +2338,70 @@ def test_non_dict_mapping_spills_like_dict(tmp_path, monkeypatch, case):
     else:
         assert parsed == dict(value)
         assert record["item_count"] == len(value)
+
+
+# --- stage 1-f: spill_record_shape_is_valid (gate 1) -----------------------
+
+VALID_SHAPE_RECORD = {
+    "relative_path": "tool-results/acme-000000000000000000000000000000.json",
+    "kind": "array",
+    "item_count": 3,
+    "original_chars": 42,
+    "value_path": "content[0].text",
+    "record_fields": ["a", "b"],
+    "truncated_after_items": None,
+}
+
+
+def test_spill_record_shape_is_valid_accepts_a_written_record(tmp_path):
+    # The validator's field names are pinned to the writer's own output,
+    # not to a hand-built dict, so a drift between the two shows up here
+    # rather than only in production.
+    target = _target(tmp_path)
+    result = {"output": "z" * (MAX_CHARS * 4)}
+    _, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert len(records) == 1
+    assert spill_record_shape_is_valid(records[0]) is True
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "not a dict",
+        {**VALID_SHAPE_RECORD, "relative_path": None},
+        {**VALID_SHAPE_RECORD, "kind": "binary"},
+        {**VALID_SHAPE_RECORD, "item_count": True},
+        {**VALID_SHAPE_RECORD, "item_count": -1},
+        {k: v for k, v in VALID_SHAPE_RECORD.items() if k != "original_chars"},
+        {**VALID_SHAPE_RECORD, "value_path": 12},
+        {**VALID_SHAPE_RECORD, "record_fields": [1]},
+        {**VALID_SHAPE_RECORD, "truncated_after_items": -1},
+    ],
+    ids=[
+        "not_a_dict",
+        "relative_path_not_str",
+        "kind_out_of_range",
+        "item_count_is_bool",
+        "item_count_negative",
+        "original_chars_missing",
+        "value_path_not_str",
+        "record_fields_not_all_str",
+        "truncated_after_items_negative",
+    ],
+)
+def test_spill_record_shape_is_valid_rejects_each_malformed_field(record):
+    assert spill_record_shape_is_valid(record) is False
+
+
+def test_spill_unavailable_notice_names_no_path_and_no_tool():
+    # This text reaches the model when the file behind a placeholder is
+    # gone; it must not itself look like a location the model could try to
+    # read.
+    assert "tool-results" not in SPILL_UNAVAILABLE_NOTICE
+    assert "read_" not in SPILL_UNAVAILABLE_NOTICE
+    assert "/" not in SPILL_UNAVAILABLE_NOTICE
 
 
 # --- stage 1-g: render_spill_notice (pure rendering, not yet wired in) -----

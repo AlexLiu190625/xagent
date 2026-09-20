@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 SPILL_DIR_NAME = "tool-results"
 SPILL_RESERVED_RESULT_KEY = "_xagent_spilled_results"
 SPILL_PLACEHOLDER_TEXT = "[large result stored by the engine; see the notice below]"
+SPILL_UNAVAILABLE_NOTICE = (
+    "[A large value in this result was stored in a workspace file that is no "
+    "longer available. Treat it as unavailable and do not reconstruct its "
+    "contents.]"
+)
 # What the placeholder costs inside the serialized result, which is two
 # characters more than the text itself: it is a string, so encoding it adds
 # the two quotes. That is the number a value has to beat before replacing
@@ -1284,6 +1289,47 @@ def spill_oversized_values(
             new_result = {**new_result, SPILL_RESERVED_RESULT_KEY: records}
         return new_result, records
     return _second_tier_result(result, target, tool_name, budget)
+
+
+def spill_record_shape_is_valid(record: Any) -> bool:
+    """Gate 1: is this a well-formed report record, regardless of truth.
+
+    Checks only the seven-field shape a genuine record always has -- string
+    types, non-negative ints, the three-value kind enum. It says nothing
+    about whether the path is canonical (gate 2) or the file actually
+    exists (gate 3); those are separate, deliberately unmerged checks so a
+    variance in one gate cannot be mistaken for a variance in another.
+
+    Two callers share it: the engine's registration gate, and
+    render_spill_notice, which must not interpolate an unvalidated
+    relative_path, item_count or original_chars into text the model reads.
+    """
+    if not isinstance(record, dict):
+        return False
+    if not isinstance(record.get("relative_path"), str):
+        return False
+    if record.get("kind") not in ("array", "object", "text"):
+        return False
+    for key in ("item_count", "original_chars"):
+        value = record.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return False
+    if not isinstance(record.get("value_path"), str):
+        return False
+    record_fields = record.get("record_fields")
+    if record_fields is not None and not (
+        isinstance(record_fields, list)
+        and all(isinstance(item, str) for item in record_fields)
+    ):
+        return False
+    truncated_after_items = record.get("truncated_after_items")
+    if truncated_after_items is not None and (
+        not isinstance(truncated_after_items, int)
+        or isinstance(truncated_after_items, bool)
+        or truncated_after_items < 0
+    ):
+        return False
+    return True
 
 
 SPILL_OBSERVATION_NOTICE_MAX_CHARS = 1_536
