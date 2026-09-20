@@ -2,11 +2,22 @@
 Integration tests for output filter with tool factory.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.output_filter import DEFAULT_TRUNCATION_MESSAGE
+from xagent.core.tools.adapters.vibe.output_filter_wrapper import (
+    OutputFilteredToolWrapper,
+)
+from xagent.core.tools.tool_result_spill import (
+    SPILL_PLACEHOLDER_TEXT,
+    SPILL_RESERVED_RESULT_KEY,
+    SpillTarget,
+)
+from xagent.core.tools.user_interaction import WAITING_FOR_USER_STATUS
 
 
 @pytest.mark.asyncio
@@ -149,3 +160,122 @@ async def test_hardcoded_truncation_message():
             # The filter uses the hardcoded message from output_filter.py
             assert tool._filter.max_chars == 10
             break
+
+
+# --- stage 1-e: wrapper integration (strip / spill / bypass branches) -----
+
+
+def _wrapper(spill_target=None, max_chars=50, max_fields=1000, max_recursion=20):
+    return OutputFilteredToolWrapper(
+        target_tool=SimpleNamespace(name="acme"),
+        max_chars=max_chars,
+        max_fields=max_fields,
+        max_recursion=max_recursion,
+        spill_target=spill_target,
+    )
+
+
+def test_wrapper_spills_oversized_dict_result_instead_of_truncating(tmp_path):
+    spill_dir = tmp_path / "output" / "tool-results"
+    wrapper = _wrapper(
+        max_chars=80, spill_target=SpillTarget(spill_dir=str(spill_dir), max_chars=80)
+    )
+    big_text = "x" * 100
+    result = {
+        "content": [{"type": "text", "text": big_text}],
+        "structured_content": None,
+        "is_error": False,
+    }
+    filtered = wrapper._filter_result(result)
+
+    assert DEFAULT_TRUNCATION_MESSAGE not in str(filtered)
+    assert filtered["content"][0]["text"] == SPILL_PLACEHOLDER_TEXT
+    assert filtered["is_error"] is False
+    records = filtered[SPILL_RESERVED_RESULT_KEY]
+    assert len(records) == 1
+    written = spill_dir / records[0]["relative_path"].split("/")[-1]
+    assert written.read_text(encoding="utf-8") == big_text
+
+
+def test_wrapper_without_spill_target_truncates_as_before(tmp_path):
+    wrapper = _wrapper(spill_target=None)
+    result = {"content": [{"type": "text", "text": "x" * 100}]}
+    filtered = wrapper._filter_result(result)
+    assert DEFAULT_TRUNCATION_MESSAGE in filtered["content"][0]["text"]
+    assert SPILL_RESERVED_RESULT_KEY not in filtered
+
+
+def test_wrapper_small_results_are_byte_identical_with_a_spill_target(tmp_path):
+    spill_dir = tmp_path / "output" / "tool-results"
+    wrapper = _wrapper(spill_target=SpillTarget(spill_dir=str(spill_dir), max_chars=50))
+    result = {"output": "small value", "count": 3}
+    filtered = wrapper._filter_result(result)
+    assert filtered == result
+    assert not spill_dir.exists()
+
+
+def test_a_waiting_for_user_result_is_never_spilled(tmp_path):
+    spill_dir = tmp_path / "output" / "tool-results"
+    wrapper = _wrapper(
+        max_chars=80, spill_target=SpillTarget(spill_dir=str(spill_dir), max_chars=80)
+    )
+    result = {
+        "status": "waiting_for_user",
+        "interaction_id": "i1",
+        "message_type": "question",
+        "message": "please answer",
+        "interactions": [{"prompt": "pick one"}],
+        "records": "r" * 100,  # oversized sibling, not part of the card
+    }
+    filtered = wrapper._filter_result(result)
+    assert SPILL_RESERVED_RESULT_KEY not in filtered
+    assert not spill_dir.exists()
+    assert DEFAULT_TRUNCATION_MESSAGE in filtered["records"]
+    assert filtered["status"] == WAITING_FOR_USER_STATUS
+    assert filtered["message"] == "please answer"
+    assert filtered["interactions"] == [{"prompt": "pick one"}]
+
+
+def test_a_classified_failure_result_is_never_spilled(tmp_path):
+    spill_dir = tmp_path / "output" / "tool-results"
+    wrapper = _wrapper(
+        max_chars=80, spill_target=SpillTarget(spill_dir=str(spill_dir), max_chars=80)
+    )
+    result = {
+        "success": False,
+        "is_error": True,
+        "status": "error",
+        "error": "short error",
+        "output": "o" * 100,  # oversized, not part of the failure signal
+    }
+    filtered = wrapper._filter_result(result)
+    assert SPILL_RESERVED_RESULT_KEY not in filtered
+    assert not spill_dir.exists()
+    assert filtered["success"] is False
+    assert filtered["is_error"] is True
+    assert filtered["error"] == "short error"
+    assert DEFAULT_TRUNCATION_MESSAGE in filtered["output"]
+
+
+def test_the_bypass_branches_read_the_post_spill_object(tmp_path):
+    """Neither the waiting-for-user nor the classified-failure envelope, but
+    an oversized ``output`` sibling: the bypass branch's final `return
+    filtered` still reads off the post-spill object, not the original one."""
+    spill_dir = tmp_path / "output" / "tool-results"
+    wrapper = _wrapper(
+        max_chars=80, spill_target=SpillTarget(spill_dir=str(spill_dir), max_chars=80)
+    )
+    result = {"output": "o" * 100}
+    filtered = wrapper._filter_result(result)
+    assert filtered["output"] == SPILL_PLACEHOLDER_TEXT
+    assert filtered[SPILL_RESERVED_RESULT_KEY][0]["value_path"] == "output"
+
+
+def test_wrapper_strips_a_forged_reserved_key_even_without_a_spill_target(caplog):
+    wrapper = _wrapper(spill_target=None)
+    forged = [{"relative_path": "tool-results/evil.json"}]
+    result = {"output": "ok", SPILL_RESERVED_RESULT_KEY: forged}
+    with caplog.at_level("WARNING"):
+        filtered = wrapper._filter_result(result)
+    assert filtered.get(SPILL_RESERVED_RESULT_KEY) != forged
+    assert SPILL_RESERVED_RESULT_KEY not in filtered

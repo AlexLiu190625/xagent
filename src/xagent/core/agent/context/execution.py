@@ -31,6 +31,15 @@ from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
 )
+from ...tools.tool_result_spill import (
+    SPILL_RESERVED_RESULT_KEY,
+    SPILL_UNAVAILABLE_NOTICE,
+    normalize_spilled_relative_path,
+    render_spill_notice,
+    resolve_spilled_under,
+    spill_dir_for_workspace,
+    spill_record_shape_is_valid,
+)
 from ..grounding import VALUE_KINDS, step_intent_not_fact_rule
 from ..language import (
     effective_output_language,
@@ -45,6 +54,7 @@ from .components import (
     ExecutionComponent,
     GenericComponent,
     MemoryComponent,
+    SpillRegistryComponent,
     WorkspaceComponent,
     clone_component,
 )
@@ -109,6 +119,7 @@ def snapshot_container(value: Any) -> Any:
 
 
 READ_FILE_CONTEXT_LIMIT = 12_000
+SPILL_REGISTRY_MAX_RECORDS = 64
 # Set by the web layer into ``ExecutionContext.metadata`` at turn start: the
 # largest persisted transcript row id the context was built from. The agent
 # core never resolves it -- it is opaque here and only has meaning to the
@@ -498,6 +509,13 @@ class ExecutionContext:
             self.components["memory"] = component
         return component
 
+    def _spill_component(self) -> SpillRegistryComponent:
+        component = self.components.get("spilled_results")
+        if not isinstance(component, SpillRegistryComponent):
+            component = SpillRegistryComponent()
+            self.components["spilled_results"] = component
+        return component
+
     @property
     def workspace_id(self) -> str | None:
         return self._workspace_component().workspace_id
@@ -521,6 +539,79 @@ class ExecutionContext:
     @property
     def memory_snapshot(self) -> dict[str, Any] | None:
         return self._memory_component().snapshot
+
+    @property
+    def spilled_results(self) -> tuple[dict[str, Any], ...]:
+        return tuple(self._spill_component().records)
+
+    def _spill_dir(self) -> str | None:
+        """This execution's spill directory as a plain path string.
+
+        Returns None when the context carries no workspace path, which is
+        also how every deployment without a spill target reads: no
+        directory, so no record can pass gate 3. The layout itself comes
+        from the spill module, which is the same place the writer's target
+        comes from -- this side must not spell it a second time.
+        """
+        workspace_path = self.workspace_path
+        if not workspace_path:
+            return None
+        return spill_dir_for_workspace(workspace_path)
+
+    def _register_spilled_results(
+        self, result: Any
+    ) -> tuple[tuple[dict[str, Any], ...], int]:
+        """Validate a tool result's spill report through four gates.
+
+        Gate 1 (shape) and gate 2 (path syntax) failures are forged or
+        malformed and are dropped silently -- the model is never told they
+        existed. Gate 3 (existence) failures are real reports pointing at a
+        file that is gone (e.g. an external-credential task's workspace was
+        removed at the end of the previous turn); those count toward the
+        caller's unavailable-value notice. Gate 4 (capacity) stops
+        registering new files once the registry is full but still returns
+        the record for this message's own observation text, the same way an
+        already-registered relative_path is returned without being
+        duplicated.
+        """
+        if not isinstance(result, dict):
+            return (), 0
+        raw_records = result.get(SPILL_RESERVED_RESULT_KEY)
+        if not isinstance(raw_records, list):
+            return (), 0
+
+        registry = self._spill_component()
+        known_paths = {record.get("relative_path") for record in registry.records}
+        accepted: list[dict[str, Any]] = []
+        unavailable_count = 0
+        spill_dir = self._spill_dir()
+
+        for record in raw_records:
+            if not spill_record_shape_is_valid(record):
+                continue
+            relative_path = record["relative_path"]
+            if normalize_spilled_relative_path(relative_path) != relative_path:
+                continue
+            if (
+                spill_dir is None
+                or resolve_spilled_under(spill_dir, relative_path) is None
+            ):
+                unavailable_count += 1
+                continue
+            accepted.append(record)
+            if relative_path in known_paths:
+                continue
+            if len(registry.records) >= SPILL_REGISTRY_MAX_RECORDS:
+                logger.warning(
+                    "Spill registry at capacity (%d); not registering %s",
+                    SPILL_REGISTRY_MAX_RECORDS,
+                    relative_path,
+                )
+                continue
+            registry.records.append(record)
+            known_paths.add(relative_path)
+
+        return tuple(accepted), unavailable_count
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> Message:
         message = Message(role=role, content=content, **kwargs)
@@ -565,7 +656,22 @@ class ExecutionContext:
         context_result = self._sanitize_tool_result_for_context(
             tool_name, public_result
         )
-        content = self._format_tool_result(tool_name, context_result)
+        spill_records, spill_unavailable_count = self._register_spilled_results(
+            context_result
+        )
+        # The reserved key -- and the relative_path inside each of its
+        # records -- stays in context_result and therefore in raw_result:
+        # replay (runner.py) only ever passes raw_result back into a fresh
+        # context, and that record is the only way the four gates have
+        # anything to re-validate on that later pass. _format_tool_result
+        # keeps the reserved key out of the rendered observation text
+        # itself; only the notice built from spill_records names a path.
+        content = self._format_tool_result(
+            tool_name,
+            context_result,
+            spill_records=spill_records,
+            unavailable_count=spill_unavailable_count,
+        )
         metadata: dict[str, Any] = {
             "tool_name": tool_name,
             "raw_result": context_result,
@@ -574,6 +680,8 @@ class ExecutionContext:
             "cwd": self.cwd,
             "memory_session_id": self.memory_session_id,
         }
+        if spill_records:
+            metadata["spilled_results"] = list(spill_records)
         if supersedes_scope:
             metadata["supersedes_scope"] = supersedes_scope
             self._compact_superseded_tool_messages(supersedes_scope)
@@ -651,14 +759,39 @@ class ExecutionContext:
         memory.session_id = session_id
         memory.snapshot = snapshot
 
-    def _format_tool_result(self, tool_name: str, result: Any) -> str:
+    def _format_tool_result(
+        self,
+        tool_name: str,
+        result: Any,
+        spill_records: tuple[dict[str, Any], ...] = (),
+        unavailable_count: int = 0,
+    ) -> str:
+        formatted: Any
         if isinstance(result, dict) and isinstance(result.get("artifacts"), list):
             formatted = format_tool_result_for_observation(tool_name, result)
         elif isinstance(result, dict):
-            formatted = result.get("output", result)
+            if "output" in result:
+                formatted = result["output"]
+            else:
+                # No "output" key falls back to the whole dict; the reserved
+                # key (and the relative_path inside its records) must not
+                # leak into this rendered text even though it stays in
+                # result itself for raw_result -- the notice below is the
+                # only place a path may appear.
+                formatted = {
+                    key: value
+                    for key, value in result.items()
+                    if key != SPILL_RESERVED_RESULT_KEY
+                }
         else:
             formatted = result
-        return f"Tool {tool_name} returned: {formatted}"
+        parts = [f"Tool {tool_name} returned: {formatted}"]
+        notice = render_spill_notice(spill_records, style="observation")
+        if notice:
+            parts.append(notice)
+        if unavailable_count:
+            parts.append(SPILL_UNAVAILABLE_NOTICE)
+        return "\n".join(parts)
 
     def _sanitize_tool_result_for_context(self, tool_name: str, result: Any) -> Any:
         if isinstance(result, dict):

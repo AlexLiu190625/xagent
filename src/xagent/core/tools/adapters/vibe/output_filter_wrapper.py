@@ -11,6 +11,13 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 from pydantic import BaseModel
 
 from ....agent.result import normalize_tool_failure_code
+from ...tool_result_spill import (
+    SpillRunBudget,
+    SpillTarget,
+    is_classified_tool_failure,
+    spill_oversized_values,
+    strip_reserved_spill_key,
+)
 from ...user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
@@ -34,29 +41,6 @@ _INTERACTION_DISPLAY_KEYS = frozenset(
         "title",
     }
 )
-
-
-def _is_classified_tool_failure(result: Any) -> bool:
-    """Return whether ``result`` is a classified structured tool failure.
-
-    Matches on the ``success is False`` **and** ``is_error is True`` pair that
-    the shared classified-failure contract always carries, rather than on any
-    dict with an ``is_error`` key — a plain MCP error result
-    (``{"content": [...], "is_error": True}``) has no ``success`` key and is
-    left to ordinary recursive filtering.
-
-    Unavailable-MCP results do carry both keys and are matched deliberately:
-    they carry a ``failure_code``, and the restore below is purely additive,
-    so their ``content``/``reason`` fields keep whatever ordinary filtering
-    left them while the classification keys are guaranteed to survive
-    field-count truncation.
-    """
-
-    return (
-        isinstance(result, dict)
-        and result.get("is_error") is True
-        and result.get("success") is False
-    )
 
 
 def _accepts_kwarg(func: Any, name: str) -> bool:
@@ -94,6 +78,8 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         max_chars: int,
         max_fields: int,
         max_recursion: int,
+        spill_target: SpillTarget | None = None,
+        spill_run_budget: SpillRunBudget | None = None,
     ):
         """
         Initialize output filter wrapper.
@@ -103,8 +89,18 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
             max_chars: Maximum output length in characters.
             max_fields: Maximum number of fields/items in dict/list.
             max_recursion: Maximum recursion depth.
+            spill_target: Where oversized values get written instead of
+                truncated. None disables spilling entirely (deployments with
+                no workspace-bound read_file tool), leaving this wrapper's
+                behavior identical to before spilling existed.
+            spill_run_budget: Shared file-count budget across every wrapper
+                built in the same tool-set construction. None gives this
+                wrapper its own budget, which only matters when a single
+                wrapper spills more than once.
         """
         self._target = target_tool
+        self._spill_target = spill_target
+        self._spill_run_budget = spill_run_budget or SpillRunBudget()
 
         # Create output filter
         self._filter = OutputValueFilter(max_chars, max_fields, max_recursion)
@@ -242,26 +238,28 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
     def _filter_result(self, result: Any) -> Any:
         """Filter output without dropping a control or classification envelope."""
 
-        filtered = self._filter.filter(result, self._target.name)
-        if not isinstance(filtered, dict) or not isinstance(result, dict):
+        result = strip_reserved_spill_key(result)
+        spilled = self._spill_oversized_values(result)
+        filtered = self._filter.filter(spilled, self._target.name)
+        if not isinstance(filtered, dict) or not isinstance(spilled, dict):
             return filtered
 
-        if tool_result_waits_for_user(result):
+        if tool_result_waits_for_user(spilled):
             filtered["status"] = WAITING_FOR_USER_STATUS
             for key in ("interaction_id", "message_type"):
-                if key in result:
-                    filtered[key] = result[key]
-            if "message" in result:
+                if key in spilled:
+                    filtered[key] = spilled[key]
+            if "message" in spilled:
                 filtered["message"] = self._filter.filter(
-                    result["message"], self._target.name
+                    spilled["message"], self._target.name
                 )
-            if "interactions" in result:
+            if "interactions" in spilled:
                 filtered["interactions"] = self._filter_interactions(
-                    result["interactions"]
+                    spilled["interactions"]
                 )
             return filtered
 
-        if _is_classified_tool_failure(result):
+        if is_classified_tool_failure(spilled):
             # ``success``/``is_error`` were matched by identity above, so
             # they are literally ``False``/``True``; the two caller-supplied
             # classification values are re-checked before bypassing the
@@ -271,22 +269,40 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
             # mcp_adapter._run_unavailable), and a waiting result is handled
             # above. Exact plain-string match keeps a ``str`` subclass from
             # writing itself back unfiltered.
-            filtered["success"] = result["success"]
-            filtered["is_error"] = result["is_error"]
-            status = result.get("status")
+            filtered["success"] = spilled["success"]
+            filtered["is_error"] = spilled["is_error"]
+            status = spilled.get("status")
             if type(status) is str and status == "error":
                 filtered["status"] = status
             normalized_failure_code = normalize_tool_failure_code(
-                result.get("failure_code")
+                spilled.get("failure_code")
             )
             if normalized_failure_code is not None:
                 filtered["failure_code"] = normalized_failure_code
             for key in ("error", "output", "response"):
-                if key in result:
-                    filtered[key] = self._filter.filter(result[key], self._target.name)
+                if key in spilled:
+                    filtered[key] = self._filter.filter(spilled[key], self._target.name)
             return filtered
 
         return filtered
+
+    def _spill_oversized_values(self, result: Any) -> Any:
+        """Replace oversized values with a file-backed placeholder, if wired.
+
+        A None spill_target (no workspace-bound read_file tool in this tool
+        set) makes this a no-op, returning result unchanged -- the same
+        deployments this wrapper served before spilling existed.
+        """
+        if self._spill_target is None:
+            return result
+        spilled, _records = spill_oversized_values(
+            result,
+            self._spill_target,
+            tool_name=self._target.name,
+            max_recursion=self._filter.max_recursion,
+            run_budget=self._spill_run_budget,
+        )
+        return spilled
 
     def _filter_interactions(self, interactions: Any) -> Any:
         """Filter display text without changing interaction cardinality."""
