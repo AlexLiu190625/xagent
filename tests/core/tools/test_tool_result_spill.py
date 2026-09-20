@@ -2465,16 +2465,17 @@ def test_spill_record_shape_is_valid_accepts_every_kind_of_real_record(
     Surveys the module's own record-producing paths -- an array field, an
     object field, a long text field, a non-container scalar, the
     whole-result tier, and a collection truncated by the file-size cap --
-    so a future field the writer adds cannot silently drift out of what
-    this gate accepts without a test noticing.
+    keyed by label so a path that silently stops producing a record is
+    caught on its own, separately from a future field the writer adds
+    drifting out of what this gate accepts.
     """
     target = _target(tmp_path)
-    records = []
+    records_by_shape = {}
 
     _, recs = spill_oversized_values(
         {"rows": list(range(200))}, target, tool_name="acme", max_recursion=20
     )
-    records.extend(recs)
+    records_by_shape["array_field"] = recs
 
     _, recs = spill_oversized_values(
         {"rows": {f"k{i}": i for i in range(200)}},
@@ -2482,29 +2483,33 @@ def test_spill_record_shape_is_valid_accepts_every_kind_of_real_record(
         tool_name="acme",
         max_recursion=20,
     )
-    records.extend(recs)
+    records_by_shape["object_field"] = recs
 
     _, recs = spill_oversized_values(
         {"output": "z" * (MAX_CHARS * 4)}, target, tool_name="acme", max_recursion=20
     )
-    records.extend(recs)
+    records_by_shape["text_field"] = recs
 
     _, recs = spill_oversized_values(
         {"value": 10**3000}, target, tool_name="acme", max_recursion=20
     )
-    records.extend(recs)
+    records_by_shape["non_container_scalar"] = recs
 
     _, recs = spill_oversized_values(
         WALK_SHAPES["wide_dict"](), target, tool_name="acme", max_recursion=20
     )
-    records.extend(recs)
+    records_by_shape["whole_result_tier"] = recs
 
     monkeypatch.setattr(spill_module, "SPILL_MAX_FILE_BYTES", 300)
     _, recs = spill_oversized_values(
         {"rows": list(range(1, 200))}, target, tool_name="acme", max_recursion=20
     )
-    records.extend(recs)
+    records_by_shape["truncated_collection"] = recs
 
+    for shape_name, recs in records_by_shape.items():
+        assert recs, f"{shape_name} produced no record"
+
+    records = [record for recs in records_by_shape.values() for record in recs]
     kinds = {record["kind"] for record in records}
     assert {"array", "object", "text"} <= kinds
     assert any(record["value_path"] == "(whole result)" for record in records)
