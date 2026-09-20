@@ -440,31 +440,37 @@ def _serialized_length(value: Any) -> int | None:
     Returns the character length a spill file would hold for this value, so
     the size decision and the payload can never disagree. Returns None when
     the value cannot be serialized at all: a reference cycle, which
-    json.dumps reports as ValueError, or nesting deeper than the
-    interpreter's recursion limit, which it reports as RecursionError.
+    json.dumps reports as ValueError; nesting deeper than the interpreter's
+    recursion limit, which it reports as RecursionError; or a mapping with a
+    key json.dumps cannot represent (anything other than str, int, float,
+    bool or None), which it reports as TypeError -- the default hook only
+    ever gets a chance to render a *value*, so a bad key raises before the
+    hook is even consulted.
 
     A None length is neither small nor oversized -- every caller skips the
     value entirely, leaving it inline for the existing OutputValueFilter,
-    which owns both of these shapes (adapters/vibe/output_filter.py keeps a
-    memo_set of container ids and substitutes CIRCULAR_REFERENCE_MESSAGE for
-    a cycle, and enforces its own max_recursion depth independently of the
-    interpreter's limit). Narrowing the filter's supported input domain is
-    not this module's to do: it runs in front of the filter, so anything it
-    refuses to handle must pass through untouched rather than become a
-    failed tool call.
+    which owns all three of these shapes (adapters/vibe/output_filter.py
+    keeps a memo_set of container ids and substitutes
+    CIRCULAR_REFERENCE_MESSAGE for a cycle, enforces its own max_recursion
+    depth independently of the interpreter's limit, and keeps a dict's
+    original keys verbatim -- it builds a Python dict, not JSON text, so a
+    non-string key is never re-encoded). Narrowing the filter's supported
+    input domain is not this module's to do: it runs in front of the
+    filter, so anything it refuses to handle must pass through untouched
+    rather than become a failed tool call.
 
-    This is the only place the walk measures anything, which is why both
-    exceptions are caught here and nowhere else: either one at any depth
-    under a node makes that whole node unmeasurable, the node is then never
-    chosen as a spill point, and no later json.dumps in the write path can
-    meet it.
+    This is the only place the walk measures anything, which is why all
+    three exceptions are caught here and nowhere else: any one of them at
+    any depth under a node makes that whole node unmeasurable, the node is
+    then never chosen as a spill point, and no later json.dumps in the
+    write path can meet it.
     """
     value = _plain_mapping(value)
     if isinstance(value, str):
         return len(value)
     try:
         return len(json.dumps(value, ensure_ascii=False, default=_spill_json_default))
-    except (ValueError, RecursionError):
+    except (ValueError, RecursionError, TypeError):
         return None
 
 
@@ -853,11 +859,13 @@ def _build_spill_record(
     """Build one report record, writing its file.
 
     Returns None when the point must not be spilled at all: the value is
-    binary, it cannot be serialized (a cycle), nothing fits under the 8 MiB
-    cap, the text cut would land inside the first line, or the write itself
-    failed. Every one of those is the caller's cue to leave the value
-    untouched rather than replace it with a placeholder that points at
-    nothing, or at a file whose content the record misdescribes.
+    binary, it cannot be serialized (a cycle, nesting past the recursion
+    limit, or a mapping with a key json.dumps cannot represent), nothing
+    fits under the 8 MiB cap, the text cut would land inside the first
+    line, or the write itself failed. Every one of those is the caller's
+    cue to leave the value untouched rather than replace it with a
+    placeholder that points at nothing, or at a file whose content the
+    record misdescribes.
 
     Every metadata field is computed from the final payload before the file
     is written, so a failure while building the record cannot leave a file on
@@ -875,8 +883,9 @@ def _build_spill_record(
     if original_chars is None:
         logger.info(
             "Tool %s returned a value at %s that cannot be serialized "
-            "(reference cycle or nesting deeper than the recursion limit); "
-            "leaving it to the output filter.",
+            "(reference cycle, nesting deeper than the recursion limit, or "
+            "a mapping with a key json.dumps cannot represent); leaving it "
+            "to the output filter.",
             tool_name,
             _format_value_path(path),
         )
@@ -1047,9 +1056,10 @@ def spill_oversized_values(
     original object -- unchanged, for any of: no spill target, a non-dict
     result, a file-ref-shaped root, an exempt envelope (waiting-for-user or
     classified failure, see _spill_is_exempt_envelope), a root that cannot
-    be measured (a reference cycle or nesting past the recursion limit), or
-    simply nothing oversized -- or a new object built by copying only the
-    containers on each spilled path (see _copy_and_set). Returns
+    be measured (a reference cycle, nesting past the recursion limit, or a
+    mapping with a key json.dumps cannot represent), or simply nothing
+    oversized -- or a new object built by copying only the containers on
+    each spilled path (see _copy_and_set). Returns
     (possibly-new result, report records) -- the records are not yet
     validated against a registry; that happens at the engine's four gates,
     not here.

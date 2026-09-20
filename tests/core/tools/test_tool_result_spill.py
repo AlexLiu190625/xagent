@@ -765,6 +765,57 @@ def test_bytearray_is_not_spilled_and_leaves_no_file(tmp_path):
     )
 
 
+# --- a mapping whose keys json.dumps cannot encode is left to the filter ---
+
+
+def _bytes_keyed_mapping(n):
+    return {f"k{i}".encode(): "x" * 20 for i in range(n)}
+
+
+def _tuple_keyed_mapping(n):
+    return {(i,): "x" * 20 for i in range(n)}
+
+
+@pytest.mark.parametrize(
+    "make_mapping",
+    [_bytes_keyed_mapping, _tuple_keyed_mapping],
+    ids=["bytes-keys", "tuple-keys"],
+)
+def test_mapping_with_unserializable_keys_is_left_to_the_output_filter(
+    tmp_path, make_mapping
+):
+    bad = make_mapping(20)
+    result = {"rows": bad}
+    target = _target(tmp_path)
+    budget = SpillRunBudget()
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20, run_budget=budget
+    )
+    assert records == []
+    assert spilled is result
+    assert not Path(target.spill_dir).exists()
+    assert budget.files_written == 0
+
+
+def test_mapping_with_unserializable_keys_leaves_its_oversized_sibling_spilled(
+    tmp_path,
+):
+    bad = _bytes_keyed_mapping(20)
+    result = {"rows": bad, "big": "x" * 150}
+    target = _target(tmp_path)
+    budget = SpillRunBudget()
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20, run_budget=budget
+    )
+    assert len(records) == 1
+    assert records[0]["value_path"] == "big"
+    assert spilled["rows"] is bad
+    assert spilled["big"] == SPILL_PLACEHOLDER_TEXT
+    files = list(Path(target.spill_dir).glob("*"))
+    assert len(files) == 1
+    assert budget.files_written == 1
+
+
 # --- nested bytes render exactly as the output filter renders them ---------
 
 
