@@ -42,6 +42,14 @@ from .file_ref import (
 )
 from .file_storage.keys import build_user_key_prefix
 
+# The engine's spilled-tool-result directory name has exactly one owner, the
+# spill module, so this file never spells it a second time. The import runs
+# one way only: tool_result_spill and everything it pulls in (artifacts,
+# user_interaction, file_ref, artifact_validation) import no workspace module,
+# so this is not a cycle. Keep it that way -- adding a workspace import to
+# tool_result_spill or to artifacts would turn this into a real one.
+from .tools.tool_result_spill import SPILL_DIR_NAME
+
 if TYPE_CHECKING:
     from ..web.services.uploaded_file_store import (
         StagedUploadedFile,
@@ -262,6 +270,38 @@ class TaskWorkspace:
 
         return self.temp_dir / _INTERNAL_TEMP_DIR_NAME
 
+    @property
+    def engine_owned_output_dir(self) -> Path:
+        """Return the output subtree the engine owns and the model may not write.
+
+        The engine stores oversized tool results here and then describes each
+        file to the model in its own words. Those descriptions are only true
+        while the files hold the bytes the engine wrote, so this subtree is
+        listed by no workspace listing, registered by no auto-registration,
+        and written by no workspace file tool. Reads are deliberately left
+        alone: the model still reaches a spilled file by path.
+        """
+
+        return self.output_dir / SPILL_DIR_NAME
+
+    def is_engine_owned_path(self, file_path: Path) -> bool:
+        """Return whether a path is the engine-owned output subtree or inside it.
+
+        Resolves both sides before comparing, so a ``..`` segment and a
+        symlink pointing into the subtree both land on the real path. Equality
+        counts as containment, which is what makes the directory itself
+        unremovable and its name unusable for a plain file.
+
+        Not defensive on purpose: a resolve failure (a symlink loop, an
+        unreadable parent) propagates instead of answering False, because the
+        write guard's caller must fail rather than proceed on an unanswered
+        question.
+        """
+
+        return file_path.resolve().is_relative_to(
+            self.engine_owned_output_dir.resolve()
+        )
+
     def register_internal_file(
         self,
         file_path: str,
@@ -361,11 +401,19 @@ class TaskWorkspace:
             return file_id
 
     def _is_internal_workspace_path(self, file_path: Path) -> bool:
-        """Return whether a path is reserved or registered runtime scratch data."""
+        """Return whether a path is reserved or registered runtime scratch data.
+
+        Three reserved kinds, all invisible to every workspace listing: the
+        process-local scratch root under temp, the engine-owned output subtree
+        (see :meth:`is_engine_owned_path`), and any path registered as an
+        internal file id.
+        """
 
         resolved_path = file_path.resolve()
         reserved_root = self.internal_temp_dir.resolve()
         if resolved_path.is_relative_to(reserved_root):
+            return True
+        if self.is_engine_owned_path(resolved_path):
             return True
         return self._get_internal_file_id_from_path(resolved_path) is not None
 
@@ -1872,6 +1920,10 @@ class TaskWorkspace:
         """
         Get all output files in the workspace.
 
+        Reserved paths are left out on both branches, matching get_all_files:
+        this list is what the user and a calling agent receive as the task's
+        deliverables, and engine-owned files are not deliverables.
+
         Args:
             include_subdirs: Whether to include files in subdirectories
 
@@ -1883,12 +1935,16 @@ class TaskWorkspace:
         if include_subdirs:
             # Recursively scan output directory
             for file_path in self.output_dir.rglob("*"):
-                if file_path.is_file():
+                if file_path.is_file() and not self._is_internal_workspace_path(
+                    file_path
+                ):
                     output_files.append(self._get_file_info(file_path, "output"))
         else:
             # Only scan top-level of output directory
             for file_path in self.output_dir.iterdir():
-                if file_path.is_file():
+                if file_path.is_file() and not self._is_internal_workspace_path(
+                    file_path
+                ):
                     output_files.append(self._get_file_info(file_path, "output"))
 
         return output_files

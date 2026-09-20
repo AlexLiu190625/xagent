@@ -541,6 +541,12 @@ class WorkspaceFileOperations:
                 for item in current_path.iterdir():
                     if not show_hidden and item.name.startswith("."):
                         continue
+                    # Unconditional, unlike the hidden-file rule above:
+                    # show_hidden must not surface the engine-owned subtree.
+                    # Skipping the directory entry itself also stops the
+                    # recursive descent into it.
+                    if self.workspace.is_engine_owned_path(item):
+                        continue
 
                     stat = item.stat()
                     file_info = FileInfo(
