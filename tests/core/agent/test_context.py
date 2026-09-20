@@ -3261,6 +3261,34 @@ def test_spill_registry_component_is_registered():
     assert restored.records == [dict(VALID_RECORD)]
 
 
+def test_the_spill_registry_survives_a_full_checkpoint_round_trip(tmp_path):
+    """The component-level round trip above never goes through
+    ExecutionContext.to_dict()/from_dict() or a JSON encode/decode; this
+    covers the whole path a real checkpoint takes."""
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    tool = ctx.add_tool_result(
+        "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
+    )
+    before_records = ctx.spilled_results
+    before_content = tool.content
+
+    payload = json.loads(json.dumps(ctx.to_dict()))
+    restored = ExecutionContext.from_dict(payload)
+
+    assert isinstance(restored.components["spilled_results"], SpillRegistryComponent)
+    assert restored.spilled_results == before_records
+    assert restored.messages[-1].content == before_content
+
+
+def test_a_checkpoint_without_the_registry_key_loads_with_an_empty_registry():
+    payload = json.loads(json.dumps(ExecutionContext().to_dict()))
+    assert "spilled_results" not in payload["components"]
+    restored = ExecutionContext.from_dict(payload)
+    assert restored.spilled_results == ()
+
+
 def test_spill_registry_not_writable_from_request_context():
     forged = [{"relative_path": "tool-results/evil.json"}]
     # Simulates what runner._apply_request_context would have done to
