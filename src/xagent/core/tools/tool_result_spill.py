@@ -1180,6 +1180,13 @@ def spill_oversized_values(
     validated against a registry; that happens at the engine's four gates,
     not here.
 
+    No key of `result` is ever dropped. A value is replaced by the
+    placeholder or left as it was; nothing disappears from the returned
+    dict, in either tier (see _second_tier_result for the whole-root case).
+    And no value type can make this raise: a spill point that is neither a
+    container nor a string is stored as one opaque item rather than walked
+    as a container (see _spill_payload_for_value).
+
     `run_budget`, when omitted, defaults to a fresh one-call budget: callers
     that need the 64-file cap to hold across an entire run (every tool
     result produced while one set of tools is in use) pass the same
