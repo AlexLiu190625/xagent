@@ -1288,8 +1288,10 @@ def spill_oversized_values(
     rule for, and _serialized_length folds only ValueError, TypeError and
     RecursionError into "leave this to the output filter". A value whose
     own __str__ raises anything else -- RuntimeError, AttributeError,
-    KeyError -- still propagates out of this call, exactly as it did
-    before.
+    KeyError -- still propagates out of this call. This module makes no
+    attempt to catch it; the wrapper that calls this function in front of a
+    real tool is responsible for degrading to plain output filtering when
+    that happens, and does so at its own call site, not here.
 
     `run_budget`, when omitted, defaults to a fresh one-call budget: callers
     that need the 64-file cap to hold across an entire run (every tool

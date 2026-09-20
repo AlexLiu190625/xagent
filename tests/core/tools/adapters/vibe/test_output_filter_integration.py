@@ -2,6 +2,7 @@
 Integration tests for output filter with tool factory.
 """
 
+import asyncio
 import threading
 from types import SimpleNamespace
 
@@ -501,3 +502,126 @@ async def test_two_wrappers_accumulate_on_one_shared_budget_across_the_thread_ho
     await wrapper_one.run_json_async({})
     await wrapper_two.run_json_async({})
     assert budget.files_written == 2
+
+
+# --- stage 3: a failed spill degrades to plain filtering --------------------
+
+
+class _SpillHostileValue:
+    """Filtered without str(), but json.dumps can only render it with str()."""
+
+    def model_dump(self) -> dict[str, str]:
+        return {"kind": "unrenderable"}
+
+    def __str__(self) -> str:
+        raise RuntimeError("this value cannot be rendered")
+
+    __repr__ = __str__
+
+
+def test_a_value_that_cannot_be_rendered_falls_back_to_plain_filtering(tmp_path):
+    spill_dir = tmp_path / "output" / "tool-results"
+    no_target = _wrapper(spill_target=None, max_chars=80)
+    with_target = _wrapper(
+        spill_target=SpillTarget(spill_dir=str(spill_dir), max_chars=80), max_chars=80
+    )
+    baseline = no_target._filter_result(
+        {"payload": _SpillHostileValue(), "note": "n" * 200}
+    )
+    degraded = with_target._filter_result(
+        {"payload": _SpillHostileValue(), "note": "n" * 200}
+    )
+    assert degraded == baseline
+
+
+def test_a_value_that_cannot_be_rendered_leaves_no_spill_file(tmp_path):
+    spill_dir = tmp_path / "output" / "tool-results"
+    wrapper = _wrapper(
+        spill_target=SpillTarget(spill_dir=str(spill_dir), max_chars=80), max_chars=80
+    )
+    wrapper._filter_result({"payload": _SpillHostileValue(), "note": "n" * 200})
+    assert not spill_dir.exists()
+
+
+def test_a_failed_spill_logs_one_warning_naming_the_tool_and_the_exception_type(
+    tmp_path, caplog
+):
+    """Scoped to output_filter_wrapper's own logger: rendering the same
+    hostile value also trips an unrelated, pre-existing warning inside the
+    output filter's own Pydantic-model fallback (it tries to reconstruct
+    the value from its filtered model_dump() and that constructor call
+    fails too) -- a fact about that filter, not about the spill boundary
+    this test is pinning."""
+    spill_dir = tmp_path / "output" / "tool-results"
+    wrapper = _wrapper(
+        spill_target=SpillTarget(spill_dir=str(spill_dir), max_chars=80), max_chars=80
+    )
+    with caplog.at_level("WARNING"):
+        wrapper._filter_result({"payload": _SpillHostileValue(), "note": "n" * 200})
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and r.name == output_filter_wrapper.__name__
+    ]
+    assert len(warnings) == 1
+    assert "acme" in warnings[0].getMessage()
+    assert "RuntimeError" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_an_async_tool_call_is_not_swallowed_by_the_spill_boundary(
+    monkeypatch, tmp_path, caplog
+):
+    def _raise_cancelled(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        output_filter_wrapper, "spill_oversized_values", _raise_cancelled
+    )
+
+    async def run_json_async(args):
+        return {"output": "value"}
+
+    target = SimpleNamespace(name="acme", run_json_async=run_json_async)
+    wrapper = OutputFilteredToolWrapper(
+        target_tool=target,
+        max_chars=50,
+        max_fields=1000,
+        max_recursion=20,
+        spill_target=SpillTarget(
+            spill_dir=str(tmp_path / "output" / "tool-results"), max_chars=50
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        with pytest.raises(asyncio.CancelledError):
+            await wrapper.run_json_async({})
+    assert not any(r.levelname == "WARNING" for r in caplog.records)
+
+
+def test_a_keyboard_interrupt_is_not_swallowed_by_the_spill_boundary(
+    monkeypatch, tmp_path, caplog
+):
+    def _raise_keyboard_interrupt(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(
+        output_filter_wrapper, "spill_oversized_values", _raise_keyboard_interrupt
+    )
+
+    def run_json_sync(args):
+        return {"output": "value"}
+
+    target = SimpleNamespace(name="acme", run_json_sync=run_json_sync)
+    wrapper = OutputFilteredToolWrapper(
+        target_tool=target,
+        max_chars=50,
+        max_fields=1000,
+        max_recursion=20,
+        spill_target=SpillTarget(
+            spill_dir=str(tmp_path / "output" / "tool-results"), max_chars=50
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        with pytest.raises(KeyboardInterrupt):
+            wrapper.run_json_sync({})
+    assert not any(r.levelname == "WARNING" for r in caplog.records)

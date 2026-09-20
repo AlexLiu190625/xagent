@@ -341,16 +341,54 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         A None spill_target (no workspace-bound read_file tool in this tool
         set) makes this a no-op, returning result unchanged -- the same
         deployments this wrapper served before spilling existed.
+
+        Any failure of the spill step lands here and degrades to that same
+        no-op, so a tool call that succeeds without this layer keeps
+        succeeding with it.
         """
         if self._spill_target is None:
             return result
-        spilled, _records = spill_oversized_values(
-            result,
-            self._spill_target,
-            tool_name=self._target.name,
-            max_recursion=self._filter.max_recursion,
-            run_budget=self._spill_run_budget,
-        )
+        try:
+            spilled, _records = spill_oversized_values(
+                result,
+                self._spill_target,
+                tool_name=self._target.name,
+                max_recursion=self._filter.max_recursion,
+                run_budget=self._spill_run_budget,
+            )
+        except Exception as exc:
+            # A deliberately broad boundary, and the only one on this path.
+            # Spilling is an optional optimization layered in front of the
+            # output filter, and this is the one place where "it did not
+            # work" has a real, correct answer: hand the untouched result to
+            # the same filter that handled it before spilling existed. That
+            # is a genuine degradation with a log line, not a bug folded
+            # into "resource unavailable" -- the result the caller gets is
+            # byte-for-byte the one this wrapper produced before this layer
+            # was added.
+            #
+            # It has to be broad because the failures are not ours. The
+            # entry point measures values by serializing them, json.dumps
+            # falls back to str() for a type it has no rule for, and the
+            # module folds only ValueError, TypeError and RecursionError
+            # into "leave this one alone" (see its own docstring). A value
+            # whose __str__ raises RuntimeError, AttributeError or KeyError
+            # therefore reaches here, and without this boundary a tool
+            # result carrying one such object -- which does not fail a call
+            # today -- would start failing it.
+            #
+            # asyncio.CancelledError and KeyboardInterrupt derive from
+            # BaseException, not Exception, so neither is caught here:
+            # cancelling a tool call still cancels it, and Ctrl-C still
+            # interrupts.
+            logger.warning(
+                "Tool %s: storing oversized values failed (%s); falling back "
+                "to ordinary output truncation for this result.",
+                self._target.name,
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return result
         return spilled
 
     def _filter_interactions(self, interactions: Any) -> Any:
