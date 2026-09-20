@@ -38,6 +38,24 @@ def test_get_output_files_omits_the_engine_directory(workspace, spilled):
     assert str(engine_file) not in paths
 
 
+def test_get_output_files_non_recursive_omits_a_look_alike_file(workspace):
+    """The non-recursive branch only scans the top of output/, where the
+    engine directory can only be met as a regular file that happens to be
+    named exactly like it, not as the directory itself."""
+    look_alike = workspace.output_dir / SPILL_DIR_NAME
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    look_alike.write_text("not the engine directory", encoding="utf-8")
+    sibling = workspace.output_dir / "ok.txt"
+    sibling.write_text("ok", encoding="utf-8")
+
+    paths = {
+        entry["file_path"]
+        for entry in workspace.get_output_files(include_subdirs=False)
+    }
+    assert str(sibling) in paths
+    assert str(look_alike) not in paths
+
+
 def test_scan_all_files_omits_the_engine_directory(workspace, spilled):
     engine_file, user_file = spilled
     scanned = workspace._scan_all_files()

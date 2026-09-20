@@ -448,23 +448,6 @@ ENGINE_SPELLINGS = [
 
 
 @pytest.fixture
-def mock_workspace_db(mocker):
-    """Mock database operations for workspace to avoid DB access in tests."""
-
-    def mock_create_record(self, file_id, file_path, db_session=None):
-        path_str = str(file_path)
-        resolved_str = str(file_path.resolve())
-        self._recently_registered_files[path_str] = file_id
-        self._recently_registered_files[resolved_str] = file_id
-        self._file_id_to_path[file_id] = file_path
-
-    mocker.patch(
-        "xagent.core.workspace.TaskWorkspace._create_file_record", mock_create_record
-    )
-    return mocker
-
-
-@pytest.fixture
 def engine_file(workspace):
     spill_dir = workspace.output_dir / SPILL_DIR_NAME
     spill_dir.mkdir(parents=True)
@@ -557,7 +540,7 @@ def test_reads_are_unaffected(ops, engine_file):
     assert ops.file_exists(f"{SPILL_DIR_NAME}/x.json") is True
 
 
-def test_a_near_miss_directory_is_still_writable(ops, workspace, mock_workspace_db):
+def test_a_near_miss_directory_is_still_writable(ops, workspace):
     result = ops.write_file(f"{SPILL_DIR_NAME}-mine/x.json", "mine")
     assert result["success"] is True
     assert (workspace.output_dir / f"{SPILL_DIR_NAME}-mine" / "x.json").exists()

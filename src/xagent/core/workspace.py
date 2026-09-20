@@ -403,10 +403,13 @@ class TaskWorkspace:
     def _is_internal_workspace_path(self, file_path: Path) -> bool:
         """Return whether a path is reserved or registered runtime scratch data.
 
-        Three reserved kinds, all invisible to every workspace listing: the
+        Three reserved kinds, skipped by every listing that consults this
+        predicate (get_all_files, get_output_files, _scan_all_files): the
         process-local scratch root under temp, the engine-owned output subtree
         (see :meth:`is_engine_owned_path`), and any path registered as an
-        internal file id.
+        internal file id. The file tool's named-directory listing calls
+        is_engine_owned_path directly instead, so it hides only the engine
+        tool-results directory, not the other two kinds.
         """
 
         resolved_path = file_path.resolve()

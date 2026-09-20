@@ -863,7 +863,8 @@ def _spill_target_holds(target: Path, payload_bytes: bytes) -> bool:
     A content-addressed name authenticates the bytes only at the moment this
     module creates them. The workspace file tools refuse to write anywhere in
     this directory (core/workspace_file_tool.py), but that refusal covers only
-    those tools: the sandbox executors write the filesystem directly, so a
+    those tools: code that writes to disk directly -- sandbox executors and
+    other tools that build their own output paths -- is not covered, so a
     matching name afterwards still proves nothing about the current content.
     Only the content proves the content, so the bytes are read back and their
     complete SHA-256 is compared with the payload's.
