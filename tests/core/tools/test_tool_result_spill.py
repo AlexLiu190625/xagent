@@ -6,6 +6,24 @@ the engine's registration gate, and the read tool
 walk/write path that decides what gets spilled and writes it to disk
 (``spill_oversized_values`` and its helpers); and the notice renderer
 (``render_spill_notice``).
+
+Three contracts the assertions here are written around, because each of
+them was once broken in a way no test could see:
+
+* every spill point is stored, whatever its type. A value that is neither
+  a container nor a string -- a big int, a Decimal, an object with a long
+  ``__str__`` -- is one opaque item, and nothing in the walk raises.
+* whole-root spill keeps every key of the result. Only values longer than
+  the placeholder that would stand in for them are replaced, and envelope
+  fields are never replaced at all.
+* each notice cap is asserted against a number written out here rather
+  than read from the module, so raising a cap in the module shows up as a
+  failure instead of moving the expectation with it.
+
+The read-side names that had no consumer (the unavailable-notice text, the
+read tool's own name and limits, and the record-shape validator) are gone
+from the module; the change that adds the read tool brings back what it
+needs.
 """
 
 from __future__ import annotations
@@ -26,6 +44,7 @@ from types import MappingProxyType
 import pytest
 
 from xagent.core.tools import tool_result_spill as spill_module
+from xagent.core.tools.artifacts import is_file_ref_like
 from xagent.core.tools.tool_result_spill import (
     SPILL_ENVELOPE_KEYS,
     SPILL_MAX_FILES_PER_RESULT,
@@ -523,6 +542,30 @@ def test_whole_root_spill_never_replaces_an_envelope_field(tmp_path):
     assert spilled["failure_code"] == "boom"
     assert spilled["message"] == "m" * 300
     assert spilled["rows"] == SPILL_PLACEHOLDER_TEXT
+
+
+def test_file_ref_shaped_root_is_left_untouched(tmp_path):
+    """A result shaped like a file reference is never spilled.
+
+    The public-context sanitizer reduces such a root to its safe keys
+    before the model sees it, so a report attached here would be dropped by
+    that same whitelist on the way out and leave a file with no record
+    pointing at it. Deleting the early return used to fail no test at all.
+    """
+    result = {
+        "file_id": "f1",
+        "filename": "report.csv",
+        "mime_type": "text/csv",
+        "preview": _big(500),
+    }
+    assert is_file_ref_like(result)
+    target = _target(tmp_path)
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+    assert spilled is result
+    assert records == []
+    assert not Path(target.spill_dir).exists()
 
 
 def test_mcp_text_blob_spills_the_leaf_string(tmp_path):
