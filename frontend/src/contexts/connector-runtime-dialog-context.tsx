@@ -197,11 +197,19 @@ export function ConnectorRuntimeDialogProvider({ children }: { children: React.R
         const mine = prev.pending.filter(p => p.taskId === taskId)
         const ambiguous = mine.length > 1
         const staged = mine.length === 1 ? mine[0] : null
-        // Hand the stash to the request and clear it in the same update: the
-        // frame that opens the dialog also settles the turn, so the handoff
-        // and the clearing cannot be two separate setState calls without a
-        // window where a "save and resend" click would read an
-        // already-cleared stash.
+        // Clear the stash in the same update that builds the request. When
+        // this frame's snapshot comes from the stash, the handoff and the
+        // clearing cannot be two separate setState calls without a window
+        // where a "save and resend" click would read an already-cleared
+        // stash. The other two branches clear it with no handoff at all --
+        // a staged turn outranks it, or the frame is ambiguous and nothing
+        // is claimed -- for forgetDelivery's reason rather than this one:
+        // the frame carries no turn identity (xorbitsai/xagent#2465), so a
+        // stash left behind is a turn this very frame may be about. It
+        // would then survive a "not-shown" or "left-host" close, be
+        // claimed unambiguously by the next frame for this task, and be
+        // offered as a one-click resend of a turn nobody could confirm had
+        // failed.
         const stashed = prev.payload?.taskId === taskId ? prev.payload : null
         // A second request for a task whose dialog is already open (or
         // already read) keeps whatever snapshot the first request carried,
