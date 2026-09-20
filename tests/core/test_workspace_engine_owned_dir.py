@@ -1,5 +1,6 @@
 """The engine-owned tool-results directory is invisible to every listing."""
 
+import errno
 import os
 
 import pytest
@@ -113,23 +114,54 @@ def test_named_directory_listing_of_the_engine_directory_itself_is_empty(
     assert engine_file.exists()
 
 
-def test_named_directory_listing_leaves_a_symlink_loop_failing_as_it_did_before(
-    workspace,
+SYMLINK_LOOP_CASES = [
+    pytest.param("direct", "symlink_loop", False, True, id="direct-show-hidden-false"),
+    pytest.param("direct", "symlink_loop", True, True, id="direct-show-hidden-true"),
+    pytest.param("nested", "symlink_loop", False, True, id="nested-show-hidden-false"),
+    pytest.param("nested", "symlink_loop", True, True, id="nested-show-hidden-true"),
+    pytest.param(
+        "direct", ".symlink_loop", True, True, id="direct-dotted-show-hidden-true"
+    ),
+    pytest.param(
+        "direct", ".symlink_loop", False, False, id="direct-dotted-show-hidden-false"
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "location, entry_name, show_hidden, reaches_stat", SYMLINK_LOOP_CASES
+)
+def test_named_directory_listing_reports_a_symlink_loop_as_a_filesystem_error(
+    workspace, location, entry_name, show_hidden, reaches_stat
 ):
-    # A symlink loop already fails item.stat() with OSError in the scan loop,
-    # before this ownership check existed. The check must not replace that
-    # failure with an error of its own kind; this test is about the
-    # ownership check's own behavior on an entry it cannot resolve, not
-    # about whether a listing should be able to survive such an entry.
-    loop_path = workspace.output_dir / "a"
+    # The ownership check resolves each entry, and a symlink loop cannot be
+    # resolved. An entry that reaches the check this way still reaches
+    # item.stat() below, so the listing fails with the filesystem's own
+    # ELOOP error rather than one raised by the check. A dotted entry with
+    # show_hidden off is skipped by the hidden-name rule before the check
+    # ever runs, so the listing succeeds and simply omits it.
+    parent = (
+        workspace.output_dir if location == "direct" else workspace.output_dir / "sub"
+    )
+    parent.mkdir(parents=True, exist_ok=True)
+    loop_path = parent / entry_name
     try:
         os.symlink(loop_path, loop_path)
     except (OSError, NotImplementedError):
         pytest.skip("symlinks not available on this platform/user")
 
     ops = WorkspaceFileOperations(workspace)
-    with pytest.raises(OSError):
-        ops.list_files(str(workspace.output_dir), recursive=True)
+    if reaches_stat:
+        with pytest.raises(OSError) as raised:
+            ops.list_files(
+                str(workspace.output_dir), show_hidden=show_hidden, recursive=True
+            )
+        assert raised.value.errno == errno.ELOOP
+    else:
+        listing = ops.list_files(
+            str(workspace.output_dir), show_hidden=show_hidden, recursive=True
+        )
+        assert listing["files"] == []
 
 
 def test_spill_temp_files_are_hidden_too(workspace):
