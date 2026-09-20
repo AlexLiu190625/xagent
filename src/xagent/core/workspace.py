@@ -292,10 +292,11 @@ class TaskWorkspace:
         counts as containment, which is what makes the directory itself
         unremovable and its name unusable for a plain file.
 
-        Not defensive on purpose: a resolve failure (a symlink loop, an
-        unreadable parent) propagates instead of answering False, because the
-        write guard's caller must fail rather than proceed on an unanswered
-        question.
+        Not defensive on purpose: a path that cannot be resolved -- a symlink
+        loop -- propagates RuntimeError instead of answering False, because a
+        write guard must fail rather than proceed on an unanswered question.
+        Listing callers that must not change how such an entry is reported
+        handle it themselves.
         """
 
         return file_path.resolve().is_relative_to(

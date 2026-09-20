@@ -1,5 +1,7 @@
 """The engine-owned tool-results directory is invisible to every listing."""
 
+import os
+
 import pytest
 
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
@@ -109,6 +111,25 @@ def test_named_directory_listing_of_the_engine_directory_itself_is_empty(
     )
     assert listing["files"] == []
     assert engine_file.exists()
+
+
+def test_named_directory_listing_leaves_a_symlink_loop_failing_as_it_did_before(
+    workspace,
+):
+    # A symlink loop already fails item.stat() with OSError in the scan loop,
+    # before this ownership check existed. The check must not replace that
+    # failure with an error of its own kind; this test is about the
+    # ownership check's own behavior on an entry it cannot resolve, not
+    # about whether a listing should be able to survive such an entry.
+    loop_path = workspace.output_dir / "a"
+    try:
+        os.symlink(loop_path, loop_path)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available on this platform/user")
+
+    ops = WorkspaceFileOperations(workspace)
+    with pytest.raises(OSError):
+        ops.list_files(str(workspace.output_dir), recursive=True)
 
 
 def test_spill_temp_files_are_hidden_too(workspace):

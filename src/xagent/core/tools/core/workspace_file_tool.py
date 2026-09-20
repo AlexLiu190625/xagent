@@ -547,8 +547,14 @@ class WorkspaceFileOperations:
                     # show_hidden must not surface the engine-owned subtree.
                     # Skipping the directory entry itself also stops the
                     # recursive descent into it.
-                    if self.workspace.is_engine_owned_path(item):
-                        continue
+                    try:
+                        if self.workspace.is_engine_owned_path(item):
+                            continue
+                    except RuntimeError:
+                        # A symlink loop cannot be resolved. Let the entry
+                        # reach the stat() below, which reports it the way it
+                        # always has.
+                        pass
 
                     stat = item.stat()
                     file_info = FileInfo(
