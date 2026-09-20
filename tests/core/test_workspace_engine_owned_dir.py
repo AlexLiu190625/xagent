@@ -17,7 +17,7 @@ def spilled(workspace):
     """One engine file in the spill directory and one ordinary output file."""
     spill_dir = workspace.output_dir / SPILL_DIR_NAME
     spill_dir.mkdir(parents=True)
-    engine_file = spill_dir / "acme-0123456789ab.json"
+    engine_file = spill_dir / "acme-stored-result.json"
     engine_file.write_text("[]", encoding="utf-8")
     user_file = workspace.output_dir / "report.txt"
     user_file.write_text("report", encoding="utf-8")
@@ -115,7 +115,7 @@ def test_spill_temp_files_are_hidden_too(workspace):
     """The writer's .tmp name is not a dotfile; the directory rule is what hides it."""
     spill_dir = workspace.output_dir / SPILL_DIR_NAME
     spill_dir.mkdir(parents=True)
-    leftover = spill_dir / "acme-0123456789ab.json.4242.deadbeef.tmp"
+    leftover = spill_dir / "acme-stored-result.json.4242.partial.tmp"
     leftover.write_text("partial", encoding="utf-8")
     assert leftover not in workspace._scan_all_files()
 
@@ -141,7 +141,7 @@ def test_auto_registration_ignores_the_engine_directory(workspace, mocker):
     spill_dir = workspace.output_dir / SPILL_DIR_NAME
     spill_dir.mkdir(parents=True)
     with workspace.auto_register_files():
-        (spill_dir / "acme-0123456789ab.json").write_text("[]", encoding="utf-8")
+        (spill_dir / "acme-stored-result.json").write_text("[]", encoding="utf-8")
         (workspace.output_dir / "report.txt").write_text("report", encoding="utf-8")
 
     assert registered == [str(workspace.output_dir / "report.txt")]
