@@ -1600,6 +1600,72 @@ describe("reports a superseded save-and-resend whose save still landed", () => {
   })
 })
 
+describe("says whether the message went out when a retarget supersedes save-and-resend's own resend", () => {
+  it("says the message was not sent when a retarget supersedes a failed resend", async () => {
+    // The save half of "save and resend" already landed (met), and this
+    // dialog's own resend (not the send-failed panel's retry) is in flight
+    // when a same-task terminal frame retargets it. The values are stored
+    // either way, so once the hung resend settles, the user must be told
+    // whether the message went out -- and the send-failed panel must not
+    // appear, since its retry button reads the fresher request's snapshot
+    // and, once that snapshot has been replaced, would send under a new
+    // client message id rather than this attempt's.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-1", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    let rejectSend: (e: Error) => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((_res, rej) => { rejectSend = rej }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask() // retargets this same dialog instance mid-resend
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    toastMock.mockClear()
+
+    await act(async () => { rejectSend(new Error("closed")) })
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendFailed"]])
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("says the message was already sent when a retarget supersedes a successful resend", async () => {
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-2", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    let resolveSend: () => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((res) => { resolveSend = () => res(undefined) }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask() // retargets this same dialog instance mid-resend
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    toastMock.mockClear()
+
+    await act(async () => { resolveSend() })
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.resendSupersededUnknown"]])
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+})
+
 describe("clears a rejected save's error once a later save lands", () => {
   it("does not show the first rejection after a save-and-resend succeeds and its resend fails", async () => {
     // First save is rejected (empty_value); the dialog stays open showing
@@ -2346,6 +2412,38 @@ describe("tells the user when save and resend did not resend", () => {
     submitMock.mockResolvedValueOnce(stillUnavailable())
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
     await waitFor(() => expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeInTheDocument())
+    expect(toastMock).not.toHaveBeenCalled()
+  })
+})
+
+describe("tells the user when the refreshed report still needs input this dialog can collect", () => {
+  const stillFillable = () => ok(report(false, [
+    connector(REF_A, "A", [
+      input({ section: "context", key: "token", type: "string", required: true, satisfied: true }),
+      input({ section: "context", key: "other", type: "string", required: true }),
+    ]),
+  ]))
+
+  it("says so when the refreshed report still needs input this dialog can collect", async () => {
+    // The save landed, but the refreshed report still has a required
+    // context row this dialog can collect, so canResendNow is false and the
+    // resend "Save and resend" promised never runs. Nothing else on screen
+    // says the message did not go out.
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(stillFillable())
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByLabelText("other")).toBeInTheDocument())
+    expect(sendMessageMock).not.toHaveBeenCalled()
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentIncomplete"]])
+  })
+
+  it("stays silent when only save was requested and the report still needs input", async () => {
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(stillFillable())
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(screen.getByLabelText("other")).toBeInTheDocument())
     expect(toastMock).not.toHaveBeenCalled()
   })
 })

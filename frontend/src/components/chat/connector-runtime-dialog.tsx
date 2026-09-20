@@ -613,6 +613,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         : t("connectorRuntime.onlyUnsupportedRemaining", { keys }))
     } else if (alsoResend && newOutcome.kind === "nothing_fillable") {
       toast(t("connectorRuntime.savedNotResentUnavailable"))
+    } else if (alsoResend && newOutcome.kind === "fillable") {
+      // The save landed and the refreshed report still leaves a required
+      // context value unfilled, so canResendNow below is false and the
+      // resend the primary button promised never runs. The rows this
+      // report re-renders show what is still missing; none of them says
+      // the message did not go out, and this dialog is the only thing
+      // that knows it did not.
+      toast(t("connectorRuntime.savedNotResentIncomplete"))
     }
 
     if (newOutcome.kind === "fillable" || newOutcome.kind === "nothing_fillable") {
@@ -639,8 +647,26 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       if (requestRef.current.seq !== seqAtStart) {
         // Same reason as the earlier seq check: a newer request retargeted
         // this dialog instance while the resend was in flight, so this
-        // result is stale, but `submitting` must still reset.
+        // result is stale, but `submitting` must still reset. The resend's
+        // own outcome is not stale: the values are stored either way, and
+        // the message either went out or did not. Nothing the fresher
+        // request renders carries that fact -- this branch leaves
+        // `sendFailed` false, so no panel says it -- and the footer it
+        // draws next offers "Save and resend this message" again, which a
+        // user who was told nothing would press on a turn that already
+        // went out. A toast rather than the send-failed panel: that
+        // panel's retry button reads whichever snapshot the fresher
+        // request now carries, and once that snapshot has been replaced
+        // the retry goes out under a new client message id rather than the
+        // one the attempt that just settled here used
+        // (xorbitsai/xagent#2502).
+        // "nothing-to-send" maps with "failed" on purpose -- both mean no
+        // message went out -- and is unreachable from here anyway, since
+        // this block only runs when doResend was called with a snapshot.
         setSubmitting(false)
+        toast(resendOutcome === "sent"
+          ? t("connectorRuntime.resendSupersededUnknown")
+          : t("connectorRuntime.sendFailed"))
         return
       }
       if (resendOutcome !== "sent") {
@@ -661,9 +687,13 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     setResending(true)
     const resendOutcome = await doResend()
     if (!aliveRef.current) {
-      // Same reasoning as handleSave's post-doResend early return above:
-      // the resend was already attempted by the time doResend resolves, so
-      // there is nothing new for a toast to report here.
+      // Unlike handleSave's unmounted exit above, this one says nothing in
+      // either outcome. A retry that went out shows up in the transcript on
+      // its own. A retry that failed leaves things as the user last saw
+      // them on the send-failed panel -- saved, not sent -- but nothing
+      // tells them the retry they clicked did not change that. Left as is
+      // here; routing every exit through one place that has to account for
+      // it is tracked in xorbitsai/xagent#2478.
       return
     }
     if (requestRef.current.seq !== seqAtStart) {
