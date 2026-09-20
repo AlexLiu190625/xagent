@@ -198,3 +198,37 @@ def test_auto_registration_ignores_the_engine_directory(workspace, mocker):
         (workspace.output_dir / "report.txt").write_text("report", encoding="utf-8")
 
     assert registered == [str(workspace.output_dir / "report.txt")]
+
+
+def test_ownership_holds_when_the_output_dir_itself_is_a_symlink(tmp_path):
+    """The check resolves the root too, so a symlinked output/ still matches.
+
+    ``output_dir`` is built by appending names to a resolved ``base_dir``; no
+    construction step resolves it, so only the comparison site can see through
+    a symlink standing where ``output/`` does. Drop ``.resolve()`` from the
+    right-hand side of ``is_engine_owned_path`` and both the listing and the
+    write refusal go silently permissive.
+    """
+
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / SPILL_DIR_NAME).mkdir(parents=True)
+    workspace = TaskWorkspace("task_symlinked_output", str(tmp_path / "base"))
+    workspace.output_dir.rmdir()
+    try:
+        workspace.output_dir.symlink_to(elsewhere, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available on this platform/user")
+
+    engine_file = workspace.output_dir / SPILL_DIR_NAME / "acme-stored-result.json"
+    engine_file.write_text("[]", encoding="utf-8")
+    user_file = workspace.output_dir / "report.txt"
+    user_file.write_text("report", encoding="utf-8")
+
+    assert workspace.is_engine_owned_path(engine_file) is True
+    listed = {entry["file_path"] for entry in workspace.get_output_files()}
+    assert str(user_file) in listed
+    assert str(engine_file) not in listed
+    with pytest.raises(ValueError, match=SPILL_DIR_NAME):
+        WorkspaceFileOperations(workspace).write_file(
+            str(workspace.output_dir / SPILL_DIR_NAME / "mine.txt"), "x"
+        )
