@@ -57,6 +57,7 @@ const ERROR_MESSAGE_TRANSLATION_KEYS: Record<ConnectorRuntimeErrorMessageKey, Tr
   conflict: "connectorRuntime.errors.conflict",
   typeString: "connectorRuntime.errors.typeString",
   typeObject: "connectorRuntime.errors.typeObject",
+  typeUnknown: "connectorRuntime.errors.typeUnknown",
   emptyValue: "connectorRuntime.errors.emptyValue",
   keyNameRejected: "connectorRuntime.errors.keyNameRejected",
   configChanged: "connectorRuntime.errors.configChanged",

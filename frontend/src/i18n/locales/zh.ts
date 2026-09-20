@@ -4971,6 +4971,7 @@ const zh = {
       conflictNoKey: "另一个窗口已经填过这个值了。",
       typeString: "这一格要填文本。",
       typeObject: "这一格要填一个 JSON 对象。",
+      typeUnknown: "服务器拒绝了这个值的类型。这个连接器没有说明它需要哪种类型。",
       emptyValue: "这一格不能为空。",
       keyNameRejected: "这个连接器声明了一个服务器不接受的键名，保存会失败；请联系连接器的属主改名。在改名之前这个连接器每次都会失败。",
       configChanged: "这个连接器的配置刚刚变了。",

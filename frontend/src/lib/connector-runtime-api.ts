@@ -285,6 +285,7 @@ export type ConnectorRuntimeErrorMessageKey =
   | "conflict"
   | "typeString"
   | "typeObject"
+  | "typeUnknown"
   | "emptyValue"
   | "keyNameRejected"
   | "configChanged"
@@ -395,8 +396,15 @@ export function classifySubmitFailure(
       // checks against the refreshed report to clear this hint outright
       // when the row's type no longer matches it, instead of leaving a
       // type-specific message attached to a row that has since changed type.
+      // Three answers, not two: "object", "string", and "this report
+      // declares no type for this row at all" -- a rejection that carries
+      // no connector_ref, or a row this report does not carry. Folding the
+      // third into "string" tells the user a field needs text on the
+      // strength of a declaration nobody ever read.
       return {
-        messageKey: declaredType === "object" ? "typeObject" : "typeString",
+        messageKey: declaredType === null
+          ? "typeUnknown"
+          : declaredType === "object" ? "typeObject" : "typeString",
         retry: false,
         refresh: true,
         locate: { connectorRef, key },
@@ -438,13 +446,14 @@ export function classifySubmitFailure(
 }
 
 /**
- * Whether a type-mismatch disposition's hint no longer matches the row it
- * would attach to, given a report re-read after the disposition's own
- * `refresh: true` landed. `typeObject`/`typeString` are the only two
- * messageKeys this disposition shape can carry that name a specific type;
- * every other messageKey is never type-specific, so this always reads false
- * for it. A `locate.key` this refreshed report no longer declares under
- * "context" returns false here too -- that case is a dropped row, not a
+ * Whether a type hint on a disposition no longer matches the row it would
+ * attach to, given a report re-read after the disposition's own
+ * `refresh: true` landed. Three messageKeys carry a type hint:
+ * `typeObject` and `typeString` name a declared type, and `typeUnknown`
+ * says the report the hint was derived from named none. Every other
+ * messageKey is never type-related, so this always reads false for it. A
+ * `locate.key` the refreshed report no longer declares under "context"
+ * leaves the two named hints alone -- that case is a dropped row, not a
  * changed type, and the dialog's own field-error location already falls
  * back to whole-dialog scope for it.
  */
@@ -452,11 +461,16 @@ export function isTypeMismatchDispositionStale(
   disposition: ConnectorRuntimeFailureDisposition,
   refreshedReport: ConnectorRuntimeReport,
 ): boolean {
-  if (disposition.messageKey !== "typeObject" && disposition.messageKey !== "typeString") return false
+  const { messageKey } = disposition
+  if (messageKey !== "typeObject" && messageKey !== "typeString" && messageKey !== "typeUnknown") return false
   const { connectorRef, key } = disposition.locate
   if (key === undefined) return false
-  const expectedType = disposition.messageKey === "typeObject" ? "object" : "string"
   const currentType = findDeclaredInputType(refreshedReport, connectorRef, key)
+  // The unknown hint's whole claim is "this report declares no type here",
+  // so any declared type in the refreshed report retires it -- including
+  // the type the server was enforcing all along, which is the common case.
+  if (messageKey === "typeUnknown") return currentType !== null
+  const expectedType = messageKey === "typeObject" ? "object" : "string"
   return currentType !== null && currentType !== expectedType
 }
 

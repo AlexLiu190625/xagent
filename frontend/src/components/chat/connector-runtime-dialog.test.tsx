@@ -1331,8 +1331,10 @@ describe("locates a field error by connector and key", () => {
       reason: "type_mismatch.context.missing", connectorRef: REF_A,
     })
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
-    // Falls back to whole-dialog scope, which renders without the {key} var.
-    await waitFor(() => expect(screen.getByText("connectorRuntime.errors.typeString")).toBeInTheDocument())
+    // The report never declares this key, so the hint is the unknown-type
+    // one; it falls back to whole-dialog scope, which renders without the
+    // {key} var.
+    await waitFor(() => expect(screen.getByText("connectorRuntime.errors.typeUnknown")).toBeInTheDocument())
   })
 
   it("locates a same-named key's error in the context row when a secrets row with that key comes first in the report", async () => {

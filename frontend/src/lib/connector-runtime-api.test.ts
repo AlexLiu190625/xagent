@@ -13,6 +13,7 @@ import {
   fetchTaskConnectorRuntimeRequirements,
   isConnectorRuntimeDialogHostPath,
   isSubmitEnabled,
+  isTypeMismatchDispositionStale,
   readConnectorRuntimeReport,
   resolveDialogActions,
   resolveDialogOutcome,
@@ -566,6 +567,58 @@ describe("classifySubmitFailure", () => {
     )).toEqual({
       messageKey: "typeString", retry: false, refresh: true, locate: { connectorRef: REF_A, key: "shared" },
     })
+  })
+
+  it("reports an undeclared type as unknown instead of as text", () => {
+    // "ghost" is not declared by any connector in baseReport, so there is
+    // no declaration to read a type from at all -- this must not be
+    // reported as "needs text" on the strength of a declaration nobody
+    // read.
+    expect(classifySubmitFailure(
+      coded(400, "invalid_runtime_context", "type_mismatch.context.ghost", REF_A),
+      baseReport,
+    )).toEqual({
+      messageKey: "typeUnknown", retry: false, refresh: true, locate: { connectorRef: REF_A, key: "ghost" },
+    })
+  })
+})
+
+describe("isTypeMismatchDispositionStale", () => {
+  const disposition = (messageKey: ConnectorRuntimeErrorMessageKey, key = "token") => ({
+    messageKey, retry: false as const, refresh: true as const, locate: { connectorRef: REF_A, key },
+  })
+
+  it("clears an unknown-type hint once a refreshed report declares a type", () => {
+    // Both directions must be asserted: a mutation that drops the
+    // typeUnknown-specific branch and falls through to the typeString
+    // comparison would still read true for the "declared as object" case
+    // by accident, and only the "declared as string" case catches it.
+    const declaredObject = report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "object", required: true })]),
+    ])
+    const declaredString = report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])
+    expect(isTypeMismatchDispositionStale(disposition("typeUnknown"), declaredObject)).toBe(true)
+    expect(isTypeMismatchDispositionStale(disposition("typeUnknown"), declaredString)).toBe(true)
+  })
+
+  it("keeps an unknown-type hint while the row is still undeclared", () => {
+    const stillUndeclared = report(false, [connector(REF_A, "A", [])])
+    expect(isTypeMismatchDispositionStale(disposition("typeUnknown"), stillUndeclared)).toBe(false)
+  })
+
+  it("leaves the two named type hints behaving as before", () => {
+    const declaredString = report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])
+    const declaredObject = report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "object", required: true })]),
+    ])
+    const stillUndeclared = report(false, [connector(REF_A, "A", [])])
+    expect(isTypeMismatchDispositionStale(disposition("typeObject"), declaredString)).toBe(true)
+    expect(isTypeMismatchDispositionStale(disposition("typeObject"), declaredObject)).toBe(false)
+    expect(isTypeMismatchDispositionStale(disposition("typeObject"), stillUndeclared)).toBe(false)
   })
 })
 
