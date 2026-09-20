@@ -288,6 +288,13 @@ def resolve_spilled_under(
         if not base.is_dir():
             return None
         resolved = (base / name.split("/", 1)[1]).resolve()
+        # Two containment checks, on purpose, and the second does imply the
+        # first: a path whose parent is the spill directory is inside it.
+        # They are kept apart because they are different statements --
+        # "inside this tree" and "directly in this directory" -- and this is
+        # the guard that stands between a model-supplied selector and the
+        # filesystem. A path escape that gets past one of them still has to
+        # get past the other.
         if not resolved.is_relative_to(base):
             return None
         if resolved.parent != base:
