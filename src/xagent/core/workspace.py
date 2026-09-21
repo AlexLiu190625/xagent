@@ -296,6 +296,15 @@ class TaskWorkspace:
         as containment, which is what makes the directory itself unremovable
         and its name unusable for a plain file.
 
+        The reserved segment is compared with case folded, on every operating
+        system. On a case-insensitive file system another spelling reaches the
+        same directory, and a segment-by-segment comparison would let a write
+        through to the engine's own bytes; folding case makes one rule, and
+        one test expectation, hold everywhere. The price is that on a
+        case-sensitive file system this also reserves spellings that are a
+        different directory there -- the same trade already recorded for a
+        user directory carrying the reserved name.
+
         Not defensive on purpose: on interpreters where a symlink loop in the
         argument makes ``resolve()`` raise RuntimeError, that error propagates
         instead of being turned into False, because a write guard must fail
@@ -305,9 +314,15 @@ class TaskWorkspace:
         reported handle the error themselves.
         """
 
-        return file_path.resolve().is_relative_to(
-            self.output_dir.resolve() / SPILL_DIR_NAME
-        )
+        reserved_root = self.engine_owned_output_dir
+        parent_root = reserved_root.parent.resolve()
+        resolved_path = file_path.resolve()
+        if not resolved_path.is_relative_to(parent_root):
+            return False
+        relative_parts = resolved_path.relative_to(parent_root).parts
+        if not relative_parts:
+            return False
+        return relative_parts[0].casefold() == reserved_root.name.casefold()
 
     def register_internal_file(
         self,
