@@ -446,9 +446,31 @@ class TaskWorkspace:
         # points at: resolve the parent, never the reserved segment itself.
         # Following it would put the failure, and the answer, in the hands of
         # whoever can create a symlink there -- and a loop there would make
-        # this shared check raise for every caller, about every path.
+        # this shared check raise for every caller, about every path. The
+        # name itself is compared as written, not case folded: it is a
+        # dot-name the engine creates itself, and no file tool resolves a
+        # write through it.
         reserved_root = self.temp_dir.resolve() / _INTERNAL_TEMP_DIR_NAME
         if resolved_path.is_relative_to(reserved_root):
+            return True
+        # Unlike the engine-owned output subtree, a directory this name
+        # currently points at is ALSO treated as reserved. The engine never
+        # puts a symlink here itself, so the only way the name points
+        # elsewhere is an alias placed by something else, and the files
+        # already living at that alias should stay internal rather than
+        # surface as new user files just because the check above stopped
+        # following the name to find them. A loop has no target to follow,
+        # so it is left to the name-based answer above instead of raising
+        # here.
+        try:
+            aliased_target = reserved_root.resolve()
+        except RuntimeError:
+            aliased_target = None
+        if (
+            aliased_target is not None
+            and aliased_target != reserved_root
+            and resolved_path.is_relative_to(aliased_target)
+        ):
             return True
         if self.is_engine_owned_path(resolved_path):
             return True
