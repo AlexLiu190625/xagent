@@ -385,7 +385,9 @@ async def test_progress_requires_ack_and_backs_off_after_failure(bridge, monkeyp
     event = Mock()
     event.to_dict.return_value = {"event": "progress"}
     await forwarder.handle_event(event)
+    await forwarder._sending
     await forwarder.handle_event(event)
+    await forwarder._sending
     publish.assert_awaited_once()
     await bridge.close()
 
@@ -436,21 +438,28 @@ async def test_missing_progress_route_backs_off_and_recovers(monkeypatch):
     event = Mock()
     for _ in range(100):
         await forwarder.handle_event(event)
+        await forwarder._sending
     assert reply.await_count == 1
     now = 1.0
     await forwarder.handle_event(event)
+    await forwarder._sending
     now = 2.0
     await forwarder.handle_event(event)
+    await forwarder._sending
     assert reply.await_count == 2
     now = 3.0
     await forwarder.handle_event(event)
+    await forwarder._sending
     await forwarder.handle_event(event)
+    await forwarder._sending
     assert reply.await_count == 4
     now = 3.5
     await forwarder.handle_event(event)
+    await forwarder._sending
     assert reply.await_count == 4
     now = 4.0
     await forwarder.handle_event(event)
+    await forwarder._sending
     assert reply.await_count == 5
 
 
@@ -470,6 +479,7 @@ async def test_missing_progress_route_retry_delay_is_capped(monkeypatch):
     for now in [0.0, 1.0, 3.0, 7.0, 15.0, 31.0, 61.0, 91.0]:
         for _ in range(100):
             await forwarder.handle_event(Mock())
+            await forwarder._sending
     assert reply.await_count == 8
 
 
@@ -520,17 +530,21 @@ async def test_progress_recovers_after_observer_route_replacement(
     event.to_dict.return_value = {"event": "progress"}
     try:
         await forwarder.handle_event(event)
+        await forwarder._sending
         replacement = bridge.register_origin(42, "command", receiver)
         route[1] = replacement
         for _ in range(10):
             await forwarder.handle_event(event)
+            await forwarder._sending
         receiver.assert_not_awaited()
         now = 1.0
         await forwarder.handle_event(event)
+        await forwarder._sending
         receiver.assert_awaited_once()
         assert publications == [original, replacement]
         # A successful new route resumes normal forwarding immediately.
         await forwarder.handle_event(event)
+        await forwarder._sending
         assert receiver.await_count == 2
     finally:
         await bridge.close()
@@ -548,5 +562,209 @@ async def test_unexpected_progress_error_still_disables_forwarder(monkeypatch):
         Mock(command_id="command", task_id=42), "run"
     )
     await forwarder.handle_event(Mock())
+    await forwarder._sending
     await forwarder.handle_event(Mock())
+    await forwarder._sending
     reply.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_progress_ack_wait_does_not_block_trace_dispatch(bridge, monkeypatch):
+    from xagent.core.agent.trace import TASK_START_GENERAL, Tracer
+    from xagent.web.services import shared_channel_execution as shared
+
+    monkeypatch.setattr(module, "_reply_route", lambda *_: ("dead-host", "origin"))
+    published = asyncio.Event()
+    publish = AsyncMock(side_effect=lambda *_: published.set())
+    monkeypatch.setattr(bridge, "_publish", publish)
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    forwarder = shared.ChannelProgressForwarder(
+        Mock(command_id="command", task_id=42), "run"
+    )
+    tracer = Tracer()
+    tracer.add_handler(forwarder)
+    next_handler = Mock(handle_event=AsyncMock())
+    tracer.add_handler(next_handler)
+    try:
+        async with asyncio.timeout(1):
+            await tracer.trace_event(TASK_START_GENERAL, task_id="42")
+            await published.wait()
+            for _ in range(100):
+                await tracer.trace_event(TASK_START_GENERAL, task_id="42")
+        assert next_handler.handle_event.await_count == 101
+        assert len(bridge._acks) == 1
+        publish.assert_awaited_once()
+        await forwarder.close()
+        assert not bridge._acks
+        await forwarder.handle_event(Mock())
+        publish.assert_awaited_once()
+    finally:
+        await forwarder.close()
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_progress_close_drains_send_despite_repeated_cancellation(monkeypatch):
+    from xagent.web.services import shared_channel_execution as shared
+
+    entered = asyncio.Event()
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+
+    async def reply(_):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cleaning.set()
+            await release.wait()
+
+    bridge = Mock()
+    bridge.reply_for.return_value = reply
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    forwarder = shared.ChannelProgressForwarder(
+        Mock(command_id="command", task_id=42), "run"
+    )
+    await forwarder.handle_event(Mock())
+    async with asyncio.timeout(1):
+        await entered.wait()
+        close = asyncio.create_task(forwarder.close())
+        await cleaning.wait()
+        close.cancel()
+        await asyncio.sleep(0)
+        close.cancel()
+        await asyncio.sleep(0)
+        assert not close.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close
+    assert forwarder._sending.done()
+
+
+@pytest.mark.asyncio
+async def test_progress_queue_preserves_order_and_applies_backpressure(monkeypatch):
+    from xagent.web.services import shared_channel_execution as shared
+
+    monkeypatch.setattr(shared.ChannelProgressForwarder, "_MAX_PENDING_EVENTS", 2)
+    entered, release = asyncio.Event(), asyncio.Event()
+    delivered = []
+
+    async def reply(message):
+        entered.set()
+        await release.wait()
+        delivered.append(message["trace"])
+
+    bridge = Mock()
+    bridge.reply_for.return_value = reply
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    forwarder = shared.ChannelProgressForwarder(
+        Mock(command_id="command", task_id=42), "run"
+    )
+
+    def event(name):
+        return Mock(to_dict=lambda: {"event": name})
+
+    try:
+        async with asyncio.timeout(1):
+            await forwarder.handle_event(event("A"))
+            await entered.wait()
+            await forwarder.handle_event(event("B"))
+            await forwarder.handle_event(event("C"))
+            fourth = asyncio.create_task(forwarder.handle_event(event("D")))
+            await asyncio.sleep(0)
+            assert not fourth.done()
+            assert len(forwarder._pending) == 2
+            release.set()
+            await fourth
+            await forwarder.close(drain=True)
+        assert delivered == [{"event": name} for name in "ABCD"]
+    finally:
+        await forwarder.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["connection_error", "unexpected_error", "close"])
+async def test_progress_queue_wakes_blocked_producer_on_failure_or_close(
+    monkeypatch, outcome
+):
+    from xagent.web.services import shared_channel_execution as shared
+
+    monkeypatch.setattr(shared.ChannelProgressForwarder, "_MAX_PENDING_EVENTS", 1)
+    now = 0.0
+    monkeypatch.setattr(shared, "monotonic", lambda: now)
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def reply(message):
+        calls.append(message["trace"])
+        if len(calls) == 1:
+            entered.set()
+            await release.wait()
+            if outcome == "connection_error":
+                raise ConnectionError("offline")
+            raise ValueError("invalid")
+
+    bridge = Mock()
+    bridge.reply_for.return_value = reply
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    forwarder = shared.ChannelProgressForwarder(
+        Mock(command_id="command", task_id=42), "run"
+    )
+
+    def event(name):
+        return Mock(to_dict=lambda: {"event": name})
+
+    try:
+        async with asyncio.timeout(1):
+            await forwarder.handle_event(event("A"))
+            await entered.wait()
+            await forwarder.handle_event(event("B"))
+            blocked = asyncio.create_task(forwarder.handle_event(event("C")))
+            await asyncio.sleep(0)
+            assert not blocked.done()
+            if outcome == "close":
+                await forwarder.close()
+            else:
+                release.set()
+                await forwarder._sending
+            await blocked
+            assert not forwarder._pending
+            now = 1.0
+            await forwarder.handle_event(event("D"))
+            if outcome != "close":
+                await forwarder._sending
+        assert calls == [{"event": "A"}] + (
+            [{"event": "D"}] if outcome == "connection_error" else []
+        )
+    finally:
+        await forwarder.close()
+
+
+@pytest.mark.asyncio
+async def test_progress_graceful_close_deadline_cancels_stuck_send(monkeypatch):
+    from xagent.web.services import shared_channel_execution as shared
+
+    monkeypatch.setattr(shared.ChannelProgressForwarder, "_DRAIN_TIMEOUT_SECONDS", 0.01)
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def reply(_):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    bridge = Mock()
+    bridge.reply_for.return_value = reply
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    forwarder = shared.ChannelProgressForwarder(
+        Mock(command_id="command", task_id=42), "run"
+    )
+    async with asyncio.timeout(1):
+        await forwarder.handle_event(Mock())
+        await entered.wait()
+        await forwarder.handle_event(Mock())
+        await forwarder.close(drain=True)
+    assert cancelled.is_set()
+    assert forwarder._sending.done()
+    assert not forwarder._pending

@@ -177,6 +177,28 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
     )
     monkeypatch.setattr(agent_service_manager, "get_agent_manager", lambda: manager)
     bridge = Mock()
+    sending = asyncio.Event()
+    release = asyncio.Event()
+    delivered = []
+
+    async def send_progress(message):
+        sending.set()
+        await release.wait()
+        assert shared._read_channel_result(command.id, selected.run_id) is None
+        delivered.append(message["trace"])
+
+    bridge.reply_for.return_value = send_progress
+
+    async def execute_with_progress(**_):
+        forwarder = tracer.add_handler.call_args.args[0]
+        await forwarder.handle_event(Mock(to_dict=lambda: {"event": "A"}))
+        await sending.wait()
+        await forwarder.handle_event(Mock(to_dict=lambda: {"event": "B"}))
+        await forwarder.handle_event(Mock(to_dict=lambda: {"event": "C"}))
+        release.set()
+        return {"success": True, "status": status, "output": "Worker answer"}
+
+    manager.execute_task.side_effect = execute_with_progress
     monkeypatch.setattr(task_event_bridge, "_bridge", bridge)
     monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
     snapshot = SimpleNamespace(
@@ -224,6 +246,8 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
         == "Worker answer"
     )
     tracer.remove_handler.assert_called_once_with(tracer.add_handler.call_args.args[0])
+    assert delivered == [{"event": "A"}, {"event": "B"}, {"event": "C"}]
+    bridge.discard_command.assert_called_with(command.command_id, command.task_id)
 
 
 def test_completion_waits_for_paused_execution_lease_release(selected):

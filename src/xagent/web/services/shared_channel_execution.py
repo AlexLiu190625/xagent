@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, cast
@@ -42,7 +43,11 @@ from .channel_runtime import (
     _prepare_channel_task_sync,
 )
 from .chat_history_service import persist_user_message_no_commit
-from .db_runtime import await_task_settlement, run_db_io_cancellation_safe
+from .db_runtime import (
+    await_task_settlement,
+    cancel_and_drain_async_task,
+    run_db_io_cancellation_safe,
+)
 from .task_command_transport import (
     ClaimedTaskCommand,
     TaskCommandKind,
@@ -529,16 +534,76 @@ def _read_channel_result(command_id: int, run_id: str) -> dict[str, Any] | None:
 
 
 class ChannelProgressForwarder(TraceHandler):
+    _MAX_PENDING_EVENTS = 128
+    _DRAIN_TIMEOUT_SECONDS = 5.0
+
     def __init__(self, command: ClaimedTaskCommand, run_id: str) -> None:
         self.command = command
         self.run_id = run_id
         self._unavailable = False
         self._next_route_attempt = 0.0
         self._route_retry_delay = 1.0
+        self._sending: asyncio.Task[None] | None = None
+        self._pending: deque[TraceEvent] = deque()
+        self._condition = asyncio.Condition()
+        self._closed = False
+
+    async def close(self, *, drain: bool = False) -> None:
+        async with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        try:
+            if drain and self._sending is not None:
+                try:
+                    async with asyncio.timeout(self._DRAIN_TIMEOUT_SECONDS):
+                        await asyncio.shield(self._sending)
+                except TimeoutError:
+                    logger.warning(
+                        "Channel progress drain timed out; abandoning remaining "
+                        "progress, final reply delivery remains independent task_id=%s",
+                        self.command.task_id,
+                    )
+        finally:
+            try:
+                if self._sending is not None:
+                    await cancel_and_drain_async_task(self._sending)
+            finally:
+                self._pending.clear()
+
+    def _accepting(self) -> bool:
+        return (
+            not self._closed
+            and not self._unavailable
+            and monotonic() >= self._next_route_attempt
+        )
 
     async def handle_event(self, event: TraceEvent) -> None:
-        if self._unavailable or monotonic() < self._next_route_attempt:
-            return
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: not self._accepting()
+                or len(self._pending) < self._MAX_PENDING_EVENTS
+            )
+            if not self._accepting():
+                return
+            self._pending.append(event)
+            if self._sending is None or self._sending.done():
+                self._sending = asyncio.create_task(self._drain())
+
+    async def _drain(self) -> None:
+        while self._pending:
+            async with self._condition:
+                event = self._pending.popleft()
+                self._condition.notify_all()
+            await self._send(event)
+            if self._unavailable or monotonic() < self._next_route_attempt:
+                # Keep the existing best-effort failure policy: abandon this
+                # backlog and let a later event retry the current route.
+                async with self._condition:
+                    self._pending.clear()
+                    self._condition.notify_all()
+                return
+
+    async def _send(self, event: TraceEvent) -> None:
         try:
             await get_task_event_bridge().reply_for(
                 self.command.command_id, self.command.task_id, require_ack=True
@@ -656,6 +721,9 @@ async def execute_channel_background(
                 task_lease=lease,
                 task_lease_heartbeat_task=heartbeat_task,
             )
+        # Drain before publishing the final state: observers must not treat
+        # queued progress as an opportunity to deliver the final reply early.
+        await forwarder.close(drain=True)
         projection = project_execution_result_for_channel(result)
         durable_result = {
             "success": projection.task_status != TaskStatus.FAILED,
@@ -685,4 +753,7 @@ async def execute_channel_background(
             raise TaskLeaseLostError("Channel result no longer owns its execution")
     finally:
         service.tracer.remove_handler(forwarder)
-        get_task_event_bridge().discard_command(command.command_id, command.task_id)
+        try:
+            await forwarder.close()
+        finally:
+            get_task_event_bridge().discard_command(command.command_id, command.task_id)

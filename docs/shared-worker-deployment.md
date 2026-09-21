@@ -278,6 +278,15 @@ sends without consuming the final reply retry budget; final-send failures retain
 the bounded retry budget. Platform sends remain at least once
 when acknowledgement or destination persistence is uncertain.
 
+Worker progress forwarding runs outside the agent's trace dispatch wait. Each
+execution allows one in-flight send and up to 128 queued events. Events are sent
+in order; a full queue applies backpressure instead of dropping healthy progress.
+Connection failures discard the queued backlog and retain the retry policy below.
+Normal execution drains progress for up to five seconds before committing its
+final result, then cancels any remaining send. Cancellation or execution errors
+abort forwarding immediately. Cleanup drains the owned send in all cases.
+Final results keep their independent durable delivery path.
+
 Worker progress retries connection failures on subsequent trace events with an
 exponential delay from one to thirty seconds, reset after successful delivery.
 This includes missing or closed routes, dead ingress hosts and lost acknowledgements,
