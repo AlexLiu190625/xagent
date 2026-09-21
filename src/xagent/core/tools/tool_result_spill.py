@@ -1389,10 +1389,10 @@ def spill_record_shape_is_valid(record: Any) -> bool:
     not take.
 
     Extra keys are tolerated and the two optional fields (record_fields,
-    truncated_after_items) may be absent rather than None, because both
-    consumers read the keys they need by name: a record written by an older
-    or a newer build stays usable as long as every field it does carry is
-    the right shape.
+    truncated_after_items) may be absent rather than None, because a reader
+    of a record takes the keys it needs by name: a record written by an
+    older or a newer build stays usable as long as every field it does
+    carry is the right shape.
 
     relative_path is held to normalize_spilled_relative_path, which accepts
     only "tool-results/<name>" with <name> drawn from [A-Za-z0-9_-] plus a
@@ -1581,6 +1581,7 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
             # record can arrive here unvalidated in two real ways: a
             # checkpoint written by an older build, and a caller that
             # renders before registering.
+            #
             # The dropped record's own strings stay out of this line: they
             # are the tool's text, and the operator needs to know which
             # rule was broken, not what the tool wrote. The rule's name and
