@@ -315,10 +315,10 @@ def test_an_aliased_reserved_temp_name_still_hides_its_target(workspace):
     """Unlike the engine-owned output subtree, this name's target stays hidden.
 
     The engine creates this directory itself, so the only way its name
-    points elsewhere is an alias placed by something else; the files
-    already living there stay internal rather than surfacing as new user
-    files, because the check answers by name and not by resolving to find
-    where the alias physically points.
+    points elsewhere is an alias placed by something else. The name is
+    reserved, and so is the directory inside temp/ that the name resolves
+    to, so scratch data does not surface as a new user file just because it
+    physically lives one directory over.
     """
     workspace.temp_dir.mkdir(parents=True, exist_ok=True)
     workspace.output_dir.mkdir(parents=True, exist_ok=True)
