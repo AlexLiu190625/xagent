@@ -316,11 +316,12 @@ def test_spill_dir_for_workspace_rejects_a_relative_path(
 ):
     """Any relative spelling resolves against the process working directory.
 
-    "./" and "././" return the same relative "output/tool-results" the
-    empty string does; they are not special cases, they are just more
-    spellings of "no directory of its own". The Path spellings need their
-    own cases because str(Path("")) is ".", which is neither empty nor
-    whitespace.
+    Two kinds are collected here: spellings that name no directory of their
+    own ("", "   ", ".", "./", "././", and the Path forms of those), and
+    spellings that do name one but only relative to wherever the process
+    happens to be ("..", "output", Path("relative/w")). Both would join into
+    a non-empty result such as "output/tool-results", which a caller's
+    truthiness guard would pass on.
     """
     with pytest.raises(ValueError) as raised:
         spill_dir_for_workspace(workspace_dir)

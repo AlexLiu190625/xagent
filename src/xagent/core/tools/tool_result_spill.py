@@ -354,12 +354,14 @@ def spill_dir_for_workspace(workspace_dir: str | Path) -> str:
     or "../output/tool-results". A caller's own "no spill directory" guard
     checks truthiness, so it would pass a relative result on and spill files
     would be written and resolved wherever the process happens to be
-    running. This does not narrow what a real caller can pass: every
-    workspace root already reaches this function as an absolute path,
-    because TaskWorkspace resolves it once at construction time
-    (``self.base_dir = Path(base_dir).expanduser().resolve()``) and hands
-    that same absolute value to everything downstream, including the
-    execution context's workspace-path string.
+    running. This does not narrow what a real caller can pass: the only
+    producer of a workspace path in this repository is TaskWorkspace, which
+    resolves it once at construction time
+    (``self.base_dir = Path(base_dir).expanduser().resolve()``), and the
+    execution context's workspace-path string is a copy of that value. The
+    check is here because that string also travels through a persisted
+    checkpoint and comes back unvalidated; a relative one arriving that way
+    should fail loudly rather than silently retarget the spill directory.
     """
     path = Path(workspace_dir)
     if not path.is_absolute():
