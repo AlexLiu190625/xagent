@@ -1,79 +1,24 @@
 """Channel acceptance is atomic and never acquires an ingress lease."""
 
-import os
+# Pytest fixture imports are intentionally shadowed by test parameters.
+# ruff: noqa: F811
+
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import text
-from sqlalchemy.engine import make_url
 
-from tests.shared.postgres_disposable import disposable_database_factory
+from tests.web.services.channel_delivery_shared import database_url as database_url
+from tests.web.services.channel_delivery_shared import selected as selected
 from xagent.web.models.chat_message import TaskChatMessage
-from xagent.web.models.database import Base, get_engine, get_session_local, init_db
+from xagent.web.models.database import get_session_local
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
-from xagent.web.models.user import User
 from xagent.web.models.user_channel import UserChannel
 from xagent.web.services import shared_channel_execution as shared
 from xagent.web.services.channel_runtime import (
     ChannelAuthorizationError,
-    _prepare_channel_task_sync,
 )
 from xagent.web.services.task_orchestrator import TaskTurnError, TaskTurnPayload
-
-
-@pytest.fixture(
-    params=["sqlite", pytest.param("postgresql", marks=pytest.mark.postgresql)]
-)
-def database_url(request, tmp_path):
-    if request.param == "postgresql":
-        with disposable_database_factory("shared_channel") as make:
-            engine = make("worker")
-            with engine.connect() as connection:
-                name = connection.execute(
-                    text("SELECT current_database()")
-                ).scalar_one()
-            yield (
-                make_url(os.environ["XAGENT_TEST_POSTGRES_URL"])
-                .set(database=name)
-                .render_as_string(hide_password=False)
-            )
-    else:
-        yield f"sqlite:///{tmp_path / 'channel.db'}"
-
-
-@pytest.fixture
-def selected(database_url, monkeypatch):
-    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
-    init_db(db_url=database_url)
-    with get_session_local()() as db:
-        user = User(username="owner", password_hash="unused")
-        db.add(user)
-        db.flush()
-        channel = UserChannel(
-            user_id=user.id,
-            channel_type="feishu",
-            channel_name="test",
-            config={"allowed_users": ["sender"]},
-            is_active=True,
-        )
-        db.add(channel)
-        db.commit()
-        channel_id = channel.id
-    selection = _prepare_channel_task_sync(
-        channel_id=channel_id,
-        external_user_id="sender",
-        active_task_id=None,
-        text="hello",
-        channel_name="test",
-        expected_owner_user_id=None,
-        defer_execution=True,
-    )
-    turn = shared.SharedChannelTurn(selection, workspace=SimpleNamespace())
-    turn.origin = "origin-token"
-    yield turn
-    Base.metadata.drop_all(bind=get_engine())
-    get_engine().dispose()
 
 
 def test_acceptance_persists_start_and_single_transcript_without_lease(selected):

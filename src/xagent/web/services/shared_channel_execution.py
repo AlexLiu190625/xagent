@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import Any, cast
 from uuid import uuid4
 
@@ -214,9 +215,7 @@ class SharedChannelTurn:
                 lambda: _settle_pending_selection(self.selection)
             )
 
-    async def execute(
-        self, payload: TaskTurnPayload, trace_handler: TraceHandler | None
-    ) -> dict[str, Any]:
+    def register_trace_handler(self, trace_handler: TraceHandler | None) -> None:
         bridge = get_task_event_bridge()
         bridge.require_ready()
 
@@ -243,6 +242,36 @@ class SharedChannelTurn:
         self.origin = bridge.register_origin(
             self.selection.task_id, self.command_id, receive, recipient=self
         )
+
+    async def observe(self, trace_handler: TraceHandler | None) -> dict[str, Any]:
+        """Attach to an already accepted command without accepting it again."""
+        self.register_trace_handler(trace_handler)
+
+        def attach() -> None:
+            with get_session_local()() as db:
+                db.query(TaskExecutionCommand).filter(
+                    TaskExecutionCommand.id == self.command_db_id,
+                    TaskExecutionCommand.command_id == self.command_id,
+                ).update(
+                    {
+                        "reply_host_id": get_task_event_bridge().host_id,
+                        "reply_origin": self.origin,
+                    },
+                    synchronize_session=False,
+                )
+                db.commit()
+
+        await run_db_io_cancellation_safe(attach)
+        # Acceptance may still be queued; wake dispatch rather than waiting for
+        # its idle poll. Reply routing itself reads the updated row on each send.
+        notify_task_command_dispatcher()
+        return await self.wait_result()
+
+    async def execute(
+        self, payload: TaskTurnPayload, trace_handler: TraceHandler | None
+    ) -> dict[str, Any]:
+        self.register_trace_handler(trace_handler)
+        bridge = get_task_event_bridge()
         if self.stop_requested:
             return {"success": True, "status": "interrupted"}
         acceptance = asyncio.create_task(
@@ -257,6 +286,10 @@ class SharedChannelTurn:
             raise cancellation
         if self.stop_requested:
             self.request_stop()
+        return await self.wait_result()
+
+    async def wait_result(self) -> dict[str, Any]:
+        command_db_id = cast(int, self.command_db_id)
         unavailable_since: float | None = None
         retry_delay = 0.25
         loop = asyncio.get_running_loop()
@@ -500,9 +533,11 @@ class ChannelProgressForwarder(TraceHandler):
         self.command = command
         self.run_id = run_id
         self._unavailable = False
+        self._next_route_attempt = 0.0
+        self._route_retry_delay = 1.0
 
     async def handle_event(self, event: TraceEvent) -> None:
-        if self._unavailable:
+        if self._unavailable or monotonic() < self._next_route_attempt:
             return
         try:
             await get_task_event_bridge().reply_for(
@@ -514,10 +549,15 @@ class ChannelProgressForwarder(TraceHandler):
                     "trace": event.to_dict(),
                 }
             )
+            self._next_route_attempt = 0.0
+            self._route_retry_delay = 1.0
         except ConnectionError:
-            self._unavailable = True
+            # A route can be absent, closed, or on a dead ingress host. Re-read
+            # it on later traces so a replacement observer can receive progress.
+            self._next_route_attempt = monotonic() + self._route_retry_delay
+            self._route_retry_delay = min(self._route_retry_delay * 2, 30.0)
             logger.warning(
-                "Channel progress forwarding stopped after delivery failure task_id=%s",
+                "Channel progress forwarding deferred after delivery failure task_id=%s",
                 self.command.task_id,
             )
             increment_counter("xagent.channel.progress.unavailable")
