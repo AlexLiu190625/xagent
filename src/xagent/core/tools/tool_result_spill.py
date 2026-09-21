@@ -1315,34 +1315,52 @@ def spill_oversized_values(
 
 
 def spill_record_shape_is_valid(record: Any) -> bool:
-    """Gate 1: is this a well-formed report record, regardless of truth.
+    """Is this a well-formed report record, regardless of truth.
 
-    Checks only the seven-field shape a genuine record always has -- string
-    types, non-negative ints, the three-value kind enum. It says nothing
-    about whether the path is canonical (gate 2) or the file actually
-    exists (gate 3); those are separate, deliberately unmerged checks so a
-    variance in one gate cannot be mistaken for a variance in another.
+    Checks the field shape a genuine record has -- string types,
+    non-negative ints, the three-value kind enum -- and that relative_path
+    is spelled the way the writer spells it. It says nothing about whether
+    the file actually exists; that is a separate check, and it belongs to a
+    caller that has a spill directory to look in, which this function does
+    not take.
 
-    Two callers share it: the engine's registration gate, and
-    render_spill_notice, which must not interpolate an unvalidated
-    relative_path, item_count or original_chars into text the model reads.
+    Extra keys are tolerated and the two optional fields (record_fields,
+    truncated_after_items) may be absent rather than None, because both
+    consumers read the keys they need by name: a record written by an older
+    or a newer build stays usable as long as every field it does carry is
+    the right shape.
 
-    relative_path also has to be a single line: render_spill_notice writes
-    it into a notice line verbatim, with no JSON encoding around it, so a
-    line break inside it -- any boundary str.splitlines() recognizes, not
-    only "\\n" -- would end that line early and start a forged one of its
-    own. value_path and record_fields carry the same tool-supplied text,
+    relative_path is held to normalize_spilled_relative_path, which accepts
+    only "tool-results/<name>" with <name> drawn from [A-Za-z0-9_-] plus a
+    .json or .txt suffix. render_spill_notice writes that field into a
+    notice line verbatim, with no JSON encoding around it, so anything
+    else -- a forged clause that stays on one line and reads as trailing
+    engine text, an ANSI escape, a bidi override, or a line break that ends
+    the entry early and starts an entry of its own -- must not reach the
+    renderer. That one rule replaces the earlier line-break rule rather
+    than joining it: the normalizer's output is built from a fixed
+    directory name and a filename matching that character class, so a value
+    equal to its own normalization cannot hold a line boundary in the first
+    place. value_path and record_fields carry the same tool-supplied text,
     but render_spill_notice always passes them through _json_data first,
     which escapes a line break rather than emitting it, so this gate leaves
-    them to the type checks below and does not require them to be single
-    lines too.
+    them to the type checks below.
+
+    No caller in this repository uses it yet. It is written for two: an
+    engine registration gate that decides which records to persist, and
+    render_spill_notice, which must not interpolate an unvalidated
+    relative_path, item_count or original_chars into text the model reads.
     """
     if not isinstance(record, dict):
         return False
     relative_path = record.get("relative_path")
+    # The isinstance check is not redundant with the line below it:
+    # normalize_spilled_relative_path answers None for a value that is not
+    # a string, and a relative_path of None would then equal its own
+    # normalization.
     if not isinstance(relative_path, str):
         return False
-    if relative_path.splitlines() != [relative_path]:
+    if normalize_spilled_relative_path(relative_path) != relative_path:
         return False
     if record.get("kind") not in ("array", "object", "text"):
         return False
@@ -1421,21 +1439,23 @@ def _spill_record_fields_clause(kind: str, record_fields: Any) -> str:
 def _render_spill_record_line(record: dict[str, Any]) -> str:
     """Render one report record as a notice line.
 
-    Renders from whatever the record claims -- a record reaching here has
-    already passed the engine's four registration gates (or, for the
-    observation notice's own tool result, was just built by this run's own
-    writer). relative_path cannot carry a line break by the time it reaches
-    here: render_spill_notice's own shape gate (spill_record_shape_is_valid)
-    already rejects a record whose relative_path is not a single line,
-    since this function writes that field into the notice unescaped. The
-    location and field names below are tool data too, copied verbatim from
-    the tool's own data and never filtered through a character whitelist;
-    instead they are quoted as JSON string values (via _json_data), so an
-    embedded newline, quote, or line separator is escaped rather than able
-    to break out of the line or forge a second entry. The three length caps
-    (field name, value_path, field list) are re-applied here at render time
-    rather than trusted from a record that may have been replayed from an
-    older checkpoint.
+    Renders from whatever the record claims. Its one call site is
+    render_spill_notice, which runs spill_record_shape_is_valid over every
+    record before rendering it, so relative_path is already spelled the way
+    normalize_spilled_relative_path spells it -- that is what makes it safe
+    to write into the notice unescaped, and it also leaves this function's
+    own .get(key, default) fallbacks unreachable, defensive rather than
+    load-bearing. The location and field names below are tool data too,
+    copied verbatim from the tool's own data and never filtered through a
+    character whitelist; instead they are quoted as JSON string values (via
+    _json_data), so an embedded newline, quote, or line separator is
+    escaped rather than able to break out of the line or forge a second
+    entry. The three length caps (field name, value_path, field list) are
+    re-applied here at render time rather than trusted from a record that
+    may have been replayed from an older checkpoint, and the path cap is
+    applied for the same reason: a canonical path is 13 characters of
+    directory plus a name of up to 117, so it can still be longer than the
+    notice gives one entry's path.
     """
     relative_path = str(record.get("relative_path", ""))[:SPILL_NOTICE_PATH_MAX_CHARS]
     value_path = _elide_value_path(str(record.get("value_path", "")))
@@ -1479,8 +1499,9 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
 
     A record whose field shape is not the writer's is dropped the same way
     and for the same reason: this renderer interpolates a record's own
-    fields into text the model reads, so the shape has to be checked here
-    and not only at the engine's registration gate.
+    fields into text the model reads, so both the field shape and the
+    spelling of relative_path are checked here, by this function, rather
+    than assumed to have been checked by whoever produced the list.
     """
     if style not in ("observation", "compaction"):
         raise ValueError(
@@ -1511,10 +1532,13 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
             # The two checks stay apart on purpose. The one above answers
             # "is this a record at all"; this one answers "is every field
             # the shape the writer produces" -- including relative_path
-            # being a single line, since this renderer writes it into the
-            # notice unescaped and a line break inside it would forge an
-            # entry line of its own, one the model would then try to read.
-            # A record can arrive here unvalidated in two real ways: a
+            # being spelled the way the writer spells it, since this
+            # renderer writes that field into the notice unescaped, so a
+            # line break, a forged clause of its own, or an escape sequence
+            # inside it would reach the model as engine text. Whether the
+            # file behind that path still exists is a question this
+            # function cannot ask: it takes no directory to look in. A
+            # record can arrive here unvalidated in two real ways: a
             # checkpoint written by an older build, and a caller that
             # renders before registering.
             logger.warning(
