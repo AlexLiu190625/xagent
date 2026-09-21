@@ -284,6 +284,27 @@ def test_spill_dir_for_workspace_joins_output_and_the_spill_dir_name():
         assert Path(result).parent.parent == Path("/w")
 
 
+@pytest.mark.parametrize(
+    "workspace_dir",
+    ["", "   ", ".", Path(""), Path(".")],
+    ids=["empty", "whitespace_only", "dot", "empty_path", "dot_path"],
+)
+def test_spill_dir_for_workspace_rejects_a_value_that_names_no_directory(
+    workspace_dir,
+):
+    """Every spelling here means "wherever this process happens to be".
+
+    Each one would otherwise return the relative path "output/tool-results",
+    which is truthy, so a caller's own "no directory" guard would let it
+    through and the spill files would land under the process working
+    directory. The Path spellings need their own cases because str(Path(""))
+    is ".", which is neither empty nor whitespace.
+    """
+    with pytest.raises(ValueError) as raised:
+        spill_dir_for_workspace(workspace_dir)
+    assert "workspace_dir" in str(raised.value)
+
+
 def test_spill_dir_for_workspace_agrees_with_the_path_normalizer():
     # The module holds this directory name in two places: this function's
     # own join, and the "output/" prefix normalize_spilled_relative_path
