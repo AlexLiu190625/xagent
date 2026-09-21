@@ -277,8 +277,11 @@ def test_resolve_spilled_under_unreadable_directory_returns_none(
 
 
 def test_spill_dir_for_workspace_joins_output_and_the_spill_dir_name():
-    assert spill_dir_for_workspace("/w") == "/w/output/tool-results"
-    assert spill_dir_for_workspace(Path("/w")) == "/w/output/tool-results"
+    for workspace_dir in ("/w", Path("/w")):
+        result = spill_dir_for_workspace(workspace_dir)
+        assert isinstance(result, str)
+        assert Path(result).parts[-2:] == ("output", "tool-results")
+        assert Path(result).parent.parent == Path("/w")
 
 
 def test_spill_dir_for_workspace_agrees_with_the_path_normalizer():
@@ -290,7 +293,7 @@ def test_spill_dir_for_workspace_agrees_with_the_path_normalizer():
         normalize_spilled_relative_path("output/tool-results/x.json")
         == "tool-results/x.json"
     )
-    assert spill_dir_for_workspace("/w").endswith("output/tool-results")
+    assert Path(spill_dir_for_workspace("/w")).parts[-2:] == ("output", "tool-results")
 
 
 # --- stage 1-b: the four read-side helpers (pure functions) ---------------
