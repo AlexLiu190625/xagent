@@ -66,33 +66,22 @@ def test_scan_all_files_omits_the_engine_directory(workspace, spilled):
     assert engine_file not in scanned
 
 
-# A bare top-level segment such as "output" does not resolve to that
-# directory itself: the resolver behind the named-directory branch only reads
-# a leading "output"/"input"/"temp" segment when the string contains a slash,
-# so a lone "output" is instead treated as a name to look up inside the
-# resolver's own default output directory, and raises FileNotFoundError
-# because no such nested directory exists. The spellings below are the ones
-# that reach the scan for real.
-ROOT_OUTPUT_DIRECTORY_SPELLINGS = [
-    pytest.param("absolute", id="absolute-output-dir"),
-]
-
-
-def _root_output_directory_path(workspace: TaskWorkspace, spelling: str) -> str:
-    if spelling == "absolute":
-        return str(workspace.output_dir)
-    raise AssertionError(f"unhandled spelling: {spelling}")
-
-
-@pytest.mark.parametrize("spelling", ROOT_OUTPUT_DIRECTORY_SPELLINGS)
+# The output root is addressed by its absolute path. A bare top-level segment
+# such as "output" does not resolve to that directory itself: the resolver
+# behind the named-directory branch only reads a leading "output"/"input"/
+# "temp" segment when the string contains a slash, so a lone "output" is
+# instead treated as a name to look up inside the resolver's own default
+# output directory, and raises FileNotFoundError because no such nested
+# directory exists.
 @pytest.mark.parametrize("show_hidden", [False, True])
 def test_named_directory_listing_of_output_root_omits_the_engine_directory(
-    workspace, spilled, spelling, show_hidden
+    workspace, spilled, show_hidden
 ):
     engine_file, user_file = spilled
     ops = WorkspaceFileOperations(workspace)
-    directory_path = _root_output_directory_path(workspace, spelling)
-    listing = ops.list_files(directory_path, show_hidden=show_hidden, recursive=True)
+    listing = ops.list_files(
+        str(workspace.output_dir), show_hidden=show_hidden, recursive=True
+    )
     paths = {entry["path"] for entry in listing["files"]}
     assert str(user_file) in paths
     assert str(engine_file) not in paths
