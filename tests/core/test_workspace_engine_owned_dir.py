@@ -316,9 +316,9 @@ def test_an_aliased_reserved_temp_name_still_hides_its_target(workspace):
 
     The engine creates this directory itself, so the only way its name
     points elsewhere is an alias placed by something else; the files
-    already living there stay internal rather than surface as new user
-    files just because the check no longer follows the name to find where
-    they physically live.
+    already living there stay internal rather than surfacing as new user
+    files, because the check answers by name and not by resolving to find
+    where the alias physically points.
     """
     workspace.temp_dir.mkdir(parents=True, exist_ok=True)
     workspace.output_dir.mkdir(parents=True, exist_ok=True)
@@ -331,6 +331,52 @@ def test_an_aliased_reserved_temp_name_still_hides_its_target(workspace):
     all_files = workspace.get_all_files()
     assert all_files["temp"] == []
     assert note not in workspace._scan_all_files()
+
+
+ESCAPING_ALIAS_TARGETS = [
+    pytest.param("..", id="workspace-root"),
+    pytest.param("../output", id="output-dir"),
+]
+
+
+@pytest.mark.parametrize("relative_target", ESCAPING_ALIAS_TARGETS)
+def test_an_alias_escaping_temp_does_not_hide_the_rest_of_the_workspace(
+    workspace, relative_target
+):
+    """A directory this name points at is reserved only when it sits inside temp/.
+
+    Nothing the engine writes ever lives outside temp/, so an alias that
+    escapes it names no scratch data to protect; honouring it anyway would
+    let a symlink placed under temp/ blank out listings anywhere else in
+    the workspace.
+    """
+    workspace.temp_dir.mkdir(parents=True, exist_ok=True)
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    plain = workspace.output_dir / "plain.txt"
+    plain.write_text("plain", encoding="utf-8")
+    _symlink(relative_target, workspace.internal_temp_dir)
+
+    assert str(plain) in {e["file_path"] for e in workspace.get_output_files()}
+    assert str(plain) in {
+        e["file_path"] for e in workspace.get_output_files(include_subdirs=False)
+    }
+    assert str(plain) in {e["file_path"] for e in workspace.get_all_files()["output"]}
+
+
+def test_an_alias_outside_the_workspace_does_not_hide_output(workspace, tmp_path):
+    workspace.temp_dir.mkdir(parents=True, exist_ok=True)
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    plain = workspace.output_dir / "plain.txt"
+    plain.write_text("plain", encoding="utf-8")
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    _symlink(outside, workspace.internal_temp_dir)
+
+    assert str(plain) in {e["file_path"] for e in workspace.get_output_files()}
+    assert str(plain) in {
+        e["file_path"] for e in workspace.get_output_files(include_subdirs=False)
+    }
+    assert str(plain) in {e["file_path"] for e in workspace.get_all_files()["output"]}
 
 
 CASE_SPELLINGS = [

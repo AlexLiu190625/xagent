@@ -434,11 +434,12 @@ class TaskWorkspace:
 
         Three reserved kinds, skipped by every listing that consults this
         predicate (get_all_files, get_output_files, _scan_all_files): the
-        process-local scratch root under temp, the engine-owned output subtree
-        (see :meth:`is_engine_owned_path`), and any path registered as an
-        internal file id. The file tool's named-directory listing calls
-        is_engine_owned_path directly instead, so it hides only the engine
-        tool-results directory, not the other two kinds.
+        process-local scratch root under temp (and, when that name is an
+        alias, the directory inside temp/ it points at), the engine-owned
+        output subtree (see :meth:`is_engine_owned_path`), and any path
+        registered as an internal file id. The file tool's named-directory
+        listing calls is_engine_owned_path directly instead, so it hides only
+        the engine tool-results directory, not the other two kinds.
         """
 
         resolved_path = file_path.resolve()
@@ -454,14 +455,17 @@ class TaskWorkspace:
         if resolved_path.is_relative_to(reserved_root):
             return True
         # Unlike the engine-owned output subtree, a directory this name
-        # currently points at is ALSO treated as reserved. The engine never
-        # puts a symlink here itself, so the only way the name points
-        # elsewhere is an alias placed by something else, and the files
-        # already living at that alias should stay internal rather than
-        # surface as new user files just because the check above stopped
-        # following the name to find them. A loop has no target to follow,
-        # so it is left to the name-based answer above instead of raising
-        # here.
+        # currently points at is ALSO treated as reserved, but only when
+        # that directory sits inside temp/: the engine never puts a symlink
+        # here itself, so the only way the name points elsewhere is an alias
+        # placed by something else, and scratch data that already lives at
+        # that alias stays internal rather than surfacing as a new user
+        # file. Nothing the engine writes ever lives outside temp/, so an
+        # alias reaching further out names no scratch data to protect;
+        # honouring it there would let a symlink placed under temp/ blank
+        # out listings anywhere else in the workspace. A loop has no target
+        # to follow, so it is left to the name-based answer above instead of
+        # raising here.
         try:
             aliased_target = reserved_root.resolve()
         except RuntimeError:
@@ -469,6 +473,7 @@ class TaskWorkspace:
         if (
             aliased_target is not None
             and aliased_target != reserved_root
+            and aliased_target.is_relative_to(reserved_root.parent)
             and resolved_path.is_relative_to(aliased_target)
         ):
             return True
