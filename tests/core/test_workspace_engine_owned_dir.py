@@ -2,6 +2,7 @@
 
 import errno
 import os
+from pathlib import Path
 
 import pytest
 
@@ -300,10 +301,36 @@ def test_a_loop_at_the_reserved_temp_name_does_not_fail_the_listings(workspace):
     loop = workspace.internal_temp_dir
     _symlink(loop, loop)
 
+    all_files = workspace.get_all_files()
     assert str(ordinary) in {e["file_path"] for e in workspace.get_output_files()}
     assert str(ordinary) in {
-        e["file_path"] for e in workspace.get_all_files()["output"]
+        e["file_path"] for e in workspace.get_output_files(include_subdirs=False)
     }
+    assert str(ordinary) in {e["file_path"] for e in all_files["output"]}
+    assert all_files["temp"] == []
+    assert ordinary in workspace._scan_all_files()
+
+
+def test_an_aliased_reserved_temp_name_still_hides_its_target(workspace):
+    """Unlike the engine-owned output subtree, this name's target stays hidden.
+
+    The engine creates this directory itself, so the only way its name
+    points elsewhere is an alias placed by something else; the files
+    already living there stay internal rather than surface as new user
+    files just because the check no longer follows the name to find where
+    they physically live.
+    """
+    workspace.temp_dir.mkdir(parents=True, exist_ok=True)
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    alias_target = workspace.temp_dir / "drafts"
+    alias_target.mkdir(parents=True)
+    note = alias_target / "note.txt"
+    note.write_text("note", encoding="utf-8")
+    _symlink(alias_target, workspace.internal_temp_dir)
+
+    all_files = workspace.get_all_files()
+    assert all_files["temp"] == []
+    assert note not in workspace._scan_all_files()
 
 
 CASE_SPELLINGS = [
@@ -332,3 +359,139 @@ def test_a_case_variant_of_the_reserved_name_is_reserved(workspace, spilled, spe
             f"output/{spelling}/{engine_file.name}", "rewritten"
         )
     assert engine_file.read_text(encoding="utf-8") == "[]"
+
+
+OUTPUT_SEGMENT_SPELLINGS = ["OUTPUT", "Output"]
+
+
+def _respell_output_segment(
+    workspace: TaskWorkspace, spelling: str, *rest: str
+) -> Path:
+    """Build an absolute path with the output/ segment itself respelled.
+
+    Every entry a listing returns is an absolute path (get_output_files and
+    friends), so a direct writer already holds one; respelling the segment
+    the workspace itself calls "output" is a shape that writer can produce
+    without any other knowledge of the workspace layout.
+    """
+    respelled_output = workspace.output_dir.resolve().with_name(spelling)
+    return respelled_output.joinpath(*rest)
+
+
+@pytest.mark.parametrize("spelling", OUTPUT_SEGMENT_SPELLINGS)
+def test_a_case_variant_of_the_output_segment_still_reserves_the_directory(
+    workspace, spilled, spelling
+):
+    """The whole path down to the reserved name is compared case folded,
+    not only the reserved name's own segment."""
+    engine_file, _ = spilled
+    target = _respell_output_segment(
+        workspace, spelling, SPILL_DIR_NAME, engine_file.name
+    )
+    assert workspace.is_engine_owned_path(target) is True
+    with pytest.raises(ValueError, match="engine-owned"):
+        WorkspaceFileOperations(workspace).write_file(str(target), "rewritten")
+    assert engine_file.read_text(encoding="utf-8") == "[]"
+
+
+@pytest.mark.parametrize("spelling", OUTPUT_SEGMENT_SPELLINGS)
+def test_a_case_variant_of_the_output_segment_refuses_delete_too(
+    workspace, spilled, spelling
+):
+    engine_file, _ = spilled
+    target = _respell_output_segment(
+        workspace, spelling, SPILL_DIR_NAME, engine_file.name
+    )
+    with pytest.raises(ValueError, match="engine-owned"):
+        WorkspaceFileOperations(workspace).delete_file(str(target))
+    assert engine_file.exists()
+    assert engine_file.read_text(encoding="utf-8") == "[]"
+
+
+@pytest.mark.parametrize("spelling", OUTPUT_SEGMENT_SPELLINGS)
+def test_a_case_variant_of_the_output_segment_is_refused_before_the_directory_exists(
+    workspace, spelling
+):
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    target = _respell_output_segment(workspace, spelling, SPILL_DIR_NAME, "x.json")
+    with pytest.raises(ValueError, match="engine-owned"):
+        WorkspaceFileOperations(workspace).write_file(str(target), "planted")
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+def test_output_dir_itself_is_not_engine_owned(workspace):
+    """The reserved subtree sits inside output/; output/ is not the subtree."""
+    assert workspace.is_engine_owned_path(workspace.output_dir) is False
+
+
+def test_a_plain_file_directly_in_output_is_not_engine_owned(workspace):
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    plain = workspace.output_dir / "report.txt"
+    plain.write_text("report", encoding="utf-8")
+    assert workspace.is_engine_owned_path(plain) is False
+
+
+def test_the_reserved_name_only_matters_directly_under_output(workspace):
+    """The rule reserves a name one level under output/, not the name anywhere."""
+    workspace.temp_dir.mkdir(parents=True, exist_ok=True)
+    workspace.input_dir.mkdir(parents=True, exist_ok=True)
+    under_temp = workspace.temp_dir / SPILL_DIR_NAME / "x.json"
+    under_input = workspace.input_dir / SPILL_DIR_NAME / "x.json"
+
+    assert workspace.is_engine_owned_path(under_temp) is False
+    assert workspace.is_engine_owned_path(under_input) is False
+
+
+def test_a_same_named_directory_nested_deeper_than_the_first_level_is_ordinary(
+    workspace,
+):
+    """The rule matches only the first segment under output/, not any depth."""
+    nested = workspace.output_dir / "sub" / SPILL_DIR_NAME
+    nested.mkdir(parents=True)
+    deep_file = nested / "x.json"
+    deep_file.write_text("{}", encoding="utf-8")
+
+    assert workspace.is_engine_owned_path(deep_file) is False
+    assert deep_file in workspace._scan_all_files()
+    assert str(deep_file) in {e["file_path"] for e in workspace.get_output_files()}
+    WorkspaceFileOperations(workspace).write_file(
+        f"output/sub/{SPILL_DIR_NAME}/rewritten.json", "mine"
+    )
+    assert (nested / "rewritten.json").read_text(encoding="utf-8") == "mine"
+
+
+def test_a_case_variant_nested_deeper_than_the_first_level_is_also_ordinary(workspace):
+    """A case variant of the reserved name only matters at the first segment."""
+    nested = workspace.output_dir / "sub" / SPILL_DIR_NAME.upper()
+    nested.mkdir(parents=True)
+    deep_file = nested / "x.json"
+    deep_file.write_text("{}", encoding="utf-8")
+
+    assert workspace.is_engine_owned_path(deep_file) is False
+    assert deep_file in workspace._scan_all_files()
+
+
+NEAR_MISS_DIRECTORY_NAMES = [f"{SPILL_DIR_NAME}-backup", f"a{SPILL_DIR_NAME}"]
+
+
+@pytest.mark.parametrize("name", NEAR_MISS_DIRECTORY_NAMES)
+def test_a_directory_whose_name_only_resembles_the_reserved_name_is_ordinary(
+    workspace, name
+):
+    near_miss = workspace.output_dir / name
+    near_miss.mkdir(parents=True)
+    sibling = near_miss / "x.json"
+    sibling.write_text("{}", encoding="utf-8")
+
+    assert workspace.is_engine_owned_path(sibling) is False
+    assert sibling in workspace._scan_all_files()
+    assert str(sibling) in {e["file_path"] for e in workspace.get_output_files()}
+
+
+def test_a_file_whose_name_only_resembles_the_reserved_name_is_ordinary(workspace):
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    look_alike = workspace.output_dir / f"{SPILL_DIR_NAME}.txt"
+    look_alike.write_text("not the engine directory", encoding="utf-8")
+
+    assert workspace.is_engine_owned_path(look_alike) is False
+    assert look_alike in workspace._scan_all_files()
