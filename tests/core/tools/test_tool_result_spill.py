@@ -2522,6 +2522,11 @@ def test_spill_unavailable_notice_names_no_path_and_no_tool():
     # This text reaches the model when the file behind a placeholder is
     # gone; it must not itself look like a location the model could try to
     # read.
+    assert SPILL_UNAVAILABLE_NOTICE == (
+        "[A large value in this result was stored in a workspace file that is no "
+        "longer available. Treat it as unavailable and do not reconstruct its "
+        "contents.]"
+    )
     assert "tool-results" not in SPILL_UNAVAILABLE_NOTICE
     assert "read_" not in SPILL_UNAVAILABLE_NOTICE
     assert "/" not in SPILL_UNAVAILABLE_NOTICE
