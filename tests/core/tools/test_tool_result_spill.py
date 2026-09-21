@@ -1,7 +1,7 @@
 """Tests for the tool-result-spill module.
 
-Covers the whole module: the two pure path primitives shared by the writer,
-the engine's registration gate, and the read tool
+Covers the whole module: the two pure path primitives written for the writer,
+an engine registration gate that is not wired up yet, and the read tool
 (``normalize_spilled_relative_path`` / ``resolve_spilled_under``); the
 walk/write path that decides what gets spilled and writes it to disk
 (``spill_oversized_values`` and its helpers); and the notice renderer
@@ -327,7 +327,7 @@ def test_spill_dir_for_workspace_rejects_a_relative_path(
     assert "absolute" in str(raised.value)
 
 
-def test_spill_dir_for_workspace_agrees_with_the_path_normalizer():
+def test_spill_dir_for_workspace_spells_output_the_way_the_normalizer_strips_it():
     # The module holds this directory name in two places: this function's
     # own join, and the "output/" prefix normalize_spilled_relative_path
     # strips. Each assertion below pins its own side against the literal
