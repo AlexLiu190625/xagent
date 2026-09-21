@@ -286,23 +286,45 @@ def test_spill_dir_for_workspace_joins_output_and_the_spill_dir_name():
 
 @pytest.mark.parametrize(
     "workspace_dir",
-    ["", "   ", ".", Path(""), Path(".")],
-    ids=["empty", "whitespace_only", "dot", "empty_path", "dot_path"],
+    [
+        "",
+        "   ",
+        ".",
+        Path(""),
+        Path("."),
+        "./",
+        "././",
+        "..",
+        "output",
+        Path("relative/w"),
+    ],
+    ids=[
+        "empty",
+        "whitespace_only",
+        "dot",
+        "empty_path",
+        "dot_path",
+        "dot_slash",
+        "dot_slash_repeated",
+        "parent",
+        "bare_relative_name",
+        "relative_path_object",
+    ],
 )
-def test_spill_dir_for_workspace_rejects_a_value_that_names_no_directory(
+def test_spill_dir_for_workspace_rejects_a_relative_path(
     workspace_dir,
 ):
-    """Every spelling here means "wherever this process happens to be".
+    """Any relative spelling resolves against the process working directory.
 
-    Each one would otherwise return the relative path "output/tool-results",
-    which is truthy, so a caller's own "no directory" guard would let it
-    through and the spill files would land under the process working
-    directory. The Path spellings need their own cases because str(Path(""))
-    is ".", which is neither empty nor whitespace.
+    "./" and "././" return the same relative "output/tool-results" the
+    empty string does; they are not special cases, they are just more
+    spellings of "no directory of its own". The Path spellings need their
+    own cases because str(Path("")) is ".", which is neither empty nor
+    whitespace.
     """
     with pytest.raises(ValueError) as raised:
         spill_dir_for_workspace(workspace_dir)
-    assert "workspace_dir" in str(raised.value)
+    assert "absolute" in str(raised.value)
 
 
 def test_spill_dir_for_workspace_agrees_with_the_path_normalizer():

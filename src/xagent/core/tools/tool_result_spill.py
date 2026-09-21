@@ -347,25 +347,28 @@ def spill_dir_for_workspace(workspace_dir: str | Path) -> str:
     relative layout lives here, and returns a str rather than a Path
     because that is what SpillTarget and resolve_spilled_under take.
 
-    Raises ValueError for a workspace_dir that names no directory of its
-    own. Empty, whitespace-only, "." and Path("") all describe the process
-    working directory, and joining the layout onto one of them returns the
-    relative "output/tool-results" -- truthy, so a caller's own "no spill
-    directory" guard would pass it on and spill files would be written and
-    resolved wherever the process happens to be running. Path("") and
-    Path(".") both stringify to ".", so the check is written against that
-    string rather than against emptiness alone. A relative path that does
-    name a directory is left to the caller: this function knows nothing
-    about which roots are legitimate.
+    Raises ValueError for a workspace_dir that is not an absolute path. Any
+    relative spelling -- "", ".", "./", "././", "..", "output" -- resolves
+    against the process's current working directory, not the workspace, and
+    the join still produces a non-empty result such as "output/tool-results"
+    or "../output/tool-results". A caller's own "no spill directory" guard
+    checks truthiness, so it would pass a relative result on and spill files
+    would be written and resolved wherever the process happens to be
+    running. This does not narrow what a real caller can pass: every
+    workspace root already reaches this function as an absolute path,
+    because TaskWorkspace resolves it once at construction time
+    (``self.base_dir = Path(base_dir).expanduser().resolve()``) and hands
+    that same absolute value to everything downstream, including the
+    execution context's workspace-path string.
     """
-    text = str(workspace_dir).strip()
-    if not text or text == ".":
+    path = Path(workspace_dir)
+    if not path.is_absolute():
         raise ValueError(
-            f"workspace_dir must name a workspace directory, not {workspace_dir!r}: "
-            "the spill directory would be resolved against the process working "
-            "directory"
+            f"workspace_dir must be an absolute path, not {workspace_dir!r}: "
+            "a relative one would put the spill directory wherever the process "
+            "happens to be running"
         )
-    return str(Path(workspace_dir) / SPILL_WORKSPACE_OUTPUT_DIR_NAME / SPILL_DIR_NAME)
+    return str(path / SPILL_WORKSPACE_OUTPUT_DIR_NAME / SPILL_DIR_NAME)
 
 
 def _spill_json_default(value: Any) -> str:
