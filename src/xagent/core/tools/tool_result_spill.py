@@ -1,11 +1,12 @@
 """Spill oversized tool results to a workspace file instead of truncating them.
 
 This module is the single owner of the tool-result-spill mechanism: the two
-path primitives shared by the writer, the engine's registration gate, and the
-read tool (``normalize_spilled_relative_path`` / ``resolve_spilled_under``),
-plus the constants that describe the on-disk and in-context contract. Later
-stages in this same module add the walk/write path and the read-side
-helpers; nothing here depends on them.
+path primitives written to be shared by the writer, an engine registration
+gate and the read tool (``normalize_spilled_relative_path`` /
+``resolve_spilled_under``), plus the constants that describe the on-disk and
+in-context contract. Later stages in this same module add the walk/write path
+and the read-side helpers; nothing here depends on them. The engine side is
+not wired up yet: outside this module and its tests, nothing calls in.
 """
 
 from __future__ import annotations
@@ -333,13 +334,14 @@ def resolve_spilled_under(
 def spill_dir_for_workspace(workspace_dir: str | Path) -> str:
     """This workspace's spill directory, as the plain string SpillTarget holds.
 
-    The one place the layout is built. Three callers need the same
+    The one place the layout is built. Nothing in this repository calls it
+    yet; it is written for the three callers that will need the same
     directory from three different starting points -- the tool factory
     holds a workspace object, the execution context holds only a workspace
-    path string, and the read tool holds a workspace object again -- and
-    before this function each of them joined the parts itself, in two
-    different spellings. A directory that three callers spell separately
-    is a directory that moves in two of the three places.
+    path string, and the read tool holds a workspace object again -- each
+    of which would otherwise join the parts itself. A directory that three
+    callers spell separately is a directory that moves in two of the three
+    places.
 
     Takes the workspace root rather than its output directory so the whole
     relative layout lives here, and returns a str rather than a Path
@@ -1248,8 +1250,8 @@ def spill_oversized_values(
     oversized -- or a new object built by copying only the containers on
     each spilled path (see _copy_and_set). Returns
     (possibly-new result, report records) -- the records are not yet
-    validated against a registry; that happens at the engine's four gates,
-    not here.
+    validated against a registry; that is for the engine side to do when it
+    registers them, not here.
 
     No key of `result` is ever dropped. A value is replaced by the
     placeholder or left as it was; nothing disappears from the returned
@@ -1323,9 +1325,10 @@ def spill_oversized_values(
             records.append(record)
             new_result = _copy_and_set(new_result, path, SPILL_PLACEHOLDER_TEXT)
         if records:
-            # The report travels with the result itself: add_tool_result's
-            # registration gate reads it from the result dict the wrapper
-            # returns, the same way it does for the whole-root tier.
+            # The report travels with the result itself, so the engine side
+            # can read it back off the result dict the wrapper returns
+            # rather than being handed it separately -- the same way it
+            # will for the whole-root tier.
             new_result = {**new_result, SPILL_RESERVED_RESULT_KEY: records}
         return new_result, records
     return _second_tier_result(result, target, tool_name, budget)
