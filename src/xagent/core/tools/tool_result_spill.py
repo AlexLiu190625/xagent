@@ -1331,6 +1331,50 @@ def spill_oversized_values(
     return _second_tier_result(result, target, tool_name, budget)
 
 
+def _spill_record_shape_failure(record: Any) -> str | None:
+    """Name the first shape rule ``record`` breaks, or None if it breaks none.
+
+    The answer is drawn from this function's own fixed wording and never
+    from the record itself. A record that fails here is one whose fields
+    are not the writer's, so every string it carries -- its keys as much as
+    its values -- is text a tool chose, and none of it is safe to hand to a
+    log line.
+    """
+    if not isinstance(record, dict):
+        return "record is not a dict"
+    relative_path = record.get("relative_path")
+    # The isinstance check is not redundant with the line below it:
+    # normalize_spilled_relative_path answers None for a value that is not
+    # a string, and a relative_path of None would then equal its own
+    # normalization.
+    if not isinstance(relative_path, str):
+        return "relative_path is not a string"
+    if normalize_spilled_relative_path(relative_path) != relative_path:
+        return "relative_path is not a canonical spilled-result path"
+    if record.get("kind") not in ("array", "object", "text"):
+        return "kind is not array, object or text"
+    for key in ("item_count", "original_chars"):
+        value = record.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return f"{key} is not a non-negative int"
+    if not isinstance(record.get("value_path"), str):
+        return "value_path is not a string"
+    record_fields = record.get("record_fields")
+    if record_fields is not None and not (
+        isinstance(record_fields, list)
+        and all(isinstance(item, str) for item in record_fields)
+    ):
+        return "record_fields is not a list of strings"
+    truncated_after_items = record.get("truncated_after_items")
+    if truncated_after_items is not None and (
+        not isinstance(truncated_after_items, int)
+        or isinstance(truncated_after_items, bool)
+        or truncated_after_items < 0
+    ):
+        return "truncated_after_items is not a non-negative int"
+    return None
+
+
 def spill_record_shape_is_valid(record: Any) -> bool:
     """Is this a well-formed report record, regardless of truth.
 
@@ -1367,40 +1411,13 @@ def spill_record_shape_is_valid(record: Any) -> bool:
     engine registration gate that decides which records to persist, and
     render_spill_notice, which must not interpolate an unvalidated
     relative_path, item_count or original_chars into text the model reads.
+
+    The rules themselves live in _spill_record_shape_failure, which answers
+    which rule was broken rather than only that one was, so a caller that
+    drops a record can say so in its log line. This is the answer for a
+    caller that only needs to decide.
     """
-    if not isinstance(record, dict):
-        return False
-    relative_path = record.get("relative_path")
-    # The isinstance check is not redundant with the line below it:
-    # normalize_spilled_relative_path answers None for a value that is not
-    # a string, and a relative_path of None would then equal its own
-    # normalization.
-    if not isinstance(relative_path, str):
-        return False
-    if normalize_spilled_relative_path(relative_path) != relative_path:
-        return False
-    if record.get("kind") not in ("array", "object", "text"):
-        return False
-    for key in ("item_count", "original_chars"):
-        value = record.get(key)
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            return False
-    if not isinstance(record.get("value_path"), str):
-        return False
-    record_fields = record.get("record_fields")
-    if record_fields is not None and not (
-        isinstance(record_fields, list)
-        and all(isinstance(item, str) for item in record_fields)
-    ):
-        return False
-    truncated_after_items = record.get("truncated_after_items")
-    if truncated_after_items is not None and (
-        not isinstance(truncated_after_items, int)
-        or isinstance(truncated_after_items, bool)
-        or truncated_after_items < 0
-    ):
-        return False
-    return True
+    return _spill_record_shape_failure(record) is None
 
 
 SPILL_OBSERVATION_NOTICE_MAX_CHARS = 1_536
@@ -1457,8 +1474,10 @@ def _render_spill_record_line(record: dict[str, Any]) -> str:
     """Render one report record as a notice line.
 
     Renders from whatever the record claims. Its one call site is
-    render_spill_notice, which runs spill_record_shape_is_valid over every
-    record before rendering it, so relative_path is already spelled the way
+    render_spill_notice, which puts every record through the same rules
+    spill_record_shape_is_valid answers for -- one at a time, so it can
+    name the one that failed -- before rendering it. The relative_path that
+    reaches here is therefore already spelled the way
     normalize_spilled_relative_path spells it -- that is what makes it safe
     to write into the notice unescaped, and it also leaves this function's
     own .get(key, default) fallbacks unreachable, defensive rather than
@@ -1545,7 +1564,8 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
                 type(record),
             )
             continue
-        if not spill_record_shape_is_valid(record):
+        shape_failure = _spill_record_shape_failure(record)
+        if shape_failure is not None:
             # The two checks stay apart on purpose. The one above answers
             # "is this a record at all"; this one answers "is every field
             # the shape the writer produces" -- including relative_path
@@ -1558,9 +1578,16 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
             # record can arrive here unvalidated in two real ways: a
             # checkpoint written by an older build, and a caller that
             # renders before registering.
+            # The dropped record's own strings stay out of this line: they
+            # are the tool's text, and the operator needs to know which
+            # rule was broken, not what the tool wrote. The rule's name and
+            # the number of keys are both this engine's own words.
             logger.warning(
                 "Ignoring a spilled-result record whose field shape is not "
-                "the one the spill writer produces."
+                "the one the spill writer produces: %s; the record carries "
+                "%d keys.",
+                shape_failure,
+                len(record),
             )
             continue
         path = record.get("relative_path")

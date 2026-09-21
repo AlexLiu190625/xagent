@@ -2689,12 +2689,58 @@ def test_render_spill_notice_returns_empty_when_every_record_fails_the_shape_che
 
 
 def test_render_spill_notice_non_dict_and_invalid_shape_log_different_warnings(caplog):
+    # Each message is pinned against its own branch's wording, so the two
+    # log calls being swapped fails here; a bare inequality would not.
     with caplog.at_level("WARNING"):
         render_spill_notice(
             ["not a dict", _shape_invalid_record()], style="observation"
         )
     assert len(caplog.messages) == 2
-    assert caplog.messages[0] != caplog.messages[1]
+    assert "not a dict" in caplog.messages[0]
+    assert "field shape" not in caplog.messages[0]
+    assert "field shape" in caplog.messages[1]
+    assert "not a dict" not in caplog.messages[1]
+
+
+SHAPE_FAILURE_CASES = [
+    (
+        "relative_path",
+        {**VALID_SHAPE_RECORD, "relative_path": "tool-results/x.json and more text"},
+    ),
+    ("kind", {**VALID_SHAPE_RECORD, "kind": "binary"}),
+    ("item_count", {**VALID_SHAPE_RECORD, "item_count": -1}),
+    ("value_path", _shape_invalid_record()),
+    ("record_fields", {**VALID_SHAPE_RECORD, "record_fields": [1]}),
+]
+
+
+@pytest.mark.parametrize(
+    "failing_field, record",
+    SHAPE_FAILURE_CASES,
+    ids=[field_name for field_name, _ in SHAPE_FAILURE_CASES],
+)
+def test_render_spill_notice_warning_names_the_failing_field_only(
+    caplog, failing_field, record
+):
+    """The warning says which rule was broken and nothing the record spelled.
+
+    A record that fails this check is one whose fields are not the
+    writer's, so every string it carries -- its keys as much as its
+    values -- is text a tool chose. The message therefore names the field
+    whose rule was broken, which is this module's own word, and counts the
+    record's keys, which is a number.
+    """
+    with caplog.at_level("WARNING"):
+        assert render_spill_notice([record], style="observation") == ""
+
+    assert len(caplog.messages) == 1
+    message = caplog.messages[0]
+    assert "field shape" in message
+    assert failing_field in message
+    assert f"{len(record)} keys" in message
+    for value in record.values():
+        if isinstance(value, str) and value not in ("array", "object", "text"):
+            assert value not in message
 
 
 def test_render_spill_notice_still_renders_a_well_formed_record_unchanged(tmp_path):
