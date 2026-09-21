@@ -287,22 +287,26 @@ class TaskWorkspace:
     def is_engine_owned_path(self, file_path: Path) -> bool:
         """Return whether a path is the engine-owned output subtree or inside it.
 
-        Resolves both sides before comparing, so a ``..`` segment and a
-        symlink pointing into the subtree both land on the real path. Equality
-        counts as containment, which is what makes the directory itself
-        unremovable and its name unusable for a plain file.
+        The subtree is a name under ``output/``, not whatever that name
+        currently points at. The parent is resolved, so a ``..`` segment, a
+        symlink pointing into the subtree and a symlinked ``output/`` all land
+        on the real path; the reserved segment itself is never followed,
+        because a direct writer can put a symlink there and following it would
+        let that writer choose which directory is protected. Equality counts
+        as containment, which is what makes the directory itself unremovable
+        and its name unusable for a plain file.
 
-        Not defensive on purpose: on interpreters where a symlink loop makes
-        ``resolve()`` raise RuntimeError, that error propagates instead of
-        being turned into False, because a write guard must fail rather than
-        proceed on an unanswered question; where ``resolve()`` instead
-        returns the loop path unresolved, the comparison is made on that
-        path. Listing callers that must not change how such an entry is
+        Not defensive on purpose: on interpreters where a symlink loop in the
+        argument makes ``resolve()`` raise RuntimeError, that error propagates
+        instead of being turned into False, because a write guard must fail
+        rather than proceed on an unanswered question; where ``resolve()``
+        instead returns the loop path unresolved, the comparison is made on
+        that path. Listing callers that must not change how such an entry is
         reported handle the error themselves.
         """
 
         return file_path.resolve().is_relative_to(
-            self.engine_owned_output_dir.resolve()
+            self.output_dir.resolve() / SPILL_DIR_NAME
         )
 
     def register_internal_file(
