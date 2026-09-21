@@ -21,8 +21,7 @@ from ...file_ref import (
     parse_file_id_ref,
     safe_asset_filename,
 )
-from ...workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
-from ..tool_result_spill import SPILL_DIR_NAME
+from ...workspace import DEFAULT_USER_FILE_LIST_LIMIT, SPILL_DIR_NAME, TaskWorkspace
 from .document_parser import DocumentCapabilities, DocumentParseArgs, parse_document
 from .file_tool import (
     EditOperation,

@@ -7,8 +7,7 @@ from pathlib import Path
 import pytest
 
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
-from xagent.core.tools.tool_result_spill import SPILL_DIR_NAME
-from xagent.core.workspace import TaskWorkspace
+from xagent.core.workspace import SPILL_DIR_NAME, TaskWorkspace
 
 
 @pytest.fixture

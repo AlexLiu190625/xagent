@@ -23,12 +23,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from ..workspace import SPILL_DIR_NAME
 from .artifacts import is_file_ref_like
 from .user_interaction import tool_result_waits_for_user
 
 logger = logging.getLogger(__name__)
 
-SPILL_DIR_NAME = "tool-results"
 SPILL_RESERVED_RESULT_KEY = "_xagent_spilled_results"
 SPILL_PLACEHOLDER_TEXT = "[large result stored by the engine; see the notice below]"
 # What the placeholder costs inside the serialized result, which is two

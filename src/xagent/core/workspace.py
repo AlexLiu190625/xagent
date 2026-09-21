@@ -42,14 +42,6 @@ from .file_ref import (
 )
 from .file_storage.keys import build_user_key_prefix
 
-# The engine's spilled-tool-result directory name has exactly one owner, the
-# spill module, so this file never spells it a second time. The import runs
-# one way only: tool_result_spill and everything it pulls in (artifacts,
-# user_interaction, file_ref, artifact_validation) import no workspace module,
-# so this is not a cycle. Keep it that way -- adding a workspace import to
-# tool_result_spill or to artifacts would turn this into a real one.
-from .tools.tool_result_spill import SPILL_DIR_NAME
-
 if TYPE_CHECKING:
     from ..web.services.uploaded_file_store import (
         StagedUploadedFile,
@@ -72,6 +64,10 @@ _internal_file_registry: Dict[Tuple[str, str], Path] = {}
 _internal_path_registry: Dict[Tuple[str, str], str] = {}
 _internal_file_registry_lock = RLock()
 _INTERNAL_TEMP_DIR_NAME = ".xagent-internal"
+# The name of the output subtree the engine owns for spilled tool results.
+# It is defined here, on the workspace side, and the spill module imports it
+# from here: tool modules import core.workspace, never the other way round.
+SPILL_DIR_NAME = "tool-results"
 
 
 def scoped_user_root(
