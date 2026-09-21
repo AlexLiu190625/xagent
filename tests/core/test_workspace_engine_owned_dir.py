@@ -206,13 +206,13 @@ def test_ownership_holds_when_the_output_dir_itself_is_a_symlink(tmp_path):
     ``output_dir`` is built by appending names to a resolved ``base_dir``; no
     construction step resolves it, so only the comparison site can see through
     a symlink standing where ``output/`` does. Drop ``.resolve()`` from the
-    right-hand side of ``is_engine_owned_path`` and both the listing and the
-    write refusal go silently permissive.
+    parent of the reserved segment and both the listing and the write refusal
+    go silently permissive.
     """
 
-    elsewhere = tmp_path / "elsewhere"
-    (elsewhere / SPILL_DIR_NAME).mkdir(parents=True)
     workspace = TaskWorkspace("task_symlinked_output", str(tmp_path / "base"))
+    elsewhere = workspace.workspace_dir / "real-output"
+    (elsewhere / SPILL_DIR_NAME).mkdir(parents=True)
     workspace.output_dir.rmdir()
     try:
         workspace.output_dir.symlink_to(elsewhere, target_is_directory=True)
@@ -228,7 +228,107 @@ def test_ownership_holds_when_the_output_dir_itself_is_a_symlink(tmp_path):
     listed = {entry["file_path"] for entry in workspace.get_output_files()}
     assert str(user_file) in listed
     assert str(engine_file) not in listed
-    with pytest.raises(ValueError, match=SPILL_DIR_NAME):
+    with pytest.raises(ValueError, match="engine-owned"):
         WorkspaceFileOperations(workspace).write_file(
             str(workspace.output_dir / SPILL_DIR_NAME / "mine.txt"), "x"
         )
+
+
+def _symlink(target, link):
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available on this platform/user")
+
+
+def test_a_symlink_standing_in_for_the_reserved_name_does_not_move_the_directory(
+    workspace,
+):
+    """The reserved directory is a name under output/, not its symlink target.
+
+    The model's code execution tools run with output/ as their working
+    directory, so a direct writer can put a symlink where the reserved name
+    would go. Following it would hand that writer the choice of which
+    directory is protected: every file under the target would drop out of the
+    deliverables and become unwritable.
+    """
+    reports = workspace.output_dir / "reports"
+    reports.mkdir(parents=True)
+    report = reports / "quarterly.pdf"
+    report.write_text("report", encoding="utf-8")
+    _symlink("reports", workspace.output_dir / SPILL_DIR_NAME)
+
+    assert workspace.is_engine_owned_path(report) is False
+    assert str(report) in {e["file_path"] for e in workspace.get_output_files()}
+    assert str(report) in {e["file_path"] for e in workspace.get_all_files()["output"]}
+    assert report in workspace._scan_all_files()
+    WorkspaceFileOperations(workspace).write_file(
+        f"output/reports/{report.name}", "rewritten"
+    )
+    assert report.read_text(encoding="utf-8") == "rewritten"
+
+
+def test_a_loop_at_the_reserved_name_does_not_fail_unrelated_callers(workspace):
+    """A loop where the reserved directory would be is one entry's problem.
+
+    Resolving the reserved name itself put the failure on the right-hand side
+    of the comparison, where it had nothing to do with the path being asked
+    about, so every caller failed about every path.
+    """
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    ordinary = workspace.output_dir / "plain.txt"
+    ordinary.write_text("plain", encoding="utf-8")
+    loop = workspace.output_dir / SPILL_DIR_NAME
+    _symlink(loop, loop)
+
+    assert workspace.is_engine_owned_path(ordinary) is False
+    assert str(ordinary) in {e["file_path"] for e in workspace.get_output_files()}
+    assert str(ordinary) in {
+        e["file_path"] for e in workspace.get_all_files()["output"]
+    }
+    assert ordinary in workspace._scan_all_files()
+    WorkspaceFileOperations(workspace).write_file("output/plain.txt", "rewritten")
+    assert ordinary.read_text(encoding="utf-8") == "rewritten"
+
+
+def test_a_loop_at_the_reserved_temp_name_does_not_fail_the_listings(workspace):
+    """The temp reserved root is compared the same way, for the same reason."""
+    workspace.temp_dir.mkdir(parents=True, exist_ok=True)
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    ordinary = workspace.output_dir / "plain.txt"
+    ordinary.write_text("plain", encoding="utf-8")
+    loop = workspace.internal_temp_dir
+    _symlink(loop, loop)
+
+    assert str(ordinary) in {e["file_path"] for e in workspace.get_output_files()}
+    assert str(ordinary) in {
+        e["file_path"] for e in workspace.get_all_files()["output"]
+    }
+
+
+CASE_SPELLINGS = [
+    SPILL_DIR_NAME.upper(),
+    SPILL_DIR_NAME.capitalize(),
+    SPILL_DIR_NAME.title(),
+]
+
+
+@pytest.mark.parametrize("spelling", CASE_SPELLINGS)
+def test_a_case_variant_of_the_reserved_name_is_reserved(workspace, spilled, spelling):
+    """One rule on every operating system, so one expectation in one test.
+
+    On a case-insensitive file system this spelling is the engine's own
+    directory, and a segment-by-segment comparison would let the write reach
+    the engine's bytes. On a case-sensitive file system it is a different
+    directory that the rule reserves anyway. Either way the answer, and this
+    assertion, are the same.
+    """
+    engine_file, _ = spilled
+    assert spelling != SPILL_DIR_NAME
+    target = workspace.output_dir / spelling / engine_file.name
+    assert workspace.is_engine_owned_path(target) is True
+    with pytest.raises(ValueError, match="engine-owned"):
+        WorkspaceFileOperations(workspace).write_file(
+            f"output/{spelling}/{engine_file.name}", "rewritten"
+        )
+    assert engine_file.read_text(encoding="utf-8") == "[]"
