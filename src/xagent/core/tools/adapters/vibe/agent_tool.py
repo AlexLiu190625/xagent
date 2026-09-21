@@ -1984,14 +1984,18 @@ class AgentTool(AbstractBaseTool):
     def _resolve_delegated_output_path(self, workspace: Any, raw_path: str) -> Path:
         raw = raw_path.strip()
         path = Path(raw)
+        # A delegated output is about to be registered as one of the parent
+        # task's own files, so it resolves through the write-side entry: a
+        # path inside the engine-owned subtree is refused there and skipped
+        # by the caller like any other unresolvable path.
         if path.is_absolute():
-            return Path(workspace.resolve_path(raw))
+            return Path(workspace.resolve_write_path(raw))
 
         first_part = Path(raw).parts[0] if Path(raw).parts else ""
         default_dir = (
             "workspace" if first_part in {"input", "output", "temp"} else "output"
         )
-        return Path(workspace.resolve_path(raw, default_dir=default_dir))
+        return Path(workspace.resolve_write_path(raw, default_dir=default_dir))
 
     def _parent_owned_file_outputs(
         self, file_outputs: Any, workspace: Any, db: Any

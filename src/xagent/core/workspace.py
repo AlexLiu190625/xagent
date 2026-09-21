@@ -274,8 +274,10 @@ class TaskWorkspace:
         file to the model in its own words. Those descriptions are only true
         while the files hold the bytes the engine wrote, so this subtree is
         listed by no workspace listing, registered by no auto-registration,
-        and written by no workspace file tool. Reads are deliberately left
-        alone: the model still reaches a spilled file by path.
+        written by no workspace file tool, and refused to every tool that
+        resolves a destination through :meth:`resolve_write_path`. Reads are
+        deliberately left alone: the model still reaches a spilled file by
+        path.
         """
 
         return self.output_dir / SPILL_DIR_NAME
@@ -326,6 +328,47 @@ class TaskWorkspace:
         if not relative_parts:
             return False
         return relative_parts[0] == reserved_root.name.casefold()
+
+    def refuse_engine_owned_write(self, resolved_path: Path, requested: str) -> Path:
+        """Refuse one resolved write target that lands in the engine-owned subtree.
+
+        The one place that turns :meth:`is_engine_owned_path` into a write
+        refusal. The workspace file tools reach it through their own
+        resolvers; tools that resolve a destination through
+        :meth:`resolve_write_path` reach it there; reads never do. Writers
+        that build their own destination do not pass here (see the known
+        limitations).
+
+        Raises ValueError, the class the resolvers already raise for a target
+        outside the workspace, so a caller that handles that refusal handles
+        this one the same way, and the model sees a readable sentence naming
+        the path and the reason rather than a generic framework error.
+        """
+
+        if self.is_engine_owned_path(resolved_path):
+            raise ValueError(
+                f"Path '{requested}' is inside the engine-owned "
+                f"'{SPILL_DIR_NAME}' directory. The engine stores oversized "
+                "tool results there and that directory is read-only for file "
+                "tools: you can read those files, but you cannot write, edit, "
+                "delete or create anything inside it. Write your own files "
+                "somewhere else under output/."
+            )
+        return resolved_path
+
+    def resolve_write_path(self, file_path: str, default_dir: str = "output") -> Path:
+        """Resolve a target the caller is about to write, then apply the policy.
+
+        Same resolution as :meth:`resolve_path`, followed by
+        :meth:`refuse_engine_owned_write`. Tools that take a destination from
+        the model and write to it directly -- rather than through the
+        workspace file tools -- resolve it here, so the engine-owned subtree
+        is refused on that path as well.
+        """
+
+        return self.refuse_engine_owned_write(
+            self.resolve_path(file_path, default_dir), file_path
+        )
 
     def register_internal_file(
         self,

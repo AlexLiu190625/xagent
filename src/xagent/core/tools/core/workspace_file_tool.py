@@ -21,7 +21,7 @@ from ...file_ref import (
     parse_file_id_ref,
     safe_asset_filename,
 )
-from ...workspace import DEFAULT_USER_FILE_LIST_LIMIT, SPILL_DIR_NAME, TaskWorkspace
+from ...workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
 from .document_parser import DocumentCapabilities, DocumentParseArgs, parse_document
 from .file_tool import (
     EditOperation,
@@ -824,27 +824,16 @@ class WorkspaceFileOperations:
     def _reject_engine_owned_target(self, resolved_path: Path, requested: str) -> Path:
         """Refuse one resolved write target that lands in the engine's subtree.
 
-        The single place this class decides that question. Every write, edit,
-        delete and directory creation reaches it through
-        :meth:`_resolve_write_path` or :meth:`_resolve_existing_write_path`;
-        reads never reach it at all.
-
-        Raises ValueError, the same class ``_resolve_path`` already raises for
-        a target outside the workspace, so the model sees this refusal in the
-        shape it already sees path refusals in -- a readable sentence naming
-        the path and the reason, not a generic framework error.
+        Every write, edit, delete and directory creation of this class reaches
+        it through :meth:`_resolve_write_path` or
+        :meth:`_resolve_existing_write_path`; reads never reach it at all. The
+        decision and its message belong to the workspace
+        (:meth:`TaskWorkspace.refuse_engine_owned_write`); this class only
+        keeps its own resolvers in front of it, because they read a leading
+        ``output/`` segment differently from ``TaskWorkspace.resolve_path``.
         """
 
-        if self.workspace.is_engine_owned_path(resolved_path):
-            raise ValueError(
-                f"Path '{requested}' is inside the engine-owned "
-                f"'{SPILL_DIR_NAME}' directory. The engine stores oversized "
-                "tool results there and that directory is read-only for file "
-                "tools: you can read those files, but you cannot write, edit, "
-                "delete or create anything inside it. Write your own files "
-                "somewhere else under output/."
-            )
-        return resolved_path
+        return self.workspace.refuse_engine_owned_write(resolved_path, requested)
 
     def _resolve_write_path(self, file_path: str, default_dir: str = "output") -> Path:
         """Resolve a write target that need not exist yet, then apply the policy."""

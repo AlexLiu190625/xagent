@@ -540,3 +540,56 @@ def test_a_file_whose_name_only_resembles_the_reserved_name_is_ordinary(workspac
 
     assert workspace.is_engine_owned_path(look_alike) is False
     assert look_alike in workspace._scan_all_files()
+
+
+# --------------------------------------------------------------------------
+# The write-side resolver on the workspace itself
+# --------------------------------------------------------------------------
+
+WRITE_PATH_SPELLINGS = [
+    pytest.param(f"{SPILL_DIR_NAME}/x.json", id="relative"),
+    pytest.param(f"./{SPILL_DIR_NAME}/x.json", id="dot-slash"),
+    pytest.param(f"sub/../{SPILL_DIR_NAME}/x.json", id="dotdot"),
+    pytest.param(f"{SPILL_DIR_NAME}/sub/x.json", id="nested"),
+    pytest.param(SPILL_DIR_NAME, id="directory-itself"),
+    pytest.param(f"{SPILL_DIR_NAME.upper()}/x.json", id="case-variant"),
+    pytest.param("absolute", id="absolute"),
+]
+
+
+@pytest.mark.parametrize("spelling", WRITE_PATH_SPELLINGS)
+def test_resolve_write_path_refuses_the_engine_subtree(workspace, spelling):
+    """Every spelling resolve_path accepts for the subtree is refused for writing."""
+    if spelling == "absolute":
+        spelling = str(workspace.output_dir / SPILL_DIR_NAME / "x.json")
+    assert workspace.resolve_path(spelling, default_dir="output")  # resolvable
+    with pytest.raises(ValueError, match="engine-owned"):
+        workspace.resolve_write_path(spelling, default_dir="output")
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+def test_resolve_write_path_returns_what_resolve_path_returns_elsewhere(workspace):
+    for spelling, default_dir in [
+        ("report.txt", "output"),
+        (f"{SPILL_DIR_NAME}-mine/x.json", "output"),
+        ("notes.txt", "temp"),
+        (str(workspace.output_dir / "sub" / "report.txt"), "output"),
+    ]:
+        assert workspace.resolve_write_path(
+            spelling, default_dir=default_dir
+        ) == workspace.resolve_path(spelling, default_dir=default_dir)
+
+
+def test_the_file_tool_refusal_is_the_workspace_refusal(workspace, monkeypatch):
+    """One owner for the decision: the file tool calls through, it does not
+    re-implement the check. Replacing the workspace's refusal changes what
+    the file tool raises."""
+
+    def sentinel(self, resolved_path, requested):
+        raise ValueError(f"SENTINEL for {requested}")
+
+    monkeypatch.setattr(TaskWorkspace, "refuse_engine_owned_write", sentinel)
+    ops = WorkspaceFileOperations(workspace)
+    with pytest.raises(ValueError, match="SENTINEL for output/plain.txt"):
+        ops.write_file("output/plain.txt", "x")
+    assert not (workspace.output_dir / "plain.txt").exists()

@@ -1150,6 +1150,56 @@ class TestCreateAgentTool:
             except OSError:
                 pass
 
+    def test_agent_tool_skips_a_delegated_output_the_workspace_refuses_to_claim(
+        self,
+        tmp_path,
+    ) -> None:
+        """A delegated output resolves through the workspace's write-side entry.
+
+        Registering it would make it one of the parent task's own files, so a
+        path the workspace refuses for writing -- the engine-owned subtree --
+        is skipped like any other path that does not resolve, and nothing is
+        registered for it.
+        """
+        db, db_path, SessionLocal = _create_session()
+        try:
+            workspace = Mock()
+            workspace.resolve_write_path.side_effect = ValueError(
+                "Path 'output/tool-results/x.json' is inside the engine-owned "
+                "'tool-results' directory."
+            )
+
+            tool = AgentTool(
+                agent_id=1,
+                agent_name="File Worker",
+                agent_description="Writes files",
+                session_factory=SessionLocal,
+                user_id=1,
+                task_id="77",
+                parent_task_id="77",
+            )
+
+            file_outputs = tool._parent_owned_file_outputs(
+                [{"file_path": "output/tool-results/x.json", "filename": "x.json"}],
+                workspace,
+                db,
+            )
+
+            assert file_outputs == []
+            workspace.resolve_write_path.assert_called_once_with(
+                "output/tool-results/x.json", default_dir="workspace"
+            )
+            workspace.resolve_path.assert_not_called()
+            workspace.register_file.assert_not_called()
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
     def test_agent_tool_does_not_swallow_delegated_output_registration_errors(
         self,
         tmp_path,
@@ -1159,7 +1209,7 @@ class TestCreateAgentTool:
             output_path = tmp_path / "report.txt"
             output_path.write_text("worker report", encoding="utf-8")
             workspace = Mock()
-            workspace.resolve_path.return_value = output_path
+            workspace.resolve_write_path.return_value = output_path
             workspace.register_file.side_effect = RuntimeError("storage unavailable")
 
             tool = AgentTool(

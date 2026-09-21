@@ -272,7 +272,7 @@ def _stream_export_to_csv(
     Returns:
         Tuple of (exported_file_path, row_count, column_names)
     """
-    resolved_path = workspace.resolve_path(file_path, default_dir="output")
+    resolved_path = workspace.resolve_write_path(file_path, default_dir="output")
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Get column names BEFORE iteration
@@ -315,7 +315,7 @@ def _stream_export_to_jsonlines(
     Returns:
         Tuple of (exported_file_path, row_count, column_names)
     """
-    resolved_path = workspace.resolve_path(file_path, default_dir="output")
+    resolved_path = workspace.resolve_write_path(file_path, default_dir="output")
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Get column names BEFORE iteration
@@ -362,7 +362,7 @@ def _stream_export_to_parquet(
             "Install it with: pip install pyarrow"
         )
 
-    resolved_path = workspace.resolve_path(file_path, default_dir="output")
+    resolved_path = workspace.resolve_write_path(file_path, default_dir="output")
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Get column names BEFORE iteration

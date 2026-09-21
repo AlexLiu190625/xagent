@@ -13,7 +13,7 @@ from xagent.core.tools.core.sql_tool import (
     execute_sql_query,
     get_database_type,
 )
-from xagent.core.workspace import TaskWorkspace
+from xagent.core.workspace import SPILL_DIR_NAME, TaskWorkspace
 
 
 class TestGetConnectionUrl:
@@ -206,6 +206,56 @@ class TestExecuteSqlQuery:
         assert result["relative_path"] == "output/test.csv"
         assert result["file_ref"]["file_id"] == result["file_id"]
         assert (workspace.output_dir / "test.csv").exists()
+
+    @pytest.mark.parametrize(
+        "extension",
+        [
+            pytest.param(".csv", id="csv"),
+            pytest.param(".jsonl", id="jsonlines"),
+            pytest.param(".parquet", id="parquet"),
+        ],
+    )
+    @patch("xagent.core.tools.core.sql_tool.create_engine")
+    def test_execute_sql_query_refuses_to_export_into_the_engine_directory(
+        self, mock_create_engine, monkeypatch, tmp_path, extension
+    ):
+        """output_file is model-facing; the engine-owned subtree is refused
+        before anything is opened, on every export format, whether or not
+        the directory exists yet, and the engine's own bytes are untouched."""
+        if extension == ".parquet":
+            pytest.importorskip("pyarrow")
+        monkeypatch.setenv("XAGENT_EXTERNAL_DB_TEST", "sqlite:///:memory:")
+        mock_engine = MagicMock()
+        mock_conn = MagicMock()
+        mock_engine.connect.return_value.__enter__.return_value = mock_conn
+        mock_create_engine.return_value = mock_engine
+        mock_result = MagicMock()
+        mock_result.keys.return_value = ["id"]
+        mock_result.fetchmany.side_effect = [[], []]
+        mock_conn.execute.return_value = mock_result
+        workspace = TaskWorkspace("test_sql_export_refused", str(tmp_path))
+        reserved = workspace.output_dir / SPILL_DIR_NAME
+        engine_file = reserved / f"acme-stored-result{extension}"
+
+        with pytest.raises(ValueError, match="engine-owned"):
+            execute_sql_query(
+                "test",
+                "SELECT * FROM users",
+                output_file=f"{SPILL_DIR_NAME}/acme-stored-result{extension}",
+                workspace=workspace,
+            )
+        assert not reserved.exists()
+
+        reserved.mkdir()
+        engine_file.write_bytes(b"engine bytes")
+        with pytest.raises(ValueError, match="engine-owned"):
+            execute_sql_query(
+                "test",
+                "SELECT * FROM users",
+                output_file=f"{SPILL_DIR_NAME}/acme-stored-result{extension}",
+                workspace=workspace,
+            )
+        assert engine_file.read_bytes() == b"engine bytes"
 
     @patch("xagent.core.tools.core.sql_tool.create_engine")
     def test_execute_sql_query_export_parquet_no_pyarrow(
