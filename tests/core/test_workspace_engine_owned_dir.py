@@ -641,3 +641,34 @@ def test_an_absent_reserved_name_is_not_announced(tmp_path, caplog):
         workspace = TaskWorkspace("task_w", str(tmp_path))
     assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
     assert [r for r in caplog.records if "reserved" in r.getMessage()] == []
+
+
+# --------------------------------------------------------------------------
+# The two listing predicates have different scopes, on purpose
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("show_hidden", [False, True])
+def test_named_temp_listing_shows_the_internal_scratch_root_only_when_asked(
+    workspace, show_hidden
+):
+    """The named-directory listing hides only the engine tool-results
+    directory; the internal scratch root under temp/ is governed there by
+    the ordinary hidden-name rule, so show_hidden surfaces it. The
+    workspace-wide listings never do."""
+    workspace.internal_temp_dir.mkdir(parents=True)
+    scratch = workspace.internal_temp_dir / "frame.bin"
+    scratch.write_bytes(b"x")
+    note = workspace.temp_dir / "note.txt"
+    note.write_text("note", encoding="utf-8")
+
+    listing = WorkspaceFileOperations(workspace).list_files(
+        str(workspace.temp_dir), show_hidden=show_hidden, recursive=True
+    )
+    named = {entry["path"] for entry in listing["files"]}
+    assert str(note) in named
+    assert (str(scratch) in named) is show_hidden
+
+    assert {e["file_path"] for e in workspace.get_all_files()["temp"]} == {str(note)}
+    assert scratch not in workspace._scan_all_files()
+    assert note in workspace._scan_all_files()
