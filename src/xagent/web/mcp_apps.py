@@ -62,6 +62,11 @@ from .models.public_mcp import PublicMCPApp
 # "meta" grant could ever have carried them), so a bare connect must never
 # be treated as satisfying it.
 #
+# planner: the shared Microsoft provider requests only User.Read, while the
+# Planner app requires Tasks.ReadWrite. A bare Microsoft login must not batch
+# connect Planner or satisfy its runtime token lookup with that under-scoped
+# provider grant.
+#
 # sharepoint: same reasoning as facebook -- its "Sites.ReadWrite.All" scope
 # isn't part of the microsoft provider's default_scopes (["User.Read"]),
 # and the connector is brand new (no pre-existing bare "microsoft" grant,
@@ -72,8 +77,23 @@ from .models.public_mcp import PublicMCPApp
 # (User.Read), while workbook reads and writes require Files.ReadWrite from
 # the Excel app row. A bare microsoft grant may continue serving other
 # Microsoft connectors, but it must neither provision nor satisfy Excel.
+#
+# powerpoint: same reasoning as excel -- reading/writing presentations
+# requires Files.ReadWrite, which isn't part of the microsoft provider's
+# default_scopes (["User.Read"]). A bare microsoft grant, or one scoped to
+# a different Microsoft app, must never be treated as satisfying it.
 APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
-    {"excel", "facebook", "github", "myob", "meta-ads", "sharepoint", "whatsapp"}
+    {
+        "excel",
+        "facebook",
+        "github",
+        "myob",
+        "meta-ads",
+        "planner",
+        "powerpoint",
+        "sharepoint",
+        "whatsapp",
+    }
 )
 
 
