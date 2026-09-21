@@ -2420,6 +2420,13 @@ def test_spill_record_shape_is_valid_accepts_a_written_record(tmp_path):
         {**VALID_SHAPE_RECORD, "value_path": 12},
         {**VALID_SHAPE_RECORD, "record_fields": [1]},
         {**VALID_SHAPE_RECORD, "truncated_after_items": -1},
+        # Iterating a str yields one-character strs, so a record_fields of
+        # "ab" satisfies an all-items-are-str test on its own; only the
+        # list check refuses it.
+        {**VALID_SHAPE_RECORD, "record_fields": "ab"},
+        {**VALID_SHAPE_RECORD, "truncated_after_items": True},
+        {k: v for k, v in VALID_SHAPE_RECORD.items() if k != "kind"},
+        {**VALID_SHAPE_RECORD, "relative_path": ""},
     ],
     ids=[
         "not_a_dict",
@@ -2431,6 +2438,10 @@ def test_spill_record_shape_is_valid_accepts_a_written_record(tmp_path):
         "value_path_not_str",
         "record_fields_not_all_str",
         "truncated_after_items_negative",
+        "record_fields_not_a_list",
+        "truncated_after_items_is_bool",
+        "kind_missing",
+        "relative_path_empty",
     ],
 )
 def test_spill_record_shape_is_valid_rejects_each_malformed_field(record):
