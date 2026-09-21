@@ -939,12 +939,29 @@ def _write_spill_file(spill_dir: str, tool_name: str, payload: str, kind: str) -
     else is overwritten atomically. The file a record points at therefore
     always holds the bytes that record describes.
 
-    Raises OSError on any filesystem failure -- the caller decides how to
-    fall back; this function does not catch.
+    The directory itself must be a real directory entry, never a symlink.
+    The workspace treats the reserved name as a name under ``output/``, not
+    as whatever that name points at (TaskWorkspace.is_engine_owned_path), so
+    a file written through a symlink standing at that name would land in a
+    directory the workspace does not reserve: listed as a deliverable, and
+    writable by the file tools. ``mkdir(exist_ok=True)`` succeeds silently on
+    a symlink to an existing directory, so the link is checked for first,
+    with lstat semantics, and refused. The parents may still be symlinks --
+    the workspace resolves those the same way on its side.
+
+    Raises OSError on any filesystem failure, and for a symlink at the
+    directory -- the caller decides how to fall back; this function does
+    not catch.
     """
     payload_bytes = payload.encode("utf-8")
     filename = _spill_file_name(tool_name, payload_bytes, kind)
     directory = Path(spill_dir)
+    if directory.is_symlink():
+        raise OSError(
+            f"Spill directory {directory} is a symlink; the engine writes only "
+            "into a real directory entry at the reserved name, so this value is "
+            "left in place"
+        )
     directory.mkdir(parents=True, exist_ok=True)
     if not _spill_target_holds(directory / filename, payload_bytes):
         _replace_spill_file(directory, filename, payload_bytes)
