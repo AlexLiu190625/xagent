@@ -288,22 +288,27 @@ class TaskWorkspace:
         """Return whether a path is the engine-owned output subtree or inside it.
 
         The subtree is a name under ``output/``, not whatever that name
-        currently points at. The parent is resolved, so a ``..`` segment, a
-        symlink pointing into the subtree and a symlinked ``output/`` all land
-        on the real path; the reserved segment itself is never followed,
-        because a direct writer can put a symlink there and following it would
-        let that writer choose which directory is protected. Equality counts
-        as containment, which is what makes the directory itself unremovable
-        and its name unusable for a plain file.
+        currently points at. The argument is resolved, so a ``..`` segment
+        and a symlink pointing into the subtree land on the real path before
+        anything is compared. The parent of the reserved segment is resolved
+        too, so a symlinked ``output/`` is seen through the same way; the
+        reserved segment itself is never followed, because a direct writer
+        can put a symlink there and following it would let that writer
+        choose which directory is protected. Equality counts as containment,
+        which is what makes the directory itself unremovable and its name
+        unusable for a plain file.
 
-        The reserved segment is compared with case folded, on every operating
-        system. On a case-insensitive file system another spelling reaches the
-        same directory, and a segment-by-segment comparison would let a write
-        through to the engine's own bytes; folding case makes one rule, and
-        one test expectation, hold everywhere. The price is that on a
-        case-sensitive file system this also reserves spellings that are a
-        different directory there -- the same trade already recorded for a
-        user directory carrying the reserved name.
+        Every segment this check compares -- the parent prefix leading to
+        ``output/`` and the reserved segment itself -- is compared with its
+        case folded, on every operating system. On a case-insensitive file
+        system another spelling of any of those segments reaches the same
+        directory, and a literal comparison would let a write through to the
+        engine's own bytes; folding case makes one rule, and one test
+        expectation, hold everywhere. The price is that on a case-sensitive
+        file system this also reserves spellings of ``output`` and of the
+        reserved name that are different directories there -- the same
+        trade already recorded for a user directory carrying the reserved
+        name.
 
         Not defensive on purpose: on interpreters where a symlink loop in the
         argument makes ``resolve()`` raise RuntimeError, that error propagates
@@ -317,12 +322,14 @@ class TaskWorkspace:
         reserved_root = self.engine_owned_output_dir
         parent_root = reserved_root.parent.resolve()
         resolved_path = file_path.resolve()
-        if not resolved_path.is_relative_to(parent_root):
+        parent_parts = tuple(part.casefold() for part in parent_root.parts)
+        path_parts = tuple(part.casefold() for part in resolved_path.parts)
+        if path_parts[: len(parent_parts)] != parent_parts:
             return False
-        relative_parts = resolved_path.relative_to(parent_root).parts
+        relative_parts = path_parts[len(parent_parts) :]
         if not relative_parts:
             return False
-        return relative_parts[0].casefold() == reserved_root.name.casefold()
+        return relative_parts[0] == reserved_root.name.casefold()
 
     def register_internal_file(
         self,
