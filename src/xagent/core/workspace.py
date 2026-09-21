@@ -420,7 +420,12 @@ class TaskWorkspace:
         """
 
         resolved_path = file_path.resolve()
-        reserved_root = self.internal_temp_dir.resolve()
+        # The reserved root is the name under temp/, not whatever that name
+        # points at: resolve the parent, never the reserved segment itself.
+        # Following it would put the failure, and the answer, in the hands of
+        # whoever can create a symlink there -- and a loop there would make
+        # this shared check raise for every caller, about every path.
+        reserved_root = self.temp_dir.resolve() / _INTERNAL_TEMP_DIR_NAME
         if resolved_path.is_relative_to(reserved_root):
             return True
         if self.is_engine_owned_path(resolved_path):
