@@ -308,8 +308,10 @@ def test_spill_dir_for_workspace_rejects_a_value_that_names_no_directory(
 def test_spill_dir_for_workspace_agrees_with_the_path_normalizer():
     # The module holds this directory name in two places: this function's
     # own join, and the "output/" prefix normalize_spilled_relative_path
-    # strips. Nothing forces the two to agree except a test that checks
-    # both at once.
+    # strips. Each assertion below pins its own side against the literal
+    # "output" written here; neither side is derived from the other, so
+    # this reads the two spellings side by side and does not make one
+    # follow from the other.
     assert (
         normalize_spilled_relative_path("output/tool-results/x.json")
         == "tool-results/x.json"
