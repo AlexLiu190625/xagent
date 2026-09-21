@@ -593,3 +593,51 @@ def test_the_file_tool_refusal_is_the_workspace_refusal(workspace, monkeypatch):
     with pytest.raises(ValueError, match="SENTINEL for output/plain.txt"):
         ops.write_file("output/plain.txt", "x")
     assert not (workspace.output_dir / "plain.txt").exists()
+
+
+# --------------------------------------------------------------------------
+# A reserved name that is already taken is announced once, at construction
+# --------------------------------------------------------------------------
+
+TAKEN_RESERVED_NAME_SHAPES = [
+    pytest.param("directory-with-a-file", id="directory-with-a-file"),
+    pytest.param("empty-directory", id="empty-directory"),
+    pytest.param("plain-file", id="plain-file"),
+    pytest.param("dangling-symlink", id="dangling-symlink"),
+]
+
+
+@pytest.mark.parametrize("shape", TAKEN_RESERVED_NAME_SHAPES)
+def test_a_taken_reserved_name_is_announced_when_the_workspace_is_built(
+    tmp_path, caplog, shape
+):
+    """Files already under the reserved name drop out of every listing and
+    become unwritable with no error on those paths, so the one place that
+    runs once per workspace object says so."""
+    reserved = tmp_path / "task_w" / "output" / SPILL_DIR_NAME
+    reserved.parent.mkdir(parents=True)
+    if shape == "directory-with-a-file":
+        reserved.mkdir()
+        (reserved / "Q3-report.txt").write_text("mine", encoding="utf-8")
+    elif shape == "empty-directory":
+        reserved.mkdir()
+    elif shape == "plain-file":
+        reserved.write_text("mine", encoding="utf-8")
+    else:
+        _symlink("does-not-exist", reserved)
+
+    with caplog.at_level("WARNING", logger="xagent.core.workspace"):
+        TaskWorkspace("task_w", str(tmp_path))
+
+    warnings = [r for r in caplog.records if "reserved" in r.getMessage()]
+    assert len(warnings) == 1
+    assert warnings[0].levelname == "WARNING"
+    assert "task_w" in warnings[0].getMessage()
+    assert str(reserved) in warnings[0].getMessage()
+
+
+def test_an_absent_reserved_name_is_not_announced(tmp_path, caplog):
+    with caplog.at_level("WARNING", logger="xagent.core.workspace"):
+        workspace = TaskWorkspace("task_w", str(tmp_path))
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+    assert [r for r in caplog.records if "reserved" in r.getMessage()] == []

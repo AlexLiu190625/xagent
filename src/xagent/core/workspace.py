@@ -246,6 +246,7 @@ class TaskWorkspace:
 
         # Create directory structure
         self._ensure_directories()
+        self._warn_if_reserved_output_name_is_taken()
 
     def __getstate__(self) -> dict[str, Any]:
         """Serialize durable workspace state without process-local synchronization."""
@@ -1697,6 +1698,28 @@ class TaskWorkspace:
         self.input_dir.mkdir(exist_ok=True)
         self.output_dir.mkdir(exist_ok=True)
         self.temp_dir.mkdir(exist_ok=True)
+
+    def _warn_if_reserved_output_name_is_taken(self) -> None:
+        """Log, once per construction, that the reserved output name is in use.
+
+        The reservation goes by name, not by origin: a directory that a user
+        or an earlier tool run created under the reserved name is hidden
+        from every listing and refused by the file tools exactly like the
+        engine's own. Nothing on those paths says so -- they run per file --
+        so the one place that runs once per workspace object is where the
+        diagnostic lives. Any entry at the name counts, a dangling symlink
+        included, hence lexists rather than exists.
+        """
+        reserved = self.engine_owned_output_dir
+        if os.path.lexists(reserved):
+            logger.warning(
+                "Workspace %s already has an entry at %s. That name is reserved "
+                "for the engine's spilled tool results: nothing under it is "
+                "listed as a deliverable and the workspace file tools refuse "
+                "to write there.",
+                self.id,
+                reserved,
+            )
 
     def get_allowed_dirs(self) -> List[str]:
         """Get list of allowed directories for this workspace"""
