@@ -284,46 +284,25 @@ class TaskWorkspace:
     def is_engine_owned_path(self, file_path: Path) -> bool:
         """Return whether a path is the engine-owned output subtree or inside it.
 
-        The subtree is a name under ``output/``, not whatever that name
-        currently points at. The argument is resolved, so a ``..`` segment
-        and a symlink pointing into the subtree land on the real path before
-        anything is compared. The parent of the reserved segment is resolved
-        too, so a symlinked ``output/`` is seen through the same way; the
-        reserved segment on that side is compared by name and not resolved,
-        because a direct writer can put a symlink there and following it
-        would let that writer choose which directory is protected. The other
-        half of that choice: a symlink standing at the reserved name is an
-        ordinary entry whose target is not reserved, so a file placed at the
-        hijacked location is not protected by this check. The spill writer
-        refuses to write through such a link, and that refusal, not this
-        check, is what keeps the engine's bytes out of that location.
-        Equality counts as containment, which is what makes the directory
-        itself unremovable and its name unusable for a plain file.
-
-        Every segment this check compares -- the parent prefix leading to
-        ``output/`` and the reserved segment itself -- is compared with its
-        case folded, on every operating system. On a case-insensitive file
-        system another spelling of any of those segments reaches the same
-        directory, and a literal comparison would let a write through to the
-        engine's own bytes; folding case makes one rule, and one test
-        expectation, hold everywhere. The price is that on a case-sensitive
-        file system this also reserves spellings of ``output`` and of the
-        reserved name that are different directories there -- the same
-        trade already recorded for a user directory carrying the reserved
-        name.
-
-        Not defensive on purpose: on interpreters where a symlink loop in the
-        argument makes ``resolve()`` raise RuntimeError, that error propagates
-        instead of being turned into False, because a write guard must fail
-        rather than proceed on an unanswered question; where ``resolve()``
-        instead returns the loop path unresolved, the comparison is made on
-        that path. Listing callers that must not change how such an entry is
-        reported handle the error themselves.
+        The argument and the parent of the reserved segment are resolved; the
+        reserved segment itself is compared by name, so a symlink standing at
+        the reserved name is an ordinary entry whose target is not reserved.
+        A file at such a hijacked location is kept free of the engine's bytes
+        by the spill writer's refusal to write through the link, not by this
+        check. Equality counts as containment. A symlink loop in the argument
+        propagates from ``resolve()``: a write guard fails rather than
+        answering False on an unanswered question.
         """
 
         reserved_root = self.engine_owned_output_dir
+        # The reserved segment is not resolved because a direct writer can
+        # put a symlink there, and following it would let that writer choose
+        # which directory is protected.
         parent_root = reserved_root.parent.resolve()
         resolved_path = file_path.resolve()
+        # Every compared segment is case-folded on every file system: one
+        # rule and one test expectation hold everywhere, at the price of also
+        # reserving other spellings on a case-sensitive file system.
         parent_parts = tuple(part.casefold() for part in parent_root.parts)
         path_parts = tuple(part.casefold() for part in resolved_path.parts)
         if path_parts[: len(parent_parts)] != parent_parts:
@@ -336,17 +315,10 @@ class TaskWorkspace:
     def refuse_engine_owned_write(self, resolved_path: Path, requested: str) -> Path:
         """Refuse one resolved write target that lands in the engine-owned subtree.
 
-        The one place that turns :meth:`is_engine_owned_path` into a write
-        refusal. The workspace file tools reach it through their own
-        resolvers; tools that resolve a destination through
-        :meth:`resolve_write_path` reach it there; reads never do. Writers
-        that build their own destination do not pass here (see the known
-        limitations).
-
-        Raises ValueError, the class the resolvers already raise for a target
-        outside the workspace, so a caller that handles that refusal handles
-        this one the same way, and the model sees a readable sentence naming
-        the path and the reason rather than a generic framework error.
+        The one place :meth:`is_engine_owned_path` becomes a write refusal;
+        the file tools' resolvers and :meth:`resolve_write_path` reach it,
+        reads never do. Raises ValueError, the class the resolvers raise for
+        a target outside the workspace, naming the path and the reason.
         """
 
         if self.is_engine_owned_path(resolved_path):
