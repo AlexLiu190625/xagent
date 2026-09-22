@@ -351,6 +351,45 @@ def test_an_alias_escaping_temp_does_not_hide_the_rest_of_the_workspace(
     assert str(plain) in {e["file_path"] for e in workspace.get_all_files()["output"]}
 
 
+NON_CHILD_ALIAS_TARGETS = [
+    pytest.param(".", id="temp-itself"),
+    pytest.param("absolute-temp", id="temp-itself-absolute"),
+    pytest.param("a/b", id="two-levels-deep"),
+]
+
+
+@pytest.mark.parametrize("relative_target", NON_CHILD_ALIAS_TARGETS)
+def test_an_alias_that_is_not_a_direct_child_of_temp_hides_nothing(
+    workspace, relative_target
+):
+    """The alias branch honours a direct child of temp/ and nothing else.
+
+    A link to temp/ itself would put every temp/ file "inside" the alias
+    and empty the temp listing. A link two levels down names a directory
+    the engine's own scratch writer refuses to use (it requires the reserved
+    root to be a direct child of temp/), so there is no scratch data there
+    to keep hidden either.
+    """
+    workspace.temp_dir.mkdir(parents=True, exist_ok=True)
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    user_file = workspace.temp_dir / "user_scratch.txt"
+    user_file.write_text("mine", encoding="utf-8")
+    deep = workspace.temp_dir / "a" / "b"
+    deep.mkdir(parents=True)
+    deep_file = deep / "inside_deep.txt"
+    deep_file.write_text("deep", encoding="utf-8")
+    if relative_target == "absolute-temp":
+        relative_target = str(workspace.temp_dir.resolve())
+    _symlink(relative_target, workspace.internal_temp_dir)
+
+    temp_listing = {e["file_path"] for e in workspace.get_all_files()["temp"]}
+    assert str(user_file) in temp_listing
+    assert str(deep_file) in temp_listing
+    scanned = set(workspace._scan_all_files())
+    assert user_file in scanned
+    assert deep_file in scanned
+
+
 def test_an_alias_outside_the_workspace_does_not_hide_output(workspace, tmp_path):
     workspace.temp_dir.mkdir(parents=True, exist_ok=True)
     workspace.output_dir.mkdir(parents=True, exist_ok=True)
