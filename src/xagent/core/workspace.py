@@ -15,7 +15,7 @@ import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -68,6 +68,11 @@ _INTERNAL_TEMP_DIR_NAME = ".xagent-internal"
 # It is defined here, on the workspace side, and the spill module imports it
 # from here: tool modules import core.workspace, never the other way round.
 SPILL_DIR_NAME = "tool-results"
+# Reserved-name collisions already announced by this process, keyed by the
+# reserved path, so that a workspace built many times over -- once per tool
+# family, per call on some paths -- announces the same collision once.
+_announced_reserved_names: set[str] = set()
+_announced_reserved_names_lock = Lock()
 
 
 def scoped_user_root(
@@ -524,6 +529,8 @@ class TaskWorkspace:
 
     def _forget_internal_files(self) -> None:
         workspace_key = str(self.workspace_dir.resolve())
+        with _announced_reserved_names_lock:
+            _announced_reserved_names.discard(str(self.engine_owned_output_dir))
         with _internal_file_registry_lock:
             file_keys = [
                 key for key in _internal_file_registry if key[0] == workspace_key
@@ -1701,18 +1708,18 @@ class TaskWorkspace:
         self.temp_dir.mkdir(exist_ok=True)
 
     def _warn_if_reserved_output_name_is_taken(self) -> None:
-        """Log, once per construction, that the reserved output name is in use.
-
-        The reservation goes by name, not by origin: a directory that a user
-        or an earlier tool run created under the reserved name is hidden
-        from every listing and refused by the file tools exactly like the
-        engine's own. Nothing on those paths says so -- they run per file --
-        so the one place that runs once per workspace object is where the
-        diagnostic lives. Any entry at the name counts, a dangling symlink
-        included, hence lexists rather than exists.
-        """
+        """Log once per process and workspace that the reserved output name is taken."""
         reserved = self.engine_owned_output_dir
+        # Any entry at the name counts, a dangling symlink included (lexists).
+        # The reservation goes by name, not by origin, so the engine's own
+        # directory is announced too; once per process keeps that off the
+        # happy path.
         if os.path.lexists(reserved):
+            key = str(reserved)
+            with _announced_reserved_names_lock:
+                if key in _announced_reserved_names:
+                    return
+                _announced_reserved_names.add(key)
             logger.warning(
                 "Workspace %s already has an entry at %s. That name is reserved "
                 "for the engine's spilled tool results: nothing under it is "

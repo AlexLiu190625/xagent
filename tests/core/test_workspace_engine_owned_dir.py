@@ -2,6 +2,7 @@
 
 import errno
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -687,6 +688,76 @@ def test_an_absent_reserved_name_is_not_announced(tmp_path, caplog):
         workspace = TaskWorkspace("task_w", str(tmp_path))
     assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
     assert [r for r in caplog.records if "reserved" in r.getMessage()] == []
+
+
+def _reserved_warnings(caplog):
+    return [r for r in caplog.records if "reserved" in r.getMessage()]
+
+
+def test_a_taken_reserved_name_is_announced_once_per_process_per_workspace(
+    tmp_path, caplog
+):
+    """Every tool family builds its own workspace object for the same task,
+    so the announcement is keyed on the reserved path, not on the object:
+    the same workspace built again says nothing, another workspace with the
+    same name taken is announced on its own."""
+    for name in ("task_a", "task_b"):
+        (tmp_path / name / "output" / SPILL_DIR_NAME).mkdir(parents=True)
+
+    with caplog.at_level("WARNING", logger="xagent.core.workspace"):
+        TaskWorkspace("task_a", str(tmp_path))
+        TaskWorkspace("task_a", str(tmp_path))
+        TaskWorkspace("task_a", str(tmp_path))
+    assert len(_reserved_warnings(caplog)) == 1
+    assert "task_a" in _reserved_warnings(caplog)[0].getMessage()
+
+    with caplog.at_level("WARNING", logger="xagent.core.workspace"):
+        TaskWorkspace("task_b", str(tmp_path))
+        TaskWorkspace("task_b", str(tmp_path))
+    messages = [r.getMessage() for r in _reserved_warnings(caplog)]
+    assert len(messages) == 2
+    assert "task_b" in messages[1]
+
+
+def test_concurrent_builds_of_one_workspace_announce_the_taken_name_once(
+    tmp_path, caplog
+):
+    """The set of announced names is shared by every thread that builds a
+    workspace, so concurrent builds of the same workspace race for one slot."""
+    (tmp_path / "task_c" / "output" / SPILL_DIR_NAME).mkdir(parents=True)
+    starter = threading.Barrier(8)
+
+    def build() -> None:
+        starter.wait()
+        TaskWorkspace("task_c", str(tmp_path))
+
+    threads = [threading.Thread(target=build) for _ in range(8)]
+    with caplog.at_level("WARNING", logger="xagent.core.workspace"):
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    assert len(_reserved_warnings(caplog)) == 1
+
+
+def test_cleanup_forgets_the_announcement_so_a_fresh_occupant_is_announced_again(
+    tmp_path, caplog
+):
+    """cleanup() removes the whole workspace directory, so a brand new
+    occupant that later shows up at the same path is a new fact, not a
+    repeat of the one that was cleaned away."""
+    (tmp_path / "task_d" / "output" / SPILL_DIR_NAME).mkdir(parents=True)
+
+    with caplog.at_level("WARNING", logger="xagent.core.workspace"):
+        workspace = TaskWorkspace("task_d", str(tmp_path))
+    assert len(_reserved_warnings(caplog)) == 1
+
+    workspace.cleanup()
+    (tmp_path / "task_d" / "output" / SPILL_DIR_NAME).mkdir(parents=True)
+
+    with caplog.at_level("WARNING", logger="xagent.core.workspace"):
+        TaskWorkspace("task_d", str(tmp_path))
+    assert len(_reserved_warnings(caplog)) == 2
 
 
 # --------------------------------------------------------------------------
