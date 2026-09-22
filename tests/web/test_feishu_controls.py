@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from xagent.web.channels.feishu import bot as module
+from xagent.web.services.channel_input_acceptance import AcceptedChannelInput
 from xagent.web.services.channel_runtime import (
     ChannelAuthorizationError,
     SelectedChannelTask,
@@ -133,28 +134,22 @@ async def test_control_fences_late_preparation(bot, monkeypatch, command, retain
         old.request_stop = Mock(return_value=True)
         bot.user_active_executions["sender"] = (45, old)
     entered, release = asyncio.Event(), asyncio.Event()
-    turn = SharedChannelTurn(
-        SelectedChannelTask(5, 99, True, 7, "sender", None, 0), None
-    )
-    turn.stop = AsyncMock()
-    turn.close = AsyncMock()
-    turn.execute = AsyncMock()
+    accept = Mock(side_effect=AssertionError("Stopped preparation cannot accept"))
 
-    async def prepare(**kwargs):
+    async def lookup(operation):
         entered.set()
         await release.wait()
-        return turn
+        return 5, (), (), ()
 
-    monkeypatch.setattr(module, "prepare_shared_channel_turn", prepare)
+    monkeypatch.setattr(module, "run_db_io_cancellation_safe", lookup)
+    monkeypatch.setattr(module, "accept_channel_input", accept)
     bot._handle_message_sync(message("request"))
     await asyncio.wait_for(entered.wait(), 2)
     await control(bot, command)
     task = bot.user_message_tasks["sender"]
     release.set()
     await asyncio.wait_for(task, 2)
-    turn.stop.assert_awaited_once()
-    turn.execute.assert_not_awaited()
-    turn.close.assert_awaited_once()
+    accept.assert_not_called()
     assert bot.active_tasks["sender"] == ("-1" if command == "/new" else "45")
 
 
@@ -176,18 +171,17 @@ async def test_control_reaches_running_shared_turn(bot, monkeypatch, command):
         release.set()
         return True
 
-    turn.execute = AsyncMock(side_effect=execute)
+    turn.observe = AsyncMock(side_effect=execute)
     turn.request_stop = Mock(side_effect=stop)
     turn.close = AsyncMock()
     turn.deliver = AsyncMock(return_value=True)
     turn.discard_delivery = AsyncMock()
-    monkeypatch.setattr(
-        module, "prepare_shared_channel_turn", AsyncMock(return_value=turn)
-    )
-    bot._handle_message_sync(message("request"))
+    accepted = AcceptedChannelInput(45, 1, "command", "run", 5, False, turn.selection)
+    monkeypatch.setattr(AcceptedChannelInput, "as_turn", lambda self: turn)
+    monkeypatch.setattr(module.DurableChannelProgress, "send", AsyncMock())
+    task = asyncio.create_task(bot._observe_shared_input("sender", accepted, 0))
     await asyncio.wait_for(entered.wait(), 2)
     handler = bot.user_active_trace_handlers["sender"]
-    task = bot.user_message_tasks["sender"]
     await control(bot, command)
     await asyncio.wait_for(task, 2)
     turn.request_stop.assert_called_once()
@@ -209,19 +203,14 @@ async def test_stop_after_shared_reply_timeout_retains_control(
     turn = SharedChannelTurn(
         SelectedChannelTask(5, 45, False, 7, "sender", None, 0), None
     )
-    turn.execute = AsyncMock(return_value={"status": status})
+    turn.observe = AsyncMock(return_value={"status": status})
     turn.deliver = AsyncMock(return_value=False)
     turn.close = AsyncMock()
     turn.request_stop = Mock(return_value=True)
-    monkeypatch.setattr(
-        module, "prepare_shared_channel_turn", AsyncMock(return_value=turn)
-    )
-    await bot._process_messages_batch("sender", [message("request")])
-    # A later busy input must not erase the still-running turn handle.
-    monkeypatch.setattr(
-        module, "prepare_shared_channel_turn", AsyncMock(return_value=None)
-    )
-    await bot._process_messages_batch("sender", [message("another request")])
+    accepted = AcceptedChannelInput(45, 1, "command", "run", 5, False, turn.selection)
+    monkeypatch.setattr(AcceptedChannelInput, "as_turn", lambda self: turn)
+    monkeypatch.setattr(module.DurableChannelProgress, "send", AsyncMock())
+    await bot._observe_shared_input("sender", accepted, 0)
     await control(bot, "/stop")
     if status == "accepted":
         turn.request_stop.assert_called_once()
@@ -481,60 +470,15 @@ async def test_control_pauses_when_local_setup_fails(bot, monkeypatch, command):
 
 
 @pytest.mark.asyncio
-async def test_stop_before_shared_start_acceptance(bot, monkeypatch):
-    from xagent.web.services import shared_channel_execution as shared
-    from xagent.web.services.execution_result_projection import INTERRUPTED_USER_MESSAGE
-
-    turn = SharedChannelTurn(
-        SelectedChannelTask(5, 45, False, 7, "sender", None, 0), None
-    )
-    turn.register_trace_handler = Mock()
-    turn.close = AsyncMock()
-    turn.deliver = AsyncMock()
-    monkeypatch.setattr(shared, "get_task_event_bridge", Mock())
-    accept = Mock(side_effect=AssertionError("Stopped turn must not accept START"))
-    monkeypatch.setattr(shared, "_accept_channel_turn", accept)
-    monkeypatch.setattr(
-        module, "prepare_shared_channel_turn", AsyncMock(return_value=turn)
-    )
-    monitor = bot._await_execution_with_stop_monitor
-
-    async def stop_before_child(*args, **kwargs):
-        asyncio.create_task(bot._handle_control("sender", message("/stop"), "/stop"))
-        return await monitor(*args, **kwargs)
-
-    bot._await_execution_with_stop_monitor = stop_before_child
-    await bot._process_messages_batch("sender", [message("request")])
-    accept.assert_not_called()
-    turn.deliver.assert_not_awaited()
-    turn.close.assert_awaited_once()
-    assert not turn.accepted
-    assert bot._update_text.await_args.args[2] == INTERRUPTED_USER_MESSAGE
-    assert all("error" not in call.args[1] for call in bot._send_text.await_args_list)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("shared", [False, True])
 @pytest.mark.parametrize("previous", [None, "-1"])
-async def test_new_task_save_failure_prevents_execution(
-    bot, monkeypatch, shared, previous
-):
+async def test_new_task_save_failure_prevents_execution(bot, monkeypatch, previous):
     from xagent.web.models.task import TaskStatus
 
     bot.active_tasks = {} if previous is None else {"sender": previous}
     assert bot._save_active_tasks()
-    monkeypatch.setattr(module, "get_shared_task_execution_enabled", lambda: shared)
+    monkeypatch.setattr(module, "get_shared_task_execution_enabled", lambda: False)
     lease = SimpleNamespace(
         finalize_result=AsyncMock(return_value=True), close=AsyncMock()
-    )
-    turn = SharedChannelTurn(
-        SelectedChannelTask(5, 99, True, 7, "sender", None, 0), None
-    )
-    turn.execute = AsyncMock()
-    turn.stop = AsyncMock()
-    turn.close = AsyncMock()
-    monkeypatch.setattr(
-        module, "prepare_shared_channel_turn", AsyncMock(return_value=turn)
     )
     monkeypatch.setattr(
         module,
@@ -556,29 +500,11 @@ async def test_new_task_save_failure_prevents_execution(
     expected = {} if previous is None else {"sender": previous}
     assert bot.active_tasks == expected
     assert bot._load_active_tasks() == expected
-    turn.execute.assert_not_awaited()
     manager.get_agent_for_task.assert_not_called()
-    if shared:
-        turn.close.assert_awaited_once()
-    else:
-        lease.finalize_result.assert_awaited_once_with(status=TaskStatus.PAUSED)
-        lease.close.assert_awaited_once()
+    lease.finalize_result.assert_awaited_once_with(status=TaskStatus.PAUSED)
+    lease.close.assert_awaited_once()
     bot._send_text.assert_awaited_once()
     assert "try again" in bot._send_text.await_args.args[1]
-
-    if shared:
-
-        async def execute(*args):
-            assert bot._load_active_tasks() == {"sender": "99"}
-            turn.accepted = True
-            return {"success": True, "status": "completed", "output": "answer"}
-
-        turn.execute.side_effect = execute
-        turn.deliver = AsyncMock(return_value=True)
-        bot._handle_message_sync(message("retry", "retry"))
-        await asyncio.wait_for(bot.user_message_tasks["sender"], 2)
-        turn.execute.assert_awaited_once()
-        turn.deliver.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -684,3 +610,23 @@ async def test_control_failure_reports_safe_error(bot, monkeypatch):
     bot._send_text.assert_awaited_once()
     assert "try again" in bot._send_text.await_args.args[1]
     assert "private" not in bot._send_text.await_args.args[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+async def test_startup_filter_preserves_controls_but_allows_shared_retries(
+    bot, monkeypatch, shared
+):
+    monkeypatch.setattr(module, "get_shared_task_execution_enabled", lambda: shared)
+    bot.start_time = 200
+    bot._process_messages_batch = AsyncMock()
+    for text in ("/new", "/stop", "retry"):
+        data = message(text)
+        data.event.message.create_time = "100"
+        bot._handle_message_sync(data)
+    tasks = list(bot.user_message_tasks.values())
+    if tasks:
+        await asyncio.gather(*tasks)
+    assert not bot.control_tasks
+    assert bot.active_tasks["sender"] == "45"
+    assert bot._process_messages_batch.await_count == int(shared)

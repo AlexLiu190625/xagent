@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any, Optional
 
 from lark_oapi.api.im.v1 import (
@@ -20,6 +21,8 @@ class FeishuTraceHandler(TraceHandler):
         api_client: Any,
         chat_id: str,
         message_id: Optional[str] = None,
+        *,
+        send_update: Callable[[str], Awaitable[None]] | None = None,
     ):
         self.task_id = task_id
         self.api_client = api_client
@@ -29,6 +32,7 @@ class FeishuTraceHandler(TraceHandler):
         )
         self.current_text = ""
         self.cancelled = False
+        self._send_update = send_update
 
     def cancel(self, *, discard_output: bool = True) -> None:
         self.cancelled = True
@@ -70,6 +74,11 @@ class FeishuTraceHandler(TraceHandler):
         display_text = text if final else text + " ✍️"
 
         if self.current_text == display_text:
+            return
+
+        if self._send_update is not None:
+            await self._send_update(display_text[:4000])
+            self.current_text = display_text
             return
 
         self.current_text = display_text

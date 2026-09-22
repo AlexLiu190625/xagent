@@ -4,7 +4,9 @@ import logging
 import os
 from collections import deque
 from contextlib import suppress
+from itertools import groupby
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Callable, Dict, Optional, cast
 from uuid import uuid4
 
@@ -18,6 +20,7 @@ from lark_oapi.api.im.v1 import (
 
 from ....config import get_channel_ingress_enabled, get_shared_task_execution_enabled
 from ....core.file_ref import build_file_id_ref
+from ....core.file_storage.keys import build_upload_storage_key
 from ...models.task import TaskStatus
 from ...services.agent_service_manager import get_agent_manager
 from ...services.channel_delivery import (
@@ -26,12 +29,18 @@ from ...services.channel_delivery import (
     discard_channel_task_results,
     recover_channel_results,
 )
+from ...services.channel_input_acceptance import (
+    AcceptedChannelInput,
+    ChannelInput,
+    ChannelInputBatchChanged,
+    accept_channel_input,
+    lookup_channel_inputs,
+)
+from ...services.channel_progress import DurableChannelProgress
 from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
-    ClaimedChannelTask,
     DownloadedChannelFile,
-    SelectedChannelTask,
     authorize_channel_sender,
     load_active_channel_configs,
     persist_channel_user_message,
@@ -41,6 +50,7 @@ from ...services.channel_runtime import (
 )
 from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ...services.db_runtime import (
+    await_task_settlement,
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
@@ -49,16 +59,19 @@ from ...services.execution_result_projection import project_execution_result_for
 from ...services.file_turn import normalize_attachments_for_persistence
 from ...services.llm_utils import AutoModelUnavailableError
 from ...services.managed_task_lease import ManagedTaskLease
-from ...services.shared_channel_execution import (
-    SharedChannelTurn,
-    prepare_shared_channel_turn,
-)
+from ...services.shared_channel_execution import SharedChannelTurn
+from ...services.task_event_bridge import get_task_event_bridge
 from ...services.task_execution_context_service import (
     materialize_task_execution_recovery_state,
 )
 from ...services.task_lease_service import TaskLeaseLostError
-from ...services.task_orchestrator import TaskTurnPayload
+from ...services.task_orchestrator import TaskTurnError, TaskTurnPayload
 from ...services.task_setup_snapshot import load_task_setup_snapshot_sync
+from ...services.uploaded_file_store import (
+    StagedUploadedFile,
+    compensate_staged_uploaded_files,
+    stage_uploaded_file_from_local_path,
+)
 from ..batch_control import BatchChannelControl
 from .trace_handler import FeishuTraceHandler
 
@@ -222,8 +235,14 @@ class FeishuBotInstance(BatchChannelControl[str]):
             if not event or not event.message or not event.sender:
                 return
 
-            # Ignore messages that were created before this bot instance started
-            if hasattr(event.message, "create_time") and event.message.create_time:
+            command = self._control_command(data)
+            # Shared ordinary inputs resolve durable receipts after restart.
+            # Controls have no receipt and must not be replayed from before startup.
+            if (
+                (command is not None or not get_shared_task_execution_enabled())
+                and hasattr(event.message, "create_time")
+                and event.message.create_time
+            ):
                 try:
                     if int(event.message.create_time) < self.start_time:
                         logger.info(
@@ -235,7 +254,6 @@ class FeishuBotInstance(BatchChannelControl[str]):
 
             open_id = event.sender.sender_id.open_id
 
-            command = self._control_command(data)
             if command is not None or open_id in self.control_queues:
                 if open_id not in self.control_queues:
                     self.control_queues[open_id] = deque()
@@ -265,16 +283,431 @@ class FeishuBotInstance(BatchChannelControl[str]):
     async def _process_queued_batch(self, open_id: str, messages: list[Any]) -> None:
         await self._process_messages_batch(open_id, messages)
 
+    def _shared_input(self, open_id: str, data: Any) -> ChannelInput:
+        message = data.event.message
+        if self.channel_id is None:
+            raise ChannelConfigurationError("Channel is not configured")
+        if not message.message_id or not message.chat_id:
+            raise TaskTurnError("input_identity_missing")
+        text, files = self._message_content(message)
+        if message.message_type in ("image", "audio", "media", "file") and not files:
+            raise TaskTurnError("file_unavailable")
+        return ChannelInput(
+            self.channel_id,
+            open_id,
+            "feishu",
+            (str(message.chat_id),),
+            str(message.message_id),
+            text,
+            tuple(f"{item['type']}:{item['file_key']}" for item in files),
+            {"chat_id": message.chat_id, "loading_message_id": None},
+        )
+
+    @staticmethod
+    def _message_content(message: Any) -> tuple[str, list[dict[str, Any]]]:
+        text = ""
+        files = []
+        content_str = getattr(message, "content", None) or ""
+        try:
+            content = json.loads(content_str)
+            if message.message_type == "text":
+                text = content.get("text", "").strip()
+            elif message.message_type in ("image", "audio", "media", "file"):
+                key = content.get(
+                    "image_key" if message.message_type == "image" else "file_key"
+                )
+                if key:
+                    files.append(
+                        {
+                            "type": message.message_type,
+                            "file_key": key,
+                            "message_id": message.message_id,
+                        }
+                    )
+            else:
+                text = f"Please process this {message.message_type}."
+        except (ValueError, AttributeError, TypeError):
+            text = content_str.strip()
+        if not text and not files:
+            text = f"Received a {message.message_type} message."
+        return text, files
+
+    async def _process_shared_messages_batch(
+        self, open_id: str, messages: list[Any]
+    ) -> None:
+        generation = self._conversation_generation(open_id)
+        self.user_preparing_executions.add(open_id)
+        self._clear_user_stop_request(open_id)
+        stop_event = self._get_user_stop_event(open_id)
+        chat_id = messages[0].event.message.chat_id
+
+        def stopped() -> bool:
+            return (
+                stop_event.is_set()
+                or self._conversation_generation(open_id) != generation
+            )
+
+        try:
+            # Preserve arrival order and per-user task selection, but never mix
+            # provider scopes inside one atomic acceptance batch.
+            for chat_id, group in groupby(
+                messages, key=lambda item: item.event.message.chat_id
+            ):
+                if stopped():
+                    return
+                try:
+                    raw = list(group)
+                    incoming = tuple(self._shared_input(open_id, item) for item in raw)
+                    files = {
+                        str(item.event.message.message_id): self._message_content(
+                            item.event.message
+                        )[1]
+                        for item in raw
+                    }
+                    observed: set[int] = set()
+                    notified_rejections: set[tuple[str, str]] = set()
+                    while not stopped():
+                        (
+                            owner_id,
+                            pending,
+                            replays,
+                            rejected,
+                        ) = await run_db_io_cancellation_safe(
+                            lambda: lookup_channel_inputs(incoming)
+                        )
+                        if stopped():
+                            return
+                        for rejection in rejected:
+                            if stopped():
+                                return
+                            key = (rejection.incoming.message_id, rejection.reason)
+                            if key not in notified_rejections:
+                                await self._send_text(
+                                    chat_id, self._input_error_message(rejection.reason)
+                                )
+                                notified_rejections.add(key)
+                        for accepted in replays:
+                            if stopped():
+                                return
+                            if accepted.command_db_id not in observed:
+                                observed.add(accepted.command_db_id)
+                                await self._observe_shared_input(
+                                    open_id, accepted, generation
+                                )
+                        if not pending or stopped():
+                            break
+                        get_task_event_bridge().require_ready()
+                        staged: list[StagedUploadedFile] = []
+                        try:
+                            with TemporaryDirectory(
+                                prefix="xagent-feishu-input-"
+                            ) as staging_dir:
+                                for item in pending:
+                                    for file_info in files[item.message_id]:
+                                        downloaded = (
+                                            await drain_async_task_cancellation_safe(
+                                                asyncio.create_task(
+                                                    asyncio.to_thread(
+                                                        self._download_feishu_file_sync,
+                                                        file_info,
+                                                        Path(staging_dir),
+                                                    )
+                                                )
+                                            )
+                                        )
+                                        if downloaded is None:
+                                            raise TaskTurnError("file_unavailable")
+                                        if stopped():
+                                            return
+                                        file_id = str(uuid4())
+                                        (
+                                            uploaded,
+                                            cancellation,
+                                        ) = await await_task_settlement(
+                                            asyncio.create_task(
+                                                asyncio.to_thread(
+                                                    stage_uploaded_file_from_local_path,
+                                                    local_path=downloaded.path,
+                                                    user_id=owner_id,
+                                                    filename=downloaded.name,
+                                                    file_id=file_id,
+                                                    mime_type=downloaded.mime_type,
+                                                    storage_key=build_upload_storage_key(
+                                                        owner_id,
+                                                        file_id,
+                                                        downloaded.name,
+                                                    ),
+                                                    upload_source="feishu",
+                                                    execution_scope=None,
+                                                )
+                                            )
+                                        )
+                                        staged.append(uploaded)
+                                        if cancellation is not None:
+                                            raise cancellation
+                                        if stopped():
+                                            return
+                                attachments = normalize_attachments_for_persistence(
+                                    [
+                                        {
+                                            "file_id": item.file_id,
+                                            "name": item.filename,
+                                            "type": item.mime_type,
+                                            "size": item.file_size,
+                                        }
+                                        for item in staged
+                                    ]
+                                )
+                                text = "\n".join(
+                                    item.text for item in pending if item.text
+                                )
+                                links = " ".join(
+                                    f"[{item.filename}]({build_file_id_ref(item.file_id)})"
+                                    for item in staged
+                                )
+                                if links:
+                                    text = f"{text}\n\n{links}" if text else links
+                                if stopped():
+                                    return
+                                active_task_id = self.active_tasks.get(open_id)
+                                accepted, cancellation = await await_task_settlement(
+                                    asyncio.create_task(
+                                        asyncio.to_thread(
+                                            accept_channel_input,
+                                            pending[0],
+                                            additional_inputs=pending[1:],
+                                            owner_id=owner_id,
+                                            active_task_id=int(active_task_id)
+                                            if active_task_id is not None
+                                            else None,
+                                            channel_name=self.channel_name,
+                                            payload=TaskTurnPayload(
+                                                text,
+                                                execution_message=text,
+                                                attachments=attachments or None,
+                                                file_ids=tuple(
+                                                    item.file_id for item in staged
+                                                ),
+                                            ),
+                                            staged_files=tuple(staged),
+                                            host_id=get_task_event_bridge().host_id,
+                                        )
+                                    )
+                                )
+                                # Inspect late commits before propagating cancellation:
+                                # /new must never restore an older task selection.
+                                saved = True
+                                if (
+                                    self._conversation_generation(open_id) == generation
+                                    and not accepted.replayed
+                                    and accepted.selection.is_new_task
+                                ):
+                                    self.active_tasks[open_id] = str(accepted.task_id)
+                                    saved = self._save_active_tasks()
+                                if stopped():
+                                    turn = accepted.as_turn()
+                                    turn.discard_output = (
+                                        self._conversation_generation(open_id)
+                                        != generation
+                                    )
+                                    await drain_async_task_cancellation_safe(
+                                        asyncio.create_task(turn.stop())
+                                    )
+                                if cancellation is not None:
+                                    raise cancellation
+                                if stopped():
+                                    return
+                                await self._observe_shared_input(
+                                    open_id,
+                                    accepted,
+                                    generation,
+                                    save_failure_chat=chat_id if not saved else None,
+                                )
+                                break
+                        except ChannelInputBatchChanged:
+                            # A competing acceptance changed the partition. Reload
+                            # all physical inputs; never replay a new START ourselves.
+                            # Compensate this attempt's unused uploads below, then
+                            # download only still-pending inputs again. Keeping files
+                            # across repartition would require separate ownership.
+                            continue
+                        finally:
+                            if staged:
+                                await run_db_io_cancellation_safe(
+                                    lambda: compensate_staged_uploaded_files(
+                                        tuple(staged)
+                                    )
+                                )
+                except TaskTurnError as error:
+                    if error.reason != "file_unavailable":
+                        raise
+                    if stopped():
+                        return
+                    await self._send_text(
+                        chat_id,
+                        "I couldn't process the attached Feishu file(s). "
+                        "New messages in this group were not accepted. "
+                        "Please resend them together.",
+                    )
+        except ChannelAuthorizationError:
+            await self._send_text(chat_id, "🚫 You are not authorized to use this bot.")
+        except ChannelConfigurationError:
+            await self._send_text(
+                chat_id, "This bot is inactive or not correctly configured."
+            )
+        except TaskTurnError as error:
+            if not stopped():
+                await self._send_text(chat_id, self._input_error_message(error.reason))
+        except Exception:
+            logger.exception("Error accepting or observing Feishu input")
+            if not stopped():
+                await self._send_text(
+                    chat_id, "Sorry, an error occurred while processing your request."
+                )
+        finally:
+            self.user_preparing_executions.discard(open_id)
+            self._clear_user_stop_request(open_id)
+
+    @staticmethod
+    def _input_error_message(reason: str) -> str:
+        return {
+            "busy": "I'm still working on the previous message. Please wait for it to finish.",
+            "input_conflict": "This Feishu message was already accepted with different content. Please send a new message.",
+            "input_unavailable": "The original task is no longer available. Please send a new message.",
+            "file_unavailable": "I couldn't download the attached Feishu file(s). Please try uploading them again.",
+        }.get(reason, "This message could not be accepted. Please try again.")
+
+    async def _observe_shared_input(
+        self,
+        open_id: str,
+        accepted: AcceptedChannelInput,
+        generation: int,
+        *,
+        save_failure_chat: str | None = None,
+    ) -> None:
+        turn = accepted.as_turn()
+        active = (accepted.task_id, turn)
+        retained = False
+        handler = None
+
+        def current() -> bool:
+            selected = self.active_tasks.get(open_id)
+            return self._conversation_generation(open_id) == generation and (
+                selected is None or selected == str(accepted.task_id)
+            )
+
+        async def deliver(delivery: ChannelDelivery, result: dict[str, Any]) -> None:
+            await self._deliver_shared_result(delivery, result, is_current=current)
+
+        async def progress(text: str | None) -> None:
+            async def send(delivery: ChannelDelivery, _: Any) -> None:
+                if not current():
+                    raise ChannelDeliveryDiscarded
+                destination = delivery.destination
+                if not destination["loading_message_id"]:
+                    destination["loading_message_id"] = await self._send_text(
+                        destination["chat_id"],
+                        f"⏳ **Task #{accepted.task_id} is processing...**\n_Please wait for the result._",
+                    )
+                    if not destination["loading_message_id"]:
+                        raise ConnectionError("Feishu loading message was not accepted")
+                if (
+                    text is not None
+                    and current()
+                    and handler is not None
+                    and not handler.cancelled
+                ):
+                    await self._update_text(
+                        destination["chat_id"],
+                        destination["loading_message_id"],
+                        text,
+                        require_delivery=True,
+                        is_current=current,
+                    )
+
+            await DurableChannelProgress(accepted.command_db_id, send, deliver).send()
+
+        try:
+            if (
+                self._conversation_generation(open_id) != generation
+                or self._get_user_stop_event(open_id).is_set()
+            ):
+                turn.discard_output = (
+                    self._conversation_generation(open_id) != generation
+                )
+                await turn.stop()
+                return
+            if not current():
+                await turn.discard_delivery()
+                return
+            previous = self.user_active_executions.get(open_id)
+            if (
+                accepted.replayed
+                and previous is not None
+                and isinstance(previous[1], SharedChannelTurn)
+                and previous[1].command_db_id is not None
+                and previous[1].command_db_id > accepted.command_db_id
+            ):
+                # A historical receipt may retry delivery, but cannot take
+                # trace or control ownership from a newer retained command.
+                await turn.deliver(deliver)
+                return
+            self.user_active_executions[open_id] = active
+            # An accepted command remains controllable if observation fails
+            # before its terminal outcome is known.
+            retained = True
+            handler = FeishuTraceHandler(
+                accepted.task_id, self.api_client, "", send_update=progress
+            )
+            self.user_active_trace_handlers[open_id] = handler
+            if save_failure_chat is not None:
+                await self._send_text(
+                    save_failure_chat,
+                    f"Your request was accepted as task #{accepted.task_id}, but I couldn't save the current conversation locally. "
+                    "Retrying this same message will reuse the accepted task.",
+                )
+            await progress(None)
+            result = await turn.observe(handler)
+            if not current():
+                await turn.discard_delivery()
+                retained = False
+                return
+            retained = result.get("status") == "accepted"
+            delivered = await turn.deliver(
+                deliver, pending_notice=result.get("status") == "accepted"
+            )
+            retained = (
+                result.get("status") == "accepted" and not delivered and current()
+            )
+        except asyncio.CancelledError:
+            # Ending an ingress observer does not cancel durable worker work.
+            # Explicit controls request their own stop; close drains that request.
+            raise
+        except Exception:
+            logger.exception(
+                "Error observing accepted Feishu input command_id=%s",
+                accepted.command_db_id,
+            )
+        finally:
+            if self.user_active_trace_handlers.get(open_id) is handler:
+                self.user_active_trace_handlers.pop(open_id, None)
+            if self.user_active_executions.get(open_id) == active and (
+                not retained or not current()
+            ):
+                self.user_active_executions.pop(open_id, None)
+            await drain_async_task_cancellation_safe(asyncio.create_task(turn.close()))
+
     async def _process_messages_batch(
         self, open_id: str, messages_data: list[Any]
     ) -> None:
+        if get_shared_task_execution_enabled():
+            await self._process_shared_messages_batch(open_id, messages_data)
+            return
         chat_id = messages_data[0].event.message.chat_id
         claimed_task_id: int | None = None
         managed_lease: ManagedTaskLease | None = None
-        shared_turn: SharedChannelTurn | None = None
         agent_service = None
         active_execution: tuple[int, object] | None = None
-        awaiting_shared_delivery = False
         fs_handler: FeishuTraceHandler | None = None
         self.user_preparing_executions.add(open_id)
         self._clear_user_stop_request(open_id)
@@ -285,9 +718,7 @@ class FeishuBotInstance(BatchChannelControl[str]):
             if not stopped and self._conversation_generation(open_id) == generation:
                 return False
             try:
-                if shared_turn is not None:
-                    await shared_turn.stop()
-                elif managed_lease is not None:
+                if managed_lease is not None:
                     await managed_lease.finalize_result(status=TaskStatus.PAUSED)
             except Exception:
                 logger.warning(
@@ -347,12 +778,7 @@ class FeishuBotInstance(BatchChannelControl[str]):
 
             active_task_id = self.active_tasks.get(open_id)
             try:
-                prepare = (
-                    prepare_shared_channel_turn
-                    if get_shared_task_execution_enabled()
-                    else prepare_channel_task
-                )
-                prepared_task = await prepare(
+                prepared_task = await prepare_channel_task(
                     channel_id=self.channel_id,
                     external_user_id=str(open_id),
                     active_task_id=(
@@ -384,13 +810,8 @@ class FeishuBotInstance(BatchChannelControl[str]):
 
             # Take ownership synchronously after the atomic DB claim so any
             # later transport failure settles or TTL-recovers this exact run.
-            selected_task: SelectedChannelTask | ClaimedChannelTask
-            if isinstance(prepared_task, SharedChannelTurn):
-                shared_turn = prepared_task
-                selected_task = shared_turn.selection
-            else:
-                selected_task = prepared_task
-                managed_lease = prepared_task.managed_lease
+            selected_task = prepared_task
+            managed_lease = prepared_task.managed_lease
             if await interrupted():
                 return
             task_id = selected_task.task_id
@@ -412,32 +833,31 @@ class FeishuBotInstance(BatchChannelControl[str]):
                     )
                     return
 
-            if shared_turn is None:
-                setup_snapshot = await run_db_io_cancellation_safe(
-                    lambda: load_task_setup_snapshot_sync(task_id, owner_user_id)
-                )
-                if setup_snapshot is None:
-                    raise RuntimeError(f"Task {task_id} disappeared before execution")
-                agent_manager = get_agent_manager()
-                agent_service = await agent_manager.get_agent_for_task(
-                    task_id,
-                    user=setup_snapshot.runtime_user,
-                    task_setup_snapshot=setup_snapshot,
-                    task_owner_user_id=owner_user_id,
-                )
-                agent_service.set_conversation_history(
-                    [dict(message) for message in setup_snapshot.conversation_history],
-                    watermark=setup_snapshot.conversation_watermark,
-                )
-                recovery_state = await materialize_task_execution_recovery_state(
-                    setup_snapshot.execution_recovery
-                )
-                agent_service.set_execution_context_messages(
-                    recovery_state.get("messages", [])
-                )
-                agent_service.set_recovered_skill_context(
-                    recovery_state.get("skill_context")
-                )
+            setup_snapshot = await run_db_io_cancellation_safe(
+                lambda: load_task_setup_snapshot_sync(task_id, owner_user_id)
+            )
+            if setup_snapshot is None:
+                raise RuntimeError(f"Task {task_id} disappeared before execution")
+            agent_manager = get_agent_manager()
+            agent_service = await agent_manager.get_agent_for_task(
+                task_id,
+                user=setup_snapshot.runtime_user,
+                task_setup_snapshot=setup_snapshot,
+                task_owner_user_id=owner_user_id,
+            )
+            agent_service.set_conversation_history(
+                [dict(message) for message in setup_snapshot.conversation_history],
+                watermark=setup_snapshot.conversation_watermark,
+            )
+            recovery_state = await materialize_task_execution_recovery_state(
+                setup_snapshot.execution_recovery
+            )
+            agent_service.set_execution_context_messages(
+                recovery_state.get("messages", [])
+            )
+            agent_service.set_recovered_skill_context(
+                recovery_state.get("skill_context")
+            )
 
             if await interrupted():
                 return
@@ -451,7 +871,6 @@ class FeishuBotInstance(BatchChannelControl[str]):
                     agent_service=agent_service,
                     task_id=task_id,
                     user_id=owner_user_id,
-                    **({"workspace": shared_turn.workspace} if shared_turn else {}),
                 )
                 if await interrupted():
                     return
@@ -479,14 +898,13 @@ class FeishuBotInstance(BatchChannelControl[str]):
 
             if await interrupted():
                 return
-            if shared_turn is None:
-                await persist_channel_user_message(
-                    task_id=task_id,
-                    user_id=owner_user_id,
-                    content=text,
-                    attachments=persisted_attachments or None,
-                    turn_id=message_turn_id,
-                )
+            await persist_channel_user_message(
+                task_id=task_id,
+                user_id=owner_user_id,
+                content=text,
+                attachments=persisted_attachments or None,
+                turn_id=message_turn_id,
+            )
 
             if await interrupted():
                 return
@@ -507,92 +925,34 @@ class FeishuBotInstance(BatchChannelControl[str]):
 
             active_execution = (
                 task_id,
-                shared_turn if shared_turn is not None else agent_service,
+                agent_service,
             )
             self.user_active_executions[open_id] = active_execution
-            if shared_turn is not None:
-                shared_turn.delivery_destination = {
-                    "chat_id": chat_id,
-                    "loading_message_id": loading_msg_id,
-                }
-                result = await self._await_execution_with_stop_monitor(
-                    open_id,
-                    shared_turn.execute(
-                        TaskTurnPayload(
-                            transcript_message=text,
-                            execution_message=text,
-                            attachments=persisted_attachments or None,
-                            file_ids=tuple(
-                                item["file_id"] for item in persisted_attachments
-                            ),
+            local_service: Any = agent_service
+            local_lease = cast(ManagedTaskLease, managed_lease)
+            from ...user_isolated_memory import UserContext
+
+            actual_task_id = str(task_id)
+            try:
+                with UserContext(owner_user_id):
+                    result = await self._await_execution_with_stop_monitor(
+                        open_id,
+                        agent_manager.execute_task(
+                            agent_service=local_service,
+                            task=text,
+                            context=context,
+                            task_id=actual_task_id,
+                            tracking_task_id=actual_task_id,
+                            db_session=None,
+                            manage_task_lease=False,
+                            task_lease=local_lease.lease,
+                            task_lease_heartbeat_task=local_lease.heartbeat_task,
                         ),
-                        fs_handler,
-                    ),
-                    reason="Feishu stop requested",
-                )
-                if self._conversation_generation(open_id) != generation:
-                    await shared_turn.discard_delivery()
-                    return
-
-                if result.get("status") == "interrupted" and not shared_turn.accepted:
-                    if loading_msg_id:
-                        await self._update_text(
-                            chat_id,
-                            loading_msg_id,
-                            project_execution_result_for_channel(result).visible_text,
-                            is_current=lambda: self._conversation_generation(open_id)
-                            == generation,
-                        )
-                    return
-
-                async def deliver_current(
-                    delivery: ChannelDelivery, result: dict[str, Any]
-                ) -> None:
-                    if self._conversation_generation(open_id) != generation:
-                        raise ChannelDeliveryDiscarded
-                    await self._deliver_shared_result(
-                        delivery,
-                        result,
-                        is_current=lambda: self._conversation_generation(open_id)
-                        == generation,
+                        reason="Feishu stop requested",
                     )
-
-                delivered = await shared_turn.deliver(
-                    deliver_current,
-                    pending_notice=result.get("status") == "accepted",
-                )
-                awaiting_shared_delivery = (
-                    result.get("status") == "accepted"
-                    and not delivered
-                    and self._conversation_generation(open_id) == generation
-                )
-                return
-            else:
-                local_service: Any = agent_service
-                local_lease = cast(ManagedTaskLease, managed_lease)
-                from ...user_isolated_memory import UserContext
-
-                actual_task_id = str(task_id)
-                try:
-                    with UserContext(owner_user_id):
-                        result = await self._await_execution_with_stop_monitor(
-                            open_id,
-                            agent_manager.execute_task(
-                                agent_service=local_service,
-                                task=text,
-                                context=context,
-                                task_id=actual_task_id,
-                                tracking_task_id=actual_task_id,
-                                db_session=None,
-                                manage_task_lease=False,
-                                task_lease=local_lease.lease,
-                                task_lease_heartbeat_task=local_lease.heartbeat_task,
-                            ),
-                            reason="Feishu stop requested",
-                        )
-                finally:
-                    if fs_handler is not None:
-                        local_service.tracer.remove_handler(fs_handler)
+            finally:
+                if fs_handler is not None:
+                    local_service.tracer.remove_handler(fs_handler)
 
             projection = project_execution_result_for_channel(result)
             if managed_lease is not None and not await managed_lease.finalize_result(
@@ -675,14 +1035,11 @@ class FeishuBotInstance(BatchChannelControl[str]):
             if (
                 active_execution is not None
                 and self.user_active_executions.get(open_id) == active_execution
-                and not awaiting_shared_delivery
             ):
                 self.user_active_executions.pop(open_id, None)
 
             async def cleanup() -> None:
                 try:
-                    if shared_turn is not None:
-                        await shared_turn.close()
                     if managed_lease is not None:
                         await managed_lease.close()
                 finally:
