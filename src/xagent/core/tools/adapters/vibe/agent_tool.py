@@ -2051,11 +2051,17 @@ class AgentTool(AbstractBaseTool):
 
             if file_record is None and workspace is not None:
                 for raw_path in raw_paths:
+                    # RuntimeError is what Path.resolve() raises for a
+                    # symlink loop on the interpreters this project supports;
+                    # OSError covers the OS-level failures resolve() can also
+                    # raise, such as a path too long for the filesystem; such
+                    # an output is skipped like any other that does not
+                    # resolve, as the file tool's write resolver does.
                     try:
                         resolved_path = self._resolve_delegated_output_path(
                             workspace, raw_path
                         )
-                    except (FileNotFoundError, ValueError):
+                    except (FileNotFoundError, ValueError, RuntimeError, OSError):
                         logger.debug(
                             "Failed to resolve delegated file output: %s",
                             raw_path,

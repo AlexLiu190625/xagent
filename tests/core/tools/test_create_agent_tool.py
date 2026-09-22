@@ -1,6 +1,7 @@
 """Tests for CreateAgentTool - dynamically creating agents during task execution."""
 
 import inspect
+import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -1196,6 +1197,113 @@ class TestCreateAgentTool:
             try:
                 import os
 
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_agent_tool_skips_a_delegated_output_behind_a_symlink_loop(
+        self,
+        tmp_path,
+    ) -> None:
+        """A delegated output whose path cannot be resolved is skipped, and a
+        symlink loop is one such path: on Python 3.11 and 3.12 the write
+        resolver raises RuntimeError for it, which is skipped like the
+        containment ValueError rather than failing the whole registration.
+        On 3.13, where resolve() returns the loop path unresolved, the output
+        does not exist as a file and is skipped by the existence check."""
+        db, db_path, SessionLocal = _create_session()
+        try:
+            workspace = TaskWorkspace("task_loop", str(tmp_path))
+            loop = workspace.output_dir / "loopy"
+            try:
+                os.symlink("loopy", loop)
+            except (OSError, NotImplementedError):
+                pytest.skip("symlinks not available on this platform/user")
+
+            tool = AgentTool(
+                agent_id=1,
+                agent_name="File Worker",
+                agent_description="Writes files",
+                session_factory=SessionLocal,
+                user_id=1,
+                task_id="77",
+                parent_task_id="77",
+            )
+
+            file_outputs = tool._parent_owned_file_outputs(
+                [{"file_path": "loopy/report.txt", "filename": "report.txt"}],
+                workspace,
+                db,
+            )
+
+            assert file_outputs == []
+        finally:
+            db.close()
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_agent_tool_skips_a_delegated_output_with_a_too_long_path(
+        self,
+        tmp_path,
+    ) -> None:
+        """A delegated output whose filename is too long for the filesystem
+        raises OSError out of resolve(), not RuntimeError or ValueError; it
+        is skipped like any other path that does not resolve, and the rest
+        of the reported outputs still register normally rather than the
+        OSError failing the whole call."""
+        db, db_path, SessionLocal = _create_session()
+        try:
+            user = User(
+                username="too-long-path-user",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            parent_task = Task(id=77, user_id=user.id, title="Parent task")
+            db.add(parent_task)
+            db.commit()
+
+            with tempfile.TemporaryDirectory() as workspace_root:
+                workspace = TaskWorkspace(
+                    id="agent_1_toolong1",
+                    base_dir=workspace_root,
+                    db_task_id=77,
+                )
+                good_path = workspace.output_dir / "report.txt"
+                good_path.write_text("worker report", encoding="utf-8")
+
+                tool = AgentTool(
+                    agent_id=1,
+                    agent_name="File Worker",
+                    agent_description="Writes files",
+                    session_factory=SessionLocal,
+                    user_id=user.id,
+                    task_id="77",
+                    parent_task_id="77",
+                    workspace_base_dir=workspace_root,
+                )
+
+                too_long_name = "x" * 5000 + ".txt"
+                file_outputs = tool._parent_owned_file_outputs(
+                    [
+                        {"file_path": too_long_name, "filename": too_long_name},
+                        {"file_path": "report.txt", "filename": "report.txt"},
+                    ],
+                    workspace,
+                    db,
+                )
+
+                assert file_outputs is not None
+                assert len(file_outputs) == 1
+                assert file_outputs[0]["filename"] == "report.txt"
+        finally:
+            db.close()
+            try:
                 os.remove(db_path)
             except OSError:
                 pass
