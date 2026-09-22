@@ -627,6 +627,17 @@ def test_the_mock_workspace_keeps_the_write_entry_point(spelling, default_dir):
     )
 
 
+@pytest.mark.parametrize("spelling, default_dir", MOCK_WRITE_SPELLINGS)
+def test_the_mock_workspace_owns_nothing_and_refuses_nothing(spelling, default_dir):
+    """The predicate and the refusal the file tool calls exist on the mock
+    too, and answer the same way for every spelling, the engine's included:
+    nothing is engine-owned where nothing is written."""
+    mock = MockWorkspace()
+    target = mock.resolve_path(spelling, default_dir)
+    assert mock.is_engine_owned_path(target) is False
+    assert mock.refuse_engine_owned_write(target, spelling) == target
+
+
 def test_the_file_tool_refusal_is_the_workspace_refusal(workspace, monkeypatch):
     """One owner for the decision: the file tool calls through, it does not
     re-implement the check. Replacing the workspace's refusal changes what

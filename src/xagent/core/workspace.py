@@ -2765,6 +2765,16 @@ class MockWorkspace:
 
         return self.resolve_path(file_path, default_dir)
 
+    def is_engine_owned_path(self, file_path: Path) -> bool:
+        """Answer False: a workspace that never writes to disk owns nothing."""
+
+        return False
+
+    def refuse_engine_owned_write(self, resolved_path: Path, requested: str) -> Path:
+        """Return the target unchanged; see :meth:`is_engine_owned_path`."""
+
+        return resolved_path
+
     def register_file(self, file_path: str, file_id: Optional[str] = None) -> str:
         """
         Mock register_file - returns a UUID without creating database record.
