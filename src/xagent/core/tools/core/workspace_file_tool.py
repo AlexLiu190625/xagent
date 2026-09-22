@@ -417,7 +417,7 @@ class WorkspaceFileOperations:
             and not resolved_target_dir.is_relative_to(output_root)
         ):
             raise ValueError("assets_subdir must resolve inside output")
-        self._reject_engine_owned_target(resolved_target_dir, assets_subdir)
+        self.workspace.refuse_engine_owned_write(resolved_target_dir, assets_subdir)
 
         target_dir.mkdir(parents=True, exist_ok=True)
         target_path = self._build_unique_asset_path(target_dir / asset_name)
@@ -821,24 +821,18 @@ class WorkspaceFileOperations:
         logger.debug("find_and_replace result: %s", result)
         return result
 
-    def _reject_engine_owned_target(self, resolved_path: Path, requested: str) -> Path:
-        """Refuse one resolved write target that lands in the engine's subtree.
+    def _resolve_write_path(self, file_path: str, default_dir: str = "output") -> Path:
+        """Resolve a write target that need not exist yet, then apply the policy.
 
-        Every write, edit, delete and directory creation of this class reaches
-        it through :meth:`_resolve_write_path` or
-        :meth:`_resolve_existing_write_path`; reads never reach it at all. The
-        decision and its message belong to the workspace
+        Every write, edit, delete and directory creation of this class
+        resolves through this method or :meth:`_resolve_existing_write_path`;
+        reads never do. The decision and its message belong to the workspace
         (:meth:`TaskWorkspace.refuse_engine_owned_write`); this class only
         keeps its own resolvers in front of it, because they read a leading
         ``output/`` segment differently from ``TaskWorkspace.resolve_path``.
         """
 
-        return self.workspace.refuse_engine_owned_write(resolved_path, requested)
-
-    def _resolve_write_path(self, file_path: str, default_dir: str = "output") -> Path:
-        """Resolve a write target that need not exist yet, then apply the policy."""
-
-        return self._reject_engine_owned_target(
+        return self.workspace.refuse_engine_owned_write(
             self._resolve_path(file_path, default_dir), file_path
         )
 
@@ -851,7 +845,7 @@ class WorkspaceFileOperations:
         engine's subtree reaches the refusal.
         """
 
-        return self._reject_engine_owned_target(
+        return self.workspace.refuse_engine_owned_write(
             self._resolve_path_with_search(file_path), file_path
         )
 
