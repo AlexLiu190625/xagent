@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
-from xagent.core.workspace import SPILL_DIR_NAME, TaskWorkspace
+from xagent.core.workspace import SPILL_DIR_NAME, MockWorkspace, TaskWorkspace
 
 
 @pytest.fixture
@@ -606,6 +606,24 @@ def test_resolve_write_path_returns_what_resolve_path_returns_elsewhere(workspac
         assert workspace.resolve_write_path(
             spelling, default_dir=default_dir
         ) == workspace.resolve_path(spelling, default_dir=default_dir)
+
+
+MOCK_WRITE_SPELLINGS = [
+    pytest.param("report.txt", "output", id="output-file"),
+    pytest.param("notes.txt", "temp", id="temp-file"),
+    pytest.param(f"{SPILL_DIR_NAME}/x.json", "output", id="engine-spelling"),
+]
+
+
+@pytest.mark.parametrize("spelling, default_dir", MOCK_WRITE_SPELLINGS)
+def test_the_mock_workspace_keeps_the_write_entry_point(spelling, default_dir):
+    """Tools built for a listing get a MockWorkspace; the write entry point
+    the converted tools call must exist on it and answer as resolve_path
+    does. The mock never writes to disk, so nothing is refused there."""
+    mock = MockWorkspace()
+    assert mock.resolve_write_path(spelling, default_dir) == mock.resolve_path(
+        spelling, default_dir
+    )
 
 
 def test_the_file_tool_refusal_is_the_workspace_refusal(workspace, monkeypatch):

@@ -2750,6 +2750,16 @@ class MockWorkspace:
         else:
             return self.workspace_dir / file_path
 
+    def resolve_write_path(self, file_path: str, default_dir: str = "output") -> Path:
+        """Resolve a write target the same way as :meth:`resolve_path`.
+
+        The mock never writes to disk, so there is no engine-owned subtree to
+        refuse; the method exists so that tools built against this workspace
+        for listing keep the write-side entry point they call.
+        """
+
+        return self.resolve_path(file_path, default_dir)
+
     def register_file(self, file_path: str, file_id: Optional[str] = None) -> str:
         """
         Mock register_file - returns a UUID without creating database record.
