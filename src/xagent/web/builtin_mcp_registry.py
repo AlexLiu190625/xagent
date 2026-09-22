@@ -806,6 +806,30 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "word",
+            "name": "Word",
+            "description": "Connect to Word to create documents and read or edit top-level main-body paragraphs stored on OneDrive or SharePoint. Tables, headers, footers, text boxes, notes, and tracked changes are excluded.",
+            "icon": "https://www.google.com/s2/favicons?domain=office.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "microsoft",
+            "category": "Productivity",
+            "oauth_scopes": ["Files.ReadWrite.All"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.word"],
+                "env_mapping": {"AUTH_TOKEN": "access_token"},
+                "static_env": {
+                    "XAGENT_TOOL_MAX_OUTPUT_LENGTH": "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
+                },
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "word",
+                    "version": 1,
+                },
+            },
+        },
+        {
             "app_id": "excel",
             "name": "Excel",
             "description": "Connect to Excel to read and write worksheets, cell ranges, and tables in workbooks stored on OneDrive or SharePoint.",
