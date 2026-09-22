@@ -1,8 +1,11 @@
 import asyncio
 import json
 import logging
+import os
+from collections import deque
+from contextlib import suppress
 from pathlib import Path
-from typing import Any, Dict, Optional, cast
+from typing import Any, Callable, Dict, Optional, cast
 from uuid import uuid4
 
 import lark_oapi as lark
@@ -17,7 +20,12 @@ from ....config import get_channel_ingress_enabled, get_shared_task_execution_en
 from ....core.file_ref import build_file_id_ref
 from ...models.task import TaskStatus
 from ...services.agent_service_manager import get_agent_manager
-from ...services.channel_delivery import ChannelDelivery, recover_channel_results
+from ...services.channel_delivery import (
+    ChannelDelivery,
+    ChannelDeliveryDiscarded,
+    discard_channel_task_results,
+    recover_channel_results,
+)
 from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
@@ -51,12 +59,15 @@ from ...services.task_execution_context_service import (
 from ...services.task_lease_service import TaskLeaseLostError
 from ...services.task_orchestrator import TaskTurnPayload
 from ...services.task_setup_snapshot import load_task_setup_snapshot_sync
+from ..batch_control import BatchChannelControl
 from .trace_handler import FeishuTraceHandler
 
 logger = logging.getLogger(__name__)
 
 
-class FeishuBotInstance:
+class FeishuBotInstance(BatchChannelControl[str]):
+    control_label = "Feishu"
+
     def __init__(
         self,
         app_id: str,
@@ -79,8 +90,11 @@ class FeishuBotInstance:
             lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
         )
         self.polling_task: Optional[asyncio.Task] = None
-        self.user_message_queues: Dict[str, list] = {}
-        self.user_message_tasks: Dict[str, asyncio.Task] = {}
+        self._initialize_batch_control()
+        self.user_active_trace_handlers: dict[str, FeishuTraceHandler] = {}
+        self.control_tasks: set[asyncio.Task] = set()
+        self.control_queues: dict[str, deque[tuple[Any, str | None]]] = {}
+        self.control_locks: dict[str, asyncio.Lock] = {}
         self._ping_task: asyncio.Task | None = None
         self._accepting = True
         self._ingress_stopped = False
@@ -101,13 +115,102 @@ class FeishuBotInstance:
                 logger.error(f"Error loading feishu active tasks: {e}")
         return {}
 
-    def _save_active_tasks(self) -> None:
+    def _save_active_tasks(self) -> bool:
+        temporary = self.active_tasks_file.with_suffix(".json.tmp")
         try:
             self.active_tasks_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.active_tasks_file, "w") as f:
+            with temporary.open("w") as f:
                 json.dump(self.active_tasks, f)
-        except Exception as e:
-            logger.error(f"Error saving feishu active tasks: {e}")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, self.active_tasks_file)
+            return True
+        except Exception:
+            logger.exception("Error saving Feishu active tasks")
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+            return False
+
+    def _active_trace_handlers(self) -> dict[str, FeishuTraceHandler]:
+        return self.user_active_trace_handlers
+
+    @staticmethod
+    def _control_command(data: Any) -> str | None:
+        message = data.event.message
+        if message.message_type != "text":
+            return None
+        try:
+            text = json.loads(message.content).get("text", "").strip()
+        except (ValueError, AttributeError, TypeError):
+            return None
+        return text if text in {"/start", "/help", "/new", "/stop", "/pause"} else None
+
+    async def _handle_control(self, open_id: str, data: Any, command: str) -> None:
+        chat_id = data.event.message.chat_id
+        lock = self.control_locks.setdefault(open_id, asyncio.Lock())
+        try:
+            async with lock:
+                await authorize_channel_sender(
+                    channel_id=self.channel_id, external_user_id=open_id
+                )
+                if not self._accepting:
+                    return
+                if command in {"/start", "/help"}:
+                    reply = "Send a message to begin, /new for a fresh task, or /stop to pause the current run."
+                elif command == "/new":
+                    previous = self.active_tasks.get(open_id)
+                    self.active_tasks[open_id] = "-1"
+                    if not self._save_active_tasks():
+                        if previous is None:
+                            self.active_tasks.pop(open_id, None)
+                        else:
+                            self.active_tasks[open_id] = previous
+                        reply = "I couldn't save the new conversation. The current task is still active. Please try again."
+                    else:
+                        self.user_conversation_generations[open_id] = (
+                            self._conversation_generation(open_id) + 1
+                        )
+                        self._request_current_conversation_stop(
+                            open_id, reason="new Feishu conversation requested"
+                        )
+                        if (
+                            previous is not None
+                            and int(previous) > 0
+                            and self.channel_id is not None
+                        ):
+                            try:
+                                await discard_channel_task_results(
+                                    channel_id=self.channel_id,
+                                    external_user_id=open_id,
+                                    task_id=int(previous),
+                                )
+                            except Exception:
+                                logger.exception("Failed to discard old Feishu replies")
+                                await self._send_text(
+                                    chat_id,
+                                    "The new conversation is selected, but I couldn't finish cleaning up the previous replies. You can send your new request.",
+                                )
+                                return
+                        reply = "Started a new task. Please describe your request."
+                else:
+                    stopped = self._stop_current_conversation(open_id)
+                    reply = (
+                        "Stopped the current run. Send another message to continue here, or /new for a fresh task."
+                        if stopped
+                        else "No active run to stop."
+                    )
+            await self._send_text(chat_id, reply)
+        except ChannelAuthorizationError:
+            await self._send_text(chat_id, "🚫 You are not authorized to use this bot.")
+        except ChannelConfigurationError:
+            await self._send_text(
+                chat_id, "This bot is inactive or not correctly configured."
+            )
+        except Exception:
+            logger.exception("Failed to handle Feishu control command")
+            await self._send_text(
+                chat_id, "I couldn't complete that command. Please try again."
+            )
 
     def _handle_message_sync(self, data: Any) -> None:
         if not self._accepting:
@@ -132,26 +235,35 @@ class FeishuBotInstance:
 
             open_id = event.sender.sender_id.open_id
 
-            if open_id not in self.user_message_queues:
-                self.user_message_queues[open_id] = []
-            self.user_message_queues[open_id].append(data)
-
-            if (
-                open_id not in self.user_message_tasks
-                or self.user_message_tasks[open_id].done()
-            ):
-                self.user_message_tasks[open_id] = loop.create_task(
-                    self._process_user_queue(open_id)
-                )
+            command = self._control_command(data)
+            if command is not None or open_id in self.control_queues:
+                if open_id not in self.control_queues:
+                    self.control_queues[open_id] = deque()
+                    task = loop.create_task(self._process_control_queue(open_id))
+                    self.control_tasks.add(task)
+                    task.add_done_callback(self.control_tasks.discard)
+                self.control_queues[open_id].append((data, command))
+                return
+            self._enqueue_user_message(open_id, data)
         else:
             logger.error("No running event loop to schedule Feishu message processing")
 
-    async def _process_user_queue(self, open_id: str) -> None:
-        await asyncio.sleep(1.0)
-        messages_data = self.user_message_queues.pop(open_id, [])
-        if not messages_data:
-            return
-        await self._process_messages_batch(open_id, messages_data)
+    async def _process_control_queue(self, open_id: str) -> None:
+        # Serialize authorization and following inputs, never the execution itself.
+        # Later messages cannot enter the old queue while a command awaits the DB.
+        queue = self.control_queues[open_id]
+        try:
+            while queue and self._accepting:
+                data, command = queue.popleft()
+                if command is None:
+                    self._enqueue_user_message(open_id, data)
+                else:
+                    await self._handle_control(open_id, data, command)
+        finally:
+            self.control_queues.pop(open_id, None)
+
+    async def _process_queued_batch(self, open_id: str, messages: list[Any]) -> None:
+        await self._process_messages_batch(open_id, messages)
 
     async def _process_messages_batch(
         self, open_id: str, messages_data: list[Any]
@@ -161,6 +273,28 @@ class FeishuBotInstance:
         managed_lease: ManagedTaskLease | None = None
         shared_turn: SharedChannelTurn | None = None
         agent_service = None
+        active_execution: tuple[int, object] | None = None
+        awaiting_shared_delivery = False
+        fs_handler: FeishuTraceHandler | None = None
+        self.user_preparing_executions.add(open_id)
+        self._clear_user_stop_request(open_id)
+        generation = self._conversation_generation(open_id)
+
+        async def interrupted() -> bool:
+            stopped = self._consume_user_stop_request(open_id)
+            if not stopped and self._conversation_generation(open_id) == generation:
+                return False
+            try:
+                if shared_turn is not None:
+                    await shared_turn.stop()
+                elif managed_lease is not None:
+                    await managed_lease.finalize_result(status=TaskStatus.PAUSED)
+            except Exception:
+                logger.warning(
+                    "Failed to settle interrupted Feishu preparation", exc_info=True
+                )
+            return True
+
         try:
             combined_text = ""
             files_info = []
@@ -211,39 +345,6 @@ class FeishuBotInstance:
                 else:
                     return
 
-            if text in {"/start", "/new"}:
-                try:
-                    await authorize_channel_sender(
-                        channel_id=self.channel_id,
-                        external_user_id=str(open_id),
-                    )
-                except ChannelAuthorizationError:
-                    await self._send_text(
-                        chat_id,
-                        "\ud83d\udeab You are not authorized to use this bot.",
-                    )
-                    return
-                except ChannelConfigurationError:
-                    await self._send_text(
-                        chat_id,
-                        "This bot is inactive or not correctly configured.",
-                    )
-                    return
-
-                if text == "/start":
-                    await self._send_text(
-                        chat_id,
-                        "Welcome to Xagent! You can send /new to start a new task.",
-                    )
-                else:
-                    self.active_tasks[open_id] = "-1"
-                    self._save_active_tasks()
-                    await self._send_text(
-                        chat_id,
-                        "Started a new task. Please describe your request.",
-                    )
-                return
-
             active_task_id = self.active_tasks.get(open_id)
             try:
                 prepare = (
@@ -290,13 +391,26 @@ class FeishuBotInstance:
             else:
                 selected_task = prepared_task
                 managed_lease = prepared_task.managed_lease
+            if await interrupted():
+                return
             task_id = selected_task.task_id
             claimed_task_id = task_id
             owner_user_id = selected_task.user_id
             is_new_task = selected_task.is_new_task
             if is_new_task:
                 self.active_tasks[open_id] = str(task_id)
-                self._save_active_tasks()
+                if not self._save_active_tasks():
+                    if active_task_id is None:
+                        self.active_tasks.pop(open_id, None)
+                    else:
+                        self.active_tasks[open_id] = active_task_id
+                    if managed_lease is not None:
+                        await managed_lease.finalize_result(status=TaskStatus.PAUSED)
+                    await self._send_text(
+                        chat_id,
+                        "I couldn't save the new conversation. Your request wasn't started. Please try again.",
+                    )
+                    return
 
             if shared_turn is None:
                 setup_snapshot = await run_db_io_cancellation_safe(
@@ -325,6 +439,8 @@ class FeishuBotInstance:
                     recovery_state.get("skill_context")
                 )
 
+            if await interrupted():
+                return
             message_turn_id = str(uuid4())
             context: dict = {"turn_id": message_turn_id}
             persisted_attachments: list[dict[str, Any]] = []
@@ -337,6 +453,8 @@ class FeishuBotInstance:
                     user_id=owner_user_id,
                     **({"workspace": shared_turn.workspace} if shared_turn else {}),
                 )
+                if await interrupted():
+                    return
                 if uploaded_info:
                     persisted_attachments = normalize_attachments_for_persistence(
                         uploaded_info
@@ -359,6 +477,8 @@ class FeishuBotInstance:
                     context["state"] = context.get("state", {})
                     context["state"]["file_info"] = uploaded_info
 
+            if await interrupted():
+                return
             if shared_turn is None:
                 await persist_channel_user_message(
                     task_id=task_id,
@@ -368,38 +488,83 @@ class FeishuBotInstance:
                     turn_id=message_turn_id,
                 )
 
+            if await interrupted():
+                return
             loading_msg_id = await self._send_text(
                 chat_id,
                 f"⏳ **Task #{task_id} is processing...**\n_Please wait for the result._",
             )
 
-            fs_handler = None
+            if await interrupted():
+                return
             if loading_msg_id:
                 fs_handler = FeishuTraceHandler(
                     task_id, self.api_client, chat_id, loading_msg_id
                 )
+                self.user_active_trace_handlers[open_id] = fs_handler
                 if agent_service is not None:
                     agent_service.tracer.add_handler(fs_handler)
 
+            active_execution = (
+                task_id,
+                shared_turn if shared_turn is not None else agent_service,
+            )
+            self.user_active_executions[open_id] = active_execution
             if shared_turn is not None:
                 shared_turn.delivery_destination = {
                     "chat_id": chat_id,
                     "loading_message_id": loading_msg_id,
                 }
-                result = await shared_turn.execute(
-                    TaskTurnPayload(
-                        transcript_message=text,
-                        execution_message=text,
-                        attachments=persisted_attachments or None,
-                        file_ids=tuple(
-                            item["file_id"] for item in persisted_attachments
+                result = await self._await_execution_with_stop_monitor(
+                    open_id,
+                    shared_turn.execute(
+                        TaskTurnPayload(
+                            transcript_message=text,
+                            execution_message=text,
+                            attachments=persisted_attachments or None,
+                            file_ids=tuple(
+                                item["file_id"] for item in persisted_attachments
+                            ),
                         ),
+                        fs_handler,
                     ),
-                    fs_handler,
+                    reason="Feishu stop requested",
                 )
-                await shared_turn.deliver(
-                    self._deliver_shared_result,
+                if self._conversation_generation(open_id) != generation:
+                    await shared_turn.discard_delivery()
+                    return
+
+                if result.get("status") == "interrupted" and not shared_turn.accepted:
+                    if loading_msg_id:
+                        await self._update_text(
+                            chat_id,
+                            loading_msg_id,
+                            project_execution_result_for_channel(result).visible_text,
+                            is_current=lambda: self._conversation_generation(open_id)
+                            == generation,
+                        )
+                    return
+
+                async def deliver_current(
+                    delivery: ChannelDelivery, result: dict[str, Any]
+                ) -> None:
+                    if self._conversation_generation(open_id) != generation:
+                        raise ChannelDeliveryDiscarded
+                    await self._deliver_shared_result(
+                        delivery,
+                        result,
+                        is_current=lambda: self._conversation_generation(open_id)
+                        == generation,
+                    )
+
+                delivered = await shared_turn.deliver(
+                    deliver_current,
                     pending_notice=result.get("status") == "accepted",
+                )
+                awaiting_shared_delivery = (
+                    result.get("status") == "accepted"
+                    and not delivered
+                    and self._conversation_generation(open_id) == generation
                 )
                 return
             else:
@@ -410,16 +575,20 @@ class FeishuBotInstance:
                 actual_task_id = str(task_id)
                 try:
                     with UserContext(owner_user_id):
-                        result = await agent_manager.execute_task(
-                            agent_service=local_service,
-                            task=text,
-                            context=context,
-                            task_id=actual_task_id,
-                            tracking_task_id=actual_task_id,
-                            db_session=None,
-                            manage_task_lease=False,
-                            task_lease=local_lease.lease,
-                            task_lease_heartbeat_task=local_lease.heartbeat_task,
+                        result = await self._await_execution_with_stop_monitor(
+                            open_id,
+                            agent_manager.execute_task(
+                                agent_service=local_service,
+                                task=text,
+                                context=context,
+                                task_id=actual_task_id,
+                                tracking_task_id=actual_task_id,
+                                db_session=None,
+                                manage_task_lease=False,
+                                task_lease=local_lease.lease,
+                                task_lease_heartbeat_task=local_lease.heartbeat_task,
+                            ),
+                            reason="Feishu stop requested",
                         )
                 finally:
                     if fs_handler is not None:
@@ -438,6 +607,8 @@ class FeishuBotInstance:
                     f"task {task_id} ownership changed before Feishu result"
                 )
 
+            if self._conversation_generation(open_id) != generation:
+                return
             output = projection.visible_text
 
             max_len = 4000
@@ -446,11 +617,19 @@ class FeishuBotInstance:
             ]
 
             if loading_msg_id:
-                await self._update_text(chat_id, loading_msg_id, text_chunks[0])
+                await self._update_text(
+                    chat_id,
+                    loading_msg_id,
+                    text_chunks[0],
+                    is_current=lambda: self._conversation_generation(open_id)
+                    == generation,
+                )
             else:
                 await self._send_text(chat_id, text_chunks[0])
 
             for chunk in text_chunks[1:]:
+                if self._conversation_generation(open_id) != generation:
+                    return
                 await self._send_text(chat_id, chunk)
 
         except TaskLeaseLostError:
@@ -460,6 +639,8 @@ class FeishuBotInstance:
             )
         except Exception as e:
             logger.error(f"Error processing Feishu message: {e}", exc_info=True)
+            if active_execution is None and await interrupted():
+                return
             if managed_lease is not None:
                 try:
                     finalized = await managed_lease.finalize_result(
@@ -480,6 +661,8 @@ class FeishuBotInstance:
                         claimed_task_id,
                     )
                     return
+            if self._conversation_generation(open_id) != generation:
+                return
             await self._send_text(
                 chat_id,
                 CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
@@ -487,14 +670,48 @@ class FeishuBotInstance:
                 else "Sorry, an error occurred while processing your request.",
             )
         finally:
-            if shared_turn is not None:
-                await shared_turn.close()
-            if managed_lease is not None:
-                await managed_lease.close()
+            if fs_handler is not None:
+                self.user_active_trace_handlers.pop(open_id, None)
+            if (
+                active_execution is not None
+                and self.user_active_executions.get(open_id) == active_execution
+                and not awaiting_shared_delivery
+            ):
+                self.user_active_executions.pop(open_id, None)
+
+            async def cleanup() -> None:
+                try:
+                    if shared_turn is not None:
+                        await shared_turn.close()
+                    if managed_lease is not None:
+                        await managed_lease.close()
+                finally:
+                    self.user_preparing_executions.discard(open_id)
+                    self._clear_user_stop_request(open_id)
+
+            await drain_async_task_cancellation_safe(asyncio.create_task(cleanup()))
 
     async def _deliver_shared_result(
-        self, delivery: ChannelDelivery, result: dict[str, Any]
+        self,
+        delivery: ChannelDelivery,
+        result: dict[str, Any],
+        *,
+        is_current: Callable[[], bool] | None = None,
     ) -> None:
+        if is_current is None:
+            selected_task = self.active_tasks.get(delivery.external_user_id)
+            if selected_task is not None and selected_task != str(delivery.task_id):
+                raise ChannelDeliveryDiscarded
+            generation = self._conversation_generation(delivery.external_user_id)
+
+            def is_current() -> bool:
+                return (
+                    self._conversation_generation(delivery.external_user_id)
+                    == generation
+                )
+
+        if not is_current():
+            raise ChannelDeliveryDiscarded
         projection = project_execution_result_for_channel(result)
         chat_id = delivery.destination["chat_id"]
         loading_id = delivery.destination["loading_message_id"]
@@ -504,11 +721,19 @@ class FeishuBotInstance:
         ]
         if loading_id:
             await self._update_text(
-                chat_id, loading_id, chunks[0], require_delivery=True
+                chat_id,
+                loading_id,
+                chunks[0],
+                require_delivery=True,
+                is_current=is_current,
             )
         elif not await self._send_text(chat_id, chunks[0]):
             raise ConnectionError("Feishu final message was not accepted")
+        if not is_current():
+            raise ChannelDeliveryDiscarded
         for chunk in chunks[1:]:
+            if not is_current():
+                raise ChannelDeliveryDiscarded
             if not await self._send_text(chat_id, chunk):
                 raise ConnectionError("Feishu final message was not accepted")
 
@@ -664,6 +889,7 @@ class FeishuBotInstance:
         text: str,
         *,
         require_delivery: bool = False,
+        is_current: Callable[[], bool] | None = None,
     ) -> None:
         try:
             card_content = {
@@ -688,6 +914,8 @@ class FeishuBotInstance:
                 logger.error(
                     f"Failed to update Feishu message: {resp.code}, {resp.msg}, {resp.error}"
                 )
+                if is_current is not None and not is_current():
+                    return
                 if resp.code == 230001:  # "This message is NOT a card." error
                     logger.info("Falling back to send_text instead of update_text")
                     sent = await self._send_text(chat_id, text)
@@ -759,7 +987,9 @@ class FeishuBotInstance:
     async def _drain_user_message_tasks(self) -> None:
         current = asyncio.current_task()
         tasks = {
-            task for task in self.user_message_tasks.values() if task is not current
+            task
+            for task in (*self.user_message_tasks.values(), *self.control_tasks)
+            if task is not current
         }
         for task in tasks:
             if not task.done():
@@ -774,6 +1004,14 @@ class FeishuBotInstance:
         finally:
             self.user_message_tasks.clear()
             self.user_message_queues.clear()
+            self.control_tasks.clear()
+            self.control_queues.clear()
+            self.control_locks.clear()
+            self.user_active_executions.clear()
+            self.user_active_trace_handlers.clear()
+            self.user_preparing_executions.clear()
+            self.user_stop_events.clear()
+            self.user_conversation_generations.clear()
 
     async def _stop_ingress(self) -> None:
         try:

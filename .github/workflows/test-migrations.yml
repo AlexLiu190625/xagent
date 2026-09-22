@@ -51,6 +51,9 @@ on:
       - 'src/xagent/core/workspace.py'
       - 'src/xagent/web/models/task_channel_delivery.py'
       - 'src/xagent/web/services/channel_input_acceptance.py'
+      - 'src/xagent/web/channels/batch_control.py'
+      - 'src/xagent/web/channels/feishu/bot.py'
+      - 'src/xagent/web/channels/feishu/trace_handler.py'
       - 'src/xagent/web/services/channel_delivery.py'
       - 'src/xagent/web/services/channel_progress.py'
       - 'src/xagent/web/services/task_event_bridge.py'
@@ -201,6 +204,9 @@ jobs:
             src/xagent/core/workspace.py
             src/xagent/web/models/task_channel_delivery.py
             src/xagent/web/services/channel_input_acceptance.py
+            src/xagent/web/channels/batch_control.py
+            src/xagent/web/channels/feishu/bot.py
+            src/xagent/web/channels/feishu/trace_handler.py
             src/xagent/web/services/channel_delivery.py
             src/xagent/web/services/channel_progress.py
             src/xagent/web/services/task_event_bridge.py

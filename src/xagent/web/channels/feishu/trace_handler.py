@@ -28,6 +28,12 @@ class FeishuTraceHandler(TraceHandler):
             message_id  # The ID of the loading message we can potentially update
         )
         self.current_text = ""
+        self.cancelled = False
+
+    def cancel(self, *, discard_output: bool = True) -> None:
+        self.cancelled = True
+        # The shared cancel signature is retained; Feishu final replies use
+        # the bot's conversation generation instead of trace-handler state.
 
     async def handle_event(self, event: TraceEvent) -> None:
         try:
@@ -58,7 +64,7 @@ class FeishuTraceHandler(TraceHandler):
             logger.warning(f"FeishuTraceHandler error for task {self.task_id}: {e}")
 
     async def _update_message(self, text: str, final: bool = False) -> None:
-        if not text:
+        if self.cancelled or not text:
             return
 
         display_text = text if final else text + " ✍️"
@@ -87,6 +93,8 @@ class FeishuTraceHandler(TraceHandler):
                 resp = await asyncio.get_event_loop().run_in_executor(
                     None, self.api_client.im.v1.message.patch, req
                 )
+                if self.cancelled:
+                    return
                 if not resp.success():
                     logger.error(
                         f"Failed to patch Feishu message: {resp.code}, {resp.msg}"
