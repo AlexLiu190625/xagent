@@ -16,7 +16,11 @@ import {
 const pathnameRef = vi.hoisted(() => ({ current: "/task/1" as string | null }))
 const appStateRef = vi.hoisted(() => ({ taskId: 1 as number | null }))
 const sendMessageMock = vi.hoisted(() =>
-  vi.fn<(message: string, config?: { clientMessageId?: string; force?: boolean }, files?: File[]) => Promise<void>>(
+  vi.fn<(
+    message: string,
+    config?: { clientMessageId?: string; force?: boolean; targetTaskId?: number },
+    files?: File[],
+  ) => Promise<void>>(
     async () => {},
   ),
 )
@@ -2501,6 +2505,41 @@ describe("keeps the send-failed panel up while a retry resend is in flight, even
     expect(screen.getByRole("dialog")).toBeInTheDocument()
     expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
     expect(screen.getByText("connectorRuntime.actions.resend")).toBeEnabled()
+  })
+})
+
+describe("resends into the task the dialog is for, not the task the page has moved to", () => {
+  it("resends into the task the dialog is for, not the task the page has moved to", async () => {
+    // Stands in for the contract sendMessage enforces in production: a
+    // named targetTaskId that is not the task this tab is connected to is
+    // rejected rather than delivered, while a send that names no task at
+    // all goes to whatever task the page is currently showing.
+    sendMessageMock.mockImplementation(async (_text, config) => {
+      if (config?.targetTaskId == null) return
+      if (config.targetTaskId !== appStateRef.taskId) {
+        throw new Error("Message not sent: the task connection moved on.")
+      }
+    })
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+
+    // The viewed task changes without a re-render, which is the real
+    // window: the effect that drops a request for a task the user has left
+    // is a plain useEffect, so the browser paints the old dialog against
+    // the new task at least once and the user can click in that frame.
+    appStateRef.taskId = 2
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+
+    // Named the dialog's own task, so it failed instead of landing in the
+    // conversation the user is now looking at, and says so on screen.
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    // Nothing was delivered into task 2: every call named task 1, and none
+    // left the target unnamed.
+    for (const call of sendMessageMock.mock.calls) {
+      expect(call[1]?.targetTaskId).toBe(1)
+    }
   })
 })
 

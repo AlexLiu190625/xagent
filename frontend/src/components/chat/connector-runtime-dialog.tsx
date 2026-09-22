@@ -507,9 +507,24 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // id under retry -- so a same-id retry never reaches it either way and
       // this flag changes nothing for it; force is what lets a fresh-id retry
       // (the original send still pending, unacknowledged) go out at all.
+      // targetTaskId names the task this dialog is for rather than letting
+      // sendMessage default to whichever task the page is currently
+      // showing, the same way the app's other cross-task send sites
+      // (workforce-builder.tsx, agent-builder.tsx) name theirs. The two
+      // can differ: the effect that drops a request belonging to a task
+      // the user has navigated away from is a plain useEffect, so it runs
+      // after the browser has painted, and the frame where the new task is
+      // already current while this dialog still holds the old one's
+      // snapshot is a frame the user can click in. Naming the task turns
+      // that click from a message delivered into the wrong conversation
+      // into a send that fails and says so on the panel below.
+      // request.taskId rather than snapshot.taskId: the two are always
+      // equal (every candidate openForTask can hand over is filtered by
+      // task id), and this body is mounted keyed on request.taskId, so it
+      // cannot change for the life of this instance.
       await sendMessage(
         snapshot.text,
-        { clientMessageId, force: true },
+        { clientMessageId, force: true, targetTaskId: request.taskId },
         snapshot.files,
       )
       resendMessageIdRef.current = null
