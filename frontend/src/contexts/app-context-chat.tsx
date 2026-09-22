@@ -2800,6 +2800,15 @@ export function AppProvider({
   // fourth frame family added later cannot settle a turn while quietly
   // skipping the stash and pending-candidate cleanup that settlement
   // requires (see the stash lifecycle docs on ConnectorRuntimePendingDelivery).
+  //
+  // Recreated on every render and captured by handleMessage's useCallback
+  // without appearing in its dependency array. That is safe for as long as
+  // the body below reads nothing but connectorRuntimeDialogRef.current,
+  // which a ref always resolves to the latest value regardless of which
+  // render's closure is calling. Anything read here that is not a ref --
+  // a prop, a state value, another callback -- makes a stale capture
+  // possible, and at that point this has to move behind a ref of its own
+  // rather than be added to that array.
   const settleConnectorRuntimeTurn = (taskId: number, opensDialog: boolean): void => {
     // openForTask hands this tab's candidate (staged or already-confirmed)
     // to the request and clears it in the same update: that frame both
@@ -6644,6 +6653,15 @@ export function AppProvider({
         connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
         throw error
       }
+      // The discard above cannot become a `finally` the way the session
+      // path's one below is, because the call on the next line -- which is
+      // what promotes the staged candidate into the resend stash, through
+      // recordDelivery -- sits outside the try. A `finally` would run
+      // before it and withdraw the candidate, and recordDelivery ignores a
+      // delivery it has no staged entry for, so every message queued for
+      // another task would stop leaving a resend candidate behind at all.
+      // Making the two paths one shape means moving this promotion inside
+      // the try first; that regrouping is tracked in xorbitsai/xagent#2488.
       addOptimisticUserMessage(targetTaskId)
       return
     }
