@@ -534,6 +534,40 @@ def test_prepare_html_asset_refuses_the_engine_subtree_as_assets_dir(
     assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
 
 
+def test_prepare_html_asset_names_the_resolved_asset_directory_it_refuses(
+    ops, html_source
+):
+    """The asset directory is the HTML path's parent joined with
+    assets_subdir, so the refusal names that directory as resolved, in its
+    workspace-relative form, rather than the assets_subdir argument alone."""
+    with pytest.raises(ValueError, match=f"Path 'output/{SPILL_DIR_NAME}' is"):
+        ops.prepare_html_asset("logo.png", "index.html", assets_subdir=SPILL_DIR_NAME)
+
+
+def test_prepare_html_asset_names_the_real_target_when_the_html_parent_is_swapped(
+    ops, workspace, html_source, monkeypatch
+):
+    """When the HTML path's parent becomes a symlink into the engine
+    directory after the HTML path was resolved, the refusal is reached
+    through that side, and only the resolved form names the real target."""
+    reserved = workspace.output_dir / SPILL_DIR_NAME
+    reserved.mkdir()
+    resolve_html_output_path = ops._resolve_html_output_path
+
+    def resolve_then_swap_the_parent(html_path: str) -> Path:
+        resolved = resolve_html_output_path(html_path)
+        os.symlink(reserved, workspace.output_dir / "report")
+        return resolved
+
+    monkeypatch.setattr(ops, "_resolve_html_output_path", resolve_then_swap_the_parent)
+    with pytest.raises(
+        ValueError, match=f"Path 'output/{SPILL_DIR_NAME}/assets' is"
+    ) as refused:
+        ops.prepare_html_asset("logo.png", "report/index.html", assets_subdir="assets")
+    assert "'assets' is" not in str(refused.value)
+    assert not (reserved / "assets").exists()
+
+
 def test_reads_are_unaffected(ops, engine_file):
     assert ops.read_file(f"{SPILL_DIR_NAME}/x.json") == '["engine"]'
     assert ops.read_file(f"output/{SPILL_DIR_NAME}/x.json") == '["engine"]'

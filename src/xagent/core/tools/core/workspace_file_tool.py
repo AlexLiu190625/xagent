@@ -417,7 +417,14 @@ class WorkspaceFileOperations:
             and not resolved_target_dir.is_relative_to(output_root)
         ):
             raise ValueError("assets_subdir must resolve inside output")
-        self.workspace.refuse_engine_owned_write(resolved_target_dir, assets_subdir)
+        # The refusal names the directory as resolved: the target depends on
+        # the HTML path's parent as well as on assets_subdir, and a symlink
+        # planted there after the HTML path was resolved reaches the refusal
+        # through that side.
+        self.workspace.refuse_engine_owned_write(
+            resolved_target_dir,
+            (Path("output") / resolved_target_dir.relative_to(output_root)).as_posix(),
+        )
 
         target_dir.mkdir(parents=True, exist_ok=True)
         target_path = self._build_unique_asset_path(target_dir / asset_name)
