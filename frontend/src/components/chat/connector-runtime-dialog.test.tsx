@@ -669,11 +669,13 @@ describe("re-reads the report on a type mismatch so a changed declaration takes 
     expect(screen.getByText("connectorRuntime.errors.typeObject:{\"key\":\"cfg\"}")).toBeInTheDocument()
   })
 
-  it("falls back to the whole dialog when a refresh's report drops the row the error was on", async () => {
+  it("drops the named type when a refresh's report drops the row the error was on", async () => {
     // Same failure as above, but the refresh reports a declaration that no
     // longer has this key at all (not just a different type): locateFieldError
     // cannot find any row to attach to, and must fall back to dialog scope
-    // rather than rendering the rejection nowhere.
+    // rather than rendering the rejection nowhere. "This field needs a JSON
+    // object" would then be pointing at no field, so dialog scope says only
+    // that the value was rejected.
     fetchMock.mockResolvedValueOnce(ok(report(false, [
       connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", required: true })]),
     ])))
@@ -693,9 +695,47 @@ describe("re-reads the report on a type mismatch so a changed declaration takes 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     await waitFor(() => expect(screen.getByLabelText("other")).toBeInTheDocument())
 
-    // Whole-dialog scope renders without the {key} interpolation.
-    expect(screen.getByText("connectorRuntime.errors.typeObject")).toBeInTheDocument()
-    expect(screen.queryByText(/connectorRuntime\.errors\.typeObject:/)).not.toBeInTheDocument()
+    // Whole-dialog scope, so the rejection is still on screen but no
+    // longer names a type, and it carries no {key} interpolation either.
+    expect(screen.getByText("connectorRuntime.errors.typeNoField")).toBeInTheDocument()
+    expect(screen.queryByText(/connectorRuntime\.errors\.typeObject/)).not.toBeInTheDocument()
+  })
+
+  it("drops the named type when a refresh reports the row satisfied", async () => {
+    // The row is still declared, and with the same type, so the hint is not
+    // stale -- but another tab (or the SDK) filled it while this dialog was
+    // open, and a satisfied row renders "already filled" with no control to
+    // attach an error to. locateFieldError falls back to dialog scope for
+    // the same reason as a dropped row, and the text has to follow: telling
+    // the user this field needs text, next to a field they cannot edit, is
+    // an instruction they cannot carry out.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "cfg", type: "string", required: true }),
+        input({ section: "context", key: "other", type: "string", required: true }),
+      ]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("cfg"), { target: { value: "hello" } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 400, code: "invalid_runtime_context",
+      reason: "type_mismatch.context.cfg", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "cfg", type: "string", required: true, satisfied: true }),
+        input({ section: "context", key: "other", type: "string", required: true }),
+      ]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.filled")).toBeInTheDocument())
+
+    expect(screen.getByText("connectorRuntime.errors.typeNoField")).toBeInTheDocument()
+    expect(screen.queryByText(/connectorRuntime\.errors\.typeString/)).not.toBeInTheDocument()
   })
 })
 

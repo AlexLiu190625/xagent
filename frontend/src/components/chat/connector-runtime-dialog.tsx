@@ -75,6 +75,37 @@ function translateFailure(
 }
 
 /**
+ * The same failure, worded for whole-dialog scope. That scope is where
+ * locateFieldError falls back when the row a failure named is not one the
+ * current report renders an editable control for -- the report dropped it,
+ * or a refresh collapsed it into "already filled" -- so two kinds of text
+ * stop being true there and get a variant instead of going through
+ * translateFailure:
+ *
+ * - `conflict` is the only text carrying a `{key}` placeholder, and there
+ *   is no key here to fill it with.
+ * - `typeObject` and `typeString` each name the type one specific field
+ *   needs. With no such field on screen that sentence points at nothing
+ *   the user can act on, so the variant says only the part that stays
+ *   true: the save was rejected over this value. The hint itself is not
+ *   dropped -- a rejection the user saw must not vanish on a refresh they
+ *   did not ask for -- only reworded, and a report that brings the row
+ *   back brings the named text back with it.
+ *
+ * `typeUnknown` needs no variant: it already names neither field nor type.
+ */
+function translateDialogScopeFailure(
+  t: (key: TranslationKey, vars?: TranslationVariables) => string,
+  messageKey: ConnectorRuntimeErrorMessageKey,
+): string {
+  if (messageKey === "conflict") return t("connectorRuntime.errors.conflictNoKey")
+  if (messageKey === "typeObject" || messageKey === "typeString") {
+    return t("connectorRuntime.errors.typeNoField")
+  }
+  return translateFailure(t, messageKey)
+}
+
+/**
  * The mount point for both halves of the connector-runtime dialog. Every
  * `AppProvider` in the tree renders this, including the two widget/share
  * ones -- there the dialog's own context read always returns the no-provider
@@ -842,15 +873,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
           <p className="text-sm text-destructive" role="alert">
             {/* This scope has no row identity in hand -- it is where
                 locateFieldError falls back when the row a failure named is
-                gone or unrecognized, most often a 409 conflict whose
-                refresh just collapsed that row into "already filled". A
-                conflict is the only messageKey whose text carries a
-                {key} placeholder, and there is no key here to fill it
-                with, so it gets a placeholder-free variant instead of
-                going through translateFailure like every other reason. */}
-            {dialogFieldError.messageKey === "conflict"
-              ? t("connectorRuntime.errors.conflictNoKey")
-              : translateFailure(t, dialogFieldError.messageKey)}
+                gone or unrecognized, most often a refresh that just
+                dropped that row or collapsed it into "already filled".
+                Which reasons that makes untrue, and what they say instead,
+                is translateDialogScopeFailure's own business. */}
+            {translateDialogScopeFailure(t, dialogFieldError.messageKey)}
           </p>
         )}
 

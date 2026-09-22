@@ -452,11 +452,17 @@ export function classifySubmitFailure(
  * `refresh: true` landed. Three messageKeys carry a type hint:
  * `typeObject` and `typeString` name a declared type, and `typeUnknown`
  * says the report the hint was derived from named none. Every other
- * messageKey is never type-related, so this always reads false for it. A
- * `locate.key` the refreshed report no longer declares under "context"
- * leaves the two named hints alone -- that case is a dropped row, not a
- * changed type, and the dialog's own field-error location already falls
- * back to whole-dialog scope for it.
+ * messageKey is never type-related, so this always reads false for it.
+ *
+ * This answers one question only: does the refreshed report still declare
+ * the type the hint names. A row that report no longer declares under
+ * "context", and one it now reports satisfied, both leave the two named
+ * hints alone -- neither is a changed type, and neither means the save
+ * stopped being rejected. What such a row does change is where the hint
+ * can attach and therefore what it may claim: the dialog's field-error
+ * location falls back to whole-dialog scope, where it is reworded to stop
+ * naming a type no field on screen is asking for
+ * (translateDialogScopeFailure in connector-runtime-dialog.tsx).
  */
 export function isTypeMismatchDispositionStale(
   disposition: ConnectorRuntimeFailureDisposition,

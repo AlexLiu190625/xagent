@@ -4969,6 +4969,7 @@ const zh = {
       contactAdmin: "保存失败，请联系管理员。",
       conflict: "另一个窗口已经填过 {key} 了。",
       conflictNoKey: "另一个窗口已经填过这个值了。",
+      typeNoField: "服务器拒绝了这个值。它对应的那一格在这里已经不能再编辑了。",
       typeString: "这一格要填文本。",
       typeObject: "这一格要填一个 JSON 对象。",
       typeUnknown: "服务器拒绝了这个值的类型。这个连接器没有说明它需要哪种类型。",
