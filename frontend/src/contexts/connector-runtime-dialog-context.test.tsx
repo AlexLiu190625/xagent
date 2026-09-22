@@ -165,6 +165,25 @@ describe("pending candidate state machine", () => {
     expect(latestState.request?.resendPayload).toBeNull()
   })
 
+  it("replaces a repeat stage under the same clientMessageId in place", () => {
+    // A retry that reuses the caller-supplied id stages a second time under
+    // that same id. Appending instead of replacing would leave two entries
+    // for one turn, which openForTask reads as two in-flight turns and
+    // withholds the whole resend chain for -- so the retry-id reuse this
+    // dialog depends on would cost the user the resend button.
+    renderProbe()
+    act(() => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-1", text: "first" })
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "cm-1", text: "second" })
+    })
+    act(() => {
+      latestActions.openForTask(1)
+    })
+    expect(latestState.request?.resendPayload).toEqual({
+      taskId: 1, clientMessageId: "cm-1", text: "second", files: [],
+    })
+  })
+
   it("does not fall through to the confirmed stash on ambiguity (Major A)", () => {
     renderProbe()
     act(() => {
