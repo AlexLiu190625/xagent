@@ -331,7 +331,7 @@ ESCAPING_ALIAS_TARGETS = [
 def test_an_alias_escaping_temp_does_not_hide_the_rest_of_the_workspace(
     workspace, relative_target
 ):
-    """A directory this name points at is reserved only when it sits inside temp/.
+    """A directory this name points at is reserved only when it is a direct child of temp/.
 
     Nothing the engine writes ever lives outside temp/, so an alias that
     escapes it names no scratch data to protect; honouring it anyway would

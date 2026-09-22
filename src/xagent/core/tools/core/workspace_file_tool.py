@@ -839,15 +839,28 @@ class WorkspaceFileOperations:
     def _resolve_existing_write_path(self, file_path: str) -> Path:
         """Resolve an existing file this call is about to modify, then apply the policy.
 
-        The not-found failure comes first, from the underlying resolver: a
-        write tool aimed at a name that does not exist gets the ordinary
-        FileNotFoundError, and only a name that really resolves into the
-        engine's subtree reaches the refusal.
+        The refusal does not depend on whether the name exists. When the
+        search resolver finds nothing, the place the name denotes as a write
+        target -- the one :meth:`_resolve_write_path` would compute -- is
+        checked, and a name inside the engine's subtree is refused with the
+        same ValueError ``write_file`` raises for it; only a name outside
+        the subtree gets the ordinary FileNotFoundError. A name the write
+        resolver refuses or cannot resolve either -- a containment or policy
+        refusal, or a symlink loop -- keeps the not-found answer, so every
+        other outcome of the search resolver is unchanged.
         """
 
-        return self.workspace.refuse_engine_owned_write(
-            self._resolve_path_with_search(file_path), file_path
-        )
+        try:
+            resolved_path = self._resolve_path_with_search(file_path)
+        except FileNotFoundError:
+            try:
+                intended: Path | None = self._resolve_path(file_path)
+            except (ValueError, OSError, RuntimeError):
+                intended = None
+            if intended is not None:
+                self.workspace.refuse_engine_owned_write(intended, file_path)
+            raise
+        return self.workspace.refuse_engine_owned_write(resolved_path, file_path)
 
     def _resolve_path_with_search(self, file_path: str) -> Path:
         """Intelligently resolve file path in workspace (first in input directory, then in output directory)"""

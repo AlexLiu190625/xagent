@@ -9,6 +9,7 @@ independent implementations (``TaskWorkspace`` and ``WorkspaceFileOperations``,
 which do not delegate to one another).
 """
 
+import os
 from pathlib import Path
 
 import pytest
@@ -545,7 +546,113 @@ def test_a_near_miss_directory_is_still_writable(ops, workspace):
     assert (workspace.output_dir / f"{SPILL_DIR_NAME}-mine" / "x.json").exists()
 
 
-def test_a_missing_engine_file_still_reports_not_found(ops, workspace):
-    (workspace.output_dir / SPILL_DIR_NAME).mkdir(parents=True)
+EXISTING_FILE_WRITES = [
+    pytest.param(lambda ops, p: ops.append_file(p, "planted"), id="append_file"),
+    pytest.param(
+        lambda ops, p: ops.edit_file(
+            p, [{"operation_type": "replace", "line_number": 1, "content": "planted"}]
+        ),
+        id="edit_file",
+    ),
+    pytest.param(
+        lambda ops, p: ops.find_and_replace(p, "engine", "planted"),
+        id="find_and_replace",
+    ),
+    pytest.param(lambda ops, p: ops.delete_file(p), id="delete_file"),
+]
+
+
+@pytest.mark.parametrize("write", EXISTING_FILE_WRITES)
+@pytest.mark.parametrize("directory_exists", [True, False], ids=["dir", "no-dir"])
+def test_a_missing_engine_file_is_refused_before_it_is_reported_missing(
+    ops, workspace, write, directory_exists
+):
+    """The refusal does not depend on existence, so it says the same thing
+    as write_file about the same target and never reports not-found for a
+    name inside the engine's subtree."""
+    if directory_exists:
+        (workspace.output_dir / SPILL_DIR_NAME).mkdir(parents=True)
+    with pytest.raises(ValueError, match="engine-owned"):
+        write(ops, f"{SPILL_DIR_NAME}/nope.json")
+    assert not (workspace.output_dir / SPILL_DIR_NAME / "nope.json").exists()
+    assert (workspace.output_dir / SPILL_DIR_NAME).exists() is directory_exists
+
+
+@pytest.mark.parametrize("write", EXISTING_FILE_WRITES)
+def test_a_missing_ordinary_file_still_reports_not_found(ops, workspace, write):
+    """Outside the engine's subtree the search resolver's answer is unchanged."""
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
     with pytest.raises(FileNotFoundError):
-        ops.delete_file(f"{SPILL_DIR_NAME}/nope.json")
+        write(ops, f"{SPILL_DIR_NAME}-mine/nope.json")
+    assert not (workspace.output_dir / f"{SPILL_DIR_NAME}-mine").exists()
+
+
+@pytest.mark.parametrize("write", EXISTING_FILE_WRITES)
+def test_a_symlink_loop_target_still_reports_not_found(ops, workspace, write):
+    """A name the search resolver reports missing but that cannot be resolved
+    as a write target either keeps the not-found answer. On interpreters
+    where ``Path.resolve`` raises RuntimeError on a loop, that error is the
+    write resolver's, and it must not replace the search resolver's."""
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    loop = workspace.output_dir / "loopy"
+    try:
+        os.symlink(loop, loop)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available on this platform/user")
+    with pytest.raises(FileNotFoundError):
+        write(ops, "output/loopy")
+
+
+@pytest.mark.parametrize("write", EXISTING_FILE_WRITES)
+@pytest.mark.parametrize(
+    ("target", "written_path"),
+    [
+        pytest.param(
+            f"{SPILL_DIR_NAME}/nope.json",
+            f"{SPILL_DIR_NAME}/nope.json",
+            id="engine-owned",
+        ),
+        pytest.param("output/nope.txt", "nope.txt", id="ordinary"),
+    ],
+)
+def test_a_policy_refusal_still_reports_not_found(
+    ops, workspace, monkeypatch, write, target, written_path
+):
+    """A name the search resolver reports missing but that the write
+    resolver cannot even check -- because its own authority check
+    (``requires_exact_file_operation_scope``) refuses first -- keeps the
+    not-found answer too, whether or not the name would otherwise fall
+    inside the engine's subtree. This pins the ``_resolve_existing_write_path``
+    docstring's "or policy refusal" clause: without it, deleting ``ValueError``
+    from the inner ``except (ValueError, OSError, RuntimeError)`` left every
+    other test in this module green."""
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def deny() -> bool:
+        raise ValueError("policy backend down")
+
+    monkeypatch.setattr(workspace, "requires_exact_file_operation_scope", deny)
+
+    with pytest.raises(FileNotFoundError):
+        write(ops, target)
+    assert not (workspace.output_dir / written_path).exists()
+
+
+@pytest.mark.parametrize("write", EXISTING_FILE_WRITES)
+def test_a_containment_refusal_still_reports_not_found(tmp_path, write):
+    """A relative target that climbs into a directory the search resolver
+    honors via ``allowed_external_dirs`` -- but that ``_resolve_path`` does
+    not, per ``test_ops_resolve_path_ignores_allowed_external_dirs`` above --
+    still keeps the search resolver's not-found answer instead of the write
+    resolver's containment ValueError, when the name does not exist there."""
+    external = tmp_path / "external"
+    external.mkdir(parents=True, exist_ok=True)
+    workspace = TaskWorkspace(
+        "task7", str(tmp_path), allowed_external_dirs=[str(external)]
+    )
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    ops = WorkspaceFileOperations(workspace)
+
+    with pytest.raises(FileNotFoundError):
+        write(ops, "../../external/nope.txt")
+    assert not (external / "nope.txt").exists()
