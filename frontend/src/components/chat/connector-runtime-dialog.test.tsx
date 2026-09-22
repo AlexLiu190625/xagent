@@ -1653,7 +1653,7 @@ describe("ignores a resend result superseded by a new request", () => {
     await act(async () => { resolveRetry() })
     expect(screen.getByRole("dialog")).toBeInTheDocument()
     expect(closeSpy).not.toHaveBeenCalledWith("resent")
-    expect(toastMock.mock.calls).toEqual([["connectorRuntime.resendSupersededUnknown"]])
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.resendSupersededSent"]])
   })
 
   it("stays silent when the superseded retry failed, since nothing went out", async () => {
@@ -1783,7 +1783,7 @@ describe("says whether the message went out when a retarget supersedes save-and-
     toastMock.mockClear()
 
     await act(async () => { resolveSend() })
-    expect(toastMock.mock.calls).toEqual([["connectorRuntime.resendSupersededUnknown"]])
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.resendSupersededSent"]])
     expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
     expect(screen.getByRole("dialog")).toBeInTheDocument()
   })
@@ -2497,7 +2497,7 @@ describe("keeps the send-failed panel up while a retry resend is in flight, even
     // panel it resolved from is still the live one, not cleared by the
     // refresh, so it re-enables rather than disappearing.
     await act(async () => { resolveRetry() })
-    await waitFor(() => expect(toastMock).toHaveBeenCalledWith("connectorRuntime.resendSupersededUnknown"))
+    await waitFor(() => expect(toastMock).toHaveBeenCalledWith("connectorRuntime.resendSupersededSent"))
     expect(screen.getByRole("dialog")).toBeInTheDocument()
     expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
     expect(screen.getByText("connectorRuntime.actions.resend")).toBeEnabled()

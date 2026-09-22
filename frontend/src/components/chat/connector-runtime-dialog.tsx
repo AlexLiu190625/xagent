@@ -685,7 +685,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         // this block only runs when doResend was called with a snapshot.
         setSubmitting(false)
         toast(resendOutcome === "sent"
-          ? t("connectorRuntime.resendSupersededUnknown")
+          ? t("connectorRuntime.resendSupersededSent")
           : t("connectorRuntime.sendFailed"))
         return
       }
@@ -726,7 +726,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // that clicking a resend button there would send this same turn a
       // second time.
       setResending(false)
-      if (resendOutcome === "sent") toast(t("connectorRuntime.resendSupersededUnknown"))
+      if (resendOutcome === "sent") toast(t("connectorRuntime.resendSupersededSent"))
       return
     }
     setResending(false)

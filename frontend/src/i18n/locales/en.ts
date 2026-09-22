@@ -4958,7 +4958,7 @@ Build when you need.`,
     savedNotResentIncomplete: "The values were saved, but this message was not resent: this connector still needs more input.",
     savedNotResentSuperseded: "The values were saved, but this message was not resent: another failure reopened this dialog before the resend could go out.",
     savedNotResentUnmounted: "The values were saved, but this message was not resent: this dialog closed before the resend could go out.",
-    resendSupersededUnknown: "The message was sent, but this dialog has since moved on to a new request. Do not resend it again.",
+    resendSupersededSent: "The message was sent, but this dialog has since moved on to a new request. Do not resend it again.",
     stillMissingAfterSave: "This connector will still be unavailable after saving; it still needs {keys}.",
     sendFailed: "The values were saved, but the message was not sent.",
     actions: {

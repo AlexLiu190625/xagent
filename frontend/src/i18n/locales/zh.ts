@@ -4953,7 +4953,7 @@ const zh = {
     savedNotResentIncomplete: "值已保存，但这条消息没有重发：这个连接器还缺别的输入。",
     savedNotResentSuperseded: "值已保存，但这条消息没有重发：重发之前，另一次失败把这个弹窗重新指向了别的请求。",
     savedNotResentUnmounted: "值已保存，但这条消息没有重发：重发之前，这个弹窗已经关闭。",
-    resendSupersededUnknown: "消息已经发出，但这个弹窗已经转向了新的请求，请不要再次重发。",
+    resendSupersededSent: "消息已经发出，但这个弹窗已经转向了新的请求，请不要再次重发。",
     stillMissingAfterSave: "保存后这个连接器仍然不可用，还缺 {keys}。",
     sendFailed: "值已保存，但消息没有发出去。",
     actions: {
