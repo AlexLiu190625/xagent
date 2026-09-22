@@ -264,7 +264,15 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const [submitting, setSubmitting] = useState(false)
   const [fieldError, setFieldError] = useState<FieldErrorState | null>(null)
   const [lastAlsoResend, setLastAlsoResend] = useState(false)
-  const [sendFailed, setSendFailed] = useState(false)
+  // The clientMessageId of the snapshot the "saved but not sent" panel is
+  // about, or null when no send has failed. It carries that id rather than
+  // being a bare flag because the panel names one message while its retry
+  // button sends whichever snapshot the request currently holds, and a
+  // same-task retarget can swap that snapshot out underneath it: holding
+  // the id is what lets the effect below notice the two have come apart.
+  // Read only through `sendFailed`.
+  const [sendFailedSnapshotId, setSendFailedSnapshotId] = useState<string | null>(null)
+  const sendFailed = sendFailedSnapshotId !== null
   const [resending, setResending] = useState(false)
   // The client message id the most recent unresolved resend attempt used,
   // together with the clientMessageId of the snapshot it was sent for, so a
@@ -290,8 +298,21 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // did anything, so it must never read as a decision the user made. The
   // same reasoning covers a still-live rejection message and a still-live
   // "saved but not sent" panel below: neither is cleared just because this
-  // re-read ran.
+  // re-read ran. The one exception is the first statement in the effect,
+  // and it is not about the re-read at all -- see there.
   useEffect(() => {
+    // A retarget can hand this instance a different resend snapshot
+    // (openForTask's staged/stashed candidates outrank the one already on
+    // screen, and an ambiguous frame can leave none at all). The "saved
+    // but not sent" panel names the message whose send failed, while its
+    // retry button sends whatever snapshot the request now carries -- so
+    // once that snapshot has been replaced the panel is about one message
+    // and the button would send another. Drop the panel in that case, and
+    // only in that case: a retarget that keeps the same snapshot leaves it
+    // standing, and nothing else here clears it.
+    setSendFailedSnapshotId(prev => (
+      prev !== null && prev !== requestRef.current.resendPayload?.clientMessageId ? null : prev
+    ))
     if (!isConnectorRuntimeDialogHostPath(pathnameRef.current)) {
       close("not-shown")
       return
@@ -340,9 +361,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // it is left alone here the same way handleSave's refresh already
       // leaves it alone. The "saved but not sent" panel is not about the
       // report at all -- nothing a re-read can show would make a send
-      // failure no longer have happened -- so it is never cleared here
-      // either; only a resend that actually completes (handleRetryResend)
-      // or unmounting clears it.
+      // failure no longer have happened -- so nothing the read returns
+      // clears it either. The only things that do are a resend that
+      // actually completes (handleRetryResend), unmounting, and this
+      // effect's own first statement, which drops it when the retarget
+      // that triggered this read also replaced the snapshot the panel's
+      // retry button would send.
       setFieldError(prev => (prev && isTypeMismatchDispositionStale(prev.disposition, result.report) ? null : prev))
       setVisible(true)
     })
@@ -706,7 +730,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       }
       if (resendOutcome !== "sent") {
         setSubmitting(false)
-        setSendFailed(true)
+        // The seq check just above proves no retarget landed while the
+        // resend was in flight, so the snapshot the request carries here
+        // is still the one doResend read -- which is what the panel this
+        // raises is about, and what its retry button would send.
+        setSendFailedSnapshotId(requestRef.current.resendPayload?.clientMessageId ?? null)
         return
       }
     }
@@ -746,7 +774,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     }
     setResending(false)
     if (resendOutcome === "sent") {
-      setSendFailed(false)
+      setSendFailedSnapshotId(null)
       close("resent")
     }
   }
@@ -931,7 +959,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         {!sendFailed && (
           <DialogFooter>
             {actions.includes("acknowledge") && (
-              <Button variant="outline" onClick={handleDismiss}>
+              // handleDismiss already refuses while a submission is in
+              // flight; without this the button still looks pressable and
+              // does nothing when pressed. A met report renders this as the
+              // only button, and a save-and-resend whose save came back met
+              // is still submitting for as long as its resend runs, so this
+              // is a state the user can reach. The save buttons reach the
+              // same guard through canSubmitNow, which folds busy in.
+              <Button variant="outline" disabled={busy} onClick={handleDismiss}>
                 {t("connectorRuntime.actions.acknowledge")}
               </Button>
             )}

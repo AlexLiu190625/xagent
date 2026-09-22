@@ -1572,11 +1572,16 @@ describe("keeps a resend id bound to the snapshot it belongs to", () => {
     ])))
     await openForTask()
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
+    // The send-failed panel went with the snapshot it was about, so the
+    // ordinary footer is back. The id this instance is still carrying was
+    // minted for the snapshot that just left.
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
 
     sendMessageMock.mockClear()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "y" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
     sendMessageMock.mockResolvedValueOnce(undefined)
-    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
     await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
     // The retargeted snapshot's own text is what goes out...
     expect(sendMessageMock.mock.calls[0][0]).toBe("TEXT-Y")
@@ -2477,10 +2482,13 @@ describe("keeps the send-failed panel up while a retry resend is in flight, even
     // Same task, another terminal frame arrives while that resend is still
     // in flight -- e.g. a second tab's own broadcast of the same failure.
     // openForTask bumps the request's seq and the read effect re-fetches,
-    // but the send-failed panel is a live "message still hasn't gone out"
-    // fact this refresh does not get to erase: it stays up, and its own
-    // retry button stays disabled for as long as this resend is in flight
-    // (the ordinary footer never reappears to need its own gating).
+    // but it has no fresher candidate to offer, so the snapshot this panel
+    // is about is the one the request still carries. The panel is a live
+    // "message still hasn't gone out" fact that such a refresh does not get
+    // to erase: it stays up, and its own retry button stays disabled for as
+    // long as this resend is in flight (the ordinary footer never reappears
+    // to need its own gating). A retarget that does swap the snapshot is
+    // the other case, covered by its own test below.
     fetchMock.mockResolvedValueOnce(ok(report(false, [
       connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
     ])))
@@ -2505,6 +2513,39 @@ describe("keeps the send-failed panel up while a retry resend is in flight, even
     expect(screen.getByRole("dialog")).toBeInTheDocument()
     expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
     expect(screen.getByText("connectorRuntime.actions.resend")).toBeEnabled()
+  })
+})
+
+describe("drops the send-failed panel once the snapshot it is about is replaced", () => {
+  it("drops the send-failed panel once the snapshot it is about is replaced", async () => {
+    // The panel names the message whose send failed, and its retry button
+    // sends whichever snapshot the request currently carries. A same-task
+    // retarget that brings a newer candidate swaps that snapshot out, so
+    // leaving the panel up would describe one message and send another.
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(new Error("closed"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    // A newer turn goes out on this same task and is acknowledged, then
+    // another terminal frame retargets this dialog: openForTask prefers
+    // that fresher snapshot over the one this instance is holding.
+    await stageThenRecord({ taskId: 1, clientMessageId: "newer-turn", text: "a later message" })
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(latestState.request).toMatchObject({
+      resendPayload: { clientMessageId: "newer-turn", text: "a later message" },
+    })
+    // The dialog itself stays open on the fresher request's report.
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.saveAndResend")).toBeInTheDocument()
   })
 })
 
@@ -2540,6 +2581,30 @@ describe("resends into the task the dialog is for, not the task the page has mov
     for (const call of sendMessageMock.mock.calls) {
       expect(call[1]?.targetTaskId).toBe(1)
     }
+  })
+})
+
+describe("disables the acknowledge button while a submission is still in flight", () => {
+  it("disables the acknowledge button while a submission is still in flight", async () => {
+    // Save and resend, where the save lands on a report with nothing left
+    // to fill and the resend is still running: the footer collapses to
+    // "Got it" alone while `submitting` is still true. handleDismiss
+    // refuses in that state, so an enabled-looking button would do nothing
+    // when pressed.
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    let resolveResend: () => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((res) => { resolveResend = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+
+    await waitFor(() =>
+      expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeInTheDocument(),
+    )
+    expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeDisabled()
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+
+    await act(async () => { resolveResend() })
   })
 })
 
