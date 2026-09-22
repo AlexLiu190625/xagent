@@ -591,10 +591,25 @@ export function resolveDialogActions(
   outcome: DialogOutcome,
   hasResendPayload: boolean,
 ): ConnectorRuntimeDialogAction[] {
-  if (outcome.kind === "fillable") {
-    return hasResendPayload ? ["saveAndResend", "saveOnly"] : ["saveOnly"]
+  switch (outcome.kind) {
+    case "fillable":
+      return hasResendPayload ? ["saveAndResend", "saveOnly"] : ["saveOnly"]
+    case "met":
+    case "unsupported_only":
+    case "nothing_fillable":
+      return ["acknowledge"]
+    default: {
+      // Listing the acknowledge kinds instead of defaulting to them is what
+      // makes this assignment stop compiling once a kind is added to
+      // DialogOutcomeKind without a case here, rather than letting the new
+      // kind inherit a button set nobody chose for it. The return below
+      // still keeps a footer from rendering empty if a value from outside
+      // the union reaches this at runtime.
+      const unhandled: never = outcome
+      void unhandled
+      return ["acknowledge"]
+    }
   }
-  return ["acknowledge"]
 }
 
 /**
