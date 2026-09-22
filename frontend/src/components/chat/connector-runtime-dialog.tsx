@@ -267,12 +267,21 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // The clientMessageId of the snapshot the "saved but not sent" panel is
   // about, or null when no send has failed. It carries that id rather than
   // being a bare flag because the panel names one message while its retry
-  // button sends whichever snapshot the request currently holds, and a
-  // same-task retarget can swap that snapshot out underneath it: holding
-  // the id is what lets the effect below notice the two have come apart.
-  // Read only through `sendFailed`.
+  // button sends whichever snapshot the request currently holds, and the
+  // request can stop carrying that snapshot underneath it: a same-task
+  // retarget swaps in a newer candidate (openForTask), and a settlement
+  // frame for this task takes it away without moving `seq` at all
+  // (forgetDelivery).
   const [sendFailedSnapshotId, setSendFailedSnapshotId] = useState<string | null>(null)
+  // Derived every render against the snapshot the request currently
+  // carries, the same way `activeFieldError` below is re-derived rather
+  // than cached: the panel and its retry button must be about the same
+  // message in every painted frame, including the first frame after a
+  // retarget commits. An effect that noticed the two had come apart and
+  // reset the panel afterwards left that first frame actionable, and never
+  // ran at all for a removal that does not move `seq`.
   const sendFailed = sendFailedSnapshotId !== null
+    && sendFailedSnapshotId === request.resendPayload?.clientMessageId
   const [resending, setResending] = useState(false)
   // The client message id the most recent unresolved resend attempt used,
   // together with the clientMessageId of the snapshot it was sent for, so a
@@ -298,21 +307,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // did anything, so it must never read as a decision the user made. The
   // same reasoning covers a still-live rejection message and a still-live
   // "saved but not sent" panel below: neither is cleared just because this
-  // re-read ran. The one exception is the first statement in the effect,
-  // and it is not about the re-read at all -- see there.
+  // re-read ran. Whether that panel still has a snapshot to be about is a
+  // separate question this effect does not answer -- `sendFailed` above
+  // derives it from the request on every render, including the retargets
+  // that never reach this effect at all.
   useEffect(() => {
-    // A retarget can hand this instance a different resend snapshot
-    // (openForTask's staged/stashed candidates outrank the one already on
-    // screen, and an ambiguous frame can leave none at all). The "saved
-    // but not sent" panel names the message whose send failed, while its
-    // retry button sends whatever snapshot the request now carries -- so
-    // once that snapshot has been replaced the panel is about one message
-    // and the button would send another. Drop the panel in that case, and
-    // only in that case: a retarget that keeps the same snapshot leaves it
-    // standing, and nothing else here clears it.
-    setSendFailedSnapshotId(prev => (
-      prev !== null && prev !== requestRef.current.resendPayload?.clientMessageId ? null : prev
-    ))
     if (!isConnectorRuntimeDialogHostPath(pathnameRef.current)) {
       close("not-shown")
       return
@@ -363,10 +362,9 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // report at all -- nothing a re-read can show would make a send
       // failure no longer have happened -- so nothing the read returns
       // clears it either. The only things that do are a resend that
-      // actually completes (handleRetryResend), unmounting, and this
-      // effect's own first statement, which drops it when the retarget
-      // that triggered this read also replaced the snapshot the panel's
-      // retry button would send.
+      // actually completes (handleRetryResend), unmounting, and the
+      // request no longer carrying the snapshot the panel is about, which
+      // `sendFailed` derives during render rather than any effect here.
       setFieldError(prev => (prev && isTypeMismatchDispositionStale(prev.disposition, result.report) ? null : prev))
       setVisible(true)
     })
@@ -757,6 +755,23 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     // A resend is one billed model call plus a possibly side-effecting tool
     // run; a double click here must not fire it twice.
     if (resending) return
+    // The panel this button lives on is about one message, and doResend
+    // below sends whichever snapshot the request carries when it runs: the
+    // two must be the same message. Unreachable today -- `sendFailed`
+    // derives the panel's visibility from exactly this comparison during
+    // render, so a frame that draws this button has already proved them
+    // equal -- but the handler re-checks rather than trusting the render
+    // that drew it, the same way handleSave re-checks `canSubmitNow`. The
+    // panel's own state is dropped here too: the send it was about can no
+    // longer be retried from this dialog, so leaving the id behind would
+    // make the panel reappear if that snapshot ever came back.
+    if (
+      sendFailedSnapshotId === null
+      || sendFailedSnapshotId !== requestRef.current.resendPayload?.clientMessageId
+    ) {
+      setSendFailedSnapshotId(null)
+      return
+    }
     const seqAtStart = request.seq
     setResending(true)
     const resendOutcome = await doResend()

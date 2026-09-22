@@ -2549,6 +2549,59 @@ describe("drops the send-failed panel once the snapshot it is about is replaced"
   })
 })
 
+describe("hides the send-failed panel as soon as the request stops carrying its snapshot", () => {
+  // Raises the panel the two cases below then take the snapshot away from:
+  // a save that lands on a met report whose resend is rejected.
+  async function openWithSendFailedPanel() {
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(new Error("closed"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    sendMessageMock.mockClear()
+  }
+
+  it("hides it when a settlement takes the snapshot away without moving the request's seq", async () => {
+    // forgetDelivery drops the snapshot in place: the request object is
+    // replaced but `seq` does not move, so the read effect never re-runs.
+    // The panel would name a message this dialog can no longer send, and
+    // its retry button would reach doResend with no snapshot at all.
+    await openWithSendFailedPanel()
+
+    await act(async () => { latestActions.forgetDelivery(1) })
+
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+    expect(sendMessageMock).not.toHaveBeenCalled()
+    // Only the panel goes. The dialog stays open on the report it is
+    // showing, the same way it does for the resend offer in the footer.
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("hides it in the commit that replaces the snapshot, before the re-read settles", async () => {
+    // A retarget that brings a newer candidate replaces the snapshot, and
+    // the panel must be gone in the frame that commits it -- not once
+    // something that runs afterwards notices. The re-read this retarget
+    // triggers is held open for the whole test, so nothing downstream of
+    // it can be what hides the panel.
+    await openWithSendFailedPanel()
+    await stageThenRecord({ taskId: 1, clientMessageId: "newer-turn", text: "a later message" })
+    fetchMock.mockReturnValueOnce(new Promise(() => {}))
+
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+    expect(sendMessageMock).not.toHaveBeenCalled()
+    expect(latestState.request).toMatchObject({
+      resendPayload: { clientMessageId: "newer-turn", text: "a later message" },
+    })
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+})
+
 describe("resends into the task the dialog is for, not the task the page has moved to", () => {
   it("resends into the task the dialog is for, not the task the page has moved to", async () => {
     // Stands in for the contract sendMessage enforces in production: a
