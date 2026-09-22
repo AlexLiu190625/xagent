@@ -271,14 +271,7 @@ class TaskWorkspace:
     def engine_owned_output_dir(self) -> Path:
         """Return the output subtree the engine owns and the model may not write.
 
-        The engine stores oversized tool results here and then describes each
-        file to the model in its own words. Those descriptions are only true
-        while the files hold the bytes the engine wrote, so this subtree is
-        listed by no workspace listing, registered by no auto-registration,
-        written by no workspace file tool, and refused to every tool that
-        resolves a destination through :meth:`resolve_write_path`. Reads are
-        deliberately left alone: the model still reaches a spilled file by
-        path.
+        :meth:`is_engine_owned_path` says what that reservation covers.
         """
 
         return self.output_dir / SPILL_DIR_NAME
@@ -291,11 +284,16 @@ class TaskWorkspace:
         and a symlink pointing into the subtree land on the real path before
         anything is compared. The parent of the reserved segment is resolved
         too, so a symlinked ``output/`` is seen through the same way; the
-        reserved segment itself is never followed, because a direct writer
-        can put a symlink there and following it would let that writer
-        choose which directory is protected. Equality counts as containment,
-        which is what makes the directory itself unremovable and its name
-        unusable for a plain file.
+        reserved segment on that side is compared by name and not resolved,
+        because a direct writer can put a symlink there and following it
+        would let that writer choose which directory is protected. The other
+        half of that choice: a symlink standing at the reserved name is an
+        ordinary entry whose target is not reserved, so a file placed at the
+        hijacked location is not protected by this check. The spill writer
+        refuses to write through such a link, and that refusal, not this
+        check, is what keeps the engine's bytes out of that location.
+        Equality counts as containment, which is what makes the directory
+        itself unremovable and its name unusable for a plain file.
 
         Every segment this check compares -- the parent prefix leading to
         ``output/`` and the reserved segment itself -- is compared with its
