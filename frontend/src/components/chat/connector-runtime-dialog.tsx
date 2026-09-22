@@ -367,36 +367,41 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         return
       }
       const outcome = resolveDialogOutcome(result.report)
-      if (outcome.kind === "met") {
-        if (!wasVisible) {
-          close("not-shown")
-          return
-        }
-        // Same path handleSave's post-save refresh already takes when a
-        // refresh finds nothing left to fill (see "leaves a way out..."
-        // below): install the report and let the footer collapse to "Got
-        // it" instead of silently discarding the user's in-progress draft.
-        setReport(result.report)
+      // A met report the user has never seen is the one case where nothing
+      // is installed at all: there is no dialog to keep open and nothing
+      // for it to say.
+      if (outcome.kind === "met" && !wasVisible) {
+        close("not-shown")
         return
       }
       setReport(result.report)
-      // This branch only runs because another terminal frame for the same
-      // task retargeted an already-open dialog (see this effect's opening
-      // comment) -- never because the user resolved anything -- so a live
-      // rejection or send failure must survive it. A type-mismatch hint is
-      // cleared only once this fresher report proves it stale (the row's
-      // declared type changed under it, via isTypeMismatchDispositionStale,
-      // the same check handleSave's own post-failure refresh uses below); a
-      // 409 conflict hint has no such report-derived staleness condition, so
-      // it is left alone here the same way handleSave's refresh already
-      // leaves it alone. The "saved but not sent" panel is not about the
-      // report at all -- nothing a re-read can show would make a send
-      // failure no longer have happened -- so nothing the read returns
-      // clears it either. The only things that do are a resend that
+      // This point is only reached because another terminal frame for the
+      // same task retargeted an already-open dialog (see this effect's
+      // opening comment) -- never because the user resolved anything -- so
+      // a live rejection or send failure must survive it. A type-mismatch
+      // hint is cleared only once this fresher report proves it stale (the
+      // row's declared type changed under it, via
+      // isTypeMismatchDispositionStale, the same check handleSave's own
+      // post-failure refresh uses below); a 409 conflict hint has no such
+      // report-derived staleness condition, so it is left alone here the
+      // same way handleSave's refresh already leaves it alone. A met report
+      // runs this too: "nothing is missing any more" says nothing about
+      // whether a type hint still describes the row it names, and that row
+      // can be declared with a different type in the very report that
+      // reports the connector complete. The "saved but not sent" panel is
+      // not about the report at all -- nothing a re-read can show would
+      // make a send failure no longer have happened -- so nothing the read
+      // returns clears it either. The only things that do are a resend that
       // actually completes (handleRetryResend), unmounting, and the
       // request no longer carrying the snapshot the panel is about, which
       // `sendFailed` derives during render rather than any effect here.
       setFieldError(prev => (prev && isTypeMismatchDispositionStale(prev.disposition, result.report) ? null : prev))
+      // An already-visible met report stays on screen with its footer
+      // collapsed to "Got it" (the same path handleSave's post-save refresh
+      // takes when a refresh finds nothing left to fill) rather than
+      // silently discarding the user's in-progress draft. `visible` is
+      // already true here, so there is nothing left to do for it.
+      if (outcome.kind === "met") return
       setVisible(true)
     })
     return () => { cancelled = true }

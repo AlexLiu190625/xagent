@@ -737,6 +737,54 @@ describe("re-reads the report on a type mismatch so a changed declaration takes 
     expect(screen.getByText("connectorRuntime.errors.typeNoField")).toBeInTheDocument()
     expect(screen.queryByText(/connectorRuntime\.errors\.typeString/)).not.toBeInTheDocument()
   })
+
+  it("checks the hint against a met refresh too, not only a still-missing one", async () => {
+    // A report that reports the connector complete says nothing about
+    // whether a type hint still describes the row it names: the same report
+    // can declare that row with the other type, which is exactly what makes
+    // the hint wrong. The met branch used to install the report and return
+    // before this check ran, so the hint outlived the report that disproved
+    // it -- and, the row still being editable, went on naming a type it no
+    // longer has.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("cfg"), { target: { value: "hello" } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 400, code: "invalid_runtime_context",
+      reason: "type_mismatch.context.cfg", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "string", required: true })]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() =>
+      expect(screen.getByText("connectorRuntime.errors.typeString:{\"key\":\"cfg\"}")).toBeInTheDocument(),
+    )
+
+    // Another terminal frame retargets this already-visible dialog; the
+    // read it triggers comes back met, and in it cfg is declared "object"
+    // and already filled -- someone else supplied a value of the type the
+    // server was enforcing all along.
+    fetchMock.mockResolvedValueOnce(ok(report(true, [
+      connector(REF_A, "A", [input({ section: "context", key: "cfg", type: "object", satisfied: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(screen.getByText("connectorRuntime.filled")).toBeInTheDocument())
+
+    // Cleared outright, not reworded: this report proves the hint names a
+    // type the row does not have, which is the stale case rather than the
+    // no-field-to-point-at case. Skipping the check would have left the
+    // whole-dialog wording of it standing under a report that says nothing
+    // is missing.
+    expect(screen.queryByText(/connectorRuntime\.errors\.typeString/)).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.errors.typeNoField")).not.toBeInTheDocument()
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
 })
 
 describe("keeps distinct row identity for a key name legitimately reused across sections", () => {
