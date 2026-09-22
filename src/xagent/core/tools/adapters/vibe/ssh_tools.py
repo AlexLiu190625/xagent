@@ -235,7 +235,10 @@ class SshDownloadTool(_SshTransferTool):
 
     @property
     def description(self) -> str:
-        return "Download a file from a bound SSH target into the task workspace."
+        return (
+            "Download a file from a bound SSH target into the task workspace. "
+            "output/tool-results/ is reserved for the engine and refuses writes."
+        )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         if self._workspace is None:

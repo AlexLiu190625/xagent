@@ -800,3 +800,49 @@ def test_named_temp_listing_shows_the_internal_scratch_root_only_when_asked(
     assert {e["file_path"] for e in workspace.get_all_files()["temp"]} == {str(note)}
     assert scratch not in workspace._scan_all_files()
     assert note in workspace._scan_all_files()
+
+
+# --------------------------------------------------------------------------
+# What the model is told before it tries
+# --------------------------------------------------------------------------
+
+RESERVED_NOTE = (
+    f"output/{SPILL_DIR_NAME}/ is reserved for the engine and refuses writes."
+)
+
+WRITE_SIDE_FILE_TOOLS = {
+    "write_file",
+    "prepare_html_asset",
+    "append_file",
+    "delete_file",
+    "create_directory",
+    "write_json_file",
+    "write_csv_file",
+    "edit_file",
+    "find_and_replace",
+}
+
+
+def test_every_write_side_file_tool_description_names_the_reserved_directory(
+    workspace,
+):
+    """The refusal is one turn late as a teacher; every tool that can reach
+    it says so up front, and no read-side tool does."""
+    from xagent.core.tools.adapters.vibe.workspace_file_tool import (
+        create_workspace_file_tools,
+    )
+
+    tools = {tool.name: tool for tool in create_workspace_file_tools(workspace)}
+    assert WRITE_SIDE_FILE_TOOLS <= set(tools)
+    for name, tool in tools.items():
+        assert (RESERVED_NOTE in tool.description) is (name in WRITE_SIDE_FILE_TOOLS), (
+            name
+        )
+
+
+def test_the_sql_export_description_names_the_reserved_directory(workspace):
+    from xagent.core.tools.adapters.vibe.sql_tool import SqlQueryTool
+
+    tools = {tool.name: tool for tool in SqlQueryTool(workspace).get_tools()}
+    assert RESERVED_NOTE in tools["execute_sql_query"].description
+    assert RESERVED_NOTE not in tools["get_database_type"].description

@@ -224,6 +224,18 @@ async def test_download_tool_writes_into_workspace(tmp_path) -> None:
     assert ex.calls[0][0] == "download"
 
 
+def test_the_download_description_names_the_reserved_directory(tmp_path) -> None:
+    """local_path is a write target, so the download tool says up front what
+    the upload tool, which only reads the workspace, has no reason to say."""
+    ex = _RecordingTransferExecutor()
+    workspace = _FakeWorkspace(tmp_path)
+    note = f"output/{SPILL_DIR_NAME}/ is reserved for the engine and refuses writes."
+    download = SshDownloadTool(executor=ex, workspace=workspace, context=_ctx())
+    upload = SshUploadTool(executor=ex, workspace=workspace, context=_ctx())
+    assert note in download.description
+    assert note not in upload.description
+
+
 async def test_download_tool_refuses_the_engine_owned_subtree(tmp_path) -> None:
     """local_path is model-facing; the download resolves through the
     write-side entry, so a destination inside the engine's tool-results
