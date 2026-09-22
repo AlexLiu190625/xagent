@@ -734,7 +734,18 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         // resend was in flight, so the snapshot the request carries here
         // is still the one doResend read -- which is what the panel this
         // raises is about, and what its retry button would send.
-        setSendFailedSnapshotId(requestRef.current.resendPayload?.clientMessageId ?? null)
+        const failedSnapshotId = requestRef.current.resendPayload?.clientMessageId ?? null
+        if (failedSnapshotId === null) {
+          // A settlement frame for this task arrived while the save was in
+          // flight and took the snapshot with it (forgetDelivery), without
+          // reopening the dialog and so without moving `seq`. There is
+          // nothing left to retry, and a panel here would draw a retry
+          // button with nothing behind it -- so say the same thing the
+          // panel says, once, and leave the dialog on its report.
+          toast(t("connectorRuntime.sendFailed"))
+          return
+        }
+        setSendFailedSnapshotId(failedSnapshotId)
         return
       }
     }

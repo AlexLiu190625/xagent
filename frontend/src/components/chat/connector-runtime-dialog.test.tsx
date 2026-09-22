@@ -2584,6 +2584,47 @@ describe("resends into the task the dialog is for, not the task the page has mov
   })
 })
 
+describe("drops an open dialog's resend offer when the task settles elsewhere", () => {
+  it("drops an open dialog's resend offer when the task settles elsewhere", async () => {
+    // A settlement frame that does not reopen the dialog -- a task_completed
+    // for a turn another tab ran, say -- means the snapshot this dialog is
+    // offering belongs to a turn that is over. The offer goes; the dialog,
+    // the report on screen and the user's half-typed draft stay.
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "half typed" } })
+    expect(screen.getByText("connectorRuntime.actions.saveAndResend")).toBeInTheDocument()
+
+    await act(async () => { latestActions.forgetDelivery(1) })
+
+    expect(screen.queryByText("connectorRuntime.actions.saveAndResend")).not.toBeInTheDocument()
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeInTheDocument()
+    expect(screen.getByLabelText("token")).toHaveValue("half typed")
+  })
+
+  it("says the message did not go out when the settlement lands mid save-and-resend", async () => {
+    // Same settlement frame, but it arrives while a save-and-resend is in
+    // flight, so the snapshot is gone by the time the resend would run.
+    // There is nothing left to retry, so this reports the failure once
+    // instead of drawing a retry button with nothing behind it.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    let resolveSave: (value: unknown) => void = () => {}
+    submitMock.mockReturnValueOnce(new Promise((res) => { resolveSave = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+
+    await act(async () => { latestActions.forgetDelivery(1) })
+    await act(async () => { resolveSave(ok(report(true, []))) })
+
+    expect(sendMessageMock).not.toHaveBeenCalled()
+    expect(toastMock).toHaveBeenCalledWith("connectorRuntime.sendFailed")
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    warnSpy.mockRestore()
+  })
+})
+
 describe("disables the acknowledge button while a submission is still in flight", () => {
   it("disables the acknowledge button while a submission is still in flight", async () => {
     // Save and resend, where the save lands on a report with nothing left

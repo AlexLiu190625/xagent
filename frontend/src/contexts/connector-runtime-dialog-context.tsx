@@ -282,13 +282,31 @@ export function ConnectorRuntimeDialogProvider({ children }: { children: React.R
       // be told apart (xorbitsai/xagent#2465). Clearing all of them trades
       // an interleaved send's still-live candidate for the guarantee that a
       // later failure never resends the wrong message.
+      //
+      // An open dialog for this task holds its own copy of the snapshot,
+      // handed over by openForTask, and that copy is what its resend button
+      // reads -- so clearing only the stash would leave a one-click resend
+      // on screen for a turn this frame has just settled. The copy goes
+      // too, but nothing else about the request does: the request stays,
+      // `seq` does not move, so the dialog stays open on the report it is
+      // showing, the user's draft survives, and only the resend button
+      // disappears. Closing the dialog here instead would throw away a
+      // draft the user is in the middle of typing over a frame they did
+      // not cause.
       setState(prev => {
+        const nextRequest = prev.request?.taskId === taskId && prev.request.resendPayload !== null
+          ? { ...prev.request, resendPayload: null }
+          : prev.request
         const nextPayload = prev.payload?.taskId === taskId ? null : prev.payload
         const nextPending = prev.pending.some(p => p.taskId === taskId)
           ? prev.pending.filter(p => p.taskId !== taskId)
           : prev.pending
-        if (nextPayload === prev.payload && nextPending === prev.pending) return prev
-        return { ...prev, payload: nextPayload, pending: nextPending }
+        if (
+          nextRequest === prev.request
+          && nextPayload === prev.payload
+          && nextPending === prev.pending
+        ) return prev
+        return { ...prev, request: nextRequest, payload: nextPayload, pending: nextPending }
       })
     },
     stagePendingDelivery: (delivery) => {
