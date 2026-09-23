@@ -7218,6 +7218,18 @@ const CONNECTOR_RUNTIME_REPORT_NEEDS_FILL = {
   }],
 }
 
+/**
+ * How the connector-runtime client calls apiRequest: the URL, and a
+ * RequestInit carrying the abort signal behind its own request timeout.
+ * Both halves are named here, so the negative rows below stay real
+ * assertions -- matching the URL alone would pass against any call shape
+ * and stop noticing a read that did go out.
+ */
+const connectorRuntimeReadCall = [
+  expect.stringContaining("connector-runtime-requirements"),
+  expect.objectContaining({ signal: expect.any(AbortSignal) }),
+] as const
+
 function stubConnectorRuntimeGet(): void {
   apiRequestMock.mockImplementation(async (url: string) => {
     if (typeof url === "string" && url.includes("connector-runtime-requirements")) {
@@ -7281,7 +7293,7 @@ describe("connector runtime dialog trigger", () => {
       })
       version += 1
       await waitFor(() =>
-        expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+        expect(apiRequestMock).toHaveBeenCalledWith(...connectorRuntimeReadCall)
       )
     }
 
@@ -7304,7 +7316,7 @@ describe("connector runtime dialog trigger", () => {
         } as unknown as TestWebSocketMessage)
       })
       version += 1
-      expect(apiRequestMock).not.toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+      expect(apiRequestMock).not.toHaveBeenCalledWith(...connectorRuntimeReadCall)
     }
 
     // Same code, state_version differing by 2 (a resend hitting the same
@@ -7320,7 +7332,7 @@ describe("connector runtime dialog trigger", () => {
         } as TestWebSocketMessage)
       })
       await waitFor(() =>
-        expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+        expect(apiRequestMock).toHaveBeenCalledWith(...connectorRuntimeReadCall)
       )
     }
 
@@ -7333,7 +7345,7 @@ describe("connector runtime dialog trigger", () => {
         code: "missing_runtime_context", run_id: `run-${version}`, state_version: version,
       } as TestWebSocketMessage)
     })
-    expect(apiRequestMock).not.toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+    expect(apiRequestMock).not.toHaveBeenCalledWith(...connectorRuntimeReadCall)
 
     // A repeated occurrence (same run_id/state_version, so the same bubble
     // text and occurrence identity) is swallowed by the bubble dedup guard --
@@ -7351,7 +7363,7 @@ describe("connector runtime dialog trigger", () => {
     apiRequestMock.mockClear()
     act(() => { onMessage?.(dup) })
     await waitFor(() =>
-      expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+      expect(apiRequestMock).toHaveBeenCalledWith(...connectorRuntimeReadCall)
     )
   })
 
@@ -8045,7 +8057,7 @@ describe("connector runtime dialog trigger", () => {
     // becoming non-null) settle before the test ends, so it cannot resolve
     // during a later test and corrupt its apiRequestMock call history.
     await waitFor(() =>
-      expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+      expect(apiRequestMock).toHaveBeenCalledWith(...connectorRuntimeReadCall)
     )
   })
 
@@ -8091,7 +8103,7 @@ describe("connector runtime dialog trigger", () => {
     // so it cannot resolve during a later test and corrupt its
     // apiRequestMock call history.
     await waitFor(() =>
-      expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+      expect(apiRequestMock).toHaveBeenCalledWith(...connectorRuntimeReadCall)
     )
 
     await act(async () => {
@@ -8151,7 +8163,7 @@ describe("connector runtime dialog trigger", () => {
     // so it cannot resolve during a later test and corrupt its
     // apiRequestMock call history.
     await waitFor(() =>
-      expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+      expect(apiRequestMock).toHaveBeenCalledWith(...connectorRuntimeReadCall)
     )
 
     // Clean up the still-queued send so it does not linger past this test:
@@ -8189,7 +8201,7 @@ describe("connector runtime dialog trigger", () => {
 
     act(() => { onMessage?.(frame) })
     await waitFor(() =>
-      expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+      expect(apiRequestMock).toHaveBeenCalledWith(...connectorRuntimeReadCall)
     )
     apiRequestMock.mockClear()
 
@@ -8199,7 +8211,7 @@ describe("connector runtime dialog trigger", () => {
     // the task's whole lifetime never emits a versioned control frame.
     act(() => { onMessage?.({ ...frame, run_id: "run-2" }) })
     await waitFor(() =>
-      expect(apiRequestMock).toHaveBeenCalledWith(expect.stringContaining("connector-runtime-requirements"))
+      expect(apiRequestMock).toHaveBeenCalledWith(...connectorRuntimeReadCall)
     )
   })
 
