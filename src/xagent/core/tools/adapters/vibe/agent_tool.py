@@ -1674,6 +1674,16 @@ def _classify_delegated_child_failure(
             failure_code="unsupported_nested_interaction",
         )
 
+    # A delivered partial answer ends the child's run, not the delegated work.
+    # In particular, iteration-limit delivery must not unlock a parent step
+    # as though the child completed all of its requested actions.
+    if result.get("completion_outcome") in ("partial", "blocked"):
+        output = result.get("output")
+        message = "The delegated task did not complete."
+        if isinstance(output, str) and output.strip():
+            message = f"{message}\n\n{output}"
+        return _classified_failure(message)
+
     status_is_incomplete = isinstance(status, str) and status.lower() != "completed"
     if result.get("success") is False or status_is_incomplete:
         if _child_never_answered(result):
