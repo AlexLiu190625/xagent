@@ -4961,6 +4961,7 @@ Build when you need.`,
     resendSupersededSent: "The message was sent, but this dialog has since moved on to a new request. Do not resend it again.",
     stillMissingAfterSave: "This connector will still be unavailable after saving; it still needs {keys}.",
     sendFailed: "The values were saved, but the message was not sent.",
+    sendOutcomeUnknown: "The values were saved, but whether the message was sent could not be confirmed. Check the conversation before sending it again.",
     actions: {
       saveAndResend: "Save and resend this message",
       saveOnly: "Save only",

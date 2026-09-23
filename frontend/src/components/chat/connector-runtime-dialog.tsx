@@ -3,7 +3,11 @@
 import React, { useEffect, useRef, useState } from "react"
 import { usePathname } from "next/navigation"
 
-import { readRetryWithNewId, readSendDisposition } from "@/components/chat/clarification-delivery"
+import {
+  readRetryWithNewId,
+  readSendDisposition,
+  sendOutcomeMayHaveLanded,
+} from "@/components/chat/clarification-delivery"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -24,6 +28,9 @@ import {
   type ConnectorRuntimeDialogRequest,
 } from "@/contexts/connector-runtime-dialog-context"
 import { useI18n } from "@/contexts/i18n-context"
+// Type-only, like clarification-delivery's own import of it: naming the
+// disposition union here adds no runtime dependency on the websocket hook.
+import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
 import type { TranslationKey, TranslationVariables } from "@/i18n/translations"
 import {
   buildSubmitItems,
@@ -261,8 +268,63 @@ function uniqueKeys(locations: Array<{ key: string }>): string[] {
   return Array.from(new Set(locations.map(l => l.key)))
 }
 
+/**
+ * What this dialog says about a message it did not manage to send, given the
+ * disposition the send path rejected with. Two texts, split by
+ * sendOutcomeMayHaveLanded rather than by a second reading of the
+ * disposition here, so this dialog and ClarificationForm cannot end up
+ * describing the same failure differently.
+ *
+ * A rejection carrying no disposition at all takes the definite text. Every
+ * rejection that leaves the wire carries one: use-websocket's sendChatMessage
+ * wraps anything that is not already a MessageDeliveryError into a `not_sent`
+ * one ("Pre-send failures never reached the server"), so the only
+ * dispositionless rejections that reach here are AppContext.sendMessage's own
+ * pre-flight refusals -- a closed session chat, files disabled for the
+ * conversation, an attachment upload that failed -- all of which throw before
+ * the send is attempted. doResend's id handling is deliberately more
+ * conservative than this for the same case: reusing an id costs nothing if
+ * the premise turns out to be too broad, while telling the user the turn did
+ * not run costs a duplicate turn.
+ */
+function sendFailureTextKey(disposition: MessageDeliveryDisposition | null): TranslationKey {
+  return sendOutcomeMayHaveLanded(disposition)
+    ? "connectorRuntime.sendOutcomeUnknown"
+    : "connectorRuntime.sendFailed"
+}
+
+// A settled resend attempt. The failed case carries the disposition the send
+// path rejected with, because what this dialog then says about the message
+// depends on it and every reader of this outcome -- the panel it raises and
+// the three toasts that stand in for that panel where it cannot be rendered
+// -- has to say the same thing.
+type ResendOutcome =
+  | { kind: "sent" }
+  | { kind: "failed"; disposition: MessageDeliveryDisposition | null }
+  | { kind: "nothing-to-send" }
+
+/**
+ * The same text, for a caller holding a settled attempt rather than a bare
+ * disposition. "nothing-to-send" takes the definite text: nothing was handed
+ * to the send path at all, so there is no uncertainty to preserve.
+ */
+function resendFailureTextKey(outcome: ResendOutcome): TranslationKey {
+  return sendFailureTextKey(outcome.kind === "failed" ? outcome.disposition : null)
+}
+
 interface FieldErrorState {
   disposition: ConnectorRuntimeFailureDisposition
+}
+
+/**
+ * The failed send the "saved but not sent" panel is about: the
+ * clientMessageId of the snapshot it names, and the disposition that failure
+ * carried, held together so the panel can never word one send's outcome with
+ * another's. See `sendFailed` in the body below for how the id half is read.
+ */
+interface SendFailureState {
+  snapshotId: string
+  disposition: MessageDeliveryDisposition | null
 }
 
 function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDialogRequest }) {
@@ -295,15 +357,17 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const [submitting, setSubmitting] = useState(false)
   const [fieldError, setFieldError] = useState<FieldErrorState | null>(null)
   const [lastAlsoResend, setLastAlsoResend] = useState(false)
-  // The clientMessageId of the snapshot the "saved but not sent" panel is
-  // about, or null when no send has failed. It carries that id rather than
+  // The send the "saved but not sent" panel is about, or null when no send
+  // has failed. It carries the failed snapshot's clientMessageId rather than
   // being a bare flag because the panel names one message while its retry
   // button sends whichever snapshot the request currently holds, and the
   // request can stop carrying that snapshot underneath it: a same-task
   // retarget swaps in a newer candidate (openForTask), and a settlement
   // frame for this task takes it away without moving `seq` at all
-  // (forgetDelivery).
-  const [sendFailedSnapshotId, setSendFailedSnapshotId] = useState<string | null>(null)
+  // (forgetDelivery). It carries that send's disposition alongside, because
+  // the panel's text depends on it -- see sendFailureTextKey -- and the two
+  // must never be able to come from different attempts.
+  const [sendFailure, setSendFailure] = useState<SendFailureState | null>(null)
   // Derived every render against the snapshot the request currently
   // carries, the same way `activeFieldError` below is re-derived rather
   // than cached: the panel and its retry button must be about the same
@@ -311,8 +375,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // retarget commits. An effect that noticed the two had come apart and
   // reset the panel afterwards left that first frame actionable, and never
   // ran at all for a removal that does not move `seq`.
-  const sendFailed = sendFailedSnapshotId !== null
-    && sendFailedSnapshotId === request.resendPayload?.clientMessageId
+  const liveSendFailure = sendFailure !== null
+    && sendFailure.snapshotId === request.resendPayload?.clientMessageId
+    ? sendFailure
+    : null
+  const sendFailed = liveSendFailure !== null
   const [resending, setResending] = useState(false)
   // The client message id the most recent unresolved resend attempt used,
   // together with the clientMessageId of the snapshot it was sent for, so a
@@ -521,8 +588,6 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     })
   }
 
-  type ResendOutcome = "sent" | "failed" | "nothing-to-send"
-
   const doResend = async (): Promise<ResendOutcome> => {
     const snapshot = requestRef.current.resendPayload
     if (!snapshot) {
@@ -534,7 +599,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // from "sent" and "failed" so a future caller that does reach it is
       // not misreported as either a completed resend or a failed one.
       console.warn("[connector-runtime] resend attempted with no snapshot to send")
-      return "nothing-to-send"
+      return { kind: "nothing-to-send" }
     }
     // Reuse the id the last unresolved attempt for this snapshot used,
     // unless that attempt's own outcome already proved it, or the snapshot
@@ -586,7 +651,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         snapshot.files,
       )
       resendMessageIdRef.current = null
-      return "sent"
+      return { kind: "sent" }
     } catch (error) {
       // Matches the read path's warn so a failing resend leaves the same
       // diagnostic signal. Carries the fixed prefix alone: unlike the read
@@ -600,13 +665,18 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // possibility open that the server already durably accepted this
       // attempt, so the next retry reuses this same id rather than risking
       // the same turn running twice under a second one.
+      const disposition = readSendDisposition(error)
       const mustMintNewId = (
         readRetryWithNewId(error)
-        || readSendDisposition(error) === "not_sent"
-        || readSendDisposition(error) === "rejected"
+        || disposition === "not_sent"
+        || disposition === "rejected"
       )
       resendMessageIdRef.current = mustMintNewId ? null : { forSnapshotId: snapshot.clientMessageId, clientMessageId }
-      return "failed"
+      // The disposition travels out with the outcome rather than being
+      // turned into text here: the caller decides whether this dialog is
+      // still on screen to raise a panel or has to settle for a toast, and
+      // both have to word the same failure the same way.
+      return { kind: "failed", disposition }
     }
   }
 
@@ -734,7 +804,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         // send-failed panel, which an unmounted instance can never render --
         // and doResend's console.warn reaches no user -- so say it once,
         // globally, without touching state or the provider.
-        if (resendOutcome !== "sent") toast(t("connectorRuntime.sendFailed"))
+        if (resendOutcome.kind !== "sent") toast(t(resendFailureTextKey(resendOutcome)))
         return
       }
       if (requestRef.current.seq !== seqAtStart) {
@@ -757,12 +827,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         // message went out -- and is unreachable from here anyway, since
         // this block only runs when doResend was called with a snapshot.
         setSubmitting(false)
-        toast(resendOutcome === "sent"
+        toast(resendOutcome.kind === "sent"
           ? t("connectorRuntime.resendSupersededSent")
-          : t("connectorRuntime.sendFailed"))
+          : t(resendFailureTextKey(resendOutcome)))
         return
       }
-      if (resendOutcome !== "sent") {
+      if (resendOutcome.kind !== "sent") {
         setSubmitting(false)
         // The seq check just above proves no retarget landed while the
         // resend was in flight, so the snapshot the request carries here
@@ -776,10 +846,13 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
           // nothing left to retry, and a panel here would draw a retry
           // button with nothing behind it -- so say the same thing the
           // panel says, once, and leave the dialog on its report.
-          toast(t("connectorRuntime.sendFailed"))
+          toast(t(resendFailureTextKey(resendOutcome)))
           return
         }
-        setSendFailedSnapshotId(failedSnapshotId)
+        setSendFailure({
+          snapshotId: failedSnapshotId,
+          disposition: resendOutcome.kind === "failed" ? resendOutcome.disposition : null,
+        })
         return
       }
     }
@@ -802,10 +875,10 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     // longer be retried from this dialog, so leaving the id behind would
     // make the panel reappear if that snapshot ever came back.
     if (
-      sendFailedSnapshotId === null
-      || sendFailedSnapshotId !== requestRef.current.resendPayload?.clientMessageId
+      sendFailure === null
+      || sendFailure.snapshotId !== requestRef.current.resendPayload?.clientMessageId
     ) {
-      setSendFailedSnapshotId(null)
+      setSendFailure(null)
       return
     }
     const seqAtStart = request.seq
@@ -831,13 +904,22 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // that clicking a resend button there would send this same turn a
       // second time.
       setResending(false)
-      if (resendOutcome === "sent") toast(t("connectorRuntime.resendSupersededSent"))
+      if (resendOutcome.kind === "sent") toast(t("connectorRuntime.resendSupersededSent"))
       return
     }
     setResending(false)
-    if (resendOutcome === "sent") {
-      setSendFailedSnapshotId(null)
+    if (resendOutcome.kind === "sent") {
+      setSendFailure(null)
       close("resent")
+      return
+    }
+    // A retry that failed again updates the panel's wording only in the
+    // direction that keeps uncertainty: once any attempt for this snapshot
+    // ended with its outcome unknown, a later attempt the server definitely
+    // refused does not make the earlier one un-sent, so the panel must not
+    // fall back to saying the message never went out.
+    if (sendOutcomeMayHaveLanded(resendOutcome.kind === "failed" ? resendOutcome.disposition : null)) {
+      setSendFailure(prev => (prev ? { ...prev, disposition: "outcome_unknown" } : prev))
     }
   }
 
@@ -886,9 +968,17 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
           </p>
         )}
 
-        {sendFailed ? (
+        {liveSendFailure ? (
           <div className="space-y-3">
-            <p className="text-sm text-destructive">{t("connectorRuntime.sendFailed")}</p>
+            {/* Two texts, one per outcome: a send the server definitely
+                refused is reported as not sent, while one whose
+                acknowledgement was lost may only warn. Re-resolved on every
+                render rather than translated once at failure time, so a
+                locale switch while this panel is up is not stuck in
+                whatever language was active when the send failed. */}
+            <p className="text-sm text-destructive">
+              {t(sendFailureTextKey(liveSendFailure.disposition))}
+            </p>
             <Button disabled={resending} onClick={handleRetryResend}>{t("connectorRuntime.actions.resend")}</Button>
           </div>
         ) : (

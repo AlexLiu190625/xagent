@@ -101,6 +101,23 @@ export const readRetryWithNewId = (error: unknown): boolean =>
   asRecord(error)?.retryWithNewId === true
 
 /**
+ * Whether the turn may have reached the agent even though the send rejected.
+ * `outcome_unknown` is the one disposition that leaves that open: the send
+ * was already on the wire when its acknowledgement was lost. Copy about it
+ * may only warn, never promise the turn did not run, because a second
+ * attempt under a fresh id could answer the same question twice.
+ *
+ * A surface with its own wording asks this rather than re-testing the
+ * disposition itself, so no two of them can end up describing the same
+ * failure differently: sendHintKey below is this split resolved into
+ * ClarificationForm's two hints, and the connector-runtime dialog resolves
+ * the same split into its own panel text.
+ */
+export const sendOutcomeMayHaveLanded = (
+  disposition: MessageDeliveryDisposition | null,
+): boolean => disposition === "outcome_unknown"
+
+/**
  * The hint that belongs with a disposition, as a key rather than a translated
  * string: the toast needs it once at failure time, while the persistent alert
  * has to re-resolve it on every render so a locale switch is not stuck behind
@@ -108,7 +125,7 @@ export const readRetryWithNewId = (error: unknown): boolean =>
  */
 export const sendHintKey = (
   disposition: MessageDeliveryDisposition | null,
-): TranslationKey | null => disposition === "outcome_unknown"
+): TranslationKey | null => sendOutcomeMayHaveLanded(disposition)
   ? "chatPage.clarification.sendOutcomeUnknown"
   : disposition === "not_sent" || disposition === "rejected"
     ? "chatPage.clarification.sendNotSent"

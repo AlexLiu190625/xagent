@@ -1584,7 +1584,7 @@ describe("reuses the resend id unless the previous attempt is proven not accepte
     submitMock.mockResolvedValueOnce(ok(report(true, [])))
     sendMessageMock.mockRejectedValueOnce(Object.assign(new Error("ack lost"), { disposition: "outcome_unknown" }))
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
-    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument())
     const firstId = sendMessageMock.mock.calls[0][1]?.clientMessageId
 
     sendMessageMock.mockClear()
@@ -1621,7 +1621,7 @@ describe("reuses the resend id unless the previous attempt is proven not accepte
       Object.assign(new Error("id conflict"), { disposition: "outcome_unknown", retryWithNewId: true }),
     )
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
-    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument())
     const firstId = sendMessageMock.mock.calls[0][1]?.clientMessageId
 
     sendMessageMock.mockClear()
@@ -1645,7 +1645,7 @@ describe("keeps a resend id bound to the snapshot it belongs to", () => {
     submitMock.mockResolvedValueOnce(ok(report(true, [])))
     sendMessageMock.mockRejectedValueOnce(Object.assign(new Error("ack lost"), { disposition: "outcome_unknown" }))
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
-    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument())
     expect(sendMessageMock.mock.calls[0][0]).toBe("TEXT-X")
     const firstId = sendMessageMock.mock.calls[0][1]?.clientMessageId
 
@@ -1663,7 +1663,7 @@ describe("keeps a resend id bound to the snapshot it belongs to", () => {
     // The send-failed panel went with the snapshot it was about, so the
     // ordinary footer is back. The id this instance is still carrying was
     // minted for the snapshot that just left.
-    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.sendOutcomeUnknown")).not.toBeInTheDocument()
 
     sendMessageMock.mockClear()
     fireEvent.change(screen.getByLabelText("token"), { target: { value: "y" } })
@@ -1690,7 +1690,7 @@ describe("keeps a resend id bound to the snapshot it belongs to", () => {
     submitMock.mockResolvedValueOnce(ok(report(true, [])))
     sendMessageMock.mockRejectedValueOnce(Object.assign(new Error("ack lost"), { disposition: "outcome_unknown" }))
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
-    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument())
     const firstId = sendMessageMock.mock.calls[0][1]?.clientMessageId
 
     // A terminal frame retargets the dialog with no new candidate staged for
@@ -1701,7 +1701,7 @@ describe("keeps a resend id bound to the snapshot it belongs to", () => {
     ])))
     await openForTask()
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument()
 
     sendMessageMock.mockClear()
     sendMessageMock.mockResolvedValueOnce(undefined)
@@ -2494,6 +2494,103 @@ describe("warns when a resend fails", () => {
     // The same fixed prefix the read path logs, and nothing else: the
     // rejection value is arbitrary and could carry message content.
     expect(warnSpy.mock.calls).toEqual([["[connector-runtime] resend failed"]])
+  })
+})
+
+// Stands in for what the websocket layer rejects a send with: the dialog and
+// clarification-delivery both probe `disposition` structurally rather than by
+// class, so the field is the contract, not the constructor.
+function deliveryFailure(disposition: "not_sent" | "rejected" | "outcome_unknown") {
+  return Object.assign(new Error("delivery rejected"), { disposition })
+}
+
+describe("keeps an unconfirmed send out of the \"not sent\" copy", () => {
+  async function failResendWith(failure: unknown) {
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(failure)
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+  }
+
+  it("warns rather than promising when the send outcome is unknown", async () => {
+    // The acknowledgement was lost after the send left the client, so the
+    // turn may already be running. Saying it was not sent sends the user to
+    // the message box, where a fresh client message id is not covered by the
+    // same-id retry the panel's own button uses.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await failResendWith(deliveryFailure("outcome_unknown"))
+
+    await waitFor(() =>
+      expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument(),
+    )
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    // The retry button is still the way out: it reuses the id of the attempt
+    // whose outcome is unknown.
+    expect(screen.getByText("connectorRuntime.actions.resend")).toBeInTheDocument()
+  })
+
+  it("still reports a refused send as not sent", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await failResendWith(deliveryFailure("rejected"))
+
+    await waitFor(() =>
+      expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument(),
+    )
+    expect(screen.queryByText("connectorRuntime.sendOutcomeUnknown")).not.toBeInTheDocument()
+  })
+
+  it("words the toast that stands in for the panel the same way", async () => {
+    // The settlement frame arrives while the resend is on the wire, so there
+    // is no snapshot left to draw a retry button for and the dialog has to
+    // say it once as a toast instead. Same failure, so the same wording.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    let rejectSend: (error: unknown) => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectSend = reject }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
+
+    await act(async () => { latestActions.forgetDelivery(1) })
+    await act(async () => { rejectSend(deliveryFailure("outcome_unknown")) })
+
+    expect(toastMock).toHaveBeenCalledWith("connectorRuntime.sendOutcomeUnknown")
+    expect(toastMock).not.toHaveBeenCalledWith("connectorRuntime.sendFailed")
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+  })
+
+  it("does not fall back to \"not sent\" when a later retry is refused", async () => {
+    // A refused retry does not make the first attempt un-sent: its outcome is
+    // still unknown, so the panel must keep warning.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await failResendWith(deliveryFailure("outcome_unknown"))
+    await waitFor(() =>
+      expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument(),
+    )
+
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("rejected"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(2))
+
+    expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+  })
+
+  it("upgrades a definite failure to a warning when the retry's outcome is unknown", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await failResendWith(deliveryFailure("not_sent"))
+    await waitFor(() =>
+      expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument(),
+    )
+
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("outcome_unknown"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await waitFor(() =>
+      expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument(),
+    )
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
   })
 })
 

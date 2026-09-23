@@ -4956,6 +4956,7 @@ const zh = {
     resendSupersededSent: "消息已经发出，但这个弹窗已经转向了新的请求，请不要再次重发。",
     stillMissingAfterSave: "保存后这个连接器仍然不可用，还缺 {keys}。",
     sendFailed: "值已保存，但消息没有发出去。",
+    sendOutcomeUnknown: "值已保存，但这条消息是否已经发出去无法确认。请先查看会话，再决定要不要重新发送。",
     actions: {
       saveAndResend: "保存并重发该消息",
       saveOnly: "仅保存",
