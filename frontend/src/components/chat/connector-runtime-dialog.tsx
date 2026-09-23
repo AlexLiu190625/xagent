@@ -502,12 +502,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // resolves (any path that would make it stop -- unmount, a task switch, a
   // host-page departure -- clears `request` and is caught by the seq/alive
   // checks first). A once-visible dialog must not vanish out from under a
-  // user who is mid-draft: a re-read for the same task only happens because
-  // another terminal frame retargeted this instance, not because the user
-  // did anything, so it must never read as a decision the user made. The
-  // same reasoning covers a still-live rejection message and a still-live
-  // "saved but not sent" panel below: neither is cleared just because this
-  // re-read ran. Whether that panel still has a snapshot to be about is a
+  // user who is mid-draft. Neither kind of re-read is a decision about what
+  // is on screen: a retarget is another terminal frame arriving, not
+  // anything the user did, and a "read again" press asks for a fresher
+  // report, not for the dialog to be emptied. The same reasoning covers a
+  // still-live rejection message and a still-live "saved but not sent"
+  // panel below: neither is cleared just because this re-read ran. A
+  // rejection the server really made is not undone by reading the report
+  // again, whoever asked for the read. Whether that panel still has a snapshot to be about is a
   // separate question this effect does not answer -- `sendFailed` above
   // derives it from the request on every render, including the retargets
   // that never reach this effect at all.
@@ -1044,9 +1046,9 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     // render, so a frame that draws this button has already proved them
     // equal -- but the handler re-checks rather than trusting the render
     // that drew it, the same way handleSave re-checks `canSubmitNow`. The
-    // panel's own state is dropped here too: the send it was about can no
-    // longer be retried from this dialog, so leaving the id behind would
-    // make the panel reappear if that snapshot ever came back.
+    // panel's own state is dropped here as well, for the same reason the
+    // render above drops it: the send it was about can no longer be retried
+    // from this dialog.
     if (
       sendFailure === null
       || sendFailure.snapshotId !== requestRef.current.resendPayload?.clientMessageId
