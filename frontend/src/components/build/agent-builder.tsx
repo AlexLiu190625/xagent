@@ -3002,7 +3002,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               if (updates.modelConfig !== undefined) setModelConfig(updates.modelConfig);
               if (updates.selectedKbs !== undefined) setSelectedKbs(updates.selectedKbs);
               if (updates.selectedSkills !== undefined) setSelectedSkills(updates.selectedSkills);
-              if (updates.selectedToolCategories !== undefined) setSelectedToolCategories(updates.selectedToolCategories);
+              const chatCategories = updates.selectedToolCategories
+              // Chat never writes connectors: keep a bare "mcp" grant or saving revokes it.
+              if (chatCategories !== undefined) setSelectedToolCategories(prev => [...chatCategories, ...prev.filter(c => c === "mcp")]);
             }}
             availableOptions={{
               models: (Array.isArray(models) ? models : []).map(m => ({ id: m.id, name: m.model_name || m.model_id })),
