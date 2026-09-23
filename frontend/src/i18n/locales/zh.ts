@@ -4957,12 +4957,15 @@ const zh = {
     stillMissingAfterSave: "保存后这个连接器仍然不可用，还缺 {keys}。",
     sendFailed: "值已保存，但消息没有发出去。",
     sendOutcomeUnknown: "值已保存，但这条消息是否已经发出去无法确认。请先查看会话，再决定要不要重新发送。",
+    refreshing: "正在查看这个连接器现在需要什么…",
+    readFailed: "刚才没能查到这个连接器需要什么，下面这份清单可能已经过时。在重新查到之前无法保存。",
     actions: {
       saveAndResend: "保存并重发该消息",
       saveOnly: "仅保存",
       acknowledge: "知道了",
       retry: "重试",
       resend: "重新发送",
+      readAgain: "重新查看",
     },
     errors: {
       network: "网络出错了，请重试。",

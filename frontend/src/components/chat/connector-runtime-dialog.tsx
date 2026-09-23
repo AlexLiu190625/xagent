@@ -387,13 +387,25 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   requestRef.current = request
 
   const [report, setReport] = useState<ConnectorRuntimeReport | null>(null)
-  // The `seq` of the request whose requirements read has settled, or null
-  // before the first one has. Compared against the current request's `seq`
-  // during render (see `reading` below) rather than being a boolean the read
-  // effect raises and lowers: that effect has six exits, and a flag left
-  // raised on any one of them would disable saving for good, while a seq
-  // that never catches up cannot outlive the request it names.
-  const [settledReadSeq, setSettledReadSeq] = useState<number | null>(null)
+  // Which read attempt has settled, or null before any has. Compared against
+  // the attempt the dialog is currently on during render (see `readKey` and
+  // `reading` below) rather than being a boolean the read effect raises and
+  // lowers: that effect has six exits, and a flag left raised on any one of
+  // them would disable saving for good, while a key that never catches up
+  // cannot outlive the attempt it names.
+  const [settledReadKey, setSettledReadKey] = useState<string | null>(null)
+  // The `seq` of the request the report currently on screen was read for, or
+  // null before any report is installed. Deliberately a second fact rather
+  // than being folded into `settledReadKey`: a read settles whichever way it
+  // goes, but only a read that succeeded installs a report, and a failed one
+  // leaves the previous request's report on screen. Telling the two apart is
+  // what lets saving stay closed over a report the current request never
+  // produced, while dismissal and the re-read below stay available.
+  const [reportSeq, setReportSeq] = useState<number | null>(null)
+  // Bumped by the "read again" button a failed read offers. The read effect
+  // depends on it, so a bump re-runs the read for the same request without
+  // needing a new request to arrive.
+  const [readNonce, setReadNonce] = useState(0)
   const [visible, setVisible] = useState(false)
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [invalidDraftKeys, setInvalidDraftKeys] = useState<Map<string, InvalidObjectDraftReason>>(new Map())
@@ -430,11 +442,19 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // snapshot -- see doResend, which is the only reader and writer.
   const resendMessageIdRef = useRef<{ forSnapshotId: string, clientMessageId: string } | null>(null)
 
-  // Read on mount and on every subsequent request for this same task (the
-  // dialog is already open and a new terminal frame retargeted it): the
-  // route gate runs before the request even goes out, and again right
-  // before the dialog would become visible, since the user is free to
-  // navigate away from a host page while this read is in flight.
+  // The read attempt this dialog is currently on: the request it is for, and
+  // which try for that request it is. Both halves are needed. `seq` alone
+  // cannot tell a fresh attempt for the same request from the one that just
+  // failed, so a "read again" press would leave `reading` false and the
+  // screen would say nothing while the retry was out.
+  const readKey = `${request.seq}:${readNonce}`
+
+  // Read on mount, on every subsequent request for this same task (the
+  // dialog is already open and a new terminal frame retargeted it), and on
+  // every "read again" press: the route gate runs before the request even
+  // goes out, and again right before the dialog would become visible, since
+  // the user is free to navigate away from a host page while this read is in
+  // flight.
   //
   // `visible` is read at the moment this effect starts, which is exactly
   // right here: setVisible is only ever called with `true` in this
@@ -459,25 +479,31 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     }
     const wasVisible = visible
     const seqAtStart = request.seq
+    const readKeyAtStart = readKey
     let cancelled = false
     fetchTaskConnectorRuntimeRequirements(request.taskId).then((result) => {
       if (cancelled || !aliveRef.current || requestRef.current.seq !== seqAtStart) return
-      // This read has settled, whichever way the branches below go. Recorded
-      // once, here, rather than at each of those branches: the three guards
-      // above are exactly the cases where it must not be recorded (a newer
-      // request's own read owns the answer now), and every branch past this
-      // point either installs a report or deliberately keeps the one already
-      // on screen. Until this lands, `reading` below holds saving closed, so
-      // a submission cannot be built from a report this read is about to
-      // replace.
-      setSettledReadSeq(seqAtStart)
+      // This attempt has settled, whichever way the branches below go.
+      // Recorded once, here, rather than at each of those branches: the three
+      // guards above are exactly the cases where it must not be recorded (a
+      // newer attempt owns the answer now), and every branch past this point
+      // either installs a report or deliberately keeps the one already on
+      // screen. This is only half the story -- it says a read finished, not
+      // that the report on screen is the current request's -- which is why
+      // `reportSeq` is written separately, next to the one place a report is
+      // actually installed.
+      setSettledReadKey(readKeyAtStart)
       if (!result.ok) {
         console.warn(
           "[connector-runtime] requirements read failed",
           result.kind === "http" ? result.status : result.kind,
         )
         // Keep whatever the user is already looking at (report and draft)
-        // rather than discarding it over a transient read failure.
+        // rather than discarding it over a transient read failure. What the
+        // user is looking at is then a report this request never produced,
+        // which `reportIsStale` below keeps saving and resending closed over
+        // until a later read installs the current one -- the dialog says so
+        // and offers that read.
         if (!wasVisible) close("not-shown")
         return
       }
@@ -494,6 +520,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         return
       }
       setReport(result.report)
+      setReportSeq(seqAtStart)
       // This point is only reached because another terminal frame for the
       // same task retargeted an already-open dialog (see this effect's
       // opening comment) -- never because the user resolved anything -- so
@@ -525,7 +552,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     })
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [request.seq])
+  }, [request.seq, readNonce])
 
   // Leaving the host pages closes a dialog the user has already seen. A move
   // between two host pages is handled by the outer task-switch cleanup, not
@@ -567,17 +594,29 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // further down, which must keep the dialog open while either kind of
   // submission has not yet settled.
   const busy = submitting || resending
-  // Whether the report on screen is older than the request the dialog is now
-  // for. A same-task retarget bumps `seq` and starts a fresh read while the
-  // previous report is still rendered, and submitting against that report
-  // writes values the current one may no longer declare -- a stored context
-  // value is immutable (see the note below), so there is no correcting it
-  // afterwards. This is not folded into `busy`, which also gates dismissal:
-  // the requirements read has no timeout, and a read that never settles
-  // would leave the dialog impossible to close, which is worse than the
-  // stale submit it guards against. Saving is what must wait, so this joins
-  // the submit gate instead.
-  const reading = settledReadSeq !== request.seq
+  // Whether a read for the attempt the dialog is currently on is still out.
+  // Only used to say so on screen and to tell a pending read apart from a
+  // failed one below; the gates read `reportIsStale`.
+  const reading = settledReadKey !== readKey
+  // Whether the report on screen belongs to some earlier request than the one
+  // the dialog is now for. A same-task retarget bumps `seq` and starts a
+  // fresh read while the previous report is still rendered; submitting or
+  // resending against that report acts on rows the current one may no longer
+  // declare, and a stored context value is immutable (see the note below), so
+  // there is no correcting it afterwards.
+  //
+  // This is the gate rather than `reading`, because the two come apart in
+  // exactly the case that matters: a read that fails settles without
+  // installing anything, so `reading` goes false while the report on screen
+  // is still the previous request's. `reportSeq` can only catch up in the
+  // same `.then` that records the attempt as settled, so this is true
+  // whenever `reading` is -- one gate covers the pending read and the failed
+  // one both.
+  const reportIsStale = reportSeq !== request.seq
+  // The read for this request settled and left the previous request's report
+  // on screen: it failed. Derived rather than stored, so it cannot disagree
+  // with the two facts it is made of.
+  const readFailed = !reading && reportIsStale
   // The one value every entry point into a submission reads: both footer
   // save buttons, the retry button a retryable failure offers, and
   // handleSave itself. The retry button used to be rendered off
@@ -589,7 +628,18 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // stored context value is immutable, so there is no correcting it
   // afterwards. handleSave re-checks rather than trusting its callers, so a
   // fourth entry point cannot reintroduce the same bypass.
-  const canSubmitNow = canSubmit && !busy && !reading
+  //
+  // `reportIsStale` is folded in here and not into `busy`, which also gates
+  // dismissal: nothing in flight may stand between the user and closing this
+  // dialog. That is not the whole picture today and the comment must not
+  // pretend it is -- `submitting` is part of `busy`, so the save POST, the
+  // refresh GET a failed save runs, and both sends do hold the dialog open
+  // while they are out. Each of those is now bounded (the two
+  // connector-runtime calls time out after 20 seconds, and a send settles or
+  // rejects), so none of them can hold it open indefinitely any more, but
+  // taking `submitting` out of `busy` would change what closing does on four
+  // separate paths mid-write and is not part of this change.
+  const canSubmitNow = canSubmit && !busy && !reportIsStale
   const hasResendPayload = request.resendPayload !== null
   const actions = outcome ? resolveDialogActions(outcome, hasResendPayload) : []
   // Whether this shape offers any way to submit. The row renderer asks this
@@ -761,10 +811,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     const result = await submitTaskConnectorRuntimeValues(request.taskId, items)
     if (!aliveRef.current) {
       // The dialog unmounted while the save was in flight (a task switch,
-      // or leaving the host pages) -- submitTaskConnectorRuntimeValues has
-      // no abort signal, so a result.ok here already wrote an immutable
-      // value server-side, and the resend the user asked for is never
-      // going to run. Nothing else in this render tree still holds the
+      // or leaving the host pages). Nothing cancels the save when this tree
+      // goes -- its only abort is its own 20-second timeout -- so a
+      // result.ok here already wrote an immutable value server-side, and the
+      // resend the user asked for is never going to run. Nothing else in
+      // this render tree still holds the
       // state to report that; this toast is the only place left to say
       // so, matching the sibling "superseded" branch right below.
       if (alsoResend && result.ok) toast(t("connectorRuntime.savedNotResentUnmounted"))
@@ -812,6 +863,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       }
       if (refreshed.ok) {
         setReport(refreshed.report)
+        // Same seq the save started under, proved unchanged by the check
+        // above: this writes the value `reportSeq` already holds. Written
+        // anyway so that every place a report is installed also says which
+        // request it is for, and a fifth such place cannot be added without
+        // the question being asked.
+        setReportSeq(seqAtStart)
         // A type-mismatch hint names a specific declared type; once the
         // refreshed report shows this row now declares the other type, that
         // hint no longer describes the row it is attached to and must be
@@ -824,6 +881,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     }
 
     setReport(result.report)
+    setReportSeq(seqAtStart)
     // A save that landed has no rejection left to show, even on the one path
     // below that renders before this dialog settles (a "save and resend"
     // whose report comes back met, which awaits the resend before closing):
@@ -928,6 +986,18 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     // A resend is one billed model call plus a possibly side-effecting tool
     // run; a double click here must not fire it twice.
     if (resending) return
+    // The report this button's own gate reads has to be the current
+    // request's. A same-task retarget starts a fresh read while the previous
+    // report is still on screen, and a read that fails never replaces it at
+    // all: across both windows canResendReport below would be answering
+    // about a report this request did not produce, which is the same
+    // question the save gate asks -- so both read the one predicate rather
+    // than each deciding what "the latest report" means. The button is
+    // disabled across both windows and the line above it says which one is
+    // happening, so this is not a dead click; it re-checks rather than
+    // trusting the render that drew it, the way handleSave re-checks
+    // canSubmitNow.
+    if (reportIsStale) return
     // The panel this button lives on is about one message, and doResend
     // below sends whichever snapshot the request carries when it runs: the
     // two must be the same message. Unreachable today -- `sendFailed`
@@ -1049,6 +1119,28 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
           </p>
         )}
 
+        {/* Both of these sit above the panel/rows split below, because both
+            shapes need them: the save buttons and the panel's resend button
+            are held closed by the same `reportIsStale`, and a disabled
+            button with nothing next to it explaining why is the shape this
+            dialog has been told twice not to leave on screen. */}
+        {reading && (
+          <p className="text-sm text-muted-foreground">{t("connectorRuntime.refreshing")}</p>
+        )}
+
+        {readFailed && (
+          <div className="space-y-2">
+            <p className="text-sm text-destructive" role="alert">{t("connectorRuntime.readFailed")}</p>
+            {/* The only way back to a current report short of closing the
+                dialog, which would drop the stashed message with it (a
+                close counts as the user giving up) and take the one-click
+                resend away for good. */}
+            <Button variant="outline" onClick={() => setReadNonce(nonce => nonce + 1)}>
+              {t("connectorRuntime.actions.readAgain")}
+            </Button>
+          </div>
+        )}
+
         {liveSendFailure ? (
           <div className="space-y-3">
             {/* Two texts, one per outcome: a send the server definitely
@@ -1060,7 +1152,9 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
             <p className="text-sm text-destructive">
               {t(sendFailureTextKey(liveSendFailure.disposition))}
             </p>
-            <Button disabled={resending} onClick={handleRetryResend}>{t("connectorRuntime.actions.resend")}</Button>
+            <Button disabled={resending || reportIsStale} onClick={handleRetryResend}>
+              {t("connectorRuntime.actions.resend")}
+            </Button>
           </div>
         ) : (
           <div className="space-y-4">

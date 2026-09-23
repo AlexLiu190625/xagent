@@ -2655,9 +2655,9 @@ describe("keeps the save buttons disabled until the current report arrives", () 
   })
 
   it("still lets the user close a dialog whose read has not come back", async () => {
-    // The requirements read has no timeout, so the gate above may not also
-    // hold the dialog open: a read that never settles would leave no way out
-    // of it.
+    // Nothing in flight may stand between the user and closing this dialog,
+    // so the gate above holds saving only -- it is not folded into the guard
+    // that keeps the dialog open.
     await openSimpleDialog()
     fetchMock.mockReturnValueOnce(new Promise(() => {}))
     await openForTask()
@@ -2665,6 +2665,81 @@ describe("keeps the save buttons disabled until the current report arrives", () 
 
     fireEvent.click(screen.getByRole("button", { name: "Close" }))
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+  })
+
+  it("says a fresh read is in flight rather than greying the buttons silently", async () => {
+    // A same-task retarget disables saving while the user has done nothing,
+    // so the dialog has to account for the buttons it just greyed out.
+    await openSimpleDialog()
+    expect(screen.queryByText("connectorRuntime.refreshing")).not.toBeInTheDocument()
+
+    let resolveRead: (value: unknown) => void = () => {}
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveRead = res }))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    expect(screen.getByText("connectorRuntime.refreshing")).toBeInTheDocument()
+
+    await act(async () => {
+      resolveRead(ok(report(false, [
+        connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+      ])))
+    })
+    expect(screen.queryByText("connectorRuntime.refreshing")).not.toBeInTheDocument()
+  })
+})
+
+describe("keeps saving closed when the replacement report never arrives", () => {
+  /**
+   * An open dialog with a draft in it, retargeted by a same-task terminal
+   * frame whose read then fails. The report on screen is the one the first
+   * read installed; the current request never produced one.
+   */
+  async function retargetWithFailedRead() {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
+
+    fetchMock.mockResolvedValueOnce({ ok: false, kind: "transport" })
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+  }
+
+  it("keeps the save buttons closed when the replacement read fails", async () => {
+    // The read settling is not the same fact as a current report arriving.
+    // A failed read settles without installing anything, and the values a
+    // save would write from the report still on screen are immutable once
+    // stored, so there is no correcting them afterwards.
+    await retargetWithFailedRead()
+
+    const saveOnly = screen.getByText("connectorRuntime.actions.saveOnly")
+    expect(saveOnly).toBeDisabled()
+    expect(screen.getByText("connectorRuntime.actions.saveAndResend")).toBeDisabled()
+    fireEvent.click(saveOnly)
+    expect(submitMock).not.toHaveBeenCalled()
+    // Not the "still reading" wording: this read is over.
+    expect(screen.queryByText("connectorRuntime.refreshing")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.readFailed")).toBeInTheDocument()
+  })
+
+  it("offers another read, and saves again once one lands", async () => {
+    // Without this button the only way back to a current report is closing
+    // the dialog, which counts as giving up and drops the stashed message
+    // with it.
+    await retargetWithFailedRead()
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.readAgain"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+
+    await waitFor(() =>
+      expect(screen.queryByText("connectorRuntime.readFailed")).not.toBeInTheDocument())
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
+    // The draft the user typed before any of this survived it.
+    expect(screen.getByLabelText("token")).toHaveValue("x")
   })
 })
 
@@ -2904,6 +2979,59 @@ describe("rechecks the current report before a retry resend", () => {
 
     await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
     expect(toastMock).not.toHaveBeenCalled()
+  })
+})
+
+describe("holds the retry closed until the current report is the one on screen", () => {
+  /** Raises the panel, then retargets with a read that does not answer. */
+  async function panelThenPendingRead() {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("not_sent"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    sendMessageMock.mockClear()
+
+    let resolveRead: (value: unknown) => void = () => {}
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveRead = res }))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    return (value: unknown) => act(async () => { resolveRead(value) })
+  }
+
+  it("does not retry while the read for the current request is still out", async () => {
+    // The gate this button's own handler applies ("can the report in hand
+    // carry this resend") is unanswerable while the report in hand belongs
+    // to an earlier request: a met one on screen can be replaced by an
+    // unsupported_only one the moment the read lands, and the backend would
+    // refuse the turn on the same gate, putting a second failure in the
+    // conversation.
+    const settleRead = await panelThenPendingRead()
+
+    const resend = screen.getByText("connectorRuntime.actions.resend")
+    expect(resend).toBeDisabled()
+    // Not a silent grey button: the line above it says what is happening.
+    expect(screen.getByText("connectorRuntime.refreshing")).toBeInTheDocument()
+    fireEvent.click(resend)
+    expect(sendMessageMock).not.toHaveBeenCalled()
+
+    await settleRead(ok(report(true, [])))
+  })
+
+  it("retries once the pending read installs a report that can still carry it", async () => {
+    // Reverse control: the button comes back the moment the current
+    // request's own report is the one on screen.
+    const settleRead = await panelThenPendingRead()
+    await settleRead(ok(report(true, [])))
+
+    const resend = screen.getByText("connectorRuntime.actions.resend")
+    expect(resend).toBeEnabled()
+    sendMessageMock.mockResolvedValueOnce(undefined)
+    fireEvent.click(resend)
+
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
   })
 })
 
