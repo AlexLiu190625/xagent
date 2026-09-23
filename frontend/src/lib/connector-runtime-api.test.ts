@@ -28,6 +28,7 @@ import {
   type DialogOutcomeKind,
   type SubmitTaskConnectorRuntimeValuesFailure,
 } from "./connector-runtime-api"
+import { AUTH_CACHE_KEY } from "@/lib/auth-cache"
 
 const REF_A = { connector_type: "custom_api", connector_id: 1 }
 
@@ -356,6 +357,7 @@ describe("the connector-runtime HTTP calls", () => {
   describe("gives up on a request that never answers", () => {
     afterEach(() => {
       vi.useRealTimers()
+      localStorage.removeItem(AUTH_CACHE_KEY)
     })
 
     /**
@@ -490,6 +492,54 @@ describe("the connector-runtime HTTP calls", () => {
       await expect(pending).resolves.toEqual({ ok: false, kind: "transport" })
       expect(signals).toHaveLength(1)
       expect(signals[0].aborted).toBe(true)
+    })
+
+    /**
+     * A stored session, in the shape auth-cache validates (same fields
+     * api-wrapper's own tests write). With one of these present apiRequest
+     * stops calling fetch directly and goes through fetchWithRetry instead,
+     * which is the path the three cases above never take.
+     */
+    function writeAuthCache() {
+      const now = Date.now()
+      localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({
+        schemaVersion: 2,
+        sessionId: "timeout-session",
+        credentialRevision: 0,
+        profileRevision: 0,
+        user: { id: "u1", username: "u1" },
+        token: "access-token",
+        refreshToken: "refresh-token",
+        timestamp: now,
+        expiresAt: now + 3_600_000,
+        refreshExpiresAt: now + 7_200_000,
+      }))
+    }
+
+    it("gives up once, not once per retry, when a signed-in request never answers", async () => {
+      // A signed-in request goes through fetchWithRetry, which retries twice
+      // more on a rejection. One controller covers all three attempts, so the
+      // two retries are handed a signal that has already fired and reject at
+      // once -- the whole call still ends 20 seconds in (plus fetchWithRetry's
+      // own 100ms and 200ms backoffs), not 60. That is why no "do not retry a
+      // timed-out request" rule was added to fetchWithRetry: there is nothing
+      // for one to save.
+      vi.useFakeTimers()
+      writeAuthCache()
+      const signals = stubUnansweredFetch()
+      const pending = fetchTaskConnectorRuntimeRequirements(7)
+      let settled = false
+      void pending.then(() => { settled = true })
+
+      await vi.advanceTimersByTimeAsync(19_999)
+      expect(settled).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(1 + 300)
+
+      await expect(pending).resolves.toEqual({ ok: false, kind: "transport" })
+      expect(signals).toHaveLength(3)
+      expect(signals.every(signal => signal.aborted)).toBe(true)
+      expect(signals[1]).toBe(signals[0])
     })
 
     it("still reports a genuinely empty body as malformed", async () => {
