@@ -2762,6 +2762,15 @@ export function AppProvider({
                 }
               })
               .catch(() => {
+                // Logged, not rethrown. This is a detached promise inside a
+                // setTimeout callback: there is no caller above it to receive
+                // a rethrow, so one would surface as an unhandled rejection
+                // instead of reaching anything that could act on it. The
+                // sibling stage/discard sites in sendMessage do rethrow
+                // because each of them sits inside a call its own caller
+                // awaits. Without this line the send failing here is silent
+                // on every surface -- no bubble, no toast, no log.
+                console.warn("[connector-runtime] pending-task auto-send failed")
                 connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
               })
             pendingTaskToExecuteRef.current = null

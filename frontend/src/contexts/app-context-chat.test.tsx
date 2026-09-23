@@ -7548,9 +7548,17 @@ describe("connector runtime dialog trigger", () => {
     // The send throws before any terminal frame arrives -- discardPendingDelivery
     // must withdraw the ticket rather than leaving it for a later,
     // unrelated terminal frame to claim.
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {})
     await act(async () => {
       rejectAck?.(new Error("closed"))
     })
+
+    // This send has no bubble and no toast of its own, so the log is the only
+    // trace it leaves. It is not rethrown: the promise is detached inside a
+    // setTimeout callback, where a rethrow becomes an unhandled rejection
+    // rather than reaching a caller.
+    expect(consoleWarn.mock.calls.flat().join(" ")).toContain("pending-task auto-send failed")
+    consoleWarn.mockRestore()
 
     const onMessage = webSocketOptions.current?.onMessage
     act(() => {
