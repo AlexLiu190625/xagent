@@ -654,13 +654,19 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const doResend = async (): Promise<ResendOutcome> => {
     const snapshot = requestRef.current.resendPayload
     if (!snapshot) {
-      // Unreachable today: both callers only reach this after a precondition
-      // that implies a snapshot exists -- handleSave's canResendNow (which
-      // itself requires the "met" outcome the saveAndResend button promised
-      // to be resendable) and handleRetryResend's sendFailed precondition
-      // (set only right after a resend that read a snapshot). Kept distinct
-      // from "sent" and "failed" so a future caller that does reach it is
-      // not misreported as either a completed resend or a failed one.
+      // Reachable, and covered by a regression test ("says the message did
+      // not go out when the settlement lands mid save-and-resend"). Both
+      // callers check a precondition that implies a snapshot exists, but a
+      // precondition only holds until the next await: a settlement frame for
+      // this task drops the snapshot in place (forgetDelivery), without
+      // moving `seq`, so nothing re-runs the read effect and nothing else
+      // notices. handleRetryResend cannot get here -- it compares the
+      // panel's snapshot id against the one the request carries right now,
+      // and awaits nothing between that comparison and the read above -- but
+      // handleSave can: its save POST is awaited in between, and the
+      // settlement can land during it. Kept distinct from "sent" and
+      // "failed" so neither this case nor a future fourth caller is
+      // misreported as a completed resend or as one the server refused.
       console.warn("[connector-runtime] resend attempted with no snapshot to send")
       return { kind: "nothing-to-send" }
     }
@@ -723,11 +729,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       console.warn("[connector-runtime] resend failed")
       // A definite not_sent/rejected disposition, or the server explicitly
       // demanding a new id, means this id is spent -- the next retry mints
-      // fresh. Every other case, including an outcome_unknown disposition
-      // and a plain exception that carries no disposition at all, leaves the
-      // possibility open that the server already durably accepted this
-      // attempt, so the next retry reuses this same id rather than risking
-      // the same turn running twice under a second one.
+      // fresh. An outcome_unknown one leaves open that the server already
+      // durably accepted this attempt, so the next retry reuses this same id
+      // rather than risking the same turn running twice under a second one.
+      // A rejection carrying no disposition at all reuses it too, although
+      // sendFailureTextKey establishes that such a rejection never left the
+      // client: keeping an id is free, while minting one on a wrong guess is
+      // not, so the cheap side is taken here and only the user-facing text
+      // splits the two cases apart.
       const disposition = readSendDisposition(error)
       const mustMintNewId = (
         readRetryWithNewId(error)
