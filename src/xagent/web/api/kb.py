@@ -79,6 +79,7 @@ from ...core.tools.core.RAG_tools.kb import (
 from ...core.tools.core.RAG_tools.kb.config_merge import (
     merge_collection_config_json,
 )
+from ...core.tools.core.RAG_tools.kb.models import RollbackFailedCloudIngestionRequest
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
 from ...core.tools.core.RAG_tools.pipelines.web_ingestion import FileHandlerResult
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
@@ -1509,7 +1510,8 @@ async def _rollback_failed_cloud_ingestion(
     register_created = bool(register_metadata.get("created"))
     doc_id = result.doc_id if isinstance(result.doc_id, str) and result.doc_id else None
 
-    try:
+    def _compensate_document() -> None:
+        # Must precede FILE's records query; delete_document already clears status.
         if register_created and doc_id:
             document_delete_result = delete_document(
                 collection_name,
@@ -1529,6 +1531,7 @@ async def _rollback_failed_cloud_ingestion(
                 is_admin=bool(user.is_admin),
             )
 
+    def _compensate_file() -> None:
         remaining_records = vector_store.list_document_records(
             collection_name=None,
             user_id=user_id,
@@ -1550,13 +1553,13 @@ async def _rollback_failed_cloud_ingestion(
                 remaining_file_ids=remaining_file_ids,
             )
 
+    async def _compensate_collection() -> None:
         collection_records = vector_store.list_document_records(
             collection_name=collection_name,
             user_id=user_id,
             is_admin=bool(user.is_admin),
             max_results=1,
         )
-        removed_new_collection = False
         if await _rollback_may_delete_collection(
             collection_name=collection_name,
             user_id=user_id,
@@ -1573,14 +1576,21 @@ async def _rollback_failed_cloud_ingestion(
                 f"delete collection '{collection_name}' during cloud rollback",
                 collection_delete_result,
             )
-            removed_new_collection = True
-
-        if removed_new_collection:
             await _cleanup_failed_new_collection_metadata(
                 collection_name=collection_name,
                 user=user,
             )
 
+    try:
+        outcome = await get_kb_coordinator().rollback_failed_cloud_ingestion(
+            RollbackFailedCloudIngestionRequest(
+                document_compensation=_compensate_document,
+                file_compensation=_compensate_file,
+                collection_compensation=_compensate_collection,
+            )
+        )
+        if outcome.error is not None:
+            raise outcome.error
         db.commit()
         _restore_ingest_file_backup(
             file_path=file_path,
