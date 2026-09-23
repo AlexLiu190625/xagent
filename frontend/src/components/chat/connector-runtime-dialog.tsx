@@ -1153,11 +1153,31 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     <Dialog open={visible} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
+          {/* The title follows the report and nothing else: a met report
+              means nothing is missing, whatever else is going on, and the
+              dialog must not go on claiming input is missing over a report
+              that says it is not -- which it did whenever a met dialog
+              stopped holding a snapshot, most directly when a settlement
+              frame took one away in place. Only the line under it depends on
+              the situation, and only to choose between two true things. */}
           <DialogTitle>
-            {t(metHoldingSnapshot ? "connectorRuntime.metTitle" : "connectorRuntime.title")}
+            {t(outcome.kind === "met" ? "connectorRuntime.metTitle" : "connectorRuntime.title")}
           </DialogTitle>
           <DialogDescription>
-            {t(metHoldingSnapshot ? "connectorRuntime.metNotResent" : "connectorRuntime.description")}
+            {t(
+              outcome.kind !== "met"
+                ? "connectorRuntime.description"
+                // Pointing the user back at the message box is only right
+                // while this dialog is holding a message it will not send
+                // and has nothing else in flight -- metHoldingSnapshot's own
+                // conditions. The neutral line covers the rest: no snapshot
+                // at all, a send-failed panel that already carries the
+                // message and its own retry button, and a resend of this
+                // very message still on the wire.
+                : metHoldingSnapshot
+                  ? "connectorRuntime.metNotResent"
+                  : "connectorRuntime.metNothingLeft",
+            )}
           </DialogDescription>
         </DialogHeader>
 

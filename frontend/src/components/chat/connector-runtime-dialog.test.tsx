@@ -1267,10 +1267,11 @@ describe("stops asking for input once a satisfied report reaches an already-visi
     expect(screen.queryByText("connectorRuntime.actions.saveAndResend")).not.toBeInTheDocument()
   })
 
-  it("keeps the original header when the same report carries no snapshot", async () => {
+  it("says nothing is left to send when the same report carries no snapshot", async () => {
     // Opened with openForTask, not recordThenOpen: this request never held a
     // resend snapshot, so a satisfied report must not claim one was not
-    // resent -- there was never anything here to resend.
+    // resent -- there was never anything here to resend. The title still
+    // follows the report: nothing is missing, so it must not say one is.
     fetchMock.mockResolvedValueOnce(ok(report(false, [
       connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
     ])))
@@ -1281,8 +1282,37 @@ describe("stops asking for input once a satisfied report reaches an already-visi
     fetchMock.mockResolvedValueOnce(ok(report(true, [])))
     await openForTask() // same-task retarget: reads a satisfied report
 
-    await waitFor(() => expect(screen.getByText("connectorRuntime.description")).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText("connectorRuntime.metTitle")).toBeInTheDocument())
+    expect(screen.getByText("connectorRuntime.metNothingLeft")).toBeInTheDocument()
     expect(screen.queryByText("connectorRuntime.metNotResent")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.title")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.description")).not.toBeInTheDocument()
+  })
+
+  it("stops asking for input when a settlement takes the snapshot away", async () => {
+    // A met dialog holding a snapshot, and then a settlement frame for this
+    // task drops the snapshot in place without moving `seq`. Only the line
+    // about the unsent message may go: the report still says nothing is
+    // missing, so the header must not go back to asking for input.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-14", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+
+    fetchMock.mockResolvedValueOnce(ok(report(true, [])))
+    await openForTask()
+    await waitFor(() => expect(screen.getByText("connectorRuntime.metNotResent")).toBeInTheDocument())
+    expect(screen.getByText("connectorRuntime.metTitle")).toBeInTheDocument()
+
+    await act(async () => { latestActions.forgetDelivery(1) })
+
+    expect(screen.getByText("connectorRuntime.metTitle")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.metNothingLeft")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.metNotResent")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.title")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.description")).not.toBeInTheDocument()
   })
 
   it("keeps the original header while the send-failed panel is up", async () => {
@@ -1307,12 +1337,13 @@ describe("stops asking for input once a satisfied report reaches an already-visi
     expect(screen.queryByText("connectorRuntime.metNotResent")).not.toBeInTheDocument()
   })
 
-  it("keeps the original header while the dialog's own resend is still in flight", async () => {
+  it("does not say the message was not resent while its own resend is in flight", async () => {
     // The save half of save-and-resend landed on a now-satisfied report,
     // but the resend it triggers has not settled yet. Saying the message
     // "was not resent" here would be false -- it is on the wire right
     // now -- and would read as an instruction to send it again from the
-    // message box, which would fire the same turn a second time.
+    // message box, which would fire the same turn a second time. The
+    // neutral line is true throughout, and the title follows the report.
     fetchMock.mockResolvedValueOnce(ok(report(false, [
       connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
     ])))
@@ -1328,8 +1359,9 @@ describe("stops asking for input once a satisfied report reaches an already-visi
 
     await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
     expect(screen.queryByText("connectorRuntime.metNotResent")).not.toBeInTheDocument()
-    expect(screen.queryByText("connectorRuntime.metTitle")).not.toBeInTheDocument()
-    expect(screen.getByText("connectorRuntime.description")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.metTitle")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.metNothingLeft")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.description")).not.toBeInTheDocument()
 
     await act(async () => { resolveSend() })
   })
