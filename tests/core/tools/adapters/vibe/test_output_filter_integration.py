@@ -23,6 +23,7 @@ from xagent.core.tools.tool_result_spill import (
     SpillTarget,
 )
 from xagent.core.tools.user_interaction import WAITING_FOR_USER_STATUS
+from xagent.core.workspace import TaskWorkspace
 
 
 @pytest.mark.asyncio
@@ -200,6 +201,34 @@ def test_wrapper_spills_oversized_dict_result_instead_of_truncating(tmp_path):
     assert len(records) == 1
     written = spill_dir / records[0]["relative_path"].split("/")[-1]
     assert written.read_text(encoding="utf-8") == big_text
+
+
+def test_a_real_spill_is_invisible_to_get_output_files(tmp_path):
+    """The file a real spill writes must not turn into a deliverable the
+    model can hand back to the user. It lands inside the workspace's
+    engine-owned tool-results directory, which get_output_files() already
+    excludes from every listing -- this pins that the two mechanisms
+    actually meet, using a real TaskWorkspace rather than a bare tmp_path
+    and manually planted files the way test_workspace_engine_owned_dir.py
+    does."""
+    workspace = TaskWorkspace("task-spill", str(tmp_path))
+    spill_dir = workspace.output_dir / "tool-results"
+    wrapper = _wrapper(
+        max_chars=80, spill_target=SpillTarget(spill_dir=str(spill_dir), max_chars=80)
+    )
+    big_text = "x" * 100
+    result = {
+        "content": [{"type": "text", "text": big_text}],
+        "structured_content": None,
+        "is_error": False,
+    }
+    filtered = wrapper._filter_result(result)
+    records = filtered[SPILL_RESERVED_RESULT_KEY]
+    written = spill_dir / records[0]["relative_path"].split("/")[-1]
+    assert written.exists()  # the spill really happened
+
+    listed_paths = {entry["file_path"] for entry in workspace.get_output_files()}
+    assert str(written) not in listed_paths
 
 
 def test_wrapper_without_spill_target_truncates_as_before(tmp_path):
