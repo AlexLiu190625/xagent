@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from ....agent.result import normalize_tool_failure_code
 from ...tool_result_spill import (
+    SPILL_RESERVED_RESULT_KEY,
     SpillRunBudget,
     SpillTarget,
     is_classified_tool_failure,
@@ -76,7 +77,8 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
     before applying length limiting, and on the asynchronous paths that
     storing step runs in a worker thread. With no target, the reserved-key
     strip is the only extra step and the observed behavior is the output
-    filter alone.
+    filter alone. When a spill did happen, the spill report is carried
+    past the length limiting unchanged.
     """
 
     def __init__(
@@ -293,6 +295,28 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         return self._spill_oversized_values(strip_reserved_spill_key(result))
 
     def _filter_after_spill(self, spilled: Any) -> Any:
+        """Filter the tool's own payload; carry the engine's spill report past it.
+
+        A reserved report key present here was written by the spill step:
+        _spill_only strips any tool-supplied one before spilling, on both the
+        sync and the async path. The report is engine metadata, not tool
+        output, so none of the output filter's limits may apply to it -- a
+        per-string cap shorter than a generated relative_path would cut the
+        path, and a field-count cap would drop the key itself, which the
+        spill step appends after every tool key. It is taken off before
+        filtering and put back unchanged; ExecutionContext validates it when
+        registering.
+        """
+        if not isinstance(spilled, dict) or SPILL_RESERVED_RESULT_KEY not in spilled:
+            return self._filter_tool_payload(spilled)
+        records = spilled[SPILL_RESERVED_RESULT_KEY]
+        payload = {k: v for k, v in spilled.items() if k != SPILL_RESERVED_RESULT_KEY}
+        filtered = self._filter_tool_payload(payload)
+        if isinstance(filtered, dict):
+            filtered[SPILL_RESERVED_RESULT_KEY] = records
+        return filtered
+
+    def _filter_tool_payload(self, spilled: Any) -> Any:
         """Filter output without dropping a control or classification envelope."""
 
         filtered = self._filter.filter(spilled, self._target.name)
