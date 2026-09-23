@@ -312,6 +312,42 @@ function resendFailureTextKey(outcome: ResendOutcome): TranslationKey {
   return sendFailureTextKey(outcome.kind === "failed" ? outcome.disposition : null)
 }
 
+/**
+ * Whether the report currently in hand can carry a resend of the message
+ * this dialog is holding. Only a met report can: `unsupported_only` still
+ * lacks a required secret this dialog cannot collect, `nothing_fillable` is a
+ * connector the server still reports unavailable with nothing left for the
+ * user to fill, and `fillable` still has a required context value missing.
+ * The backend rejects all three while it builds the turn's tool list, so a
+ * resend would fail on the same gate and put a second failure in the
+ * conversation.
+ *
+ * Both entry points into a resend ask this -- handleSave right after its own
+ * save lands, and handleRetryResend against the report on screen -- so the
+ * two cannot disagree about whether the same snapshot is sendable.
+ */
+function canResendReport(report: ConnectorRuntimeReport): boolean {
+  return resolveDialogOutcome(report).kind === "met"
+}
+
+/**
+ * Why the message was not resent, for a report canResendReport turns down.
+ * Returns null for a met report, which has no such reason. Shared by the two
+ * resend entry points so a user who reaches the same dead end from the
+ * footer and from the retry button is told the same thing.
+ */
+function savedNotResentText(
+  t: (key: TranslationKey, vars?: TranslationVariables) => string,
+  outcome: DialogOutcome,
+): string | null {
+  if (outcome.kind === "unsupported_only") {
+    return t("connectorRuntime.savedNotResentUnsupported", { keys: uniqueKeys(outcome.blocking).join(", ") })
+  }
+  if (outcome.kind === "nothing_fillable") return t("connectorRuntime.savedNotResentUnavailable")
+  if (outcome.kind === "fillable") return t("connectorRuntime.savedNotResentIncomplete")
+  return null
+}
+
 interface FieldErrorState {
   disposition: ConnectorRuntimeFailureDisposition
 }
@@ -787,30 +823,22 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     // that in fact succeeded.
     setFieldError(null)
     const newOutcome = resolveDialogOutcome(result.report)
-    // Only a met report can carry the resend the primary button promised.
-    // `unsupported_only` still lacks a required secret this dialog cannot
-    // collect, and `nothing_fillable` is a connector the server still reports
-    // unavailable with nothing left for the user to fill; the backend rejects
-    // either while it builds the turn's tool list, so a resend would fail on
-    // the same gate and put a second failure in the conversation. Neither
-    // resends, and because the button promised one, both say so.
-    const canResendNow = newOutcome.kind === "met"
+    // Only a met report can carry the resend the primary button promised --
+    // see canResendReport, which handleRetryResend asks too, so the two
+    // entry points cannot disagree about the same snapshot. Because the
+    // button promised a resend, a report that turns it down says so.
+    const canResendNow = canResendReport(result.report)
 
-    if (newOutcome.kind === "unsupported_only") {
-      const keys = uniqueKeys(newOutcome.blocking).join(", ")
-      toast(alsoResend
-        ? t("connectorRuntime.savedNotResentUnsupported", { keys })
-        : t("connectorRuntime.onlyUnsupportedRemaining", { keys }))
-    } else if (alsoResend && newOutcome.kind === "nothing_fillable") {
-      toast(t("connectorRuntime.savedNotResentUnavailable"))
-    } else if (alsoResend && newOutcome.kind === "fillable") {
-      // The save landed and the refreshed report still leaves a required
-      // context value unfilled, so canResendNow below is false and the
-      // resend the primary button promised never runs. The rows this
-      // report re-renders show what is still missing; none of them says
-      // the message did not go out, and this dialog is the only thing
-      // that knows it did not.
-      toast(t("connectorRuntime.savedNotResentIncomplete"))
+    // The refreshed report's own reason for not resending, for a
+    // save-and-resend that promised one. A "save only" press promised
+    // nothing, so it stays quiet -- except for unsupported_only, which is
+    // news either way: what this dialog cannot collect is not visible in
+    // the rows it renders.
+    const notResentText = alsoResend ? savedNotResentText(t, newOutcome) : null
+    if (notResentText) {
+      toast(notResentText)
+    } else if (newOutcome.kind === "unsupported_only") {
+      toast(t("connectorRuntime.onlyUnsupportedRemaining", { keys: uniqueKeys(newOutcome.blocking).join(", ") }))
     }
 
     if (newOutcome.kind === "fillable" || newOutcome.kind === "nothing_fillable") {
@@ -906,6 +934,23 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       || sendFailure.snapshotId !== requestRef.current.resendPayload?.clientMessageId
     ) {
       setSendFailure(null)
+      return
+    }
+    // The report can change under a panel that stays up: this panel is about
+    // a send that failed, not about the report, so a same-task re-read
+    // leaves it alone while installing a report that no longer supports a
+    // resend at all. handleSave asks canResendReport before its own resend
+    // for exactly this reason -- the backend rejects the turn while it
+    // builds the tool list, so sending anyway would put a second failure in
+    // the conversation. This button asks the same question of the report on
+    // screen, and answers a no the same way handleSave does: the panel goes
+    // (there is nothing this dialog can still send) and the report's own
+    // reason is said out loud, rather than leaving a disabled button with no
+    // explanation next to it.
+    if (!report || !canResendReport(report)) {
+      setSendFailure(null)
+      const reason = report ? savedNotResentText(t, resolveDialogOutcome(report)) : null
+      if (reason) toast(reason)
       return
     }
     const seqAtStart = request.seq

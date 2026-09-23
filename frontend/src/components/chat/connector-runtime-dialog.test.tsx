@@ -1695,10 +1695,11 @@ describe("keeps a resend id bound to the snapshot it belongs to", () => {
 
     // A terminal frame retargets the dialog with no new candidate staged for
     // this task: openForTask keeps the same snapshot this instance already
-    // holds (the "kept" branch of its staged/stashed/kept chain).
-    fetchMock.mockResolvedValueOnce(ok(report(false, [
-      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
-    ])))
+    // holds (the "kept" branch of its staged/stashed/kept chain). The
+    // refreshed report still has everything the connector needs, so what the
+    // retry below exercises is which id it reuses, not whether the report
+    // still allows a resend at all -- that gate has its own tests.
+    fetchMock.mockResolvedValueOnce(ok(report(true, [])))
     await openForTask()
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument()
@@ -2830,6 +2831,79 @@ describe("hides the send-failed panel as soon as the request stops carrying its 
       resendPayload: { clientMessageId: "newer-turn", text: "a later message" },
     })
     expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+})
+
+describe("rechecks the current report before a retry resend", () => {
+  // The panel is about a send that failed, not about the report, so a
+  // same-task re-read leaves it up while installing whatever the server now
+  // reports. Raise the panel, then hand the dialog a fresher report.
+  async function panelThenRefresh(refreshed: ConnectorRuntimeReport) {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("not_sent"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    // A terminal frame retargets the dialog with no newer candidate staged,
+    // so the snapshot the panel is about is the one the request still
+    // carries: the panel stays up over a report that has moved on.
+    fetchMock.mockResolvedValueOnce(ok(refreshed))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
+    sendMessageMock.mockClear()
+    toastMock.mockClear()
+  }
+
+  it("does not resend into a report that has become unsupported", async () => {
+    // The connector now needs a secret this dialog cannot collect. The
+    // backend rejects the turn while it builds the tool list, so resending
+    // would only put a second failure in the conversation -- the same gate
+    // handleSave applies before its own resend.
+    await panelThenRefresh(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "token", type: "string", required: true, satisfied: true }),
+        input({ section: "secrets", key: "s1", type: "string", required: true }),
+      ]),
+    ]))
+
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+
+    expect(sendMessageMock).not.toHaveBeenCalled()
+    // The panel goes rather than leaving a disabled button with nothing to
+    // explain it, and the report's own reason is said out loud.
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+    expect(toastMock.mock.calls).toEqual([
+      ['connectorRuntime.savedNotResentUnsupported:{"keys":"s1"}'],
+    ])
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("does not resend into a report the server still reports unavailable", async () => {
+    await panelThenRefresh(report(false, [connector(REF_A, "A", [
+      input({ section: "context", key: "token", type: "string", required: true, satisfied: true }),
+    ])]))
+
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+
+    expect(sendMessageMock).not.toHaveBeenCalled()
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentUnavailable"]])
+  })
+
+  it("still resends while the refreshed report has everything it needs", async () => {
+    // Reverse control: the gate is about the report, not about the refresh.
+    await panelThenRefresh(report(true, []))
+    sendMessageMock.mockResolvedValueOnce(undefined)
+
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(1))
+    expect(toastMock).not.toHaveBeenCalled()
   })
 })
 
