@@ -2982,6 +2982,42 @@ describe("rechecks the current report before a retry resend", () => {
   })
 })
 
+describe("drops the retry button when the refreshed report offers no way to save", () => {
+  it("drops the retry button when the refreshed report offers no way to save", async () => {
+    // A transport failure raises a whole-dialog, retryable hint, and nothing
+    // clears that hint: it is not type-specific, so no refresh proves it
+    // stale. A same-task retarget then reads a report needing only a secret
+    // this dialog cannot collect, which renders every row read-only and
+    // collapses the footer to "Got it" -- except that the retry button was
+    // still there, still able to POST into a shape offering no way to save.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce({ ok: false, kind: "transport" })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() =>
+      expect(screen.getByText("connectorRuntime.errors.network")).toBeInTheDocument())
+    expect(screen.getByText("connectorRuntime.actions.retry")).toBeInTheDocument()
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "token", type: "string", required: true, satisfied: true }),
+        input({ section: "secrets", key: "s1", type: "string", required: true }),
+      ]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    // The rejection the user saw is still reported -- it really happened,
+    // and no report can undo that -- but nothing beside it can submit.
+    expect(screen.getByText("connectorRuntime.errors.network")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.retry")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.saveOnly")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeInTheDocument()
+    expect(submitMock).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe("holds the retry closed until the current report is the one on screen", () => {
   /** Raises the panel, then retargets with a read that does not answer. */
   async function panelThenPendingRead() {

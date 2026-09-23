@@ -1307,7 +1307,16 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
                 {t("connectorRuntime.actions.saveAndResend")}
               </Button>
             )}
-            {dialogFieldError?.retry && (
+            {/* Both conditions, not just the retryable failure. A hint can
+                outlive the report it was raised against: a transport failure
+                raises a whole-dialog, retryable one that no refresh clears,
+                and a same-task retarget can then install a report offering no
+                way to save at all -- nothing left but what this dialog cannot
+                collect, or nothing but "Got it". The rows render read-only in
+                those shapes for that reason, so a retry button beside them
+                was the one control still able to submit into a shape whose
+                whole point is that submitting is not on offer. */}
+            {hasSaveEntryPoint && dialogFieldError?.retry && (
               <Button variant="outline" disabled={!canSubmitNow} onClick={() => handleSave(lastAlsoResend)}>
                 {t("connectorRuntime.actions.retry")}
               </Button>
