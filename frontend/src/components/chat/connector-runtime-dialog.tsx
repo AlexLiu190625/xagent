@@ -313,6 +313,25 @@ function resendFailureTextKey(outcome: ResendOutcome): TranslationKey {
 }
 
 /**
+ * The disposition the send-failed panel carries after one more attempt for
+ * the same snapshot. Uncertainty only ever accumulates: once any attempt
+ * ended with its outcome unknown, a later one the server definitely refused
+ * does not make the earlier one un-sent, so neither the panel nor anything
+ * standing in for it may fall back to saying the message never went out.
+ *
+ * One function rather than one rule in the panel and another wherever a
+ * toast reports the same attempt: the two are read by the same user, seconds
+ * apart, about one message.
+ */
+function mergeSendFailureDisposition(
+  previous: MessageDeliveryDisposition | null,
+  attempt: MessageDeliveryDisposition | null,
+): MessageDeliveryDisposition | null {
+  if (sendOutcomeMayHaveLanded(previous) || sendOutcomeMayHaveLanded(attempt)) return "outcome_unknown"
+  return attempt
+}
+
+/**
  * Whether the report currently in hand can carry a resend of the message
  * this dialog is holding. Only a met report can: `unsupported_only` still
  * lacks a required secret this dialog cannot collect, `nothing_fillable` is a
@@ -1035,6 +1054,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       setSendFailure(null)
       return
     }
+    // What the panel says right now, captured before the await below: a
+    // failed attempt is reported against the wording the panel ends up
+    // carrying, not against this attempt's own outcome, and by the time
+    // this settles the state behind that wording may already have moved.
+    const dispositionBefore = sendFailure.disposition
     // The report can change under a panel that stays up: this panel is about
     // a send that failed, not about the report, so a same-task re-read
     // leaves it alone while installing a report that no longer supports a
@@ -1056,13 +1080,21 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     setResending(true)
     const resendOutcome = await doResend()
     if (!aliveRef.current) {
-      // Unlike handleSave's unmounted exit above, this one says nothing in
-      // either outcome. A retry that went out shows up in the transcript on
-      // its own. A retry that failed leaves things as the user last saw
-      // them on the send-failed panel -- saved, not sent -- but nothing
-      // tells them the retry they clicked did not change that. Left as is
-      // here; routing every exit through one place that has to account for
-      // it is tracked in xorbitsai/xagent#2478.
+      // A retry that went out shows up in the transcript on its own, so that
+      // outcome stays silent, matching handleSave's unmounted exit above. A
+      // retry that failed leaves things exactly as the user last saw them --
+      // saved, not sent -- with the panel that said so already gone, so
+      // without this nothing would tell them the retry they pressed changed
+      // nothing. Worded off the panel's own wording rather than this
+      // attempt's, so a refusal cannot un-say an earlier unknown outcome.
+      // Counting every exit of this handler in one place is still tracked in
+      // xorbitsai/xagent#2478.
+      if (resendOutcome.kind !== "sent") {
+        toast(t(sendFailureTextKey(mergeSendFailureDisposition(
+          dispositionBefore,
+          resendOutcome.kind === "failed" ? resendOutcome.disposition : null,
+        ))))
+      }
       return
     }
     if (requestRef.current.seq !== seqAtStart) {
@@ -1084,14 +1116,20 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       close("resent")
       return
     }
-    // A retry that failed again updates the panel's wording only in the
-    // direction that keeps uncertainty: once any attempt for this snapshot
-    // ended with its outcome unknown, a later attempt the server definitely
-    // refused does not make the earlier one un-sent, so the panel must not
-    // fall back to saying the message never went out.
-    if (sendOutcomeMayHaveLanded(resendOutcome.kind === "failed" ? resendOutcome.disposition : null)) {
-      setSendFailure(prev => (prev ? { ...prev, disposition: "outcome_unknown" } : prev))
-    }
+    // A retry that failed again. The panel's wording only ever moves toward
+    // uncertainty (see mergeSendFailureDisposition), which means that in the
+    // two cases where it does not move at all the panel says exactly what it
+    // said before the click: the user cannot tell "nothing happened" from
+    // "it failed again". So the panel is updated and the fact is said once,
+    // both off the same merged disposition -- the toast carries the new
+    // event, the panel carries the standing state, and the two cannot word
+    // the same message differently.
+    const disposition = mergeSendFailureDisposition(
+      dispositionBefore,
+      resendOutcome.kind === "failed" ? resendOutcome.disposition : null,
+    )
+    setSendFailure(prev => (prev ? { ...prev, disposition } : prev))
+    toast(t(sendFailureTextKey(disposition)))
   }
 
   // A resend in flight holds the dialog open for the same reason a save does:

@@ -2595,6 +2595,78 @@ describe("keeps an unconfirmed send out of the \"not sent\" copy", () => {
   })
 })
 
+describe("reports a retry that failed again", () => {
+  /** Raises the panel through a save-and-resend whose resend fails. */
+  async function panelFrom(failure: unknown) {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(failure)
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByRole("button", { name: "connectorRuntime.actions.resend" })).toBeInTheDocument())
+    toastMock.mockClear()
+  }
+
+  it("says the retry failed too, rather than leaving the panel saying what it already said", async () => {
+    // Two definite failures in a row leave the panel's wording untouched, so
+    // without this the screen is identical before and after the click and
+    // the user cannot tell a retry that failed from a button that did
+    // nothing.
+    await panelFrom(deliveryFailure("not_sent"))
+
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("not_sent"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(2))
+
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendFailed"]])
+    expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
+  })
+
+  it("does not let that report un-say an earlier unknown outcome", async () => {
+    // The first attempt may already be running server-side. A later refusal
+    // is about the second attempt only, so neither the panel nor the toast
+    // reporting it may say the message never went out.
+    await panelFrom(deliveryFailure("outcome_unknown"))
+
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("rejected"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(2))
+
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendOutcomeUnknown"]])
+    expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument()
+  })
+
+  it("says the retry did not go out when the tree is gone before it settles", async () => {
+    // The panel the failure would normally reach cannot render any more, and
+    // doResend's console.warn reaches no user, so this exit has to say it
+    // itself -- the same thing handleSave's unmounted exit already does.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    const tree = render(<ConnectorRuntimeDialogProvider><Probe /></ConnectorRuntimeDialogProvider>)
+    await recordThenOpen({ taskId: 1, clientMessageId: "retry-unmount", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("not_sent"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    toastMock.mockClear()
+
+    let rejectRetry: (e: unknown) => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((_res, rej) => { rejectRetry = rej }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(2))
+    tree.rerender(<ConnectorRuntimeDialogProvider><Probe mounted={false} /></ConnectorRuntimeDialogProvider>)
+
+    await act(async () => { rejectRetry(deliveryFailure("not_sent")) })
+
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendFailed"]])
+  })
+})
+
 describe("keeps the save buttons disabled until a failure refresh settles", () => {
   it("keeps the save buttons disabled until a failure refresh settles", async () => {
     await openSimpleDialog()
