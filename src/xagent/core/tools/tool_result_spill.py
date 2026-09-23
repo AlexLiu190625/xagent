@@ -1,12 +1,25 @@
 """Spill oversized tool results to a workspace file instead of truncating them.
 
-This module is the single owner of the tool-result-spill mechanism: the two
-path primitives written to be shared by the writer, an engine registration
-gate and the read tool (``normalize_spilled_relative_path`` /
-``resolve_spilled_under``), plus the constants that describe the on-disk and
-in-context contract. Later stages in this same module add the walk/write path
-and the read-side helpers; nothing here depends on them. The engine side is
-not wired up yet: outside this module and its tests, nothing calls in.
+This module is the single owner of the tool-result-spill mechanism: the path
+primitives shared by the writer, the engine registration gate and the read
+side (``normalize_spilled_relative_path`` / ``resolve_spilled_under``), the
+walk-and-write entry point (``spill_oversized_values``), the report-record
+shape gate and notice renderer, and the constants that describe the on-disk
+and in-context contract.
+
+Spilling is wired but not enabled. OutputFilteredToolWrapper
+(adapters/vibe/output_filter_wrapper.py) strips a tool-supplied report key
+from every result and, only when it is given a SpillTarget, spills oversized
+values before ordinary output filtering. ExecutionContext
+(core/agent/context/execution.py) validates the report records a result
+carries, registers the accepted ones and renders their notice. The
+production tool factory supplies no SpillTarget, so in a deployed tool set
+the wrapper only strips the reserved key and no spill file is written.
+
+Read-back is not wired. The read-side helpers here
+(``spill_read_unavailable`` and ``_spill_slice``) have no caller
+outside this module and its tests, and no read_tool_result tool is
+registered.
 """
 
 from __future__ import annotations
