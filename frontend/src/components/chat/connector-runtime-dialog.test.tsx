@@ -1851,6 +1851,47 @@ describe("reports a superseded save-and-resend whose save still landed", () => {
     expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentSuperseded"]])
     expect(sendMessageMock).not.toHaveBeenCalled()
   })
+
+  it("reports a superseded save the server rejected", async () => {
+    // Same race, opposite result: the save was refused while a same-task
+    // terminal frame retargeted this dialog instance. The dialog stays on
+    // screen with the draft still in it, so saying nothing would show a save
+    // that merely stopped. The text is the whole-dialog wording, not the
+    // field-level one -- the report on screen belongs to the newer request,
+    // and the rejected draft was never built from it.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-1", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    let resolveSubmit: (value: unknown) => void = () => {}
+    submitMock.mockReturnValueOnce(new Promise((res) => { resolveSubmit = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask() // retargets this same dialog instance mid-save
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    toastMock.mockClear()
+    await act(async () => {
+      resolveSubmit({
+        ok: false, kind: "coded", status: 409, code: "runtime_context_immutable",
+        reason: "conflict.context.token", connectorRef: REF_A,
+      })
+    })
+
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.errors.conflictNoKey"]])
+    // The reason reaches the user as a toast only: pinning it to a row of a
+    // report this draft was never built from is what the toast avoids.
+    expect(screen.queryByText(/connectorRuntime\.errors\.conflict:/)).not.toBeInTheDocument()
+    // The buttons come back, rather than the dialog staying stuck mid-save.
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
+  })
 })
 
 describe("says whether the message went out when a retarget supersedes save-and-resend's own resend", () => {

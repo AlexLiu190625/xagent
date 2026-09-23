@@ -873,6 +873,18 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       if (alsoResend && result.ok) {
         toast(t("connectorRuntime.savedNotResentSuperseded"))
       }
+      // A rejected save says so too. The dialog is still on screen and the
+      // user's draft is still in it, so leaving silently would show a save
+      // that simply stopped. A toast rather than the field error the
+      // non-superseded path below sets: the report on screen is the newer
+      // request's by now, and locating this rejection against it would pin
+      // the server's reason to whatever row happens to hold that key in a
+      // report the rejected draft was never built from. The whole-dialog
+      // wording is used for the same reason -- there is no field here this
+      // rejection can claim to be about.
+      if (!result.ok) {
+        toast(translateDialogScopeFailure(t, classifySubmitFailure(result, report).messageKey))
+      }
       setSubmitting(false)
       return
     }
