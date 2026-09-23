@@ -766,9 +766,14 @@ export function connectorRuntimeInputDraftKey(
  * batch down with it -- so this is the one predicate both the dialog's blur
  * validation and buildSubmitItems below read, instead of each hand-rolling
  * its own "is this submittable" check and drifting apart on `{}`.
+ *
+ * Built on api-wrapper's isJsonRecord rather than restating the plain-object
+ * test, so the dialog -- which needs the two halves apart, to tell an empty
+ * object from a value that is no object at all -- reads the same plain-object
+ * rule this does instead of a second copy of it.
  */
 export function isSubmittableObjectValue(parsed: unknown): boolean {
-  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) && Object.keys(parsed).length > 0
+  return isJsonRecord(parsed) && Object.keys(parsed).length > 0
 }
 
 /**

@@ -52,6 +52,7 @@ import {
   type ConnectorRuntimeReport,
   type DialogOutcome,
 } from "@/lib/connector-runtime-api"
+import { isJsonRecord } from "@/lib/api-wrapper"
 import { generateClientMessageId } from "@/lib/utils"
 
 // An exhaustive lookup (not a template-literal key) so a source scan can
@@ -742,9 +743,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         // valid is never the one buildSubmitItems silently drops. A value
         // that fails it for being array/null/non-object is "invalid"; one
         // that is object-shaped but empty is "empty" -- the row's error
-        // message tells the two apart.
+        // message tells the two apart. Both halves come from the same two
+        // functions buildSubmitItems is built from, so "object-shaped" cannot
+        // come to mean one thing here and another there.
         if (!isSubmittableObjectValue(parsed)) {
-          reason = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? "empty" : "invalid"
+          reason = isJsonRecord(parsed) ? "empty" : "invalid"
         }
       } catch {
         reason = "invalid"
