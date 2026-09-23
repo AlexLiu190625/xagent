@@ -561,6 +561,44 @@ export function isTypeMismatchDispositionStale(
 }
 
 /**
+ * What a type hint becomes once a report re-read after its own
+ * `refresh: true` has landed: the same hint, a re-derived one, or none.
+ *
+ * Three answers rather than the two "keep it or drop it" the staleness
+ * check alone gives, because a hint stops matching a refreshed report for
+ * two opposite reasons. `typeObject`/`typeString` name a type the row has
+ * since stopped declaring, and nothing in the refreshed report says what
+ * the server was enforcing instead, so there is nothing left to say and
+ * the hint goes. `typeUnknown` is the other way round: its whole claim is
+ * that the report named no type here, and a refreshed report that does
+ * name one answers exactly the question the hint said it could not. So it
+ * is re-derived into the named hint rather than dropped -- dropping it
+ * would take a rejection the user was shown off the screen while the draft
+ * that provoked it is still in the box and the save button still live, and
+ * the next save would be refused the same way for the same unstated
+ * reason.
+ *
+ * The caller compares the result with what it passed in: the same object
+ * back means nothing changed.
+ */
+export function reconcileTypeMismatchDisposition(
+  disposition: ConnectorRuntimeFailureDisposition,
+  refreshedReport: ConnectorRuntimeReport,
+): ConnectorRuntimeFailureDisposition | null {
+  if (!isTypeMismatchDispositionStale(disposition, refreshedReport)) return disposition
+  if (disposition.messageKey !== "typeUnknown") return null
+  const { connectorRef, key } = disposition.locate
+  const currentType = key === undefined ? null : findDeclaredInputType(refreshedReport, connectorRef, key)
+  // Unreachable: the staleness check calls an unknown-type hint stale only
+  // when the refreshed report declares a type for this row. Kept as a guard
+  // rather than a non-null assertion so that this function proves the fact
+  // instead of assuming it, and so a future loosening of that check cannot
+  // turn it into a hint naming a type nobody read.
+  if (currentType === null) return null
+  return { ...disposition, messageKey: currentType === "object" ? "typeObject" : "typeString" }
+}
+
+/**
  * Whether the connector-runtime dialog is a supported presence on the
  * current page. The failure notification that would open it reaches every
  * page an authenticated user can be on (the triggering frame is filtered

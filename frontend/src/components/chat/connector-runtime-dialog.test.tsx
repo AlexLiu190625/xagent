@@ -2344,6 +2344,82 @@ describe("resolves every connectorRuntime key the dialog uses", () => {
   })
 })
 
+describe("upgrades the unknown-type hint when the refresh declares a type", () => {
+  it("upgrades the unknown-type hint when the refresh declares a type", async () => {
+    // The unknown-type hint is the one that says the connector does not
+    // state which type it expects. Its disposition asks for a refresh, and a
+    // connector's own edit endpoint rewrites declarations in place, so the
+    // refresh it asks for is exactly what can answer it. Clearing the hint
+    // there took the server's rejection off the screen while the rejected
+    // draft was still in the box and the save button still live.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    // Rejected over a key this report does not declare at all, which is what
+    // makes the hint the unknown-type one.
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 400, code: "invalid_runtime_context",
+      reason: "type_mismatch.context.missing", connectorRef: REF_A,
+    })
+    // The refresh that disposition asks for: the row is declared now.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "token", type: "string", required: true }),
+        input({ section: "context", key: "missing", type: "object", required: true }),
+      ]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+
+    await waitFor(() => expect(
+      screen.getByText('connectorRuntime.errors.typeObject:{"key":"missing"}'),
+    ).toBeInTheDocument())
+    expect(screen.queryByText("connectorRuntime.errors.typeUnknown")).not.toBeInTheDocument()
+  })
+
+  it("upgrades the unknown-type hint when a same-task re-read declares a type", async () => {
+    // The read effect's own report swap, not handleSave's refresh: a second
+    // terminal frame for the same task retargets an already-open dialog, and
+    // the report it installs can declare the row too.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 400, code: "invalid_runtime_context",
+      reason: "type_mismatch.context.missing", connectorRef: REF_A,
+    })
+    // handleSave's own refresh still finds the row undeclared, so the hint
+    // survives it unchanged and this test is about the read effect alone.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.errors.typeUnknown")).toBeInTheDocument())
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [
+        input({ section: "context", key: "token", type: "string", required: true }),
+        input({ section: "context", key: "missing", type: "string", required: true }),
+      ]),
+    ])))
+    await openForTask() // same task: a second request, not a remount
+
+    await waitFor(() => expect(
+      screen.getByText('connectorRuntime.errors.typeString:{"key":"missing"}'),
+    ).toBeInTheDocument())
+    expect(screen.queryByText("connectorRuntime.errors.typeUnknown")).not.toBeInTheDocument()
+  })
+})
+
 describe("does not open off the host routes", () => {
   it("does not open off the host routes", async () => {
     // Not a host route when the request arrives: no read, request cleared.

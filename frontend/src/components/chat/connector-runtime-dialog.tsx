@@ -41,7 +41,7 @@ import {
   isConnectorRuntimeDialogHostPath,
   isSubmitEnabled,
   isSubmittableObjectValue,
-  isTypeMismatchDispositionStale,
+  reconcileTypeMismatchDisposition,
   resolveDialogActions,
   resolveDialogOutcome,
   submitTaskConnectorRuntimeValues,
@@ -566,10 +566,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // same task retargeted an already-open dialog (see this effect's
       // opening comment) -- never because the user resolved anything -- so
       // a live rejection or send failure must survive it. A type-mismatch
-      // hint is cleared only once this fresher report proves it stale (the
-      // row's declared type changed under it, via
-      // isTypeMismatchDispositionStale, the same check handleSave's own
-      // post-failure refresh uses below); a 409 conflict hint has no such
+      // hint is reconciled against this fresher report -- cleared when the
+      // row's declared type changed under it, re-derived when the row
+      // finally declares one at all, via reconcileTypeMismatchDisposition,
+      // the same call handleSave's own post-failure refresh makes below; a
+      // 409 conflict hint has no such
       // report-derived staleness condition, so it is left alone here the
       // same way handleSave's refresh already leaves it alone. A met report
       // runs this too: "nothing is missing any more" says nothing about
@@ -582,7 +583,15 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // actually completes (handleRetryResend), unmounting, and the
       // request no longer carrying the snapshot the panel is about, which
       // `sendFailed` derives during render rather than any effect here.
-      setFieldError(prev => (prev && isTypeMismatchDispositionStale(prev.disposition, result.report) ? null : prev))
+      setFieldError((prev) => {
+        if (!prev) return prev
+        const reconciled = reconcileTypeMismatchDisposition(prev.disposition, result.report)
+        // The same disposition back means this report changed nothing about
+        // the hint, and returning `prev` keeps the field error referentially
+        // stable rather than re-rendering over an equal value.
+        if (reconciled === prev.disposition) return prev
+        return reconciled ? { disposition: reconciled } : null
+      })
       // An already-visible met report stays on screen with its footer
       // collapsed to "Got it" (the same path handleSave's post-save refresh
       // takes when a refresh finds nothing left to fill) rather than
@@ -926,8 +935,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         // refreshed report shows this row now declares the other type, that
         // hint no longer describes the row it is attached to and must be
         // cleared outright rather than left to describe a type this row no
-        // longer has.
-        if (isTypeMismatchDispositionStale(disposition, refreshed.report)) setFieldError(null)
+        // longer has. The one hint that names no type -- "this connector
+        // does not say which type it expects" -- is re-derived rather than
+        // cleared when the refresh finally declares one, since that refresh
+        // is exactly what answers it.
+        const reconciled = reconcileTypeMismatchDisposition(disposition, refreshed.report)
+        if (reconciled !== disposition) setFieldError(reconciled ? { disposition: reconciled } : null)
       }
       setSubmitting(false)
       return

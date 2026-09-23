@@ -15,6 +15,7 @@ import {
   isSubmitEnabled,
   isTypeMismatchDispositionStale,
   readConnectorRuntimeReport,
+  reconcileTypeMismatchDisposition,
   resolveDialogActions,
   resolveDialogOutcome,
   submitTaskConnectorRuntimeValues,
@@ -821,6 +822,48 @@ describe("isTypeMismatchDispositionStale", () => {
     expect(isTypeMismatchDispositionStale(disposition("typeObject"), declaredString)).toBe(true)
     expect(isTypeMismatchDispositionStale(disposition("typeObject"), declaredObject)).toBe(false)
     expect(isTypeMismatchDispositionStale(disposition("typeObject"), stillUndeclared)).toBe(false)
+  })
+})
+
+describe("reconcileTypeMismatchDisposition", () => {
+  const disposition = (messageKey: ConnectorRuntimeErrorMessageKey, key = "token") => ({
+    messageKey, retry: false as const, refresh: true as const, locate: { connectorRef: REF_A, key },
+  })
+  const declaredString = report(false, [
+    connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+  ])
+  const declaredObject = report(false, [
+    connector(REF_A, "A", [input({ section: "context", key: "token", type: "object", required: true })]),
+  ])
+  const stillUndeclared = report(false, [connector(REF_A, "A", [])])
+
+  it("re-derives an unknown-type hint into the type the refreshed report declares", () => {
+    // The refresh is what answers the question this hint said it could not,
+    // so the answer replaces the hint. Dropping it instead would take a
+    // rejection the user was shown off the screen while the draft that
+    // provoked it is still in the box and still saveable.
+    expect(reconcileTypeMismatchDisposition(disposition("typeUnknown"), declaredString))
+      .toEqual({ ...disposition("typeUnknown"), messageKey: "typeString" })
+    expect(reconcileTypeMismatchDisposition(disposition("typeUnknown"), declaredObject))
+      .toEqual({ ...disposition("typeUnknown"), messageKey: "typeObject" })
+  })
+
+  it("drops a named type hint the refreshed report contradicts", () => {
+    // Nothing in the refreshed report says what the server was enforcing
+    // instead, so there is no re-derivation to make here.
+    expect(reconcileTypeMismatchDisposition(disposition("typeObject"), declaredString)).toBeNull()
+    expect(reconcileTypeMismatchDisposition(disposition("typeString"), declaredObject)).toBeNull()
+  })
+
+  it("hands back the same disposition when the refreshed report changes nothing", () => {
+    // Identity, not equality: the dialog compares the result with what it
+    // passed in to decide whether to touch its field-error state at all.
+    const unknown = disposition("typeUnknown")
+    expect(reconcileTypeMismatchDisposition(unknown, stillUndeclared)).toBe(unknown)
+    const named = disposition("typeString")
+    expect(reconcileTypeMismatchDisposition(named, declaredString)).toBe(named)
+    const unrelated = disposition("conflict")
+    expect(reconcileTypeMismatchDisposition(unrelated, declaredObject)).toBe(unrelated)
   })
 })
 
