@@ -370,6 +370,13 @@ describe("the connector-runtime HTTP calls", () => {
         const signal = init?.signal
         if (signal) signals.push(signal)
         return new Promise<Response>((_resolve, reject) => {
+          // Real fetch rejects straight away when it is handed a signal that
+          // has already fired, which is what every retry after the first
+          // abort gets. Without this the retries here would hang instead.
+          if (signal?.aborted) {
+            reject(new Error("aborted"))
+            return
+          }
           signal?.addEventListener("abort", () => reject(new Error("aborted")))
         })
       }))
@@ -428,6 +435,73 @@ describe("the connector-runtime HTTP calls", () => {
 
       expect(signals).toHaveLength(1)
       expect(signals[0].aborted).toBe(false)
+    })
+
+    /**
+     * A fetch whose headers arrive at once and whose body then never does.
+     * This is the shape the timeout used to miss entirely: fetch resolves on
+     * the headers, so a body that stalls was read outside the window. The
+     * body stream errors when the signal fires, the same way a real one does.
+     */
+    function stubHeadersOnlyFetch(): AbortSignal[] {
+      const signals: AbortSignal[] = []
+      vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+        const signal = init?.signal
+        if (signal) signals.push(signal)
+        const body = new ReadableStream({
+          start(controller) {
+            signal?.addEventListener("abort", () => controller.error(new Error("aborted")))
+          },
+        })
+        return Promise.resolve(new Response(body, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }))
+      }))
+      return signals
+    }
+
+    it("abandons a requirements read whose headers arrive but whose body never does", async () => {
+      // Not `malformed`: parseApiResponse turns the cut-short body read into
+      // an empty body, which would otherwise be reported as a server bug --
+      // no retry button, and the dialog re-reading a report that is never
+      // going to arrive.
+      vi.useFakeTimers()
+      const signals = stubHeadersOnlyFetch()
+      const pending = fetchTaskConnectorRuntimeRequirements(7)
+
+      await vi.advanceTimersByTimeAsync(20_000)
+
+      await expect(pending).resolves.toEqual({ ok: false, kind: "transport" })
+      expect(signals).toHaveLength(1)
+      expect(signals[0].aborted).toBe(true)
+    })
+
+    it("abandons a save whose headers arrive but whose body never does", async () => {
+      // The save is the one the dialog refuses to close over, so a body that
+      // never finishes arriving must end the same way a request that never
+      // answered at all does.
+      vi.useFakeTimers()
+      const signals = stubHeadersOnlyFetch()
+      const pending = submitTaskConnectorRuntimeValues(7, [{ connector_ref: REF_A, context: { token: "abc" } }])
+
+      await vi.advanceTimersByTimeAsync(20_000)
+
+      await expect(pending).resolves.toEqual({ ok: false, kind: "transport" })
+      expect(signals).toHaveLength(1)
+      expect(signals[0].aborted).toBe(true)
+    })
+
+    it("still reports a genuinely empty body as malformed", async () => {
+      // The guard above keys on the signal, not on the body being empty, so
+      // an empty body that arrived in time keeps its own distinct answer.
+      vi.useFakeTimers()
+      vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("", { status: 200 }))))
+
+      await expect(fetchTaskConnectorRuntimeRequirements(7)).resolves.toEqual({
+        ok: false,
+        kind: "malformed",
+      })
     })
   })
 })
