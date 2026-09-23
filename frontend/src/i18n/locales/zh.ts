@@ -3663,6 +3663,7 @@ const zh = {
     workerFailed: "Worker 执行失败",
     unknownWorker: "未知 Worker",
     viewAgentExecution: "查看 Agent 详情",
+    connectorUnavailable: "连接器 {connector} 不可用",
     toolNames: {
       web_search: "正在搜索网络",
       tavily_web_search: "正在搜索网络",

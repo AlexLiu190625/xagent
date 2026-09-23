@@ -164,6 +164,7 @@ export default defineConfig({
       "src/components/chat/chat-input-public-file-access.test.tsx",
       "src/components/chat/ChatMessage.test.tsx",
       "src/components/chat/TraceEventRenderer.test.tsx",
+      "src/components/chat/trace-event-processing.test.ts",
       "src/components/chat/clarification-form.test.tsx",
       "src/components/chat/connector-runtime-dialog.test.tsx",
       "src/components/file/file-preview-content.test.tsx",
