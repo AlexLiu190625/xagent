@@ -34,7 +34,6 @@ from ...tools.artifacts import (
 from ...tools.tool_result_spill import (
     SPILL_RESERVED_RESULT_KEY,
     SPILL_UNAVAILABLE_NOTICE,
-    normalize_spilled_relative_path,
     render_spill_notice,
     resolve_spilled_under,
     spill_dir_for_workspace,
@@ -549,9 +548,10 @@ class ExecutionContext:
 
         Returns None when the context carries no workspace path, which is
         also how every deployment without a spill target reads: no
-        directory, so no record can pass gate 3. The layout itself comes
-        from the spill module, which is the same place the writer's target
-        comes from -- this side must not spell it a second time.
+        directory, so no record can pass gate 2 (existence). The layout
+        itself comes from the spill module, which is the same place the
+        writer's target comes from -- this side must not spell it a second
+        time.
         """
         workspace_path = self.workspace_path
         if not workspace_path:
@@ -561,16 +561,20 @@ class ExecutionContext:
     def _register_spilled_results(
         self, result: Any
     ) -> tuple[tuple[dict[str, Any], ...], int]:
-        """Validate a tool result's spill report through four gates.
+        """Validate a tool result's spill report through three gates.
 
-        Gate 1 (shape) and gate 2 (path syntax) failures are forged or
-        malformed and are dropped silently -- the model is never told they
-        existed. Gate 3 (existence) failures are real reports pointing at a
-        file that is gone (e.g. an external-credential task's workspace was
-        removed at the end of the previous turn); those count toward the
-        caller's unavailable-value notice. Gate 4 (capacity) stops
-        registering new files once the registry is full but still returns
-        the record for this message's own observation text, the same way an
+        Gate 1 (shape) failures are forged or malformed and are dropped
+        silently -- the model is never told they existed. Path syntax used
+        to be a separate gate here; it now lives inside gate 1, because
+        spill_record_shape_is_valid (and the failure-naming helper behind
+        it) already rejects a relative_path that is not its own
+        normalization, so a second check here would never fire. Gate 2
+        (existence) failures are real reports pointing at a file that is
+        gone (e.g. an external-credential task's workspace was removed at
+        the end of the previous turn); those count toward the caller's
+        unavailable-value notice. Gate 3 (capacity) stops registering new
+        files once the registry is full but still returns the record for
+        this message's own observation text, the same way an
         already-registered relative_path is returned without being
         duplicated.
 
@@ -598,8 +602,6 @@ class ExecutionContext:
             if not spill_record_shape_is_valid(record):
                 continue
             relative_path = record["relative_path"]
-            if normalize_spilled_relative_path(relative_path) != relative_path:
-                continue
             if (
                 spill_dir is None
                 or resolve_spilled_under(spill_dir, relative_path) is None
@@ -673,7 +675,7 @@ class ExecutionContext:
         # The reserved key -- and the relative_path inside each of its
         # records -- stays in context_result and therefore in raw_result:
         # replay (runner.py) only ever passes raw_result back into a fresh
-        # context, and that record is the only way the four gates have
+        # context, and that record is the only way the three gates have
         # anything to re-validate on that later pass. _format_tool_result
         # keeps the reserved key out of the rendered observation text
         # itself; only the notice built from spill_records names a path.
