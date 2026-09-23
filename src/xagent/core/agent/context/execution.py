@@ -562,6 +562,19 @@ class ExecutionContext:
         not the place to fail a tool call over that: this degrades to "no
         spill directory" the same way a missing workspace_path already
         does, with a warning so the bad value is not silently swallowed.
+
+        The two cases this degrades to the same reading are not the same
+        cost, though. A missing workspace_path means there is no
+        workspace, so the file genuinely does not exist and telling the
+        model "unavailable" is the truth. A relative workspace_path means
+        the workspace does exist and the writer -- which always holds the
+        real workspace object, resolved to an absolute path at
+        construction -- already wrote the file; only this side is looking
+        for it in the wrong place, so "unavailable" is told to the model in
+        place of data it could otherwise have read. That cost is accepted
+        anyway, because the alternative is worse: letting the ValueError
+        propagate would fail the whole tool call over a checkpoint field
+        this code never validated to begin with.
         """
         workspace_path = self.workspace_path
         if not workspace_path:

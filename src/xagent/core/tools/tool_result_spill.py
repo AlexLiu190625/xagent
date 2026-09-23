@@ -331,14 +331,12 @@ def resolve_spilled_under(
 def spill_dir_for_workspace(workspace_dir: str | Path) -> str:
     """This workspace's spill directory, as the plain string SpillTarget holds.
 
-    The one place the layout is built. Nothing in this repository calls it
-    yet; it is written for the three callers that will need the same
-    directory from three different starting points -- the tool factory
-    holds a workspace object, the execution context holds only a workspace
-    path string, and the read tool holds a workspace object again -- each
-    of which would otherwise join the parts itself. A directory that three
-    callers spell separately is a directory that moves in two of the three
-    places.
+    The one place the layout is built. ExecutionContext._spill_dir is this
+    repository's first caller, holding only a workspace path string; the
+    tool factory and the read tool still need the same directory from a
+    workspace object instead, each of which would otherwise join the parts
+    itself. A directory that three callers spell separately is a directory
+    that moves in two of the three places.
 
     Takes the workspace root rather than its output directory so the whole
     relative layout lives here, and returns a str rather than a Path
@@ -1434,10 +1432,12 @@ def spill_record_shape_is_valid(record: Any) -> bool:
     which escapes a line break rather than emitting it, so this gate leaves
     them to the type checks below.
 
-    No caller in this repository uses it yet. It is written for two: an
-    engine registration gate that decides which records to persist, and
-    render_spill_notice, which must not interpolate an unvalidated
-    relative_path, item_count or original_chars into text the model reads.
+    ExecutionContext._register_spilled_results is this repository's
+    caller: it uses this boolean form as the engine registration gate that
+    decides which records to persist. render_spill_notice does not call
+    this function -- it goes straight to _spill_record_shape_failure below,
+    because it needs the broken-rule string for its log line, not a plain
+    yes/no.
 
     The rules themselves live in _spill_record_shape_failure, which answers
     which rule was broken rather than only that one was, so a caller that
