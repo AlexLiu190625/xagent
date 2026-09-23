@@ -121,6 +121,10 @@ on:
       - 'src/xagent/config.py'
       - 'src/xagent/web/services/trace_handlers.py'
       - 'tests/web/services/test_trace_database_postgresql.py'
+      - 'src/xagent/web/services/task_retention.py'
+      - 'src/xagent/web/tracking/task_tracker.py'
+      - 'tests/web/services/test_task_retention.py'
+      - 'tests/alembic/test_20260922_task_last_activity_at.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -278,6 +282,10 @@ jobs:
             src/xagent/config.py
             src/xagent/web/services/trace_handlers.py
             tests/web/services/test_trace_database_postgresql.py
+            src/xagent/web/services/task_retention.py
+            src/xagent/web/tracking/task_tracker.py
+            tests/web/services/test_task_retention.py
+            tests/alembic/test_20260922_task_last_activity_at.py
           )
 
           case "$EVENT_NAME" in
@@ -673,6 +681,14 @@ jobs:
         run: |
           pytest tests/web/services/test_trace_blob_upsert_postgresql.py -m postgresql -q
           pytest tests/web/services/test_trace_database_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test retention anchor and eligibility (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_retention.py -m postgresql -q
+          pytest tests/alembic/test_20260922_task_last_activity_at.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
