@@ -743,9 +743,9 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         // valid is never the one buildSubmitItems silently drops. A value
         // that fails it for being array/null/non-object is "invalid"; one
         // that is object-shaped but empty is "empty" -- the row's error
-        // message tells the two apart. Both halves come from the same two
-        // functions buildSubmitItems is built from, so "object-shaped" cannot
-        // come to mean one thing here and another there.
+        // message tells the two apart. isSubmittableObjectValue is itself
+        // built on this same isJsonRecord, so "object-shaped" cannot come to
+        // mean one thing in the filter and another in this message.
         if (!isSubmittableObjectValue(parsed)) {
           reason = isJsonRecord(parsed) ? "empty" : "invalid"
         }

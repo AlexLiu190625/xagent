@@ -121,8 +121,9 @@ export const READ_FAILURE_STATUSES = [400, 401, 403, 404, 422, 500, 503] as cons
  * answering. Nothing else cancels these two: the dialog's read effect drops a
  * late answer but does not stop the request behind it, and the save runs to
  * completion on purpose even when the dialog unmounts mid-flight. Without a
- * bound here, a request that never answers leaves the dialog unable to save
- * and -- while the save is the call in flight -- unable to close at all.
+ * bound here, a request that never finishes answering -- no response at all,
+ * or headers with a body that never arrives -- leaves the dialog unable to
+ * save and, while the save is the call in flight, unable to close at all.
  *
  * The one comparable constant in this frontend is api-wrapper's
  * AUTH_REFRESH_TIMEOUT_MS (15s, for the token refresh). These two calls are
@@ -542,6 +543,11 @@ export function classifySubmitFailure(
  * location falls back to whole-dialog scope, where it is reworded to stop
  * naming a type no field on screen is asking for
  * (translateDialogScopeFailure in connector-runtime-dialog.tsx).
+ *
+ * What the dialog should then *do* about a hint this calls stale is not
+ * this predicate's question, and the dialog does not ask it directly:
+ * reconcileTypeMismatchDisposition below is the one caller, because two of
+ * the three hints are dropped on a stale answer and one is re-derived.
  */
 export function isTypeMismatchDispositionStale(
   disposition: ConnectorRuntimeFailureDisposition,
@@ -553,8 +559,10 @@ export function isTypeMismatchDispositionStale(
   if (key === undefined) return false
   const currentType = findDeclaredInputType(refreshedReport, connectorRef, key)
   // The unknown hint's whole claim is "this report declares no type here",
-  // so any declared type in the refreshed report retires it -- including
+  // so any declared type in the refreshed report ends that claim -- including
   // the type the server was enforcing all along, which is the common case.
+  // Ending the claim is not the same as having nothing left to say, which is
+  // why the reconciler below re-derives this one instead of dropping it.
   if (messageKey === "typeUnknown") return currentType !== null
   const expectedType = messageKey === "typeObject" ? "object" : "string"
   return currentType !== null && currentType !== expectedType
