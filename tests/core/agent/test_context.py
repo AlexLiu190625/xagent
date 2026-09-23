@@ -3326,7 +3326,7 @@ def test_registering_a_result_with_no_accepted_records_creates_no_component(
         assert "spilled_results" not in ctx.to_dict()["components"]
 
 
-def test_gate_one_rejects_malformed_shapes(tmp_path):
+def test_a_malformed_shape_is_rejected_by_the_shape_gate(tmp_path):
     _spill_workspace(tmp_path)
     ctx = ExecutionContext()
     ctx.attach_workspace("ws-1", str(tmp_path))
@@ -3347,7 +3347,7 @@ def test_gate_one_rejects_malformed_shapes(tmp_path):
         assert SPILL_RESERVED_RESULT_KEY not in str(tool.content)
 
 
-def test_gate_two_rejects_non_canonical_paths(tmp_path):
+def test_a_non_canonical_path_is_rejected_by_the_shape_gate(tmp_path):
     _spill_workspace(tmp_path)
     ctx = ExecutionContext()
     ctx.attach_workspace("ws-1", str(tmp_path))
@@ -3366,7 +3366,9 @@ def test_gate_two_rejects_non_canonical_paths(tmp_path):
         assert ctx.spilled_results == ()
 
 
-def test_gate_three_rejects_missing_files_and_counts_unavailable(tmp_path):
+def test_a_missing_file_is_rejected_by_the_existence_gate_and_counted_unavailable(
+    tmp_path,
+):
     _spill_workspace(tmp_path)
     ctx = ExecutionContext()
     ctx.attach_workspace("ws-1", str(tmp_path))
@@ -3379,7 +3381,7 @@ def test_gate_three_rejects_missing_files_and_counts_unavailable(tmp_path):
     assert "tool-results/" not in tool.content
 
 
-def test_gate_three_fails_closed_without_a_workspace():
+def test_the_existence_gate_fails_closed_without_a_workspace():
     ctx = ExecutionContext()  # no attach_workspace call
     tool = ctx.add_tool_result(
         "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
@@ -3388,7 +3390,7 @@ def test_gate_three_fails_closed_without_a_workspace():
     assert tool.content.endswith(SPILL_UNAVAILABLE_NOTICE)
 
 
-def test_gate_one_and_two_failures_do_not_add_the_unavailable_notice(tmp_path):
+def test_a_shape_gate_failure_does_not_add_the_unavailable_notice(tmp_path):
     _spill_workspace(tmp_path)
     ctx = ExecutionContext()
     ctx.attach_workspace("ws-1", str(tmp_path))
@@ -3399,7 +3401,7 @@ def test_gate_one_and_two_failures_do_not_add_the_unavailable_notice(tmp_path):
     assert tool.content == "Tool acme returned: ok"
 
 
-def test_gate_four_capacity_stops_registering_but_keeps_returning_for_render(
+def test_the_capacity_gate_stops_registering_but_keeps_returning_for_render(
     tmp_path,
 ):
     _spill_workspace(tmp_path)
@@ -3443,7 +3445,9 @@ def test_duplicate_relative_path_is_not_re_registered_but_still_returned(tmp_pat
     assert tool.metadata["spilled_results"] == [dict(VALID_RECORD)]
 
 
-def test_gate_three_uses_only_the_path_string_no_taskworkspace(tmp_path, mocker):
+def test_the_existence_gate_uses_only_the_path_string_no_taskworkspace(
+    tmp_path, mocker
+):
     from xagent.core.workspace import TaskWorkspace
 
     missing_dir = tmp_path / "does-not-exist"
@@ -3483,7 +3487,7 @@ def test_spill_dir_degrades_to_none_for_a_relative_workspace_path(caplog):
     assert "relative/workspace/path" in records[0].getMessage()
 
 
-def test_only_gate_three_failures_are_counted_unavailable(tmp_path):
+def test_two_shape_gate_failures_do_not_add_the_unavailable_notice(tmp_path):
     _spill_workspace(tmp_path)
     ctx = ExecutionContext()
     ctx.attach_workspace("ws-1", str(tmp_path))
@@ -3492,15 +3496,18 @@ def test_only_gate_three_failures_are_counted_unavailable(tmp_path):
         {
             "output": "ok",
             SPILL_RESERVED_RESULT_KEY: [
-                {**VALID_RECORD, "kind": "records"},  # gate 1
-                {**VALID_RECORD, "relative_path": "../x.json"},  # gate 2
+                {**VALID_RECORD, "kind": "records"},  # fails the shape gate
+                {
+                    **VALID_RECORD,
+                    "relative_path": "../x.json",
+                },  # non-canonical path, also the shape gate
             ],
         },
     )
     assert SPILL_UNAVAILABLE_NOTICE not in tool.content
 
 
-def test_two_gate_three_failures_add_the_notice_only_once(tmp_path):
+def test_two_existence_gate_failures_add_the_unavailable_notice_only_once(tmp_path):
     _spill_workspace(tmp_path)
     ctx = ExecutionContext()
     ctx.attach_workspace("ws-1", str(tmp_path))
@@ -3692,7 +3699,8 @@ def test_spill_replay_registers_when_the_file_is_still_there(tmp_path):
 def test_spill_replay_reports_unavailable_when_the_file_is_gone(tmp_path):
     """After the workspace that held the file is gone (e.g. an
     external-credential task's per-turn rmtree), replaying the same
-    raw_result must fail gate 3 and say so without naming a path."""
+    raw_result must fail the existence gate and say so without naming a
+    path."""
     spill_dir = _spill_workspace(tmp_path)
     ctx = ExecutionContext()
     ctx.attach_workspace("ws-1", str(tmp_path))
