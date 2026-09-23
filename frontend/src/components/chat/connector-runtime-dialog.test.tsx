@@ -2909,6 +2909,41 @@ describe("hides the send-failed panel as soon as the request stops carrying its 
   })
 })
 
+describe("forgets a send failure whose snapshot is gone for good", () => {
+  it("forgets a send failure whose snapshot is gone for good", async () => {
+    // The panel's visibility is derived from the request every render, so it
+    // goes the moment a settlement takes the snapshot away. The value behind
+    // it is what this pins down: nothing on the way out clears it, because
+    // every place that does requires the panel to still be rendering. Hand
+    // the request that same clientMessageId back and the panel must not
+    // return with it, reporting a send that has nothing left to retry.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("not_sent"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    await act(async () => { latestActions.forgetDelivery(1) })
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+
+    // The same id reaches the request again. Nothing in production mints a
+    // client message id twice, which is why the leftover is unreachable
+    // rather than wrong today -- this drives the case directly so the
+    // reclaim does not quietly disappear.
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-1", text: "hi" })
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+    expect(screen.getByLabelText("token")).toBeInTheDocument()
+  })
+})
+
 describe("rechecks the current report before a retry resend", () => {
   // The panel is about a send that failed, not about the report, so a
   // same-task re-read leaves it up while installing whatever the server now

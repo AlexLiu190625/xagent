@@ -435,6 +435,26 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     ? sendFailure
     : null
   const sendFailed = liveSendFailure !== null
+  // Deriving the panel from the request each render is what keeps every
+  // painted frame honest, but it leaves the value itself behind once the
+  // snapshot it names is gone: the three places that clear it all require
+  // the panel to be rendering, and the two ways a snapshot disappears --
+  // forgetDelivery dropping it in place, a retarget swapping in a newer
+  // candidate -- are exactly the ways it stops rendering. Today nothing
+  // brings a clientMessageId back once it has gone (doResend mints a fresh
+  // id per attempt, and a snapshot's own id is written once at send time),
+  // so that leftover is unreachable rather than wrong; it is dropped here so
+  // it cannot become wrong if an id ever does come back.
+  //
+  // Set during render, not from an effect. An effect noticing this
+  // afterwards is the shape this dialog already replaced once: it lands a
+  // frame late, and it never runs at all for a removal that does not move
+  // `seq`. React re-runs this component with the reset value before
+  // committing anything, so the condition is false on the second pass and
+  // no frame is painted from the state being dropped.
+  if (sendFailure !== null && liveSendFailure === null) {
+    setSendFailure(null)
+  }
   const [resending, setResending] = useState(false)
   // The client message id the most recent unresolved resend attempt used,
   // together with the clientMessageId of the snapshot it was sent for, so a
