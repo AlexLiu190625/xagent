@@ -351,6 +351,13 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   requestRef.current = request
 
   const [report, setReport] = useState<ConnectorRuntimeReport | null>(null)
+  // The `seq` of the request whose requirements read has settled, or null
+  // before the first one has. Compared against the current request's `seq`
+  // during render (see `reading` below) rather than being a boolean the read
+  // effect raises and lowers: that effect has six exits, and a flag left
+  // raised on any one of them would disable saving for good, while a seq
+  // that never catches up cannot outlive the request it names.
+  const [settledReadSeq, setSettledReadSeq] = useState<number | null>(null)
   const [visible, setVisible] = useState(false)
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [invalidDraftKeys, setInvalidDraftKeys] = useState<Map<string, InvalidObjectDraftReason>>(new Map())
@@ -419,6 +426,15 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     let cancelled = false
     fetchTaskConnectorRuntimeRequirements(request.taskId).then((result) => {
       if (cancelled || !aliveRef.current || requestRef.current.seq !== seqAtStart) return
+      // This read has settled, whichever way the branches below go. Recorded
+      // once, here, rather than at each of those branches: the three guards
+      // above are exactly the cases where it must not be recorded (a newer
+      // request's own read owns the answer now), and every branch past this
+      // point either installs a report or deliberately keeps the one already
+      // on screen. Until this lands, `reading` below holds saving closed, so
+      // a submission cannot be built from a report this read is about to
+      // replace.
+      setSettledReadSeq(seqAtStart)
       if (!result.ok) {
         console.warn(
           "[connector-runtime] requirements read failed",
@@ -515,6 +531,17 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // further down, which must keep the dialog open while either kind of
   // submission has not yet settled.
   const busy = submitting || resending
+  // Whether the report on screen is older than the request the dialog is now
+  // for. A same-task retarget bumps `seq` and starts a fresh read while the
+  // previous report is still rendered, and submitting against that report
+  // writes values the current one may no longer declare -- a stored context
+  // value is immutable (see the note below), so there is no correcting it
+  // afterwards. This is not folded into `busy`, which also gates dismissal:
+  // the requirements read has no timeout, and a read that never settles
+  // would leave the dialog impossible to close, which is worse than the
+  // stale submit it guards against. Saving is what must wait, so this joins
+  // the submit gate instead.
+  const reading = settledReadSeq !== request.seq
   // The one value every entry point into a submission reads: both footer
   // save buttons, the retry button a retryable failure offers, and
   // handleSave itself. The retry button used to be rendered off
@@ -526,7 +553,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // stored context value is immutable, so there is no correcting it
   // afterwards. handleSave re-checks rather than trusting its callers, so a
   // fourth entry point cannot reintroduce the same bypass.
-  const canSubmitNow = canSubmit && !busy
+  const canSubmitNow = canSubmit && !busy && !reading
   const hasResendPayload = request.resendPayload !== null
   const actions = outcome ? resolveDialogActions(outcome, hasResendPayload) : []
   // Whether this shape offers any way to submit. The row renderer asks this

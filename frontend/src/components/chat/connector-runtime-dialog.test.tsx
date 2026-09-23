@@ -2621,6 +2621,52 @@ describe("keeps the save buttons disabled until a failure refresh settles", () =
   })
 })
 
+describe("keeps the save buttons disabled until the current report arrives", () => {
+  it("keeps the save buttons disabled until the current report arrives", async () => {
+    // A same-task retarget starts a fresh read while the report the user is
+    // looking at is still the previous one. Saving during that window builds
+    // the batch from the older report -- rows the current one may have
+    // dropped or already satisfied -- and a stored context value cannot be
+    // corrected afterwards.
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
+
+    let resolveRead: (value: unknown) => void = () => {}
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveRead = res }))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    const saveOnly = screen.getByText("connectorRuntime.actions.saveOnly")
+    expect(saveOnly).toBeDisabled()
+    expect(screen.getByText("connectorRuntime.actions.saveAndResend")).toBeDisabled()
+    fireEvent.click(saveOnly)
+    expect(submitMock).not.toHaveBeenCalled()
+
+    // Nothing was submitted while the read was out, so the reopened dialog
+    // must be usable again once the current report is the one on screen.
+    await act(async () => {
+      resolveRead(ok(report(false, [
+        connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+      ])))
+    })
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
+  })
+
+  it("still lets the user close a dialog whose read has not come back", async () => {
+    // The requirements read has no timeout, so the gate above may not also
+    // hold the dialog open: a read that never settles would leave no way out
+    // of it.
+    await openSimpleDialog()
+    fetchMock.mockReturnValueOnce(new Promise(() => {}))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+  })
+})
+
 describe("holds the dialog open while a retry resend is in flight", () => {
   it("holds the dialog open while a retry resend is in flight", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {})
