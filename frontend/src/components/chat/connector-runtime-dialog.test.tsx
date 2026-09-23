@@ -995,8 +995,11 @@ describe("re-locates an existing field error when an already-visible dialog re-r
     await waitFor(() => expect(screen.getByText("connectorRuntime.filled")).toBeInTheDocument())
     // The stale field error re-derives against the fresh report instead of
     // continuing to point at a row identity the refresh folded away: it now
-    // attaches to the whole dialog rather than rendering nowhere.
-    expect(screen.getByText("connectorRuntime.errors.emptyValue")).toBeInTheDocument()
+    // attaches to the whole dialog rather than rendering nowhere. It is also
+    // reworded there -- "this field cannot be empty" would be pointing at a
+    // field the fresh report just collapsed into "already filled".
+    expect(screen.getByText("connectorRuntime.errors.emptyValueNoField")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.errors.emptyValue")).not.toBeInTheDocument()
     expect(screen.queryByText(/connectorRuntime\.errors\.emptyValue:/)).not.toBeInTheDocument()
   })
 })

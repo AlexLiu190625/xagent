@@ -98,8 +98,14 @@ function translateFailure(
  *   dropped -- a rejection the user saw must not vanish on a refresh they
  *   did not ask for -- only reworded, and a report that brings the row
  *   back brings the named text back with it.
+ * - `emptyValue` says "this field", of a field that is not there. Its own
+ *   disposition asks for no refresh, but the report under it still changes:
+ *   a same-task re-read installs a fresher one, and the error's location is
+ *   re-derived against whatever report is on screen at the time.
  *
  * `typeUnknown` needs no variant: it already names neither field nor type.
+ * Every other messageKey is either about the connector or about the save as
+ * a whole, and stays true with no field on screen.
  */
 function translateDialogScopeFailure(
   t: (key: TranslationKey, vars?: TranslationVariables) => string,
@@ -109,6 +115,7 @@ function translateDialogScopeFailure(
   if (messageKey === "typeObject" || messageKey === "typeString") {
     return t("connectorRuntime.errors.typeNoField")
   }
+  if (messageKey === "emptyValue") return t("connectorRuntime.errors.emptyValueNoField")
   return translateFailure(t, messageKey)
 }
 
