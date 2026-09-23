@@ -3463,6 +3463,26 @@ def test_the_execution_context_takes_its_spill_directory_from_the_module(tmp_pat
     assert ctx._spill_dir() == spill_dir_for_workspace(str(tmp_path))
 
 
+def test_spill_dir_degrades_to_none_for_a_relative_workspace_path(caplog):
+    """workspace_path can arrive from a deserialized checkpoint with no
+    validation of its own; a relative value must not reach
+    spill_dir_for_workspace, which raises for it. _spill_dir degrades to
+    "no spill directory" instead, the same reading a missing workspace_path
+    already gets, with a warning so the bad value is not silently
+    swallowed."""
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", "relative/workspace/path")
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.context.execution"):
+        assert ctx._spill_dir() is None
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.core.agent.context.execution"
+    ]
+    assert len(records) == 1
+    assert "relative/workspace/path" in records[0].getMessage()
+
+
 def test_only_gate_three_failures_are_counted_unavailable(tmp_path):
     _spill_workspace(tmp_path)
     ctx = ExecutionContext()

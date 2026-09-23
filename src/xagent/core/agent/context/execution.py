@@ -552,11 +552,30 @@ class ExecutionContext:
         itself comes from the spill module, which is the same place the
         writer's target comes from -- this side must not spell it a second
         time.
+
+        spill_dir_for_workspace raises ValueError for a workspace_path that
+        is non-empty but not absolute. A freshly built TaskWorkspace never
+        produces one, but this context's workspace_path can also arrive
+        from a deserialized checkpoint, which sets it with no validation of
+        its own -- an older build, a hand-edited checkpoint, or a migrated
+        one could carry a relative value. Registering spilled results is
+        not the place to fail a tool call over that: this degrades to "no
+        spill directory" the same way a missing workspace_path already
+        does, with a warning so the bad value is not silently swallowed.
         """
         workspace_path = self.workspace_path
         if not workspace_path:
             return None
-        return spill_dir_for_workspace(workspace_path)
+        try:
+            return spill_dir_for_workspace(workspace_path)
+        except ValueError:
+            logger.warning(
+                "Execution context workspace_path %r is not an absolute "
+                "path; treating this execution as having no spill "
+                "directory.",
+                workspace_path,
+            )
+            return None
 
     def _register_spilled_results(
         self, result: Any
