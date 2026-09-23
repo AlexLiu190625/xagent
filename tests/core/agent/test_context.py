@@ -3225,10 +3225,12 @@ def test_execution_context_to_dict_is_unaffected_by_later_mutation() -> None:
     context.metadata["nested"]["inner"] = "after"
 
     assert snapshot["metadata"] == before
+
+
 # --- registration gates, registry component, unavailable notice ------------
 
 VALID_RECORD = {
-    "relative_path": "tool-results/acme-012345678910.json",
+    "relative_path": "tool-results/acme-stored-result.json",
     "kind": "array",
     "item_count": 3,
     "original_chars": 42,
@@ -3241,7 +3243,7 @@ VALID_RECORD = {
 def _spill_workspace(tmp_path):
     spill_dir = tmp_path / "output" / "tool-results"
     spill_dir.mkdir(parents=True)
-    real_file = spill_dir / "acme-012345678910.json"
+    real_file = spill_dir / "acme-stored-result.json"
     real_file.write_text("[1,2,3]", encoding="utf-8")
     return spill_dir
 
@@ -3335,7 +3337,7 @@ def test_gate_one_rejects_malformed_shapes(tmp_path):
         {**VALID_RECORD, "record_fields": "id,name"},
         {**VALID_RECORD, "truncated_after_items": -1},
         {**VALID_RECORD, "value_path": 5},
-        {"relative_path": "tool-results/acme-012345678910.json"},  # missing keys
+        {"relative_path": "tool-results/acme-stored-result.json"},  # missing keys
     ]
     for shape in bad_shapes:
         tool = ctx.add_tool_result(
@@ -3350,11 +3352,11 @@ def test_gate_two_rejects_non_canonical_paths(tmp_path):
     ctx = ExecutionContext()
     ctx.attach_workspace("ws-1", str(tmp_path))
     bad_paths = [
-        "../tool-results/acme-012345678910.json",
+        "../tool-results/acme-stored-result.json",
         "/etc/passwd",
         "tool-results/sub/x.json",
         "tool-results/x.jsonl",
-        "output/tool-results/acme-012345678910.json",  # not canonical
+        "output/tool-results/acme-stored-result.json",  # not canonical
     ]
     for path in bad_paths:
         record = {**VALID_RECORD, "relative_path": path}
@@ -3368,7 +3370,7 @@ def test_gate_three_rejects_missing_files_and_counts_unavailable(tmp_path):
     _spill_workspace(tmp_path)
     ctx = ExecutionContext()
     ctx.attach_workspace("ws-1", str(tmp_path))
-    record = {**VALID_RECORD, "relative_path": "tool-results/missing-000000000000.json"}
+    record = {**VALID_RECORD, "relative_path": "tool-results/missing-result.json"}
     tool = ctx.add_tool_result(
         "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [record]}
     )
@@ -3409,7 +3411,7 @@ def test_gate_four_capacity_stops_registering_but_keeps_returning_for_render(
             records=[
                 {
                     **VALID_RECORD,
-                    "relative_path": f"tool-results/filler{i}-000000000000.json",
+                    "relative_path": f"tool-results/filler{i}-result.json",
                 }
                 for i in range(SPILL_REGISTRY_MAX_RECORDS)
             ]
@@ -3489,11 +3491,11 @@ def test_two_gate_three_failures_add_the_notice_only_once(tmp_path):
             SPILL_RESERVED_RESULT_KEY: [
                 {
                     **VALID_RECORD,
-                    "relative_path": "tool-results/missing-000000000000.json",
+                    "relative_path": "tool-results/missing-result.json",
                 },
                 {
                     **VALID_RECORD,
-                    "relative_path": "tool-results/missing2-000000000000.json",
+                    "relative_path": "tool-results/missing2-result.json",
                 },
             ],
         },
@@ -3638,7 +3640,7 @@ def test_spill_unavailable_notice_carries_no_path(tmp_path):
     ctx.attach_workspace("ws-1", str(tmp_path))
     missing = {
         **VALID_RECORD,
-        "relative_path": "tool-results/missing-000000000000.json",
+        "relative_path": "tool-results/missing-result.json",
     }
     tool = ctx.add_tool_result(
         "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [missing]}
