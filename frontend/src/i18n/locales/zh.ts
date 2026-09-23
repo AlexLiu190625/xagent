@@ -2846,6 +2846,7 @@ const zh = {
         placeholder: "选择工具类别",
         noData: "暂无可用工具",
         selectedCount: "已选择 {count} 个类别（共 {tools} 个工具）",
+        alwaysAvailable: "Agent 还可能用到这些内置工具：{tools}",
         selectAll: "全选",
         categories: {
           basic: "基础工具",
@@ -2866,7 +2867,7 @@ const zh = {
           ssh: "SSH",
         },
         categoryDescriptions: {
-          basic: "系统基础能力，包括数学计算、日期时间获取等核心功能。",
+          basic: "系统基础能力：执行 Python/JavaScript 代码和命令行命令、调用 HTTP API、翻译 JSON 字段。",
           webSearch: "网页搜索与网页内容抓取，用于查找资料并按需读取网页正文。",
           file: "文件系统操作，支持文件的读写、搜索、列表和管理。",
           vision: "计算机视觉能力，支持图像识别、分析和内容提取。",

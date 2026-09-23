@@ -303,6 +303,39 @@ describe("AgentBuilder preview", () => {
     })
   })
 
+  it("derives preview tool categories the same way as save", async () => {
+    const baseImpl = apiRequestMock.getMockImplementation()!
+    apiRequestMock.mockImplementation(async (url: string, opts?: RequestInit) => {
+      const response = await baseImpl(url, opts)
+      if (!url.endsWith("/api/agents/42")) return response
+      const agent = await response.json()
+      return new Response(
+        JSON.stringify({ ...agent, knowledge_bases: ["kb1"], tool_categories: ["mcp:foo"] }),
+        { status: 200 },
+      )
+    })
+    render(<AgentBuilder agentId="42" />)
+
+    fireEvent.change(await screen.findByDisplayValue("Existing SSH agent"), {
+      target: { value: "Renamed agent" },
+    })
+    fireEvent.click(screen.getByText("send-preview-message"))
+    fireEvent.click(screen.getByText("builds.editor.header.update"))
+
+    const findBody = (match: (url: string, opts?: RequestInit) => boolean) => {
+      const call = apiRequestMock.mock.calls.find(([url, opts]) => match(String(url), opts))
+      return call ? JSON.parse(call[1].body as string) : undefined
+    }
+    await waitFor(() => {
+      expect(findBody((url) => url.endsWith("/api/chat/task/create"))).toBeDefined()
+      expect(findBody((_, opts) => opts?.method === "PUT")).toBeDefined()
+    })
+    const previewCategories: string[] = findBody((url) => url.endsWith("/api/chat/task/create")).agent_config.tool_categories
+    const saveCategories: string[] = findBody((_, opts) => opts?.method === "PUT").tool_categories
+    expect(previewCategories).toEqual(expect.arrayContaining(["knowledge", "mcp:foo"]))
+    expect([...previewCategories].sort()).toEqual([...saveCategories].sort())
+  })
+
   it("shows task file management in the embedded preview panel", async () => {
     render(<AgentBuilder />)
 
