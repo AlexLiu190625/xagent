@@ -352,6 +352,84 @@ describe("the connector-runtime HTTP calls", () => {
       })
     })
   })
+
+  describe("gives up on a request that never answers", () => {
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    /**
+     * A fetch that answers only when its caller aborts it, which is what a
+     * real one does: the request stays open until the signal fires and then
+     * rejects. Returns the signals it was handed, so a test can check whether
+     * the timer behind one was cleared.
+     */
+    function stubUnansweredFetch(): AbortSignal[] {
+      const signals: AbortSignal[] = []
+      vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+        const signal = init?.signal
+        if (signal) signals.push(signal)
+        return new Promise<Response>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("aborted")))
+        })
+      }))
+      return signals
+    }
+
+    it("abandons a requirements read that never answers", async () => {
+      // Nothing else stops this request: the dialog's read effect ignores a
+      // late answer but does not cancel it, so without the timeout the
+      // promise below never settles and the dialog is left unable to save.
+      vi.useFakeTimers()
+      const signals = stubUnansweredFetch()
+      const pending = fetchTaskConnectorRuntimeRequirements(7)
+
+      await vi.advanceTimersByTimeAsync(20_000)
+
+      await expect(pending).resolves.toEqual({ ok: false, kind: "transport" })
+      expect(signals).toHaveLength(1)
+      expect(signals[0].aborted).toBe(true)
+    })
+
+    it("abandons a save that never answers", async () => {
+      // The save is the worse of the two: the dialog refuses to close while
+      // one is in flight, so a request that never answers leaves no way out
+      // of it at all.
+      vi.useFakeTimers()
+      const signals = stubUnansweredFetch()
+      const pending = submitTaskConnectorRuntimeValues(7, [{ connector_ref: REF_A, context: { token: "abc" } }])
+
+      await vi.advanceTimersByTimeAsync(20_000)
+
+      await expect(pending).resolves.toEqual({ ok: false, kind: "transport" })
+      expect(signals).toHaveLength(1)
+      expect(signals[0].aborted).toBe(true)
+    })
+
+    it("stops the clock once the response has arrived", async () => {
+      // The timer has to be cleared on the way out. Left running, it fires
+      // against a request that already finished, and every call leaves one
+      // more pending abort behind it.
+      vi.useFakeTimers()
+      const signals: AbortSignal[] = []
+      vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+        if (init?.signal) signals.push(init.signal)
+        return Promise.resolve(new Response(JSON.stringify(rawReport()), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }))
+      }))
+
+      await expect(fetchTaskConnectorRuntimeRequirements(7)).resolves.toEqual({
+        ok: true,
+        report: expectedReport,
+      })
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      expect(signals).toHaveLength(1)
+      expect(signals[0].aborted).toBe(false)
+    })
+  })
 })
 
 describe("buildSubmitItems", () => {

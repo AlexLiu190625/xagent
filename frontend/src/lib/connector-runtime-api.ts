@@ -116,6 +116,53 @@ export function readConnectorRuntimeReport(value: unknown): ConnectorRuntimeRepo
 // not 200 is still a read failure, it just does not need its own entry here.
 export const READ_FAILURE_STATUSES = [400, 401, 403, 404, 422, 500, 503] as const
 
+/**
+ * How long either call below waits before giving up on a request that is not
+ * answering. Nothing else cancels these two: the dialog's read effect drops a
+ * late answer but does not stop the request behind it, and the save runs to
+ * completion on purpose even when the dialog unmounts mid-flight. Without a
+ * bound here, a request that never answers leaves the dialog unable to save
+ * and -- while the save is the call in flight -- unable to close at all.
+ *
+ * The one comparable constant in this frontend is api-wrapper's
+ * AUTH_REFRESH_TIMEOUT_MS (15s, for the token refresh). These two calls are
+ * the heavier pair -- the write endpoint runs a full validation pass and one
+ * encryption before it answers -- so this is one notch longer rather than a
+ * number carried in from somewhere outside this repository.
+ */
+const CONNECTOR_RUNTIME_REQUEST_TIMEOUT_MS = 20_000
+
+/**
+ * Runs one connector-runtime request under the timeout above, handing it the
+ * signal to pass on to apiRequest.
+ *
+ * Both of apiRequest's paths forward the whole RequestInit to fetch -- direct
+ * with no stored token, through withBearer and fetchWithRetry with one -- so
+ * the signal reaches every attempt without api-wrapper's shared helpers
+ * needing to know this timeout exists, and callers that pass no signal keep
+ * behaving exactly as before.
+ *
+ * Shaped like api-wrapper's own performTokenRefresh: an explicit controller
+ * and timer rather than AbortSignal.timeout, because the timer has to be
+ * cleared on the way out -- a request that answered in time must not leave a
+ * pending abort behind it.
+ *
+ * No distinct failure kind for a timeout: an aborted fetch rejects, and both
+ * callers below already map a rejection to `transport`, which is what a
+ * request that never answered is from the caller's side.
+ */
+async function withConnectorRuntimeTimeout(
+  run: (signal: AbortSignal) => Promise<Response>,
+): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), CONNECTOR_RUNTIME_REQUEST_TIMEOUT_MS)
+  try {
+    return await run(controller.signal)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export type FetchTaskConnectorRuntimeRequirementsResult =
   | { ok: true; report: ConnectorRuntimeReport }
   | { ok: false; kind: "transport" }
@@ -129,16 +176,19 @@ export type FetchTaskConnectorRuntimeRequirementsResult =
  * "read a report that says nothing is missing" -- collapsing the two would
  * make a task whose read genuinely fails look permanently satisfied. The
  * response body's `detail` string is never read: it is the server's English
- * safe message, not something to show a user.
+ * safe message, not something to show a user. A request that does not answer
+ * within CONNECTOR_RUNTIME_REQUEST_TIMEOUT_MS is abandoned and reported the
+ * same way as any other transport failure.
  */
 export async function fetchTaskConnectorRuntimeRequirements(
   taskId: number,
 ): Promise<FetchTaskConnectorRuntimeRequirementsResult> {
   let response: Response
   try {
-    response = await apiRequest(
+    response = await withConnectorRuntimeTimeout(signal => apiRequest(
       `${getApiUrl()}/api/chat/task/${taskId}/connector-runtime-requirements`,
-    )
+      { signal },
+    ))
   } catch {
     return { ok: false, kind: "transport" }
   }
@@ -196,7 +246,10 @@ function readSubmitErrorEnvelope(
  * whose body fails report validation is its own case (a server bug, not a
  * network problem). A 200 response does not by itself mean the connector is
  * now satisfied -- resolveDialogOutcome decides that from the returned
- * report, not from this function's `ok` flag.
+ * report, not from this function's `ok` flag. A request that does not answer
+ * within CONNECTOR_RUNTIME_REQUEST_TIMEOUT_MS is abandoned and reported as a
+ * transport failure; the values it carried may or may not have been written,
+ * which is already true of every other transport failure on this endpoint.
  */
 export async function submitTaskConnectorRuntimeValues(
   taskId: number,
@@ -204,14 +257,15 @@ export async function submitTaskConnectorRuntimeValues(
 ): Promise<SubmitTaskConnectorRuntimeValuesResult> {
   let response: Response
   try {
-    response = await apiRequest(
+    response = await withConnectorRuntimeTimeout(signal => apiRequest(
       `${getApiUrl()}/api/chat/task/${taskId}/connector-runtime-values`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ items }),
+        signal,
       },
-    )
+    ))
   } catch {
     return { ok: false, kind: "transport" }
   }
