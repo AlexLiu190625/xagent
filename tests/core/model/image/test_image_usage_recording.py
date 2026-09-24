@@ -56,6 +56,56 @@ def test_record_image_usage_records_resolution_tier() -> None:
     assert entry["provider_output_tokens"] == 3
 
 
+def test_record_image_usage_preserves_input_modality_split_and_zero() -> None:
+    with TokenContextManager() as manager:
+        record_image_usage(
+            {
+                "usage": {
+                    "input_tokens": 23,
+                    "output_tokens": 5,
+                    "input_tokens_details": {
+                        "text_tokens": 23,
+                        "image_tokens": 0,
+                    },
+                }
+            },
+            model_name="gpt-image-1",
+        )
+        entry = manager.get_usage().details[0]
+
+    assert entry["provider_input_tokens"] == 23
+    assert entry["provider_text_input_tokens"] == 23
+    assert entry["provider_image_input_tokens"] == 0
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        None,
+        {},
+        {"text_tokens": True, "image_tokens": -1},
+        {"text_tokens": 1.5, "image_tokens": "not-a-count"},
+        {"text_tokens": float("inf"), "image_tokens": 10**400},
+    ],
+)
+def test_absent_or_malformed_input_modality_split_is_omitted(details) -> None:
+    with TokenContextManager() as manager:
+        record_image_usage(
+            {
+                "usage": {
+                    "input_tokens": 17,
+                    "input_tokens_details": details,
+                }
+            },
+            model_name="gpt-image-1",
+        )
+        entry = manager.get_usage().details[0]
+
+    assert entry["provider_input_tokens"] == 17
+    assert "provider_text_input_tokens" not in entry
+    assert "provider_image_input_tokens" not in entry
+
+
 class _FakeResponse:
     """Minimal stand-in for an httpx/aiohttp 200 response."""
 
@@ -772,6 +822,58 @@ async def test_openai_edit_records_through_the_real_context(monkeypatch) -> None
     assert entry["call_type"] == "edit_image"
     assert entry["quantity"] == 3.0
     assert entry["model_id"] == "oa-1"
+
+
+@pytest.mark.parametrize(
+    ("method", "text_tokens", "image_tokens"),
+    [("generate", 19, 0), ("edit", 7, 11)],
+)
+@pytest.mark.asyncio
+async def test_openai_paths_record_provider_input_modalities(
+    monkeypatch, method: str, text_tokens: int, image_tokens: int
+) -> None:
+    from xagent.core.model.image.openai import OpenAIImageModel
+
+    class _InputDetails:
+        pass
+
+    class _Usage:
+        input_tokens = text_tokens + image_tokens
+        output_tokens = 3
+        input_tokens_details = _InputDetails()
+
+    _Usage.input_tokens_details.text_tokens = text_tokens
+    _Usage.input_tokens_details.image_tokens = image_tokens
+
+    class _Response:
+        data = [_StubOpenAIImage()]
+        usage = _Usage()
+        id = "modality-response"
+
+    class _Images:
+        async def generate(self, **kwargs):
+            return _Response()
+
+        async def edit(self, **kwargs):
+            return _Response()
+
+    model = OpenAIImageModel(api_key="k", model_id="oa-modalities")
+    monkeypatch.setattr(model, "_ensure_client", lambda: None)
+    monkeypatch.setattr(model, "_client", type("_C", (), {"images": _Images()})())
+    monkeypatch.setattr("builtins.open", lambda path, mode: _CloseableFile())
+
+    with TokenContextManager() as manager:
+        if method == "generate":
+            await model.generate_image(prompt="draw")
+        else:
+            await model.edit_image(image_url="local.png", prompt="edit")
+        usage = manager.get_usage()
+        entry = usage.details[0]
+
+    assert usage.media_calls == 1
+    assert entry["provider_input_tokens"] == text_tokens + image_tokens
+    assert entry["provider_text_input_tokens"] == text_tokens
+    assert entry["provider_image_input_tokens"] == image_tokens
 
 
 class _CloseableFile:
