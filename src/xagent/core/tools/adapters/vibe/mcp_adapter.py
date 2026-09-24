@@ -241,6 +241,7 @@ class EmptyArgsModel(BaseModel):
 logger = logging.getLogger(__name__)
 _RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
 _OAUTH_TOKEN_RESOLVER_REFRESH_KEY = "_oauth_token_resolver_refresh"
+_SLACK_ACTOR_RUNTIME_REFRESH_KEY = "_slack_actor_runtime_refresh"
 # Hard ceiling on how many exception nodes either walk over a failed call
 # visits, so a wide or cyclic __cause__/__context__ graph cannot spin.
 # Two consumers read it: _bounded_exception_nodes (the 401 resolver's
@@ -1822,11 +1823,22 @@ class MCPToolAdapter(AbstractBaseTool):
             user_context = UserContext(current_user_id)
 
             with user_context.set_context():
+                (
+                    invocation_connection,
+                    was_refreshed,
+                ) = await self._invocation_connection()
+                if invocation_connection is None:
+                    return _delegated_authorization_failed_result()
                 try:
                     return await self._execute_mcp_call(
-                        self.connection, tool_args, tool_meta
+                        invocation_connection, tool_args, tool_meta
                     )
                 except (BaseExceptionGroup, Exception) as exc:
+                    # A trusted Slack grant is freshly revalidated before every
+                    # invocation. Never retry its call with the stale connection
+                    # retained only for tool metadata/listing.
+                    if was_refreshed:
+                        raise
                     retry_result = await self._retry_after_authorization_failure(
                         exc, tool_args, tool_meta
                     )
@@ -1878,6 +1890,34 @@ class MCPToolAdapter(AbstractBaseTool):
                 "content": [{"text": "Error executing MCP tool."}],
                 "is_error": True,
             }
+
+    async def _invocation_connection(self) -> tuple[Connection | None, bool]:
+        """Resolve a one-call trusted connection without stale fallback."""
+
+        if not isinstance(self.connection, Mapping):
+            return self.connection, False
+        refresh = self.connection.get(_SLACK_ACTOR_RUNTIME_REFRESH_KEY)
+        if refresh is None:
+            return self.connection, False
+        if not callable(refresh):
+            logger.warning("Slack actor runtime refresh is malformed")
+            return None, True
+        try:
+            refreshed = refresh()
+            if inspect.isawaitable(refreshed):
+                refreshed = await refreshed
+        except Exception as exc:
+            logger.warning(
+                "Slack actor runtime refresh failed (%s)", type(exc).__name__
+            )
+            return None, True
+        if (
+            not isinstance(refreshed, dict)
+            or _SLACK_ACTOR_RUNTIME_REFRESH_KEY in refreshed
+        ):
+            logger.warning("Slack actor runtime refresh returned no valid connection")
+            return None, True
+        return cast(Connection, refreshed), True
 
     async def _execute_mcp_call(
         self,
