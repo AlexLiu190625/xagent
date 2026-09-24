@@ -3735,21 +3735,6 @@ def test_spill_no_absolute_path_anywhere(tmp_path):
     assert absolute not in json.dumps(ctx.to_dict())
 
 
-def test_formatting_a_result_without_an_output_key_is_unchanged():
-    """The pre-spill fallback for a dict with no "output" key rendered the
-    dict itself: ``result.get("output", result)`` returns the same object
-    by identity when the key is absent. The post-spill fallback instead
-    builds a new dict with the reserved key filtered out; with no reserved
-    key present and no spill notice or unavailable count to append, that
-    new dict has the same keys and values in the same order, so its repr
-    -- and therefore the rendered text -- is byte-for-byte the same
-    string."""
-    ctx = ExecutionContext()
-    result = {"content": [{"type": "text", "text": "small"}], "is_error": False}
-    pre_spill_equivalent = f"Tool acme returned: {result.get('output', result)}"
-    assert ctx._format_tool_result("acme", result) == pre_spill_equivalent
-
-
 # Every shape _format_tool_result branches on. The two artifact shapes take
 # different paths inside format_tool_result_for_observation: a list with a
 # renderable entry prints a metadata line built from the remaining keys, and
@@ -3770,7 +3755,10 @@ _OBSERVATION_BODY_SHAPES = {
     },
     "artifacts_empty": {"output": "done", "artifacts": [], "generated_files": []},
     "output_key": {"output": "primary text", "is_error": False},
-    "no_output_key": {"content": [{"type": "text", "text": "small"}]},
+    "no_output_key": {
+        "content": [{"type": "text", "text": "small"}],
+        "is_error": False,
+    },
 }
 
 
