@@ -4,6 +4,7 @@ Output Filter Tool Wrapper
 Wraps any tool with output length filtering capabilities.
 """
 
+import asyncio
 import inspect
 import logging
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
@@ -11,6 +12,14 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 from pydantic import BaseModel
 
 from ....agent.result import normalize_tool_failure_code
+from ...tool_result_spill import (
+    SPILL_RESERVED_RESULT_KEY,
+    SpillRunBudget,
+    SpillTarget,
+    is_classified_tool_failure,
+    spill_oversized_values,
+    strip_reserved_spill_key,
+)
 from ...user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
@@ -34,29 +43,6 @@ _INTERACTION_DISPLAY_KEYS = frozenset(
         "title",
     }
 )
-
-
-def _is_classified_tool_failure(result: Any) -> bool:
-    """Return whether ``result`` is a classified structured tool failure.
-
-    Matches on the ``success is False`` **and** ``is_error is True`` pair that
-    the shared classified-failure contract always carries, rather than on any
-    dict with an ``is_error`` key — a plain MCP error result
-    (``{"content": [...], "is_error": True}``) has no ``success`` key and is
-    left to ordinary recursive filtering.
-
-    Unavailable-MCP results do carry both keys and are matched deliberately:
-    they carry a ``failure_code``, and the restore below is purely additive,
-    so their ``content``/``reason`` fields keep whatever ordinary filtering
-    left them while the classification keys are guaranteed to survive
-    field-count truncation.
-    """
-
-    return (
-        isinstance(result, dict)
-        and result.get("is_error") is True
-        and result.get("success") is False
-    )
 
 
 def _accepts_kwarg(func: Any, name: str) -> bool:
@@ -84,8 +70,15 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
     """
     Wrapper that applies output filtering to any tool.
 
-    This wrapper intercepts the return value from run_json_sync/async
-    and applies length limiting before returning to the caller.
+    This wrapper intercepts the return value from run_json_sync/async.
+    Every result has the engine's reserved spill report key stripped
+    first, regardless of configuration. When this wrapper is given a
+    spill target, it then stores any oversized value in that target
+    before applying length limiting, and on the asynchronous paths that
+    storing step runs in a worker thread. With no target, the reserved-key
+    strip is the only extra step and the observed behavior is the output
+    filter alone. When a spill did happen, the spill report is carried
+    past the length limiting unchanged.
     """
 
     def __init__(
@@ -94,6 +87,8 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         max_chars: int,
         max_fields: int,
         max_recursion: int,
+        spill_target: SpillTarget | None = None,
+        spill_run_budget: SpillRunBudget | None = None,
     ):
         """
         Initialize output filter wrapper.
@@ -103,8 +98,18 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
             max_chars: Maximum output length in characters.
             max_fields: Maximum number of fields/items in dict/list.
             max_recursion: Maximum recursion depth.
+            spill_target: Where oversized values get written instead of
+                truncated. None disables spilling entirely -- when no spill
+                target was given, this wrapper's behavior is identical to
+                before spilling existed.
+            spill_run_budget: Shared file-count budget across every wrapper
+                built in the same tool-set construction. None gives this
+                wrapper its own budget, which only matters when a single
+                wrapper spills more than once.
         """
         self._target = target_tool
+        self._spill_target = spill_target
+        self._spill_run_budget = spill_run_budget or SpillRunBudget()
 
         # Create output filter
         self._filter = OutputValueFilter(max_chars, max_fields, max_recursion)
@@ -158,7 +163,7 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute tool asynchronously with output filtering."""
         result = await self._target.run_json_async(args)
-        return self._filter_result(result)
+        return await self._filter_result_async(result)
 
     async def save_state_json(self) -> Mapping[str, Any]:
         """Save state (delegates to target tool)."""
@@ -235,33 +240,105 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
 
         async def wrapped_func_async(*args: Any, **kwargs: Any) -> Any:
             result = await original_func(*args, **kwargs)
-            return self._filter_result(result)
+            return await self._filter_result_async(result)
 
         return wrapped_func_async
 
     def _filter_result(self, result: Any) -> Any:
+        """Filter one result on this thread; only for callers off the loop.
+
+        The spill step under _spill_only is synchronous and CPU-bound -- the
+        module's entry point can run for seconds on a collection of tiny
+        items -- so a caller on an asyncio event loop must use
+        _filter_result_async instead of this method. The two synchronous
+        callers (run_json_sync and the closure _make_sync_wrapper returns)
+        are already off the loop, and wrapping them in a worker thread would
+        only add a hop.
+        """
+
+        return self._filter_after_spill(self._spill_only(result))
+
+    async def _filter_result_async(self, result: Any) -> Any:
+        """Filter one result without holding the event loop for the spill.
+
+        The whole spill entry point goes to a worker thread, not one inner
+        function of it: every CPU cost on this path -- each measuring pass,
+        the per-item prefix scan that enforces the file cap, and the writes
+        -- sits under that one call, so a boundary drawn anywhere inside it
+        leaves part of the cost on the loop. What stays here is dict work
+        and the pre-existing output filter, which this change does not move.
+
+        The run budget crosses the boundary by reference: to_thread receives
+        the bound method, so self._spill_run_budget is the same object in
+        the worker. It has to be -- it holds a lock and cannot be copied --
+        and its reserve() is what makes two workers landing on one budget
+        safe.
+        """
+
+        if self._spill_target is None:
+            # Nothing to offload. Without a target the spill step is a
+            # dictionary-key strip, and the worker-thread hop would cost
+            # more than the work it moves. This is the same None test
+            # _spill_oversized_values already makes, not a switch: this
+            # path always hops when a spill target was given.
+            return self._filter_result(result)
+        spilled = await asyncio.to_thread(self._spill_only, result)
+        return self._filter_after_spill(spilled)
+
+    def _spill_only(self, result: Any) -> Any:
+        """Strip a forged report key, then spill oversized values.
+
+        The CPU-bound half of filtering, kept in one method so the async
+        path has exactly one thing to offload.
+        """
+
+        return self._spill_oversized_values(strip_reserved_spill_key(result))
+
+    def _filter_after_spill(self, spilled: Any) -> Any:
+        """Filter the tool's own payload; carry the engine's spill report past it.
+
+        A reserved report key present here was written by the spill step:
+        _spill_only strips any tool-supplied one before spilling, on both the
+        sync and the async path. The report is engine metadata, not tool
+        output, so none of the output filter's limits may apply to it -- a
+        per-string cap shorter than a generated relative_path would cut the
+        path, and a field-count cap would drop the key itself, which the
+        spill step appends after every tool key. It is taken off before
+        filtering and put back unchanged; ExecutionContext validates it when
+        registering.
+        """
+        if not isinstance(spilled, dict) or SPILL_RESERVED_RESULT_KEY not in spilled:
+            return self._filter_tool_payload(spilled)
+        records = spilled[SPILL_RESERVED_RESULT_KEY]
+        payload = {k: v for k, v in spilled.items() if k != SPILL_RESERVED_RESULT_KEY}
+        filtered = self._filter_tool_payload(payload)
+        if isinstance(filtered, dict):
+            filtered[SPILL_RESERVED_RESULT_KEY] = records
+        return filtered
+
+    def _filter_tool_payload(self, spilled: Any) -> Any:
         """Filter output without dropping a control or classification envelope."""
 
-        filtered = self._filter.filter(result, self._target.name)
-        if not isinstance(filtered, dict) or not isinstance(result, dict):
+        filtered = self._filter.filter(spilled, self._target.name)
+        if not isinstance(filtered, dict) or not isinstance(spilled, dict):
             return filtered
 
-        if tool_result_waits_for_user(result):
+        if tool_result_waits_for_user(spilled):
             filtered["status"] = WAITING_FOR_USER_STATUS
             for key in ("interaction_id", "message_type"):
-                if key in result:
-                    filtered[key] = result[key]
-            if "message" in result:
+                if key in spilled:
+                    filtered[key] = spilled[key]
+            if "message" in spilled:
                 filtered["message"] = self._filter.filter(
-                    result["message"], self._target.name
+                    spilled["message"], self._target.name
                 )
-            if "interactions" in result:
+            if "interactions" in spilled:
                 filtered["interactions"] = self._filter_interactions(
-                    result["interactions"]
+                    spilled["interactions"]
                 )
             return filtered
 
-        if _is_classified_tool_failure(result):
+        if is_classified_tool_failure(spilled):
             # ``success``/``is_error`` were matched by identity above, so
             # they are literally ``False``/``True``; the two caller-supplied
             # classification values are re-checked before bypassing the
@@ -271,22 +348,80 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
             # mcp_adapter._run_unavailable), and a waiting result is handled
             # above. Exact plain-string match keeps a ``str`` subclass from
             # writing itself back unfiltered.
-            filtered["success"] = result["success"]
-            filtered["is_error"] = result["is_error"]
-            status = result.get("status")
+            filtered["success"] = spilled["success"]
+            filtered["is_error"] = spilled["is_error"]
+            status = spilled.get("status")
             if type(status) is str and status == "error":
                 filtered["status"] = status
             normalized_failure_code = normalize_tool_failure_code(
-                result.get("failure_code")
+                spilled.get("failure_code")
             )
             if normalized_failure_code is not None:
                 filtered["failure_code"] = normalized_failure_code
             for key in ("error", "output", "response"):
-                if key in result:
-                    filtered[key] = self._filter.filter(result[key], self._target.name)
+                if key in spilled:
+                    filtered[key] = self._filter.filter(spilled[key], self._target.name)
             return filtered
 
         return filtered
+
+    def _spill_oversized_values(self, result: Any) -> Any:
+        """Replace oversized values with a file-backed placeholder, if wired.
+
+        When no spill target was given, this is a no-op, returning result
+        unchanged -- the same behavior this wrapper had before spilling
+        existed.
+
+        Any failure of the spill step lands here and degrades to that same
+        no-op, so a tool call that succeeds without this layer keeps
+        succeeding with it.
+        """
+        if self._spill_target is None:
+            return result
+        try:
+            spilled, _records = spill_oversized_values(
+                result,
+                self._spill_target,
+                tool_name=self._target.name,
+                max_recursion=self._filter.max_recursion,
+                run_budget=self._spill_run_budget,
+            )
+        except Exception as exc:
+            # A deliberately broad boundary, and the only one on this path.
+            # Spilling is an optional optimization layered in front of the
+            # output filter, and this is the one place where "it did not
+            # work" has a real, correct answer: hand the untouched result to
+            # the same filter that handled it before spilling existed. That
+            # is a genuine degradation with a log line, not a bug folded
+            # into "resource unavailable" -- the result the caller gets is
+            # identical to the one this wrapper's own output filter would
+            # have produced for the same input with the reserved report key
+            # already removed (that strip runs before this method is ever
+            # called, so it is not part of what this boundary changes).
+            #
+            # It has to be broad because the failures are not ours. The
+            # entry point measures values by serializing them, json.dumps
+            # falls back to str() for a type it has no rule for, and the
+            # module folds only ValueError, TypeError and RecursionError
+            # into "leave this one alone" (see its own docstring). A value
+            # whose __str__ raises RuntimeError, AttributeError or KeyError
+            # therefore reaches here, and without this boundary a tool
+            # result carrying one such object -- which does not fail a call
+            # today -- would start failing it.
+            #
+            # asyncio.CancelledError and KeyboardInterrupt derive from
+            # BaseException, not Exception, so neither is caught here:
+            # cancelling a tool call still cancels it, and Ctrl-C still
+            # interrupts.
+            logger.warning(
+                "Tool %s: storing oversized values failed (%s); falling back "
+                "to ordinary output truncation for this result.",
+                self._target.name,
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return result
+        return spilled
 
     def _filter_interactions(self, interactions: Any) -> Any:
         """Filter display text without changing interaction cardinality."""

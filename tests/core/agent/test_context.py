@@ -18,6 +18,7 @@ from xagent.core.agent.context import (
 )
 from xagent.core.agent.context import enrichment as enrichment_module
 from xagent.core.agent.context import execution as execution_module
+from xagent.core.agent.context.components import SpillRegistryComponent
 from xagent.core.agent.context.enrichment import (
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
@@ -31,6 +32,7 @@ from xagent.core.agent.context.execution import (
     COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
     COMPACT_THRESHOLD_SOURCE_UNKNOWN,
+    SPILL_REGISTRY_MAX_RECORDS,
 )
 from xagent.core.agent.grounding import VALUE_KINDS, step_intent_not_fact_rule
 from xagent.core.agent.language import (
@@ -51,6 +53,14 @@ from xagent.core.context_ref import (
 from xagent.core.model.chat.types import (
     CONTENT_SOURCE_KEY,
     CONTENT_SOURCE_REASONING_FALLBACK,
+)
+from xagent.core.tools.tool_result_spill import (
+    SPILL_PLACEHOLDER_TEXT,
+    SPILL_RESERVED_RESULT_KEY,
+    SPILL_UNAVAILABLE_NOTICE,
+    SpillTarget,
+    spill_dir_for_workspace,
+    spill_oversized_values,
 )
 from xagent.web.user_isolated_memory import current_user_id
 
@@ -3215,3 +3225,524 @@ def test_execution_context_to_dict_is_unaffected_by_later_mutation() -> None:
     context.metadata["nested"]["inner"] = "after"
 
     assert snapshot["metadata"] == before
+
+
+# --- registration gates, registry component, unavailable notice ------------
+
+VALID_RECORD = {
+    "relative_path": "tool-results/acme-stored-result.json",
+    "kind": "array",
+    "item_count": 3,
+    "original_chars": 42,
+    "value_path": "content[0].text",
+    "record_fields": ["id", "name"],
+    "truncated_after_items": None,
+}
+
+
+def _spill_workspace(tmp_path):
+    spill_dir = tmp_path / "output" / "tool-results"
+    spill_dir.mkdir(parents=True)
+    real_file = spill_dir / "acme-stored-result.json"
+    real_file.write_text("[1,2,3]", encoding="utf-8")
+    return spill_dir
+
+
+def test_spill_registry_component_is_registered():
+    from xagent.core.agent.context.components import COMPONENT_LOADERS
+
+    # classmethod access rebinds on every lookup (Foo.m is Foo.m is False in
+    # CPython), so identity is checked on the underlying function instead.
+    assert (
+        COMPONENT_LOADERS["spilled_results"].__func__
+        is SpillRegistryComponent.from_dict.__func__
+    )
+    component = SpillRegistryComponent(records=[dict(VALID_RECORD)])
+    restored = SpillRegistryComponent.from_dict(component.to_dict())
+    assert isinstance(restored, SpillRegistryComponent)
+    assert restored.records == [dict(VALID_RECORD)]
+
+
+def test_the_spill_registry_survives_a_full_checkpoint_round_trip(tmp_path):
+    """The component-level round trip above never goes through
+    ExecutionContext.to_dict()/from_dict() or a JSON encode/decode; this
+    covers the whole path a real checkpoint takes."""
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    tool = ctx.add_tool_result(
+        "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
+    )
+    before_records = ctx.spilled_results
+    before_content = tool.content
+
+    payload = json.loads(json.dumps(ctx.to_dict()))
+    restored = ExecutionContext.from_dict(payload)
+
+    assert isinstance(restored.components["spilled_results"], SpillRegistryComponent)
+    assert restored.spilled_results == before_records
+    assert restored.messages[-1].content == before_content
+
+
+def test_a_checkpoint_without_the_registry_key_loads_with_an_empty_registry():
+    payload = json.loads(json.dumps(ExecutionContext().to_dict()))
+    assert "spilled_results" not in payload["components"]
+    restored = ExecutionContext.from_dict(payload)
+    assert restored.spilled_results == ()
+
+
+def test_spill_registry_not_writable_from_request_context():
+    forged = [{"relative_path": "tool-results/evil.json"}]
+    # Simulates what runner._apply_request_context would have done to
+    # context.metadata -- components is a separate top-level field it never
+    # touches, so a forged metadata entry cannot reach the registry.
+    ctx = ExecutionContext(metadata={"spilled_results": forged})
+    assert ctx.spilled_results == ()
+
+
+def test_registering_a_result_with_no_accepted_records_creates_no_component(
+    tmp_path,
+):
+    """Whether the reported list is empty or every record in it fails a
+    gate, zero records ever reach the registry -- so the checkpoint must
+    come out the same as if the reserved key had never been present."""
+    _spill_workspace(tmp_path)
+    baseline_ctx = ExecutionContext()
+    baseline_ctx.attach_workspace("ws-1", str(tmp_path))
+    baseline_ctx.add_tool_result("acme", {"output": "ok"})
+    baseline_keys = set(baseline_ctx.to_dict()["components"].keys())
+
+    for payload in (
+        {"output": "ok", SPILL_RESERVED_RESULT_KEY: []},
+        {
+            "output": "ok",
+            SPILL_RESERVED_RESULT_KEY: [{**VALID_RECORD, "kind": "records"}],
+        },
+    ):
+        ctx = ExecutionContext()
+        ctx.attach_workspace("ws-1", str(tmp_path))
+        ctx.add_tool_result("acme", payload)
+        assert set(ctx.to_dict()["components"].keys()) == baseline_keys
+        assert "spilled_results" not in ctx.to_dict()["components"]
+
+
+def test_a_malformed_shape_is_rejected_by_the_shape_gate(tmp_path):
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    bad_shapes = [
+        {**VALID_RECORD, "item_count": "3"},
+        {**VALID_RECORD, "kind": "records"},
+        {**VALID_RECORD, "original_chars": -1},
+        {**VALID_RECORD, "record_fields": "id,name"},
+        {**VALID_RECORD, "truncated_after_items": -1},
+        {**VALID_RECORD, "value_path": 5},
+        {"relative_path": "tool-results/acme-stored-result.json"},  # missing keys
+    ]
+    for shape in bad_shapes:
+        tool = ctx.add_tool_result(
+            "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [shape]}
+        )
+        assert ctx.spilled_results == ()
+        assert SPILL_RESERVED_RESULT_KEY not in str(tool.content)
+
+
+def test_a_non_canonical_path_is_rejected_by_the_shape_gate(tmp_path):
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    bad_paths = [
+        "../tool-results/acme-stored-result.json",
+        "/etc/passwd",
+        "tool-results/sub/x.json",
+        "tool-results/x.jsonl",
+        "output/tool-results/acme-stored-result.json",  # not canonical
+    ]
+    for path in bad_paths:
+        record = {**VALID_RECORD, "relative_path": path}
+        ctx.add_tool_result(
+            "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [record]}
+        )
+        assert ctx.spilled_results == ()
+
+
+def test_a_missing_file_is_rejected_by_the_existence_gate_and_counted_unavailable(
+    tmp_path,
+):
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    record = {**VALID_RECORD, "relative_path": "tool-results/missing-result.json"}
+    tool = ctx.add_tool_result(
+        "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [record]}
+    )
+    assert ctx.spilled_results == ()
+    assert tool.content.endswith(SPILL_UNAVAILABLE_NOTICE)
+    assert "tool-results/" not in tool.content
+
+
+def test_the_existence_gate_fails_closed_without_a_workspace():
+    ctx = ExecutionContext()  # no attach_workspace call
+    tool = ctx.add_tool_result(
+        "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
+    )
+    assert ctx.spilled_results == ()
+    assert tool.content.endswith(SPILL_UNAVAILABLE_NOTICE)
+
+
+def test_a_shape_gate_failure_does_not_add_the_unavailable_notice(tmp_path):
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    malformed = {**VALID_RECORD, "kind": "records"}
+    tool = ctx.add_tool_result(
+        "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [malformed]}
+    )
+    assert tool.content == "Tool acme returned: ok"
+
+
+def test_the_capacity_gate_stops_registering_but_keeps_returning_for_render(
+    tmp_path,
+):
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    ctx.set_component(
+        "spilled_results",
+        SpillRegistryComponent(
+            records=[
+                {
+                    **VALID_RECORD,
+                    "relative_path": f"tool-results/filler{i}-result.json",
+                }
+                for i in range(SPILL_REGISTRY_MAX_RECORDS)
+            ]
+        ),
+    )
+    assert len(ctx.spilled_results) == SPILL_REGISTRY_MAX_RECORDS
+    tool = ctx.add_tool_result(
+        "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
+    )
+    # Not registered: the registry stays at the cap.
+    assert len(ctx.spilled_results) == SPILL_REGISTRY_MAX_RECORDS
+    assert dict(VALID_RECORD) not in ctx.spilled_results
+    # But this message's own metadata still carries the record it produced.
+    assert tool.metadata["spilled_results"] == [dict(VALID_RECORD)]
+
+
+def test_duplicate_relative_path_is_not_re_registered_but_still_returned(tmp_path):
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    ctx.add_tool_result(
+        "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
+    )
+    assert len(ctx.spilled_results) == 1
+    tool = ctx.add_tool_result(
+        "acme", {"output": "ok2", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
+    )
+    assert len(ctx.spilled_results) == 1  # not duplicated
+    assert tool.metadata["spilled_results"] == [dict(VALID_RECORD)]
+
+
+def test_the_existence_gate_uses_only_the_path_string_no_taskworkspace(
+    tmp_path, mocker
+):
+    from xagent.core.workspace import TaskWorkspace
+
+    missing_dir = tmp_path / "does-not-exist"
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(missing_dir))
+    ctor_spy = mocker.spy(TaskWorkspace, "__init__")
+    ctx.add_tool_result(
+        "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
+    )
+    assert not missing_dir.exists()
+    ctor_spy.assert_not_called()
+
+
+def test_the_execution_context_takes_its_spill_directory_from_the_module(tmp_path):
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    assert ctx._spill_dir() == spill_dir_for_workspace(str(tmp_path))
+
+
+def test_spill_dir_degrades_to_none_for_a_relative_workspace_path(caplog):
+    """workspace_path can arrive from a deserialized checkpoint with no
+    validation of its own; a relative value must not reach
+    spill_dir_for_workspace, which raises for it. _spill_dir degrades to
+    "no spill directory" instead, the same reading a missing workspace_path
+    already gets, with a warning so the bad value is not silently
+    swallowed."""
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", "relative/workspace/path")
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.context.execution"):
+        assert ctx._spill_dir() is None
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.core.agent.context.execution"
+    ]
+    assert len(records) == 1
+    assert "relative/workspace/path" in records[0].getMessage()
+
+
+def test_two_shape_gate_failures_do_not_add_the_unavailable_notice(tmp_path):
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    tool = ctx.add_tool_result(
+        "acme",
+        {
+            "output": "ok",
+            SPILL_RESERVED_RESULT_KEY: [
+                {**VALID_RECORD, "kind": "records"},  # fails the shape gate
+                {
+                    **VALID_RECORD,
+                    "relative_path": "../x.json",
+                },  # non-canonical path, also the shape gate
+            ],
+        },
+    )
+    assert SPILL_UNAVAILABLE_NOTICE not in tool.content
+
+
+def test_two_existence_gate_failures_add_the_unavailable_notice_only_once(tmp_path):
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    tool = ctx.add_tool_result(
+        "acme",
+        {
+            "output": "ok",
+            SPILL_RESERVED_RESULT_KEY: [
+                {
+                    **VALID_RECORD,
+                    "relative_path": "tool-results/missing-result.json",
+                },
+                {
+                    **VALID_RECORD,
+                    "relative_path": "tool-results/missing2-result.json",
+                },
+            ],
+        },
+    )
+    assert tool.content.count(SPILL_UNAVAILABLE_NOTICE) == 1
+
+
+# --- observation notice wiring + no-path-in-raw_result ---------------------
+
+
+def test_spill_notice_visible_alongside_output_key(tmp_path):
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    tool = ctx.add_tool_result(
+        "acme",
+        {"output": "primary text", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]},
+    )
+    assert "Tool acme returned: primary text" in tool.content
+    assert VALID_RECORD["relative_path"] in tool.content
+
+
+def test_spill_notice_visible_for_second_tier_replacement(tmp_path):
+    """The merged second tier keeps every key -- including a non-envelope
+    one like is_error -- and only replaces values whose serialized form
+    would run longer than the placeholder; it never synthesizes an "output"
+    key the way the pre-merge second tier did."""
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    whole_result_record = {**VALID_RECORD, "value_path": "(whole result)"}
+    tool = ctx.add_tool_result(
+        "acme",
+        {
+            "content": SPILL_PLACEHOLDER_TEXT,
+            "structured_content": SPILL_PLACEHOLDER_TEXT,
+            "is_error": False,
+            SPILL_RESERVED_RESULT_KEY: [whole_result_record],
+        },
+    )
+    assert "(whole result)" in tool.content
+    first_line = tool.content.splitlines()[0]
+    assert "is_error" in first_line
+    assert "tool-results/" not in first_line
+
+
+def test_spill_report_survives_public_sanitization():
+    ctx = ExecutionContext()
+    sanitized = ctx._sanitize_tool_result_for_context(
+        "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
+    )
+    assert set(sanitized[SPILL_RESERVED_RESULT_KEY][0].keys()) == set(
+        VALID_RECORD.keys()
+    )
+
+
+def test_file_ref_shaped_root_is_never_spilled(tmp_path):
+    """A root that itself looks like a file reference (file_id + filename +
+    one of file_path/relative_path/mime_type -- the shape write_file's own
+    result already has) is left to the ordinary filter untouched by either
+    spill tier. The public-context sanitizer already reduces this shape to
+    its safe-key whitelist before the model ever sees it; a report attached
+    here would just be dropped by that same whitelist on the way out, an
+    orphaned file with nothing pointing at it. Not spilling this shape at
+    all keeps every downstream step -- including the sanitizer -- identical
+    to what it does today, without touching the sanitizer itself.
+    """
+    spill_dir = tmp_path / "output" / "tool-results"
+    result = {
+        "file_id": "abc",
+        "filename": "f.txt",
+        "relative_path": "output/f.txt",
+        "notes": "n" * 5000,  # would exceed max_chars on its own
+    }
+    target = SpillTarget(spill_dir=str(spill_dir), max_chars=100)
+
+    spilled, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20
+    )
+
+    assert records == []
+    assert spilled == result
+    assert not spill_dir.exists()
+
+    ctx = ExecutionContext()
+    sanitized_after = ctx._sanitize_tool_result_for_context("acme", spilled)
+    sanitized_baseline = ctx._sanitize_tool_result_for_context("acme", result)
+    assert sanitized_after == sanitized_baseline
+
+
+def test_spill_placeholder_and_first_line_carry_no_path_first_tier(tmp_path):
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    tool = ctx.add_tool_result(
+        "acme",
+        {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]},
+    )
+    first_line = tool.content.splitlines()[0]
+    assert "tool-results/" not in first_line
+    # The path lives only in the notice appended after the first line.
+    assert "tool-results/" in tool.content
+
+    # raw_result keeps the reserved key (replay needs it); the only place a
+    # path may appear there is inside that key's own records.
+    raw_result = tool.metadata["raw_result"]
+    assert (
+        raw_result[SPILL_RESERVED_RESULT_KEY][0]["relative_path"]
+        == (VALID_RECORD["relative_path"])
+    )
+    without_reserved_key = {
+        key: value
+        for key, value in raw_result.items()
+        if key != SPILL_RESERVED_RESULT_KEY
+    }
+    assert "tool-results/" not in json.dumps(without_reserved_key)
+
+
+def test_spill_first_line_has_no_path_when_result_has_no_output_key(tmp_path):
+    """MCP-shaped results commonly have no top-level "output" key, which
+    means _format_tool_result's dict-repr fallback -- not the placeholder --
+    is what could leak the reserved key's path into the first line."""
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    tool = ctx.add_tool_result(
+        "acme",
+        {
+            "content": [{"type": "text", "text": "small"}],
+            "is_error": False,
+            SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)],
+        },
+    )
+    first_line = tool.content.splitlines()[0]
+    assert "tool-results/" not in first_line
+    assert SPILL_RESERVED_RESULT_KEY not in first_line
+
+
+def test_spill_unavailable_notice_carries_no_path(tmp_path):
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    missing = {
+        **VALID_RECORD,
+        "relative_path": "tool-results/missing-result.json",
+    }
+    tool = ctx.add_tool_result(
+        "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [missing]}
+    )
+    first_line = tool.content.splitlines()[0]
+    assert "tool-results/" not in first_line
+    assert SPILL_UNAVAILABLE_NOTICE in tool.content
+
+
+def test_spill_replay_registers_when_the_file_is_still_there(tmp_path):
+    """Replaying raw_result through a fresh context (what runner.py does on
+    task resume) must re-validate and re-register the record, not just
+    carry the bytes forward inertly."""
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    first = ctx.add_tool_result(
+        "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
+    )
+
+    replay_ctx = ExecutionContext()
+    replay_ctx.attach_workspace("ws-1", str(tmp_path))
+    replayed = replay_ctx.add_tool_result("acme", first.metadata["raw_result"])
+
+    assert len(replay_ctx.spilled_results) == 1
+    assert "tool-results/" in replayed.content
+
+
+def test_spill_replay_reports_unavailable_when_the_file_is_gone(tmp_path):
+    """After the workspace that held the file is gone (e.g. an
+    external-credential task's per-turn rmtree), replaying the same
+    raw_result must fail the existence gate and say so without naming a
+    path."""
+    spill_dir = _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    first = ctx.add_tool_result(
+        "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
+    )
+
+    for entry in spill_dir.iterdir():
+        entry.unlink()
+
+    replay_ctx = ExecutionContext()
+    replay_ctx.attach_workspace("ws-1", str(tmp_path))
+    replayed = replay_ctx.add_tool_result("acme", first.metadata["raw_result"])
+
+    assert replay_ctx.spilled_results == ()
+    assert SPILL_UNAVAILABLE_NOTICE in replayed.content
+    assert "tool-results/" not in replayed.content.splitlines()[0]
+
+
+def test_spill_no_absolute_path_anywhere(tmp_path):
+    spill_dir = _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    tool = ctx.add_tool_result(
+        "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
+    )
+    absolute = str(spill_dir)
+    assert absolute not in tool.content
+    assert absolute not in json.dumps(tool.metadata["raw_result"])
+    assert absolute not in json.dumps(ctx.to_dict())
+
+
+def test_formatting_a_result_without_an_output_key_is_unchanged():
+    """The pre-spill fallback for a dict with no "output" key rendered the
+    dict itself: ``result.get("output", result)`` returns the same object
+    by identity when the key is absent. The post-spill fallback instead
+    builds a new dict with the reserved key filtered out; with no reserved
+    key present and no spill notice or unavailable count to append, that
+    new dict has the same keys and values in the same order, so its repr
+    -- and therefore the rendered text -- is byte-for-byte the same
+    string."""
+    ctx = ExecutionContext()
+    result = {"content": [{"type": "text", "text": "small"}], "is_error": False}
+    pre_spill_equivalent = f"Tool acme returned: {result.get('output', result)}"
+    assert ctx._format_tool_result("acme", result) == pre_spill_equivalent

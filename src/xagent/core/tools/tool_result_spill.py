@@ -1,12 +1,25 @@
 """Spill oversized tool results to a workspace file instead of truncating them.
 
-This module is the single owner of the tool-result-spill mechanism: the two
-path primitives written to be shared by the writer, an engine registration
-gate and the read tool (``normalize_spilled_relative_path`` /
-``resolve_spilled_under``), plus the constants that describe the on-disk and
-in-context contract. Later stages in this same module add the walk/write path
-and the read-side helpers; nothing here depends on them. The engine side is
-not wired up yet: outside this module and its tests, nothing calls in.
+This module is the single owner of the tool-result-spill mechanism: the path
+primitives shared by the writer, the engine registration gate and the read
+side (``normalize_spilled_relative_path`` / ``resolve_spilled_under``), the
+walk-and-write entry point (``spill_oversized_values``), the report-record
+shape gate and notice renderer, and the constants that describe the on-disk
+and in-context contract.
+
+Spilling is wired but not enabled. OutputFilteredToolWrapper
+(adapters/vibe/output_filter_wrapper.py) strips a tool-supplied report key
+from every result and, only when it is given a SpillTarget, spills oversized
+values before ordinary output filtering. ExecutionContext
+(core/agent/context/execution.py) validates the report records a result
+carries, registers the accepted ones and renders their notice. The
+production tool factory supplies no SpillTarget, so in a deployed tool set
+the wrapper only strips the reserved key and no spill file is written.
+
+Read-back is not wired. The read-side helpers here
+(``spill_read_unavailable`` and ``_spill_slice``) have no caller
+outside this module and its tests, and no read_tool_result tool is
+registered.
 """
 
 from __future__ import annotations
@@ -212,14 +225,9 @@ def is_classified_tool_failure(result: Any) -> bool:
     left them while the classification keys are guaranteed to survive
     field-count truncation.
 
-    adapters/vibe/output_filter_wrapper.py holds a private copy of this same
-    test. The two should become one, and this is the copy to keep: that
-    module is the caller this one is written to run in front of, so an
-    import the other way round would point a module at its own consumer --
-    and it would become a real import cycle the moment the wrapper imports
-    this module, which is what wiring the spill path in means. Folding the
-    two together therefore belongs to the change that edits the wrapper,
-    not here.
+    This is the only definition. adapters/vibe/output_filter_wrapper.py
+    imports it; an import in the other direction would point this module at
+    its own consumer and would be a cycle.
     """
     return (
         isinstance(result, dict)
@@ -336,14 +344,12 @@ def resolve_spilled_under(
 def spill_dir_for_workspace(workspace_dir: str | Path) -> str:
     """This workspace's spill directory, as the plain string SpillTarget holds.
 
-    The one place the layout is built. Nothing in this repository calls it
-    yet; it is written for the three callers that will need the same
-    directory from three different starting points -- the tool factory
-    holds a workspace object, the execution context holds only a workspace
-    path string, and the read tool holds a workspace object again -- each
-    of which would otherwise join the parts itself. A directory that three
-    callers spell separately is a directory that moves in two of the three
-    places.
+    The one place the layout is built. ExecutionContext._spill_dir is this
+    repository's first caller, holding only a workspace path string; the
+    tool factory and the read tool still need the same directory from a
+    workspace object instead, each of which would otherwise join the parts
+    itself. A directory that three callers spell separately is a directory
+    that moves in two of the three places.
 
     Takes the workspace root rather than its output directory so the whole
     relative layout lives here, and returns a str rather than a Path
@@ -1293,8 +1299,10 @@ def spill_oversized_values(
     rule for, and _serialized_length folds only ValueError, TypeError and
     RecursionError into "leave this to the output filter". A value whose
     own __str__ raises anything else -- RuntimeError, AttributeError,
-    KeyError -- still propagates out of this call, exactly as it did
-    before.
+    KeyError -- still propagates out of this call. This module makes no
+    attempt to catch it; the wrapper that calls this function in front of a
+    real tool is responsible for degrading to plain output filtering when
+    that happens, and does so at its own call site, not here.
 
     `run_budget`, when omitted, defaults to a fresh one-call budget: callers
     that need the 64-file cap to hold across an entire run (every tool
@@ -1437,10 +1445,12 @@ def spill_record_shape_is_valid(record: Any) -> bool:
     which escapes a line break rather than emitting it, so this gate leaves
     them to the type checks below.
 
-    No caller in this repository uses it yet. It is written for two: an
-    engine registration gate that decides which records to persist, and
-    render_spill_notice, which must not interpolate an unvalidated
-    relative_path, item_count or original_chars into text the model reads.
+    ExecutionContext._register_spilled_results is this repository's
+    caller: it uses this boolean form as the engine registration gate that
+    decides which records to persist. render_spill_notice does not call
+    this function -- it goes straight to _spill_record_shape_failure below,
+    because it needs the broken-rule string for its log line, not a plain
+    yes/no.
 
     The rules themselves live in _spill_record_shape_failure, which answers
     which rule was broken rather than only that one was, so a caller that
