@@ -1421,7 +1421,7 @@ def test_file_compensation_restore_handles_recreated_file_without_existing(
 
     def _fake_get_session_local():
         session = MagicMock()
-        session.query().filter().first.return_value = None
+        session().query().filter().first.return_value = None
         return session
 
     monkeypatch.setattr("xagent.web.api.kb.get_session_local", _fake_get_session_local)
@@ -1431,6 +1431,8 @@ def test_file_compensation_restore_handles_recreated_file_without_existing(
         existing_path=existing_file,
         backup_path=None,
         record_snapshot={"storage_key": "", "mime_type": "text/markdown"},
+        previous_version=MagicMock(),
+        expected_current_version=MagicMock(),
         had_existing_file=False,
     )
     compensation()
