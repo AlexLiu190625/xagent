@@ -134,7 +134,6 @@ def _cleanup_failed_job_collection_metadata(
     *,
     context: str,
     successful_documents: int = 0,
-    side_effects_may_remain: bool = False,
 ) -> None:
     user = _get_job_user(
         db,
@@ -153,7 +152,6 @@ def _cleanup_failed_job_collection_metadata(
             user=user,
             context=context,
             successful_documents=successful_documents,
-            side_effects_may_remain=side_effects_may_remain,
         )
     )
 

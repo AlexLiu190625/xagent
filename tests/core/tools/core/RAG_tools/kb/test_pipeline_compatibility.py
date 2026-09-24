@@ -315,6 +315,7 @@ def test_process_document_records_failed_ingest_operation_outcome(
 def test_run_document_ingestion_preserves_legacy_non_result_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from xagent.core.tools.core.RAG_tools.kb import pipeline_compatibility
     from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
 
     expected_result = object()
@@ -338,7 +339,9 @@ def test_run_document_ingestion_preserves_legacy_non_result_boundary(
         facade, "_record_document_ingestion_side_effects", fail_if_called
     )
     monkeypatch.setattr(facade, "ensure_collection_backend_binding", fail_if_called)
-    monkeypatch.setattr(facade, "_finish_document_ingestion_outcome", fail_if_called)
+    monkeypatch.setattr(
+        pipeline_compatibility, "finish_ingestion_outcome", fail_if_called
+    )
 
     result = facade.run_document_ingestion("demo", "/tmp/doc.md")
 

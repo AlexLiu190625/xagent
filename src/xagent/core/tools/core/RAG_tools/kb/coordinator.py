@@ -2136,7 +2136,7 @@ class KBCoordinator:
     async def rollback_failed_ingestion(
         self, request: RollbackFailedIngestionRequest
     ) -> RollbackFailedIngestionResult:
-        """Async twin (coordinator convention; first awaited in #795)."""
+        """Async twin of ``rollback_failed_ingestion_sync``, run in a worker thread."""
         return await asyncio.to_thread(self.rollback_failed_ingestion_sync, request)
 
     async def rollback_failed_upload_ingestion(

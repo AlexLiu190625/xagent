@@ -130,9 +130,6 @@ from ..services.kb_file_service import (
     capture_uploaded_file_refresh_snapshot as _capture_uploaded_file_refresh_snapshot,
 )
 from ..services.kb_file_service import (
-    compensate_new_uploaded_file as _compensate_new_uploaded_file,
-)
-from ..services.kb_file_service import (
     delete_uploaded_file_if_orphaned as _delete_uploaded_file_if_orphaned,
 )
 from ..services.kb_file_service import (
@@ -2979,36 +2976,6 @@ def _recreate_missing_existing_file(
             "file_id": file_record_id,
         },
     )
-
-
-def _compensate_new_web_ingest_files(
-    db: Session,
-    *,
-    file_ids: set[str],
-    user_id: int,
-) -> tuple[bool, list[str]]:
-    cleanup_incomplete = False
-    cleanup_errors: list[str] = []
-    for file_id in sorted(file_ids):
-        cleanup_result = _compensate_new_uploaded_file(
-            db,
-            file_id=file_id,
-            user_id=user_id,
-        )
-        if cleanup_result.side_effects_may_remain:
-            cleanup_incomplete = True
-            cleanup_errors.extend(cleanup_result.errors)
-            db.rollback()
-            continue
-        try:
-            db.commit()
-        except Exception as commit_exc:  # noqa: BLE001
-            cleanup_incomplete = True
-            cleanup_errors.append(
-                f"Database commit failed for file {file_id}: {commit_exc}"
-            )
-            db.rollback()
-    return cleanup_incomplete, cleanup_errors
 
 
 class _WebFileLock:

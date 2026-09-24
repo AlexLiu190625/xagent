@@ -36,7 +36,6 @@ from xagent.web.api.kb import (
     _WEB_FILE_LOCKS,
     _atomic_replace_file,
     _build_ingest_backup_path,
-    _compensate_new_web_ingest_files,
     _copy_upload_file_to_path,
     _create_file_compensation_restore,
     _create_web_uploaded_file_record,
@@ -2224,53 +2223,6 @@ class TestWebFileRefreshHelpers:
         processed_urls["hash-key"] = str(file_record.file_id)
 
         assert processed_urls["hash-key"] == "new-file-id"
-
-    def test_compensate_new_web_ingest_files_continues_after_commit_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        compensated_file_ids: list[str] = []
-
-        class _CleanupResult:
-            side_effects_may_remain = False
-            errors: tuple[str, ...] = ()
-
-        def fake_compensate(_db, *, file_id: str, user_id: int):
-            assert user_id == 1
-            compensated_file_ids.append(file_id)
-            return _CleanupResult()
-
-        class _DB:
-            def __init__(self) -> None:
-                self.commits = 0
-                self.rollbacks = 0
-
-            def commit(self) -> None:
-                self.commits += 1
-                if self.commits == 1:
-                    raise RuntimeError("commit unavailable")
-
-            def rollback(self) -> None:
-                self.rollbacks += 1
-
-        monkeypatch.setattr(
-            "xagent.web.api.kb._compensate_new_uploaded_file",
-            fake_compensate,
-        )
-        db = _DB()
-
-        cleanup_incomplete, cleanup_errors = _compensate_new_web_ingest_files(
-            db,  # type: ignore[arg-type]
-            file_ids={"file-b", "file-a"},
-            user_id=1,
-        )
-
-        assert compensated_file_ids == ["file-a", "file-b"]
-        assert db.commits == 2
-        assert db.rollbacks == 1
-        assert cleanup_incomplete is True
-        assert cleanup_errors == [
-            "Database commit failed for file file-a: commit unavailable"
-        ]
 
     def test_mark_uploaded_file_for_reindex_clears_ingestion_runs(
         self, monkeypatch: pytest.MonkeyPatch

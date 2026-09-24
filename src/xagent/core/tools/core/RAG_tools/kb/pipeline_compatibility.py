@@ -512,16 +512,6 @@ class KBPipelineCompatibilityFacade:
         return step_metadata(completed_steps, name)
 
     @staticmethod
-    def _finish_document_ingestion_outcome(
-        operation: KBOperation | None,
-        result: IngestionResult,
-    ) -> None:
-        # Thin delegator kept for an existing test's monkeypatch target (#515).
-        finish_ingestion_outcome(
-            operation, status=result.status, message=result.message
-        )
-
-    @staticmethod
     def _record_web_ingestion_outcome(
         operation: KBOperation | None,
         result: WebIngestionResult,
