@@ -450,18 +450,6 @@ class KBPipelineCompatibilityFacade:
         )
 
     @staticmethod
-    def compensate_web_page_file_side_effect(
-        operation: KBOperation | None,
-    ) -> tuple[BaseException, ...]:
-        """Execute registered web-file compensation callbacks for a page."""
-        if operation is None or operation.outcome is not None:
-            return ()
-        return operation.execute_compensations(
-            step_names={"cleanup_web_page_persistence"},
-            planes={SideEffectPlane.FILE},
-        )
-
-    @staticmethod
     def finish_web_page_operation(
         operation: KBOperation | None,
         *,

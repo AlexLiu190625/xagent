@@ -2389,59 +2389,6 @@ class TestWebFileRefreshHelpers:
         mock_restore_runs.assert_called_once_with(run_snapshot)
 
 
-def test_reuse_handler_output_spares_the_persistent_file(tmp_path) -> None:
-    """The guard must hold for the real handler's output, not a hand-built dict.
-
-    `_existing_web_file_result_with_rollback` returns the one shape that carries
-    no `file_compensation`, so it is the shape that decides whether the legacy
-    cleanup unlinks a reused file. Shape drift here is exactly what a literal
-    dict in the pipeline-level test cannot catch.
-    """
-    from xagent.core.tools.core.RAG_tools.pipelines.web_ingestion import (
-        _run_legacy_persistent_file_compensation,
-    )
-    from xagent.web.api.kb import _existing_web_file_result_with_rollback
-
-    persistent = tmp_path / "page.md"
-    persistent.write_text("keep me", encoding="utf-8")
-
-    with (
-        patch(
-            "xagent.web.api.kb._snapshot_ingestion_runs_for_uploaded_file",
-            return_value=object(),
-        ),
-        patch(
-            "xagent.web.api.kb._snapshot_rag_documents_for_uploaded_file",
-            return_value=object(),
-        ),
-    ):
-        file_info = _existing_web_file_result_with_rollback(
-            existing_record=MagicMock(file_id="file-1"),
-            file_path=persistent,
-            collection_name="col",
-            user_id=1,
-            is_admin=False,
-            url="https://example.com/page",
-            context="test",
-        )
-
-    facade = MagicMock()
-    facade.compensate_web_page_file_side_effect.return_value = []
-    _run_legacy_persistent_file_compensation(
-        pipeline_facade=facade,
-        page_operation=None,
-        collection="col",
-        url="https://example.com/page",
-        copied_persistent_file=persistent,
-        file_info=file_info,
-        warnings=[],
-    )
-
-    # The facade is a mock, so the file is never actually unlinked here; the
-    # registration call is what says whether the guard let the cleanup through.
-    facade.record_web_page_file_side_effect.assert_not_called()
-
-
 def test_web_rollback_skips_status_clear_after_deleting_registered_doc() -> None:
     from xagent.core.tools.core.RAG_tools.core.schemas import (
         IngestionResult,
