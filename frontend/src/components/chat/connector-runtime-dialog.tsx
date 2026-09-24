@@ -502,7 +502,8 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // Bookkeeping only: nothing renders from it, and only doResend reads or
   // writes it, folding it into the disposition every failed outcome carries,
   // so the panel and each toast that stands in for it receive the merged
-  // verdict without asking for it. Scoped to this instance, which is mounted
+  // verdict without asking for it, and into whether an attempt that never
+  // left the client may drop the id it carried. Scoped to this instance, which is mounted
   // per task, so it goes with the dialog and never reaches another task.
   // Transitional: it belongs with the panel's own state and is folded into
   // the send-failed phase's data once that state is restructured.
@@ -856,8 +857,10 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // path there is no closed-set status to report here, and the rejection
       // value is arbitrary, so logging it could carry message content.
       console.warn("[connector-runtime] resend failed")
-      // A definite not_sent/rejected disposition, or the server explicitly
-      // demanding a new id, means this id is spent -- the next retry mints
+      const disposition = readSendDisposition(error)
+      const earlierVerdict = deliveryVerdictRef.current.get(snapshot.clientMessageId) ?? null
+      // The server refusing this id outright (`rejected`), or explicitly
+      // demanding a new one, means this id is spent -- the next retry mints
       // fresh. An outcome_unknown one leaves open that the server already
       // durably accepted this attempt, so the next retry reuses this same id
       // rather than risking the same turn running twice under a second one.
@@ -866,21 +869,24 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // client: keeping an id is free, while minting one on a wrong guess is
       // not, so the cheap side is taken here and only the user-facing text
       // splits the two cases apart.
-      const disposition = readSendDisposition(error)
+      //
+      // `not_sent` is thrown by the websocket layer before anything reaches
+      // the server, so it only speaks for this attempt: it says nothing about
+      // an earlier attempt under the same id whose outcome was unknown. Once
+      // this snapshot's verdict is already "may have landed", the id is kept
+      // so the next retry can still be coalesced with that earlier attempt;
+      // only a snapshot with no such attempt behind it mints fresh here.
       const mustMintNewId = (
         readRetryWithNewId(error)
-        || disposition === "not_sent"
         || disposition === "rejected"
+        || (disposition === "not_sent" && !sendOutcomeMayHaveLanded(earlierVerdict))
       )
       resendMessageIdRef.current = mustMintNewId ? null : { forSnapshotId: snapshot.clientMessageId, clientMessageId }
-      // The id decision above reads this attempt's own disposition; what
-      // travels out is the message's verdict across every attempt so far
-      // (see deliveryVerdictRef), so no caller can word a refusal of this
-      // attempt as "not sent" after an earlier attempt's outcome was unknown.
-      const verdict = mergeSendFailureDisposition(
-        deliveryVerdictRef.current.get(snapshot.clientMessageId) ?? null,
-        disposition,
-      )
+      // What travels out is the message's verdict across every attempt so
+      // far (see deliveryVerdictRef), not this attempt's own disposition, so
+      // no caller can word a refusal of this attempt as "not sent" after an
+      // earlier attempt's outcome was unknown.
+      const verdict = mergeSendFailureDisposition(earlierVerdict, disposition)
       deliveryVerdictRef.current.set(snapshot.clientMessageId, verdict)
       // The verdict travels out with the outcome rather than being turned
       // into text here: the caller decides whether this dialog is still on
@@ -1123,13 +1129,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       return
     }
     // What the panel says right now, captured before the await below: a
-    // failed attempt is reported against the wording the panel ends up
-    // carrying, not against this attempt's own outcome, and by the time
-    // this settles the state behind that wording may already have moved.
+    // superseded attempt announces itself only when it moves that wording,
+    // and by the time it settles the state behind the wording may already
+    // have moved.
     const dispositionBefore = sendFailure.disposition
     // Which snapshot that wording is about, captured alongside it: a
-    // superseded attempt below only merges into the panel that raised it,
-    // never into a panel a same-task re-read has since replaced.
+    // superseded attempt below only writes into the panel that raised it,
+    // and tells a retarget that kept this snapshot (the panel is still up)
+    // from one that replaced it (the panel is gone).
     const snapshotIdBefore = sendFailure.snapshotId
     // The report can change under a panel that stays up: this panel is about
     // a send that failed, not about the report, so a same-task re-read
@@ -1157,16 +1164,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // retry that failed leaves things exactly as the user last saw them --
       // saved, not sent -- with the panel that said so already gone, so
       // without this nothing would tell them the retry they pressed changed
-      // nothing. Worded off the panel's own wording rather than this
-      // attempt's, so a refusal cannot un-say an earlier unknown outcome.
-      // Counting every exit of this handler in one place is still tracked in
-      // xorbitsai/xagent#2478.
-      if (resendOutcome.kind !== "sent") {
-        toast(t(sendFailureTextKey(mergeSendFailureDisposition(
-          dispositionBefore,
-          resendOutcome.kind === "failed" ? resendOutcome.disposition : null,
-        ))))
-      }
+      // nothing. Worded off the verdict doResend returns, which already
+      // folds in every earlier attempt for this message (see
+      // deliveryVerdictRef), so a refusal cannot un-say an earlier unknown
+      // outcome. Counting every exit of this handler in one place is still
+      // tracked in xorbitsai/xagent#2478.
+      if (resendOutcome.kind !== "sent") toast(t(resendFailureTextKey(resendOutcome)))
       return
     }
     if (requestRef.current.seq !== seqAtStart) {
@@ -1180,24 +1183,31 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // no way to tell that clicking a resend button there would send this
       // same turn a second time.
       //
-      // A resend that did not go out leaves the panel itself behind --
-      // unlike the unmounted branch above, this dialog instance is still
-      // alive and may still be showing the very panel this attempt was
-      // about. That panel's wording only ever moves toward uncertainty
-      // (mergeSendFailureDisposition), so it is updated the same way a
-      // same-request failure updates it, guarded to the snapshot this
-      // attempt was actually for. A toast fires only the moment the merged
-      // wording crosses from "definitely not sent" to "may have landed" --
-      // that is the one fact this attempt adds that the user could not
-      // already tell from the panel; every other outcome leaves the panel
-      // saying what it already said, so nothing new is announced.
+      // A resend that did not go out is reported according to whether the
+      // panel this attempt was about is still up. A retarget that replaced
+      // the snapshot has already taken the panel down (the render-time reset
+      // above), so -- as in the unmounted branch -- a toast is the only
+      // report left, and every failed outcome gets one. A retarget that
+      // kept the snapshot leaves the panel up with its button re-enabled:
+      // its wording takes doResend's verdict, which only ever moves toward
+      // uncertainty (see deliveryVerdictRef), and a toast fires only the
+      // moment that wording crosses from "definitely not sent" to "may have
+      // landed" -- the one fact this attempt adds that the user could not
+      // already tell from the panel.
       setResending(false)
       if (resendOutcome.kind === "sent") {
         toast(t("connectorRuntime.resendSupersededSent"))
         return
       }
-      const attempt = resendOutcome.kind === "failed" ? resendOutcome.disposition : null
-      const disposition = mergeSendFailureDisposition(dispositionBefore, attempt)
+      if (requestRef.current.resendPayload?.clientMessageId !== snapshotIdBefore) {
+        toast(t(resendFailureTextKey(resendOutcome)))
+        return
+      }
+      const disposition = resendOutcome.kind === "failed" ? resendOutcome.disposition : null
+      // Defensive: the check above already established that the panel up
+      // now is the one this attempt was about, and nothing else can raise a
+      // panel while `resending` holds the dialog busy. Kept so the write can
+      // never land on a panel for a different snapshot.
       setSendFailure(prev => (prev && prev.snapshotId === snapshotIdBefore ? { ...prev, disposition } : prev))
       if (sendOutcomeMayHaveLanded(disposition) && !sendOutcomeMayHaveLanded(dispositionBefore)) {
         toast(t(sendFailureTextKey(disposition)))
@@ -1211,17 +1221,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       return
     }
     // A retry that failed again. The panel's wording only ever moves toward
-    // uncertainty (see mergeSendFailureDisposition), which means that in the
-    // two cases where it does not move at all the panel says exactly what it
-    // said before the click: the user cannot tell "nothing happened" from
-    // "it failed again". So the panel is updated and the fact is said once,
-    // both off the same merged disposition -- the toast carries the new
-    // event, the panel carries the standing state, and the two cannot word
-    // the same message differently.
-    const disposition = mergeSendFailureDisposition(
-      dispositionBefore,
-      resendOutcome.kind === "failed" ? resendOutcome.disposition : null,
-    )
+    // uncertainty (doResend returns the merged verdict, see
+    // deliveryVerdictRef), which means that in the two cases where it does
+    // not move at all the panel says exactly what it said before the click:
+    // the user cannot tell "nothing happened" from "it failed again". So the
+    // panel is updated and the fact is said once, both off the same verdict
+    // -- the toast carries the new event, the panel carries the standing
+    // state, and the two cannot word the same message differently.
+    const disposition = resendOutcome.kind === "failed" ? resendOutcome.disposition : null
     setSendFailure(prev => (prev ? { ...prev, disposition } : prev))
     toast(t(sendFailureTextKey(disposition)))
   }
