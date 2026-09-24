@@ -986,7 +986,7 @@ class TestReadToolResult:
         }
 
     @pytest.mark.usefixtures("mock_workspace_db")
-    def test_read_tool_result_lists_only_writer_shaped_regular_files(self, tmp_path):
+    def test_read_tool_result_lists_only_pattern_matching_regular_files(self, tmp_path):
         workspace = TaskWorkspace("task-1", str(tmp_path))
         tools = WorkspaceFileTools(workspace)
         second = self._spill_file(workspace, "b" * 50, tool_name="zeta")

@@ -4613,18 +4613,131 @@ def test_spill_read_schema_field_starts_as_none() -> None:
     assert ReActPattern()._spill_read_schema is None
 
 
-def test_forced_answer_schema_unaffected_by_a_non_empty_spill_registry() -> None:
-    """The main loop's ``[final_answer] if force_final_answer_now else
-    normal_tool_schemas`` never reads normal_tool_schemas on the True
-    branch, so a non-empty spill registry cannot put read_tool_result on a
-    forced turn: the forced-answer branch stays byte-identical to baseline.
-    force_final_answer_now short-circuits before normal_tool_schemas would
-    matter."""
-    pattern = ReActPattern()
-    tool_schemas = [pattern._final_answer_tool_schema()]
-    names = [schema["function"]["name"] for schema in tool_schemas]
-    assert names == ["final_answer"]
-    assert SPILL_READ_TOOL_NAME not in names
+def _tool_call_response(call_id: str, name: str, arguments: str) -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            {"id": call_id, "function": {"name": name, "arguments": arguments}}
+        ],
+    }
+
+
+def _schema_names(llm_call: dict[str, Any]) -> list[str]:
+    return [schema["function"]["name"] for schema in llm_call["tools"]]
+
+
+@pytest.mark.asyncio
+async def test_forced_answer_turn_sends_only_final_answer_with_a_non_empty_registry() -> (
+    None
+):
+    """With the registry already non-empty, the ordinary turn offers the
+    reader, but the forced-answer turn that follows a successful tool result
+    sends the model final_answer and nothing else -- asserted on the tools
+    the model call actually received."""
+    llm = FakeLLM(
+        responses=[
+            _tool_call_response("call_calc", "calculator", '{"expression": "1+1"}'),
+            _tool_call_response("call_final", "final_answer", '{"answer": "2"}'),
+        ]
+    )
+    pattern = ReActPattern(max_iterations=4, finalize_after_tool_result=True)
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    context.add_user_message("What is 1+1?")
+
+    result = await pattern.run(
+        context=context, tools=[FakeTool(), FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert len(llm.calls) == 2
+    assert SPILL_READ_TOOL_NAME in _schema_names(llm.calls[0])
+    assert _schema_names(llm.calls[1]) == ["final_answer"]
+
+
+@pytest.mark.asyncio
+async def test_reader_is_offered_on_the_turn_after_a_mid_run_spill(tmp_path) -> None:
+    """The registry fills up during the run: the first tool call returns a
+    result whose oversized value was really spilled under the run's
+    workspace, and add_tool_result registers it. The model call before that
+    result must not offer the reader, and the very next one must -- the gate
+    runs on every iteration, not once before the loop."""
+    from xagent.core.tools.tool_result_spill import (
+        SPILL_RESERVED_RESULT_KEY,
+        SpillTarget,
+        spill_dir_for_workspace,
+        spill_oversized_values,
+    )
+
+    target = SpillTarget(spill_dir=spill_dir_for_workspace(tmp_path), max_chars=100)
+
+    class SpillingTool(FakeTool):
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            self.calls.append(args)
+            spilled, records = spill_oversized_values(
+                {"output": "x" * 300},
+                target,
+                tool_name="calculator",
+                max_recursion=20,
+            )
+            return {**spilled, SPILL_RESERVED_RESULT_KEY: records}
+
+    llm = FakeLLM(
+        responses=[
+            _tool_call_response("call_calc", "calculator", '{"expression": "1+1"}'),
+            _tool_call_response("call_final", "final_answer", '{"answer": "done"}'),
+        ]
+    )
+    context = ExecutionContext()
+    context.attach_workspace("ws-mid-run", str(tmp_path))
+    context.add_user_message("q")
+    tool = SpillingTool()
+
+    result = await ReActPattern(max_iterations=4).run(
+        context=context, tools=[tool, FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert len(tool.calls) == 1
+    assert context.get_component("spilled_results") is not None
+    assert len(context.get_component("spilled_results").records) == 1
+    assert len(llm.calls) == 2
+    assert SPILL_READ_TOOL_NAME not in _schema_names(llm.calls[0])
+    assert SPILL_READ_TOOL_NAME in _schema_names(llm.calls[1])
+
+
+@pytest.mark.asyncio
+async def test_a_record_without_a_relative_path_is_ignored_by_the_gate() -> None:
+    """A registry record of the wrong shape -- here one with no
+    relative_path, as a hand-edited or older checkpoint could carry -- is
+    skipped rather than crashing the gate, and the well-formed record next
+    to it still opens it."""
+    from xagent.core.agent.context.components import SpillRegistryComponent
+
+    good_path = "tool-results/a-000000000000.json"
+    context = ExecutionContext()
+    context.set_component(
+        "spilled_results",
+        SpillRegistryComponent(
+            records=[
+                {"kind": "array", "item_count": 1},
+                {"relative_path": good_path, "kind": "array", "item_count": 1},
+            ]
+        ),
+    )
+    context.add_user_message("hi")
+    pattern = ReActPattern(max_iterations=3)
+    llm = FakeLLM(
+        responses=[
+            _tool_call_response("call_final", "final_answer", '{"answer": "done"}')
+        ]
+    )
+
+    assert pattern._spilled_paths(context) == frozenset({good_path})
+    result = await pattern.run(
+        context=context, tools=[FakeTool(), FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert SPILL_READ_TOOL_NAME in _schema_names(llm.calls[0])
 
 
 @pytest.mark.asyncio

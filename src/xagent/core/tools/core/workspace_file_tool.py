@@ -1086,9 +1086,13 @@ class WorkspaceFileOperations:
         on the execution context. The directory belongs to the task, so the
         listing can include files an earlier run of the same task stored.
 
-        Only direct children that are regular files (a symlink is not
-        followed) and whose name the spill writer could have produced are
-        listed; anything else is skipped silently. Each relative_path is the
+        An entry is listed only if it is a direct child that is a regular
+        file (a symlink is not followed), its name matches the spill file
+        name pattern (1 to 112 ASCII letters, digits, underscores or hyphens,
+        ending in .json or .txt), and that name normalizes as a stored-result
+        path; anything else is skipped silently. The pattern is wider than
+        the names the writer actually produces, so a listed name is not by
+        itself evidence the writer made it. Each relative_path is the
         canonical spelling normalize_spilled_relative_path returns, the same
         one the notice shows and a successful read returns. No digest is
         checked here -- that would read every file in full -- so a listed file
