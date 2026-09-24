@@ -730,6 +730,36 @@ def _load_actor_interaction_task(
     return task, agent
 
 
+def bind_channel_turn_identity(
+    context: dict[str, Any],
+    *,
+    task_source: str | None,
+    managed_lease: ManagedTaskLease | None,
+) -> None:
+    """Bind the MCP approval gate's identity pair onto a bot turn's context.
+
+    Both keys or neither. ``ToolCallExecutionContext.is_complete()``
+    requires ``run_id`` as well as ``task_source``, and a registered source
+    presenting an incomplete identity is refused before dispatch. Binding
+    the source alone would therefore turn a registration on this source
+    into a hard outage for every MCP call on this path -- strictly worse
+    than leaving it unbound, where the call simply passes through ungated,
+    which is also what a lease with no run id gets here.
+
+    Shared by the Slack, Telegram and Feishu direct-message paths, which
+    each build their own ``context`` dict and call
+    ``AgentService.execute_task`` directly rather than going through the
+    WebSocket turn path that binds the pair itself. The shared-turn
+    executor does not carry this dict at all: it binds the same pair from
+    its own snapshot and lease in
+    ``shared_channel_execution.execute_channel_background``.
+    """
+    turn_run_id = managed_lease.lease.run_id if managed_lease is not None else None
+    if turn_run_id is not None:
+        context["task_source"] = task_source
+        context["run_id"] = turn_run_id
+
+
 def prepare_channel_task_no_commit(
     db: Session,
     *,

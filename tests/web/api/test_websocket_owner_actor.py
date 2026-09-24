@@ -16,7 +16,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, TypeVar
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -1569,6 +1569,12 @@ async def test_running_chat_message_uses_one_offloop_scope_and_no_request_sessio
     assert len(resolver_threads) == 1
     assert claim_threads and claim_threads[0] != main_thread_id
     assert resume_bg.await_args.kwargs["resolved_execution_scope"] is scope
+    # The paused task row's own source must reach the resume, not the
+    # ``execute_resume_background`` default of ``None`` -- see
+    # ``test_execution_scope_turn_wiring.test_resume_task_forwards_the_task_rows_source``
+    # for the sibling resume-command call site.
+    assert resume_bg.await_args.kwargs["trusted_task_source"] == task.source
+    assert task.source == "sdk"
 
 
 @pytest.mark.asyncio
@@ -4348,7 +4354,9 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
         "deferred-marker-turn",
         command_execution_service.DELIVERY_DISPATCHED,
     )
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     accepted = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
@@ -4439,7 +4447,9 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
         "deferred-marker-cancel-turn",
         command_execution_service.DELIVERY_DISPATCHED,
     )
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     accepted = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
@@ -4543,7 +4553,9 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
             ),
         )
 
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     assert len(observed_close_calls) == 1
     called_task_id, called_run_id, live_run_id = observed_close_calls[0]
     assert called_task_id == int(task.id)
@@ -4640,7 +4652,9 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
     assert close_mock.call_args.kwargs["interaction_id"] == 9876
 
     read_mock.assert_not_called()
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     assert any(
@@ -4750,7 +4764,9 @@ async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
     close_mock.assert_not_called()
 
     read_mock.assert_not_called()
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     assert any(
@@ -4846,7 +4862,9 @@ async def test_deferred_injection_close_cancellation_does_not_abort_resume(
             ),
         )
 
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     assert len(observed_close_calls) == 1
     called_task_id, called_run_id, live_run_id = observed_close_calls[0]
     assert called_task_id == int(task.id)

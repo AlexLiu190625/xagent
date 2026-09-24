@@ -697,6 +697,16 @@ async def execute_channel_background(
         or normalize_attachments_for_persistence(file_infos),
         "display_message": payload.transcript_message,
     }
+    if lease.run_id is not None:
+        # Server-owned execution identity, taken from the task row this
+        # command was admitted against and the lease it holds -- matching
+        # what the websocket turn path and the three channel bots' direct
+        # path bind. Both keys or neither: ``ToolCallExecutionContext``
+        # counts an execution complete only with ``run_id`` too, and a
+        # registered source presenting an incomplete identity is refused
+        # before dispatch, so a half binding would be worse than none.
+        context["task_source"] = snapshot.task.source
+        context["run_id"] = lease.run_id
     if file_infos:
         context.update(
             {

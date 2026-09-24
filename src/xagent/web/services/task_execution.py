@@ -1907,10 +1907,33 @@ async def execute_task_background(
             # Execute the next turn under the same task/thread id.
             actual_task_id = str(task_id)
             task_for_agent = llm_user_message or user_message
+            # ``task_source`` and ``run_id`` are server-owned execution
+            # identities: the first selects the MCP approval registration,
+            # the second names the lease an approval is recorded under. This
+            # context is caller supplied, so both keys are overwritten rather
+            # than defaulted -- a client must not be able to relabel its task
+            # into (or out of) another source's approval policy, nor claim a
+            # different execution lease.
+            agent_context = dict(context_dict)
+            turn_run_id = (
+                task_lease.run_id if task_lease is not None else expected_run_id
+            )
+            if turn_run_id is not None:
+                # Both keys or neither: a registered source presenting an
+                # incomplete identity (``task_source`` with no ``run_id``)
+                # is refused before dispatch, which would turn a
+                # registration on this path into a hard outage for every
+                # MCP call -- strictly worse than leaving both unbound,
+                # where the call simply passes through ungated.
+                agent_context["task_source"] = snapshot.task.source
+                agent_context["run_id"] = turn_run_id
+            else:
+                agent_context.pop("task_source", None)
+                agent_context.pop("run_id", None)
             result = await agent_manager.execute_task(
                 agent_service=agent_service,
                 task=task_for_agent,
-                context=context,
+                context=agent_context,
                 task_id=actual_task_id,
                 tracking_task_id=str(task_id),
                 db_session=None,
@@ -2464,6 +2487,18 @@ async def execute_resume_background(
     preacquired_heartbeat_stop: asyncio.Event | None = None,
     preacquired_heartbeat_task: (asyncio.Task[TaskLeaseHeartbeatOutcome] | None) = None,
     preacquired_prior_status: TaskStatus | None = None,
+    # Appended, never inserted: this function has no ``*`` separator and a
+    # downstream caller (xagent-saas ``external_input_dispatch``) binds it by
+    # keyword against a pinned parameter order, so a new parameter goes last
+    # or it shifts every positional slot after it.
+    #
+    # The task row's own ``source``, read by the caller that already holds an
+    # authoritative row for this task. It is overlaid onto the restored
+    # checkpoint metadata so a resumed MCP approval is evaluated under the
+    # source it was gated for. ``None`` means "this caller has no trusted
+    # value", never "this task has no source": the runner's overlay ignores a
+    # None and keeps whatever the checkpoint carries.
+    trusted_task_source: str | None = None,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
@@ -2847,7 +2882,13 @@ async def execute_resume_background(
             bind_task_lease_context(lease),
         ):
             result = await run_while_task_lease_owned(
-                agent_service.resume_execution_by_id(str(task_id)),
+                agent_service.resume_execution_by_id(
+                    str(task_id),
+                    metadata={
+                        "task_source": trusted_task_source,
+                        "run_id": lease.run_id,
+                    },
+                ),
                 lease_heartbeat_task,
             )
 

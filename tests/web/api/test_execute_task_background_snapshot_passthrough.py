@@ -224,10 +224,11 @@ async def test_snapshot_path_skips_task_and_user_queries() -> None:
             await execute_task_background(
                 task_id=42,
                 user_message="hi",
-                context={},
+                context={"task_source": "spoofed", "run_id": "spoofed-run"},
                 agent_manager=agent_manager,
                 task_owner_user_id=1,
                 task_setup_snapshot=snapshot,
+                expected_run_id="run-snapshot",
             )
         except Exception:
             # Downstream finalize stubs may raise; the query counts
@@ -248,6 +249,52 @@ async def test_snapshot_path_skips_task_and_user_queries() -> None:
     ]
     assert forwarded_snapshot is snapshot
     assert forwarded_snapshot.task.source == "trigger"
+    forwarded_context = agent_manager.execute_task.await_args.kwargs["context"]
+    assert forwarded_context["task_source"] == "trigger"
+    assert forwarded_context["run_id"] == "run-snapshot"
+
+
+@pytest.mark.asyncio
+async def test_no_lease_and_no_expected_run_id_binds_neither_key() -> None:
+    """Both identity keys or neither -- never ``task_source`` alone.
+
+    A registered source presenting an incomplete identity (``task_source``
+    with no ``run_id``) is refused before dispatch by
+    ``ToolCallExecutionContext.is_complete()``, so binding the source alone
+    when no lease and no ``expected_run_id`` are available would turn a
+    registration on this path into a hard outage for every MCP call --
+    strictly worse than leaving both unbound, where the call simply passes
+    through ungated. Unreachable through the production caller today (it
+    always supplies a lease), but the contract holds regardless.
+    """
+    db, _counter = _build_db_mock(task_row=_make_task_orm(), user_row=_make_user_orm())
+    snapshot = _make_snapshot()
+    agent_service = _build_fake_agent_service()
+    agent_manager = MagicMock(
+        get_agent_for_task=AsyncMock(return_value=agent_service),
+        execute_task=AsyncMock(
+            return_value={"success": True, "output": "ok", "status": "completed"}
+        ),
+    )
+
+    with _Patches(_common_patches(db, agent_service)):
+        try:
+            await execute_task_background(
+                task_id=42,
+                user_message="hi",
+                context={"task_source": "spoofed", "run_id": "spoofed-run"},
+                agent_manager=agent_manager,
+                task_owner_user_id=1,
+                task_setup_snapshot=snapshot,
+                expected_run_id=None,
+                task_lease=None,
+            )
+        except Exception:
+            pass
+
+    forwarded_context = agent_manager.execute_task.await_args.kwargs["context"]
+    assert "task_source" not in forwarded_context
+    assert "run_id" not in forwarded_context
 
 
 @pytest.mark.asyncio

@@ -727,6 +727,10 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
     schedule_resume.assert_called_once()
     scheduled_lease = schedule_resume.call_args.kwargs["task_lease"]
     assert scheduled_lease == observed_lease["lease"]
+    # The resumed run carries the task row's own source, so a gated MCP
+    # approval issued before the pause is evaluated under the source it was
+    # gated for instead of being erased by a None overlay.
+    assert schedule_resume.call_args.kwargs["trusted_task_source"] == "a2a"
     db = _direct_db_session()
     try:
         resumed = db.query(Task).filter(Task.id == int(task_id)).one()

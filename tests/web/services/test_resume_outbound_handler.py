@@ -94,7 +94,10 @@ async def test_resume_installs_outbound_handler_so_follow_up_question_persists(
     agent = MagicMock()
     agent.set_outbound_message_handler = MagicMock()
 
-    async def _resume(_task_id_str: str) -> dict[str, Any]:
+    # ``**_kwargs``: the resume boundary forwards the task's trusted
+    # identity as ``metadata=`` (see ``execute_resume_background``); the real
+    # ``AgentService.resume_execution_by_id`` accepts it, so the double must.
+    async def _resume(_task_id_str: str, **_kwargs: Any) -> dict[str, Any]:
         call = agent.set_outbound_message_handler.call_args
         handler = call.args[0] if call is not None else None
         runtime = PatternRuntime(

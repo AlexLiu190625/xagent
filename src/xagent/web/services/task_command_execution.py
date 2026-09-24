@@ -827,6 +827,10 @@ class _TaskCommandRoutingSnapshot:
 
     task_id: int
     task_owner_user_id: int
+    # The task row's own ``source``. Server owned: it selects the MCP
+    # approval registration for every turn of this task, so it is read here
+    # from the row rather than accepted from the client's request context.
+    task_source: str | None
     status: TaskStatus
     control_state: str | None
     run_id: str | None
@@ -924,6 +928,7 @@ def _load_task_command_routing_snapshot(
         _TaskCommandRoutingSnapshot(
             task_id=int(task.id),
             task_owner_user_id=int(task.user_id),
+            task_source=str(task.source) if task.source is not None else None,
             status=status,
             control_state=_task_control_state_value(task),
             run_id=_task_run_id(task),
@@ -1895,6 +1900,7 @@ async def handle_task_message(
                             # is what a resume wants: those pointers are the
                             # anchor it is resuming from.
                             expected_run_id=handoff_snapshot.run_id,
+                            trusted_task_source=routing.task_source,
                             previous_task=previous_task,
                             resolved_execution_scope=resolved_execution_scope,
                             pending_user_message=(
@@ -3244,6 +3250,7 @@ async def resume_task(
                         agent_service=agent_service,
                         task_owner_user_id=task_owner_user_id,
                         expected_run_id=resume_snapshot.run_id,
+                        trusted_task_source=task_fields.source,
                         previous_task=previous_task,
                         # Not `resolved_execution_scope`: that value is the
                         # off-turn downgrade used above to obtain

@@ -90,6 +90,14 @@ EXPECTED_RESUME_PARAMETERS: list[tuple[str, Any]] = [
     ("preacquired_heartbeat_stop", None),
     ("preacquired_heartbeat_task", None),
     ("preacquired_prior_status", None),
+    # Added by the MCP approval gate host wiring: the task row's own
+    # ``source``, so a resumed gated call is evaluated under the source it
+    # was gated for. Appended rather than inserted -- the function has no
+    # ``*`` separator, so a parameter added in the middle would shift every
+    # positional slot after it for a downstream caller. Defaulted, so the
+    # downstream keyword set below still binds unchanged; the downstream
+    # should start passing it once it has an authoritative row to read.
+    ("trusted_task_source", None),
 ]
 
 EXPECTED_EXECUTE_PARAMETERS: list[tuple[str, Any]] = [

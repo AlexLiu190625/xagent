@@ -35,7 +35,14 @@ from .base import (
     ToolCategory,
     ToolVisibility,
 )
-from .config import run_with_tool_runtime_cleanup
+from .config import (
+    NESTED_DELEGATION_NOT_APPROVABLE_REASON,
+    run_with_tool_runtime_cleanup,
+)
+from .mcp_approval_gate import (
+    current_tool_call_execution_context,
+    has_approval_gate_for_source,
+)
 
 logger = logging.getLogger(__name__)
 MAX_AGENT_NAME_LENGTH = 200
@@ -1810,6 +1817,37 @@ def _delegated_child_final_output(result: Mapping[str, Any]) -> tuple[Any, bool]
     return result.get("output"), True
 
 
+def _nested_mcp_refusal_reason() -> Optional[str]:
+    """Why a delegated run may not materialize MCP connectors, or ``None``.
+
+    A delegated run must not dispatch connector writes that the delegating run
+    would have had to get approved. The child builds its own execution context
+    and inherits no ``task_source``, so the approval gate would see an unbound
+    source and pass the call straight through -- an approval bypass the model
+    itself can reach, just by calling this tool with a published agent whose
+    persisted selection contains ``mcp:<server>``.
+
+    Inheriting the parent's source instead would only move the problem: the
+    gate would pause the child, and a paused child is classified as an
+    unsupported nested interaction (see
+    :func:`_classify_delegated_child_failure`), so the approval could never be
+    resumed and the host would be left holding a dangling prompt. The
+    connectors are therefore refused for the child instead.
+
+    The parent source comes from the execution identity ReAct binds around
+    this very tool call -- server-owned, never model-supplied. An unbound
+    parent, or a parent whose source has no registration, yields ``None`` and
+    changes nothing: this is scoped to the exact case where an approval was
+    actually required.
+    """
+
+    parent_call = current_tool_call_execution_context()
+    parent_source = parent_call.task_source if parent_call is not None else None
+    if not has_approval_gate_for_source(parent_source):
+        return None
+    return NESTED_DELEGATION_NOT_APPROVABLE_REASON
+
+
 def _classify_delegated_child_failure(
     result: Mapping[str, Any],
 ) -> Optional[dict[str, Any]]:
@@ -1911,6 +1949,7 @@ class AgentTool(AbstractBaseTool):
         execution_scope: Optional[Any] = None,
         file_operation_access_version: Any = None,
         voice: Optional[str] = None,
+        inherited_mcp_unavailable_reason: Optional[str] = None,
     ):
         """
         Initialize an agent tool.
@@ -1947,6 +1986,15 @@ class AgentTool(AbstractBaseTool):
                 core.agent.voice_policy.apply_output_voice and
                 BaseToolConfig.get_voice), so a task's chosen voice reaches
                 every agent this user talks to, not just the top-level one.
+            inherited_mcp_unavailable_reason: The MCP refusal reason the
+                config that built this tool was itself refused under, if
+                any (see BaseToolConfig.get_mcp_unavailable_reason). Propagated
+                the same way ``voice`` is, so a refusal computed one hop up
+                the delegation chain -- where the ReAct-bound execution
+                context that ``_nested_mcp_refusal_reason`` reads was still
+                populated -- keeps holding for every further hop, where that
+                context is empty and the call would otherwise read as
+                unregistered and dispatch ungated.
         """
         self._agent_id = agent_id
         self._agent_name = agent_name
@@ -1980,6 +2028,7 @@ class AgentTool(AbstractBaseTool):
         self._runtime_metadata = dict(runtime_metadata or {})
         self._file_operation_access_version = file_operation_access_version
         self._voice = voice
+        self._inherited_mcp_unavailable_reason = inherited_mcp_unavailable_reason
         self._agent_call_stack = _normalize_agent_ids(agent_call_stack) or []
         if agent_id not in self._agent_call_stack:
             self._agent_call_stack.append(agent_id)
@@ -2460,6 +2509,23 @@ class AgentTool(AbstractBaseTool):
                 # _SpecAll still admits MCP at the final filter layer for
                 # compatibility, but it does not opt into MCP server init.
                 include_mcp_tools=should_load_mcp_server_configs(tool_selection_spec),
+                # The connectors are refused rather than the parent's
+                # task_source being inherited -- see
+                # ``_nested_mcp_refusal_reason`` for why a paused child cannot
+                # be the answer here. But the refusal itself must survive
+                # past this one hop: this call site sees the live ReAct
+                # binding only for the *first* delegation, because the
+                # child's own execution context carries no task_source (see
+                # ``execute_delegated_runtime`` below), so a grandchild
+                # delegated from here would otherwise read the immediate
+                # context as unbound and dispatch ungated. ``or
+                # self._inherited_mcp_unavailable_reason`` makes a refusal
+                # sticky for the rest of the chain once any ancestor hop
+                # triggers it.
+                mcp_unavailable_reason=(
+                    _nested_mcp_refusal_reason()
+                    or self._inherited_mcp_unavailable_reason
+                ),
                 allowed_agent_ids=self._delegation_allowed_agent_ids,
                 agent_tool_overrides=self._agent_tool_overrides,
                 enable_global_agent_tools=self._enable_global_agent_tools,
@@ -2733,6 +2799,7 @@ def build_published_agent_tools_from_records(
     execution_scope: Optional[Any] = None,
     file_operation_access_version: Any = None,
     voice: Optional[str] = None,
+    inherited_mcp_unavailable_reason: Optional[str] = None,
 ) -> list[AbstractBaseTool]:
     """Construct AgentTool instances from ORM-free worker results."""
     if workspace_base_dir is None:
@@ -2821,6 +2888,7 @@ def build_published_agent_tools_from_records(
             execution_scope=execution_scope,
             file_operation_access_version=file_operation_access_version,
             voice=voice,
+            inherited_mcp_unavailable_reason=inherited_mcp_unavailable_reason,
         )
         tools.append(tool)
         logger.debug("Created agent tool: %s", tool.name)
@@ -2846,6 +2914,7 @@ def get_published_agents_tools(
     execution_scope: Optional[Any] = None,
     file_operation_access_version: Any = None,
     voice: Optional[str] = None,
+    inherited_mcp_unavailable_reason: Optional[str] = None,
 ) -> list[AbstractBaseTool]:
     """
     Get tools for published (and optionally draft) agents.
@@ -2908,6 +2977,7 @@ def get_published_agents_tools(
             execution_scope=execution_scope,
             file_operation_access_version=file_operation_access_version,
             voice=voice,
+            inherited_mcp_unavailable_reason=inherited_mcp_unavailable_reason,
         )
 
     except Exception as e:
@@ -2973,6 +3043,7 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
                 FILE_OPERATION_ACCESS_VERSION_KEY
             ),
             voice=config.get_voice(),
+            inherited_mcp_unavailable_reason=config.get_mcp_unavailable_reason(),
         )
         records_getter = getattr(config, "get_published_agent_tool_records", None)
         records = records_getter() if callable(records_getter) else None

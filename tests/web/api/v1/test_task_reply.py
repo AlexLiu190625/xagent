@@ -245,6 +245,10 @@ def test_reply_happy_path_resumes_the_same_run(mock_start_task):
     schedule_resume.assert_called_once()
     scheduled_lease = schedule_resume.call_args.kwargs["task_lease"]
     assert scheduled_lease.run_id == "run-original"
+    # Read from the task row, not inferred from which API accepted the
+    # reply: the resumed run must present the source its pending MCP
+    # approval was gated under.
+    assert schedule_resume.call_args.kwargs["trusted_task_source"] == "sdk"
 
     db = _direct_db_session()
     try:
@@ -1101,6 +1105,7 @@ async def test_reply_resume_binds_the_coordinator_to_the_leased_run() -> None:
             task_lease=lease,
             heartbeat_stop=asyncio.Event(),
             heartbeat_task=asyncio.ensure_future(asyncio.sleep(0)),
+            trusted_task_source="sdk",
         )
         try:
             assert (

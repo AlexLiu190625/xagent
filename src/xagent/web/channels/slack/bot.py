@@ -47,6 +47,7 @@ from ...services.channel_runtime import (
     ChannelConfigurationError,
     DownloadedChannelFile,
     authorize_channel_sender,
+    bind_channel_turn_identity,
     deactivate_channel_sync,
     load_active_channel_configs,
     load_channel_output_files,
@@ -536,6 +537,10 @@ class SlackBotInstance:
             )
             if setup_snapshot is None:
                 raise RuntimeError(f"Task {task_id} disappeared before execution")
+            # Server-owned execution identity: it selects this run's MCP
+            # approval registration, so it is read from the task row and
+            # never from the inbound chat event.
+            task_row_source = setup_snapshot.task.source
 
             agent_manager = get_agent_manager()
             agent_service = await agent_manager.get_agent_for_task(
@@ -560,6 +565,9 @@ class SlackBotInstance:
 
             turn_id = str(uuid4())
             context: dict[str, Any] = {"turn_id": turn_id}
+            bind_channel_turn_identity(
+                context, task_source=task_row_source, managed_lease=managed_lease
+            )
             display_message = text
             execution_text = prompt_text
             persisted_attachments: list[dict[str, Any]] = []

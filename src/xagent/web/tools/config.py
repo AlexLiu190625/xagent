@@ -1683,6 +1683,10 @@ class WebToolConfig(BaseToolConfig):
         vision_model: Optional[Any] = None,
         llm: Optional[Any] = None,
         include_mcp_tools: bool = True,
+        # Set by a caller that must not let this config materialize live MCP
+        # connectors, but still wants the model told why. The selected servers
+        # are reported unavailable with this reason instead of being loaded.
+        mcp_unavailable_reason: Optional[str] = None,
         task_id: Optional[str] = None,
         workspace_base_dir: Optional[str] = None,
         browser_tools_enabled: bool = True,
@@ -1805,6 +1809,7 @@ class WebToolConfig(BaseToolConfig):
         self._explicit_vision_model = vision_model
         self._explicit_llm = llm
         self._include_mcp_tools = include_mcp_tools
+        self._mcp_unavailable_reason = mcp_unavailable_reason
         self._task_id = task_id
         self._browser_tools_enabled = browser_tools_enabled
         self._allowed_collections = allowed_collections
@@ -2078,6 +2083,9 @@ class WebToolConfig(BaseToolConfig):
         if not self._include_mcp_tools:
             return []
 
+        if self._mcp_unavailable_reason is not None:
+            return self._refused_mcp_server_configs(self._mcp_unavailable_reason)
+
         if self._cached_mcp_configs is not None:
             if self._mcp_config_cache_is_valid():
                 return self._cached_mcp_configs
@@ -2089,6 +2097,34 @@ class WebToolConfig(BaseToolConfig):
         configs = await self._load_mcp_server_configs()
         self._store_mcp_config_cache_if_cacheable(configs)
         return configs
+
+    def _refused_mcp_server_configs(self, reason: str) -> List[Dict[str, Any]]:
+        """Project the selected MCP servers into unavailable configs.
+
+        Deliberately does not load anything: the point of the refusal is that
+        no connector is materialized, so paying the config scan to name the
+        servers more precisely would defeat it. The selection spec already
+        names them whenever the selection is server-scoped, which is the case
+        this refusal exists for -- a delegated agent whose persisted selection
+        lists ``mcp:<server>``.
+
+        An unrestricted selection (``scoped_mcp_servers()`` is ``None``, i.e.
+        the plain ``mcp`` parent or ALL mode) has no names to report without
+        that scan, so it yields no tools at all. The refusal still holds; only
+        the explanation is best effort.
+        """
+
+        spec = self._tool_selection_spec
+        scoped = spec.scoped_mcp_servers() if spec is not None else None
+        if not scoped:
+            return []
+        return [
+            {
+                "name": server_name,
+                "config": {"unavailable": True, "reason": reason},
+            }
+            for server_name in sorted(scoped)
+        ]
 
     def get_actor_mcp_stdio_session_identities(
         self,
@@ -2609,6 +2645,10 @@ class WebToolConfig(BaseToolConfig):
     def get_voice(self) -> Optional[str]:
         """See BaseToolConfig.get_voice's docstring."""
         return self._voice
+
+    def get_mcp_unavailable_reason(self) -> Optional[str]:
+        """See BaseToolConfig.get_mcp_unavailable_reason's docstring."""
+        return self._mcp_unavailable_reason
 
     def _note_unresolved_tool_policy(self, input_name: str, reason: str) -> None:
         """Record that a policy input could not be resolved for this turn.
