@@ -359,7 +359,9 @@ async def test_a2a_does_not_retry_unknown_or_terminal_outcome(reply, outcome):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure_stage", ["after_injection", "lease_restore"])
+@pytest.mark.parametrize(
+    "failure_stage", ["after_injection", "lease_restore", "unknown_result"]
+)
 async def test_a2a_unsafe_checkpoint_failure_cannot_create_retry(
     reply, monkeypatch, failure_stage
 ):
@@ -381,7 +383,9 @@ async def test_a2a_unsafe_checkpoint_failure_cannot_create_retry(
         task_resume.agent_runtime_service, "get_agent_manager", lambda: manager
     )
     failure = CheckpointUnavailableError("temporary outage")
-    if failure_stage == "after_injection":
+    if failure_stage == "unknown_result":
+        post.return_value = UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    elif failure_stage == "after_injection":
         monkeypatch.setattr(
             task_resume, "_schedule_waiting_a2a_resume", AsyncMock(side_effect=failure)
         )
@@ -399,7 +403,7 @@ async def test_a2a_unsafe_checkpoint_failure_cannot_create_retry(
         )
     await execute_durable_task_command(command)
     assert module._read_reply_outcome(command_id)["outcome"] == (
-        "unknown" if failure_stage == "after_injection" else "unavailable"
+        "unavailable" if failure_stage == "lease_restore" else "unknown"
     )
     assert module._admit_reply(reply, "a2a", "message", "original") == command_id
     post.assert_awaited_once()

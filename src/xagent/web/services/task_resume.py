@@ -553,6 +553,8 @@ async def resume_a2a_task(
                 request_interrupt=False,
                 reason="A2A input-required response",
             )
+            if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                raise TaskResumeOutcomeUnknownError(message_id)
             return agent_service, posted
 
         with bind_task_lease_context(task_lease):
@@ -1057,6 +1059,8 @@ async def resume_task_reply(
                 request_interrupt=False,
                 reason="V1 interaction response",
             )
+            if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                raise TaskResumeOutcomeUnknownError(turn_id)
             return agent_service, bool(posted)
 
         with bind_task_lease_context(task_lease):

@@ -103,6 +103,7 @@ from .chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
     mark_user_message_delivery_sync,
 )
 from .client_error_messages import (
@@ -2540,6 +2541,7 @@ async def execute_resume_background(
     task_agent_id: int | None = None
     agent_name: str | None = None
     agent_logo_url: str | None = None
+    delivery_outcome_unknown = False
     delivery_was_dispatched = delivery_already_dispatched
     control_event_state: dict[str, Any] = {}
 
@@ -2554,6 +2556,18 @@ async def execute_resume_background(
         if delivery_notifier is None:
             return
         try:
+            if delivery_outcome_unknown:
+                await delivery_notifier(
+                    turn_id=delivery_turn_id,
+                    accepted=False,
+                    message=client_error_message(
+                        ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
+                    ),
+                    error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                    retry_with_new_id=False,
+                    rejection_outcome="outcome_unknown",
+                )
+                return
             await delivery_notifier(
                 turn_id=delivery_turn_id,
                 accepted=accepted,
@@ -2581,7 +2595,9 @@ async def execute_resume_background(
                 lambda: mark_user_message_delivery_sync(
                     task_id,
                     delivery_turn_id,
-                    DELIVERY_FAILED,
+                    DELIVERY_OUTCOME_UNKNOWN
+                    if delivery_outcome_unknown
+                    else DELIVERY_FAILED,
                 )
             )
             return True
@@ -2739,6 +2755,9 @@ async def execute_resume_background(
                     ),
                     lease_heartbeat_task,
                 )
+            if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                delivery_outcome_unknown = True
+                raise RuntimeError("The user message injection outcome is unknown")
             if not posted:
                 raise RuntimeError(
                     "The user message was saved, but no resumable execution "

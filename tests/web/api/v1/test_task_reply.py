@@ -1147,3 +1147,42 @@ def test_reply_timeout_reports_accepted_outcome_unknown():
         "command_id": "original-reply",
     }
     assert "same command_id" in response.json()["error"]["message"]
+
+
+def test_reply_reports_unknown_without_closing_interaction(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="unknown-protocol")
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="unknown-protocol", idempotency_key="unknown-question"
+    )
+    post = AsyncMock(return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN)
+    agent_patch, _agent = _patch_agent_service(post)
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ) as schedule,
+    ):
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+    assert response.status_code == 504, response.text
+    assert response.json()["error"]["code"] == "reply_outcome_unknown"
+    post.assert_awaited_once()
+    schedule.assert_not_awaited()
+    db = _direct_db_session()
+    try:
+        # Transitional pre-producer behavior; R1 must replace this restoration.
+        assert db.get(Task, task_id).status == TaskStatus.WAITING_FOR_USER
+        assert (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+            .status
+            == "active"
+        )
+    finally:
+        db.close()

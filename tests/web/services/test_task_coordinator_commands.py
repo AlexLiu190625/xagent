@@ -309,7 +309,7 @@ def test_completion_poll_does_not_contend_with_unrelated_sqlite_writer(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["after_post", "during_post"])
+@pytest.mark.parametrize("failure", ["after_post", "during_post", "unknown_result"])
 async def test_unknown_reply_returns_original_identity_without_reinjection(
     host, monkeypatch, failure
 ):
@@ -318,7 +318,11 @@ async def test_unknown_reply_returns_original_identity_without_reinjection(
         "UPDATE tasks", None, RuntimeError("connection interrupted")
     )
     post = AsyncMock(return_value=True)
-    if failure == "during_post":
+    if failure == "unknown_result":
+        from xagent.core.agent.runner import UserMessageInjectionOutcome
+
+        post.return_value = UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    elif failure == "during_post":
         post.side_effect = error
     else:
         monkeypatch.setattr(

@@ -254,7 +254,15 @@ class ExecutionRegistry:
             reason=reason,
         )
         handle = self.get(execution_id)
-        if handle is not None and result.context is not None:
+        if (
+            handle is not None
+            and result.context is not None
+            and result.outcome
+            in (
+                UserMessageInjectionOutcome.POSTED_FRESH,
+                UserMessageInjectionOutcome.POSTED_REPLAY,
+            )
+        ):
             resolved_execution_message = (
                 execution_message if execution_message is not None else message
             )

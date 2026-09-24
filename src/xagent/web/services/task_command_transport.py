@@ -310,6 +310,40 @@ def _load_actor_subject(db: Session, actor_user_id: int | None) -> str | None:
     return str(stored_subject) if stored_subject is not None else None
 
 
+def existing_task_command_payload_matches(
+    db: Session,
+    *,
+    task_id: int,
+    command_id: str,
+    actor_user_id: int | None,
+    kind: TaskCommandKind,
+    payload: dict[str, Any],
+) -> bool | None:
+    """Read an existing command's payload identity without staging any writes.
+
+    None means no command exists; False means its actor, kind or payload
+    conflicts. Missing actor identities are not created by this read path.
+    """
+    with db.no_autoflush:
+        existing = (
+            db.query(TaskExecutionCommand)
+            .filter(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.command_id == command_id,
+            )
+            .first()
+        )
+        if existing is None:
+            return None
+        return _matches_existing(
+            existing,
+            actor_user_id=actor_user_id,
+            actor_subject=_load_actor_subject(db, actor_user_id),
+            kind=kind,
+            payload=payload,
+        )
+
+
 def _resolve_actor_subject(db: Session, actor_user_id: int | None) -> str | None:
     stored_subject = _load_actor_subject(db, actor_user_id)
     if actor_user_id is None or stored_subject is not None:

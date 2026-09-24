@@ -242,8 +242,8 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
 
     # These are deliberate exact baselines. If a producer is added or removed,
     # inspect the changed site and bump the corresponding count in this test.
-    assert result.producers == 30, (
-        f"expected exactly 30 producers, matched {result.producers}; "
+    assert result.producers == 36, (
+        f"expected exactly 36 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
     # #1658 removed ``_resync_client_to_running_task``'s stale-client ``error``
@@ -254,9 +254,9 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # external-scope non-cancel commands, mirroring the persisted-event
     # identity rule for the live frame too, bringing the census to 51.
     # The host event and command reply adapters add two forwarding sinks
-    # to the original 51.
-    assert result.error_payloads == 53, (
-        f"expected exactly 53 error payloads, matched {result.error_payloads}; "
+    # to the original 51. Unknown delivery adds a personal coded notice.
+    assert result.error_payloads == 54, (
+        f"expected exactly 54 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry

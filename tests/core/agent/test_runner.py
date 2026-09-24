@@ -314,39 +314,21 @@ class EmptyCanonicalCheckpointStore:
 
 
 def test_user_message_injection_outcome_truthiness_contract() -> None:
-    """``NOT_POSTED`` is the empty string, and the other two members are
-    not. That is the whole reason an unmodified ``if not posted`` /
-    ``bool(posted)`` caller keeps asking exactly the question it always
-    asked -- "did this hand back a usable context at all" -- across the
-    fresh/replay split. Roughly a dozen call sites in ``websocket.py``,
-    ``a2a.py`` and ``task_reply.py`` rest on it, and none of them names
-    the enum, so an edit to these values would break them all silently.
-    Assert the contract here instead, where the values live.
-    """
+    """Preserve baseline truthiness; consumers handle unknown explicitly first."""
     assert UserMessageInjectionOutcome.NOT_POSTED == ""
     assert not UserMessageInjectionOutcome.NOT_POSTED
     assert UserMessageInjectionOutcome.POSTED_FRESH
     assert UserMessageInjectionOutcome.POSTED_REPLAY
+    assert UserMessageInjectionOutcome.OUTCOME_UNKNOWN
 
 
 def test_user_message_injection_outcome_member_set_has_not_drifted() -> None:
-    """A fourth member added here falls through the ``is
-    UserMessageInjectionOutcome.POSTED_FRESH`` guards in ``a2a.py`` and
-    ``websocket.py`` silently -- see ``task_interaction_close.py`` for what
-    that means for an interaction row left open. The three guard sites are
-    not equally exposed to it, though: the deferred WebSocket guard is
-    documented defense-in-depth there, since it can only ever re-name a row
-    an earlier attempt already retired.
-
-    Relative to ``test_user_message_injection_outcome_truthiness_contract``
-    above, this test's only unique catch is a member being added -- a
-    rename or removal already raises ``AttributeError`` there. A member's
-    value changing is the reverse case: caught there, not here.
-    """
+    """Adding outcomes requires auditing every success and interaction-close path."""
     assert {member.name for member in UserMessageInjectionOutcome} == {
         "NOT_POSTED",
         "POSTED_FRESH",
         "POSTED_REPLAY",
+        "OUTCOME_UNKNOWN",
     }
 
 

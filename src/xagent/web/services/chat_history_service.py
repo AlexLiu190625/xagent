@@ -44,6 +44,7 @@ DELIVERY_PENDING = "pending"
 DELIVERY_DISPATCHED = "dispatched"
 DELIVERY_COMPLETED = "completed"
 DELIVERY_FAILED = "failed"
+DELIVERY_OUTCOME_UNKNOWN = "outcome_unknown"
 
 QUESTION_MESSAGE_TYPE = "question"
 SUPERSEDED_MESSAGE_TYPE = "question_superseded"
@@ -93,6 +94,10 @@ class UserMessageDeliveryClaim:
     @property
     def failed(self) -> bool:
         return str(self.message.delivery_status) == DELIVERY_FAILED
+
+    @property
+    def outcome_unknown(self) -> bool:
+        return str(self.message.delivery_status) == DELIVERY_OUTCOME_UNKNOWN
 
     @property
     def pending(self) -> bool:
@@ -288,6 +293,7 @@ def mark_user_message_delivery(
         DELIVERY_DISPATCHED,
         DELIVERY_COMPLETED,
         DELIVERY_FAILED,
+        DELIVERY_OUTCOME_UNKNOWN,
     }:
         raise ValueError(f"Unknown delivery status: {status}")
     query = db.query(TaskChatMessage).filter(
@@ -307,6 +313,7 @@ def mark_user_message_delivery(
             DELIVERY_DISPATCHED,
             DELIVERY_COMPLETED,
             DELIVERY_FAILED,
+            DELIVERY_OUTCOME_UNKNOWN,
         },
         DELIVERY_DISPATCHED: {DELIVERY_COMPLETED},
     }

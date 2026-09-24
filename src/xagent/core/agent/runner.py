@@ -62,27 +62,21 @@ class ExecutionControl:
 
 
 class UserMessageInjectionOutcome(str, Enum):
-    """What ``AgentRunner.inject_user_message`` actually did on a given
-    call, threaded unmodified through every layer that forwards its
-    result (``ExecutionRegistry``, ``AgentExecutionAdapter``,
-    ``AgentService.post_user_message``).
+    """Result of an injection, forwarded unchanged by the service layers.
 
-    ``POSTED_FRESH`` and ``POSTED_REPLAY`` both mean a live, durable user
-    turn answers the caller's message -- a short-circuited repeat
-    ``turn_id`` (``POSTED_REPLAY``) returns the same context the first
-    attempt did without writing anything new, while ``POSTED_FRESH``
-    persisted one. ``NOT_POSTED`` is the empty string and the other two
-    members are not, so an unmodified ``if not posted`` / ``bool(posted)``
-    caller keeps asking exactly the question it always asked -- "did this
-    hand back a usable context at all" -- unaffected by the fresh/replay
-    split. Telling a replay apart from a fresh write requires comparing
-    identity against ``POSTED_REPLAY``; truthiness alone cannot and must
-    not be used for that.
+    FRESH and REPLAY confirm a durable turn; NOT_POSTED means no usable
+    context. OUTCOME_UNKNOWN means neither acceptance nor rejection can be
+    established. It must be handled explicitly before testing truthiness,
+    without treating it as permission to inject again.
+
+    The runner does not yet produce OUTCOME_UNKNOWN. Consumers are prepared
+    separately before the atomic injection producer is enabled.
     """
 
     NOT_POSTED = ""
     POSTED_FRESH = "posted_fresh"
     POSTED_REPLAY = "posted_replay"
+    OUTCOME_UNKNOWN = "outcome_unknown"
 
 
 @dataclass(frozen=True)
@@ -91,8 +85,7 @@ class UserMessageInjectionResult:
     found already holding the answered turn) with what kind of write, if
     any, produced it.
 
-    ``context`` is ``None`` only when there was no execution context to
-    inject into at all (``outcome`` is then ``NOT_POSTED``); every layer
+    ``context`` may be absent for NOT_POSTED or OUTCOME_UNKNOWN; every layer
     downstream of the registry drops the raw context and forwards only
     ``outcome``, since nothing past that boundary reads the context
     object itself today.
