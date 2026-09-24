@@ -72,6 +72,11 @@ from ..services.mcp_runtime import (
     MCPActorExecutionIdentity,
     MCPBuiltinOAuthActorPolicy,
 )
+from ..services.slack_actor_runtime import (
+    SLACK_CHANNEL_ACCESS_POLICY_ENV,
+    resolve_slack_actor_runtime_grant,
+    serialize_slack_channel_access_policy,
+)
 from ..services.tool_credentials import (
     TOOL_CREDENTIAL_SPECS,
     get_sql_connection_map,
@@ -182,6 +187,7 @@ class ResolvedToken:
 class _LegacyOAuthTokenResolution:
     access_token: str | None
     refresh_failed: bool = False
+    credential_present: bool = False
     # Set only for providers that return a per-org API host instead of
     # using a fixed domain (Salesforce) -- None for everyone else.
     instance_url: str | None = None
@@ -3871,8 +3877,12 @@ class WebToolConfig(BaseToolConfig):
         user_id: int,
         resource_owner_key: str | None,
     ) -> _LegacyOAuthTokenResolution:
-        if not oauth_account or not oauth_account.access_token:
+        if not oauth_account:
             return _LegacyOAuthTokenResolution(access_token=None)
+        if not oauth_account.access_token:
+            return _LegacyOAuthTokenResolution(
+                access_token=None, credential_present=True
+            )
 
         logger.info(
             "OAUTH CONFIG: Token found for '%s'. Refresh token present: %s, Expires: %s",
@@ -3906,6 +3916,7 @@ class WebToolConfig(BaseToolConfig):
             return _LegacyOAuthTokenResolution(
                 access_token=None,
                 refresh_failed=True,
+                credential_present=True,
             )
 
         if permanently_invalid:
@@ -3956,6 +3967,7 @@ class WebToolConfig(BaseToolConfig):
             return _LegacyOAuthTokenResolution(
                 access_token=None,
                 refresh_failed=True,
+                credential_present=True,
             )
 
         access_token = str(oauth_account.access_token)
@@ -3964,6 +3976,7 @@ class WebToolConfig(BaseToolConfig):
         return _LegacyOAuthTokenResolution(
             access_token=access_token,
             instance_url=instance_url,
+            credential_present=True,
         )
 
     async def _resolve_actor_oauth_access_token_in_worker(
@@ -4343,7 +4356,28 @@ class WebToolConfig(BaseToolConfig):
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
                     )
-                if legacy_token.access_token is None:
+                access_token = legacy_token.access_token
+                serialized_slack_policy: str | None = None
+                actor_policy = self._mcp_runtime_authorization_policy
+                if (
+                    actor_builtin
+                    and app_id == "slack"
+                    and access_token is None
+                    and not legacy_token.credential_present
+                    and actor_policy is not None
+                ):
+                    grant = await resolve_slack_actor_runtime_grant(
+                        user_id=self._user_id,
+                        resource_owner_key=actor_policy.resource_owner_key,
+                        execution_identity=self._mcp_actor_execution_identity,
+                        scope=self.get_execution_scope(),
+                    )
+                    if grant is not None:
+                        access_token = grant.access_token
+                        serialized_slack_policy = serialize_slack_channel_access_policy(
+                            grant.channel_access
+                        )
+                if access_token is None:
                     logger.info(
                         f"OAUTH CONFIG: No valid token found for '{provider_name}'."
                     )
@@ -4358,9 +4392,13 @@ class WebToolConfig(BaseToolConfig):
                     transport_config = self._build_oauth_mcp_stdio_transport_config(
                         server=server,
                         app_info=app_info,
-                        access_token=legacy_token.access_token,
+                        access_token=access_token,
                         instance_url=legacy_token.instance_url,
                     )
+                    if serialized_slack_policy is not None:
+                        transport_config.setdefault("env", {})[
+                            SLACK_CHANNEL_ACCESS_POLICY_ENV
+                        ] = serialized_slack_policy
                 except _OAuthLaunchConfigInvalid as error:
                     logger.warning(
                         "Skipping OAuth MCP server '%s' because launch_config.%s is invalid",
