@@ -2164,8 +2164,8 @@ class DAGPattern(AgentPattern):
             # registry, so it leaves the reader out entirely.
             available_tool_names=[
                 name
-                for name in (self._tool_name(tool) for tool in tools)
-                if name != SPILL_READ_TOOL_NAME
+                for tool in tools
+                if (name := self._tool_name(tool)) != SPILL_READ_TOOL_NAME
             ],
             completion_feedback=self.completion_feedback,
             reply_driven=reply_driven,

@@ -3282,14 +3282,14 @@ class ReActPattern(AgentPattern):
         external_tools = [
             self._build_tool_schema(tool)
             for tool in tools
-            if self._tool_name(tool) not in control_tool_names
+            if (name := self._tool_name(tool)) not in control_tool_names
             # Unconditional: this function only sees the static tool list
             # (it runs once per run, before the iteration loop even starts),
             # so it cannot know whether the run has stored anything yet.
             # _tool_schemas_with_spill_read adds the reader back once the
             # registry is non-empty -- a dynamic fact this function has no
             # way to observe.
-            and self._tool_name(tool) != SPILL_READ_TOOL_NAME
+            and name != SPILL_READ_TOOL_NAME
         ]
         can_lookup_output_files = any(
             schema.get("function", {}).get("name") == WORKSPACE_OUTPUT_FILES_TOOL_NAME
