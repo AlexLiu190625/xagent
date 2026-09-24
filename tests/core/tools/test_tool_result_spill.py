@@ -344,7 +344,7 @@ def test_spill_dir_for_workspace_spells_output_the_way_the_normalizer_strips_it(
     assert Path(spill_dir_for_workspace("/w")).parts[-2:] == ("output", "tool-results")
 
 
-# --- stage 1-b: the four read-side helpers (pure functions) ---------------
+# --- the four read-side helpers (pure functions) ---------------
 
 
 def test_spill_kind_of_array():
@@ -490,7 +490,7 @@ def test_spill_read_unavailable_rejects_an_undefined_reason():
         spill_read_unavailable("typo")
 
 
-# --- stage 1-c: walk, second tier, envelope, report construction ----------
+# --- walk, second tier, envelope, report construction ----------
 
 MAX_CHARS = 100
 
@@ -1472,7 +1472,7 @@ def test_spill_structured_content_spills_when_only_it_is_oversized(tmp_path):
     assert spilled["content"][0]["text"] == "small"
 
 
-# --- stage 1-d: write hardening (caps, byte truncation, OSError fallback) --
+# --- write hardening (caps, byte truncation, OSError fallback) --
 
 
 def test_second_tier_write_failure_falls_back_whole(tmp_path, monkeypatch):
@@ -2518,7 +2518,7 @@ def test_non_dict_mapping_spills_like_dict(tmp_path, monkeypatch, case):
         assert record["item_count"] == len(value)
 
 
-# --- stage 1-f: spill_record_shape_is_valid (gate 1) -----------------------
+# --- spill_record_shape_is_valid (gate 1) -----------------------
 
 VALID_SHAPE_RECORD = {
     "relative_path": "tool-results/acme-000000000000000000000000000000.json",

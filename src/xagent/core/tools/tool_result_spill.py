@@ -1489,14 +1489,13 @@ _SPILL_OBSERVATION_NOTICE_HEADER = (
 )
 # core/agent/context/execution.py has a notice of its own for the compaction
 # summary: COMPACT_REREADABLE_TOOL_NAMES lists the tools whose observation
-# the summary may drop because the model can run them again, and replaces
-# the dropped content with a one-line pointer. This header is not the same
-# mechanism and does not replace it -- an observation that was spilled is
-# not re-runnable, the file is the only remaining copy, and the entry has
-# to name that file and how to read a range of it. The one place they
-# touch is the read tool itself, which is re-readable by that definition
-# once it exists, so the change that wires the read tool in is where the
-# two get reconciled.
+# the summary request may replace with a one-line pointer, because the model
+# can run them again. This header is not the same mechanism and does not
+# replace it -- an observation that was spilled is not re-runnable, the file
+# is the only remaining copy, and the entry has to name that file and how to
+# read a range of it. read_tool_result is deliberately not on that list, so
+# its observations are never replaced by a re-run pointer: the summary
+# request carries them the way it carries any other tool's.
 _SPILL_COMPACTION_NOTICE_HEADER = (
     "Large tool results from this run were stored by the engine. Read one "
     "with read_tool_result, using start and end to take a range of items. "

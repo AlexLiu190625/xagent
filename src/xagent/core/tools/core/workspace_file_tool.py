@@ -29,7 +29,6 @@ from ..tool_result_spill import (
     SPILL_MAX_FILES_PER_RUN,
     SPILL_READ_MAX_CHARS,
     SPILL_READ_TRUNCATED_INSTRUCTION,
-    SPILL_WORKSPACE_OUTPUT_DIR_NAME,
     _spill_item_count,
     _spill_kind_of,
     _spill_slice,
@@ -1089,45 +1088,49 @@ class WorkspaceFileOperations:
 
         Only direct children that are regular files (a symlink is not
         followed) and whose name the spill writer could have produced are
-        listed; anything else is skipped silently. No digest is checked here
-        -- that would read every file in full -- so a listed file can still
-        be reported unavailable when it is read; the listing answers which
-        names are there, and the read answers whether one is a stored result.
+        listed; anything else is skipped silently. Each relative_path is the
+        canonical spelling normalize_spilled_relative_path returns, the same
+        one the notice shows and a successful read returns. No digest is
+        checked here -- that would read every file in full -- so a listed file
+        can still be reported unavailable when it is read; the listing answers
+        which names are there, and the read answers whether one is a stored
+        result.
 
-        A missing directory, a path that is not a directory, and any OSError
-        while listing all return an empty listing: a task that never stored
-        anything asking for its stored results is an ordinary question, not
-        a failure. Entries are sorted by relative_path and capped at
+        A missing directory, a path that is not a directory, and an OSError
+        from opening or iterating the directory all return an empty listing:
+        a task that never stored anything asking for its stored results is an
+        ordinary question, not a failure. An OSError from one entry's own
+        is_file or stat skips that entry only; the others are still listed.
+        Entries are sorted by relative_path and capped at
         SPILL_MAX_FILES_PER_RUN; the rest are counted in ``omitted``.
         """
         spill_dir = spill_dir_for_workspace(self.workspace.workspace_dir)
-        prefix = f"{SPILL_WORKSPACE_OUTPUT_DIR_NAME}/{SPILL_DIR_NAME}/"
+        found: list[Dict[str, Any]] = []
         try:
             with os.scandir(spill_dir) as entries:
-                candidates = sorted(
-                    (
-                        (f"{prefix}{entry.name}", entry)
-                        for entry in entries
-                        if _SPILL_FILENAME_RE.fullmatch(entry.name)
-                        and normalize_spilled_relative_path(f"{prefix}{entry.name}")
-                        is not None
-                        and entry.is_file(follow_symlinks=False)
-                    ),
-                    key=lambda candidate: candidate[0],
-                )
-            listed = [
-                {
-                    "relative_path": relative_path,
-                    "bytes": entry.stat(follow_symlinks=False).st_size,
-                }
-                for relative_path, entry in candidates[:SPILL_MAX_FILES_PER_RUN]
-            ]
+                for entry in entries:
+                    if not _SPILL_FILENAME_RE.fullmatch(entry.name):
+                        continue
+                    relative_path = normalize_spilled_relative_path(
+                        f"{SPILL_DIR_NAME}/{entry.name}"
+                    )
+                    if relative_path is None:
+                        continue
+                    try:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        size = entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+                    found.append({"relative_path": relative_path, "bytes": size})
         except OSError:
             return {"stored_results": [], "count": 0, "omitted": 0}
+        found.sort(key=lambda item: item["relative_path"])
+        listed = found[:SPILL_MAX_FILES_PER_RUN]
         return {
             "stored_results": listed,
             "count": len(listed),
-            "omitted": len(candidates) - len(listed),
+            "omitted": len(found) - len(listed),
         }
 
 

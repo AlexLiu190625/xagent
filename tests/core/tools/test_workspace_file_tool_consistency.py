@@ -2,8 +2,10 @@
 Tests for workspace file tool consistency between write and read operations.
 """
 
+import contextlib
 import hashlib
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -1003,11 +1005,11 @@ class TestReadToolResult:
         assert listing == {
             "stored_results": [
                 {
-                    "relative_path": f"output/{first}",
+                    "relative_path": first,
                     "bytes": (workspace.output_dir / first).stat().st_size,
                 },
                 {
-                    "relative_path": f"output/{second}",
+                    "relative_path": second,
                     "bytes": (workspace.output_dir / second).stat().st_size,
                 },
             ],
@@ -1056,8 +1058,53 @@ class TestReadToolResult:
         assert listing["omitted"] == 1
         paths = [entry["relative_path"] for entry in listing["stored_results"]]
         assert paths == sorted(paths)
-        assert paths[0] == f"output/tool-results/t000-{0:032d}.json"
-        assert f"output/tool-results/t064-{64:032d}.json" not in paths
+        assert paths[0] == f"tool-results/t000-{0:032d}.json"
+        assert f"tool-results/t064-{64:032d}.json" not in paths
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_read_tool_result_listing_skips_an_entry_whose_stat_fails(
+        self, tmp_path, mocker
+    ):
+        """One entry that cannot be stat'ed is left out; the rest are still
+        listed rather than the whole listing coming back empty."""
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        kept_first = self._spill_file(workspace, "a" * 10, tool_name="alpha")
+        failing = self._spill_file(workspace, "b" * 10, tool_name="beta")
+        kept_second = self._spill_file(workspace, "c" * 10, tool_name="gamma")
+        failing_name = failing.split("/", 1)[1]
+        real_scandir = os.scandir
+
+        class _StatFailingEntry:
+            def __init__(self, entry):
+                self._entry = entry
+                self.name = entry.name
+
+            def is_file(self, *, follow_symlinks=True):
+                return self._entry.is_file(follow_symlinks=follow_symlinks)
+
+            def stat(self, *, follow_symlinks=True):
+                if self.name == failing_name:
+                    raise PermissionError(13, "Permission denied", self.name)
+                return self._entry.stat(follow_symlinks=follow_symlinks)
+
+        @contextlib.contextmanager
+        def scandir_with_one_failing_stat(path):
+            with real_scandir(path) as entries:
+                yield (_StatFailingEntry(entry) for entry in entries)
+
+        mocker.patch.object(
+            core_workspace_file_tool.os, "scandir", scandir_with_one_failing_stat
+        )
+
+        listing = tools.read_tool_result()
+
+        assert [entry["relative_path"] for entry in listing["stored_results"]] == [
+            kept_first,
+            kept_second,
+        ]
+        assert listing["count"] == 2
+        assert listing["omitted"] == 0
 
     def test_read_tool_result_listing_authority_failure_raises(self, tmp_path, mocker):
         workspace = TaskWorkspace("task-1", str(tmp_path))
