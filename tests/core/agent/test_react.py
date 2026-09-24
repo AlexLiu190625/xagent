@@ -8682,6 +8682,50 @@ async def test_free_text_reply_to_several_writes_is_delivered_not_re_asked() -> 
 
 
 @pytest.mark.asyncio
+async def test_react_run_reports_pattern_error_when_resume_checkpoint_fails() -> None:
+    """A durability failure while checkpointing the received user response
+    must still be reported as a terminal pattern error.
+
+    ``run()`` calls ``_resume_waiting_for_user_if_needed`` before its own
+    ``try``/``except Exception: on_pattern_error(); raise`` block starts.
+    Without a dedicated guard around that call, a
+    ``CheckpointPersistenceError`` raised while checkpointing
+    ``"tool_interaction_response_received"`` would propagate straight past
+    ``on_pattern_error`` -- no terminal ``trace_error`` would ever be
+    recorded, even though the run aborts.
+    """
+
+    class _FailingResumeCheckpointTracer(TraceEventRecorder):
+        async def checkpoint(self, **payload: Any) -> None:
+            if payload.get("label") == "tool_interaction_response_received":
+                raise CheckpointPersistenceError("transient checkpoint write failure")
+
+    tracer = _FailingResumeCheckpointTracer()
+    pattern = ReActPattern()
+    pattern.status = "waiting_for_user"
+    pattern.waiting_for_user_request = {
+        "kind": "tool_waiting_for_user",
+        "message": "Approve?",
+        "message_type": "question",
+        "message_count": 0,
+        "requests": [],
+        "interactions": [],
+    }
+    context = ExecutionContext(execution_id="resume-checkpoint-failure")
+    context.add_user_message("Approve")
+    runtime = PatternRuntime(tracer=tracer, execution_id="resume-checkpoint-failure")
+
+    with pytest.raises(CheckpointPersistenceError):
+        await pattern.run(context=context, tools=[], llm=FakeLLM([]), runtime=runtime)
+
+    error_events = [
+        event for event in tracer.events if event["event_type"] == "task_error_general"
+    ]
+    assert error_events
+    assert error_events[-1]["data"]["error_type"] == "agent_pattern_error"
+
+
+@pytest.mark.asyncio
 async def test_concurrent_tool_interactions_pause_in_one_deterministic_message() -> (
     None
 ):

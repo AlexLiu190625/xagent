@@ -6381,6 +6381,137 @@ async def test_dag_pattern_returns_failed_result_for_plan_generator_exception() 
 
 
 @pytest.mark.asyncio
+async def test_dag_pattern_reraises_checkpoint_persistence_error_from_plan_generation() -> (
+    None
+):
+    """A durability failure while checkpointing a freshly generated plan must
+    abort the run, not become an ordinary ``_fail()`` result.
+
+    Before this fix, the broad ``except Exception`` around ``_generate_plan``
+    converted ``CheckpointPersistenceError`` into a recoverable
+    ``PatternResult(success=False)`` -- indistinguishable from any other plan
+    failure once it reached the runner's pattern loop, which could then try a
+    fallback pattern and repeat a non-idempotent side effect.
+    """
+
+    class PlanCheckpointFailingRuntime(PatternRuntime):
+        async def checkpoint(self, label: str, **kwargs: Any) -> dict[str, Any]:
+            if label == "dag_plan_generated":
+                raise CheckpointPersistenceError("transient checkpoint write failure")
+            return await super().checkpoint(label, **kwargs)
+
+    plan = build_plan(PlanStep(id="step_1", task="do the thing"))
+    pattern = DAGPattern(lambda **_: plan)
+    runtime = PlanCheckpointFailingRuntime(execution_id="dag-plan-checkpoint-failure")
+
+    with pytest.raises(CheckpointPersistenceError):
+        await pattern.run(
+            context=ExecutionContext(execution_id="dag-plan-checkpoint-failure"),
+            tools=[],
+            llm=SequenceLLM([]),
+            runtime=runtime,
+        )
+
+
+class _ReplanCheckpointFailingRuntime(PatternRuntime):
+    """Fails only the checkpoint write that follows a successful (re)plan."""
+
+    async def checkpoint(self, label: str, **kwargs: Any) -> dict[str, Any]:
+        if label == "dag_replanned":
+            raise CheckpointPersistenceError("transient checkpoint write failure")
+        return await super().checkpoint(label, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_reraises_checkpoint_persistence_error_from_replan() -> None:
+    """The in-loop replan catch must not swallow the same durability error.
+
+    Drives ``_run`` directly with a plan already set and pattern state
+    arranged so ``_needs_replan`` is true on the first loop iteration and no
+    step is actively waiting, which sends control straight into the replan
+    branch's ``_generate_plan(replan=True)`` call without first exercising
+    step execution.
+    """
+
+    plan = build_plan(PlanStep(id="step_1", task="already done", status="completed"))
+    pattern = DAGPattern(lambda **_: plan)
+    pattern.plan = plan
+    pattern.step_results = {"step_1": "already done result"}
+    pattern.status = "waiting_for_user"
+    pattern.planned_user_message_count = 0
+
+    runtime = _ReplanCheckpointFailingRuntime(
+        execution_id="dag-replan-checkpoint-failure"
+    )
+    context = ExecutionContext(execution_id="dag-replan-checkpoint-failure")
+    context.add_user_message("keep going")
+
+    with pytest.raises(CheckpointPersistenceError):
+        await pattern._run(
+            context=context,
+            tools=[],
+            llm=SequenceLLM([]),
+            runtime=runtime,
+        )
+
+
+class _IncompleteAssessmentLLM:
+    """Answers the completion-assessment tool call as not yet complete."""
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("completion assessment should stream, not chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": "call_completion",
+                    "function": {
+                        "name": DAG_COMPLETION_TOOL_NAME,
+                        "arguments": json.dumps(
+                            {
+                                "status": "incomplete",
+                                "reason": "More steps required.",
+                                "answer": "",
+                                "missing_work": "one more step",
+                                "replan_instruction": "add another step",
+                            }
+                        ),
+                    },
+                }
+            ],
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_reraises_checkpoint_persistence_error_from_completion_replan() -> (
+    None
+):
+    """The completion-replan catch must not swallow the same durability error."""
+
+    completed_step = PlanStep(id="step_1", task="already done", status="completed")
+    plan = build_plan(completed_step)
+    pattern = DAGPattern(lambda **_: plan)
+    pattern.plan = plan
+    pattern.step_results = {"step_1": "already done result"}
+
+    runtime = _ReplanCheckpointFailingRuntime(
+        execution_id="dag-completion-replan-checkpoint-failure"
+    )
+    context = ExecutionContext(execution_id="dag-completion-replan-checkpoint-failure")
+
+    with pytest.raises(CheckpointPersistenceError):
+        await pattern._handle_completed_plan(
+            context=context,
+            tools=[],
+            llm=_IncompleteAssessmentLLM(),
+            runtime=runtime,
+        )
+
+
+@pytest.mark.asyncio
 async def test_dag_pattern_returns_friendly_missing_required_tool_failure() -> None:
     runtime = PatternRuntime(execution_id="dag-plan-tool-missing")
     pattern = DAGPattern(LLMPlanGenerator())

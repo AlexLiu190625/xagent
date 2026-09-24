@@ -90,6 +90,7 @@ from ....tools.user_interaction import (
     tool_result_waits_for_user,
     user_interaction_resume_callable,
 )
+from ...checkpoint import CheckpointPersistenceError
 from ...clarification import draft_from_waiting_request
 from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
@@ -609,11 +610,21 @@ class ReActPattern(AgentPattern):
             ).to_dict()
 
         await runtime.on_pattern_start(context=context, pattern=self)
-        waiting_result = await self._resume_waiting_for_user_if_needed(
-            context=context,
-            runtime=runtime,
-            tools=tools,
-        )
+        try:
+            waiting_result = await self._resume_waiting_for_user_if_needed(
+                context=context,
+                runtime=runtime,
+                tools=tools,
+            )
+        except CheckpointPersistenceError as exc:
+            # This runs before the main try/except below, so without this
+            # handler a durability failure while checkpointing the received
+            # user response (see ``_resume_waiting_for_user_if_needed``'s
+            # ``"tool_interaction_response_received"`` checkpoint) would
+            # propagate straight past ``on_pattern_error``: no terminal
+            # ``trace_error`` would be recorded, even though the run aborts.
+            await runtime.on_pattern_error(context=context, pattern=self, error=exc)
+            raise
         if waiting_result is not None:
             await runtime.on_pattern_end(
                 context=context,

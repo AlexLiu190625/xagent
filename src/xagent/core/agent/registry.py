@@ -195,7 +195,23 @@ class ExecutionRegistry:
             return None
         if handle.status == ExecutionLifecycleStatus.CANCELLED:
             return None
-        result = await handle.runner.resume(execution_id, **kwargs)
+        try:
+            result = await handle.runner.resume(execution_id, **kwargs)
+        except Exception:
+            # A raised exception (for example CheckpointPersistenceError)
+            # means this resume never reached a normalized result, so
+            # ``_apply_result`` below never runs. Leaving the handle in its
+            # previous ``is_resumable`` state would let a caller resume it
+            # again and repeat whatever non-idempotent work already
+            # happened before the failure -- settle it the same way
+            # ``_on_task_done`` already does for the async ``start()`` path,
+            # then let the caller see the original exception.
+            handle.status = ExecutionLifecycleStatus.FAILED
+            handle.last_error = "Execution resume failed without a normalized result."
+            handle.updated_at = _utcnow()
+            self._emit_event("execution.failed", handle)
+            self.unregister(execution_id)
+            raise
         self._apply_result(handle, result)
         if not handle.is_resumable:
             self.unregister(execution_id)

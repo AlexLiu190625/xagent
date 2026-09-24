@@ -22,7 +22,11 @@ from ..task_runtime import (
 )
 from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
-from .checkpoint import CheckpointCorruptError, read_latest_checkpoint_payload
+from .checkpoint import (
+    CheckpointCorruptError,
+    CheckpointPersistenceError,
+    read_latest_checkpoint_payload,
+)
 from .context import ContextManager, ExecutionContext
 from .context.execution import (
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
@@ -355,6 +359,36 @@ class AgentRunner:
                             result=normalized,
                         )
                         return normalized
+                    except CheckpointPersistenceError as exc:
+                        # A checkpoint that did not persist is not a
+                        # recoverable pattern failure: the state transition
+                        # was never durably committed. Falling through to the
+                        # next pattern would let it repeat a non-idempotent
+                        # side effect the failed pattern already performed, or
+                        # report success while the checkpoint needed for
+                        # recovery is missing. Abort the run instead, the same
+                        # way ``ExecutionInterrupted`` above leaves the loop.
+                        teardown_status = "failed"
+                        if not getattr(runtime, "pattern_error_reported", False):
+                            # The AgentPattern contract only requires
+                            # run(); a custom pattern that raises this
+                            # without calling on_pattern_error() itself
+                            # (as DAGPattern and ReActPattern already do)
+                            # would otherwise abort with no terminal
+                            # trace_error at all. Report it here, exactly
+                            # once, without letting a failure in this
+                            # fallback report mask the original
+                            # persistence error.
+                            try:
+                                await runtime.on_pattern_error(
+                                    context=context, pattern=pattern, error=exc
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "on_pattern_error failed while reporting "
+                                    "a checkpoint durability abort"
+                                )
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         teardown_status = "failed"
                         logger.exception(

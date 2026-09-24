@@ -36,7 +36,7 @@ from ..tools.user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
 )
-from .checkpoint import CheckpointPersistenceError
+from .checkpoint import CheckpointPersistenceError, TraceCheckpointStore
 from .context.execution import (
     COMPACT_SUMMARY_FALLBACK_BUDGETS,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
@@ -321,6 +321,12 @@ class PatternRuntime:
     # on_tool_error so tool trace events can be joined to their turn without
     # relying on step_id or timestamp-adjacency heuristics.
     active_turn_id: str | None = None
+    # Set by on_pattern_error() before it does anything else, so the
+    # runner's CheckpointPersistenceError guard can tell whether the
+    # failing pattern already reported its own terminal trace (as
+    # DAGPattern and ReActPattern do) or whether it needs a fallback
+    # report for a custom pattern that only raises.
+    pattern_error_reported: bool = False
     last_final_answer_stream_message_id: str | None = None
     inline_file_delivery: InlineFileDelivery | None = None
     _inline_stream_guards: dict[str, InlineFileStreamGuard] = field(
@@ -1043,6 +1049,12 @@ class PatternRuntime:
         pattern: Any,
         error: Exception,
     ) -> None:
+        # Set before any I/O below, so a pattern is marked as having
+        # reported its own failure even if a later step here raises --
+        # the runner's fallback terminal-trace reporting (see its
+        # ``CheckpointPersistenceError`` guard) checks this to decide
+        # whether it still needs to report the abort itself.
+        self.pattern_error_reported = True
         await self._emit_trace_event(
             TraceEventType(TraceScope.TASK, TraceAction.ERROR, TraceCategory.GENERAL),
             task_id=self._task_id(context),
@@ -1060,19 +1072,29 @@ class PatternRuntime:
             return
         finish_trace = getattr(self.tracer, "finish_trace", None)
         if callable(finish_trace):
-            await self._maybe_await(
-                finish_trace(
-                    name=self._pattern_trace_name(pattern),
-                    status="error",
-                    output={"error": str(error)},
-                    metadata={
-                        "execution_id": getattr(
-                            context, "execution_id", self.execution_id
-                        ),
-                        "pattern": pattern.__class__.__name__,
-                    },
+            try:
+                await self._maybe_await(
+                    finish_trace(
+                        name=self._pattern_trace_name(pattern),
+                        status="error",
+                        output={"error": str(error)},
+                        metadata={
+                            "execution_id": getattr(
+                                context, "execution_id", self.execution_id
+                            ),
+                            "pattern": pattern.__class__.__name__,
+                        },
+                    )
                 )
-            )
+            except Exception:
+                # Trace finalization is best-effort here: this method's job
+                # is to report ``error`` (often a CheckpointPersistenceError
+                # durability abort) to the caller. Letting a ``finish_trace``
+                # failure propagate would replace ``error`` with this
+                # unrelated exception, and the runner's typed guard would
+                # then treat the replacement as an ordinary recoverable
+                # pattern exception instead of aborting the run.
+                logger.exception("finish_trace failed while reporting a pattern error")
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
         # Count one billable action per tool invocation, at invocation time.
@@ -1874,13 +1896,46 @@ class PatternRuntime:
 
         trace_event = getattr(self.tracer, "trace_event", None)
         if callable(trace_event):
-            await self._maybe_await(
-                trace_event(
-                    self._checkpoint_trace_event_type(trace_event),
-                    task_id=str(payload.get("execution_id") or self.execution_id),
-                    data=payload,
-                )
+            # Write through ``TraceCheckpointStore`` rather than emitting the
+            # event here. Asking a plain event tracer for persisted delivery
+            # only proves its handlers ran; it does not make a task-scoped
+            # event carrying the raw payload a *readable* checkpoint. The
+            # checkpoint readers select on the canonical envelope -- system
+            # scope, ``checkpoint_type`` in ``READABLE_CHECKPOINT_TYPES``, and
+            # a ``snapshot`` dict -- so a raw event is dropped by
+            # ``EphemeralCheckpointTraceHandler`` and filtered out of the
+            # database checkpoint lookup. A cold resume would then find no
+            # checkpoint and could replay non-idempotent work, even though
+            # this call reported success.
+            #
+            # The store also keeps the capability check: it raises
+            # ``CheckpointPersistenceError`` when ``trace_event`` cannot
+            # accept ``require_persisted``, when a genuine ``Tracer`` has no
+            # handler that can answer a checkpoint read (a ``Tracer`` wired
+            # with only observational handlers such as
+            # ``ConsoleTraceHandler`` would otherwise dispatch cleanly and
+            # return an event id without ever being able to survive a cold
+            # resume), and when the write returns no event id. Nothing is
+            # double-wrapped, because a tracer that is already a
+            # ``TraceCheckpointStore`` exposes ``checkpoint`` and returns at
+            # the first branch above.
+            await TraceCheckpointStore(self.tracer, require_persisted=True).save(
+                payload
             )
+            return
+
+        # No writer capability at all: the tracer does spans only, which is
+        # the same "checkpointing is not configured" mode as ``tracer=None``
+        # above, and is treated the same way rather than failing the run.
+        # Raising here would break every execution that passes an
+        # observability-only tracer (see the span-only tracer in
+        # ``test_react.py``), which is a supported shape.
+        #
+        # The case just above is different and does raise: a tracer that
+        # exposes an event writer but cannot be asked for persisted delivery
+        # is claiming to record the checkpoint without being able to promise
+        # it survives, and that claim must not be reported as durable.
+        return
 
     async def _maybe_await(self, result: Any) -> None:
         if inspect.isawaitable(result):
@@ -2019,16 +2074,6 @@ class PatternRuntime:
     def _pattern_trace_name(self, pattern: Any) -> str:
         del pattern
         return "agent.task"
-
-    def _checkpoint_trace_event_type(self, trace_event: Any) -> Any:
-        del trace_event
-        # Runtime checkpoints are task-scoped progress events. Durable checkpoint
-        # persistence uses TraceCheckpointStore, which emits system-scoped events.
-        return TraceEventType(
-            TraceScope.TASK,
-            TraceAction.UPDATE,
-            TraceCategory.GENERAL,
-        )
 
 
 def load_pattern_checkpoint(pattern: Any, checkpoint: dict[str, Any] | None) -> None:
