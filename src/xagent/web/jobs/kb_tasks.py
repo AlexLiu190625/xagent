@@ -134,7 +134,6 @@ def _cleanup_failed_job_collection_metadata(
     payload: dict[str, Any],
     *,
     context: str,
-    successful_documents: int = 0,
 ) -> None:
     user = _get_job_user(
         db,
@@ -152,9 +151,7 @@ def _cleanup_failed_job_collection_metadata(
             collection_name=str(payload["collection"]),
             user=user,
             context=context,
-            decision=KBApiFailedIngestCleanupDecision(
-                successful_documents=successful_documents,
-            ),
+            decision=KBApiFailedIngestCleanupDecision(),
         )
     )
 
@@ -878,7 +875,6 @@ def _cleanup_failed_web_collection_metadata_if_new(
             db,
             payload,
             context="background web ingest",
-            successful_documents=int(successful_documents or 0),
         )
         return
 

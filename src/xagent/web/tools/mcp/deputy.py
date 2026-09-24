@@ -85,6 +85,110 @@ def _empty_create_response(subject: str) -> str:
     )
 
 
+def _verify_created_record(resource: str, safe_resource: str, result: Any) -> str:
+    """Confirm a just-created record is actually retrievable before
+    reporting success, rather than trusting the create response at face
+    value. Deputy's create endpoints can return a 200 with a plausible,
+    fully-formed record body (Id, timestamps, ...) for a record that
+    turns out to be permission-orphaned and unreadable by every other
+    endpoint -- confirmed in a 2026-09-21 production incident, where a
+    bare POST /resource/Employee did exactly this twice (see
+    deputy_create_resource's Employee rejection and deputy_add_employee).
+    Shared by both create tools rather than duplicated, since the same
+    "success" response shape can mislead regardless of which endpoint
+    produced it.
+
+    ``safe_resource`` is the already-``url_path_id``-sanitized form of
+    ``resource``, passed in rather than re-derived here: both callers have
+    already computed it for their own POST, and a caller that ever
+    sanitizes ``resource`` differently before its POST than what it hands
+    this helper (e.g. adds trimming/casefolding to one call site only)
+    should not be able to silently point the readback GET somewhere other
+    than the record it just created.
+    """
+    if not isinstance(result, dict):
+        # A malformed response _record_response already errors on.
+        return _record_response(resource, result)
+    if result.get("Id") is None:
+        # Already-empty ({}) is handled by each caller before this is
+        # reached, so this is a non-empty body with nothing to read back
+        # and verify against -- not a different, safer case than a
+        # present-but-orphaned Id, just a differently-shaped instance of
+        # the same "can't confirm this succeeded" risk this function
+        # exists to catch. This matters most for deputy_add_employee:
+        # Deputy's own OpenAPI spec documents POST /supervise/employee's
+        # response as an undocumented, empty schema (unlike the Resource
+        # API's Employee object, which always has an Id), so a body
+        # that comes back anyway without an Id is exactly the
+        # unconfirmed-shape case, not a clean pass-through.
+        warning = (
+            f"Unconfirmed Deputy {resource} create -- verify directly in "
+            "Deputy before relying on it. The create response had no Id "
+            "to read back and confirm."
+        )
+        return success_with_capped_dict(
+            "record", result, critical_fields={"warning": warning}
+        )
+    record_id = result["Id"]
+    detail: str | None = None
+    readback: Any = None
+    try:
+        safe_id = url_path_id(str(record_id), "resource_id")
+        readback = _request("GET", f"/resource/{safe_resource}/{safe_id}")
+        verified = isinstance(readback, dict) and bool(readback)
+    except Exception as e:
+        verified = False
+        # `str(e)` is "" for an exception raised with no args (e.g. a bare
+        # `raise SomeError()`) -- `detail` would then be falsy even though
+        # an exception genuinely happened, so this is checked with
+        # `detail is not None` below rather than truthiness, and falls
+        # back to the exception's type name so "failed: " is never
+        # followed by nothing.
+        detail = str(e) or type(e).__name__
+        logger.warning(
+            f"Deputy readback failed for {resource} Id {record_id}: {detail}",
+            exc_info=True,
+        )
+    if verified:
+        # The freshly-read record, not the create response: Deputy may
+        # normalize or default fields between the write and this read, and
+        # since a full GET is already being paid for, there's no reason to
+        # return the staler of the two.
+        return _record_response(resource, readback)
+    if detail is not None:
+        reason = f"failed: {detail}"
+    elif not readback:
+        reason = "returned no record"
+    else:
+        # verified is False here only because readback wasn't a dict (see
+        # the isinstance check above) -- something came back, just not
+        # record-shaped, which is a different, more informative case than
+        # a plain empty response.
+        reason = "returned an unexpected response shape"
+    # The actionable instruction comes first and the (potentially long,
+    # up to MAX_ERROR_RESPONSE_TEXT_CHARS) diagnostic detail comes last:
+    # success_with_capped_dict's last-resort fallback cuts an oversized
+    # critical field from the end, so if this ever needs shortening, it
+    # must eat into "reason" -- not into the one instruction a caller
+    # actually needs to act on. "Do not retry" is explicit rather than
+    # implied by "verify directly": the POST that got this far already
+    # returned an Id, so Deputy most likely did create the record --
+    # retrying the create on an unconfirmed *readback* risks a genuine
+    # duplicate, not just a redundant no-op.
+    warning = (
+        f"Unconfirmed Deputy {resource} create (Id {record_id}) -- verify "
+        "directly in Deputy before relying on it; do not retry the create, "
+        f"which likely already succeeded. Reading it back {reason}."
+    )
+    # critical_fields, not extra_fields: this warning is the entire point
+    # of this function, so it must survive even success_with_capped_dict's
+    # last-resort truncation fallback, which otherwise drops ordinary
+    # extra_fields to make room.
+    return success_with_capped_dict(
+        "record", result, critical_fields={"warning": warning}
+    )
+
+
 def _success_with_capped_list(
     list_field: str, items: list[Any], *, truncated: bool = False, **extra: Any
 ) -> str:
@@ -400,6 +504,10 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
     This is not idempotent: retrying after a timeout or connection error
     can create a duplicate record. Use deputy_query_resource to check
     whether the record already exists before retrying a failed call.
+    After Deputy reports success, this reads the new record back before
+    confirming -- if that fails, the result is still returned but with a
+    "warning" field flagging it as unconfirmed; treat that the same as a
+    failure until you've verified it directly in Deputy.
     """
     try:
         # Case/whitespace-insensitive: Deputy's own resource-name routing
@@ -441,7 +549,7 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
         result = _request("POST", f"/resource/{safe_resource}", json_data=create_data)
         if isinstance(result, dict) and not result:
             return _empty_create_response(resource)
-        return _record_response(resource, result)
+        return _verify_created_record(resource, safe_resource, result)
     except Exception as e:
         logger.error(f"Error creating Deputy {resource} record: {e}", exc_info=True)
         return _error(str(e))
@@ -512,6 +620,10 @@ def deputy_add_employee(
     can create a duplicate record. Use deputy_query_resource("Employee",
     ...) to check whether the record already exists before retrying a
     failed call.
+    After Deputy reports success, this reads the new employee back before
+    confirming -- if that fails, the result is still returned but with a
+    "warning" field flagging it as unconfirmed; treat that the same as a
+    failure until you've verified it directly in Deputy.
     """
     try:
         # Flattened, individually-named parameters rather than a generic
@@ -555,7 +667,7 @@ def deputy_add_employee(
         result = _request("POST", "/supervise/employee", json_data=body)
         if isinstance(result, dict) and not result:
             return _empty_create_response("employee")
-        return _record_response("Employee", result)
+        return _verify_created_record("Employee", "Employee", result)
     except Exception as e:
         logger.error(f"Error adding Deputy employee: {e}", exc_info=True)
         return _error(str(e))

@@ -347,55 +347,6 @@ def _compensation_incomplete(
     )
 
 
-def _compensate_new_uploaded_file_impl(
-    db: Session,
-    *,
-    file_id: str,
-    user_id: Optional[int] = None,
-    delete_local: bool = True,
-    local_root: Optional[Path] = None,
-) -> FileCompensationResult:
-    """Idempotently remove a newly created UploadedFile row and artifacts.
-
-    The caller owns commit/rollback timing. This helper flushes through
-    ``UploadedFileStore.delete`` but intentionally does not commit.
-    """
-    normalized_file_id = str(file_id or "").strip()
-    if not normalized_file_id:
-        return _compensation_complete("missing_file_id")
-
-    query = db.query(UploadedFile).filter(UploadedFile.file_id == normalized_file_id)
-    if user_id is not None:
-        scope = resolve_user_scope(user_id=user_id, is_admin=False)
-        if scope.user_id is None:
-            return _compensation_complete("missing_user")
-        query = query.filter(UploadedFile.user_id == scope.user_id)
-    file_record = query.first()
-    if file_record is None:
-        return _compensation_complete("already_removed")
-
-    try:
-        effective_local_root = local_root
-        if delete_local and effective_local_root is None:
-            effective_local_root = get_uploads_dir()
-        UploadedFileStore(db).delete(
-            file_record,
-            delete_local=delete_local,
-            local_root=effective_local_root,
-        )
-        record_user_id = getattr(file_record, "user_id", None)
-        if record_user_id is not None:
-            _file_status_cache.invalidate_user(int(record_user_id))
-        return _compensation_complete("uploaded_file_removed")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Failed to compensate UploadedFile creation: file_id=%s error=%s",
-            normalized_file_id,
-            exc,
-        )
-        return _compensation_incomplete(exc)
-
-
 def _cleanup_local_copied_file_impl(
     *,
     file_path: Path,
@@ -1091,24 +1042,6 @@ def reconcile_uploaded_files(
         stale_ttl_hours=stale_ttl_hours,
         delete_stale=delete_stale,
         deletable_statuses=deletable_statuses,
-    )
-
-
-def compensate_new_uploaded_file(
-    db: Session,
-    *,
-    file_id: str,
-    user_id: Optional[int] = None,
-    delete_local: bool = True,
-    local_root: Optional[Path] = None,
-) -> FileCompensationResult:
-    """Idempotently remove a newly created UploadedFile row and artifacts."""
-    return _get_file_compatibility_facade().compensate_new_uploaded_file(
-        db,
-        file_id=file_id,
-        user_id=user_id,
-        delete_local=delete_local,
-        local_root=local_root,
     )
 
 
