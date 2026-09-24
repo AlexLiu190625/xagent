@@ -1096,6 +1096,10 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     // carrying, not against this attempt's own outcome, and by the time
     // this settles the state behind that wording may already have moved.
     const dispositionBefore = sendFailure.disposition
+    // Which snapshot that wording is about, captured alongside it: a
+    // superseded attempt below only merges into the panel that raised it,
+    // never into a panel a same-task re-read has since replaced.
+    const snapshotIdBefore = sendFailure.snapshotId
     // The report can change under a panel that stays up: this panel is about
     // a send that failed, not about the report, so a same-task re-read
     // leaves it alone while installing a report that no longer supports a
@@ -1139,12 +1143,34 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // resend was in flight; the result is stale, but `resending` must
       // still reset or the retry button stays stuck forever. A resend that
       // did go out needs to say so: the send-failed panel this button
-      // lives on is about to be replaced by whatever the fresher request
-      // renders next, and without a toast the user has no way to tell
-      // that clicking a resend button there would send this same turn a
-      // second time.
+      // lives on may be replaced by whatever the fresher request renders
+      // next, or, when the retarget kept this same snapshot, stay up with
+      // its button re-enabled -- either way, without a toast the user has
+      // no way to tell that clicking a resend button there would send this
+      // same turn a second time.
+      //
+      // A resend that did not go out leaves the panel itself behind --
+      // unlike the unmounted branch above, this dialog instance is still
+      // alive and may still be showing the very panel this attempt was
+      // about. That panel's wording only ever moves toward uncertainty
+      // (mergeSendFailureDisposition), so it is updated the same way a
+      // same-request failure updates it, guarded to the snapshot this
+      // attempt was actually for. A toast fires only the moment the merged
+      // wording crosses from "definitely not sent" to "may have landed" --
+      // that is the one fact this attempt adds that the user could not
+      // already tell from the panel; every other outcome leaves the panel
+      // saying what it already said, so nothing new is announced.
       setResending(false)
-      if (resendOutcome.kind === "sent") toast(t("connectorRuntime.resendSupersededSent"))
+      if (resendOutcome.kind === "sent") {
+        toast(t("connectorRuntime.resendSupersededSent"))
+        return
+      }
+      const attempt = resendOutcome.kind === "failed" ? resendOutcome.disposition : null
+      const disposition = mergeSendFailureDisposition(dispositionBefore, attempt)
+      setSendFailure(prev => (prev && prev.snapshotId === snapshotIdBefore ? { ...prev, disposition } : prev))
+      if (sendOutcomeMayHaveLanded(disposition) && !sendOutcomeMayHaveLanded(dispositionBefore)) {
+        toast(t(sendFailureTextKey(disposition)))
+      }
       return
     }
     setResending(false)
