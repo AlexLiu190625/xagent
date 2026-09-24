@@ -137,6 +137,9 @@ from ..services.kb_file_service import (
     get_document_record_file_id as _get_document_record_file_id,
 )
 from ..services.kb_file_service import (
+    list_document_records_for_file_ids as _list_document_records_for_file_ids,
+)
+from ..services.kb_file_service import (
     list_documents_for_user as _list_documents_for_user,
 )
 from ..services.kb_file_service import (
@@ -1351,8 +1354,8 @@ async def _rollback_failed_ingestion(
 
     def _compensate_file() -> None:
         if register_created and doc_id:
-            remaining_records = vector_store.list_document_records(
-                collection_name=None,
+            remaining_records = _list_document_records_for_file_ids(
+                [file_record_id],
                 user_id=user_id,
                 is_admin=bool(user.is_admin),
             )
@@ -1414,8 +1417,8 @@ async def _rollback_failed_ingestion(
                 raise RuntimeError(
                     f"delete collection physical directory during rollback failed: {error_detail}"
                 )
-            remaining_records = vector_store.list_document_records(
-                collection_name=None,
+            remaining_records = _list_document_records_for_file_ids(
+                collection_file_ids,
                 user_id=user_id,
                 is_admin=bool(user.is_admin),
             )
@@ -1543,8 +1546,8 @@ async def _rollback_failed_cloud_ingestion(
         )
 
     def _compensate_file() -> None:
-        remaining_records = vector_store.list_document_records(
-            collection_name=None,
+        remaining_records = _list_document_records_for_file_ids(
+            [file_record_id] if file_record_id is not None else [],
             user_id=user_id,
             is_admin=bool(user.is_admin),
         )
@@ -6432,8 +6435,8 @@ def _perform_kb_collection_delete(
                 deleted_counts=result.deleted_counts,
             )
 
-        remaining_records = get_vector_index_store().list_document_records(
-            collection_name=None,
+        remaining_records = _list_document_records_for_file_ids(
+            set().union(*mutation_scope.file_ids_by_owner.values()),
             user_id=user_id,
             is_admin=is_admin,
         )
@@ -7374,7 +7377,8 @@ async def delete_document_api(
 
     if cleanup_candidate_file_ids:
         try:
-            remaining_records = _list_documents_for_user(
+            remaining_records = _list_document_records_for_file_ids(
+                cleanup_candidate_file_ids,
                 user_id=user_id_int,
                 is_admin=bool(_user.is_admin),
             )

@@ -4810,15 +4810,12 @@ def test_delete_document_keeps_uploaded_file_when_other_docs_still_reference_it(
         },
     ]
 
-    def _fake_list_documents_for_user(*args, **kwargs):
-        collection_name = kwargs.get("collection_name")
-        if collection_name:
-            return [
-                record
-                for record in document_state
-                if record["collection"] == collection_name
-            ]
-        return list(document_state)
+    def _fake_referencing_records(file_ids, *, user_id, is_admin):
+        return [
+            DocumentRecord(doc_id=record["doc_id"], file_id=record["file_id"])
+            for record in document_state
+            if record["file_id"] in set(file_ids)
+        ]
 
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
         document_state[:] = [
@@ -4829,8 +4826,8 @@ def test_delete_document_keeps_uploaded_file_when_other_docs_still_reference_it(
     with (
         patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
         patch(
-            "xagent.web.api.kb._list_documents_for_user",
-            side_effect=_fake_list_documents_for_user,
+            "xagent.web.api.kb._list_document_records_for_file_ids",
+            side_effect=_fake_referencing_records,
         ),
         patch(
             "xagent.web.api.kb.delete_document",
@@ -4898,20 +4895,9 @@ def test_delete_document_skips_orphan_cleanup_when_remaining_doc_refresh_fails(
             "source_path": str(file_path),
         },
     ]
-    call_count = {"value": 0}
 
-    def _fake_list_documents_for_user(*args, **kwargs):
-        call_count["value"] += 1
-        collection_name = kwargs.get("collection_name")
-        if collection_name:
-            return [
-                record
-                for record in document_state
-                if record["collection"] == collection_name
-            ]
-        if call_count["value"] >= 2:
-            raise RuntimeError("refresh failed")
-        return list(document_state)
+    def _failing_referencing_records(file_ids, *, user_id, is_admin):
+        raise RuntimeError("refresh failed")
 
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
         document_state[:] = [
@@ -4922,8 +4908,8 @@ def test_delete_document_skips_orphan_cleanup_when_remaining_doc_refresh_fails(
     with (
         patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
         patch(
-            "xagent.web.api.kb._list_documents_for_user",
-            side_effect=_fake_list_documents_for_user,
+            "xagent.web.api.kb._list_document_records_for_file_ids",
+            side_effect=_failing_referencing_records,
         ),
         patch(
             "xagent.web.api.kb.delete_document",

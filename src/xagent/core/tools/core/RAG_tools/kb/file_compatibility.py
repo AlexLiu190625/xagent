@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Union
 
 from ..storage.contracts import DocumentRecord
 
@@ -68,6 +68,23 @@ class KBFileCompatibilityFacade:
             user_id=user_id,
             is_admin=is_admin,
             collection_name=collection_name,
+        )
+
+    def list_document_records_for_file_ids(
+        self,
+        file_ids: Iterable[str],
+        *,
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> List[DocumentRecord]:
+        from xagent.web.services.kb_file_service import (
+            _list_document_records_for_file_ids_impl,
+        )
+
+        return _list_document_records_for_file_ids_impl(
+            file_ids,
+            user_id=user_id,
+            is_admin=is_admin,
         )
 
     def build_uploaded_filename_map(
