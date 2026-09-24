@@ -37,7 +37,9 @@ from xagent.web.api.kb import (
     _atomic_replace_file,
     _build_ingest_backup_path,
     _copy_upload_file_to_path,
+    _create_document_compensation,
     _create_file_compensation_restore,
+    _create_status_compensation,
     _create_web_uploaded_file_record,
     _delete_web_rag_side_effects_for_file_id,
     _get_file_sha256,
@@ -71,8 +73,8 @@ def run_web_file_rollback(
 ):
     """Roll back a file_handler result the way ``web_ingestion`` does.
 
-    Enters at ``_run_file_handler_compensation`` so the per-boundary vs legacy
-    routing is exercised too. ``page_operation`` is None, which is the
+    Enters at ``_run_file_handler_compensation`` so the routing into per-boundary
+    compensation is exercised too. ``page_operation`` is None, which is the
     degenerate branch, not the typical one: the ingest-web route opens an
     operation, so `web_page_operation` normally yields a real ``KBOperation``
     and the coordinator takes its saga path (covered by the coordinator's own
@@ -2497,3 +2499,48 @@ def test_web_document_rollback_keeps_its_failure_label() -> None:
             )
 
     assert str(info.value) == "delete document 'd' during web rollback failed: boom"
+
+
+def test_document_and_status_compensation_without_ingestion_result() -> None:
+    from xagent.core.tools.core.RAG_tools.utils.string_utils import (
+        generate_deterministic_doc_id,
+    )
+
+    vector_store = MagicMock()
+    with (
+        patch(
+            "xagent.web.api.kb.get_session_local",
+            side_effect=RuntimeError("no DB session expected"),
+        ) as mock_session_local,
+        patch(
+            "xagent.web.api.kb._list_document_refs_for_uploaded_file",
+            return_value=[],
+        ),
+        patch("xagent.web.api.kb.get_vector_index_store", return_value=vector_store),
+        patch("xagent.web.api.kb.clear_ingestion_status") as mock_clear_status,
+    ):
+        _create_document_compensation(
+            collection_name="test_collection",
+            user_id=1,
+            is_admin=False,
+            file_record_id="file-1",
+        )(None)()
+        doc_id = generate_deterministic_doc_id("test_collection", "file-1")
+        vector_store.delete_document_data.assert_called_once_with(
+            collection_name="test_collection",
+            doc_id=doc_id,
+            user_id=1,
+            is_admin=False,
+        )
+        mock_clear_status.assert_called_once_with(
+            "test_collection", doc_id, user_id=1, is_admin=False
+        )
+
+        _create_status_compensation(
+            collection_name="test_collection",
+            user_id=1,
+            is_admin=False,
+        )(None)()
+
+    mock_clear_status.assert_called_once()
+    mock_session_local.assert_not_called()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 from unittest.mock import MagicMock
 
 import pytest
@@ -762,7 +762,7 @@ async def test_web_ingestion_file_compensation_leaves_document_effects_incomplet
     monkeypatch.setattr(
         web_ingestion, "run_document_ingestion", facade.run_document_ingestion
     )
-    compensation_calls: list[IngestionResult | None] = []
+    compensation_calls: list[str] = []
 
     def fake_run_document_ingestion_impl(**_: object) -> IngestionResult:
         return IngestionResult(
@@ -782,9 +782,7 @@ async def test_web_ingestion_file_compensation_leaves_document_effects_incomplet
         return {
             "file_path": str(temp_file),
             "file_id": "file-1",
-            "rollback_on_failure": lambda result=None: compensation_calls.append(
-                result
-            ),
+            "file_compensation": lambda: compensation_calls.append("file"),
             "rollback_context": {"rollback_kind": "new_web_file"},
         }
 
@@ -802,8 +800,7 @@ async def test_web_ingestion_file_compensation_leaves_document_effects_incomplet
 
     assert result.status == "error"
     assert result.side_effects_may_remain is True
-    assert len(compensation_calls) == 1
-    assert compensation_calls[0] is not None
+    assert compensation_calls == ["file"]
     outcome = operation_facade.last_outcome
     assert outcome is not None
     assert outcome.rollback_status is RollbackStatus.INCOMPLETE
@@ -1368,7 +1365,7 @@ async def test_web_ingestion_file_compensation_failure_marks_side_effects_remain
             message="parse failed",
         )
 
-    def rollback(_result=None) -> None:
+    def rollback() -> None:
         raise RuntimeError("rollback exploded")
 
     def file_handler(
@@ -1377,7 +1374,7 @@ async def test_web_ingestion_file_compensation_failure_marks_side_effects_remain
         return {
             "file_path": str(temp_file),
             "file_id": "file-1",
-            "rollback_on_failure": rollback,
+            "file_compensation": rollback,
             "rollback_context": {"rollback_kind": "existing_web_file_refresh"},
         }
 
@@ -1397,7 +1394,7 @@ async def test_web_ingestion_file_compensation_failure_marks_side_effects_remain
     assert result.side_effects_may_remain is True
     assert result.failed_urls == {"https://example.com/page": "parse failed"}
     assert "rollback exploded" in result.message
-    assert any("rollback_on_failure failed" in item for item in result.warnings)
+    assert any("FILE compensation failed" in item for item in result.warnings)
     outcome = operation_facade.last_outcome
     assert outcome is not None
     assert outcome.rollback_status is RollbackStatus.INCOMPLETE
@@ -1483,58 +1480,6 @@ def test_document_compensation_marks_cascaded_planes() -> None:
             }
         )
         assert operation.has_uncompensated_side_effects() is False
-
-
-def test_rollback_on_failure_compat_wrapper_delegates_to_per_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """rollback_on_failure compat wrapper calls all per-boundary callbacks."""
-    from unittest.mock import MagicMock
-
-    from xagent.web.api.kb import (
-        _create_document_compensation,
-        _create_status_compensation,
-    )
-
-    monkeypatch.setattr(
-        "xagent.web.api.kb.get_session_local",
-        MagicMock(side_effect=RuntimeError("unused in this test")),
-    )
-
-    calls: list[str] = []
-
-    def _file_cb() -> None:
-        calls.append("file")
-
-    def _snap_cb() -> None:
-        calls.append("snapshot")
-
-    file_cb: Callable = _file_cb
-    doc_factory = _create_document_compensation(
-        collection_name="demo",
-        user_id=1,
-        is_admin=True,
-        file_record_id="f1",
-    )
-    status_factory = _create_status_compensation(
-        collection_name="demo",
-        user_id=1,
-        is_admin=True,
-        ingestion_runs_snapshot=None,
-    )
-    snap_cb: Callable = _snap_cb
-
-    def _rollback_compat(ingestion_result=None) -> None:
-        calls.append("called")
-        file_cb()
-        doc_cb = doc_factory(ingestion_result)
-        doc_cb()
-        status_cb = status_factory(ingestion_result)
-        status_cb()
-        snap_cb()
-
-    _rollback_compat(None)
-    assert calls == ["called", "file", "snapshot"]
 
 
 def test_pipeline_facade_rollback_delegates_to_coordinator() -> None:

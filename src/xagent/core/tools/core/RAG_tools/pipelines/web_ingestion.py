@@ -103,19 +103,14 @@ class FileHandlerResult(TypedDict):
     Attributes:
         file_path: Path to the file for ingestion (persistent or temporary)
         file_id: Optional file_id for stable doc_id generation
-        rollback_on_failure: Optional callback to compensate file persistence
-            when the subsequent document ingestion does not succeed.
-            Only consulted when no per-boundary callback is set; the
-            boundary callbacks below take priority.
         commit_on_success: Optional callback to finalize temporary rollback
             resources once the subsequent document ingestion succeeds.
         rollback_context: Optional operation-outcome metadata describing the
             web file side effect. This is internal and does not affect public
             web ingestion result schemas.
         file_compensation: Optional FILE-boundary compensation callback.
-            Declaring any boundary callback (or rollback_on_failure) also
-            disables the pipeline's own persistent-file cleanup: the
-            handler owns whatever it wrote.
+            Declaring any boundary callback also disables the pipeline's own
+            persistent-file cleanup: the handler owns whatever it wrote.
         document_compensation: Optional DOCUMENT-boundary compensation callback.
         status_compensation: Optional STATUS-boundary compensation callback.
         snapshot_compensation: Optional SNAPSHOT-boundary compensation callback.
@@ -123,21 +118,12 @@ class FileHandlerResult(TypedDict):
 
     file_path: str
     file_id: Optional[str]
-    rollback_on_failure: NotRequired[FileHandlerCallback]
     commit_on_success: NotRequired[FileHandlerCallback]
     rollback_context: NotRequired[dict[str, object]]
     file_compensation: NotRequired[FileHandlerCallback]
     document_compensation: NotRequired[FileHandlerCallback]
     status_compensation: NotRequired[FileHandlerCallback]
     snapshot_compensation: NotRequired[FileHandlerCallback]
-
-
-class _FileHandlerRollbackError(RuntimeError):
-    def __init__(self, callback_name: str, url: str, reason: str) -> None:
-        self.callback_name = callback_name
-        self.url = url
-        self.reason = reason
-        super().__init__(f"File persistence {callback_name} failed for {url}: {reason}")
 
 
 def _callback_accepts_ingestion_result(callback: FileHandlerCallback) -> bool:
@@ -241,39 +227,17 @@ def _run_file_handler_compensation(
     warnings: list[str],
     ingestion_result: Optional[IngestionResult] = None,
 ) -> Optional[str]:
-    if not file_info:
+    if not file_info or not _has_per_boundary_compensation(file_info):
         return None
-
-    # Per-boundary compensation takes priority over legacy rollback_on_failure.
-    has_per_boundary = _has_per_boundary_compensation(file_info)
-    if has_per_boundary:
-        return _run_per_boundary_compensation(
-            pipeline_facade=pipeline_facade,
-            page_operation=page_operation,
-            file_info=file_info,
-            collection=collection,
-            url=url,
-            warnings=warnings,
-            ingestion_result=ingestion_result,
-        )
-
-    # Legacy monolithic rollback_on_failure callback (custom callbacks only)
-    legacy_callback = cast(
-        Optional[FileHandlerCallback], file_info.get("rollback_on_failure")
+    return _run_per_boundary_compensation(
+        pipeline_facade=pipeline_facade,
+        page_operation=page_operation,
+        file_info=file_info,
+        collection=collection,
+        url=url,
+        warnings=warnings,
+        ingestion_result=ingestion_result,
     )
-    if legacy_callback is not None:
-        return _run_legacy_rollback_compensation(
-            pipeline_facade=pipeline_facade,
-            page_operation=page_operation,
-            file_info=file_info,
-            collection=collection,
-            url=url,
-            warnings=warnings,
-            legacy_callback=legacy_callback,
-            ingestion_result=ingestion_result,
-        )
-
-    return None
 
 
 def _run_per_boundary_compensation(
@@ -327,61 +291,6 @@ def _run_per_boundary_compensation(
     return result.first_error
 
 
-def _run_legacy_rollback_compensation(
-    *,
-    pipeline_facade: "KBPipelineCompatibilityFacade",
-    page_operation: Any,
-    file_info: FileHandlerResult,
-    collection: str,
-    url: str,
-    warnings: list[str],
-    legacy_callback: FileHandlerCallback,
-    ingestion_result: Optional[IngestionResult] = None,
-) -> Optional[str]:
-    """Handle legacy monolithic rollback_on_failure (custom callbacks)."""
-    rollback_context = _rollback_context_payload(file_info)
-
-    def _compensate() -> None:
-        try:
-            _run_sync_file_handler_callback(
-                legacy_callback,
-                callback_name="rollback_on_failure",
-                url=url,
-                ingestion_result=ingestion_result,
-            )
-        except Exception as cleanup_error:  # noqa: BLE001
-            raise _FileHandlerRollbackError(
-                "rollback_on_failure",
-                url,
-                str(cleanup_error),
-            ) from cleanup_error
-
-    pipeline_facade.record_web_page_file_side_effect(
-        page_operation,
-        collection=collection,
-        url=url,
-        file_path=cast(Optional[str], file_info.get("file_path")),
-        file_id=cast(Optional[str], file_info.get("file_id")),
-        reason="rollback_on_failure",
-        extra_payload=rollback_context,
-        compensation=_compensate,
-    )
-    errors = pipeline_facade.compensate_web_page_file_side_effect(page_operation)
-    if not errors:
-        return None
-
-    first_error = errors[0]
-    cleanup_reason = (
-        first_error.reason
-        if isinstance(first_error, _FileHandlerRollbackError)
-        else str(first_error)
-    )
-    message = f"File persistence rollback_on_failure failed for {url}: {cleanup_reason}"
-    logger.warning(message)
-    warnings.append(message)
-    return cleanup_reason
-
-
 def _run_legacy_persistent_file_compensation(
     *,
     pipeline_facade: "KBPipelineCompatibilityFacade",
@@ -398,10 +307,7 @@ def _run_legacy_persistent_file_compensation(
     # the new-file handler deletes it, the reuse handler leaves it alone. That
     # second case is why this matters: its file_path is a pre-existing file,
     # and unlinking it here would destroy user data.
-    if file_info and (
-        _has_per_boundary_compensation(file_info)
-        or file_info.get("rollback_on_failure") is not None
-    ):
+    if file_info and _has_per_boundary_compensation(file_info):
         return None
 
     def _compensate() -> None:
@@ -650,6 +556,14 @@ async def _run_web_ingestion_impl(
                             if not file_info:
                                 raise ValueError(
                                     "File handler returned no file information"
+                                )
+                            # Ignoring it would let the persistent-file cleanup
+                            # below unlink a pre-existing file_path.
+                            if "rollback_on_failure" in file_info:
+                                raise ValueError(
+                                    "rollback_on_failure is no longer supported; "
+                                    "return per-boundary callbacks such as "
+                                    "file_compensation instead"
                                 )
                             final_file_path = Path(
                                 file_info.get("file_path") or temp_file
