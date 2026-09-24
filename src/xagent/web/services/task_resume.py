@@ -113,6 +113,22 @@ _RESUMABLE_CONTROL_STATES = frozenset(
 )
 
 
+def _trusted_task_source_sync(task_id: int) -> str | None:
+    """Read one task row's own ``source`` in a worker-owned short Session.
+
+    The resumed run's MCP approval gate is selected by this value, so it is
+    read from the task row rather than inferred from which API accepted the
+    reply. ``None`` (row gone, or a legacy row with a NULL source) means the
+    caller has nothing trusted to supply, and the runner's resume overlay
+    then keeps whatever source the checkpoint was gated under.
+    """
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        source = db.query(Task.source).filter(Task.id == task_id).scalar()
+        return str(source) if source is not None else None
+
+
 async def _schedule_waiting_a2a_resume(
     *,
     task_id: int,
@@ -122,6 +138,7 @@ async def _schedule_waiting_a2a_resume(
     heartbeat_stop: asyncio.Event,
     heartbeat_task: asyncio.Task[TaskLeaseHeartbeatOutcome],
     resumable_status: TaskStatus,
+    trusted_task_source: str | None,
 ) -> None:
     from .task_execution import (
         background_task_manager,
@@ -141,6 +158,7 @@ async def _schedule_waiting_a2a_resume(
                 agent_service=agent_service,
                 task_owner_user_id=task_owner_user_id,
                 expected_run_id=task_lease.run_id,
+                trusted_task_source=trusted_task_source,
                 previous_task=previous_task,
                 preacquired_lease=task_lease,
                 preacquired_heartbeat_stop=heartbeat_stop,
@@ -482,6 +500,12 @@ async def resume_a2a_task(
         active_interaction_read = await run_db_io_cancellation_safe(
             lambda: active_interaction_id_sync(task_id)
         )
+        # Read here, beside the other pre-injection read, rather than at the
+        # scheduling handoff below: this is the last point at which an extra
+        # await is free of the input-write/registration window.
+        trusted_task_source = await run_db_io_cancellation_safe(
+            lambda: _trusted_task_source_sync(task_id)
+        )
         # Translate the three-state read into the `int | None` this site's
         # close call takes. Absent and Unavailable both become `None` here
         # -- but that is not folding Unavailable into Absent, it is this
@@ -529,6 +553,8 @@ async def resume_a2a_task(
                 request_interrupt=False,
                 reason="A2A input-required response",
             )
+            if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                raise TaskResumeOutcomeUnknownError(message_id)
             return agent_service, posted
 
         with bind_task_lease_context(task_lease):
@@ -568,6 +594,7 @@ async def resume_a2a_task(
             heartbeat_stop=heartbeat_stop,
             heartbeat_task=heartbeat_task,
             resumable_status=resumable_status,
+            trusted_task_source=trusted_task_source,
         )
         ownership_transferred = True
     except CheckpointReadError as exc:
@@ -846,6 +873,7 @@ async def _schedule_waiting_reply_resume(
     task_lease: TaskLease,
     heartbeat_stop: asyncio.Event,
     heartbeat_task: "asyncio.Task[TaskLeaseHeartbeatOutcome]",
+    trusted_task_source: str | None,
 ) -> None:
     if task_lease.task_id != task_id or task_lease.run_id is None:
         raise ValueError("Reply resume scheduling requires an exact task lease")
@@ -866,6 +894,7 @@ async def _schedule_waiting_reply_resume(
                 agent_service=agent_service,
                 task_owner_user_id=task_owner_user_id,
                 expected_run_id=task_lease.run_id,
+                trusted_task_source=trusted_task_source,
                 previous_task=previous_task,
                 preacquired_lease=task_lease,
                 preacquired_heartbeat_stop=heartbeat_stop,
@@ -977,6 +1006,12 @@ async def resume_task_reply(
         active_interaction_read = await run_db_io_cancellation_safe(
             lambda: active_interaction_id_sync(task_id)
         )
+        # Read here, beside the other pre-injection read, rather than at the
+        # scheduling handoff below: this is the last point at which an extra
+        # await is free of the input-write/registration window.
+        trusted_task_source = await run_db_io_cancellation_safe(
+            lambda: _trusted_task_source_sync(task_id)
+        )
         # Translate the three-state read into the `int | None` this site's
         # close call takes. Absent and Unavailable both become `None` here
         # -- but that is not folding Unavailable into Absent, it is this
@@ -1024,6 +1059,8 @@ async def resume_task_reply(
                 request_interrupt=False,
                 reason="V1 interaction response",
             )
+            if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                raise TaskResumeOutcomeUnknownError(turn_id)
             return agent_service, bool(posted)
 
         with bind_task_lease_context(task_lease):
@@ -1062,6 +1099,7 @@ async def resume_task_reply(
             task_lease=task_lease,
             heartbeat_stop=heartbeat_stop,
             heartbeat_task=heartbeat_task,
+            trusted_task_source=trusted_task_source,
         )
         ownership_transferred = True
     except CheckpointReadError as exc:

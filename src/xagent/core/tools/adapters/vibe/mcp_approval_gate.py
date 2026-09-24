@@ -420,6 +420,20 @@ def _registration_for(task_source: str | None) -> _RegisteredHooks | None:
         return _REGISTRATIONS.get(task_source) if task_source is not None else None
 
 
+def has_approval_gate_for_source(task_source: str | None) -> bool:
+    """Whether calls bound to ``task_source`` are subject to an approval gate.
+
+    Public because the host wiring has to answer one question this module
+    cannot answer for it: may a *delegated* run materialize connectors that
+    the delegating run would have had to get approved? A nested run builds its
+    own execution context and cannot pause for approval, so the wiring uses
+    this to refuse those connectors rather than let them dispatch outside the
+    parent's scope. ``None`` is never gated, matching dispatch.
+    """
+
+    return _registration_for(task_source) is not None
+
+
 def _has_registrations() -> bool:
     with _REGISTRATIONS_LOCK:
         return bool(_REGISTRATIONS)

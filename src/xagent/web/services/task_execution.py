@@ -103,6 +103,7 @@ from .chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
     mark_user_message_delivery_sync,
 )
 from .client_error_messages import (
@@ -1907,10 +1908,33 @@ async def execute_task_background(
             # Execute the next turn under the same task/thread id.
             actual_task_id = str(task_id)
             task_for_agent = llm_user_message or user_message
+            # ``task_source`` and ``run_id`` are server-owned execution
+            # identities: the first selects the MCP approval registration,
+            # the second names the lease an approval is recorded under. This
+            # context is caller supplied, so both keys are overwritten rather
+            # than defaulted -- a client must not be able to relabel its task
+            # into (or out of) another source's approval policy, nor claim a
+            # different execution lease.
+            agent_context = dict(context_dict)
+            turn_run_id = (
+                task_lease.run_id if task_lease is not None else expected_run_id
+            )
+            if turn_run_id is not None:
+                # Both keys or neither: a registered source presenting an
+                # incomplete identity (``task_source`` with no ``run_id``)
+                # is refused before dispatch, which would turn a
+                # registration on this path into a hard outage for every
+                # MCP call -- strictly worse than leaving both unbound,
+                # where the call simply passes through ungated.
+                agent_context["task_source"] = snapshot.task.source
+                agent_context["run_id"] = turn_run_id
+            else:
+                agent_context.pop("task_source", None)
+                agent_context.pop("run_id", None)
             result = await agent_manager.execute_task(
                 agent_service=agent_service,
                 task=task_for_agent,
-                context=context,
+                context=agent_context,
                 task_id=actual_task_id,
                 tracking_task_id=str(task_id),
                 db_session=None,
@@ -2464,6 +2488,18 @@ async def execute_resume_background(
     preacquired_heartbeat_stop: asyncio.Event | None = None,
     preacquired_heartbeat_task: (asyncio.Task[TaskLeaseHeartbeatOutcome] | None) = None,
     preacquired_prior_status: TaskStatus | None = None,
+    # Appended, never inserted: this function has no ``*`` separator and a
+    # downstream caller (xagent-saas ``external_input_dispatch``) binds it by
+    # keyword against a pinned parameter order, so a new parameter goes last
+    # or it shifts every positional slot after it.
+    #
+    # The task row's own ``source``, read by the caller that already holds an
+    # authoritative row for this task. It is overlaid onto the restored
+    # checkpoint metadata so a resumed MCP approval is evaluated under the
+    # source it was gated for. ``None`` means "this caller has no trusted
+    # value", never "this task has no source": the runner's overlay ignores a
+    # None and keeps whatever the checkpoint carries.
+    trusted_task_source: str | None = None,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
@@ -2505,6 +2541,7 @@ async def execute_resume_background(
     task_agent_id: int | None = None
     agent_name: str | None = None
     agent_logo_url: str | None = None
+    delivery_outcome_unknown = False
     delivery_was_dispatched = delivery_already_dispatched
     control_event_state: dict[str, Any] = {}
 
@@ -2519,6 +2556,18 @@ async def execute_resume_background(
         if delivery_notifier is None:
             return
         try:
+            if delivery_outcome_unknown:
+                await delivery_notifier(
+                    turn_id=delivery_turn_id,
+                    accepted=False,
+                    message=client_error_message(
+                        ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
+                    ),
+                    error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                    retry_with_new_id=False,
+                    rejection_outcome="outcome_unknown",
+                )
+                return
             await delivery_notifier(
                 turn_id=delivery_turn_id,
                 accepted=accepted,
@@ -2546,7 +2595,9 @@ async def execute_resume_background(
                 lambda: mark_user_message_delivery_sync(
                     task_id,
                     delivery_turn_id,
-                    DELIVERY_FAILED,
+                    DELIVERY_OUTCOME_UNKNOWN
+                    if delivery_outcome_unknown
+                    else DELIVERY_FAILED,
                 )
             )
             return True
@@ -2704,6 +2755,9 @@ async def execute_resume_background(
                     ),
                     lease_heartbeat_task,
                 )
+            if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                delivery_outcome_unknown = True
+                raise RuntimeError("The user message injection outcome is unknown")
             if not posted:
                 raise RuntimeError(
                     "The user message was saved, but no resumable execution "
@@ -2847,7 +2901,13 @@ async def execute_resume_background(
             bind_task_lease_context(lease),
         ):
             result = await run_while_task_lease_owned(
-                agent_service.resume_execution_by_id(str(task_id)),
+                agent_service.resume_execution_by_id(
+                    str(task_id),
+                    metadata={
+                        "task_source": trusted_task_source,
+                        "run_id": lease.run_id,
+                    },
+                ),
                 lease_heartbeat_task,
             )
 

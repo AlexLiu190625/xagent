@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -11,7 +12,10 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionStepResult,
     WebIngestionResult,
 )
-from xagent.core.tools.core.RAG_tools.kb import KBApiOperationResult
+from xagent.core.tools.core.RAG_tools.kb import (
+    KBApiFailedIngestCleanupDecision,
+    KBApiOperationResult,
+)
 from xagent.web.api import kb as kb_module
 from xagent.web.models.user import User
 
@@ -45,14 +49,10 @@ class _Facade:
         successful_documents: int | None = None,
     ) -> Any:
         self.single_cleanup_inputs.append((api_result, successful_documents))
-        return type(
-            "Decision",
-            (),
-            {
-                "successful_documents": 3,
-                "side_effects_may_remain": api_result.rollback_complete is False,
-            },
-        )()
+        return KBApiFailedIngestCleanupDecision(
+            successful_documents=3,
+            side_effects_may_remain=api_result.rollback_complete is False,
+        )
 
     def failed_batch_ingest_cleanup_decision(
         self,
@@ -61,14 +61,10 @@ class _Facade:
         successful_documents: int | None = None,
     ) -> Any:
         self.batch_cleanup_inputs.append((api_results, successful_documents))
-        return type(
-            "Decision",
-            (),
-            {
-                "successful_documents": 5,
-                "side_effects_may_remain": True,
-            },
-        )()
+        return KBApiFailedIngestCleanupDecision(
+            successful_documents=5,
+            side_effects_may_remain=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -115,8 +111,10 @@ async def test_api_failed_ingest_config_cleanup_uses_api_outcome_decision(
             "collection_name": "demo",
             "user": user,
             "context": "ingest",
-            "successful_documents": 3,
-            "side_effects_may_remain": True,
+            "decision": KBApiFailedIngestCleanupDecision(
+                successful_documents=3,
+                side_effects_may_remain=True,
+            ),
         }
     ]
 
@@ -160,8 +158,10 @@ async def test_api_failed_batch_ingest_config_cleanup_uses_api_outcome_decision(
             "collection_name": "demo",
             "user": user,
             "context": "ingest_cloud",
-            "successful_documents": 5,
-            "side_effects_may_remain": True,
+            "decision": KBApiFailedIngestCleanupDecision(
+                successful_documents=5,
+                side_effects_may_remain=True,
+            ),
         }
     ]
 
@@ -243,7 +243,6 @@ def test_background_web_cleanup_keeps_early_exception_fallback(
         db,
         payload,
         context="background web ingest",
-        successful_documents=0,
     )
     api_helper.assert_not_called()
 
@@ -1112,3 +1111,75 @@ async def test_config_save_failure_advice_matches_what_the_user_can_do(
         )
 
     assert expected in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_failed_ingest_config_cleanup_follows_the_cleanup_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleaned: list[str] = []
+
+    async def fake_cleanup(*, collection_name: str, user: Any) -> None:
+        cleaned.append(collection_name)
+
+    monkeypatch.setattr(
+        kb_module, "_cleanup_failed_new_collection_metadata", fake_cleanup
+    )
+    user = User()
+    user.id = 3
+
+    await kb_module._cleanup_collection_metadata_after_failed_ingest(
+        collection_existed_before=False,
+        collection_name="demo",
+        user=user,
+        context="ingest",
+        decision=SimpleNamespace(  # type: ignore[arg-type]
+            keeps_new_collection_metadata=False,
+            successful_documents=5,
+            side_effects_may_remain=True,
+        ),
+    )
+
+    assert cleaned == ["demo"]
+
+
+@pytest.mark.asyncio
+async def test_failed_ingest_config_cleanup_warns_when_side_effects_may_remain(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cleaned: list[str] = []
+
+    async def fake_cleanup(*, collection_name: str, user: Any) -> None:
+        cleaned.append(collection_name)
+
+    monkeypatch.setattr(
+        kb_module, "_cleanup_failed_new_collection_metadata", fake_cleanup
+    )
+    caplog.set_level("WARNING", logger="xagent.web.api.kb")
+    user = User()
+    user.id = 3
+
+    await kb_module._cleanup_collection_metadata_after_failed_ingest(
+        collection_existed_before=False,
+        collection_name="demo",
+        user=user,
+        context="ingest",
+        decision=KBApiFailedIngestCleanupDecision(
+            successful_documents=0,
+            side_effects_may_remain=True,
+        ),
+    )
+
+    assert cleaned == []
+    assert [
+        (record.levelname, record.getMessage())
+        for record in caplog.records
+        if record.name == "xagent.web.api.kb"
+    ] == [
+        (
+            "WARNING",
+            "Skipping failed-ingest collection metadata cleanup for demo/user_3 "
+            "during ingest because rollback side effects may remain",
+        )
+    ]

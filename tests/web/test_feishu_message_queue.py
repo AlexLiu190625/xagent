@@ -214,6 +214,10 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             conversation_history=(),
             conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
+            # The turn binds ``task.source`` into the agent context (MCP
+            # approval gate identity), so the stand-in row carries the
+            # ``Task.source`` column default a channel-created task gets.
+            task=SimpleNamespace(source="internal"),
         ),
     )
 
@@ -393,6 +397,10 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
             conversation_history=(),
             conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
+            # The turn binds ``task.source`` into the agent context (MCP
+            # approval gate identity), so the stand-in row carries the
+            # ``Task.source`` column default a channel-created task gets.
+            task=SimpleNamespace(source="internal"),
         ),
     )
     monkeypatch.setattr(

@@ -727,6 +727,10 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
     schedule_resume.assert_called_once()
     scheduled_lease = schedule_resume.call_args.kwargs["task_lease"]
     assert scheduled_lease == observed_lease["lease"]
+    # The resumed run carries the task row's own source, so a gated MCP
+    # approval issued before the pause is evaluated under the source it was
+    # gated for instead of being erased by a None overlay.
+    assert schedule_resume.call_args.kwargs["trusted_task_source"] == "a2a"
     db = _direct_db_session()
     try:
         resumed = db.query(Task).filter(Task.id == int(task_id)).one()
@@ -3595,3 +3599,84 @@ def test_shared_first_message_replay_and_conflict_use_a2a_envelope(monkeypatch, 
     deleted = client.post(url, headers=_bearer(full_key), json=body)
     assert deleted.status_code == 404
     assert deleted.json()["error"]["status"] == "NOT_FOUND"
+
+
+def _seed_outcome_unknown_a2a_task(suffix: str) -> tuple[int, str, int, int]:
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title=f"legacy resume close outcome unknown {suffix}",
+            status=TaskStatus.PAUSED,
+            control_state=TaskControlState.PAUSED.value,
+            run_id=f"run-outcome-unknown-{suffix}",
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": f"ctx-outcome-unknown-{suffix}"},
+            interaction_protocol_version=1,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        row_id = _seed_active_interaction_row(
+            db,
+            task_id=task_id,
+            run_id=f"run-outcome-unknown-{suffix}",
+            idempotency_key=f"outcome-unknown-q1-{suffix}",
+        )
+    finally:
+        db.close()
+    return agent_id, full_key, task_id, row_id
+
+
+def test_message_send_reports_unknown_without_closing_interaction():
+    agent_id, full_key, task_id, row_id = _seed_outcome_unknown_a2a_task("protocol")
+    agent = MagicMock(
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+        )
+    )
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_a2a_resume",
+            new=AsyncMock(),
+        ) as schedule,
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "unknown-reply",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "uncertain reply"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+    assert response.status_code == 504, response.text
+    assert response.json()["error"]["details"][0]["reason"] == "REPLY_OUTCOME_UNKNOWN"
+    agent.post_user_message.assert_awaited_once()
+    schedule.assert_not_awaited()
+    db = _direct_db_session()
+    try:
+        # Transitional pre-producer behavior; R1 must replace this restoration.
+        assert db.get(Task, task_id).status == TaskStatus.PAUSED
+        assert (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+            .status
+            == "active"
+        )
+    finally:
+        db.close()

@@ -73,6 +73,7 @@ from ...core.tools.core.RAG_tools.core.schemas import (
 )
 from ...core.tools.core.RAG_tools.kb import (
     KBApiCompatibilityFacade,
+    KBApiFailedIngestCleanupDecision,
     KBApiOperationResult,
     get_kb_coordinator,
 )
@@ -128,9 +129,6 @@ from ..services.kb_file_service import (
 )
 from ..services.kb_file_service import (
     capture_uploaded_file_refresh_snapshot as _capture_uploaded_file_refresh_snapshot,
-)
-from ..services.kb_file_service import (
-    compensate_new_uploaded_file as _compensate_new_uploaded_file,
 )
 from ..services.kb_file_service import (
     delete_uploaded_file_if_orphaned as _delete_uploaded_file_if_orphaned,
@@ -1246,15 +1244,14 @@ async def _cleanup_collection_metadata_after_failed_ingest(
     collection_name: str,
     user: User,
     context: str,
-    successful_documents: int = 0,
-    side_effects_may_remain: bool = False,
+    decision: KBApiFailedIngestCleanupDecision,
 ) -> None:
     """Clean up only truly empty new collections; config is saved after ingest."""
     if collection_existed_before:
         return
 
-    if successful_documents > 0 or side_effects_may_remain:
-        if side_effects_may_remain:
+    if decision.keeps_new_collection_metadata:
+        if decision.side_effects_may_remain:
             logger.warning(
                 "Skipping failed-ingest collection metadata cleanup for %s/user_%s "
                 "during %s because rollback side effects may remain",
@@ -1295,8 +1292,7 @@ async def _cleanup_collection_metadata_after_failed_api_ingest(
         collection_name=collection_name,
         user=user,
         context=context,
-        successful_documents=cleanup_decision.successful_documents,
-        side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+        decision=cleanup_decision,
     )
 
 
@@ -1321,8 +1317,7 @@ async def _cleanup_collection_metadata_after_failed_batch_api_ingest(
         collection_name=collection_name,
         user=user,
         context=context,
-        successful_documents=cleanup_decision.successful_documents,
-        side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+        decision=cleanup_decision,
     )
 
 
@@ -2979,36 +2974,6 @@ def _recreate_missing_existing_file(
             "file_id": file_record_id,
         },
     )
-
-
-def _compensate_new_web_ingest_files(
-    db: Session,
-    *,
-    file_ids: set[str],
-    user_id: int,
-) -> tuple[bool, list[str]]:
-    cleanup_incomplete = False
-    cleanup_errors: list[str] = []
-    for file_id in sorted(file_ids):
-        cleanup_result = _compensate_new_uploaded_file(
-            db,
-            file_id=file_id,
-            user_id=user_id,
-        )
-        if cleanup_result.side_effects_may_remain:
-            cleanup_incomplete = True
-            cleanup_errors.extend(cleanup_result.errors)
-            db.rollback()
-            continue
-        try:
-            db.commit()
-        except Exception as commit_exc:  # noqa: BLE001
-            cleanup_incomplete = True
-            cleanup_errors.append(
-                f"Database commit failed for file {file_id}: {commit_exc}"
-            )
-            db.rollback()
-    return cleanup_incomplete, cleanup_errors
 
 
 class _WebFileLock:
@@ -4741,18 +4706,6 @@ async def ingest_cloud(
                             except OSError:
                                 pass
                         return api_result
-                    except RollbackFailureError as rollback_exc:
-                        return KBApiOperationResult(
-                            result=IngestionResult(
-                                status="error",
-                                message=str(rollback_exc),
-                                doc_id=source_filename,
-                            ),
-                            operation_outcome=api_result.operation_outcome
-                            if "api_result" in locals()
-                            else None,
-                            rollback_complete=False,
-                        )
                     except Exception as e:
                         rollback_result = IngestionResult(
                             status="error",
@@ -4801,16 +4754,6 @@ async def ingest_cloud(
                         )
                     )
 
-            except RollbackFailureError as e:
-                logger.exception("Rollback failed for %s: %s", file_info.fileName, e)
-                return KBApiOperationResult(
-                    result=IngestionResult(
-                        status="error",
-                        message=str(e),
-                        doc_id=source_filename,
-                    ),
-                    rollback_complete=False,
-                )
             except Exception as e:
                 rollback_api_result = KBApiOperationResult(
                     result=IngestionResult(

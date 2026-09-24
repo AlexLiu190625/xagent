@@ -630,7 +630,18 @@ class DAGPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
             raise
-        except RequiredToolCallError:
+        except (RequiredToolCallError, CheckpointPersistenceError):
+            # RequiredToolCallError already carries its own user-facing
+            # failure; re-raising lets the caller apply it directly.
+            # CheckpointPersistenceError is a durability failure, not a
+            # plan-generation failure: converting it to _fail() here would
+            # let its own checkpoint write (if it happens to succeed, e.g.
+            # after a transient failure) mask the durability error behind an
+            # ordinary unsuccessful PatternResult. That result reaches the
+            # runner's pattern loop as a recoverable failure, so a fallback
+            # pattern could run and repeat a non-idempotent side effect this
+            # pattern already performed. Let the runner's durability guard
+            # see it instead, same as the step-execution catch above.
             raise
         except Exception as exc:  # noqa: BLE001
             return await self._fail(
@@ -679,7 +690,9 @@ class DAGPattern(AgentPattern):
                         if interrupted is not None:
                             return interrupted
                         raise
-                    except RequiredToolCallError:
+                    except (RequiredToolCallError, CheckpointPersistenceError):
+                        # See the matching comment on the first
+                        # plan-generation catch above.
                         raise
                     except Exception as exc:  # noqa: BLE001
                         return await self._fail(
@@ -1740,7 +1753,9 @@ class DAGPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
             raise
-        except RequiredToolCallError:
+        except (RequiredToolCallError, CheckpointPersistenceError):
+            # See the matching comment on the first plan-generation catch
+            # above.
             raise
         except Exception as exc:  # noqa: BLE001
             return await self._fail(

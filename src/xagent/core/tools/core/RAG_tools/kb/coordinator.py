@@ -2133,12 +2133,6 @@ class KBCoordinator:
             return self._rollback_boundaries_with_operation(request)
         return self._rollback_boundaries_callbacks_only(request)
 
-    async def rollback_failed_ingestion(
-        self, request: RollbackFailedIngestionRequest
-    ) -> RollbackFailedIngestionResult:
-        """Async twin (coordinator convention; first awaited in #795)."""
-        return await asyncio.to_thread(self.rollback_failed_ingestion_sync, request)
-
     async def rollback_failed_upload_ingestion(
         self, request: RollbackFailedUploadIngestionRequest
     ) -> RollbackFailedIngestionResult:

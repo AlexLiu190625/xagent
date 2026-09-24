@@ -99,14 +99,16 @@ def _execution_host(pipe, env, task_id):
         with get_session_local()() as db:
             owner_id = db.get(Task, task_id).user_id
         snapshot = SimpleNamespace(
-            task=SimpleNamespace(user_id=owner_id, status=TaskStatus.RUNNING),
+            task=SimpleNamespace(
+                user_id=owner_id, status=TaskStatus.RUNNING, source="internal"
+            ),
             runtime_user=object(),
             conversation_history=(),
             conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
         )
-        task_orchestrator.load_task_setup_snapshot_sync = (
-            lambda *args, **kwargs: snapshot
+        task_orchestrator.load_task_setup_snapshot_sync = lambda *args, **kwargs: (
+            snapshot
         )
         handlers = []
         tracer = SimpleNamespace(

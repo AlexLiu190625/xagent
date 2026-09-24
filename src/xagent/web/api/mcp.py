@@ -5409,6 +5409,10 @@ async def test_mcp_connection(
         connection.update(**test_data.config)
 
         try:
+            # No ``connector_refs``: this connection is not persisted yet, so
+            # there is no connector identity to carry. The tools built here
+            # are only projected to names/descriptions and never dispatched,
+            # so the approval gate is never consulted for them.
             connections_dict: Dict[str, Any] = {"test": connection}
             load_result = await load_mcp_tools_as_agent_tools(
                 connections_dict, name_prefix="test_"
@@ -5597,6 +5601,7 @@ async def get_mcp_server_tools(
         connection = runtime_build.connection
 
         # Try to load tools
+        from ...core.tools.adapters.vibe.connector_runtime import ConnectorRef
         from ...core.tools.adapters.vibe.mcp_adapter import (
             load_mcp_tools_as_agent_tools,
         )
@@ -5606,8 +5611,15 @@ async def get_mcp_server_tools(
         load_failures: tuple[dict[str, Any], ...] = ()
         if isinstance(server_name, str):
             connections_dict: Dict[str, Any] = {server_name: connection}
+            # This listing never dispatches a call, but it is still a place
+            # where MCP tools are materialized: carry the persisted server id
+            # so every materialization seam in the process is identifiable,
+            # rather than leaving one that would fail closed if it ever grew
+            # an execution path.
             load_result = await load_mcp_tools_as_agent_tools(
-                connections_dict, name_prefix=f"server_{server_id}_"
+                connections_dict,
+                connector_refs={server_name: ConnectorRef("mcp", int(server_id))},
+                name_prefix=f"server_{server_id}_",
             )
             projection = _project_mcp_tool_load_result(load_result)
             if not projection.tools:

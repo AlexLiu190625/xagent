@@ -16,7 +16,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, TypeVar
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -57,7 +57,11 @@ from xagent.web.models.user import User
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_orchestrator
-from xagent.web.services.chat_history_service import DELIVERY_FAILED, DELIVERY_PENDING
+from xagent.web.services.chat_history_service import (
+    DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
+    DELIVERY_PENDING,
+)
 from xagent.web.services.managed_file_ref import (
     DurableObjectIntegrityError,
     DurableStorageOperationError,
@@ -1569,6 +1573,12 @@ async def test_running_chat_message_uses_one_offloop_scope_and_no_request_sessio
     assert len(resolver_threads) == 1
     assert claim_threads and claim_threads[0] != main_thread_id
     assert resume_bg.await_args.kwargs["resolved_execution_scope"] is scope
+    # The paused task row's own source must reach the resume, not the
+    # ``execute_resume_background`` default of ``None`` -- see
+    # ``test_execution_scope_turn_wiring.test_resume_task_forwards_the_task_rows_source``
+    # for the sibling resume-command call site.
+    assert resume_bg.await_args.kwargs["trusted_task_source"] == task.source
+    assert task.source == "sdk"
 
 
 @pytest.mark.asyncio
@@ -4193,8 +4203,10 @@ async def test_resume_failure_rejection_redacts_exception_text(db_session) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("unknown", [False, True])
 async def test_deferred_injection_failure_rejects_before_any_acceptance(
     db_session,
+    unknown,
 ) -> None:
     owner = _user(db_session, "owner")
     task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
@@ -4212,9 +4224,9 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
     db_session.commit()
     observed_leases: list[TaskLease | None] = []
 
-    async def post_user_message(*_args, **_kwargs) -> bool:
+    async def post_user_message(*_args, **_kwargs):
         observed_leases.append(current_task_lease())
-        return False
+        return UserMessageInjectionOutcome.OUTCOME_UNKNOWN if unknown else False
 
     agent = MagicMock(
         post_user_message=AsyncMock(side_effect=post_user_message),
@@ -4253,7 +4265,11 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
         if call.args[0].get("type") in {"message_accepted", "message_rejected"}
     ]
     assert [event["type"] for event in delivery_events] == ["message_rejected"]
-    assert delivery_events[0]["retry_with_new_id"] is True
+    assert bool(delivery_events[0].get("retry_with_new_id")) is (not unknown)
+    assert delivery_events[0]["rejection_outcome"] == (
+        "outcome_unknown" if unknown else "not_accepted"
+    )
+    agent.resume_execution_by_id.assert_not_awaited()
     assert len(observed_leases) == 1
     assert observed_leases[0] is not None
     assert observed_leases[0].task_id == int(task.id)
@@ -4265,7 +4281,12 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
         .filter(TaskChatMessage.turn_id == "deferred-injection-failure")
         .one()
     )
-    assert delivery.delivery_status == DELIVERY_FAILED
+    assert delivery.delivery_status == (
+        DELIVERY_OUTCOME_UNKNOWN if unknown else DELIVERY_FAILED
+    )
+
+    # Characterize the existing cleanup, not the target R1 unknown lifecycle.
+    assert db_session.get(Task, int(task.id)).status == TaskStatus.FAILED
 
 
 @pytest.mark.asyncio
@@ -4348,7 +4369,9 @@ async def test_deferred_injection_marker_failure_does_not_abort_resume(
         "deferred-marker-turn",
         command_execution_service.DELIVERY_DISPATCHED,
     )
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     accepted = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
@@ -4439,7 +4462,9 @@ async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
         "deferred-marker-cancel-turn",
         command_execution_service.DELIVERY_DISPATCHED,
     )
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     accepted = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
@@ -4543,7 +4568,9 @@ async def test_deferred_injection_close_failure_does_not_abort_resume(
             ),
         )
 
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     assert len(observed_close_calls) == 1
     called_task_id, called_run_id, live_run_id = observed_close_calls[0]
     assert called_task_id == int(task.id)
@@ -4640,7 +4667,9 @@ async def test_deferred_injection_closes_the_row_the_online_handler_observed(
     assert close_mock.call_args.kwargs["interaction_id"] == 9876
 
     read_mock.assert_not_called()
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     assert any(
@@ -4750,7 +4779,9 @@ async def test_deferred_injection_skips_the_close_on_a_replayed_turn_id(
     close_mock.assert_not_called()
 
     read_mock.assert_not_called()
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     assert any(
@@ -4846,7 +4877,9 @@ async def test_deferred_injection_close_cancellation_does_not_abort_resume(
             ),
         )
 
-    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    agent.resume_execution_by_id.assert_awaited_once_with(
+        str(task.id), metadata={"task_source": None, "run_id": ANY}
+    )
     assert len(observed_close_calls) == 1
     called_task_id, called_run_id, live_run_id = observed_close_calls[0]
     assert called_task_id == int(task.id)
@@ -5218,3 +5251,383 @@ async def test_a_durable_integrity_fault_is_answered_as_corruption_not_an_outage
         if entry.name == logger_name
         and "Durable storage unavailable" in entry.getMessage()
     ], "an integrity fault emitted an outage warning -- the arms are misordered"
+
+
+def _seed_deferred_delivery(db_session: Session, suffix: str) -> tuple[User, Task, str]:
+    owner = _user(db_session, f"deferred-unknown-{suffix}-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    turn_id = f"deferred-unknown-{suffix}"
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Deferred guidance",
+            message_type="user_message",
+            turn_id=turn_id,
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+    return owner, task, turn_id
+
+
+def _delivery_status(db_session: Session, turn_id: str) -> str:
+    db_session.expire_all()
+    return str(
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == turn_id, TaskChatMessage.role == "user")
+        .one()
+        .delivery_status
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "files", "stored_content"),
+    [
+        ("Deferred guidance", [], "Deferred guidance"),
+        ("Deferred guidance", [{"file_id": "original-file"}], "Deferred guidance"),
+        ("", [{"file_id": "original-file"}], "Uploaded file(s)"),
+    ],
+)
+async def test_websocket_retry_preserves_unknown_delivery(
+    db_session, message, files, stored_content
+):
+    from xagent.web.api.websocket import handle_chat_message
+
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "websocket-unknown")
+    row = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == turn_id)
+        .one()
+    )
+    row.delivery_status = DELIVERY_OUTCOME_UNKNOWN
+    row.attachments = files
+    row.content = stored_content
+    db_session.commit()
+    ws = MagicMock(send_personal_message=AsyncMock())
+    with patch("xagent.web.api.websocket.manager", ws):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": message,
+                "files": files,
+                "client_message_id": turn_id,
+                "user": owner,
+            },
+        )
+    ack = _delivery_acks(ws)[0]
+    assert ack["rejection_outcome"] == "outcome_unknown"
+    assert not ack.get("retry_with_new_id")
+
+
+@pytest.mark.asyncio
+async def test_durable_unknown_notifies_origin_without_client_resend(db_session):
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "durable-origin")
+    # A registered background owner has already settled the original command.
+    row = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == turn_id)
+        .one()
+    )
+    row.delivery_status = DELIVERY_OUTCOME_UNKNOWN
+    db_session.commit()
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(owner.id),
+        command_id=turn_id,
+        kind=TaskCommandKind.MESSAGE,
+        payload={
+            "type": "chat_message",
+            "message": "Deferred guidance",
+            "client_message_id": turn_id,
+            "files": [],
+        },
+        target_run_id=None,
+        attempt_count=2,
+    )
+    origin = SimpleNamespace()
+    websocket_api._command_origins.register(turn_id, origin, int(task.id))
+    try:
+        with (
+            patch.object(
+                websocket_api.manager, "is_connection_registered", return_value=True
+            ),
+            patch.object(
+                websocket_api.manager, "send_personal_message", new=AsyncMock()
+            ) as send,
+            patch.object(
+                websocket_api.manager, "broadcast_to_task", new=AsyncMock()
+            ) as broadcast,
+        ):
+            result = await command_execution_service._execute_and_report_task_command(
+                command
+            )
+        assert result["delivery_outcome"] == DELIVERY_OUTCOME_UNKNOWN
+        assert send.await_count == 2
+        ack, recipient = send.await_args_list[0].args
+        assert recipient is origin
+        assert ack["type"] == "message_rejected"
+        assert ack["error_code"] == "message_outcome_unknown"
+        assert ack["rejection_outcome"] == "outcome_unknown"
+        assert not ack.get("retry_with_new_id")
+        notice, recipient = send.await_args_list[1].args
+        assert recipient is origin
+        assert notice["type"] == "error"
+        assert notice["task_id"] == int(task.id)
+        assert notice["client_message_id"] == turn_id
+        assert notice["error_code"] == "message_outcome_unknown"
+        assert not notice.get("retry_with_new_id")
+        broadcast.assert_not_awaited()
+        assert not websocket_api._command_origins.has(turn_id, int(task.id))
+    finally:
+        websocket_api._command_origins.discard_command(turn_id, int(task.id))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "original_files",
+    [
+        [{"file_id": "file-a"}, {"file_id": "file-a"}],
+        [{"file_id": "file-a"}, {"file_id": "missing-file"}],
+    ],
+)
+@pytest.mark.parametrize("conflicting_retry", [False, True])
+async def test_unknown_retry_compares_original_command_before_normalized_attachments(
+    db_session,
+    original_files,
+    conflicting_retry,
+):
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "normalized-retry")
+    payload = {
+        "message": "Deferred guidance",
+        "files": original_files,
+        "client_message_id": turn_id,
+    }
+    enqueued = websocket_api._enqueue_websocket_task_command_sync(
+        task_id=int(task.id),
+        actor_user_id=int(owner.id),
+        actor_is_admin=False,
+        command_id=turn_id,
+        kind=TaskCommandKind.MESSAGE,
+        payload=payload,
+        allow_missing_task=False,
+    )
+    assert enqueued.created
+    # Preparation persists only resolved, deduplicated attachment IDs.
+    row = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == turn_id)
+        .one()
+    )
+    row.attachments = [{"file_id": "file-a"}]
+    row.delivery_status = DELIVERY_OUTCOME_UNKNOWN
+    db_session.commit()
+    retry = dict(payload, user=owner)
+    if conflicting_retry:
+        retry["files"] = [{"file_id": "different-file"}]
+    ws = MagicMock(send_personal_message=AsyncMock())
+    with (
+        patch.object(websocket_api, "manager", ws),
+        patch.object(
+            websocket_api, "dispatch_task_command_promptly", new=AsyncMock()
+        ) as dispatch,
+    ):
+        await websocket_api.handle_chat_message(MagicMock(), int(task.id), retry)
+    ack = _delivery_acks(ws)[0]
+    assert ack["rejection_outcome"] == (
+        "not_accepted" if conflicting_retry else "outcome_unknown"
+    )
+    assert bool(ack.get("retry_with_new_id")) is conflicting_retry
+    assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_live_injection_outcome_unknown_is_not_acknowledged_or_reposted(
+    live_task_lease,
+    db_session,
+) -> None:
+    owner = _user(db_session, "outcome-unknown-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "outcome-unknown-runner"
+    task.run_id = "outcome-unknown-run"
+    db_session.commit()
+    live_task_lease(db_session, task)
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_mgr.running_tasks.get.return_value = None
+    resume_background_mock = AsyncMock()
+
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background",
+            resume_background_mock,
+        ),
+        patch(
+            "xagent.web.services.task_command_execution.close_legacy_resume_interaction_sync",
+        ) as close_mock,
+    ):
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
+            int(task.id),
+            {
+                "message": "Unconfirmed write",
+                "client_message_id": "outcome-unknown-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    close_mock.assert_not_called()
+    bg_mgr.register_reserved_resume.assert_not_called()
+    bg_mgr.release_resume_reservation.assert_called_once_with(int(task.id))
+    resume_background_mock.assert_not_called()
+    ack = _delivery_acks(ws_manager)[0]
+    assert ack["type"] == "message_rejected"
+    assert ack["error_code"] == "message_outcome_unknown"
+    assert ack["rejection_outcome"] == "outcome_unknown"
+    assert not ack.get("retry_with_new_id")
+    assert (
+        _delivery_status(db_session, "outcome-unknown-turn") == DELIVERY_OUTCOME_UNKNOWN
+    )
+
+    # Live injection still has no task handoff until R1 enables the producer.
+    assert db_session.get(Task, int(task.id)).status == TaskStatus.RUNNING
+
+
+def _delivery_acks(ws_manager: MagicMock) -> list[dict[str, Any]]:
+    return [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") in {"message_accepted", "message_rejected"}
+    ]
+
+
+@pytest.mark.parametrize("missing_actor_subject", [False, True])
+def test_existing_command_payload_comparison_is_read_only(
+    db_session, missing_actor_subject
+):
+    from sqlalchemy import event
+
+    from xagent.web.services.task_command_transport import (
+        existing_task_command_payload_matches,
+    )
+
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "readonly")
+    payload = {"message": "Deferred guidance", "files": []}
+    websocket_api._enqueue_websocket_task_command_sync(
+        task_id=int(task.id),
+        actor_user_id=int(owner.id),
+        actor_is_admin=False,
+        command_id=turn_id,
+        kind=TaskCommandKind.MESSAGE,
+        payload=payload,
+        allow_missing_task=False,
+    )
+    db_session.refresh(owner)
+    if missing_actor_subject:
+        owner.actor_subject = None
+        db_session.commit()
+    task_id, owner_id = int(task.id), int(owner.id)
+    task.title = "pending caller-owned write"
+    statements = []
+
+    def require_select(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement)
+        assert statement.lstrip().upper().startswith("SELECT"), statement
+
+    engine = db_session.get_bind()
+    event.listen(engine, "before_cursor_execute", require_select)
+    try:
+        matches = existing_task_command_payload_matches(
+            db_session,
+            task_id=task_id,
+            actor_user_id=owner_id,
+            command_id=turn_id,
+            kind=TaskCommandKind.MESSAGE,
+            payload=payload,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", require_select)
+    assert statements
+    assert matches is (not missing_actor_subject)
+    assert task in db_session.dirty
+    if missing_actor_subject:
+        assert owner.actor_subject is None
+    db_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_unknown_retry_during_task_deletion_does_not_enqueue(db_session):
+    from xagent.web.services import task_command_transport as transport
+
+    owner, task, turn_id = _seed_deferred_delivery(db_session, "deleted-retry")
+    task_id, owner_id = int(task.id), int(owner.id)
+    payload = {
+        "message": "Deferred guidance",
+        "files": [],
+        "client_message_id": turn_id,
+    }
+    websocket_api._enqueue_websocket_task_command_sync(
+        task_id=task_id,
+        actor_user_id=owner_id,
+        actor_is_admin=False,
+        command_id=turn_id,
+        kind=TaskCommandKind.MESSAGE,
+        payload=payload,
+        allow_missing_task=False,
+    )
+    row = db_session.query(TaskChatMessage).filter_by(turn_id=turn_id).one()
+    row.delivery_status = DELIVERY_OUTCOME_UNKNOWN
+    db_session.commit()
+    load_actor_subject = transport._load_actor_subject
+
+    def delete_after_command_read(db, actor_user_id):
+        db_session.query(Task).filter_by(id=task_id).delete(synchronize_session=False)
+        db_session.commit()
+        return load_actor_subject(db, actor_user_id)
+
+    ws = MagicMock(send_personal_message=AsyncMock())
+    with (
+        patch.object(
+            transport, "_load_actor_subject", side_effect=delete_after_command_read
+        ),
+        patch.object(
+            websocket_api,
+            "enqueue_task_command",
+            side_effect=AssertionError("retry must only read"),
+        ),
+        patch.object(
+            websocket_api, "dispatch_task_command_promptly", new=AsyncMock()
+        ) as dispatch,
+        patch.object(websocket_api, "manager", ws),
+    ):
+        await websocket_api.handle_chat_message(
+            MagicMock(), task_id, dict(payload, user=owner)
+        )
+    ack = _delivery_acks(ws)[0]
+    assert ack["error_code"] == "message_outcome_unknown"
+    assert ack["rejection_outcome"] == "outcome_unknown"
+    assert not ack.get("retry_with_new_id")
+    dispatch.assert_not_awaited()

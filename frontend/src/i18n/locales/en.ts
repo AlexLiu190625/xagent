@@ -20,6 +20,7 @@ const en = {
     authenticationRequired: "Authentication is required to send this message.",
     taskAccessDenied: "You do not have access to this task.",
     invalidMessage: "The message format is invalid.",
+    messageOutcomeUnknown: "The message may or may not have been applied. Check the conversation before sending it again.",
     uploadTooLarge: "File is too large. Please reduce the upload size and try again.",
     uploadProxyError: "Upload failed before reaching the application. Please check the server upload limit.",
     uploadFailed: "Upload failed. Please try again.",

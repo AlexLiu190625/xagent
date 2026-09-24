@@ -203,7 +203,10 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
     monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
     snapshot = SimpleNamespace(
         runtime_user=object(),
-        task=SimpleNamespace(user_id=selected.selection.user_id),
+        # ``source`` is bound into the agent context by
+        # ``execute_channel_background`` (MCP approval gate identity), so the
+        # stand-in row has to carry the column's real default.
+        task=SimpleNamespace(user_id=selected.selection.user_id, source="internal"),
         conversation_history=(),
         conversation_watermark=None,
         execution_recovery=TaskExecutionRecoverySnapshot(),
@@ -228,6 +231,9 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
     assert (
         manager.execute_task.await_args.kwargs["task_lease"].run_id == selected.run_id
     )
+    forwarded_context = manager.execute_task.await_args.kwargs["context"]
+    assert forwarded_context["task_source"] == "internal"
+    assert forwarded_context["run_id"] == selected.run_id
     with get_session_local()() as db:
         task = db.get(Task, command.task_id)
         row = db.get(TaskExecutionCommand, command.id)

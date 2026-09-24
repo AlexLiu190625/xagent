@@ -22,7 +22,11 @@ from ..task_runtime import (
 )
 from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
-from .checkpoint import CheckpointCorruptError, read_latest_checkpoint_payload
+from .checkpoint import (
+    CheckpointCorruptError,
+    CheckpointPersistenceError,
+    read_latest_checkpoint_payload,
+)
 from .context import ContextManager, ExecutionContext
 from .context.execution import (
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
@@ -62,27 +66,21 @@ class ExecutionControl:
 
 
 class UserMessageInjectionOutcome(str, Enum):
-    """What ``AgentRunner.inject_user_message`` actually did on a given
-    call, threaded unmodified through every layer that forwards its
-    result (``ExecutionRegistry``, ``AgentExecutionAdapter``,
-    ``AgentService.post_user_message``).
+    """Result of an injection, forwarded unchanged by the service layers.
 
-    ``POSTED_FRESH`` and ``POSTED_REPLAY`` both mean a live, durable user
-    turn answers the caller's message -- a short-circuited repeat
-    ``turn_id`` (``POSTED_REPLAY``) returns the same context the first
-    attempt did without writing anything new, while ``POSTED_FRESH``
-    persisted one. ``NOT_POSTED`` is the empty string and the other two
-    members are not, so an unmodified ``if not posted`` / ``bool(posted)``
-    caller keeps asking exactly the question it always asked -- "did this
-    hand back a usable context at all" -- unaffected by the fresh/replay
-    split. Telling a replay apart from a fresh write requires comparing
-    identity against ``POSTED_REPLAY``; truthiness alone cannot and must
-    not be used for that.
+    FRESH and REPLAY confirm a durable turn; NOT_POSTED means no usable
+    context. OUTCOME_UNKNOWN means neither acceptance nor rejection can be
+    established. It must be handled explicitly before testing truthiness,
+    without treating it as permission to inject again.
+
+    The runner does not yet produce OUTCOME_UNKNOWN. Consumers are prepared
+    separately before the atomic injection producer is enabled.
     """
 
     NOT_POSTED = ""
     POSTED_FRESH = "posted_fresh"
     POSTED_REPLAY = "posted_replay"
+    OUTCOME_UNKNOWN = "outcome_unknown"
 
 
 @dataclass(frozen=True)
@@ -91,8 +89,7 @@ class UserMessageInjectionResult:
     found already holding the answered turn) with what kind of write, if
     any, produced it.
 
-    ``context`` is ``None`` only when there was no execution context to
-    inject into at all (``outcome`` is then ``NOT_POSTED``); every layer
+    ``context`` may be absent for NOT_POSTED or OUTCOME_UNKNOWN; every layer
     downstream of the registry drops the raw context and forwards only
     ``outcome``, since nothing past that boundary reads the context
     object itself today.
@@ -362,6 +359,36 @@ class AgentRunner:
                             result=normalized,
                         )
                         return normalized
+                    except CheckpointPersistenceError as exc:
+                        # A checkpoint that did not persist is not a
+                        # recoverable pattern failure: the state transition
+                        # was never durably committed. Falling through to the
+                        # next pattern would let it repeat a non-idempotent
+                        # side effect the failed pattern already performed, or
+                        # report success while the checkpoint needed for
+                        # recovery is missing. Abort the run instead, the same
+                        # way ``ExecutionInterrupted`` above leaves the loop.
+                        teardown_status = "failed"
+                        if not getattr(runtime, "pattern_error_reported", False):
+                            # The AgentPattern contract only requires
+                            # run(); a custom pattern that raises this
+                            # without calling on_pattern_error() itself
+                            # (as DAGPattern and ReActPattern already do)
+                            # would otherwise abort with no terminal
+                            # trace_error at all. Report it here, exactly
+                            # once, without letting a failure in this
+                            # fallback report mask the original
+                            # persistence error.
+                            try:
+                                await runtime.on_pattern_error(
+                                    context=context, pattern=pattern, error=exc
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "on_pattern_error failed while reporting "
+                                    "a checkpoint durability abort"
+                                )
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         teardown_status = "failed"
                         logger.exception(

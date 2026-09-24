@@ -9,6 +9,11 @@ import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime
 from xagent.core.agent import runtime as runtime_module
+from xagent.core.agent.checkpoint import (
+    CHECKPOINT_SCHEMA_VERSION,
+    READABLE_CHECKPOINT_TYPES,
+    CheckpointPersistenceError,
+)
 from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.execution import (
     COMPACT_SUMMARY_METADATA_KEY,
@@ -604,7 +609,11 @@ class TraceOnlyTracer:
         *,
         task_id: str | None = None,
         data: dict[str, Any] | None = None,
-    ) -> None:
+        # Mirrors the real ``Tracer.trace_event``: a checkpoint write asks
+        # for persisted delivery, and a tracer that cannot accept the flag
+        # is not treated as a durable checkpoint writer.
+        require_persisted: bool = False,
+    ) -> str:
         self.events.append(
             {
                 "event_type": getattr(event_type, "value", str(event_type)),
@@ -612,6 +621,9 @@ class TraceOnlyTracer:
                 "data": data or {},
             }
         )
+        # The real ``Tracer.trace_event`` returns the event id; a writer that
+        # returns nothing cannot evidence persistence and is rejected.
+        return f"evt-{len(self.events)}"
 
 
 class FailingTraceOnlyTracer:
@@ -1290,16 +1302,37 @@ async def test_runtime_checkpoint_prefers_checkpoint_api() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_checkpoint_trace_event_fallback_is_task_scoped() -> None:
+async def test_runtime_checkpoint_trace_event_fallback_is_a_canonical_checkpoint() -> (
+    None
+):
+    """The event-tracer fallback must emit a *readable* checkpoint.
+
+    Asking a plain event tracer for persisted delivery only proves its
+    handlers ran. The checkpoint readers select on the canonical envelope --
+    system scope, ``checkpoint_type``, and a ``snapshot`` dict -- so a
+    task-scoped event carrying the raw payload is dropped by
+    ``EphemeralCheckpointTraceHandler`` and filtered out of the database
+    checkpoint lookup, and a cold resume would find nothing.
+    """
+
     tracer = TraceOnlyTracer()
     runtime = PatternRuntime(tracer=tracer, execution_id="exec-runtime")
     context = ExecutionContext(execution_id="exec-runtime")
 
     await runtime.checkpoint("fallback", context=context, pattern=PatternWithState())
 
-    assert tracer.events[0]["event_type"] == "task_update_general"
-    assert tracer.events[0]["task_id"] == "exec-runtime"
-    assert tracer.events[0]["data"]["label"] == "fallback"
+    event = tracer.events[0]
+    assert event["event_type"] == "system_update_general"
+    assert event["task_id"] == "exec-runtime"
+    data = event["data"]
+    # The exact fields the readers select on.
+    assert data["checkpoint_type"] in READABLE_CHECKPOINT_TYPES
+    assert data["snapshot_schema_version"] == CHECKPOINT_SCHEMA_VERSION
+    assert data["root_execution_id"] == "exec-runtime"
+    assert data["execution_id"] == "exec-runtime"
+    assert data["label"] == "fallback"
+    assert isinstance(data["snapshot"], dict)
+    assert data["snapshot"]["label"] == "fallback"
 
 
 @pytest.mark.asyncio
@@ -2647,3 +2680,58 @@ async def test_runtime_send_message_debug_logs_dropped_progress_update(
     assert "no outbound message handler" in logged
     assert "task-123" in logged
     assert "Still working" not in logged
+
+
+class _FailingFinishTraceTracer:
+    """A tracer whose finish_trace hook always fails."""
+
+    async def finish_trace(self, **kwargs: Any) -> None:
+        raise RuntimeError("tracer backend unavailable")
+
+
+class _RecordingReActPattern:
+    __class__ = type("ReActPattern", (), {})  # noqa: A003 - mimic real class name
+
+
+@pytest.mark.asyncio
+async def test_on_pattern_error_preserves_the_original_error_when_finish_trace_fails() -> (
+    None
+):
+    """A failing ``finish_trace`` hook must not mask the reported error.
+
+    Before this fix, ``on_pattern_error`` awaited the optional
+    ``tracer.finish_trace()`` hook unshielded. If that hook raised, its
+    exception propagated out of ``on_pattern_error`` in place of the
+    original error -- for a ``CheckpointPersistenceError`` durability abort,
+    that would let the runner's typed guard miss it entirely and treat the
+    replacement as an ordinary recoverable pattern exception.
+    """
+
+    runtime = PatternRuntime(
+        tracer=_FailingFinishTraceTracer(), execution_id="exec-finish-trace-fails"
+    )
+    original = CheckpointPersistenceError("after_tool checkpoint failed")
+
+    # Must return normally: the finish_trace failure is swallowed as
+    # best-effort telemetry cleanup, not re-raised in place of ``original``.
+    await runtime.on_pattern_error(
+        context=ExecutionContext(execution_id="exec-finish-trace-fails"),
+        pattern=_RecordingReActPattern(),
+        error=original,
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_pattern_error_marks_the_pattern_error_as_reported() -> None:
+    """The runner's fallback terminal-trace report checks this flag."""
+
+    runtime = PatternRuntime(execution_id="exec-reported-flag")
+    assert runtime.pattern_error_reported is False
+
+    await runtime.on_pattern_error(
+        context=ExecutionContext(execution_id="exec-reported-flag"),
+        pattern=_RecordingReActPattern(),
+        error=CheckpointPersistenceError("checkpoint write failed"),
+    )
+
+    assert runtime.pattern_error_reported is True

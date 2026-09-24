@@ -15,6 +15,7 @@ from xagent.core.agent import (
     PatternRuntime,
 )
 from xagent.core.agent import registry as registry_module
+from xagent.core.agent.checkpoint import CheckpointPersistenceError
 from xagent.core.agent.registry import ExecutionRegistry
 from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
 
@@ -115,6 +116,14 @@ class BlockingPattern:
         self.started.set()
         await asyncio.Future()
         return {"success": True, "output": "unreachable"}
+
+
+class CheckpointFailingPattern:
+    """Raises the typed durability error, as a real pattern does when its
+    checkpoint writer refuses the write mid-run."""
+
+    async def run(self, **_: Any) -> dict[str, Any]:
+        raise CheckpointPersistenceError("after_tool checkpoint failed")
 
 
 @pytest.mark.asyncio
@@ -227,6 +236,48 @@ async def test_registry_emits_lifecycle_and_message_events(
 
 
 @pytest.mark.asyncio
+async def test_registry_does_not_emit_message_posted_for_outcome_unknown(
+    tmp_path: Path,
+) -> None:
+    """An available context is not evidence that the turn was posted."""
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-unknown-event"
+    registry = ExecutionRegistry()
+    events: list[dict[str, Any]] = []
+    registry.subscribe(events.append)
+    agent = Agent(name="writer", patterns=[])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    agent.patterns = [InterruptingPattern(runner, execution_id)]
+
+    handle = registry.start(runner, execution_id=execution_id, task="Calculate 6*7")
+    await handle.task
+
+    unknown_context = ExecutionContext(execution_id=execution_id)
+
+    async def fake_inject_user_message(*_args: Any, **_kwargs: Any) -> Any:
+        from xagent.core.agent.runner import UserMessageInjectionResult
+
+        return UserMessageInjectionResult(
+            context=unknown_context,
+            outcome=UserMessageInjectionOutcome.OUTCOME_UNKNOWN,
+        )
+
+    runner.inject_user_message = fake_inject_user_message  # type: ignore[method-assign]
+
+    result = await registry.post_user_message(
+        execution_id, "Reply", request_interrupt=False
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    event_types = [event["type"] for event in events]
+    assert "execution.message_posted" not in event_types
+
+
+@pytest.mark.asyncio
 async def test_registry_logs_async_subscriber_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -333,6 +384,37 @@ async def test_registry_cancelled_execution_cannot_resume(tmp_path: Path) -> Non
         await handle.task
 
     assert await registry.resume("exec-cancel-resume") is None
+
+
+@pytest.mark.asyncio
+async def test_registry_resume_settles_a_checkpoint_failure_as_non_resumable(
+    tmp_path: Path,
+) -> None:
+    """A durability failure during resume must not leave the handle resumable.
+
+    Before this fix, ``ExecutionRegistry.resume()`` had no exception handling
+    around ``handle.runner.resume()``: a raised ``CheckpointPersistenceError``
+    exited before ``_apply_result``/``unregister`` ran, so the retained handle
+    stayed advertised as resumable. A caller could then resume it again and
+    repeat whatever non-idempotent work already happened before the failure.
+    """
+
+    registry = ExecutionRegistry()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[CheckpointFailingPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    handle = registry.register("exec-resume-checkpoint-failure", runner)
+    handle.status = ExecutionLifecycleStatus.WAITING_FOR_USER
+
+    with pytest.raises(CheckpointPersistenceError):
+        await registry.resume("exec-resume-checkpoint-failure")
+
+    assert registry.get("exec-resume-checkpoint-failure") is None
+
+    # A second resume on the same execution id must come back None (unknown
+    # handle) rather than silently retrying the same non-idempotent work.
+    assert await registry.resume("exec-resume-checkpoint-failure") is None
 
 
 @pytest.mark.asyncio

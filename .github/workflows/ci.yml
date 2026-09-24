@@ -799,7 +799,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          .github/scripts/docker-pull-retry.sh quay.io/minio/minio postgres:17-bookworm
+          .github/scripts/docker-pull-retry.sh cgr.dev/chainguard/minio postgres:17-bookworm
 
       - name: Run e2e tests
         if: needs.changes.outputs.code == 'true'

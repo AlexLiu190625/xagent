@@ -386,6 +386,12 @@ class OpenAICompatibleLLM(BaseLLM):
                 else None,
                 api_key=self.api_key,
                 timeout=self.timeout,
+                # Retry policy lives in exactly one layer. Left at the SDK
+                # default this client would retry twice inside every attempt
+                # the shared RetryWrapper makes, multiplying the configured
+                # budget by three and putting the total beyond the reach of
+                # any single bound.
+                max_retries=0,
             )
 
     def _prepare_extra_body(self, extra_body: Dict[str, Any]) -> Dict[str, Any]:

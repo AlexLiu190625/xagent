@@ -1308,6 +1308,10 @@ async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
             conversation_history=(),
             conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
+            # The turn binds ``task.source`` into the agent context (MCP
+            # approval gate identity), so the stand-in row carries the
+            # ``Task.source`` column default a channel-created task gets.
+            task=SimpleNamespace(source="internal"),
         ),
     )
     monkeypatch.setattr(

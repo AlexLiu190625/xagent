@@ -6152,6 +6152,8 @@ export function AppProvider({
               timestamp: message.timestamp,
               status: "failed",
               isResult: errorFrame.isResult,
+              // Delivery uncertainty is informational, not the task's result.
+              isSystemNotice: getWebSocketErrorCode(message) === "message_outcome_unknown",
             },
           })
         }

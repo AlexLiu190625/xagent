@@ -62,6 +62,7 @@ from ...services.channel_runtime import (
     DownloadedChannelFile,
     TelegramChannelTaskSnapshot,
     authorize_channel_sender,
+    bind_channel_turn_identity,
     get_channel_owner_agent,
     list_channel_owner_agents,
     load_active_channel_configs,
@@ -2253,6 +2254,10 @@ class TelegramBotInstance(BatchChannelControl[int]):
             )
             if setup_snapshot is None:
                 raise RuntimeError(f"Task {task_id} disappeared before execution")
+            # Server-owned execution identity: it selects this run's MCP
+            # approval registration, so it is read from the task row and
+            # never from the inbound chat event.
+            task_row_source = setup_snapshot.task.source
 
             agent_manager = get_agent_manager()
             agent_service = await agent_manager.get_agent_for_task(
@@ -2277,6 +2282,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
 
             message_turn_id = str(uuid4())
             context: dict = {"turn_id": message_turn_id}
+            bind_channel_turn_identity(
+                context, task_source=task_row_source, managed_lease=managed_lease
+            )
 
             if self._consume_user_stop_request(user_id):
                 await self._settle_fenced_turn(

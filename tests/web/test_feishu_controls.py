@@ -256,7 +256,9 @@ async def test_control_reaches_local_execution(bot, monkeypatch, command):
     monkeypatch.setattr(module, "get_shared_task_execution_enabled", lambda: False)
     entered, release = asyncio.Event(), asyncio.Event()
     lease = SimpleNamespace(
-        lease=object(),
+        # The turn reads ``lease.run_id`` for the MCP approval gate identity,
+        # so the stand-in carries the one ``TaskLease`` field it touches.
+        lease=SimpleNamespace(run_id="run-a"),
         heartbeat_task=None,
         close=AsyncMock(),
         finalize_result=AsyncMock(return_value=True),
@@ -295,6 +297,9 @@ async def test_control_reaches_local_execution(bot, monkeypatch, command):
             conversation_history=(),
             conversation_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
+            # The turn binds ``task.source`` (MCP approval gate identity);
+            # "internal" is the column default a channel task gets.
+            task=SimpleNamespace(source="internal"),
         ),
     )
     monkeypatch.setattr(module, "persist_channel_user_message", AsyncMock())
@@ -457,7 +462,12 @@ async def test_control_pauses_when_local_setup_fails(bot, monkeypatch, command):
     monkeypatch.setattr(
         module,
         "load_task_setup_snapshot_sync",
-        lambda *args: SimpleNamespace(runtime_user=None),
+        # ``task.source`` is read before setup, so the stand-in must carry it
+        # for the failure this test injects (in ``get_agent_for_task``) to be
+        # the one it actually reaches.
+        lambda *args: SimpleNamespace(
+            runtime_user=None, task=SimpleNamespace(source="internal")
+        ),
     )
     bot._handle_message_sync(message("request"))
     await asyncio.wait_for(entered.wait(), 2)

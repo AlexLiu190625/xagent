@@ -187,6 +187,7 @@ function StateProbe() {
               typeof message.content === "string" ? message.content : "react-node",
             isOptimistic: message.isOptimistic,
             isResult: message.isResult,
+            isSystemNotice: message.isSystemNotice,
             interactionRequestId: message.interactionRequestId,
           }))
         )}
@@ -6566,7 +6567,10 @@ describe("terminal error frames", () => {
   // conversation panel treat the turn as answered -- it renders only user /
   // isResult / system-notice messages, so a flagged rejection ends the live
   // progress indicator of a turn that is still running.
-  it("does not treat a rejection on a running task as the turn's result", async () => {
+  it.each([
+    ["task_busy", "clientErrors.taskBusy", false],
+    ["message_outcome_unknown", "clientErrors.messageOutcomeUnknown", true],
+  ])("does not treat %s on a running task as the turn's result", async (code, translation, isNotice) => {
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -6584,22 +6588,23 @@ describe("terminal error frames", () => {
         task_id: 1,
         task: { id: 1, status: "running" },
         message: "Task is currently busy; please wait for the previous turn to finish.",
-        error_code: "task_busy",
+        error_code: code,
       } as TestWebSocketMessage)
     })
 
     await waitFor(() => {
       expect(screen.getByTestId("messages").textContent).toContain(
-        "clientErrors.taskBusy"
+        translation
       )
     })
 
     const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
     const bubble = messages.find((m: { content: string }) =>
-      m.content.includes("clientErrors.taskBusy")
+      m.content.includes(translation)
     )
     expect(bubble).toBeDefined()
     expect(bubble?.isResult).not.toBe(true)
+    expect(bubble?.isSystemNotice).toBe(isNotice)
     // The turn is untouched: still running, still processing.
     expect(screen.getByTestId("task-status").textContent).toBe("running")
     expect(screen.getByTestId("processing").textContent).toBe("true")

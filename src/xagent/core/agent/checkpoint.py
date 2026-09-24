@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .trace import TraceAction, TraceCategory, TraceEventType, TraceScope
+from .trace import TraceAction, TraceCategory, TraceEventType, Tracer, TraceScope
 
 CHECKPOINT_TYPE = "agent_execution_checkpoint"
 LEGACY_CHECKPOINT_TYPES = frozenset({"agent_v2_execution_checkpoint"})
@@ -37,6 +37,22 @@ def checkpoint_execution_id(data: dict[str, Any]) -> str:
     nested = snapshot.get("execution_id") if isinstance(snapshot, dict) else None
     return str(
         data.get("root_execution_id") or data.get("execution_id") or nested or ""
+    )
+
+
+def supports_kwarg(method: Any, name: str) -> bool:
+    """Whether ``method`` accepts ``name`` as a keyword argument.
+
+    Used to decide whether a duck-typed tracer can be asked for persisted
+    delivery before it is treated as a durable checkpoint writer.
+    """
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return False
+    return name in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
     )
 
 
@@ -212,13 +228,38 @@ class TraceCheckpointStore:
 
         trace_event = getattr(self.tracer, "trace_event", None)
         if callable(trace_event):
-            if self.require_persisted and not self._supports_kwarg(
+            if self.require_persisted and not supports_kwarg(
                 trace_event,
                 "require_persisted",
             ):
                 raise CheckpointPersistenceError(
                     "Tracer.trace_event() cannot guarantee checkpoint persistence."
                 )
+            if self.require_persisted and isinstance(self.tracer, Tracer):
+                # ``Tracer.trace_event(require_persisted=True)`` only proves
+                # every handler currently attached to this ``Tracer``
+                # dispatched without raising, and that at least one handler
+                # is registered -- it does not prove any of them can durably
+                # store this checkpoint and later answer a read for it. A
+                # ``Tracer`` wired with only observational handlers (for
+                # example ``ConsoleTraceHandler``) would otherwise "succeed"
+                # here and still lose the checkpoint on a cold resume, since
+                # no handler is capable of ``load_latest_checkpoint``. This
+                # check is scoped to genuine ``Tracer`` instances: a
+                # duck-typed writer that implements its own
+                # ``trace_event(require_persisted=...)`` (with no
+                # ``.handlers`` list to inspect) already made its own
+                # persistence promise via the kwarg check above, and is
+                # trusted at face value as before.
+                if not any(
+                    callable(getattr(handler, "load_latest_checkpoint", None))
+                    for handler in self.tracer.handlers
+                ):
+                    raise CheckpointPersistenceError(
+                        "Tracer has no checkpoint-reading handler attached; "
+                        "its trace_event(require_persisted=True) acknowledgement "
+                        "cannot be trusted as a durable checkpoint write."
+                    )
             result = trace_event(
                 self._checkpoint_trace_event_type(trace_event),
                 task_id=event_payload["root_execution_id"],
@@ -297,16 +338,6 @@ class TraceCheckpointStore:
                 "Checkpoint payload is missing execution_id."
             )
         return str(execution_id)
-
-    def _supports_kwarg(self, method: Any, name: str) -> bool:
-        try:
-            signature = inspect.signature(method)
-        except (TypeError, ValueError):
-            return False
-        return name in signature.parameters or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
-        )
 
     def _checkpoint_trace_event_type(self, trace_event: Any) -> Any:
         del trace_event

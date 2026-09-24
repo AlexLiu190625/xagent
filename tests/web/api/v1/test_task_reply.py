@@ -245,6 +245,10 @@ def test_reply_happy_path_resumes_the_same_run(mock_start_task):
     schedule_resume.assert_called_once()
     scheduled_lease = schedule_resume.call_args.kwargs["task_lease"]
     assert scheduled_lease.run_id == "run-original"
+    # Read from the task row, not inferred from which API accepted the
+    # reply: the resumed run must present the source its pending MCP
+    # approval was gated under.
+    assert schedule_resume.call_args.kwargs["trusted_task_source"] == "sdk"
 
     db = _direct_db_session()
     try:
@@ -1101,6 +1105,7 @@ async def test_reply_resume_binds_the_coordinator_to_the_leased_run() -> None:
             task_lease=lease,
             heartbeat_stop=asyncio.Event(),
             heartbeat_task=asyncio.ensure_future(asyncio.sleep(0)),
+            trusted_task_source="sdk",
         )
         try:
             assert (
@@ -1142,3 +1147,42 @@ def test_reply_timeout_reports_accepted_outcome_unknown():
         "command_id": "original-reply",
     }
     assert "same command_id" in response.json()["error"]["message"]
+
+
+def test_reply_reports_unknown_without_closing_interaction(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="unknown-protocol")
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="unknown-protocol", idempotency_key="unknown-question"
+    )
+    post = AsyncMock(return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN)
+    agent_patch, _agent = _patch_agent_service(post)
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ) as schedule,
+    ):
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+    assert response.status_code == 504, response.text
+    assert response.json()["error"]["code"] == "reply_outcome_unknown"
+    post.assert_awaited_once()
+    schedule.assert_not_awaited()
+    db = _direct_db_session()
+    try:
+        # Transitional pre-producer behavior; R1 must replace this restoration.
+        assert db.get(Task, task_id).status == TaskStatus.WAITING_FOR_USER
+        assert (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+            .status
+            == "active"
+        )
+    finally:
+        db.close()

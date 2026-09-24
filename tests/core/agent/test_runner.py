@@ -19,6 +19,7 @@ from xagent.core.agent import runtime as runtime_module
 from xagent.core.agent.attachments import build_image_context_references
 from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
+    CheckpointPersistenceError,
     CheckpointUnavailableError,
 )
 from xagent.core.agent.context.execution import (
@@ -314,39 +315,21 @@ class EmptyCanonicalCheckpointStore:
 
 
 def test_user_message_injection_outcome_truthiness_contract() -> None:
-    """``NOT_POSTED`` is the empty string, and the other two members are
-    not. That is the whole reason an unmodified ``if not posted`` /
-    ``bool(posted)`` caller keeps asking exactly the question it always
-    asked -- "did this hand back a usable context at all" -- across the
-    fresh/replay split. Roughly a dozen call sites in ``websocket.py``,
-    ``a2a.py`` and ``task_reply.py`` rest on it, and none of them names
-    the enum, so an edit to these values would break them all silently.
-    Assert the contract here instead, where the values live.
-    """
+    """Preserve baseline truthiness; consumers handle unknown explicitly first."""
     assert UserMessageInjectionOutcome.NOT_POSTED == ""
     assert not UserMessageInjectionOutcome.NOT_POSTED
     assert UserMessageInjectionOutcome.POSTED_FRESH
     assert UserMessageInjectionOutcome.POSTED_REPLAY
+    assert UserMessageInjectionOutcome.OUTCOME_UNKNOWN
 
 
 def test_user_message_injection_outcome_member_set_has_not_drifted() -> None:
-    """A fourth member added here falls through the ``is
-    UserMessageInjectionOutcome.POSTED_FRESH`` guards in ``a2a.py`` and
-    ``websocket.py`` silently -- see ``task_interaction_close.py`` for what
-    that means for an interaction row left open. The three guard sites are
-    not equally exposed to it, though: the deferred WebSocket guard is
-    documented defense-in-depth there, since it can only ever re-name a row
-    an earlier attempt already retired.
-
-    Relative to ``test_user_message_injection_outcome_truthiness_contract``
-    above, this test's only unique catch is a member being added -- a
-    rename or removal already raises ``AttributeError`` there. A member's
-    value changing is the reverse case: caught there, not here.
-    """
+    """Adding outcomes requires auditing every success and interaction-close path."""
     assert {member.name for member in UserMessageInjectionOutcome} == {
         "NOT_POSTED",
         "POSTED_FRESH",
         "POSTED_REPLAY",
+        "OUTCOME_UNKNOWN",
     }
 
 
@@ -787,6 +770,109 @@ async def test_runner_tries_multiple_patterns_and_collects_failures(
         "Recover",
         "second worked",
     ]
+
+
+class CheckpointFailingPattern:
+    """Raises the typed durability error, as a DAG step does when its
+    checkpoint writer refuses the write."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, **_: Any) -> dict[str, Any]:
+        self.calls += 1
+        raise CheckpointPersistenceError("checkpoint writer unavailable")
+
+
+class RaisingPattern:
+    """Raises an ordinary exception, which stays a recoverable failure."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, **_: Any) -> dict[str, Any]:
+        self.calls += 1
+        raise RuntimeError("ordinary pattern failure")
+
+
+@pytest.mark.asyncio
+async def test_runner_aborts_the_run_on_a_checkpoint_durability_failure(
+    tmp_path: Path,
+) -> None:
+    """A durability failure must not fall through to the next pattern.
+
+    The state transition was never committed, so running the fallback could
+    repeat a non-idempotent side effect the first pattern already performed,
+    or report success while the checkpoint needed for recovery is missing.
+    """
+
+    first = CheckpointFailingPattern()
+    second = FakePattern({"success": True, "message": "second worked"})
+    agent = Agent(name="writer", patterns=[first, second])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with pytest.raises(CheckpointPersistenceError):
+        await runner.run(task="Durability", execution_id="exec-durability")
+
+    assert first.calls == 1
+    assert second.calls == []
+
+
+@pytest.mark.asyncio
+async def test_runner_still_falls_back_after_an_ordinary_pattern_exception(
+    tmp_path: Path,
+) -> None:
+    """The contrast: an ordinary raised exception stays recoverable."""
+
+    first = RaisingPattern()
+    second = FakePattern({"success": True, "message": "second worked"})
+    agent = Agent(name="writer", patterns=[first, second])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(task="Recover", execution_id="exec-recover-raise")
+
+    assert first.calls == 1
+    assert len(second.calls) == 1
+    assert result["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_runner_reports_a_terminal_trace_for_a_custom_pattern_that_never_calls_on_pattern_error(
+    tmp_path: Path,
+) -> None:
+    """A custom pattern that only raises must still get a terminal trace.
+
+    The ``AgentPattern`` interface requires only ``run()``; unlike
+    ``DAGPattern``/``ReActPattern``, a custom pattern is not required to call
+    ``runtime.on_pattern_error()`` itself before letting
+    ``CheckpointPersistenceError`` propagate. Without a fallback report here,
+    the abort would still correctly propagate to the caller, but no terminal
+    ``trace_error`` would ever be recorded -- an audit/trace visibility gap.
+    """
+
+    tracer = RecordingTraceEventTracer()
+    first = CheckpointFailingPattern()
+    agent = Agent(name="writer", patterns=[first])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with pytest.raises(CheckpointPersistenceError):
+        await runner.run(task="Durability", execution_id="exec-custom-pattern-trace")
+
+    error_events = [
+        event for event in tracer.events if event["event_type"] == "task_error_general"
+    ]
+    assert error_events
+    assert error_events[-1]["data"]["error_type"] == "agent_pattern_error"
 
 
 @pytest.mark.asyncio
