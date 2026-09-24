@@ -49,6 +49,7 @@ from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
     register_mcp_approval_gate,
     unregister_mcp_approval_gate,
 )
+from xagent.core.tools.tool_result_spill import SPILL_READ_TOOL_NAME
 from xagent.core.tools.user_interaction import ToolInteractionSettlement
 
 
@@ -159,6 +160,18 @@ async def test_react_binds_exact_execution_identity_for_mcp_gate() -> None:
     assert execution.tool_call_id == "call-1"
     assert execution.pattern == "react"
     assert execution.react_step_id
+
+
+class FakeReadToolResultTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = SPILL_READ_TOOL_NAME
+            description = "Read one engine-stored large tool result."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return EmptyArgs
 
 
 class FakeWriteFileTool:
@@ -4400,6 +4413,402 @@ def test_react_final_answer_lookup_instruction_tracks_active_workspace_tool() ->
     ]["description"]
 
     assert "get_workspace_output_files" in answer_description
+
+
+def _context_with_spill_records(*relative_paths: str) -> ExecutionContext:
+    from xagent.core.agent.context.components import SpillRegistryComponent
+
+    context = ExecutionContext()
+    records = [
+        {
+            "relative_path": path,
+            "kind": "array",
+            "item_count": 1,
+            "original_chars": 10,
+            "value_path": "output",
+            "record_fields": None,
+            "truncated_after_items": None,
+        }
+        for path in relative_paths
+    ]
+    context.set_component("spilled_results", SpillRegistryComponent(records=records))
+    return context
+
+
+# --- read_tool_result schema gate -------------------------------------------
+
+
+def test_read_tool_result_excluded_from_base_tool_schemas_unconditionally() -> None:
+    pattern = ReActPattern()
+    schemas = pattern._tool_schemas_with_builtin_controls(
+        [FakeWorkspaceOutputTool(), FakeReadToolResultTool()]
+    )
+    names = [schema["function"]["name"] for schema in schemas]
+    assert SPILL_READ_TOOL_NAME not in names
+
+
+def test_spilled_paths_empty_registry() -> None:
+    pattern = ReActPattern()
+    assert pattern._spilled_paths(ExecutionContext()) == frozenset()
+
+
+def test_spilled_paths_does_not_create_a_registry_component() -> None:
+    """Reading the registry must not add an empty component to the context.
+
+    The context's spilled_results property creates one on first read, and
+    the schema gate reads the registry on every iteration, so going through
+    that property would put an empty spilled_results entry into every
+    checkpoint of a run that never stored anything.
+    """
+    pattern = ReActPattern()
+    context = ExecutionContext()
+
+    assert pattern._spilled_paths(context) == frozenset()
+    assert context.get_component("spilled_results") is None
+    assert "spilled_results" not in context.to_dict()["components"]
+
+
+def test_spilled_paths_reflects_registry_contents() -> None:
+    pattern = ReActPattern()
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    assert pattern._spilled_paths(context) == frozenset(
+        {"tool-results/a-000000000000.json"}
+    )
+
+
+def test_schema_gate_returns_base_object_unchanged_when_registry_empty() -> None:
+    pattern = ReActPattern()
+    tools = [FakeReadToolResultTool()]
+    base = pattern._tool_schemas_with_builtin_controls(tools)
+    result = pattern._tool_schemas_with_spill_read(base, tools, ExecutionContext())
+    assert result is base  # byte-identical to the baseline surface
+    names = [schema["function"]["name"] for schema in result]
+    assert SPILL_READ_TOOL_NAME not in names
+
+
+def test_schema_gate_adds_read_tool_result_when_registry_non_empty() -> None:
+    pattern = ReActPattern()
+    tools = [FakeReadToolResultTool()]
+    base = pattern._tool_schemas_with_builtin_controls(tools)
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+
+    result = pattern._tool_schemas_with_spill_read(base, tools, context)
+
+    names = [schema["function"]["name"] for schema in result]
+    assert SPILL_READ_TOOL_NAME in names
+    assert result is not base
+
+
+def test_schema_gate_adds_it_on_a_normal_turn_not_just_after_restart() -> None:
+    """Registry becomes non-empty mid-run; the very next call sees it."""
+    pattern = ReActPattern()
+    tools = [FakeReadToolResultTool()]
+    base = pattern._tool_schemas_with_builtin_controls(tools)
+    empty_context = ExecutionContext()
+
+    first = pattern._tool_schemas_with_spill_read(base, tools, empty_context)
+    assert SPILL_READ_TOOL_NAME not in [s["function"]["name"] for s in first]
+
+    filled_context = _context_with_spill_records("tool-results/a-000000000000.json")
+    second = pattern._tool_schemas_with_spill_read(base, tools, filled_context)
+    assert SPILL_READ_TOOL_NAME in [s["function"]["name"] for s in second]
+
+
+@pytest.mark.parametrize("record_count", [0, 1, 64])
+def test_read_tool_result_stays_dispatchable_whatever_the_registry_holds(
+    record_count: int,
+) -> None:
+    """The gate only decides what the model is shown; the tool object itself
+    never leaves the tools list, so a call to it can always be dispatched."""
+    pattern = ReActPattern()
+    read_tool = FakeReadToolResultTool()
+    tools = [FakeWorkspaceOutputTool(), read_tool]
+    base = pattern._tool_schemas_with_builtin_controls(tools)
+    context = _context_with_spill_records(
+        *(f"tool-results/r{i:02d}-000000000000.json" for i in range(record_count))
+    )
+
+    names = [
+        schema["function"]["name"]
+        for schema in pattern._tool_schemas_with_spill_read(base, tools, context)
+    ]
+
+    assert SPILL_READ_TOOL_NAME not in [s["function"]["name"] for s in base]
+    assert (SPILL_READ_TOOL_NAME in names) is (record_count > 0)
+    assert pattern._find_tool(SPILL_READ_TOOL_NAME, tools) is read_tool
+
+
+def test_schema_gate_absent_when_agent_has_no_read_tool_result_object() -> None:
+    pattern = ReActPattern()
+    tools: list[Any] = []  # no file tools at all
+    base = pattern._tool_schemas_with_builtin_controls(tools)
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+
+    result = pattern._tool_schemas_with_spill_read(base, tools, context)
+    assert result is base
+
+
+def test_schema_gate_short_circuits_when_tool_choice_none() -> None:
+    pattern = ReActPattern()
+    pattern.tool_choice = "none"
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    result = pattern._tool_schemas_with_spill_read(
+        [], [FakeReadToolResultTool()], context
+    )
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_schema_cache_is_reset_at_the_start_of_each_run() -> None:
+    """A stale cached schema from a prior run must not leak into the next.
+
+    Runs the same ReActPattern instance through _run_tool_calling_loop
+    twice (via the public run() entry point, the only real caller of that
+    loop), never touching _spill_read_schema by hand -- only the
+    production reset at the top of the loop is allowed to clear it.
+    """
+
+    def _final_answer_response(text: str) -> dict[str, Any]:
+        return {
+            "tool_calls": [
+                {
+                    "id": "call_final",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": f'{{"answer":"{text}"}}',
+                    },
+                }
+            ],
+        }
+
+    pattern = ReActPattern(max_iterations=5)
+
+    tools_v1 = [FakeReadToolResultTool()]
+    context_v1 = _context_with_spill_records("tool-results/a-000000000000.json")
+    context_v1.add_user_message("first")
+    llm_v1 = FakeLLM(responses=[_final_answer_response("done 1")])
+    result_v1 = await pattern.run(context=context_v1, tools=tools_v1, llm=llm_v1)
+    assert result_v1["success"] is True
+    schema_v1 = pattern._spill_read_schema
+    assert schema_v1 is not None
+    assert schema_v1["function"]["name"] == SPILL_READ_TOOL_NAME
+
+    # A fresh run on the same instance: different tools object (same name),
+    # registry still non-empty. current_iteration is reset the way a new
+    # task would start it -- this test is about the schema cache, not
+    # iteration bookkeeping across unrelated runs.
+    pattern.current_iteration = 0
+    tools_v2 = [FakeReadToolResultTool()]
+    context_v2 = _context_with_spill_records("tool-results/b-000000000000.json")
+    context_v2.add_user_message("second")
+    llm_v2 = FakeLLM(responses=[_final_answer_response("done 2")])
+    result_v2 = await pattern.run(context=context_v2, tools=tools_v2, llm=llm_v2)
+    assert result_v2["success"] is True
+    schema_v2 = pattern._spill_read_schema
+    assert schema_v2 is not None
+    assert schema_v2 is not schema_v1
+
+
+def test_spill_read_schema_field_starts_as_none() -> None:
+    assert ReActPattern()._spill_read_schema is None
+
+
+def test_forced_answer_schema_unaffected_by_a_non_empty_spill_registry() -> None:
+    """The main loop's ``[final_answer] if force_final_answer_now else
+    normal_tool_schemas`` never reads normal_tool_schemas on the True
+    branch, so a non-empty spill registry cannot put read_tool_result on a
+    forced turn: the forced-answer branch stays byte-identical to baseline.
+    force_final_answer_now short-circuits before normal_tool_schemas would
+    matter."""
+    pattern = ReActPattern()
+    tool_schemas = [pattern._final_answer_tool_schema()]
+    names = [schema["function"]["name"] for schema in tool_schemas]
+    assert names == ["final_answer"]
+    assert SPILL_READ_TOOL_NAME not in names
+
+
+@pytest.mark.asyncio
+async def test_normal_turn_protocol_retry_schema_includes_read_tool_result() -> None:
+    """The protocol-repair call sites (react.py's two
+    _retry_tool_protocol_response call sites) must offer the same dynamic
+    tool face as the turn they are repairing, not the static
+    base_tool_schemas computed once before the loop starts. Triggers the
+    empty-final-answer repair -- a retry path that runs on an ordinary
+    (non-forced) turn -- and inspects the tools list the retry call itself
+    received.
+    """
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_empty",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer": ""}',
+                        },
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer": "done"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    context.add_user_message("hi")
+
+    result = await pattern.run(
+        context=context, tools=[FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert len(llm.calls) == 2
+    retry_tool_names = [schema["function"]["name"] for schema in llm.calls[1]["tools"]]
+    assert SPILL_READ_TOOL_NAME in retry_tool_names
+    assert llm.calls[1]["tools"] == llm.calls[0]["tools"]
+
+
+@pytest.mark.asyncio
+async def test_protocol_error_retry_schema_includes_read_tool_result() -> None:
+    """The other protocol-repair call site: an LLMToolProtocolError raised by
+    the model call itself on an ordinary turn. Its retry must be offered the
+    same tool list as the call that failed, reader included."""
+
+    class ProtocolErrorLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise LLMToolProtocolError(
+                    provider="deepseek",
+                    code="malformed_tool_arguments",
+                    message="The model returned malformed tool arguments.",
+                )
+            return {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer": "done"}',
+                        },
+                    }
+                ],
+            }
+
+    llm = ProtocolErrorLLM()
+    pattern = ReActPattern(max_iterations=3)
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    context.add_user_message("hi")
+
+    result = await pattern.run(
+        context=context, tools=[FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert len(llm.calls) == 2
+    first_tool_names = [schema["function"]["name"] for schema in llm.calls[0]["tools"]]
+    assert SPILL_READ_TOOL_NAME in first_tool_names
+    assert llm.calls[1]["tools"] == llm.calls[0]["tools"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_never_spilled_offers_no_reader_and_adds_no_component() -> (
+    None
+):
+    """A run whose registry stays empty sees the baseline tool list on every
+    call, and finishes with no spilled_results component in its checkpoint
+    payload -- the gate that runs on every iteration only reads the
+    registry, it never creates one."""
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression": "2+2"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer": "4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("What is 2+2?")
+    calculator = FakeTool()
+
+    result = await pattern.run(
+        context=context, tools=[calculator, FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert calculator.calls == [{"expression": "2+2"}]
+    assert len(llm.calls) == 2
+    for call in llm.calls:
+        names = [schema["function"]["name"] for schema in call["tools"]]
+        assert "calculator" in names
+        assert SPILL_READ_TOOL_NAME not in names
+    assert context.get_component("spilled_results") is None
+    assert "spilled_results" not in context.to_dict()["components"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_with_a_registered_spill_offers_the_reader_on_ordinary_turns() -> (
+    None
+):
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer": "done"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    context.add_user_message("hi")
+
+    result = await pattern.run(
+        context=context, tools=[FakeTool(), FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    names = [schema["function"]["name"] for schema in llm.calls[0]["tools"]]
+    assert names.count(SPILL_READ_TOOL_NAME) == 1
+    assert "calculator" in names
 
 
 @pytest.mark.asyncio

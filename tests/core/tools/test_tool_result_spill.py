@@ -1,7 +1,7 @@
 """Tests for the tool-result-spill module.
 
 Covers the whole module: the two pure path primitives written for the writer,
-an engine registration gate that is not wired up yet, and the read tool
+the engine registration gate and the read tool
 (``normalize_spilled_relative_path`` / ``resolve_spilled_under``); the
 walk/write path that decides what gets spilled and writes it to disk
 (``spill_oversized_values`` and its helpers); and the notice renderer
@@ -24,10 +24,9 @@ them was once broken in a way no test could see:
   than read from the module, so raising a cap in the module shows up as a
   failure instead of moving the expectation with it.
 
-The read tool's own name, character limit, and truncated-read instruction
-still have no consumer and are not in this module; the change that adds
-the read tool brings back what it needs. The unavailable-notice text and
-the record-shape validator are back already, each pinned by tests below.
+The read tool's name, character limit and truncated-read instruction live
+in this module and are pinned below, as are the unavailable-notice text and
+the record-shape validator.
 """
 
 from __future__ import annotations
@@ -54,6 +53,9 @@ from xagent.core.tools.tool_result_spill import (
     SPILL_MAX_FILES_PER_RESULT,
     SPILL_MAX_FILES_PER_RUN,
     SPILL_PLACEHOLDER_TEXT,
+    SPILL_READ_MAX_CHARS,
+    SPILL_READ_TOOL_NAME,
+    SPILL_READ_TRUNCATED_INSTRUCTION,
     SPILL_READ_UNAVAILABLE_MESSAGES,
     SPILL_RESERVED_RESULT_KEY,
     SPILL_UNAVAILABLE_NOTICE,
@@ -459,6 +461,25 @@ def test_spill_read_unavailable_names_the_item_count_for_a_range():
     result = spill_read_unavailable("invalid_range", item_count=7)
     assert "7" in result["output"]
     assert result["is_error"] is True
+
+
+def test_read_tool_name_and_truncated_instruction_are_pinned():
+    # Written out rather than read back: the name is what ReAct excludes
+    # from and adds back to the model's tool list, and the instruction is
+    # what the model sees when one read goes over the cap.
+    assert SPILL_READ_TOOL_NAME == "read_tool_result"
+    assert SPILL_READ_TRUNCATED_INSTRUCTION == (
+        "Call read_tool_result again with a narrower start/end range."
+    )
+    assert SPILL_READ_MAX_CHARS == 12_000
+
+
+def test_read_limit_mirrors_read_file_context_limit():
+    # The read tool caps itself because the context layer's preview cap
+    # covers only read_file; the two caps must not drift apart.
+    from xagent.core.agent.context.execution import READ_FILE_CONTEXT_LIMIT
+
+    assert SPILL_READ_MAX_CHARS == READ_FILE_CONTEXT_LIMIT
 
 
 def test_spill_read_unavailable_rejects_an_undefined_reason():
@@ -2713,7 +2734,7 @@ def test_spill_unavailable_notice_names_no_path_and_no_tool():
     assert "/" not in SPILL_UNAVAILABLE_NOTICE
 
 
-# --- stage 1-g: render_spill_notice (pure rendering, not yet wired in) -----
+# --- render_spill_notice (pure rendering) ---
 
 ARRAY_RECORD = {
     "relative_path": "tool-results/acme-812345678901.json",
@@ -2920,7 +2941,23 @@ def test_render_spill_notice_stays_inside_its_own_character_budget():
 
     assert len(notice) <= spill_module.SPILL_OBSERVATION_NOTICE_MAX_CHARS
     assert rendered >= 1
-    assert body_lines[-1] == f"- ... {12 - rendered} more stored file(s) omitted"
+    assert body_lines[-1] == (
+        f"- ... {12 - rendered} more stored file(s); call read_tool_result "
+        "with no path to list them all"
+    )
+
+
+def test_render_spill_notice_omitted_line_names_the_listing_call():
+    """One record past the observation entry cap: the last line says how to
+    see every stored file, since the notice itself cannot list them all."""
+    notice = render_spill_notice(_short_records(9), style="observation")
+    body_lines = notice.splitlines()[1:]
+
+    assert len(body_lines) == 9
+    assert body_lines[-1] == (
+        "- ... 1 more stored file(s); call read_tool_result with no path "
+        "to list them all"
+    )
 
 
 def test_render_spill_notice_mentions_read_tool_result_not_read_file():
@@ -3198,6 +3235,9 @@ def test_render_spill_notice_caps_entries_per_style(style, max_entries, max_char
 
     assert len(notice) < max_chars
     assert len(body_lines) == max_entries + 1
-    assert body_lines[-1] == f"- ... {total - max_entries} more stored file(s) omitted"
+    assert body_lines[-1] == (
+        f"- ... {total - max_entries} more stored file(s); call read_tool_result "
+        "with no path to list them all"
+    )
     for line in body_lines[:-1]:
         assert line.startswith("- tool-results/s")

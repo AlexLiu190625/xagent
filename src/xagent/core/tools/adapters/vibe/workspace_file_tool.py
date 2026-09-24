@@ -16,6 +16,7 @@ from .....core.workspace import (
     TaskWorkspace,
 )
 from ...core.workspace_file_tool import FileInfo, WorkspaceFileOperations
+from ...tool_result_spill import SPILL_READ_TOOL_NAME
 from .base import ToolCategory
 from .function import FunctionTool
 
@@ -158,6 +159,15 @@ class WorkspaceFileTools(WorkspaceFileOperations):
     def get_workspace_output_files(self) -> Dict[str, Any]:
         """Get output file list from current workspace"""
         return self.inner.get_workspace_output_files()
+
+    def read_tool_result(
+        self,
+        path: str | None = None,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> Dict[str, Any]:
+        """Read one engine-stored large tool result, or list them with no path."""
+        return self.inner.read_tool_result(path, start=start, end=end)
 
     def list_all_user_files(  # type: ignore[override]
         self,
@@ -307,6 +317,21 @@ class WorkspaceFileTools(WorkspaceFileOperations):
                 name="find_and_replace",
                 description="Convenience function to find and replace text content in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths."
                 + _RESERVED_OUTPUT_NOTE,
+            ),
+            FileTool(
+                self.read_tool_result,
+                name=SPILL_READ_TOOL_NAME,
+                description=(
+                    "Read one engine-stored large tool result by the exact path listed "
+                    "in its notice. Omit path to list the stored results instead "
+                    "(relative_path and size in bytes of each); start and end must "
+                    "then be omitted too. start and end are 1-based item numbers, not "
+                    "line numbers: array elements for a JSON array, top-level entries "
+                    "for a JSON object, and lines only for plain text. Omit both to "
+                    "read the whole result."
+                ),
+                read_only=True,
+                concurrency_safe=True,
             ),
         ]
 

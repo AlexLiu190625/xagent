@@ -85,6 +85,7 @@ from ....tools.adapters.vibe.mcp_approval_gate import (
     ToolCallExecutionContext,
     bind_tool_call_execution_context,
 )
+from ....tools.tool_result_spill import SPILL_READ_TOOL_NAME
 from ....tools.user_interaction import (
     ToolInteractionSettlement,
     tool_result_waits_for_user,
@@ -585,6 +586,12 @@ class ReActPattern(AgentPattern):
         self.memory_input_text: str | None = None
         self._memory_store: Any | None = None
         self._tool_decision_groups_by_name: dict[str, str] = {}
+        # Rebuilt per run in _run_tool_calling_loop, right before
+        # base_tool_schemas is computed: the cached schema comes from that
+        # call's tools, and the same pattern instance can be run again with
+        # a different set. Not part of get_state()/load_state() -- it is
+        # cheap to recompute and carries no run-lifecycle meaning.
+        self._spill_read_schema: dict[str, Any] | None = None
 
     async def run(
         self,
@@ -757,6 +764,12 @@ class ReActPattern(AgentPattern):
             "generate_image" in self._tool_decision_groups_by_name
             and "edit_image" not in self._tool_decision_groups_by_name
         )
+        # Rebuilt per run: the cached schema comes from this call's tools,
+        # and the same pattern instance can be run again with a different
+        # set. The cache's only reader is _tool_schemas_with_spill_read,
+        # which runs only inside this loop, so there is no writer between
+        # this reset and that first read.
+        self._spill_read_schema = None
         base_tool_schemas = (
             []
             if self.tool_choice == "none"
@@ -798,10 +811,13 @@ class ReActPattern(AgentPattern):
                     and self._latest_tool_result_success(context)
                 )
             )
+            normal_tool_schemas = self._tool_schemas_with_spill_read(
+                base_tool_schemas, tools, context
+            )
             tool_schemas = (
                 [self._final_answer_tool_schema()]
                 if force_final_answer_now
-                else base_tool_schemas
+                else normal_tool_schemas
             )
             interrupted = await self._interrupt_if_requested(
                 runtime=runtime,
@@ -958,7 +974,7 @@ class ReActPattern(AgentPattern):
                         llm=call_llm,
                         runtime=runtime,
                         iteration=iteration,
-                        tool_schemas=base_tool_schemas,
+                        tool_schemas=normal_tool_schemas,
                         force_final_answer=(
                             force_final_answer_now and not restore_full_tool_set
                         ),
@@ -1062,7 +1078,7 @@ class ReActPattern(AgentPattern):
                         llm=call_llm,
                         runtime=runtime,
                         iteration=iteration,
-                        tool_schemas=base_tool_schemas,
+                        tool_schemas=normal_tool_schemas,
                         force_final_answer=(
                             force_final_answer_now and not recover_full_tool_set
                         ),
@@ -3267,6 +3283,13 @@ class ReActPattern(AgentPattern):
             self._build_tool_schema(tool)
             for tool in tools
             if self._tool_name(tool) not in control_tool_names
+            # Unconditional: this function only sees the static tool list
+            # (it runs once per run, before the iteration loop even starts),
+            # so it cannot know whether the run has stored anything yet.
+            # _tool_schemas_with_spill_read adds the reader back once the
+            # registry is non-empty -- a dynamic fact this function has no
+            # way to observe.
+            and self._tool_name(tool) != SPILL_READ_TOOL_NAME
         ]
         can_lookup_output_files = any(
             schema.get("function", {}).get("name") == WORKSPACE_OUTPUT_FILES_TOOL_NAME
@@ -3278,6 +3301,51 @@ class ReActPattern(AgentPattern):
                 can_lookup_output_files=can_lookup_output_files
             ),
         ]
+
+    def _spilled_paths(self, context: Any) -> frozenset[str]:
+        """Exact relative paths this execution stored results into.
+
+        Read-only on purpose: it goes through get_component and treats a
+        missing component as empty. The context's spilled_results property
+        creates an empty registry component the first time it is read, and
+        this runs on every iteration, so reading through that property would
+        add an empty spilled_results entry to every checkpoint of every run
+        that never stored anything.
+        """
+        get_component = getattr(context, "get_component", None)
+        component = (
+            get_component("spilled_results") if callable(get_component) else None
+        )
+        records = getattr(component, "records", ()) or ()
+        return frozenset(
+            str(record["relative_path"])
+            for record in records
+            if isinstance(record, dict) and isinstance(record.get("relative_path"), str)
+        )
+
+    def _tool_schemas_with_spill_read(
+        self, base_schemas: list[dict[str, Any]], tools: list[Any], context: Any
+    ) -> list[dict[str, Any]]:
+        """Add the stored-result reader once this run has actually stored one.
+
+        base_schemas is built once per run, before the iteration loop, so it
+        cannot know about a registry that fills up mid-run. This runs on
+        every iteration instead, which is the only place that sees the
+        spill that just happened.
+        """
+        if not base_schemas:
+            return base_schemas  # tool_choice == "none"
+        if not self._spilled_paths(context):
+            return base_schemas  # byte-identical to the baseline surface
+        if self._spill_read_schema is None:
+            read_tool = next(
+                (t for t in tools if self._tool_name(t) == SPILL_READ_TOOL_NAME),
+                None,
+            )
+            if read_tool is None:
+                return base_schemas  # agent has no file tools at all
+            self._spill_read_schema = self._build_tool_schema(read_tool)
+        return [*base_schemas, self._spill_read_schema]
 
     def _control_tool_names(self) -> set[str]:
         return set(CONTROL_TOOL_NAMES)

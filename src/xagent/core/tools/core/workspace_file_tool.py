@@ -7,6 +7,7 @@ It focuses on pure file operations without tool framework dependencies.
 
 import asyncio
 import csv
+import hashlib
 import logging
 import os
 import shutil
@@ -21,7 +22,22 @@ from ...file_ref import (
     parse_file_id_ref,
     safe_asset_filename,
 )
-from ...workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
+from ...workspace import DEFAULT_USER_FILE_LIST_LIMIT, SPILL_DIR_NAME, TaskWorkspace
+from ..tool_result_spill import (
+    _SPILL_FILENAME_RE,
+    SPILL_DIGEST_HEX_CHARS,
+    SPILL_MAX_FILES_PER_RUN,
+    SPILL_READ_MAX_CHARS,
+    SPILL_READ_TRUNCATED_INSTRUCTION,
+    SPILL_WORKSPACE_OUTPUT_DIR_NAME,
+    _spill_item_count,
+    _spill_kind_of,
+    _spill_slice,
+    normalize_spilled_relative_path,
+    resolve_spilled_under,
+    spill_dir_for_workspace,
+    spill_read_unavailable,
+)
 from .document_parser import DocumentCapabilities, DocumentParseArgs, parse_document
 from .file_tool import (
     EditOperation,
@@ -960,6 +976,159 @@ class WorkspaceFileOperations:
 
             logger.debug("Relative path resolved to: %s", resolved_path)
             return resolved_path
+
+    def read_tool_result(
+        self,
+        path: str | None = None,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> Dict[str, Any]:
+        """Read one engine-stored tool result without any path search.
+
+        Unlike read_file this never strips a directory prefix beyond the one
+        canonical ``output/``, never looks in input/ or temp/, never retries a
+        normalized filename, and never falls back to fuzzy stem matching: a
+        path that does not name an existing regular file directly under
+        output/tool-results/ is reported unavailable, full stop.
+
+        The file's bytes are checked against the digest its name carries
+        before they are decoded. The writer names every file after the
+        SHA-256 of the exact bytes it writes, so a file whose bytes no longer
+        produce that digest -- changed after it was written, or put there by
+        something other than the writer -- is reported unavailable exactly
+        like a missing one, never read back as if it were a stored result.
+
+        start and end are 1-based inclusive item numbers, not line numbers.
+        What one item is comes from the file's own content, decided here on
+        every call: a JSON array addresses elements, a JSON object addresses
+        top-level entries in document order, anything else addresses physical
+        lines. The registry is not consulted and the extension is not trusted.
+
+        A path that is None or blank lists the stored files instead; see
+        _list_stored_tool_results. start and end have no meaning for that
+        listing, so passing either one with it is an invalid range rather
+        than something to ignore.
+
+        It returns a classified failure rather than raising, because the
+        caller records the return value as the tool observation the model
+        reads. The one exception is the workspace authority check: its
+        ValueError propagates unchanged, as it does from every other File
+        Operation method that calls _require_workspace_authority.
+        """
+        self._require_workspace_authority()
+        if path is None or (isinstance(path, str) and not path.strip()):
+            if start is not None or end is not None:
+                return spill_read_unavailable("invalid_range")
+            return self._list_stored_tool_results()
+        name = normalize_spilled_relative_path(path)
+        if name is None:
+            return spill_read_unavailable("invalid_path")
+        resolved = resolve_spilled_under(
+            spill_dir_for_workspace(self.workspace.workspace_dir), name
+        )
+        if resolved is None:
+            return spill_read_unavailable("not_found")
+        try:
+            raw = resolved.read_bytes()
+        except OSError:
+            return spill_read_unavailable("not_found")
+        # The digest is computed over the raw bytes and only then are they
+        # decoded: errors="replace" rewrites invalid bytes, so decoding first
+        # would hash different bytes than the writer did. bytes.decode also
+        # does no newline translation, so a stored \r\n reads back intact,
+        # matching both the byte-original write and the line count
+        # _spill_text_lines computes from the same string.
+        stem = name.rsplit("/", 1)[1].rsplit(".", 1)[0]
+        _, separator, stored_digest = stem.rpartition("-")
+        actual_digest = hashlib.sha256(raw).hexdigest()[:SPILL_DIGEST_HEX_CHARS]
+        if not separator or stored_digest != actual_digest:
+            return spill_read_unavailable("not_found")
+        content = raw.decode("utf-8", errors="replace")
+
+        if start is None and end is None:
+            # No range asked: hand back the file as written. Parsing it here
+            # would cost the whole 8 MiB budget and change nothing.
+            output = content
+        else:
+            if (
+                (start is not None and start < 1)
+                or (end is not None and end < 1)
+                or (start is not None and end is not None and start > end)
+            ):
+                return spill_read_unavailable("invalid_range")
+            kind, value = _spill_kind_of(content)
+            total = _spill_item_count(kind, value, content)
+            first = 1 if start is None else start
+            if first > total:
+                return spill_read_unavailable("invalid_range", item_count=total)
+            last = total if end is None else min(end, total)
+            output = _spill_slice(kind, value, content, first, last)
+
+        if len(output) <= SPILL_READ_MAX_CHARS:
+            return {"relative_path": name, "output": output}
+        # Mirror read_file's over-limit shape (execution.py's
+        # READ_FILE_CONTEXT_LIMIT branch): no "output" key, so
+        # _format_tool_result renders the whole dict and the instruction
+        # stays visible to the model.
+        return {
+            "relative_path": name,
+            "content_preview": output[:SPILL_READ_MAX_CHARS],
+            "content_truncated": True,
+            "original_chars": len(output),
+            "instruction": SPILL_READ_TRUNCATED_INSTRUCTION,
+        }
+
+    def _list_stored_tool_results(self) -> Dict[str, Any]:
+        """List the files in this workspace's spill directory, by name and size.
+
+        The listing comes from the directory itself, not from the spill
+        registry: this class holds only the workspace, and the registry lives
+        on the execution context. The directory belongs to the task, so the
+        listing can include files an earlier run of the same task stored.
+
+        Only direct children that are regular files (a symlink is not
+        followed) and whose name the spill writer could have produced are
+        listed; anything else is skipped silently. No digest is checked here
+        -- that would read every file in full -- so a listed file can still
+        be reported unavailable when it is read; the listing answers which
+        names are there, and the read answers whether one is a stored result.
+
+        A missing directory, a path that is not a directory, and any OSError
+        while listing all return an empty listing: a task that never stored
+        anything asking for its stored results is an ordinary question, not
+        a failure. Entries are sorted by relative_path and capped at
+        SPILL_MAX_FILES_PER_RUN; the rest are counted in ``omitted``.
+        """
+        spill_dir = spill_dir_for_workspace(self.workspace.workspace_dir)
+        prefix = f"{SPILL_WORKSPACE_OUTPUT_DIR_NAME}/{SPILL_DIR_NAME}/"
+        try:
+            with os.scandir(spill_dir) as entries:
+                candidates = sorted(
+                    (
+                        (f"{prefix}{entry.name}", entry)
+                        for entry in entries
+                        if _SPILL_FILENAME_RE.fullmatch(entry.name)
+                        and normalize_spilled_relative_path(f"{prefix}{entry.name}")
+                        is not None
+                        and entry.is_file(follow_symlinks=False)
+                    ),
+                    key=lambda candidate: candidate[0],
+                )
+            listed = [
+                {
+                    "relative_path": relative_path,
+                    "bytes": entry.stat(follow_symlinks=False).st_size,
+                }
+                for relative_path, entry in candidates[:SPILL_MAX_FILES_PER_RUN]
+            ]
+        except OSError:
+            return {"stored_results": [], "count": 0, "omitted": 0}
+        return {
+            "stored_results": listed,
+            "count": len(listed),
+            "omitted": len(candidates) - len(listed),
+        }
 
 
 def _get_workspace_ops(workspace_id: str) -> WorkspaceFileOperations:

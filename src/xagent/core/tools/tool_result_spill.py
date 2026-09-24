@@ -16,10 +16,14 @@ carries, registers the accepted ones and renders their notice. The
 production tool factory supplies no SpillTarget, so in a deployed tool set
 the wrapper only strips the reserved key and no spill file is written.
 
-Read-back is not wired. The read-side helpers here
-(``spill_read_unavailable`` and ``_spill_slice``) have no caller
-outside this module and its tests, and no read_tool_result tool is
-registered.
+Read-back is wired: read_tool_result, registered by
+WorkspaceFileTools.get_tools, reads one stored result by its relative
+path with no path search, checks the digest in the file name against the
+file's bytes before decoding them, and slices by item with
+``_spill_slice``. Called with no path, it lists the files in the spill
+directory by name and size instead, without checking any digest. ReAct
+adds it to the model's tool list only once the run's registry holds a
+record.
 """
 
 from __future__ import annotations
@@ -102,6 +106,15 @@ SPILL_READ_UNAVAILABLE_MESSAGES = {
         "greater, and start must not exceed end."
     ),
 }
+# The read tool's own name, output cap and over-cap instruction. The cap
+# mirrors READ_FILE_CONTEXT_LIMIT (core/agent/context/execution.py), and a
+# test pins the two equal: the context layer's own preview cap applies only
+# to read_file's plain-string results, so the read tool has to cap itself.
+SPILL_READ_TOOL_NAME = "read_tool_result"
+SPILL_READ_MAX_CHARS = 12_000
+SPILL_READ_TRUNCATED_INSTRUCTION = (
+    "Call read_tool_result again with a narrower start/end range."
+)
 
 # The union of every key the two OutputFilteredToolWrapper bypass branches
 # write back (output_filter_wrapper.py's waiting-for-user and
@@ -1662,10 +1675,16 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
         # which can lengthen the line again, so the length is recomputed
         # every time round. The header is never given back: a notice with no
         # header does not say what it is listing.
-        omitted_line = f"- ... {omitted} more stored file(s) omitted"
+        omitted_line = (
+            f"- ... {omitted} more stored file(s); call read_tool_result "
+            "with no path to list them all"
+        )
         while len(lines) > 1 and total_chars + 1 + len(omitted_line) > max_chars:
             total_chars -= 1 + len(lines.pop())
             omitted += 1
-            omitted_line = f"- ... {omitted} more stored file(s) omitted"
+            omitted_line = (
+                f"- ... {omitted} more stored file(s); call read_tool_result "
+                "with no path to list them all"
+            )
         lines.append(omitted_line)
     return "\n".join(lines)
