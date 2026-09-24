@@ -93,4 +93,7 @@ class AzureOpenAILLM(OpenAILLM):
                 api_version=self.api_version,
                 api_key=self.api_key,
                 timeout=self.timeout,
+                # Retry policy lives in the shared RetryWrapper only; see
+                # ``OpenAICompatibleLLM._ensure_client``.
+                max_retries=0,
             )

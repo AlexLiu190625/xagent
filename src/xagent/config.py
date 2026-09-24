@@ -126,6 +126,8 @@ _STANDARD_OTEL_EXPORTER_OTLP_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT"
 _STANDARD_OTEL_METRIC_EXPORT_INTERVAL = "OTEL_METRIC_EXPORT_INTERVAL"
 _STANDARD_OTEL_SERVICE_NAME = "OTEL_SERVICE_NAME"
 MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
+LLM_RETRY_DEADLINE_SECONDS = "XAGENT_LLM_RETRY_DEADLINE_SECONDS"
+LLM_CAPACITY_MAX_ATTEMPTS = "XAGENT_LLM_CAPACITY_MAX_ATTEMPTS"
 SANDBOX_CPUS = "SANDBOX_CPUS"
 SANDBOX_MEMORY = "SANDBOX_MEMORY"
 SANDBOX_ENV = "SANDBOX_ENV"
@@ -2830,6 +2832,46 @@ def get_mcp_tool_init_timeout_seconds() -> int:
         Seconds allowed per MCP server; 0 disables the timeout.
     """
     return _get_positive_int_env(MCP_TOOL_INIT_TIMEOUT_SECONDS, 60, minimum=0)
+
+
+def get_llm_retry_deadline_seconds() -> float:
+    """Get the wall-clock ceiling for one LLM call's whole retry loop.
+
+    Attempt counting cannot bound how long one call holds an execution slot,
+    because every attempt may consume a full request timeout. This is the
+    bound that does. It gates whether a *new* attempt may start, so one call
+    can still overrun it by a single attempt's duration.
+
+    Priority:
+        1. XAGENT_LLM_RETRY_DEADLINE_SECONDS environment variable
+        2. 300
+
+    Returns:
+        Seconds allowed for one call's retry loop; invalid or non-positive
+        values fall back to the default, because an unbounded loop is the
+        defect this exists to prevent.
+    """
+    deadline = _get_positive_float_env(LLM_RETRY_DEADLINE_SECONDS, None)
+    return 300.0 if deadline is None else deadline
+
+
+def get_llm_capacity_max_attempts() -> int:
+    """Get the attempt budget for a provider capacity refusal.
+
+    Deliberately far below the per-model ``max_retries``: a provider that
+    reports being over capacity has asked us not to grow its load, so
+    replaying the identical request is the wrong response. Only ever lowers
+    a call's ceiling -- it cannot raise it above ``max_retries``.
+
+    Priority:
+        1. XAGENT_LLM_CAPACITY_MAX_ATTEMPTS environment variable
+        2. 2
+
+    Returns:
+        Attempts allowed for a capacity refusal; invalid or non-positive
+        values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_CAPACITY_MAX_ATTEMPTS, 2)
 
 
 def get_sandbox_cpus() -> int | None:

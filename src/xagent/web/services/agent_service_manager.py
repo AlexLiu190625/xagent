@@ -27,6 +27,7 @@ from ...core.execution_scope import (
 )
 from ...core.memory.base import MemoryStore
 from ...core.memory.in_memory import InMemoryMemoryStore
+from ...core.model.chat.basic.adapter import attach_chat_retry_wrapper
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.openai import OpenAILLM
@@ -327,11 +328,13 @@ def create_default_llm() -> Optional[BaseLLM]:
                 thinking_mode = (
                     None if thinking_mode_env == "auto" else thinking_mode_env == "true"
                 )
-                return ZhipuLLM(
-                    model_name=zhipu_model or "glm-4.7-flash",
-                    api_key=zhipu_api_key,
-                    base_url=zhipu_base_url,
-                    thinking_mode=thinking_mode,
+                return attach_chat_retry_wrapper(
+                    ZhipuLLM(
+                        model_name=zhipu_model or "glm-4.7-flash",
+                        api_key=zhipu_api_key,
+                        base_url=zhipu_base_url,
+                        thinking_mode=thinking_mode,
+                    )
                 )
             else:
                 logger.error(
@@ -342,17 +345,21 @@ def create_default_llm() -> Optional[BaseLLM]:
             openai_api_key == "" or not is_placeholder_api_key(openai_api_key)
         ):
             logger.info(f"Using OpenAI LLM with model: {openai_model}")
-            return OpenAILLM(
-                model_name=openai_model or "gpt-4o-mini",
-                base_url=openai_base_url,
-                api_key=openai_api_key,
+            return attach_chat_retry_wrapper(
+                OpenAILLM(
+                    model_name=openai_model or "gpt-4o-mini",
+                    base_url=openai_base_url,
+                    api_key=openai_api_key,
+                )
             )
         elif deepseek_api_key and not is_placeholder_api_key(deepseek_api_key):
             logger.info(f"Using DeepSeek LLM with model: {deepseek_model}")
-            return DeepSeekLLM(
-                model_name=deepseek_model or "deepseek-v4-flash",
-                base_url=deepseek_base_url,
-                api_key=deepseek_api_key,
+            return attach_chat_retry_wrapper(
+                DeepSeekLLM(
+                    model_name=deepseek_model or "deepseek-v4-flash",
+                    base_url=deepseek_base_url,
+                    api_key=deepseek_api_key,
+                )
             )
 
         # No LLM available - AgentService will run without DAG pattern

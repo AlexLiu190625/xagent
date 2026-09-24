@@ -2363,6 +2363,51 @@ class TestOrphanUploadGcConfig:
         assert get_orphan_upload_sweep_interval_seconds() == 900
 
 
+class TestLlmRetryBudgetConfig:
+    """#2605: the two bounds that attempt counting cannot express."""
+
+    def test_deadline_default(self, monkeypatch):
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.delenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", raising=False)
+        assert get_llm_retry_deadline_seconds() == 300.0
+
+    def test_deadline_env_override(self, monkeypatch):
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", "45.5")
+        assert get_llm_retry_deadline_seconds() == 45.5
+
+    @pytest.mark.parametrize(
+        "value", ["", "   ", "not-a-number", "0", "-5", "nan", "inf"]
+    )
+    def test_deadline_rejects_unusable_values(self, monkeypatch, value):
+        """An unbounded loop is the bug; never let bad config reintroduce it."""
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", value)
+        assert get_llm_retry_deadline_seconds() == 300.0
+
+    def test_capacity_attempts_default(self, monkeypatch):
+        from xagent.config import get_llm_capacity_max_attempts
+
+        monkeypatch.delenv("XAGENT_LLM_CAPACITY_MAX_ATTEMPTS", raising=False)
+        assert get_llm_capacity_max_attempts() == 2
+
+    def test_capacity_attempts_env_override(self, monkeypatch):
+        from xagent.config import get_llm_capacity_max_attempts
+
+        monkeypatch.setenv("XAGENT_LLM_CAPACITY_MAX_ATTEMPTS", "1")
+        assert get_llm_capacity_max_attempts() == 1
+
+    @pytest.mark.parametrize("value", ["", "1.5", "not-a-number", "0", "-3"])
+    def test_capacity_attempts_rejects_unusable_values(self, monkeypatch, value):
+        from xagent.config import get_llm_capacity_max_attempts
+
+        monkeypatch.setenv("XAGENT_LLM_CAPACITY_MAX_ATTEMPTS", value)
+        assert get_llm_capacity_max_attempts() == 2
+
+
 class TestWorkforcePreviewRunReapConfig:
     """PR #1060 review: get_workforce_preview_run_stale_seconds() had no
     test, unlike its sibling TTL config functions above."""
