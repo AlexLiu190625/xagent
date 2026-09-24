@@ -302,10 +302,11 @@ function sendFailureTextKey(disposition: MessageDeliveryDisposition | null): Tra
 }
 
 // A settled resend attempt. The failed case carries the disposition the send
-// path rejected with, because what this dialog then says about the message
-// depends on it and every reader of this outcome -- the panel it raises and
-// the three toasts that stand in for that panel where it cannot be rendered
-// -- has to say the same thing.
+// path rejected with, already merged with what earlier failed attempts for
+// the same snapshot established (doResend does the merge), because what this
+// dialog then says about the message depends on it and every reader of this
+// outcome -- the panel it raises and the three toasts that stand in for that
+// panel where it cannot be rendered -- has to say the same thing.
 type ResendOutcome =
   | { kind: "sent" }
   | { kind: "failed"; disposition: MessageDeliveryDisposition | null }
@@ -488,6 +489,24 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // further retry can reuse the id only while it is still retrying that same
   // snapshot -- see doResend, which is the only reader and writer.
   const resendMessageIdRef = useRef<{ forSnapshotId: string, clientMessageId: string } | null>(null)
+  // What every failed resend so far has established about each snapshot's
+  // message, keyed by the snapshot's clientMessageId and merged with
+  // mergeSendFailureDisposition, so it only ever moves toward "may have
+  // landed". The send-failed panel carries the same verdict while it is up,
+  // but the panel can go while the message stays -- a retry the re-read
+  // report turns down takes it down, and a resend a retarget supersedes never
+  // raises one -- and the next resend of that message (which reuses the id of
+  // an attempt whose outcome was unknown) must not then be reported as
+  // "definitely not sent" just because the server refused that one attempt.
+  //
+  // Bookkeeping only: nothing renders from it, and only doResend reads or
+  // writes it, folding it into the disposition every failed outcome carries,
+  // so the panel and each toast that stands in for it receive the merged
+  // verdict without asking for it. Scoped to this instance, which is mounted
+  // per task, so it goes with the dialog and never reaches another task.
+  // Transitional: it belongs with the panel's own state and is folded into
+  // the send-failed phase's data once that state is restructured.
+  const deliveryVerdictRef = useRef(new Map<string, MessageDeliveryDisposition | null>())
 
   // The read attempt this dialog is currently on: the request it is for, and
   // which try for that request it is. Both halves are needed. `seq` alone
@@ -854,11 +873,20 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         || disposition === "rejected"
       )
       resendMessageIdRef.current = mustMintNewId ? null : { forSnapshotId: snapshot.clientMessageId, clientMessageId }
-      // The disposition travels out with the outcome rather than being
-      // turned into text here: the caller decides whether this dialog is
-      // still on screen to raise a panel or has to settle for a toast, and
-      // both have to word the same failure the same way.
-      return { kind: "failed", disposition }
+      // The id decision above reads this attempt's own disposition; what
+      // travels out is the message's verdict across every attempt so far
+      // (see deliveryVerdictRef), so no caller can word a refusal of this
+      // attempt as "not sent" after an earlier attempt's outcome was unknown.
+      const verdict = mergeSendFailureDisposition(
+        deliveryVerdictRef.current.get(snapshot.clientMessageId) ?? null,
+        disposition,
+      )
+      deliveryVerdictRef.current.set(snapshot.clientMessageId, verdict)
+      // The verdict travels out with the outcome rather than being turned
+      // into text here: the caller decides whether this dialog is still on
+      // screen to raise a panel or has to settle for a toast, and both have
+      // to word the same failure the same way.
+      return { kind: "failed", disposition: verdict }
     }
   }
 
@@ -1021,9 +1049,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         // the retry goes out under a new client message id rather than the
         // one the attempt that just settled here used
         // (xorbitsai/xagent#2502).
-        // "nothing-to-send" maps with "failed" on purpose -- both mean no
-        // message went out -- and is unreachable from here anyway, since
-        // this block only runs when doResend was called with a snapshot.
+        // "nothing-to-send" takes the same toast path as "failed" on
+        // purpose: resendFailureTextKey words a failed outcome off the
+        // verdict it carries and a nothing-to-send one, which handed nothing
+        // to the send path, as not sent -- and it is unreachable from here
+        // anyway, since this block only runs when doResend was called with
+        // a snapshot.
         setSubmitting(false)
         toast(resendOutcome.kind === "sent"
           ? t("connectorRuntime.resendSupersededSent")
