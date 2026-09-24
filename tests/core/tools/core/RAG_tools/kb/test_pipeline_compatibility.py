@@ -1124,7 +1124,6 @@ async def test_web_ingestion_snapshot_compensation_failure_is_tracked(
 
 def test_web_ingestion_root_compensation_success_marks_outcome_complete() -> None:
     operation_facade = KBOperationCompatibilityFacade()
-    facade = KBPipelineCompatibilityFacade(operation_compatibility=operation_facade)
 
     with operation_facade.start_operation(
         operation_type="web_ingestion",
@@ -1137,23 +1136,14 @@ def test_web_ingestion_root_compensation_success_marks_outcome_complete() -> Non
             compensation=lambda: None,
         )
         assert operation.execute_compensations() == ()
-        facade._record_web_ingestion_outcome(
+        finish_web_ingestion_outcome(
             operation,
-            WebIngestionResult(
-                status="error",
-                collection="demo",
-                total_urls_found=1,
-                pages_crawled=1,
-                pages_failed=1,
-                documents_created=0,
-                chunks_created=0,
-                embeddings_created=0,
-                crawled_urls=[],
-                failed_urls={"https://example.com": "failed"},
-                message="failed",
-                warnings=[],
-                elapsed_time_ms=1,
-            ),
+            status="error",
+            documents_created=0,
+            pages_crawled=1,
+            pages_failed=1,
+            failed_urls={"https://example.com": "failed"},
+            message="failed",
         )
 
     outcome = operation_facade.last_outcome

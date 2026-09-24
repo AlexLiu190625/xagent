@@ -4706,18 +4706,6 @@ async def ingest_cloud(
                             except OSError:
                                 pass
                         return api_result
-                    except RollbackFailureError as rollback_exc:
-                        return KBApiOperationResult(
-                            result=IngestionResult(
-                                status="error",
-                                message=str(rollback_exc),
-                                doc_id=source_filename,
-                            ),
-                            operation_outcome=api_result.operation_outcome
-                            if "api_result" in locals()
-                            else None,
-                            rollback_complete=False,
-                        )
                     except Exception as e:
                         rollback_result = IngestionResult(
                             status="error",
@@ -4766,16 +4754,6 @@ async def ingest_cloud(
                         )
                     )
 
-            except RollbackFailureError as e:
-                logger.exception("Rollback failed for %s: %s", file_info.fileName, e)
-                return KBApiOperationResult(
-                    result=IngestionResult(
-                        status="error",
-                        message=str(e),
-                        doc_id=source_filename,
-                    ),
-                    rollback_complete=False,
-                )
             except Exception as e:
                 rollback_api_result = KBApiOperationResult(
                     result=IngestionResult(

@@ -237,27 +237,6 @@ class KBFileCompatibilityFacade:
             deletable_statuses=deletable_statuses,
         )
 
-    def compensate_new_uploaded_file(
-        self,
-        db: Session,
-        *,
-        file_id: str,
-        user_id: Optional[int] = None,
-        delete_local: bool = True,
-        local_root: Optional[Path] = None,
-    ) -> FileCompensationResult:
-        from xagent.web.services.kb_file_service import (
-            _compensate_new_uploaded_file_impl,
-        )
-
-        return _compensate_new_uploaded_file_impl(
-            db,
-            file_id=file_id,
-            user_id=user_id,
-            delete_local=delete_local,
-            local_root=local_root,
-        )
-
     def cleanup_local_copied_file(
         self,
         *,

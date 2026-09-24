@@ -712,7 +712,6 @@ async def _run_web_ingestion_impl(
                                 page_operation,
                                 status=ingest_result.status,
                                 message=ingest_result.message,
-                                side_effects_may_remain=bool(rollback_error),
                             )
                             copied_persistent_file = None
 
@@ -753,7 +752,6 @@ async def _run_web_ingestion_impl(
                             page_operation,
                             status="error",
                             message=failure_message,
-                            side_effects_may_remain=bool(rollback_error),
                         )
 
                 except Exception as e:

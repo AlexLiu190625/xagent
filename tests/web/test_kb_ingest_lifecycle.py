@@ -243,7 +243,6 @@ def test_background_web_cleanup_keeps_early_exception_fallback(
         db,
         payload,
         context="background web ingest",
-        successful_documents=0,
     )
     api_helper.assert_not_called()
 
