@@ -26,6 +26,7 @@ from ...workspace import DEFAULT_USER_FILE_LIST_LIMIT, SPILL_DIR_NAME, TaskWorks
 from ..tool_result_spill import (
     _SPILL_FILENAME_RE,
     SPILL_DIGEST_HEX_CHARS,
+    SPILL_MAX_FILE_BYTES,
     SPILL_MAX_FILES_PER_RUN,
     SPILL_READ_MAX_CHARS,
     SPILL_READ_TRUNCATED_INSTRUCTION,
@@ -1006,8 +1007,8 @@ class WorkspaceFileOperations:
 
         A path that is None or blank lists the stored files instead; see
         _list_stored_tool_results. start and end have no meaning for that
-        listing, so passing either one with it is an invalid range rather
-        than something to ignore.
+        listing, so passing either one with it is rejected with its own
+        reason rather than ignored.
 
         It returns a classified failure rather than raising, because the
         caller records the return value as the tool observation the model
@@ -1018,7 +1019,7 @@ class WorkspaceFileOperations:
         self._require_workspace_authority()
         if path is None or (isinstance(path, str) and not path.strip()):
             if start is not None or end is not None:
-                return spill_read_unavailable("invalid_range")
+                return spill_read_unavailable("listing_takes_no_range")
             return self._list_stored_tool_results()
         name = normalize_spilled_relative_path(path)
         if name is None:
@@ -1029,6 +1030,11 @@ class WorkspaceFileOperations:
         if resolved is None:
             return spill_read_unavailable("not_found")
         try:
+            # The writer never produces a file above SPILL_MAX_FILE_BYTES, so
+            # a larger file cannot be a stored result and is not read into
+            # memory.
+            if resolved.stat(follow_symlinks=False).st_size > SPILL_MAX_FILE_BYTES:
+                return spill_read_unavailable("not_found")
             raw = resolved.read_bytes()
         except OSError:
             return spill_read_unavailable("not_found")

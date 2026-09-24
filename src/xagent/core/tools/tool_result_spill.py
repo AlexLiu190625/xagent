@@ -105,6 +105,10 @@ SPILL_READ_UNAVAILABLE_MESSAGES = {
         "start and end are 1-based item numbers: both must be 1 or "
         "greater, and start must not exceed end."
     ),
+    "listing_takes_no_range": (
+        "Omit start and end to list the stored results, or give a path to "
+        "read one of them."
+    ),
 }
 # The read tool's own name, output cap and over-cap instruction. The cap
 # mirrors READ_FILE_CONTEXT_LIMIT (core/agent/context/execution.py), and a

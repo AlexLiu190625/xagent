@@ -1271,8 +1271,8 @@ class AutoPattern(AgentPattern):
             if memory_tools_available
             else ""
         )
-        # Count and names both leave out the stored-result reader (see
-        # _execution_tool_names), so the number and the list stay in step.
+        # Both the count and the name list leave out the stored-result reader
+        # (see _execution_tool_names), so its exclusion changes neither.
         tool_count = sum(
             1
             for tool in tools

@@ -457,6 +457,29 @@ def test_spill_read_unavailable_is_a_classified_failure(reason):
     assert result["output"] == SPILL_READ_UNAVAILABLE_MESSAGES[reason]
 
 
+def test_spill_read_unavailable_messages_are_pinned():
+    # Written out rather than read back, so a reworded reason or a new one
+    # shows up here instead of moving the expectation with it.
+    assert SPILL_READ_UNAVAILABLE_MESSAGES == {
+        "invalid_path": (
+            "That is not one of the stored result paths. Copy a path from the "
+            "notice exactly as written."
+        ),
+        "not_found": (
+            "That stored result is no longer available: report the value as "
+            "unavailable and do not reconstruct it."
+        ),
+        "invalid_range": (
+            "start and end are 1-based item numbers: both must be 1 or "
+            "greater, and start must not exceed end."
+        ),
+        "listing_takes_no_range": (
+            "Omit start and end to list the stored results, or give a path to "
+            "read one of them."
+        ),
+    }
+
+
 def test_spill_read_unavailable_names_the_item_count_for_a_range():
     result = spill_read_unavailable("invalid_range", item_count=7)
     assert "7" in result["output"]

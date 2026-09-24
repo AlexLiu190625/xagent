@@ -13,6 +13,7 @@ import pytest
 from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
 from xagent.core.tools.core import workspace_file_tool as core_workspace_file_tool
 from xagent.core.tools.tool_result_spill import (
+    SPILL_MAX_FILE_BYTES,
     SPILL_MAX_FILES_PER_RUN,
     SPILL_READ_MAX_CHARS,
     SPILL_READ_TOOL_NAME,
@@ -958,6 +959,27 @@ class TestReadToolResult:
             "output": "ok\ufffd\n",
         }
 
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_read_tool_result_size_gate_sits_at_the_writer_file_cap(self, tmp_path):
+        """A file at exactly the writer's cap is read; one byte more cannot be
+        a stored result, so it is reported unavailable without being read,
+        even though its name carries the right digest."""
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        at_cap = b"a" * SPILL_MAX_FILE_BYTES
+        over_cap = at_cap + b"a"
+        at_cap_path = self._plant(workspace, f"cap-{self._digest(at_cap)}.txt", at_cap)
+        over_cap_path = self._plant(
+            workspace, f"over-{self._digest(over_cap)}.txt", over_cap
+        )
+
+        at_cap_result = tools.read_tool_result(at_cap_path)
+        assert at_cap_result["content_truncated"] is True
+        assert at_cap_result["original_chars"] == SPILL_MAX_FILE_BYTES
+        assert tools.read_tool_result(over_cap_path) == spill_read_unavailable(
+            "not_found"
+        )
+
     # --- no path: list the stored results -----------------------------------
 
     @pytest.mark.usefixtures("mock_workspace_db")
@@ -1041,7 +1063,11 @@ class TestReadToolResult:
         self._spill_file(workspace, "a" * 10)
 
         result = tools.read_tool_result(path, start=start, end=end)
-        assert result == spill_read_unavailable("invalid_range")
+        assert result == spill_read_unavailable("listing_takes_no_range")
+        assert result["output"] == (
+            "Omit start and end to list the stored results, or give a path to "
+            "read one of them."
+        )
 
     @pytest.mark.usefixtures("mock_workspace_db")
     def test_read_tool_result_listing_is_capped_and_counts_the_rest(self, tmp_path):
