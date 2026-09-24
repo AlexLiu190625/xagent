@@ -529,6 +529,23 @@ describe("AgentBuilder preview", () => {
     expect(closeFilePreviewMock).toHaveBeenCalledTimes(1)
   })
 
+  it("nulls the shared task when the preview resets on mount", async () => {
+    render(<AgentBuilder />)
+    await screen.findByText("send-preview-message")
+
+    expect(setTaskIdMock).toHaveBeenCalledWith(null, { navigate: false })
+  })
+
+  it("nulls the shared task when the preview is cleared", async () => {
+    render(<AgentBuilder />)
+    await screen.findByText("send-preview-message")
+    setTaskIdMock.mockClear()
+
+    fireEvent.click(screen.getByTitle("common.clear"))
+
+    expect(setTaskIdMock).toHaveBeenCalledWith(null, { navigate: false })
+  })
+
   it("does not show App Widget in the builder form (widget moved to Deploy dialog)", async () => {
     // App Widget was removed from the Configure form and is now only accessible
     // via the Deploy Agent dialog. Verify it is absent from the builder UI.

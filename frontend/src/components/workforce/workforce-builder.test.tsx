@@ -14,6 +14,7 @@ const routerPushMock = vi.hoisted(() => vi.fn())
 const searchParamsMock = vi.hoisted(() => new URLSearchParams())
 const translateMock = vi.hoisted(() => (key: string) => key)
 const sendMessageMock = vi.hoisted(() => vi.fn())
+const setTaskIdMock = vi.hoisted(() => vi.fn())
 
 // Spied rather than mocked via vi.mock: handleCreate now updates the address
 // bar via the native History API instead of router.replace/push, precisely
@@ -44,7 +45,7 @@ vi.mock("@/contexts/i18n-context", () => ({
 vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => ({
     sendMessage: sendMessageMock,
-    setTaskId: vi.fn(),
+    setTaskId: setTaskIdMock,
     closeFilePreview: vi.fn(),
     dispatch: vi.fn(),
     state: { currentTask: null, traceEvents: [], filePreview: { isOpen: false, fileId: "", fileName: "", viewMode: "preview" } },
@@ -108,6 +109,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     getWorkforceMock.mockReset()
     runWorkforceMock.mockReset()
     sendMessageMock.mockReset().mockResolvedValue(undefined)
+    setTaskIdMock.mockReset()
     historyReplaceStateSpy.mockClear()
   })
 
@@ -585,6 +587,55 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     await waitFor(() => {
       expect(runWorkforcePreviewMock).toHaveBeenCalledTimes(2)
     })
+  })
+
+  it("nulls the shared task when a config edit invalidates the test preview", async () => {
+    runWorkforcePreviewMock.mockResolvedValueOnce({
+      workforce_run_id: 1,
+      task_id: 42,
+      status: "running",
+      redirect_url: "/task/42",
+    })
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    fireEvent.click(screen.getByText("workforces.canvas.title"))
+    fireEvent.click(screen.getByText("workforces.canvas.chooseLead.title"))
+    fireEvent.click(await screen.findByText("Project Coordinator"))
+    fireEvent.click(screen.getByText("workforces.canvas.addFirstAgent.title"))
+    fireEvent.click(await screen.findByText("Web Researcher"))
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.addMemberTitle")).not.toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText("Send Test"))
+    await waitFor(() => expect(setTaskIdMock).toHaveBeenCalledWith(42, { navigate: false }))
+    setTaskIdMock.mockClear()
+
+    fireEvent.click(screen.getByText("workforces.actions.addAgent"))
+    fireEvent.click(await screen.findByText("Silent Analyst"))
+
+    await waitFor(() => {
+      expect(setTaskIdMock).toHaveBeenCalledWith(null, { navigate: false })
+    })
+  })
+
+  it("nulls the shared task on mount", async () => {
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    expect(setTaskIdMock).toHaveBeenCalledWith(null, { navigate: false })
+  })
+
+  it("nulls the shared task when the builder unmounts", async () => {
+    const { unmount } = render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+    setTaskIdMock.mockClear()
+
+    unmount()
+
+    expect(setTaskIdMock).toHaveBeenCalledWith(null, { navigate: false })
   })
 
   it("does not fire a second concurrent preview-creation request when a draft edit invalidates the first one mid-flight", async () => {

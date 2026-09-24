@@ -271,6 +271,12 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
         setTaskId(null, { navigate: false })
     }, [closeFilePreview, dispatch, setTaskId])
 
+    // Pages like /task/<id> leave their task in the shared context on unmount.
+    useEffect(() => {
+        invalidatePreviewRun()
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [])
+
     // useCallback: workforce-canvas.tsx's node-layout memo depends on this
     // reference, and a fresh one on every unrelated re-render (e.g. opening a
     // dialog) would otherwise rebuild the whole nodes array from scratch.
