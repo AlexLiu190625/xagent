@@ -73,6 +73,7 @@ from ...core.tools.core.RAG_tools.core.schemas import (
 )
 from ...core.tools.core.RAG_tools.kb import (
     KBApiCompatibilityFacade,
+    KBApiFailedIngestCleanupDecision,
     KBApiOperationResult,
     get_kb_coordinator,
 )
@@ -1243,15 +1244,14 @@ async def _cleanup_collection_metadata_after_failed_ingest(
     collection_name: str,
     user: User,
     context: str,
-    successful_documents: int = 0,
-    side_effects_may_remain: bool = False,
+    decision: KBApiFailedIngestCleanupDecision,
 ) -> None:
     """Clean up only truly empty new collections; config is saved after ingest."""
     if collection_existed_before:
         return
 
-    if successful_documents > 0 or side_effects_may_remain:
-        if side_effects_may_remain:
+    if decision.keeps_new_collection_metadata:
+        if decision.side_effects_may_remain:
             logger.warning(
                 "Skipping failed-ingest collection metadata cleanup for %s/user_%s "
                 "during %s because rollback side effects may remain",
@@ -1292,8 +1292,7 @@ async def _cleanup_collection_metadata_after_failed_api_ingest(
         collection_name=collection_name,
         user=user,
         context=context,
-        successful_documents=cleanup_decision.successful_documents,
-        side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+        decision=cleanup_decision,
     )
 
 
@@ -1318,8 +1317,7 @@ async def _cleanup_collection_metadata_after_failed_batch_api_ingest(
         collection_name=collection_name,
         user=user,
         context=context,
-        successful_documents=cleanup_decision.successful_documents,
-        side_effects_may_remain=cleanup_decision.side_effects_may_remain,
+        decision=cleanup_decision,
     )
 
 

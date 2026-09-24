@@ -62,10 +62,15 @@ class KBApiOperationResult(Generic[T_Result]):
 
 @dataclass(frozen=True)
 class KBApiFailedIngestCleanupDecision:
-    """API-facing cleanup policy derived from operation rollback state."""
+    """Cleanup policy for a failed ingest, from rollback outcomes or plain counts."""
 
     successful_documents: int = 0
     side_effects_may_remain: bool = False
+
+    @property
+    def keeps_new_collection_metadata(self) -> bool:
+        """Whether a failed ingest must keep a new collection's metadata."""
+        return self.successful_documents > 0 or self.side_effects_may_remain
 
 
 @dataclass(frozen=True)
