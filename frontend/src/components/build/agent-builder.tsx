@@ -713,8 +713,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const previewTaskIdRef = useRef<number | null>(null)
+  // Bumped by resetPreviewSession (Clear, mount/unmount); a mismatch silently drops an in-flight send's task and error.
+  const previewGenerationRef = useRef(0)
+  // Bumped by invalidatePreviewTask on config changes; a mismatch still sends the in-flight message but won't cache its task.
+  const previewConfigGenerationRef = useRef(0)
 
   const resetPreviewSession = useCallback(() => {
+    previewGenerationRef.current += 1
     previewTaskIdRef.current = null
     closeFilePreview()
     dispatch({ type: "CLEAR_MESSAGES" })
@@ -727,6 +732,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }, [closeFilePreview, dispatch, setTaskId])
 
   const invalidatePreviewTask = useCallback(() => {
+    previewConfigGenerationRef.current += 1
     previewTaskIdRef.current = null
   }, [])
 
@@ -738,9 +744,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }, [resetPreviewSession])
 
   useEffect(() => {
-    if (!previewTaskIdRef.current) {
-      return
-    }
     invalidatePreviewTask()
   }, [instructions, executionMode, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, invalidatePreviewTask])
 
@@ -1173,6 +1176,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }
 
   const handlePreviewSendMessage = async (content: string, _config?: any, files?: File[]) => {
+    const generationAtStart = previewGenerationRef.current
     try {
       // Check if general model is selected
       if (!modelConfig.general) {
@@ -1205,6 +1209,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       const finalToolCategories = buildToolCategories()
 
       if (!previewTaskId) {
+        const configGenerationAtStart = previewConfigGenerationRef.current
         const response = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1235,11 +1240,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         }
 
         const taskData = await response.json()
+        if (previewGenerationRef.current !== generationAtStart) return
         previewTaskId = Number(taskData.task_id)
         if (!Number.isFinite(previewTaskId)) {
           throw new Error("Preview task creation returned an invalid task id")
         }
-        previewTaskIdRef.current = previewTaskId
+        // Config edited mid-create: this message still goes to the pre-edit task, the next send starts a fresh one.
+        if (previewConfigGenerationRef.current === configGenerationAtStart) {
+          previewTaskIdRef.current = previewTaskId
+        }
 
         // Close any file preview opened from the previous preview task before switching context.
         closeFilePreview()
@@ -1274,6 +1283,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       await sendMessage(backendMessage, { force: true, targetTaskId: previewTaskId }, files)
     } catch (error) {
       console.error("Preview failed:", error)
+      if (previewGenerationRef.current !== generationAtStart) return
       dispatch({
         type: "ADD_MESSAGE",
         payload: {

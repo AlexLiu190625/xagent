@@ -557,4 +557,132 @@ describe("AgentBuilder preview", () => {
     expect(screen.queryByText("appWidget.builder.title")).not.toBeInTheDocument()
     expect(screen.queryByRole("switch", { name: "appWidget.builder.toggle" })).not.toBeInTheDocument()
   })
+
+  describe("while preview task creation is pending", () => {
+    let pendingCreates: Array<(response: Response) => void>
+
+    beforeEach(() => {
+      pendingCreates = []
+      const baseImpl = apiRequestMock.getMockImplementation()!
+      apiRequestMock.mockImplementation((url: string, init?: RequestInit) =>
+        url.endsWith("/api/chat/task/create")
+          ? new Promise<Response>((resolve) => pendingCreates.push(resolve))
+          : baseImpl(url, init),
+      )
+    })
+
+    const sendPreview = async () => {
+      const button = await screen.findByText("send-preview-message")
+      // A click before the default model loads hits the no-model guard, so retry until one reaches task/create.
+      await waitFor(() => {
+        if (pendingCreates.length === 0) fireEvent.click(button)
+        expect(pendingCreates).toHaveLength(1)
+      })
+    }
+
+    const settle = (fn: () => void) =>
+      act(async () => {
+        fn()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      })
+
+    const resolveCreate = (taskId: number) =>
+      settle(() =>
+        pendingCreates.shift()!(
+          new Response(JSON.stringify({ task_id: taskId, title: "Preview this", status: "pending" }), { status: 200 }),
+        ),
+      )
+
+    const expectDropped = (taskId: number) => {
+      expect(setTaskIdMock).not.toHaveBeenCalledWith(taskId, expect.anything())
+      expect(dispatchMock).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: "SET_CURRENT_TASK", payload: expect.objectContaining({ id: String(taskId) }) }),
+      )
+      expect(sendMessageMock).not.toHaveBeenCalled()
+    }
+
+    it("drops a task that resolves after Clear", async () => {
+      render(<AgentBuilder />)
+      await sendPreview()
+
+      fireEvent.click(screen.getByTitle("common.clear"))
+      await resolveCreate(123)
+
+      expectDropped(123)
+    })
+
+    it("drops a task that resolves after the builder unmounts", async () => {
+      const { unmount } = render(<AgentBuilder />)
+      await sendPreview()
+
+      unmount()
+      await resolveCreate(123)
+
+      expectDropped(123)
+    })
+
+    it("reuses the created task for the next send when the config is unchanged", async () => {
+      render(<AgentBuilder />)
+      await sendPreview()
+      await resolveCreate(123)
+
+      fireEvent.click(screen.getByText("send-preview-message"))
+
+      await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(2))
+      expect(apiRequestMock.mock.calls.filter(([url]) => String(url).endsWith("/api/chat/task/create"))).toHaveLength(1)
+      expect(sendMessageMock.mock.calls.map(([, config]) => config.targetTaskId)).toEqual([123, 123])
+    })
+
+    it("delivers the pending message after a config edit but starts the next send on a new task", async () => {
+      render(<AgentBuilder />)
+      await sendPreview()
+
+      fireEvent.click(screen.getByText("builds.configForm.executionMode.think.title"))
+      await resolveCreate(123)
+
+      expect(setTaskIdMock).toHaveBeenCalledWith(123, { navigate: false })
+      expect(sendMessageMock).toHaveBeenCalledWith("Preview this", expect.objectContaining({ targetTaskId: 123 }), undefined)
+
+      await sendPreview()
+      const createModes = apiRequestMock.mock.calls
+        .filter(([url]) => String(url).endsWith("/api/chat/task/create"))
+        .map(([, init]) => JSON.parse(init.body as string).execution_mode)
+      expect(createModes).toEqual(["balanced", "think"])
+    })
+
+    it("does not report a send that fails after Clear", async () => {
+      let rejectSend!: (error: Error) => void
+      sendMessageMock.mockReturnValue(new Promise((_, reject) => { rejectSend = reject }))
+      render(<AgentBuilder />)
+      await sendPreview()
+      await resolveCreate(123)
+      expect(sendMessageMock).toHaveBeenCalled()
+
+      fireEvent.click(screen.getByTitle("common.clear"))
+      await settle(() => rejectSend(new Error("reset before delivery")))
+
+      expect(dispatchMock).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "ADD_MESSAGE",
+          payload: expect.objectContaining({ content: "builds.preview.errors.requestFailed" }),
+        }),
+      )
+    })
+
+    it("still reports a send that fails without a reset", async () => {
+      sendMessageMock.mockRejectedValue(new Error("send failed"))
+      render(<AgentBuilder />)
+      await sendPreview()
+      await resolveCreate(123)
+
+      await waitFor(() =>
+        expect(dispatchMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "ADD_MESSAGE",
+            payload: expect.objectContaining({ content: "builds.preview.errors.requestFailed" }),
+          }),
+        ),
+      )
+    })
+  })
 })
