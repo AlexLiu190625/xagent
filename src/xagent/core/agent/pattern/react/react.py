@@ -85,6 +85,7 @@ from ....tools.adapters.vibe.mcp_approval_gate import (
     ToolCallExecutionContext,
     bind_tool_call_execution_context,
 )
+from ....tools.tool_result_spill import SPILL_RESERVED_RESULT_KEY
 from ....tools.user_interaction import (
     ToolInteractionSettlement,
     tool_result_waits_for_user,
@@ -4865,12 +4866,23 @@ class ReActPattern(AgentPattern):
             # those at the top level, so drop them here — unconditionally,
             # not via the split helpers, whose scope validation could raise —
             # or they reach the model as noise nested inside the envelope.
+            # The spill report is one of them: add_tool_result registers it
+            # and keeps it out of the rendered body only at the top level,
+            # so nested here it would print its relative_path in the
+            # envelope's body with no notice. Dropping it loses nothing; the
+            # report was registered when the original call's result was
+            # added.
             prior_result = record.result
             if isinstance(prior_result, dict):
                 prior_result = {
                     key: value
                     for key, value in prior_result.items()
-                    if key not in (CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY)
+                    if key
+                    not in (
+                        CONTEXT_REFS_KEY,
+                        SUPERSEDES_SCOPE_KEY,
+                        SPILL_RESERVED_RESULT_KEY,
+                    )
                 }
             return build_suppression_envelope(
                 tool_name=tool_name,
