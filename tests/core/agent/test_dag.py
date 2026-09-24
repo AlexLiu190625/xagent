@@ -417,6 +417,52 @@ def build_plan(*steps: PlanStep) -> ExecutionPlan:
     return ExecutionPlan(steps=list(steps))
 
 
+@pytest.mark.asyncio
+async def test_plan_request_tool_names_leave_out_the_stored_result_reader(
+    tmp_path: Path,
+) -> None:
+    """The planner is given every real file tool name except read_tool_result:
+    ReAct offers the reader per turn once the run's registry holds a record,
+    and the planner's list is not gated on the registry."""
+    from xagent.core.tools.adapters.vibe.workspace_file_tool import (
+        create_workspace_file_tools,
+    )
+    from xagent.core.tools.tool_result_spill import SPILL_READ_TOOL_NAME
+    from xagent.core.workspace import TaskWorkspace
+
+    requests: list[PlanGenerationRequest] = []
+
+    class CapturingPlanGenerator(PlanGenerator):
+        async def generate_plan(
+            self,
+            *,
+            request: PlanGenerationRequest,
+            llm: Any,
+        ) -> ExecutionPlan:
+            del llm
+            requests.append(request)
+            raise RuntimeError("request captured")
+
+    tools = create_workspace_file_tools(TaskWorkspace("dag-tools", str(tmp_path)))
+    all_names = [tool.metadata.name for tool in tools]
+    assert SPILL_READ_TOOL_NAME in all_names
+    context = ExecutionContext(execution_id="dag-tool-names")
+    context.add_user_message("Tidy up the output files")
+
+    result = await DAGPattern(CapturingPlanGenerator()).run(
+        context=context,
+        tools=tools,
+        llm=SequenceLLM([]),
+        runtime=PatternRuntime(execution_id="dag-tool-names"),
+    )
+
+    assert result["failure_reason"] == "plan_generation_error"
+    assert len(requests) == 1
+    assert requests[0].available_tool_names == [
+        name for name in all_names if name != SPILL_READ_TOOL_NAME
+    ]
+
+
 def test_completion_assessment_plan_withholds_execution_intent_fields() -> None:
     """The call that writes the user's answer never sees planner-authored prose.
 

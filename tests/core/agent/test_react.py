@@ -4499,8 +4499,9 @@ def test_schema_gate_adds_read_tool_result_when_registry_non_empty() -> None:
     assert result is not base
 
 
-def test_schema_gate_adds_it_on_a_normal_turn_not_just_after_restart() -> None:
-    """Registry becomes non-empty mid-run; the very next call sees it."""
+def test_gate_function_offers_the_reader_with_a_non_empty_registry() -> None:
+    """Called directly, the gate leaves the reader out for a context whose
+    registry is empty and adds it for one whose registry holds a record."""
     pattern = ReActPattern()
     tools = [FakeReadToolResultTool()]
     base = pattern._tool_schemas_with_builtin_controls(tools)

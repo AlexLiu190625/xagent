@@ -993,10 +993,10 @@ class WorkspaceFileOperations:
 
         The file's bytes are checked against the digest its name carries
         before they are decoded. The writer names every file after the
-        SHA-256 of the exact bytes it writes, so a file whose bytes no longer
-        produce that digest -- changed after it was written, or put there by
-        something other than the writer -- is reported unavailable exactly
-        like a missing one, never read back as if it were a stored result.
+        SHA-256 of the exact bytes it writes. A file whose bytes do not hash
+        to the digest in its own name -- for example one changed after it was
+        written -- is reported unavailable exactly like a missing one. The
+        check proves that the bytes match the name, not who wrote the file.
 
         start and end are 1-based inclusive item numbers, not line numbers.
         What one item is comes from the file's own content, decided here on

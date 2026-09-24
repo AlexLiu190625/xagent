@@ -10,6 +10,7 @@ from json_repair import loads as repair_json_loads
 
 from ....file_ref import final_deliverable_file_reference_instructions
 from ....model.chat.exceptions import LLMToolProtocolError
+from ....tools.tool_result_spill import SPILL_READ_TOOL_NAME
 from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     MEMORY_CONTEXT_METADATA_KEY,
@@ -1270,7 +1271,13 @@ class AutoPattern(AgentPattern):
             if memory_tools_available
             else ""
         )
-        tool_count = len(tools)
+        # Count and names both leave out the stored-result reader (see
+        # _execution_tool_names), so the number and the list stay in step.
+        tool_count = sum(
+            1
+            for tool in tools
+            if self._execution_tool_name(tool) != SPILL_READ_TOOL_NAME
+        )
         tool_names = self._execution_tool_names(tools)
         tool_capability_summary = (
             f"{tool_count} execution tools are available to the downstream "
@@ -1377,27 +1384,35 @@ class AutoPattern(AgentPattern):
         )
 
     @staticmethod
+    def _execution_tool_name(tool: Any) -> str:
+        name: Any = None
+        if isinstance(tool, dict):
+            function = tool.get("function")
+            if isinstance(function, dict):
+                name = function.get("name")
+            if not name:
+                name = tool.get("name")
+        else:
+            metadata = getattr(tool, "metadata", None)
+            if metadata is not None:
+                name = getattr(metadata, "name", None)
+            if not name:
+                name = getattr(tool, "name", None)
+            if not name:
+                name = getattr(tool, "__name__", None)
+        return str(name or "").strip()
+
+    @staticmethod
     def _execution_tool_names(tools: list[Any]) -> list[str]:
         names: list[str] = []
         seen: set[str] = set()
         for tool in tools:
-            name: Any = None
-            if isinstance(tool, dict):
-                function = tool.get("function")
-                if isinstance(function, dict):
-                    name = function.get("name")
-                if not name:
-                    name = tool.get("name")
-            else:
-                metadata = getattr(tool, "metadata", None)
-                if metadata is not None:
-                    name = getattr(metadata, "name", None)
-                if not name:
-                    name = getattr(tool, "name", None)
-                if not name:
-                    name = getattr(tool, "__name__", None)
-
-            normalized = str(name or "").strip()
+            normalized = AutoPattern._execution_tool_name(tool)
+            # ReAct offers the stored-result reader per turn, once the run's
+            # registry holds a record; this list is not gated on the
+            # registry, so it leaves the reader out entirely.
+            if normalized == SPILL_READ_TOOL_NAME:
+                continue
             if normalized and normalized not in seen:
                 names.append(normalized)
                 seen.add(normalized)

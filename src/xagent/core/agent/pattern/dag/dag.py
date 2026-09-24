@@ -12,6 +12,7 @@ from ....task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
     normalize_input_modalities,
 )
+from ....tools.tool_result_spill import SPILL_READ_TOOL_NAME
 from ...checkpoint import CheckpointPersistenceError
 from ...context.enrichment import (
     enrich_context_with_memory,
@@ -2158,7 +2159,14 @@ class DAGPattern(AgentPattern):
             replan=replan,
             completed_step_results=dict(self.step_results),
             previous_plan=self.plan,
-            available_tool_names=[self._tool_name(tool) for tool in tools],
+            # ReAct offers the stored-result reader per turn, once the run's
+            # registry holds a record; this list is not gated on the
+            # registry, so it leaves the reader out entirely.
+            available_tool_names=[
+                name
+                for name in (self._tool_name(tool) for tool in tools)
+                if name != SPILL_READ_TOOL_NAME
+            ],
             completion_feedback=self.completion_feedback,
             reply_driven=reply_driven,
         )
