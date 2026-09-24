@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import os
+import tracemalloc
 from types import SimpleNamespace
 
 import pytest
@@ -962,8 +963,8 @@ class TestReadToolResult:
     @pytest.mark.usefixtures("mock_workspace_db")
     def test_read_tool_result_size_gate_sits_at_the_writer_file_cap(self, tmp_path):
         """A file at exactly the writer's cap is read; one byte more cannot be
-        a stored result, so it is reported unavailable without being read,
-        even though its name carries the right digest."""
+        a stored result, so it is reported unavailable even though its name
+        carries the right digest."""
         workspace = TaskWorkspace("task-1", str(tmp_path))
         tools = WorkspaceFileTools(workspace)
         at_cap = b"a" * SPILL_MAX_FILE_BYTES
@@ -979,6 +980,41 @@ class TestReadToolResult:
         assert tools.read_tool_result(over_cap_path) == spill_read_unavailable(
             "not_found"
         )
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_read_tool_result_bounds_the_read_when_the_entry_is_swapped(
+        self, tmp_path, monkeypatch
+    ):
+        """The size bound holds for whatever the path names when it is read,
+        not only for what the lookup saw: an entry replaced by a symlink to a
+        far larger file after the lookup is not read into memory whole."""
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        raw = b"[1, 2, 3]"
+        rel = self._plant(workspace, f"acme-{self._digest(raw)}.json", raw)
+        large = tmp_path / "large.bin"
+        with large.open("wb") as handle:
+            handle.truncate(8 * SPILL_MAX_FILE_BYTES)
+        real_resolve = core_workspace_file_tool.resolve_spilled_under
+
+        def resolve_then_swap(spill_dir, name):
+            resolved = real_resolve(spill_dir, name)
+            resolved.unlink()
+            resolved.symlink_to(large)
+            return resolved
+
+        monkeypatch.setattr(
+            core_workspace_file_tool, "resolve_spilled_under", resolve_then_swap
+        )
+        tracemalloc.start()
+        try:
+            result = tools.read_tool_result(rel)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert result == spill_read_unavailable("not_found")
+        assert peak < SPILL_MAX_FILE_BYTES
 
     # --- no path: list the stored results -----------------------------------
 

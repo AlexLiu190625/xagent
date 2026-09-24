@@ -1032,11 +1032,22 @@ class WorkspaceFileOperations:
         try:
             # The writer never produces a file above SPILL_MAX_FILE_BYTES, so
             # a larger file cannot be a stored result and is not read into
-            # memory.
-            if resolved.stat(follow_symlinks=False).st_size > SPILL_MAX_FILE_BYTES:
-                return spill_read_unavailable("not_found")
-            raw = resolved.read_bytes()
+            # memory. The size is taken from the open handle, not from the
+            # path: the entry can be replaced after resolve_spilled_under
+            # returned -- by a symlink to a far larger file, say -- and a
+            # size looked up by path describes whatever the path named at
+            # that moment, not what the open reaches. The read is bounded
+            # too, one byte past that size, so a file that grows after the
+            # size is taken still cannot be read whole; the length check
+            # below catches one that grew past the cap.
+            with resolved.open("rb") as handle:
+                size = os.fstat(handle.fileno()).st_size
+                if size > SPILL_MAX_FILE_BYTES:
+                    return spill_read_unavailable("not_found")
+                raw = handle.read(size + 1)
         except OSError:
+            return spill_read_unavailable("not_found")
+        if len(raw) > SPILL_MAX_FILE_BYTES:
             return spill_read_unavailable("not_found")
         # The digest is computed over the raw bytes and only then are they
         # decoded: errors="replace" rewrites invalid bytes, so decoding first
