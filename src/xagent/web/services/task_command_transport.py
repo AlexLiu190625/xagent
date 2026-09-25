@@ -551,6 +551,9 @@ def stage_task_command(
     )
     db.add(command)
     db.flush()
+    from .task_execution_admission import stage_task_admission
+
+    stage_task_admission(db, command)
     return StagedTaskCommand(
         staged_db_id=int(command.id),
         client_command_id=normalized_id,
@@ -754,12 +757,19 @@ def _command_routing_predicate(runner_id: str, now: datetime) -> Any:
 
 
 def _unfinished_earlier_command() -> Any:
+    from .task_execution_admission import waiting_admission
+
     earlier = aliased(TaskExecutionCommand)
     return exists(
         select(1).where(
             earlier.task_id == TaskExecutionCommand.task_id,
             earlier.id < TaskExecutionCommand.id,
             earlier.status.notin_(COMMAND_TERMINAL),
+            ~and_(
+                TaskExecutionCommand.kind.in_(("cancel", "pause")),
+                earlier.status == COMMAND_PENDING,
+                waiting_admission(earlier.id),
+            ),
         )
     )
 
@@ -767,6 +777,8 @@ def _unfinished_earlier_command() -> Any:
 def _claimable_query(
     db: Session, *, runner_id: str, command_db_id: int | None
 ) -> Query[Any]:
+    from .task_execution_admission import admission_eligible
+
     now = _utc_now()
     query = (
         db.query(TaskExecutionCommand)
@@ -781,6 +793,7 @@ def _claimable_query(
                 )
             ),
             _claim_availability_predicate(now),
+            admission_eligible(),
             ~_unfinished_earlier_command(),
             _command_routing_predicate(runner_id, now),
         )
@@ -869,6 +882,11 @@ def claim_task_command(
             or coordinator.lease.runner_id != resolved_runner_id
             or not lock_task_lease_no_commit(db, coordinator.lease)
         ):
+            return None
+        from .task_execution_admission import reserve_task_admission
+
+        if not reserve_task_admission(db, int(candidate.id), coordinator.lease):
+            db.rollback()
             return None
     now = _utc_now()
     expires = now + timedelta(seconds=get_task_lease_ttl_seconds())
@@ -1051,6 +1069,9 @@ def finish_task_command_no_commit(
         synchronize_session=False,
     )
     if updated == 1:
+        from .task_execution_admission import settle_cancelled_admissions
+
+        settle_cancelled_admissions(db, command_db_id)
         stage_terminal_event(db, command_db_id=command_db_id)
     return updated == 1
 
@@ -1283,6 +1304,10 @@ def retry_failed_task_command(
     command_db_id: int,
 ) -> bool:
     """Reset one failed command without retargeting its immutable execution."""
+
+    from .task_execution_admission import prepare_task_admission_retry
+
+    prepare_task_admission_retry(db, command_db_id)
 
     now = _utc_now()
     updated = (
