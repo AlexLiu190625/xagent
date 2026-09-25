@@ -19,20 +19,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.web.api import test_kb_dir as kb_dir
-from xagent.core.tools.core.RAG_tools.core.schemas import (
-    IngestionConfig,
-    IngestionResult,
-)
+from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
 from xagent.core.tools.core.RAG_tools.utils.string_utils import (
     generate_deterministic_doc_id,
 )
 from xagent.web.api import kb as kb_module
 from xagent.web.api.kb import RollbackFailureError
-from xagent.web.jobs.exceptions import BackgroundJobHandlerError
-from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
-from xagent.web.models.background_job import BackgroundJobType
-from xagent.web.models.uploaded_file import UploadedFile
-from xagent.web.services.background_jobs import create_background_job
 
 test_env = kb_dir.test_env
 temp_uploads = kb_dir.temp_uploads
@@ -542,7 +534,7 @@ def test_wrapper_stays_a_coroutine_function() -> None:
     assert inspect.iscoroutinefunction(kb_module._rollback_failed_ingestion)
 
 
-# --- Text surfaced by /ingest and the legacy (non-staged) document job ---
+# --- Text surfaced by /ingest ---
 
 
 def _post_ingest(test_env, filename: str, collection: str, *patches: Any) -> Any:
@@ -687,88 +679,3 @@ def test_ingest_keeps_failed_result_after_clean_rollback(
 
     assert response.status_code == 500
     assert response.json() == {**ingested.model_dump(mode="json"), "status": "error"}
-
-
-def _run_legacy_job(test_env, tmp_path: Path) -> BackgroundJobHandlerError:
-    _, _, user, session_local = test_env
-    source = tmp_path / "doc.txt"
-    source.write_text("content", encoding="utf-8")
-    file_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-    db = session_local()
-    try:
-        db.add(
-            UploadedFile(
-                file_id=file_id,
-                user_id=int(user.id),
-                filename="doc.txt",
-                storage_path=str(source),
-                mime_type="text/plain",
-                file_size=source.stat().st_size,
-            )
-        )
-        db.commit()
-        job = create_background_job(
-            db,
-            user_id=int(user.id),
-            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
-            payload={
-                "collection": "existing-kb",
-                "source_path": str(source),
-                "file_id": file_id,
-                "filename": "doc.txt",
-                "mime_type": "text/plain",
-                "file_size": source.stat().st_size,
-                "user_id": int(user.id),
-                "is_admin": False,
-                "ingestion_config": IngestionConfig().model_dump(mode="json"),
-                "collection_existed_before": True,
-                "had_existing_file": False,
-            },
-        )
-        with pytest.raises(BackgroundJobHandlerError) as info:
-            handle_kb_ingest_document(db, job)
-        return info.value
-    finally:
-        db.close()
-
-
-def test_legacy_job_returns_rollback_failure_text_verbatim(
-    test_env, tmp_path, monkeypatch
-) -> None:
-    ingested = _result(message="ingestion failed")
-    monkeypatch.setattr(
-        "xagent.web.jobs.kb_tasks.run_document_ingestion", lambda **_kw: ingested
-    )
-    monkeypatch.setattr(kb_module, "get_vector_index_store", MagicMock())
-    monkeypatch.setattr(
-        kb_module,
-        "delete_document",
-        lambda *_a: SimpleNamespace(status="error", message="boom"),
-    )
-
-    err = _run_legacy_job(test_env, tmp_path)
-
-    assert str(err) == (
-        "Failed to fully roll back ingest for existing-kb/doc.txt: "
-        "delete document 'doc-1' during rollback failed: boom. "
-        "Original ingestion error: ingestion failed"
-    )
-    assert err.retryable is False
-    assert err.result == ingested.model_dump(mode="json")
-
-
-def test_legacy_job_routes_through_the_patched_wrapper(
-    test_env, tmp_path, monkeypatch
-) -> None:
-    monkeypatch.setattr(
-        "xagent.web.jobs.kb_tasks.run_document_ingestion",
-        lambda **_kw: _result(message="ingestion failed"),
-    )
-
-    with patch(
-        "xagent.web.api.kb._rollback_failed_ingestion",
-        side_effect=RollbackFailureError("x"),
-    ):
-        err = _run_legacy_job(test_env, tmp_path)
-
-    assert str(err) == "x"
