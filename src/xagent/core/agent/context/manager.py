@@ -86,6 +86,11 @@ class ContextManager:
             self._contexts[context.execution_id] = context
         return context
 
+    def set_context_if_absent(self, context: ExecutionContext) -> ExecutionContext:
+        """Make concurrent cold-start readers share one context and gate."""
+        with self._lock:
+            return self._contexts.setdefault(context.execution_id, context)
+
     def remove_context(self, execution_id: str) -> None:
         with self._lock:
             self._contexts.pop(execution_id, None)

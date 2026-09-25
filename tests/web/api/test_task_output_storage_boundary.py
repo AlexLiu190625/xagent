@@ -406,6 +406,105 @@ async def test_takeover_during_output_upload_cannot_commit_old_run_metadata(
         get_unscoped_file_storage.cache_clear()
 
 
+@pytest.mark.parametrize(
+    ("terminal_state", "result_status", "expect_committed"),
+    [
+        ("a2a_canceled", "completed", False),
+        ("unknown_failed", "completed", False),
+        ("running", "interrupted", True),
+    ],
+)
+def test_late_result_files_commit_only_with_a_pause_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    terminal_state: str,
+    result_status: str,
+    expect_committed: bool,
+) -> None:
+    """A result the finalizer ignores must not persist its file outputs."""
+    run_id = f"late-{terminal_state}"
+    task_id, user_id = _seed_running_task(runner_id="late-runner", run_id=run_id)
+    uploads_dir = tmp_path / "uploads"
+    output_path = (
+        uploads_dir / f"user_{user_id}" / f"web_task_{task_id}" / "output" / "late.txt"
+    )
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("late output", encoding="utf-8")
+    object_root = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+    get_unscoped_file_storage.cache_clear()
+    try:
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
+            task_id=task_id,
+            task_user_id=user_id,
+            file_outputs=[{"path": str(output_path), "filename": "late.txt"}],
+            resolved_scope_segments=(),
+        )
+        assert prepared.staged_files
+        assert any(path.is_file() for path in object_root.rglob("*"))
+        if terminal_state != "running":
+            db = _direct_db_session()
+            try:
+                task = db.query(Task).filter(Task.id == task_id).one()
+                task.status = TaskStatus.FAILED
+                task.error_message = "Task canceled."
+                if terminal_state == "a2a_canceled":
+                    task.agent_config = {"a2a_state": "TASK_STATE_CANCELED"}
+                db.commit()
+            finally:
+                db.close()
+        result: dict[str, Any] = {
+            "success": result_status == "completed",
+            "status": result_status,
+            "output": "late result",
+            "file_outputs": [],
+        }
+        if terminal_state == "unknown_failed":
+            result["injection_outcome_unknown"] = True
+
+        finalized = task_execution_service._finalize_task_execution_result_isolated(
+            task_id=task_id,
+            task_user_id=user_id,
+            pre_run_status=TaskStatus.RUNNING,
+            result=result,
+            expected_run_id=run_id,
+            task_lease=TaskLease(
+                attempt_id="test-attempt",
+                task_id=task_id,
+                runner_id="late-runner",
+                run_id=run_id,
+            ),
+            resolved_scope_segments=(),
+            prepared_outputs=prepared,
+        )
+
+        assert finalized.waiting_for_control
+        check_db = _direct_db_session()
+        try:
+            file_count = (
+                check_db.query(UploadedFile)
+                .filter(UploadedFile.task_id == task_id)
+                .count()
+            )
+            task = check_db.get(Task, task_id)
+            if expect_committed:
+                assert file_count == 1
+                assert task.status == TaskStatus.PAUSED
+            else:
+                assert file_count == 0
+                assert task.status == TaskStatus.FAILED
+                assert task.error_message == "Task canceled."
+                assert task.output is None
+        finally:
+            check_db.close()
+        assert (
+            any(path.is_file() for path in object_root.rglob("*")) is expect_committed
+        )
+    finally:
+        get_unscoped_file_storage.cache_clear()
+
+
 def test_metadata_version_change_rolls_back_entire_task_finalization(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -668,6 +767,74 @@ def test_lost_resume_owner_compensates_new_version_without_deleting_committed_ob
         )
     finally:
         get_unscoped_file_storage.cache_clear()
+
+
+@pytest.mark.parametrize("release_succeeds", [True, False])
+def test_resumed_unknown_failed_result_commits_only_a_confirmed_release(
+    monkeypatch: pytest.MonkeyPatch,
+    release_succeeds: bool,
+) -> None:
+    task_id, user_id = _seed_running_task(
+        runner_id="failed-runner",
+        run_id="failed-run",
+    )
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.FAILED
+        db.commit()
+    finally:
+        db.close()
+
+    real_release = task_execution_service.release_task_lease_no_commit
+
+    def release(db: Any, lease: TaskLease, **kwargs: Any) -> bool:
+        db.query(Task).filter(Task.id == lease.task_id).update(
+            {Task.error_message: "written before release"},
+            synchronize_session=False,
+        )
+        if release_succeeds:
+            return real_release(db, lease, **kwargs)
+        return False
+
+    monkeypatch.setattr(task_execution_service, "release_task_lease_no_commit", release)
+    prepared = task_execution_service._prepare_task_file_outputs_isolated(
+        task_id=task_id,
+        task_user_id=user_id,
+        file_outputs=[],
+        resolved_scope_segments=(),
+    )
+
+    finalized = task_execution_service._finalize_resumed_task(
+        task_id,
+        status="interrupted",
+        success=False,
+        output=None,
+        task_owner_user_id=user_id,
+        result={"success": False, "injection_outcome_unknown": True},
+        task_lease=TaskLease(
+            attempt_id="test-attempt",
+            task_id=task_id,
+            runner_id="failed-runner",
+            run_id="failed-run",
+        ),
+        prepared_outputs=prepared,
+    )
+
+    assert finalized["late_result"]
+    check_db = _direct_db_session()
+    try:
+        task = check_db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.FAILED
+        if release_succeeds:
+            assert task.runner_id is None
+            assert task.error_message == "written before release"
+        else:
+            # A failed release must not commit anything flushed before it.
+            assert task.runner_id == "failed-runner"
+            assert task.error_message != "written before release"
+    finally:
+        check_db.close()
 
 
 def test_superseded_output_is_deleted_only_after_exact_metadata_commit(

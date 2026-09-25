@@ -4559,3 +4559,42 @@ def test_acceptance_snapshot_stages_no_execution_lease(db_session, commit):
     assert db_session.query(TaskChatMessage).filter_by(task_id=task_id).count() == int(
         commit
     )
+
+
+@pytest.mark.asyncio
+async def test_unknown_settlement_flushes_workforce_projection(db_session):
+    from xagent.web.services.task_execution import _acquire_resume_task_lease
+    from xagent.web.services.task_orchestrator import pause_unknown_task_lease
+
+    user = _create_user(db_session)
+    manager = Agent(user_id=user.id, name="unknown projection manager")
+    db_session.add(manager)
+    db_session.flush()
+    workforce = Workforce(
+        owner_user_id=user.id,
+        scope_type="user",
+        scope_id=str(user.id),
+        name="unknown workforce",
+        manager_agent_id=manager.id,
+        status="active",
+    )
+    db_session.add(workforce)
+    db_session.flush()
+    task = _create_task(db_session, user.id, status=TaskStatus.PAUSED)
+    run = WorkforceRun(
+        workforce_id=workforce.id,
+        task_id=task.id,
+        user_id=user.id,
+        status="paused",
+        snapshot={"version": 1},
+    )
+    db_session.add(run)
+    db_session.flush()
+    task.agent_config = {"workforce_run_id": int(run.id)}
+    db_session.commit()
+    lease = _acquire_resume_task_lease(int(task.id), int(user.id), None)
+    assert lease is not None
+    assert await pause_unknown_task_lease(lease)
+    db_session.expire_all()
+    assert db_session.get(Task, task.id).status == TaskStatus.PAUSED
+    assert db_session.get(WorkforceRun, run.id).status == "paused"

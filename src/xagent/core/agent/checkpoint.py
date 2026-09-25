@@ -199,6 +199,11 @@ class TraceCheckpointStore:
         self,
         execution_id: str,
     ) -> dict[str, Any] | None:
+        if not any(
+            callable(getattr(self.tracer, name, None))
+            for name in CHECKPOINT_READER_METHODS
+        ):
+            raise CheckpointUnavailableError("Checkpoint store has no readable backend")
         payload = await read_latest_checkpoint_payload(self.tracer, execution_id)
         return self._unwrap_checkpoint_payload(payload)
 

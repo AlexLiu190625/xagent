@@ -122,3 +122,75 @@ execution outcome is unknown. The existing generic retry behavior must not be
 assumed safe for START when wiring the future consumer. Process roles, producer
 migration, consumer admission, cross-process events and credentials remain
 subsequent work.
+
+## Uncertain input delivery
+
+The injection checkpoint is the acceptance boundary. Reading or preparing a
+message can fail before any write; such a failure is not an unknown write.
+After a write starts, a failed acknowledgement requires an authoritative
+read-back. If acceptance cannot be determined, the existing delivery receipt
+records `outcome_unknown` and the owned execution pauses. There is no automatic
+reinjection or execution restart. Already generated answers remain in history;
+a genuine execution failure retains its original diagnostic.
+
+The runtime records acceptance separately from later tracing and notification
+work, so an exception after a confirmed write cannot mean “not accepted”.
+Cancellation before a write and cancellation during a write have different
+acceptance outcomes. The old context remains fenced against stale checkpoint
+writes. Once its execution has exited, an explicit deferred input or resume
+loads durable state again.
+
+While that fence is up, a later input that would have to write into the fenced
+context (a live message that interrupts the run, or any input while the old
+execution is still active) writes nothing and returns `rejected_retryable`.
+Its own outcome is known: it was not accepted. It is never deferred and never
+schedules a resume, because either would restart the fenced run without the
+user's decision. Only the original uncertain write is reported as
+`outcome_unknown`.
+
+`classify_injection` in `core.agent.runner` is the single place that turns an
+attempt into an `InjectionDisposition`. It reads the recorded attempt
+evidence, the returned outcome, and any escaped error or cancellation.
+Recorded acceptance wins over a later error. A read-back that proves the
+write absent (`UserMessageInjectionRejectedError`) is not accepted in the
+same way as a fenced rejection, but it lifts the fence. Each entry point only
+maps the disposition:
+
+| Disposition | WebSocket live | Deferred | A2A / SDK | Shared command |
+| --- | --- | --- | --- | --- |
+| `accepted` | dispatched | dispatched, resume | scheduled | `accepted` |
+| `defer` | deferred resume | fails (no checkpoint) | not resumable | `not_resumable` |
+| `not_accepted_retryable` | delivery failed, resend with a new id; no task failure | delivery failed, resend with a new id; task paused if fenced, else restored | prelease restored; error carries `retryWithNewId` / `retry_with_new_id` | `busy` with `retry_with_new_id` |
+| `unknown` | `outcome_unknown` | `outcome_unknown`, paused | outcome unknown | `unknown` |
+| `failed_before_write` | existing error handling | existing | existing | existing |
+
+When a cancellation or lease loss lands after acceptance, the delivery is
+still recorded as dispatched and the interruption then follows its normal
+handling; it is never paused as an unknown input. A shared reply that was not
+accepted keeps its stored answer: repeating the same A2A `messageId` or SDK
+`command_id` replays "not accepted, resend with a new id" without a second
+injection.
+
+An explicit cancel (A2A `tasks/cancel`, an external cancel, or task deletion,
+all through `BackgroundTaskManager.cancel_task`) wins over the unknown-input
+pause. The manager records that intent before it cancels, so a deferred
+resume whose delivery is `outcome_unknown` settles as FAILED (cancelled), and
+the delivery stays `outcome_unknown` and is never resendable. Other
+cancellations, such as shutdown or lease loss, keep the pause.
+
+The fence also rejects every later checkpoint of the old run, including the
+ones taken after tool steps. Tool calls that complete between the uncertain
+write and the stop therefore leave no durable record, and an explicit resume
+reloads the earlier checkpoint and may run them again. Tools with external
+side effects can repeat. This is an accepted cost of the at-most-once input
+contract; a per-step intent log together with tool side-effect classification
+is the intended remedy.
+
+A reply timeout can also mean that an accepted command is still queued or being
+processed. It is not evidence of a failed injection. For shared execution,
+clients can repeat the same request identity to observe the existing command;
+they must not automatically create a new identity to resend the input. A2A's
+shared `commandId` identifies the internal deterministic command, whereas its
+nonshared error correlates with the original `messageId`. Nonshared SDK replies
+return a correlation ID, not a new durable deduplication guarantee. Check task
+state before deciding whether to resume or send new input.

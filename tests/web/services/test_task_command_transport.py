@@ -1698,6 +1698,113 @@ async def test_dispatcher_worker_isolates_one_command_error(
     assert "single command failure" in caplog.text
 
 
+def _dispatch_diagnostics(db_session, dispatch_task, command_db_id) -> str:
+    """Temporary CI diagnostics: why finish_task_command was never reached."""
+    import io
+
+    from xagent.config import (
+        get_shared_task_execution_enabled,
+        get_task_execution_role,
+        get_worker_count,
+    )
+
+    try:  # Added on main by the shared-worker admission change.
+        from xagent.web.models.task_admission import TaskAdmissionTicket
+        from xagent.web.services import task_execution_admission
+    except ImportError:
+        TaskAdmissionTicket = None
+        task_execution_admission = None
+    from xagent.web.services.task_execution_host import consumes_task_commands
+    from xagent.web.services.task_lease_service import get_runner_id
+
+    lines = [f"dispatch done={dispatch_task.done()}"]
+    if dispatch_task.done():
+        if dispatch_task.cancelled():
+            lines.append("dispatch cancelled")
+        elif dispatch_task.exception() is not None:
+            lines.append(f"dispatch exception={dispatch_task.exception()!r}")
+        else:
+            lines.append(f"dispatch result={dispatch_task.result()!r}")
+    else:
+        stack = io.StringIO()
+        dispatch_task.print_stack(file=stack)
+        lines.append(f"dispatch stack=\n{stack.getvalue()}")
+    lines.append(
+        "shared_enabled={} role={} worker_count={} consumes={} runner_id={}".format(
+            get_shared_task_execution_enabled(),
+            get_task_execution_role(),
+            get_worker_count(),
+            consumes_task_commands(),
+            get_runner_id(),
+        )
+    )
+    lines.append(
+        "admission_hook={!r}".format(
+            getattr(task_execution_admission, "_hook", "<no admission module>")
+        )
+    )
+    lines.append(
+        "env="
+        + repr(
+            {
+                key: value
+                for key, value in os.environ.items()
+                if key.startswith("XAGENT_")
+                and any(
+                    part in key
+                    for part in ("SHARED", "ROLE", "WORKER", "RUNNER", "LEASE")
+                )
+            }
+        )
+    )
+    db_session.expire_all()
+    command = db_session.get(TaskExecutionCommand, command_db_id)
+    if command is None:
+        lines.append("command row missing")
+    else:
+        lines.append(
+            "command status={} kind={} attempts={} claimed_by={} "
+            "claim_expires_at={} retry_available_at={}".format(
+                command.status,
+                command.kind,
+                command.attempt_count,
+                command.claimed_by,
+                command.claim_expires_at,
+                command.retry_available_at,
+            )
+        )
+        task_row = db_session.get(Task, command.task_id)
+        lines.append(
+            "task status={} runner_id={} run_id={} lease_attempt_id={} "
+            "lease_expires_at={}".format(
+                task_row.status,
+                task_row.runner_id,
+                task_row.run_id,
+                task_row.lease_attempt_id,
+                task_row.lease_expires_at,
+            )
+        )
+        if TaskAdmissionTicket is not None:
+            tickets = (
+                db_session.query(TaskAdmissionTicket)
+                .filter(TaskAdmissionTicket.command_id == command_db_id)
+                .count()
+            )
+            lines.append(f"admission tickets={tickets}")
+        lines.append(
+            "commands on task: "
+            + repr(
+                [
+                    (row.id, row.kind, row.status)
+                    for row in db_session.query(TaskExecutionCommand)
+                    .filter(TaskExecutionCommand.task_id == command.task_id)
+                    .all()
+                ]
+            )
+        )
+    return "finish_task_command not reached within 1s\n" + "\n".join(lines)
+
+
 @pytest.mark.asyncio
 async def test_dispatch_cancellation_drains_inflight_completion_worker(
     db_session,
@@ -1736,7 +1843,12 @@ async def test_dispatch_cancellation_drains_inflight_completion_worker(
     dispatch_task = asyncio.create_task(
         dispatch_one_task_command(execute, command_db_id=enqueued.command_id)
     )
-    await asyncio.wait_for(asyncio.to_thread(finish_started.wait, 1), timeout=1)
+    try:
+        await asyncio.wait_for(asyncio.to_thread(finish_started.wait, 1), timeout=1)
+    except TimeoutError:
+        pytest.fail(
+            _dispatch_diagnostics(db_session, dispatch_task, enqueued.command_id)
+        )
     dispatch_task.cancel()
     try:
         await asyncio.sleep(0.02)

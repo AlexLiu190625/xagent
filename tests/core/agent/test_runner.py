@@ -321,6 +321,7 @@ def test_user_message_injection_outcome_truthiness_contract() -> None:
     assert UserMessageInjectionOutcome.POSTED_FRESH
     assert UserMessageInjectionOutcome.POSTED_REPLAY
     assert UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    assert UserMessageInjectionOutcome.REJECTED_RETRYABLE
 
 
 def test_user_message_injection_outcome_member_set_has_not_drifted() -> None:
@@ -330,6 +331,7 @@ def test_user_message_injection_outcome_member_set_has_not_drifted() -> None:
         "POSTED_FRESH",
         "POSTED_REPLAY",
         "OUTCOME_UNKNOWN",
+        "REJECTED_RETRYABLE",
     }
 
 

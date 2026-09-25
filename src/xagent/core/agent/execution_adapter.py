@@ -446,6 +446,7 @@ class AgentExecutionAdapter:
                 "task_id": execution_id,
             },
             "agent_result": result,
+            "injection_outcome_unknown": result.get("injection_outcome_unknown", False),
         }
         completion_outcome = result.get("completion_outcome")
         if completion_outcome in {"completed", "partial", "blocked"}:

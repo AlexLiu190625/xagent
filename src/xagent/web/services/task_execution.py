@@ -36,6 +36,7 @@ import re
 import shutil
 import time
 import uuid
+import weakref
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -63,7 +64,12 @@ from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointUnavailableError,
 )
-from ...core.agent.runner import UserMessageInjectionOutcome
+from ...core.agent.runner import (
+    InjectionDisposition,
+    UserMessageInjectionOutcome,
+    classify_injection,
+    track_user_message_injection,
+)
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
@@ -88,6 +94,7 @@ from .task_lease_service import (
 
 if TYPE_CHECKING:
     from .task_setup_snapshot import TaskSetupSnapshot
+
 from ...core.file_storage.keys import (
     build_task_output_storage_key,
 )
@@ -321,6 +328,35 @@ class ClientVisibleError(Exception):
 
 class ClientVisibleValidationError(ClientVisibleError, ValueError):
     """A validation failure whose text is safe to show the sender."""
+
+
+class _DeferredInjectionRejectedRetryableError(RuntimeError):
+    """The deferred message was not accepted; nothing was written for it.
+
+    ``fenced`` is True when an earlier uncertain input still fences the run
+    (``REJECTED_RETRYABLE``), and False when a read-back proved this write
+    absent, which leaves the context unfenced.
+    """
+
+    def __init__(self, message: str, *, fenced: bool) -> None:
+        super().__init__(message)
+        self.fenced = fenced
+
+
+def _resume_cancel_settlement_error(task_source: str | None) -> str:
+    """Settlement text for a cancelled resume, matching a cancelled run.
+
+    An external visitor reads this text in the transcript, and the external
+    cancel command recognizes it as its own settled outcome.
+    """
+    from .external_task_cancel import (
+        EXTERNAL_TASK_SOURCE,
+        EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+    )
+
+    if task_source == EXTERNAL_TASK_SOURCE:
+        return EXTERNAL_TURN_INTERRUPTED_MESSAGE
+    return "resume execution cancelled"
 
 
 def client_safe_error_message(
@@ -1596,6 +1632,9 @@ def _finalize_task_execution_result_isolated(
 
         waiting_for_control = False
         terminal_state_committed = False
+        # Only a pause transition owns this transaction. Canceled, failed and
+        # already-paused tasks ignore the late result and roll back its files.
+        pause_commit_pending = False
         final_control_snapshot: TaskControlSnapshot | None = None
         final_task_status = pre_run_status.value
 
@@ -1605,14 +1644,19 @@ def _finalize_task_execution_result_isolated(
                 if isinstance(task_updated.agent_config, dict)
                 else {}
             )
-            if task_agent_config.get("a2a_state") == "TASK_STATE_CANCELED":
+            if task_agent_config.get("a2a_state") == "TASK_STATE_CANCELED" or (
+                result.get("injection_outcome_unknown")
+                and task_updated.status == TaskStatus.FAILED
+            ):
                 waiting_for_control = True
                 logger.info(
                     "Task %s was canceled while execution was in flight; "
                     "ignoring the late result",
                     task_id,
                 )
-            elif result.get("status") == "waiting_for_user":
+            elif result.get("status") == "waiting_for_user" and not result.get(
+                "injection_outcome_unknown"
+            ):
                 next_control_state = (
                     TaskControlState.RESUME_REQUESTED
                     if task_updated.control_state
@@ -1634,7 +1678,13 @@ def _finalize_task_execution_result_isolated(
                 metadata_committed = True
                 terminal_state_committed = True
                 waiting_for_control = True
-            elif result.get("status") == "interrupted":
+            elif (
+                result.get("injection_outcome_unknown")
+                and (
+                    result.get("success", False)
+                    or result.get("status") == "waiting_for_user"
+                )
+            ) or result.get("status") == "interrupted":
                 next_control_state = (
                     TaskControlState.RESUME_REQUESTED
                     if task_updated.control_state
@@ -1652,10 +1702,9 @@ def _finalize_task_execution_result_isolated(
                     task_updated,
                     task_updated.status,
                 )
-                finalize_db.commit()
-                metadata_committed = True
                 terminal_state_committed = True
                 waiting_for_control = True
+                pause_commit_pending = True
             elif task_updated.status not in {
                 TaskStatus.PAUSED,
                 TaskStatus.WAITING_FOR_USER,
@@ -1692,7 +1741,12 @@ def _finalize_task_execution_result_isolated(
                 terminal_state_committed = True
 
             final_task_status = task_updated.status.value
-            if not waiting_for_control:
+            preserve_unknown_result = (
+                bool(result.get("injection_outcome_unknown"))
+                and bool(result.get("success", False))
+                and task_updated.status == TaskStatus.PAUSED
+            )
+            if not waiting_for_control or preserve_unknown_result:
                 if task_user_id is None:
                     raise ValueError(
                         f"Task {task_id}: cannot persist assistant message "
@@ -1715,6 +1769,7 @@ def _finalize_task_execution_result_isolated(
                     "output",
                     history_content
                     if task_updated.status == TaskStatus.COMPLETED
+                    or (preserve_unknown_result and result.get("success", False))
                     else None,
                 )
                 persist_assistant_message_no_commit(
@@ -1735,6 +1790,9 @@ def _finalize_task_execution_result_isolated(
                 metadata_committed = True
                 terminal_state_committed = True
 
+            if pause_commit_pending and not metadata_committed:
+                finalize_db.commit()
+                metadata_committed = True
             broadcast_meta = {
                 "id": int(task_updated.id),
                 "title": task_updated.title,
@@ -2347,6 +2405,17 @@ def _finalize_resumed_task(
         if task is None:
             finalized["late_result"] = True
             return finalized
+        if result.get("injection_outcome_unknown") and task.status == TaskStatus.FAILED:
+            # Explicit cancellation/failure already owns the terminal result.
+            if not release_task_lease_no_commit(
+                db, task_lease, status=TaskStatus.FAILED
+            ):
+                db.rollback()
+                finalized["late_result"] = True
+                return finalized
+            db.commit()
+            finalized["late_result"] = True
+            return finalized
 
         (
             normalized_outputs,
@@ -2375,7 +2444,11 @@ def _finalize_resumed_task(
                 finalized["agent_name"] = cast(Any, agent.name)
                 finalized["agent_logo_url"] = cast(Any, agent.logo_url)
 
-        if status == "waiting_for_user":
+        if result.get("injection_outcome_unknown") and (
+            success or status in {"waiting_for_user", "interrupted"}
+        ):
+            final_task_status = TaskStatus.PAUSED
+        elif status == "waiting_for_user":
             final_task_status = TaskStatus.WAITING_FOR_USER
         elif status == "interrupted":
             final_task_status = TaskStatus.PAUSED
@@ -2461,9 +2534,22 @@ def _settle_resumed_task_lease(
     error_message: str | None,
 ) -> bool:
     """Delegate resume cleanup to the shared run/runner-fenced lifecycle."""
+    from .assistant_history_safety import CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+    from .external_task_cancel import EXTERNAL_TURN_INTERRUPTED_MESSAGE
     from .task_orchestrator import settle_task_lease_isolated
 
-    return settle_task_lease_isolated(lease, error_message=error_message)
+    if error_message == EXTERNAL_TURN_INTERRUPTED_MESSAGE:
+        # Written for the external visitor, as a cancelled run writes it.
+        return settle_task_lease_isolated(
+            lease,
+            error_message=error_message,
+            client_error_message=error_message,
+            client_message_type=CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+        )
+    return settle_task_lease_isolated(
+        lease,
+        error_message=error_message,
+    )
 
 
 async def execute_resume_background(
@@ -2517,6 +2603,8 @@ async def execute_resume_background(
     settlement_error: str | None = None
     broadcast_error_message: str | None = None
     defer_db_cleanup_to_ttl_recovery = False
+    # A fenced rejection keeps the uncertain run paused instead of failing it.
+    pause_rejected_lease = False
     # The status this task held before a lease claim flipped it to RUNNING;
     # the checkpoint-unavailable/refused recovery path below restores to
     # this instead of a terminal FAILED. Captured at acquisition when this
@@ -2543,6 +2631,9 @@ async def execute_resume_background(
     agent_logo_url: str | None = None
     delivery_outcome_unknown = False
     delivery_was_dispatched = delivery_already_dispatched
+    # Set when a cancellation or lease loss lands after the deferred turn was
+    # durably accepted; the handlers below record the acceptance.
+    delivery_accepted_unrecorded = False
     control_event_state: dict[str, Any] = {}
 
     async def notify_deferred_delivery(
@@ -2584,6 +2675,31 @@ async def execute_resume_background(
                 task_id,
                 exc_info=True,
             )
+
+    async def record_accepted_delivery() -> None:
+        """Record a durably accepted turn whose resume did not proceed."""
+        nonlocal delivery_accepted_unrecorded
+        if not delivery_accepted_unrecorded:
+            return
+        delivery_accepted_unrecorded = False
+        if delivery_turn_id is not None:
+            try:
+                await run_db_io_cancellation_safe(
+                    lambda: mark_user_message_delivery_sync(
+                        task_id,
+                        delivery_turn_id,
+                        DELIVERY_DISPATCHED,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "delivery marker failed after an interrupted accepted "
+                    "deferred message for task %s turn %s",
+                    task_id,
+                    delivery_turn_id,
+                    exc_info=True,
+                )
+        await notify_deferred_delivery(True)
 
     async def mark_deferred_delivery_failed() -> bool:
         """Persist a failed delivery without amplifying pool exhaustion."""
@@ -2742,23 +2858,72 @@ async def execute_resume_background(
         # not allowed to run the resume.
         if pending_user_message is not None:
             assert lease_heartbeat_task is not None
-            with bind_task_lease_context(lease):
-                posted = await run_while_task_lease_owned(
-                    agent_service.post_user_message(
-                        str(task_id),
-                        execution_message=pending_user_message.get("execution_message"),
-                        display_message=pending_user_message.get("display_message"),
-                        files=pending_user_message.get("files"),
-                        turn_id=pending_user_message.get("turn_id"),
-                        request_interrupt=False,
-                        reason="deferred websocket user message",
-                    ),
-                    lease_heartbeat_task,
+            with track_user_message_injection() as attempt:
+                try:
+                    with bind_task_lease_context(lease):
+                        posted = await run_while_task_lease_owned(
+                            agent_service.post_user_message(
+                                str(task_id),
+                                execution_message=pending_user_message.get(
+                                    "execution_message"
+                                ),
+                                display_message=pending_user_message.get(
+                                    "display_message"
+                                ),
+                                files=pending_user_message.get("files"),
+                                turn_id=pending_user_message.get("turn_id"),
+                                request_interrupt=False,
+                                reason="deferred websocket user message",
+                            ),
+                            lease_heartbeat_task,
+                        )
+                except BaseException as injection_error:
+                    disposition = classify_injection(
+                        attempt.outcome, error=injection_error
+                    )
+                    if (
+                        disposition is InjectionDisposition.ACCEPTED
+                        and isinstance(injection_error, Exception)
+                        and not isinstance(injection_error, TaskLeaseLostError)
+                    ):
+                        # The turn is durable; only a later projection (such
+                        # as the registry event) failed. Continue as accepted.
+                        logger.warning(
+                            "post-acceptance injection error for deferred "
+                            "message on task %s",
+                            task_id,
+                            exc_info=True,
+                        )
+                        posted = attempt.outcome
+                    elif disposition is (
+                        InjectionDisposition.NOT_ACCEPTED_RETRYABLE
+                    ) and isinstance(injection_error, Exception):
+                        raise _DeferredInjectionRejectedRetryableError(
+                            "The user message was not accepted",
+                            fenced=attempt.outcome
+                            is UserMessageInjectionOutcome.REJECTED_RETRYABLE,
+                        ) from injection_error
+                    else:
+                        delivery_outcome_unknown = (
+                            disposition is InjectionDisposition.UNKNOWN
+                        )
+                        if disposition is InjectionDisposition.ACCEPTED:
+                            # Cancellation or lease loss after the durable
+                            # write: the handlers below record acceptance.
+                            delivery_was_dispatched = True
+                            delivery_accepted_unrecorded = True
+                        raise
+                else:
+                    disposition = classify_injection(attempt.outcome, posted=posted)
+            delivery_outcome_unknown = disposition is InjectionDisposition.UNKNOWN
+            if disposition is InjectionDisposition.NOT_ACCEPTED_RETRYABLE:
+                raise _DeferredInjectionRejectedRetryableError(
+                    "The user message was not accepted by a fenced execution",
+                    fenced=True,
                 )
-            if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
-                delivery_outcome_unknown = True
+            if disposition is InjectionDisposition.UNKNOWN:
                 raise RuntimeError("The user message injection outcome is unknown")
-            if not posted:
+            if disposition is InjectionDisposition.DEFER:
                 raise RuntimeError(
                     "The user message was saved, but no resumable execution "
                     "checkpoint became available."
@@ -3037,7 +3202,7 @@ async def execute_resume_background(
                 )
             )
 
-        if status in {"interrupted", "waiting_for_user"}:
+        if final_status in {TaskStatus.PAUSED.value, TaskStatus.WAITING_FOR_USER.value}:
             await publish_task_event(
                 create_stream_event(
                     "task_info",
@@ -3082,6 +3247,10 @@ async def execute_resume_background(
             task_id,
         )
     except TaskLeaseLostError:
+        if delivery_outcome_unknown:
+            if await mark_deferred_delivery_failed():
+                await notify_deferred_delivery(False)
+        await record_accepted_delivery()
         defer_db_cleanup_to_ttl_recovery = lease is not None and not lease_released
         logger.warning(
             "Task %s resume execution cancelled after lease ownership loss",
@@ -3089,8 +3258,9 @@ async def execute_resume_background(
         )
         return
     except asyncio.CancelledError:
-        settlement_error = "resume execution cancelled"
+        settlement_error = _resume_cancel_settlement_error(trusted_task_source)
         logger.info(f"V2 resume background task {task_id} cancelled")
+        await record_accepted_delivery()
         if delivery_turn_id is not None and not delivery_was_dispatched:
             if await mark_deferred_delivery_failed():
                 await notify_deferred_delivery(
@@ -3126,6 +3296,40 @@ async def execute_resume_background(
             # otherwise left reclaimable when no lease was acquired). Do not
             # emit the generic FAILED/task_error payload below.
             return
+        elif delivery_outcome_unknown:
+            if await mark_deferred_delivery_failed():
+                await notify_deferred_delivery(False)
+        elif isinstance(e, _DeferredInjectionRejectedRetryableError):
+            # Nothing was written for this message, so it is never failed or
+            # resumed for. A fence left by an earlier uncertain input keeps the
+            # task paused for the user. Without one (a read-back proved this
+            # write absent) the task returns to its prior resting status; a
+            # prior status that cannot be restored without re-running or
+            # re-announcing a result is paused instead.
+            if (
+                not e.fenced
+                and lease is not None
+                and not lease_released
+                and resume_prior_status
+                in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}
+            ):
+                restore_lease_to_prior_status = resume_prior_status
+            else:
+                pause_rejected_lease = True
+            logger.warning(
+                "Task %s deferred message was not accepted (fenced=%s)",
+                task_id,
+                e.fenced,
+            )
+            if delivery_turn_id is not None and not delivery_was_dispatched:
+                if await mark_deferred_delivery_failed():
+                    await notify_deferred_delivery(
+                        False,
+                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                        retry_with_new_id=True,
+                        rejection_outcome="not_accepted",
+                    )
         elif (
             isinstance(e, (CheckpointUnavailableError, CheckpointAccessRefusedError))
             and lease is not None
@@ -3221,6 +3425,7 @@ async def execute_resume_background(
 
         async def finalize_resume_resources() -> None:
             nonlocal defer_db_cleanup_to_ttl_recovery, lease_released
+            nonlocal settlement_error
             nonlocal prepared_outputs
 
             try:
@@ -3371,12 +3576,32 @@ async def execute_resume_background(
                     and not defer_db_cleanup_to_ttl_recovery
                 ):
                     try:
-                        settled = await run_db_io_cancellation_safe(
-                            lambda: _settle_resumed_task_lease(
-                                lease,
-                                error_message=settlement_error,
-                            )
+                        explicit_cancel = background_task_manager.cancel_was_requested(
+                            resume_owner_task
                         )
+                        pause_for_input = (
+                            delivery_outcome_unknown or pause_rejected_lease
+                        )
+                        if explicit_cancel and pause_for_input:
+                            # An explicit cancel wins over the uncertain-input
+                            # pause: the task fails as cancelled while the
+                            # delivery keeps its recorded outcome (an unknown
+                            # one is never resendable).
+                            settlement_error = (
+                                settlement_error
+                                or _resume_cancel_settlement_error(trusted_task_source)
+                            )
+                        if pause_for_input and not explicit_cancel:
+                            from .task_orchestrator import pause_unknown_task_lease
+
+                            settled = await pause_unknown_task_lease(lease)
+                        else:
+                            settled = await run_db_io_cancellation_safe(
+                                lambda: _settle_resumed_task_lease(
+                                    lease,
+                                    error_message=settlement_error,
+                                )
+                            )
                         if settled:
                             lease_released = True
                             if broadcast_error_message is not None:
@@ -3466,6 +3691,10 @@ class BackgroundTaskManager:
         self._resume_run_ids: dict[int, str | None] = {}
         self._resume_reservations: set[int] = set()
         self._resume_owner_started_at: dict[int, float] = {}
+        # Tasks cancelled through ``cancel_task``: an explicit stop request,
+        # as opposed to shutdown or lease-loss cancellation. Recorded before
+        # ``Task.cancel()`` so the cancelled task's own cleanup can read it.
+        self._explicitly_cancelled: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
         self._shutting_down = False
         self._shutdown_lock = asyncio.Lock()
 
@@ -3706,6 +3935,7 @@ class BackgroundTaskManager:
         for task in tasks:
             if task.done():
                 continue
+            self._explicitly_cancelled.add(task)
             requested = task.cancel() or requested
             try:
                 await asyncio.wait_for(task, timeout=timeout_seconds)
@@ -3730,6 +3960,11 @@ class BackgroundTaskManager:
             self._resume_run_ids.pop(task_id, None)
             self._resume_owner_started_at.pop(task_id, None)
         return BackgroundTaskCancelOutcome(requested=requested)
+
+    def cancel_was_requested(self, task: asyncio.Task | None) -> bool:
+        """Whether ``task`` was cancelled by an explicit ``cancel_task`` call."""
+
+        return task is not None and task in self._explicitly_cancelled
 
     async def shutdown(self) -> None:
         """Fence new work, cancel every owned task, and drain its cleanup."""

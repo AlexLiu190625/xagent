@@ -24,13 +24,16 @@ from tests.web.api.client_safe_ast_guard import guard_offenders as _guard_offend
 from tests.web.services.task_lease_shared import (
     live_task_lease as live_task_lease_fixture,
 )
+from xagent.core.agent.runner import UserMessageInjectionRejectedError
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import _make_command_reply
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
-from xagent.web.services.client_error_messages import ClientErrorCode
+from xagent.web.services.client_error_messages import (
+    ClientErrorCode,
+)
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
@@ -242,8 +245,11 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
 
     # These are deliberate exact baselines. If a producer is added or removed,
     # inspect the changed site and bump the corresponding count in this test.
-    assert result.producers == 36, (
-        f"expected exactly 36 producers, matched {result.producers}; "
+    # Cancellation during live injection now persists and sends an unknown
+    # acknowledgement through finish_delivery_failure's safe message builder.
+    # A fenced-run rejection adds one live and one deferred delivery-failed ack.
+    assert result.producers == 39, (
+        f"expected exactly 39 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
     # #1658 removed ``_resync_client_to_running_task``'s stale-client ``error``
@@ -2361,9 +2367,11 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
     assert SECRET not in repr(everything), everything
 
     rejected = [p for p in personal if p.get("type") == "message_rejected"]
-    assert rejected and rejected[0]["message"] == (
-        task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
-    )
+    assert len(rejected) == 1
+    assert rejected[0]["message"] == task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
+    assert rejected[0]["error_code"] == "message_processing_failed"
+    assert rejected[0]["rejection_outcome"] == "not_accepted"
+    assert not rejected[0].get("retry_with_new_id")
     task_errors = [b for b in broadcast if b.get("type") == "agent_error"]
     assert task_errors and task_errors[0]["message"] == (
         task_execution_service.CLIENT_SAFE_VALIDATION_ERROR
@@ -2396,9 +2404,11 @@ def _chat_runtime_error_harness(secret_error: Exception):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("definitely_rejected", [False, True])
 async def test_runtime_error_is_redacted_and_coded_for_every_audience(
     live_task_lease,
     _test_db: None,
+    definitely_rejected: bool,
 ) -> None:
     """Neither the initiator nor task subscribers may receive exception text."""
     db = _direct_db_session()
@@ -2424,7 +2434,10 @@ async def test_runtime_error_is_redacted_and_coded_for_every_audience(
     finally:
         db.close()
 
-    raised = RuntimeError(f"durable object scope={SECRET}")
+    error_type = (
+        UserMessageInjectionRejectedError if definitely_rejected else RuntimeError
+    )
+    raised = error_type(f"durable object scope={SECRET}")
     mgr, ws_manager, bg_mgr, fake_payload = _chat_runtime_error_harness(raised)
 
     with (
@@ -2455,17 +2468,34 @@ async def test_runtime_error_is_redacted_and_coded_for_every_audience(
         )
 
     broadcast = [c.args[0] for c in ws_manager.broadcast_to_task.await_args_list]
-    assert broadcast, "the task-wide notification must still go out"
     assert SECRET not in repr(broadcast), broadcast
+    personal = [c.args[0] for c in ws_manager.send_personal_message.await_args_list]
+    assert SECRET not in repr(personal), personal
+    rejected = [p for p in personal if p.get("type") == "message_rejected"]
+    if definitely_rejected:
+        # Proven absent: only this input failed, so the running task is not
+        # reported as failed and the sender may resend under a new id.
+        assert not [b for b in broadcast if b.get("type") == "agent_error"]
+        assert rejected == [
+            {
+                "type": "message_rejected",
+                "client_message_id": "runtime-boundary",
+                "turn_id": "runtime-boundary",
+                "timestamp": rejected[0]["timestamp"],
+                "message": rejected[0]["message"],
+                "error_code": "message_delivery_failed",
+                "retry_with_new_id": True,
+                "rejection_outcome": "not_accepted",
+            }
+        ]
+        return
+    assert broadcast, "the task-wide notification must still go out"
     task_errors = [b for b in broadcast if b.get("type") == "agent_error"]
     assert task_errors and task_errors[0]["message"] == (
         websocket_api.CLIENT_SAFE_TASK_FAILURE
     )
     assert task_errors[0]["error_code"] == "task_execution_failed"
 
-    personal = [c.args[0] for c in ws_manager.send_personal_message.await_args_list]
-    assert SECRET not in repr(personal), personal
-    rejected = [p for p in personal if p.get("type") == "message_rejected"]
     assert rejected == [
         {
             "type": "message_rejected",
@@ -3179,13 +3209,11 @@ async def test_live_chat_runtime_error_sends_one_safe_rejection(
         if isinstance(c.args[0], dict)
     ]
     assert SECRET not in repr(personal)
-    safe_rejections = [
-        p
-        for p in personal
-        if p.get("type") == "message_rejected"
-        and p.get("error_code") == "message_processing_failed"
-    ]
+    safe_rejections = [p for p in personal if p.get("type") == "message_rejected"]
     assert len(safe_rejections) == 1, safe_rejections
+    assert safe_rejections[0]["error_code"] == "message_processing_failed"
+    assert safe_rejections[0]["rejection_outcome"] == "not_accepted"
+    assert not safe_rejections[0].get("retry_with_new_id")
 
 
 def test_a_later_duplicate_cannot_rebind_after_the_creator_disconnects(

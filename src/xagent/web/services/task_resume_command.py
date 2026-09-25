@@ -48,6 +48,7 @@ from .task_resume import (
     TaskReplyInput,
     TaskReplyResumeResult,
     TaskResumeBusyError,
+    TaskResumeNotAcceptedError,
     TaskResumeNotResumableError,
     TaskResumeOutcomeUnknownError,
     TaskResumeRetryableError,
@@ -121,6 +122,9 @@ def _admit_reply(
                     NAMESPACE_URL, f"a2a-reply-retry:{ctx.task_id}:{existing.id}"
                 ).hex
                 continue
+            # Every other stored outcome, including a not-accepted "busy"
+            # carrying ``retry_with_new_id``, is the answer for this identity:
+            # a retry replays it, and only a new message id is a new attempt.
             return int(existing.id)
         if ctx.status != TaskStatus.WAITING_FOR_USER and source == "sdk":
             if ctx.status == TaskStatus.RUNNING:
@@ -249,6 +253,8 @@ async def enqueue_resume_input(
             raise TaskResumeOutcomeUnknownError(command_id)
         await asyncio.sleep(min(0.25, remaining))
     if result["outcome"] == "busy":
+        if result.get("retry_with_new_id"):
+            raise TaskResumeNotAcceptedError
         raise TaskResumeBusyError
     if result["outcome"] == "not_resumable":
         raise TaskResumeNotResumableError
@@ -363,8 +369,20 @@ def _handoff(
         return payload, lease, owner_id, state
 
 
+def _outcome_fields(outcome: str, retry_with_new_id: bool) -> dict[str, Any]:
+    """The stored reply outcome; the marker only accompanies a rejection."""
+    if retry_with_new_id:
+        return {"outcome": outcome, "retry_with_new_id": True}
+    return {"outcome": outcome}
+
+
 def _record_outcome(
-    command: ClaimedTaskCommand, state: dict, outcome: str, owner_lease: TaskOwnerLease
+    command: ClaimedTaskCommand,
+    state: dict,
+    outcome: str,
+    owner_lease: TaskOwnerLease,
+    *,
+    retry_with_new_id: bool = False,
 ) -> None:
     with get_session_local()() as db:
         # Preparation remains part of the owner-managed command lifecycle even
@@ -378,7 +396,9 @@ def _record_outcome(
             and row.attempt_count == command.attempt_count
             and row.result == state
         ):
-            setattr(row, "result", {**state, "outcome": outcome})
+            setattr(
+                row, "result", {**state, **_outcome_fields(outcome, retry_with_new_id)}
+            )
             db.commit()
 
 
@@ -406,6 +426,7 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
             lambda: _handoff(command, owner_lease)
         )
         outcome = "unavailable"
+        retry_with_new_id = False
         try:
             if payload.source == "sdk":
                 assert command.actor_user_id is not None
@@ -437,6 +458,12 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
             outcome = "accepted"
         except TaskResumeOutcomeUnknownError:
             outcome = "unknown"
+        except TaskResumeNotAcceptedError:
+            # Nothing was written. The stored result is the answer for every
+            # retry of this command: "busy" with the resend-with-a-new-id
+            # instruction. No successor is minted for the same identity.
+            outcome = "busy"
+            retry_with_new_id = True
         except TaskResumeBusyError:
             outcome = "busy"
         except (TaskResumeNotResumableError, CheckpointCorruptError):
@@ -455,6 +482,14 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
             )
         finally:
             await run_db_io_cancellation_safe(
-                lambda: _record_outcome(command, state, outcome, owner_lease)
+                lambda: _record_outcome(
+                    command,
+                    state,
+                    outcome,
+                    owner_lease,
+                    retry_with_new_id=retry_with_new_id,
+                )
             )
-        return SettledTaskCommand({**state, "outcome": outcome})
+        return SettledTaskCommand(
+            {**state, **_outcome_fields(outcome, retry_with_new_id)}
+        )

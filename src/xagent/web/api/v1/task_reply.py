@@ -88,7 +88,9 @@ async def reply_to_task(
         V1ApiError 422: body.message.files is non-empty, or
             body.agent_id is missing for an agent-bound key.
         V1ApiError 409: ``task_busy`` (task is RUNNING, or the resume
-            lease was lost to a concurrent reply -- retryable);
+            lease was lost to a concurrent reply -- retryable; with
+            ``details.retry_with_new_id`` the reply was provably not
+            written and must be resent under a new ``command_id``);
             ``no_pending_interaction`` (task is not currently waiting
             on a question); ``interaction_not_resumable`` (the task's
             saved progress cannot be resumed -- NOT retryable, the task
@@ -114,10 +116,25 @@ async def reply_to_task(
         raise V1ApiError(
             V1ErrorCode.REPLY_OUTCOME_UNKNOWN,
             504,
+            message="Reply was accepted but its outcome is unknown. "
+            "Check task status; do not resend automatically.",
             details={
                 "accepted": True,
                 "task_id": task_id,
                 "command_id": exc.command_id,
+            },
+        ) from exc
+    except task_resume_service.TaskResumeNotAcceptedError as exc:
+        # Nothing was written; replaying the same command_id returns this
+        # same answer, so the client must resend under a new command_id.
+        raise V1ApiError(
+            V1ErrorCode.TASK_BUSY,
+            409,
+            message="Reply was not accepted. Resend it with a new command_id.",
+            details={
+                "accepted": False,
+                "task_id": task_id,
+                "retry_with_new_id": True,
             },
         ) from exc
     except task_resume_service.TaskResumeBusyError as exc:
