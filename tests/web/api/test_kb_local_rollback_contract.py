@@ -23,6 +23,9 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionConfig,
     IngestionResult,
 )
+from xagent.core.tools.core.RAG_tools.utils.string_utils import (
+    generate_deterministic_doc_id,
+)
 from xagent.web.api import kb as kb_module
 from xagent.web.api.kb import RollbackFailureError
 from xagent.web.jobs.exceptions import BackgroundJobHandlerError
@@ -610,26 +613,33 @@ def test_ingest_returns_collection_rollback_failure_verbatim(
     }
 
 
-def test_ingest_setup_failure_clears_status_by_filename(test_env, temp_uploads) -> None:
-    """Pins a known pre-existing bug: the filename is used as doc_id. Not intended."""
+def test_ingest_setup_failure_clears_status_by_real_doc_id(
+    test_env, temp_uploads
+) -> None:
     _, _, user, _ = test_env
     clear_status = MagicMock()
+    seen: dict[str, Any] = {}
+
+    def _raise(**kwargs: Any) -> None:
+        seen["file_id"] = kwargs["file_id"]
+        raise RuntimeError("parser crashed")
 
     response = _post_ingest(
         test_env,
         "x.txt",
         "coll",
         _existing_collection(),
-        patch(
-            "xagent.web.api.kb.run_document_ingestion",
-            side_effect=RuntimeError("parser crashed"),
-        ),
+        patch("xagent.web.api.kb.run_document_ingestion", side_effect=_raise),
         patch("xagent.web.api.kb.clear_ingestion_status", clear_status),
     )
 
     assert response.status_code == 500
+    assert not response.json()["detail"].startswith("Failed to fully roll back")
     clear_status.assert_called_once_with(
-        "coll", "x.txt", user_id=int(user.id), is_admin=False
+        "coll",
+        generate_deterministic_doc_id("coll", seen["file_id"]),
+        user_id=int(user.id),
+        is_admin=False,
     )
 
 

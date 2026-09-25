@@ -23,6 +23,9 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionConfig,
     IngestionResult,
 )
+from xagent.core.tools.core.RAG_tools.utils.string_utils import (
+    generate_deterministic_doc_id,
+)
 from xagent.web.api import kb as kb_module
 from xagent.web.api.kb import RollbackFailureError
 from xagent.web.jobs.exceptions import BackgroundJobHandlerError
@@ -357,13 +360,15 @@ def test_ingest_cloud_returns_rollback_failure_text_verbatim(
     )
 
 
-def test_ingest_cloud_raised_ingestion_clears_status_by_source_filename(
+def test_ingest_cloud_raised_ingestion_clears_status_by_real_doc_id(
     test_env, temp_uploads
 ) -> None:
     _, _, user, _ = test_env
     clear_status = MagicMock()
+    seen: dict[str, Any] = {}
 
-    def _raise(**_kw):
+    def _raise(**kwargs):
+        seen["file_id"] = kwargs["file_id"]
         raise RuntimeError("parser crashed")
 
     response = _post_cloud(
@@ -374,8 +379,13 @@ def test_ingest_cloud_raised_ingestion_clears_status_by_source_filename(
     )
 
     assert response.status_code == 200
+    assert response.json()[0]["doc_id"] == "cloud.csv"
+    assert response.json()[0]["message"] == "Ingestion failed: parser crashed"
     clear_status.assert_called_once_with(
-        "cloud_coll", "cloud.csv", user_id=int(user.id), is_admin=False
+        "cloud_coll",
+        generate_deterministic_doc_id("cloud_coll", seen["file_id"]),
+        user_id=int(user.id),
+        is_admin=False,
     )
 
 
