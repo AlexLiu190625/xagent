@@ -920,6 +920,12 @@ def test_detail_on_a_trace_expired_task_is_empty_not_an_error() -> None:
         task.status = TaskStatus.COMPLETED
         task.last_activity_at = base
         task.lease_expires_at = None
+        # The transcript was written at wall-clock time, and the assessment
+        # measures from the newest message as well as the stored anchor
+        # (#2580), so it has to be as old as the anchor it stands beside.
+        db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).update(
+            {TaskChatMessage.created_at: base}, synchronize_session=False
+        )
         db.commit()
         # Task creation stages a start command, and the eligibility predicate
         # counts a pending command as work still owed. Clearing it keeps this
