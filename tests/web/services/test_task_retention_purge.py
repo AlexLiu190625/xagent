@@ -755,14 +755,14 @@ def test_a_failing_task_is_counted_and_the_batch_carries_on(
         doomed = _seed_full_task(db, username="doomed", anchor=_age(400))
         last = _seed_full_task(db, username="ok-after", anchor=_age(400))
 
-    real = purge_module.purge_task
+    real = purge_module.purge_task_rows
 
-    def failing(db, task_id, **kwargs):
+    def failing(db, *, task_id):
         if task_id == doomed:
             raise RuntimeError("deterministic per-task failure")
-        return real(db, task_id, **kwargs)
+        return real(db, task_id=task_id)
 
-    monkeypatch.setattr(purge_module, "purge_task", failing)
+    monkeypatch.setattr(purge_module, "purge_task_rows", failing)
 
     report = _run_batch(sessions, limit=10)
 

@@ -558,7 +558,12 @@ async def delete_task_extensions(
     bound_extensions: Iterable[str],
     force: bool = False,
 ) -> tuple[str, ...]:
-    """Release provider-owned state before the core task row is deleted.
+    """Release provider-owned state for one task.
+
+    The on-demand deletion paths call this before the core task row is
+    deleted; the cleanup retry driver (``task_cleanup_obligations``) calls it
+    after, for a release that is owed -- see the provider contract in
+    ``core.task_runtime``.
 
     Only providers listed in ``bound_extensions`` -- the per-task binding record
     written when the task was created -- are dispatched. Deletion is therefore

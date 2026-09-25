@@ -125,6 +125,12 @@ from ..models.task import (
     TraceMessageBlob,
 )
 from ..models.task_interaction import TaskInteractionRequest
+from .task_cleanup_obligations import (
+    CleanupObligation,
+    captured_workspace_obligation,
+    extension_obligation,
+    record_cleanup_obligations_no_commit,
+)
 from .task_deletion import purge_task_rows
 from .task_interaction_schema import interaction_requests_table_exists
 from .task_retention import (
@@ -133,6 +139,8 @@ from .task_retention import (
     retention_expiry_condition,
     retention_quiescent_condition,
 )
+from .task_runtime import task_extension_bindings_from_agent_config
+from .task_workspace_cleanup import capture_workspace_cleanup_target_best_effort
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +199,12 @@ class RetentionPurgeReport:
     skipped_active_interaction: int = 0
     nothing_to_purge: int = 0
     failed: int = 0
+    #: External cleanup the purged conversations left for the cleanup retry
+    #: driver: one workspace per purged conversation plus each runtime
+    #: extension it was bound to. Separate from the purge counters because the
+    #: rows are deleted when this is counted and the resources are not -- the
+    #: driver's own log line reports when they are.
+    cleanup_owed: int = 0
     dry_run: bool = False
     #: Highest task id this batch actually processed, or ``None`` when it
     #: processed none. The loop resumes after it rather than from the start of
@@ -245,7 +259,8 @@ class RetentionPurgeReport:
             f"skipped_busy={self.skipped_busy} "
             f"skipped_active_interaction={self.skipped_active_interaction} "
             f"nothing_to_purge={self.nothing_to_purge} "
-            f"failed={self.failed}"
+            f"failed={self.failed} "
+            f"cleanup_owed={self.cleanup_owed}"
         )
 
 
@@ -428,6 +443,47 @@ def _purge_trace_rows(db: Session, task_id: int) -> int:
     return removed
 
 
+def _conversation_cleanup_owed(db: Session, task_id: int) -> list[CleanupObligation]:
+    """The external cleanup expiring this task's conversation will owe.
+
+    Read while the row still exists and is locked: the workspace's base
+    directory comes from the task's execution scope and the extension bindings
+    from its ``agent_config``, and neither can be read once the row is gone.
+    The scope is resolved off-turn -- no activated turn belongs to a purge --
+    and a resolution failure degrades to the unscoped candidates, marked so
+    that clearing them is not taken for a full cleanup.
+
+    Resolving the scope reads the task row through the snapshot loader's own
+    session: a plain read, which ``FOR UPDATE`` does not block, so it cannot
+    deadlock against this transaction's lock. It does mean one purge holds a
+    second pooled connection for the length of that read; the purge works one
+    task at a time, so that is one connection per sweeping process.
+
+    Resolution also runs whatever scope resolver is registered, which is code
+    this module does not own, while the row is held ``FOR UPDATE``. It
+    touches no workspace or provider, but it holds the lock for as long as
+    it takes, so a registered resolver must be bounded.
+    """
+    row = db.execute(
+        select(Task.user_id, Task.source, Task.agent_config).where(Task.id == task_id)
+    ).one()
+    owner_id = int(row.user_id)
+    target = capture_workspace_cleanup_target_best_effort(
+        task_id, owner_id, prefer_active_scope=False
+    )
+    owed = [captured_workspace_obligation(task_id, owner_id, target)]
+    owed.extend(
+        extension_obligation(
+            task_id=task_id,
+            user_id=owner_id,
+            source=row.source,
+            extension=name,
+        )
+        for name in task_extension_bindings_from_agent_config(row.agent_config)
+    )
+    return owed
+
+
 def purge_task(
     db: Session,
     task_id: int,
@@ -437,7 +493,28 @@ def purge_task(
     trace_days: int | None,
     dry_run: bool = False,
 ) -> RetentionPurgeAction:
-    """Assess one task under a lock and expire what its disposition allows.
+    """Assess one task under a lock and expire what its disposition allows."""
+    action, _owed = _purge_task(
+        db,
+        task_id,
+        now=now,
+        conversation_days=conversation_days,
+        trace_days=trace_days,
+        dry_run=dry_run,
+    )
+    return action
+
+
+def _purge_task(
+    db: Session,
+    task_id: int,
+    *,
+    now: datetime,
+    conversation_days: int | None,
+    trace_days: int | None,
+    dry_run: bool = False,
+) -> tuple[RetentionPurgeAction, int]:
+    """:func:`purge_task`, plus how many cleanup obligations it recorded.
 
     Owns its transaction: it commits what it deleted, or rolls back. One
     transaction per task is what keeps the lock held from the assessment to
@@ -446,9 +523,21 @@ def purge_task(
 
     ``dry_run`` computes the same action against the same locked assessment
     and then rolls back, so what it reports is what a real run would do rather
-    than a separately-derived estimate. It performs no external call because
-    this module makes none at all: external cleanup is #2564's, and every
-    statement here is a row delete.
+    than a separately-derived estimate. It records no cleanup obligation and
+    performs no *release* call.
+
+    No run performs a release call either. Expiring a conversation owes the
+    task's workspace directory and any runtime-extension state it was bound
+    to; those are *recorded* here, in the same transaction as the row delete,
+    and released afterwards by the cleanup retry driver
+    (``task_cleanup_obligations``). Releasing them here would hold this task's
+    row lock across a filesystem walk and a provider's network round trip, and
+    releasing them before the lock would release a task the assessment might
+    still refuse.
+
+    "No release call" is narrower than "no external call": recording resolves
+    the task's execution scope, which runs any registered scope resolver under
+    the lock (see :func:`_conversation_cleanup_owed`).
 
     Every exit rolls back or commits, so the ``FOR UPDATE`` the assessment
     took is never held past this call -- a sweep that left one open per task
@@ -464,19 +553,22 @@ def purge_task(
             trace_days=trace_days,
         )
         if assessment.disposition is RetentionDisposition.NOT_ELIGIBLE:
-            return RetentionPurgeAction.SKIPPED_BUSY
+            return RetentionPurgeAction.SKIPPED_BUSY, 0
 
         if assessment.disposition is RetentionDisposition.CONVERSATION_EXPIRED:
             action = RetentionPurgeAction.PURGED_CONVERSATION
         else:
             if _has_active_interaction(db, task_id):
-                return RetentionPurgeAction.SKIPPED_ACTIVE_INTERACTION
+                return RetentionPurgeAction.SKIPPED_ACTIVE_INTERACTION, 0
             action = RetentionPurgeAction.PURGED_TRACES
 
         if dry_run:
-            return action
+            return action, 0
 
+        owed: list[CleanupObligation] = []
         if action is RetentionPurgeAction.PURGED_CONVERSATION:
+            owed = _conversation_cleanup_owed(db, task_id)
+            record_cleanup_obligations_no_commit(db, owed, now=now)
             purge_task_rows(db, task_id=task_id)
         elif _purge_trace_rows(db, task_id) == 0:
             # Either the rows went between the scan and the lock, or the scan
@@ -487,7 +579,7 @@ def purge_task(
             action = RetentionPurgeAction.NOTHING_TO_PURGE
         db.commit()
         committed = True
-        return action
+        return action, len(owed)
     finally:
         # Covers every exit -- the two skips, the dry run, the purge (both
         # branches converge on one return) and any exception -- because
@@ -578,7 +670,7 @@ def run_retention_purge_batch(
                 break
             try:
                 with session_factory() as db:
-                    action = purge_task(
+                    action, owed = _purge_task(
                         db,
                         task_id,
                         now=now,
@@ -598,8 +690,12 @@ def run_retention_purge_batch(
                     task_id,
                     exc_info=True,
                 )
-                action = RetentionPurgeAction.FAILED
-            report = replace(report, last_task_id=task_id).with_action(action)
+                action, owed = RetentionPurgeAction.FAILED, 0
+            report = replace(
+                report,
+                last_task_id=task_id,
+                cleanup_owed=report.cleanup_owed + owed,
+            ).with_action(action)
             processed += 1
     finally:
         # In ``finally`` so that work already committed is still reported. Each

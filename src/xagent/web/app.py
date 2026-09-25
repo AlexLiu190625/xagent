@@ -27,6 +27,7 @@ from ..config import (
     get_orphan_upload_sweep_interval_seconds,
     get_session_secret,
     get_shared_task_execution_enabled,
+    get_task_cleanup_retry_interval_seconds,
     get_task_lease_recovery_batch_size,
     get_task_lease_recovery_interval_seconds,
     get_taskless_upload_ttl_seconds,
@@ -676,6 +677,80 @@ async def stop_orphan_upload_gc_task(app_instance: FastAPI) -> None:
         except Exception as exc:
             logger.error(
                 "Orphan upload GC loop stopped after failure",
+                exc_info=exc,
+            )
+
+
+def start_task_cleanup_retry_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the retry driver for cleanup task deletions still owe (#2587).
+
+    Unlike the retention purge this runs in every deployment: on-demand task
+    and account deletion record obligations on any store, and a directory left
+    by a failed removal is owed whether or not retention is configured. Several
+    replicas running it is safe -- its claim is a compare-and-set.
+
+    Guarded under pytest like the sibling loops; a test that means to exercise
+    the starter opts in through ``task_cleanup_retry_allowed_in_tests``.
+    """
+
+    from .models.database import get_session_local
+    from .services.task_cleanup_obligations import run_cleanup_obligation_loop
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "task_cleanup_retry_task", None),
+    )
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        try:
+            failure = existing_task.exception()
+        except asyncio.CancelledError:
+            failure = None
+        if failure is not None:
+            logger.error("Previous task cleanup retry loop failed", exc_info=failure)
+        app_instance.state.task_cleanup_retry_task = None
+
+    if os.getenv("PYTEST_CURRENT_TEST") and not getattr(
+        app_instance.state, "task_cleanup_retry_allowed_in_tests", False
+    ):
+        logger.info("Skipping task cleanup retry loop (test environment)")
+        return None
+
+    poll_interval_seconds = get_task_cleanup_retry_interval_seconds()
+    task = asyncio.create_task(
+        run_cleanup_obligation_loop(
+            get_session_local(), poll_interval_seconds=poll_interval_seconds
+        )
+    )
+    app_instance.state.task_cleanup_retry_task = task
+    logger.info("Started task cleanup retry loop (interval=%ss)", poll_interval_seconds)
+    return task
+
+
+async def stop_task_cleanup_retry_task(app_instance: FastAPI) -> None:
+    """Cancel and drain this process's task cleanup retry loop.
+
+    Cancelling is enough here, unlike the purge: an interrupted release keeps
+    its claim until the lease lapses and is then retried, and the release is
+    idempotent.
+    """
+
+    task = getattr(app_instance.state, "task_cleanup_retry_task", None)
+    app_instance.state.task_cleanup_retry_task = None
+    if task is not None and not task.done():
+        logger.info("Cancelling task cleanup retry loop...")
+        task.cancel()
+    if task is not None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error(
+                "Task cleanup retry loop stopped after failure",
                 exc_info=exc,
             )
 
@@ -1460,6 +1535,7 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     start_uploaded_file_recovery_task(app_instance)
     start_orphan_upload_gc_task(app_instance)
     start_retention_purge_task(app_instance)
+    start_task_cleanup_retry_task(app_instance)
 
 
 async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
@@ -2067,6 +2143,7 @@ async def shutdown_event() -> None:
 
     await stop_orphan_upload_gc_task(app)
     await stop_retention_purge_task(app)
+    await stop_task_cleanup_retry_task(app)
     await stop_uploaded_file_recovery_task(app)
     await stop_task_lease_recovery_task(app)
 

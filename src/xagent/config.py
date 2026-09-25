@@ -176,6 +176,8 @@ BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
 BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
 TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
 ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS = "XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS"
+TASK_CLEANUP_RETRY_INTERVAL_SECONDS = "XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS"
+TASK_CLEANUP_MAX_ATTEMPTS = "XAGENT_TASK_CLEANUP_MAX_ATTEMPTS"
 WORKFORCE_PREVIEW_RUN_STALE_SECONDS = "XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS"
 TRIGGER_DISPATCHER_ENABLED = "XAGENT_TRIGGER_DISPATCHER_ENABLED"
 TRIGGER_DISPATCHER_INTERVAL_SECONDS = "XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS"
@@ -1249,6 +1251,39 @@ def get_orphan_upload_sweep_interval_seconds() -> int:
         60 * 60,
         minimum=60,
     )
+
+
+def get_task_cleanup_retry_interval_seconds() -> int:
+    """How often the task-cleanup retry driver looks for due obligations (#2587).
+
+    A task deletion that could not release a workspace directory or a
+    runtime-extension's state records the obligation and this driver retries
+    it. The interval only sets how often an idle driver re-checks; per-row
+    backoff decides when a given obligation is due.
+
+    Priority:
+        1. XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS environment variable
+        2. Default 300 (5 minutes)
+    """
+    return _get_positive_int_env(
+        TASK_CLEANUP_RETRY_INTERVAL_SECONDS,
+        5 * 60,
+        minimum=30,
+    )
+
+
+def get_task_cleanup_max_attempts() -> int:
+    """Attempts before a cleanup obligation stops retrying (#2587).
+
+    After this many failed attempts the obligation moves to the terminal
+    ``exhausted`` state, where it stays for an operator to reconcile rather
+    than being retried forever against a resource that will never come back.
+
+    Priority:
+        1. XAGENT_TASK_CLEANUP_MAX_ATTEMPTS environment variable
+        2. Default 8
+    """
+    return _get_positive_int_env(TASK_CLEANUP_MAX_ATTEMPTS, 8)
 
 
 def get_workforce_preview_run_stale_seconds() -> int:

@@ -2363,6 +2363,46 @@ class TestOrphanUploadGcConfig:
         assert get_orphan_upload_sweep_interval_seconds() == 900
 
 
+class TestTaskCleanupRetryConfig:
+    """Config for retrying the external cleanup a task deletion owes (#2587)."""
+
+    def test_retry_interval_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_retry_interval_seconds
+
+        monkeypatch.delenv("XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS", raising=False)
+        assert get_task_cleanup_retry_interval_seconds() == 300
+
+    def test_retry_interval_env_override(self, monkeypatch):
+        from xagent.config import get_task_cleanup_retry_interval_seconds
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS", "120")
+        assert get_task_cleanup_retry_interval_seconds() == 120
+
+    def test_retry_interval_below_minimum_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_retry_interval_seconds
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS", "1")
+        assert get_task_cleanup_retry_interval_seconds() == 300
+
+    def test_max_attempts_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_max_attempts
+
+        monkeypatch.delenv("XAGENT_TASK_CLEANUP_MAX_ATTEMPTS", raising=False)
+        assert get_task_cleanup_max_attempts() == 8
+
+    def test_max_attempts_env_override(self, monkeypatch):
+        from xagent.config import get_task_cleanup_max_attempts
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_MAX_ATTEMPTS", "3")
+        assert get_task_cleanup_max_attempts() == 3
+
+    def test_max_attempts_zero_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_max_attempts
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_MAX_ATTEMPTS", "0")
+        assert get_task_cleanup_max_attempts() == 8
+
+
 class TestLlmRetryBudgetConfig:
     """#2605: the two bounds that attempt counting cannot express."""
 
