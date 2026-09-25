@@ -40,7 +40,7 @@ WHOLE = [
     "may_delete",
     "delete_collection",
     "physdir",
-    "list:None",
+    "refs:[]",
     "del_coll_files",
     "query",
     "store.delete:refreshed",
@@ -52,7 +52,7 @@ KEPT = [
     "list:coll",
     "may_delete",
     "delete_document",
-    "list:None",
+    "refs:['file-1']",
     "orphan",
     "commit",
     "restore",
@@ -142,6 +142,10 @@ def _install_leaves(
     def _orphan(db, *, file_id, user_id, remaining_file_ids):
         _hit("orphan")
 
+    def _refs(file_ids, *, user_id, is_admin):
+        _hit(f"refs:{sorted(file_ids)}")
+        return []
+
     def _clear_status(collection, doc_id, *, user_id, is_admin):
         _hit("clear_status")
 
@@ -158,6 +162,7 @@ def _install_leaves(
         "_cleanup_failed_new_collection_metadata": _metadata,
         "delete_document": _delete_document,
         "_delete_uploaded_file_if_orphaned": _orphan,
+        "_list_document_records_for_file_ids": _refs,
         "clear_ingestion_status": _clear_status,
         "_restore_ingest_file_backup": _restore,
         "_delete_web_rag_side_effects_for_file_id": lambda **_kw: _hit("web_cleanup"),
@@ -319,6 +324,7 @@ async def test_collection_decision_compares_doc_ids(
         "context": "failed-ingest rollback",
     }
     assert seen["collection_file_ids"] == file_ids
+    assert f"refs:{sorted(file_ids)}" in calls
 
 
 async def test_collection_existed_before_still_asks_the_decision(monkeypatch) -> None:
@@ -358,7 +364,7 @@ async def test_collection_existed_before_still_asks_the_decision(monkeypatch) ->
             id="physical-dir-without-detail",
         ),
         pytest.param(
-            {"may_delete": True, "raises": {"list:None": RuntimeError("list down")}},
+            {"may_delete": True, "raises": {"refs:[]": RuntimeError("list down")}},
             {},
             WHOLE[:5],
             "list down",
@@ -404,6 +410,13 @@ async def test_collection_existed_before_still_asks_the_decision(monkeypatch) ->
             KEPT[:5],
             "disk",
             id="orphan-before-commit",
+        ),
+        pytest.param(
+            {"raises": {"refs:['file-1']": RuntimeError("refs down")}},
+            {},
+            KEPT[:4],
+            "refs down",
+            id="kept-refs",
         ),
         pytest.param(
             {"raises": {"clear_status": RuntimeError("status down")}},

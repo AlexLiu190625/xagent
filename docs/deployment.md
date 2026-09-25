@@ -402,7 +402,25 @@ The job is gated on `XAGENT_CONVERSATION_RETENTION_DAYS` / `XAGENT_TRACE_RETENTI
 
 **Every retention setting takes effect at process start, and only there.** `.env` is read once and nothing mutates the environment afterwards, so changing a period, the dry-run flag or the kill switch requires a restart. The kill switch exists so that stopping expiry does not mean editing the periods — not so that a running sweep can be halted from outside.
 
-Before setting a period anywhere, work through the enablement gate on the retention tracking issue — in particular `XAGENT_CONVERSATION_RETENTION_DAYS` must not be set while a mixed-version rollout can still leave `tasks.last_activity_at` behind its task's newest message, since a stale anchor expires a conversation *early*.
+Before setting a period anywhere, work through the enablement gate on the retention tracking issue.
+
+### Mixed-version rollouts and rollbacks
+
+A binary older than the `tasks.last_activity_at` migration writes transcript messages without advancing the anchor. That happens during a rolling deploy, while old workers are still running after the backfill, and for as long as a deployment runs such a binary after rolling back past it. Either way the stored anchor can end up older than the task's newest message.
+
+No drain or reconciliation step is needed for this. Before deleting anything, the purge measures each task from the later of the stored anchor and the task's newest message. It reads both under the task's row lock, and a message insert for that task waits on the lock, so a stale stored anchor cannot expire a conversation early, whichever version wrote the message.
+
+The lock covers message inserts only because `task_chat_messages.task_id` has a foreign key to `tasks.id`. Every supported initialization path creates it, but the revision that introduced the table adds it only when `tasks` already existed. Confirm it on the target database before enabling a period; the query must return one row:
+
+```sql
+SELECT conname
+FROM pg_constraint
+WHERE contype = 'f'
+  AND conrelid = 'task_chat_messages'::regclass
+  AND confrelid = 'tasks'::regclass;
+```
+
+A stale anchor still affects `xagent retention preview` and the purge's candidate scan, which read the stored value only. Both can treat such a task as older than the purge will: the preview over-counts, never under-counts, and the scan hands the purge a candidate it then keeps (`skipped_busy`) or expires only the trace of (`purged_traces`), where the stored anchor alone would have expired the whole conversation. Because the stored anchor is not repaired, the scan keeps selecting such a task on every sweep: it goes on reporting `skipped_busy`, or `nothing_to_purge` once its trace is gone, until its newest message itself passes the conversation period.
 
 Recommended first run: set the period together with `XAGENT_RETENTION_DRY_RUN=true`, restart, read the audit line, and only then clear the dry-run flag and restart again. A value the parser does not recognise resolves to a dry run rather than a deletion, but do not rely on that instead of checking the log line.
 
@@ -416,7 +434,7 @@ What it costs is duplicated scanning, which is why there is no advisory lock her
 
 `xagent retention preview --days N` reports what a period would expire without touching anything. Once the job runs, each *batch* logs one line beginning `retention purge` — a sweep that drains a backlog logs one per page, not one in total — counting `scanned`, `purged_conversations`, `purged_traces`, `skipped_busy`, `skipped_active_interaction`, `nothing_to_purge` and `failed`.
 
-`scanned` is how many candidates the batch selected, not how many proved expirable — the locked assessment can still refuse any of them. `skipped_busy` covers every such refusal, which is usually a task that is genuinely not quiescent but also includes a row that vanished between the scan and the lock (normal with more than one replica) and a task with no anchor at all. `nothing_to_purge` is a trace-expiry candidate whose trace was already gone by the time the lock was taken. `failed` is a task whose own purge raised: it is logged with its id and traceback, the sweep carries on, and the task is retried on the next pass.
+`scanned` is how many candidates the batch selected, not how many proved expirable — the locked assessment can still refuse any of them. `skipped_busy` covers every such refusal, which is usually a task that is genuinely not quiescent but also includes a row that vanished between the scan and the lock (normal with more than one replica), a task whose newest message is more recent than its stored anchor, and a task with no anchor at all. `nothing_to_purge` is a trace-expiry candidate whose trace was already gone by the time the lock was taken — either removed between the scan and the lock, or, for a task whose stored anchor lags its newest message, removed by an earlier sweep. `failed` is a task whose own purge raised: it is logged with its id and traceback, the sweep carries on, and the task is retried on the next pass.
 
 Those field names deliberately differ from the ones sketched on the tracking issue (`eligible / deleted / skipped-busy / external-pending`): `deleted` is split because the two paths delete different things and an operator needs to know which ran, `skipped_active_interaction` names the one refusal that is permanent rather than transient, and `external-pending` belongs to the external-cleanup work, which this job does not perform.
 

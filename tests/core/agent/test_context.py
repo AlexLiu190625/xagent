@@ -54,11 +54,13 @@ from xagent.core.model.chat.types import (
     CONTENT_SOURCE_KEY,
     CONTENT_SOURCE_REASONING_FALLBACK,
 )
+from xagent.core.tools.artifacts import format_tool_result_for_observation
 from xagent.core.tools.tool_result_spill import (
     SPILL_PLACEHOLDER_TEXT,
     SPILL_RESERVED_RESULT_KEY,
     SPILL_UNAVAILABLE_NOTICE,
     SpillTarget,
+    render_spill_notice,
     spill_dir_for_workspace,
     spill_oversized_values,
 )
@@ -3733,16 +3735,111 @@ def test_spill_no_absolute_path_anywhere(tmp_path):
     assert absolute not in json.dumps(ctx.to_dict())
 
 
-def test_formatting_a_result_without_an_output_key_is_unchanged():
-    """The pre-spill fallback for a dict with no "output" key rendered the
-    dict itself: ``result.get("output", result)`` returns the same object
-    by identity when the key is absent. The post-spill fallback instead
-    builds a new dict with the reserved key filtered out; with no reserved
-    key present and no spill notice or unavailable count to append, that
-    new dict has the same keys and values in the same order, so its repr
-    -- and therefore the rendered text -- is byte-for-byte the same
-    string."""
+# Every shape _format_tool_result branches on. The two artifact shapes take
+# different paths inside format_tool_result_for_observation: a list with a
+# renderable entry prints a metadata line built from the remaining keys, and
+# an empty list (what a code-executor run that writes no new file carries)
+# falls back to printing the whole result.
+_OBSERVATION_BODY_SHAPES = {
+    "artifacts_with_entry": {
+        "output": "chart saved",
+        "artifacts": [
+            {
+                "type": "image",
+                "file_id": "chart-file-id",
+                "filename": "chart.png",
+                "mime_type": "image/png",
+                "display": "inline",
+            }
+        ],
+    },
+    "artifacts_empty": {"output": "done", "artifacts": [], "generated_files": []},
+    "output_key": {"output": "primary text", "is_error": False},
+    "no_output_key": {
+        "content": [{"type": "text", "text": "small"}],
+        "is_error": False,
+    },
+}
+
+
+def _pre_spill_observation(tool_name, result):
+    """The observation text a result without a spill report renders to,
+    written out branch by branch: artifacts, output key, whole dict."""
+    if isinstance(result.get("artifacts"), list):
+        body = format_tool_result_for_observation(tool_name, result)
+    else:
+        body = result.get("output", result)
+    return f"Tool {tool_name} returned: {body}"
+
+
+@pytest.mark.parametrize("shape", sorted(_OBSERVATION_BODY_SHAPES))
+def test_spill_report_never_reaches_the_observation_body(tmp_path, shape):
+    _spill_workspace(tmp_path)
     ctx = ExecutionContext()
-    result = {"content": [{"type": "text", "text": "small"}], "is_error": False}
-    pre_spill_equivalent = f"Tool acme returned: {result.get('output', result)}"
-    assert ctx._format_tool_result("acme", result) == pre_spill_equivalent
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    result = {
+        **_OBSERVATION_BODY_SHAPES[shape],
+        SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)],
+    }
+
+    tool = ctx.add_tool_result("acme", result)
+
+    notice = render_spill_notice(
+        tuple(tool.metadata["spilled_results"]), style="observation"
+    )
+    assert VALID_RECORD["relative_path"] in notice
+    # The body is exactly what the same result renders to without a report;
+    # the only thing the report adds is the notice after it. add_tool_result
+    # sanitizes before rendering, so the comparison does too.
+    without_report = ctx._sanitize_tool_result_for_context(
+        "acme", _OBSERVATION_BODY_SHAPES[shape]
+    )
+    assert tool.content == (
+        _pre_spill_observation("acme", without_report) + "\n" + notice
+    )
+    body = tool.content[: -len(notice)]
+    assert "tool-results/" not in body
+    assert SPILL_RESERVED_RESULT_KEY not in body
+    # raw_result keeps the report for replay.
+    assert tool.metadata["raw_result"][SPILL_RESERVED_RESULT_KEY] == [VALID_RECORD]
+
+
+def test_a_real_spill_of_a_code_executor_result_keeps_the_path_out_of_the_body(
+    tmp_path,
+):
+    spill_dir = tmp_path / "output" / "tool-results"
+    result = {
+        "success": True,
+        "output": "x" * 200,
+        "error": "",
+        "generated_files": [],
+        "file_refs": [],
+        "artifacts": [],
+    }
+    spilled, records = spill_oversized_values(
+        result,
+        SpillTarget(spill_dir=str(spill_dir), max_chars=100),
+        tool_name="execute_python_code",
+        max_recursion=20,
+    )
+    assert len(records) == 1
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    tool = ctx.add_tool_result("execute_python_code", spilled)
+
+    notice = render_spill_notice(
+        tuple(tool.metadata["spilled_results"]), style="observation"
+    )
+    assert records[0]["relative_path"] in notice
+    body = tool.content[: -len(notice)]
+    assert "tool-results/" not in body
+    assert SPILL_RESERVED_RESULT_KEY not in body
+
+
+@pytest.mark.parametrize("shape", sorted(_OBSERVATION_BODY_SHAPES))
+def test_observation_without_a_spill_report_is_unchanged(shape):
+    ctx = ExecutionContext()
+    result = _OBSERVATION_BODY_SHAPES[shape]
+    assert ctx._format_tool_result("acme", result) == _pre_spill_observation(
+        "acme", result
+    )

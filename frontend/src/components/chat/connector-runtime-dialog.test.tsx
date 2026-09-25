@@ -1647,6 +1647,34 @@ describe("reuses the resend id unless the previous attempt is proven not accepte
     expect(sendMessageMock.mock.calls[0][1]?.clientMessageId).not.toBe(firstId)
   })
 
+  it("keeps the id of an attempt whose outcome was unknown when a later attempt never leaves the client", async () => {
+    // The first attempt's outcome is unknown, so the retry reuses its id. That
+    // retry fails before anything reaches the server (`not_sent`), which says
+    // nothing about the first attempt: it may still have landed. The next
+    // retry must therefore reuse the same id again, or a first attempt that
+    // did land would run a second time under a fresh one.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("outcome_unknown"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument())
+    const firstId = sendMessageMock.mock.calls[0][1]?.clientMessageId
+
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("not_sent"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(2))
+    expect(sendMessageMock.mock.calls[1][1]?.clientMessageId).toBe(firstId)
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.resend")).toBeEnabled())
+    expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument()
+
+    sendMessageMock.mockResolvedValueOnce(undefined)
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(3))
+    expect(sendMessageMock.mock.calls[2][1]?.clientMessageId).toBe(firstId)
+  })
+
   it("mints a new id when the server demands one even for an outcome_unknown rejection", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {})
     await openSimpleDialog()
@@ -3044,6 +3072,279 @@ describe("keeps the send-failed panel up while a retry resend is in flight, even
     expect(screen.getByRole("dialog")).toBeInTheDocument()
     expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
     expect(screen.getByText("connectorRuntime.actions.resend")).toBeEnabled()
+  })
+})
+
+describe("warns once and keeps the panel honest when a superseded retry's outcome is unknown", () => {
+  it("warns once and keeps the panel honest when a superseded retry's outcome is unknown", async () => {
+    // Same-task retarget, snapshot unchanged -- same setup as "ignores a
+    // resend result superseded by a new request" above, but the retry that
+    // settles under the fresher request is neither a plain send nor a
+    // definite refusal: its outcome is unknown, which is the one case the
+    // panel cannot already be telling the truth about (it still says
+    // "definitely not sent").
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("not_sent"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    toastMock.mockClear()
+
+    // First superseded retry: its outcome is unknown, so the merged wording
+    // crosses from "definitely not sent" to "may have landed" -- the one
+    // fact this attempt adds.
+    // The retargeted read still comes back met: handleRetryResend re-asks
+    // canResendReport against whatever report is on screen before it sends,
+    // and a second click below has to reach that check on a report the
+    // retarget just installed, not on the met one the save left behind.
+    let rejectFirstRetry: (e: unknown) => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((_res, rej) => { rejectFirstRetry = rej }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    fetchMock.mockResolvedValueOnce(ok(report(true, [])))
+    await openForTask() // retargets this same dialog instance mid-resend
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    await act(async () => { rejectFirstRetry(deliveryFailure("outcome_unknown")) })
+
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendOutcomeUnknown"]])
+
+    // A second superseded retry, outcome unknown again: the panel already
+    // says "may have landed", so this attempt adds nothing new and must not
+    // warn a second time.
+    toastMock.mockClear()
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.resend")).toBeEnabled())
+    let rejectSecondRetry: (e: unknown) => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((_res, rej) => { rejectSecondRetry = rej }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    fetchMock.mockResolvedValueOnce(ok(report(true, [])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+
+    await act(async () => { rejectSecondRetry(deliveryFailure("outcome_unknown")) })
+
+    expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument()
+    expect(toastMock).not.toHaveBeenCalled()
+
+    // A third superseded retry, this time definitely refused: uncertainty
+    // only ever accumulates (mergeSendFailureDisposition), so a later
+    // definite refusal must not un-say the earlier unknown outcome, and
+    // since the panel's wording does not move, nothing is announced again.
+    toastMock.mockClear()
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.resend")).toBeEnabled())
+    let rejectThirdRetry: (e: unknown) => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((_res, rej) => { rejectThirdRetry = rej }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    fetchMock.mockResolvedValueOnce(ok(report(true, [])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4))
+
+    await act(async () => { rejectThirdRetry(deliveryFailure("rejected")) })
+
+    expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(toastMock).not.toHaveBeenCalled()
+  })
+})
+
+describe("does not resurrect a dropped panel when a superseded retry's outcome is unknown", () => {
+  it("does not resurrect a dropped panel when a superseded retry's outcome is unknown", async () => {
+    // Same starting panel as "warns once and keeps the panel honest" above,
+    // but this retarget also swaps the snapshot the panel was about (see
+    // "drops the send-failed panel once the snapshot it is about is
+    // replaced" below), not just the request's seq. The render-time reset
+    // above handleRetryResend already takes the panel down in the same
+    // commit as the retarget, before this stale retry ever settles, so
+    // there is no panel left for the merged disposition to write into. The
+    // toast is still the only place left to say "may have landed" -- warn
+    // once, but do not bring the panel back to say it a second way.
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(new Error("closed"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    sendMessageMock.mockClear()
+    let rejectRetry: (e: unknown) => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((_res, rej) => { rejectRetry = rej }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+
+    // A same-task retarget that brings a newer candidate: the snapshot this
+    // panel was about is gone, so the panel drops in the same commit,
+    // before the stale retry below ever settles.
+    await stageThenRecord({ taskId: 1, clientMessageId: "newer-turn", text: "a later message" })
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    toastMock.mockClear()
+
+    await act(async () => { rejectRetry(deliveryFailure("outcome_unknown")) })
+
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.sendOutcomeUnknown")).not.toBeInTheDocument()
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendOutcomeUnknown"]])
+  })
+})
+
+describe("reports a definite failure of a retry whose panel a retarget replaced", () => {
+  it.each(["not_sent", "rejected"] as const)(
+    "toasts a %s outcome once the snapshot the panel was about is gone",
+    async (disposition) => {
+      // Same setup as "does not resurrect a dropped panel" above: the
+      // retarget swaps the snapshot, so the panel is gone before the retry
+      // settles and nothing on screen can carry its outcome. A definite
+      // failure moves no wording from "not sent" to "may have landed", but
+      // with no panel left the toast is the only report of it at all.
+      vi.spyOn(console, "warn").mockImplementation(() => {})
+      await openSimpleDialog()
+      fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+      submitMock.mockResolvedValueOnce(ok(report(true, [])))
+      sendMessageMock.mockRejectedValueOnce(deliveryFailure("not_sent"))
+      fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+      await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+      let rejectRetry: (e: unknown) => void = () => {}
+      sendMessageMock.mockReturnValueOnce(new Promise((_res, rej) => { rejectRetry = rej }))
+      fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+
+      await stageThenRecord({ taskId: 1, clientMessageId: "newer-turn", text: "a later message" })
+      fetchMock.mockResolvedValueOnce(ok(report(false, [
+        connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+      ])))
+      await openForTask()
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+      expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+      toastMock.mockClear()
+
+      await act(async () => { rejectRetry(deliveryFailure(disposition)) })
+
+      expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+      expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendFailed"]])
+    },
+  )
+})
+
+describe("keeps a message's delivery verdict from falling back once its panel is gone", () => {
+  function fillableReport() {
+    return report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])
+  }
+
+  /**
+   * Leaves the dialog on a fillable report with no panel, after a resend of
+   * `clientMessageId` whose outcome is unknown: the panel said "may have
+   * landed", then a same-task re-read installed a report that needs a value
+   * again, and the panel's own retry button -- turned down by that report --
+   * took the panel down with it. Nothing on screen still says the earlier
+   * attempt may have gone out.
+   */
+  async function unknownOutcomeThenPanelDropped(taskId = 1, clientMessageId = `orig-${taskId}`) {
+    fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+    renderHarness()
+    await recordThenOpen({ taskId, clientMessageId, text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("outcome_unknown"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument())
+
+    fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+    await openForTask(taskId) // a same-task terminal frame; the snapshot stays
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.resend")).toBeEnabled())
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    expect(screen.queryByText("connectorRuntime.sendOutcomeUnknown")).not.toBeInTheDocument()
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentIncomplete"]])
+    toastMock.mockClear()
+
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "y" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+  }
+
+  it("does not tell the user a message whose earlier attempt may have landed was not sent", async () => {
+    // Save and resend again. doResend reuses the id of the attempt whose
+    // outcome is unknown, so this is the same message, and the server now
+    // definitely refuses it. That refusal is about this attempt only: the
+    // earlier one may still be running, and "not sent" would send the user
+    // to the message box, where a fresh id is not covered by the same-id
+    // retry the panel's button uses.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await unknownOutcomeThenPanelDropped()
+    const firstId = sendMessageMock.mock.calls[0][1]?.clientMessageId
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("rejected"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(2))
+
+    expect(sendMessageMock.mock.calls[1][1]?.clientMessageId).toBe(firstId)
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument())
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(toastMock).not.toHaveBeenCalledWith("connectorRuntime.sendFailed")
+
+    // A third attempt, from the panel's own retry button. The second
+    // attempt's disposition was a definite "rejected" -- not unknown -- so
+    // the id-reuse decision, which reads only that attempt's own
+    // disposition, must mint a fresh id here rather than reuse firstId
+    // again, even though the merged verdict shown above stayed "unknown".
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("rejected"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(3))
+    expect(sendMessageMock.mock.calls[2][1]?.clientMessageId).not.toBe(firstId)
+    expect(screen.getByText("connectorRuntime.sendOutcomeUnknown")).toBeInTheDocument()
+  })
+
+  it("words the toast the same way when a retarget supersedes that resend", async () => {
+    // Same history, but a same-task terminal frame retargets the dialog
+    // while the save-and-resend's own resend is on the wire, so the refusal
+    // is reported by a toast rather than a panel. The toast must not say
+    // "not sent" either.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await unknownOutcomeThenPanelDropped()
+    let rejectSend: (e: unknown) => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((_res, rej) => { rejectSend = rej }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(2))
+    fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+    await openForTask() // retargets this same dialog instance mid-resend
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+
+    await act(async () => { rejectSend(deliveryFailure("rejected")) })
+
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendOutcomeUnknown"]])
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+  })
+
+  it("does not carry a verdict over to another task's dialog", async () => {
+    // What this dialog remembers belongs to the one open instance, which is
+    // mounted per task. Client message ids are unique in production; this
+    // reuses one across the two tasks on purpose, so the only thing that can
+    // keep task 2's definite refusal worded as "not sent" is that task 1's
+    // record went away with task 1's dialog.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await unknownOutcomeThenPanelDropped(1, "shared-id")
+
+    pathnameRef.current = "/task/2"
+    appStateRef.taskId = 2
+    await act(async () => { latestActions.retainOnlyTask(2) })
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+
+    fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+    await recordThenOpen({ taskId: 2, clientMessageId: "shared-id", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "z" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("rejected"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+    expect(screen.queryByText("connectorRuntime.sendOutcomeUnknown")).not.toBeInTheDocument()
   })
 })
 

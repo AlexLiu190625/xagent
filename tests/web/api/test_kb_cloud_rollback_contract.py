@@ -36,7 +36,7 @@ temp_uploads = kb_dir.temp_uploads
 REGISTERED = [{"name": "register_document", "metadata": {"created": True}}]
 FULL_CHAIN = [
     "delete_document",
-    "list:None",
+    "refs:['file-1']",
     "orphan",
     "list:coll",
     "may_delete",
@@ -70,6 +70,7 @@ def _install_leaves(
     document_status: str = "success",
     collection_error: Optional[Exception] = None,
     restore_error: Optional[Exception] = None,
+    refs_error: Optional[Exception] = None,
 ) -> Any:
     class _Store:
         def list_document_records(self, *, collection_name, user_id, is_admin, **_kw):
@@ -85,6 +86,12 @@ def _install_leaves(
 
     def _orphan(db, *, file_id, user_id, remaining_file_ids):
         calls.append("orphan")
+
+    def _refs(file_ids, *, user_id, is_admin):
+        calls.append(f"refs:{sorted(file_ids)}")
+        if refs_error is not None:
+            raise refs_error
+        return []
 
     async def _may_delete(**_kwargs):
         calls.append("may_delete")
@@ -109,6 +116,7 @@ def _install_leaves(
         "delete_document": _delete_document,
         "clear_ingestion_status": _clear_status,
         "_delete_uploaded_file_if_orphaned": _orphan,
+        "_list_document_records_for_file_ids": _refs,
         "_rollback_may_delete_collection": _may_delete,
         "delete_collection": _delete_collection,
         "_cleanup_failed_new_collection_metadata": _metadata_cleanup,
@@ -160,7 +168,7 @@ async def _rollback(
             {},
             False,
             True,
-            [c for c in FULL_CHAIN if c != "orphan"],
+            [FULL_CHAIN[0], "refs:[]", *FULL_CHAIN[3:]],
             id="no-file-record-still-lists",
         ),
         pytest.param(
@@ -218,6 +226,19 @@ async def test_collection_failure_rolls_back_session_and_chains_the_exception(
         f"{PREFIX}: lance down. Original ingestion error: partial failure"
     )
     assert calls == [*FULL_CHAIN[:6], "rollback", "restore"]
+
+
+async def test_refs_failure_stops_before_orphan_and_collection(monkeypatch) -> None:
+    calls: list[str] = []
+    db = _install_leaves(monkeypatch, calls, refs_error=RuntimeError("refs down"))
+
+    with pytest.raises(RollbackFailureError) as info:
+        await _rollback(db)
+
+    assert str(info.value) == (
+        f"{PREFIX}: refs down. Original ingestion error: partial failure"
+    )
+    assert calls == [*FULL_CHAIN[:2], "rollback", "restore"]
 
 
 async def test_restore_failure_after_commit_reports_both(monkeypatch) -> None:

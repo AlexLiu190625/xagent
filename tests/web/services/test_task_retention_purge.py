@@ -162,6 +162,10 @@ def _seed_full_task(
                 role="user",
                 content="hello",
                 message_type="text",
+                # The message that produced ``anchor``. Left to its server
+                # default it would be "now", and the assessment measures from
+                # the newest message as well as the stored anchor (#2580).
+                created_at=anchor,
             ),
         ]
     )

@@ -164,9 +164,12 @@ class RetentionPurgeAction(enum.Enum):
     #: ``ck_task_interaction_requests_active_anchor``.
     SKIPPED_ACTIVE_INTERACTION = "skipped_active_interaction"
     #: Trace expiry only: the task is due, but its trace is already gone, so
-    #: there was nothing to delete. The scan filters these out, so reaching
-    #: here means the rows went between the scan and the lock -- normal with
-    #: more than one replica sweeping.
+    #: there was nothing to delete. Two ways to get here: the rows went
+    #: between the scan and the lock -- normal with more than one replica
+    #: sweeping -- or the task's stored anchor lags its newest message
+    #: (#2580). The scan then admits it as conversation-expired on every
+    #: sweep, and the locked assessment downgrades it to trace expiry on a
+    #: trace that an earlier sweep already removed.
     NOTHING_TO_PURGE = "nothing_to_purge"
     #: The task's own purge raised. Counted rather than propagated, because a
     #: task that fails deterministically would otherwise stop every task
@@ -476,10 +479,11 @@ def purge_task(
         if action is RetentionPurgeAction.PURGED_CONVERSATION:
             purge_task_rows(db, task_id=task_id)
         elif _purge_trace_rows(db, task_id) == 0:
-            # The scan filters these out, so arriving here means the rows went
-            # between the scan and the lock. Committing an empty transaction
-            # is still right -- it releases the lock -- but calling it a purge
-            # is not.
+            # Either the rows went between the scan and the lock, or the scan
+            # admitted a drifted task whose trace an earlier sweep removed
+            # (see ``NOTHING_TO_PURGE``). Committing an empty transaction is
+            # still right -- it releases the lock -- but calling it a purge is
+            # not.
             action = RetentionPurgeAction.NOTHING_TO_PURGE
         db.commit()
         committed = True

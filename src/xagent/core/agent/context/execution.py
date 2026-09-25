@@ -905,22 +905,24 @@ class ExecutionContext:
         unavailable_count: int = 0,
     ) -> str:
         formatted: Any
-        if isinstance(result, dict) and isinstance(result.get("artifacts"), list):
-            formatted = format_tool_result_for_observation(tool_name, result)
-        elif isinstance(result, dict):
-            if "output" in result:
-                formatted = result["output"]
+        if isinstance(result, dict):
+            # The reserved key (and the relative_path inside its records)
+            # stays in result itself for raw_result, but none of the branches
+            # below may render it: the notice appended after the body is the
+            # only place a path may appear. Dropping it once here keeps every
+            # branch -- the artifact formatter's metadata line included --
+            # from seeing it at all.
+            visible = {
+                key: value
+                for key, value in result.items()
+                if key != SPILL_RESERVED_RESULT_KEY
+            }
+            if isinstance(visible.get("artifacts"), list):
+                formatted = format_tool_result_for_observation(tool_name, visible)
+            elif "output" in visible:
+                formatted = visible["output"]
             else:
-                # No "output" key falls back to the whole dict; the reserved
-                # key (and the relative_path inside its records) must not
-                # leak into this rendered text even though it stays in
-                # result itself for raw_result -- the notice below is the
-                # only place a path may appear.
-                formatted = {
-                    key: value
-                    for key, value in result.items()
-                    if key != SPILL_RESERVED_RESULT_KEY
-                }
+                formatted = visible
         else:
             formatted = result
         parts = [f"Tool {tool_name} returned: {formatted}"]

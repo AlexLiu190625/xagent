@@ -21,6 +21,9 @@ repos:
           - "pydantic[mypy]"
           - aiohttp
           - redis==6.4.0
+          # Match uv.lock: the isolated hook otherwise resolves SQLAlchemy 2.1,
+          # whose ORM typing changes break inference for legacy Column models.
+          - sqlalchemy==2.0.47
           - types-PyYAML
           - types-beautifulsoup4
           - types-requests

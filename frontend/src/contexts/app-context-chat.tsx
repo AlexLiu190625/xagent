@@ -7241,6 +7241,9 @@ export function AppProvider({
     if (taskId) {
       isHistoricalDataLoadingRef.current = true
       dispatch({ type: "SET_HISTORY_LOADING", payload: true })
+    } else {
+      // The task socket is keyed on taskId, so no terminal WS event will clear this.
+      dispatch({ type: "SET_PROCESSING", payload: false })
     }
   }, [dispatch, router])
 
