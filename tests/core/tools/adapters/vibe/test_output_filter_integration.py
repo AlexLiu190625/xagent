@@ -17,6 +17,7 @@ from xagent.core.tools.adapters.vibe.output_filter import DEFAULT_TRUNCATION_MES
 from xagent.core.tools.adapters.vibe.output_filter_wrapper import (
     OutputFilteredToolWrapper,
 )
+from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
 from xagent.core.tools.tool_result_spill import (
     SPILL_PLACEHOLDER_TEXT,
     SPILL_RESERVED_RESULT_KEY,
@@ -231,6 +232,37 @@ def test_a_real_spill_is_invisible_to_get_output_files(tmp_path):
 
     listed_paths = {entry["file_path"] for entry in workspace.get_output_files()}
     assert str(written) not in listed_paths
+
+
+def test_a_real_spill_refuses_file_tool_writes_but_reads_back_whole(tmp_path):
+    """The same real spill file, seen from the two sides of the workspace
+    file tools: writing into the engine's directory is refused, while
+    read_tool_result returns exactly the value that was stored in place of
+    the placeholder."""
+    workspace = TaskWorkspace("task-spill", str(tmp_path))
+    spill_dir = workspace.output_dir / "tool-results"
+    wrapper = _wrapper(
+        max_chars=80, spill_target=SpillTarget(spill_dir=str(spill_dir), max_chars=80)
+    )
+    big_text = "x" * 100
+    result = {
+        "content": [{"type": "text", "text": big_text}],
+        "structured_content": None,
+        "is_error": False,
+    }
+    filtered = wrapper._filter_result(result)
+    relative_path = filtered[SPILL_RESERVED_RESULT_KEY][0]["relative_path"]
+    assert filtered["content"][0]["text"] == SPILL_PLACEHOLDER_TEXT
+    file_tools = WorkspaceFileTools(workspace)
+
+    with pytest.raises(ValueError):
+        file_tools.write_file("output/tool-results/x.json", "[1]")
+    assert not (spill_dir / "x.json").exists()
+
+    assert file_tools.read_tool_result(relative_path) == {
+        "relative_path": relative_path,
+        "output": big_text,
+    }
 
 
 def test_wrapper_without_spill_target_truncates_as_before(tmp_path):

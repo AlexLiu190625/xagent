@@ -85,7 +85,7 @@ from ....tools.adapters.vibe.mcp_approval_gate import (
     ToolCallExecutionContext,
     bind_tool_call_execution_context,
 )
-from ....tools.tool_result_spill import SPILL_RESERVED_RESULT_KEY
+from ....tools.tool_result_spill import SPILL_READ_TOOL_NAME, SPILL_RESERVED_RESULT_KEY
 from ....tools.user_interaction import (
     ToolInteractionSettlement,
     tool_result_waits_for_user,
@@ -763,6 +763,27 @@ class ReActPattern(AgentPattern):
             if self.tool_choice == "none"
             else self._tool_schemas_with_builtin_controls(tools)
         )
+        # base_tool_schemas never lists the stored-result reader; its schema
+        # is built here from this run's tools and added back per iteration
+        # by _tool_schemas_with_spill_read. None when the run offers no tools
+        # at all or has no reader tool, and then it is never offered.
+        spill_read_tool = (
+            None
+            if self.tool_choice == "none"
+            else next(
+                (
+                    tool
+                    for tool in tools
+                    if self._tool_name(tool) == SPILL_READ_TOOL_NAME
+                ),
+                None,
+            )
+        )
+        spill_read_schema = (
+            None
+            if spill_read_tool is None
+            else self._build_tool_schema(spill_read_tool)
+        )
 
         for iteration in range(self.current_iteration, self.max_iterations):
             self.current_iteration = iteration
@@ -799,10 +820,13 @@ class ReActPattern(AgentPattern):
                     and self._latest_tool_result_success(context)
                 )
             )
+            normal_tool_schemas = self._tool_schemas_with_spill_read(
+                base_tool_schemas, spill_read_schema, context
+            )
             tool_schemas = (
                 [self._final_answer_tool_schema()]
                 if force_final_answer_now
-                else base_tool_schemas
+                else normal_tool_schemas
             )
             interrupted = await self._interrupt_if_requested(
                 runtime=runtime,
@@ -959,7 +983,7 @@ class ReActPattern(AgentPattern):
                         llm=call_llm,
                         runtime=runtime,
                         iteration=iteration,
-                        tool_schemas=base_tool_schemas,
+                        tool_schemas=normal_tool_schemas,
                         force_final_answer=(
                             force_final_answer_now and not restore_full_tool_set
                         ),
@@ -1063,7 +1087,7 @@ class ReActPattern(AgentPattern):
                         llm=call_llm,
                         runtime=runtime,
                         iteration=iteration,
-                        tool_schemas=base_tool_schemas,
+                        tool_schemas=normal_tool_schemas,
                         force_final_answer=(
                             force_final_answer_now and not recover_full_tool_set
                         ),
@@ -3285,7 +3309,14 @@ class ReActPattern(AgentPattern):
         external_tools = [
             self._build_tool_schema(tool)
             for tool in tools
-            if self._tool_name(tool) not in control_tool_names
+            if (name := self._tool_name(tool)) not in control_tool_names
+            # Unconditional: this function only sees the static tool list
+            # (it runs once per run, before the iteration loop even starts),
+            # so it cannot know whether the run has stored anything yet.
+            # _tool_schemas_with_spill_read adds the reader back once the
+            # registry is non-empty -- a dynamic fact this function has no
+            # way to observe.
+            and name != SPILL_READ_TOOL_NAME
         ]
         can_lookup_output_files = any(
             schema.get("function", {}).get("name") == WORKSPACE_OUTPUT_FILES_TOOL_NAME
@@ -3297,6 +3328,46 @@ class ReActPattern(AgentPattern):
                 can_lookup_output_files=can_lookup_output_files
             ),
         ]
+
+    def _spilled_paths(self, context: Any) -> frozenset[str]:
+        """Exact relative paths this execution stored results into.
+
+        Read-only on purpose: it goes through get_component and treats a
+        missing component as empty. The context's spilled_results property
+        creates an empty registry component the first time it is read, and
+        this runs on every iteration, so reading through that property would
+        add an empty spilled_results entry to every checkpoint of every run
+        that never stored anything.
+        """
+        get_component = getattr(context, "get_component", None)
+        component = (
+            get_component("spilled_results") if callable(get_component) else None
+        )
+        records = getattr(component, "records", ()) or ()
+        return frozenset(
+            str(record["relative_path"])
+            for record in records
+            if isinstance(record, dict) and isinstance(record.get("relative_path"), str)
+        )
+
+    def _tool_schemas_with_spill_read(
+        self,
+        base_schemas: list[dict[str, Any]],
+        spill_read_schema: dict[str, Any] | None,
+        context: Any,
+    ) -> list[dict[str, Any]]:
+        """Add the stored-result reader once this run has actually stored one.
+
+        base_schemas is built once per run, before the iteration loop, so it
+        cannot know about a registry that fills up mid-run. This runs on
+        every iteration instead, which is the only place that sees the
+        spill that just happened. spill_read_schema is None when the run
+        has no reader to offer (tool_choice "none", or no reader tool), and
+        base_schemas then comes back unchanged whatever the registry holds.
+        """
+        if spill_read_schema is None or not self._spilled_paths(context):
+            return base_schemas  # byte-identical to the baseline surface
+        return [*base_schemas, spill_read_schema]
 
     def _control_tool_names(self) -> set[str]:
         return set(CONTROL_TOOL_NAMES)
