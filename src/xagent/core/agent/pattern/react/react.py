@@ -2071,9 +2071,14 @@ class ReActPattern(AgentPattern):
     ) -> bool:
         """Whether a rejected response should get the full tool set back.
 
-        On a forced turn only a call outside allowed_tool_names does: a
-        provider-rejected call and a plain call are judged against the same
-        names. Without allowed_tool_names only final_answer is allowed.
+        On a forced turn only a call outside allowed_tool_names does. A plain
+        response is judged by every call it carries; a provider-reported
+        unavailable_tool_call only by the one refused name the provider
+        reports, which is the first call it refused. A reply that mixes a read
+        with another tool can therefore stay on the narrowed tools on the
+        provider path where the plain path hands the full set back; that is
+        the conservative direction. Without allowed_tool_names only
+        final_answer is allowed.
         """
         allowed_names = allowed_tool_names or frozenset({"final_answer"})
         protocol_error = get_tool_protocol_error(normalized.get("raw"))
