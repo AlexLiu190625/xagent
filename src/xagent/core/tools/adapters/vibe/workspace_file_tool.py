@@ -16,7 +16,11 @@ from .....core.workspace import (
     TaskWorkspace,
 )
 from ...core.workspace_file_tool import FileInfo, WorkspaceFileOperations
-from ...tool_result_spill import SPILL_READ_MAX_CHARS, SPILL_READ_TOOL_NAME
+from ...tool_result_spill import (
+    SPILL_MAX_FILES_PER_RUN,
+    SPILL_READ_MAX_CHARS,
+    SPILL_READ_TOOL_NAME,
+)
 from .base import ToolCategory
 from .function import FunctionTool
 
@@ -324,17 +328,20 @@ class WorkspaceFileTools(WorkspaceFileOperations):
                 name=SPILL_READ_TOOL_NAME,
                 description=(
                     "Read one engine-stored large tool result by the exact path listed "
-                    "in its notice. Omit path to list the stored results instead "
-                    "(relative_path and size in bytes of each); start, end and offset "
-                    "must then be omitted too. start and end are 1-based item numbers, not "
-                    "line numbers: array elements for a JSON array, top-level entries "
-                    "for a JSON object, and lines only for plain text. Omit both to "
-                    "read the whole result. One call returns at most "
-                    f"{SPILL_READ_MAX_CHARS:,} characters; offset is a 0-based character position in the "
-                    "text the selected items render to, and the reply starts there. "
-                    "When a reply is cut short, call again with the same start and "
-                    "end and a larger offset to continue, which is how a single "
-                    "item longer than the limit is read to its end."
+                    "in its notice. start and end are 1-based item numbers, not line "
+                    "numbers: array elements for a JSON array, top-level entries for a "
+                    "JSON object, and lines only for plain text. Omit both to read the "
+                    "whole result. One call returns at most "
+                    f"{SPILL_READ_MAX_CHARS:,} characters; offset is a 0-based "
+                    "character position in the text the selected items render to, and "
+                    "the reply starts there. When a reply is cut short, call again "
+                    "with the same start and end and a larger offset to continue, "
+                    "which is how a single item longer than the limit is read to its "
+                    "end. Omit path to list the stored results instead: relative_path "
+                    "and size in bytes of each, sorted by path, at most "
+                    f"{SPILL_MAX_FILES_PER_RUN} per call. When listing, start and end "
+                    "are 1-based entry numbers that page through that list, count is "
+                    "the total number of entries, and offset is not used."
                 ),
                 read_only=True,
                 concurrency_safe=True,

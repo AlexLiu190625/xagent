@@ -24,7 +24,7 @@ workspace's spill directory to the two read-back entry points here.
 no path search, checks the digest in the file name against the file's
 bytes before decoding them, and slices by item with ``_spill_slice``.
 ``list_spilled_results`` lists the files in the spill directory by name
-and size instead, without checking any digest. ReAct adds the tool to the
+and size instead, a page at a time, without checking any digest. ReAct adds the tool to the
 model's tool list only once the run's registry holds a record.
 """
 
@@ -104,14 +104,11 @@ SPILL_READ_UNAVAILABLE_MESSAGES = {
         "unavailable and do not reconstruct it."
     ),
     "invalid_range": (
-        "start and end are 1-based item numbers: both must be 1 or "
-        "greater, and start must not exceed end. offset is a 0-based "
-        "character position: it must be 0 or greater and fall inside the "
-        "text the selected items render to."
-    ),
-    "listing_takes_no_range": (
-        "Omit start and end to list the stored results, or give a path to "
-        "read one of them."
+        "start and end are 1-based item numbers, or entry numbers when "
+        "listing: both must be 1 or greater, and start must not exceed end. "
+        "offset is a 0-based character position in the text of one stored "
+        "result's selected items: it must be 0 or greater and fall inside "
+        "that text, and it is not used when listing."
     ),
 }
 # The read tool's own name, output cap and over-cap instruction. The cap
@@ -708,18 +705,8 @@ def read_spilled_result(
     return preview
 
 
-def list_spilled_results(
-    spill_dir: str | Path | None,
-    *,
-    start: int | None = None,
-    end: int | None = None,
-) -> dict[str, Any]:
-    """List the files in ``spill_dir``, by name and size.
-
-    The listing comes from the directory itself, not from the spill
-    registry: the read tool holds only the workspace, and the registry
-    lives on the execution context. The directory belongs to the task, so
-    the listing can include files an earlier run of the same task stored.
+def _stored_result_entries(spill_dir: str | Path | None) -> list[dict[str, Any]]:
+    """Every listable entry in ``spill_dir``, sorted by relative_path.
 
     An entry is listed only if it is a direct child that is a regular
     file (a symlink is not followed), its name matches the spill file
@@ -729,27 +716,16 @@ def list_spilled_results(
     the names the writer actually produces, so a listed name is not by
     itself evidence the writer made it. Each relative_path is the
     canonical spelling normalize_spilled_relative_path returns, the same
-    one the notice shows and a successful read returns. No digest is
-    checked here -- that would read every file in full -- so a listed file
-    can still be reported unavailable when it is read; the listing answers
-    which names are there, and the read answers whether one is a stored
-    result.
+    one the notice shows and a successful read returns.
 
     A missing spill_dir, a path that is not a directory, and an OSError
-    from opening or iterating the directory all return an empty listing:
-    a task that never stored anything asking for its stored results is an
+    from opening or iterating the directory all give no entries: a task
+    that never stored anything asking for its stored results is an
     ordinary question, not a failure. An OSError from one entry's own
     is_file or stat skips that entry only; the others are still listed.
-    Entries are sorted by relative_path and capped at
-    SPILL_MAX_FILES_PER_RUN; the rest are counted in ``omitted``.
-
-    start and end have no meaning for this listing, so passing either one
-    is rejected with its own reason rather than ignored.
     """
-    if start is not None or end is not None:
-        return spill_read_unavailable("listing_takes_no_range")
     if not spill_dir:
-        return {"stored_results": [], "count": 0, "omitted": 0}
+        return []
     found: list[dict[str, Any]] = []
     try:
         with os.scandir(spill_dir) as entries:
@@ -769,13 +745,75 @@ def list_spilled_results(
                     continue
                 found.append({"relative_path": relative_path, "bytes": size})
     except OSError:
-        return {"stored_results": [], "count": 0, "omitted": 0}
+        return []
     found.sort(key=lambda item: item["relative_path"])
-    listed = found[:SPILL_MAX_FILES_PER_RUN]
+    return found
+
+
+def list_spilled_results(
+    spill_dir: str | Path | None,
+    *,
+    start: int | None = None,
+    end: int | None = None,
+) -> dict[str, Any]:
+    """List one page of the files in ``spill_dir``, by name and size.
+
+    The listing comes from the directory itself, not from the spill
+    registry: the read tool holds only the workspace, and the registry
+    lives on the execution context. So each entry carries its path and
+    size only -- the kind, item count and source characters of a stored
+    result are recorded in the run's registry, not in the directory. The
+    directory belongs to the task, so the listing can include files an
+    earlier run of the same task stored. No digest is checked here --
+    that would read every file in full -- so a listed file can still be
+    reported unavailable when it is read; the listing answers which names
+    are there, and the read answers whether one is a stored result. Which
+    entries qualify is described on _stored_result_entries.
+
+    start and end are 1-based inclusive entry numbers over the entries
+    sorted by relative_path, validated the way read_spilled_result
+    validates item numbers: both 1 or greater and start not past end, else
+    invalid_range; a start past the last entry is invalid_range naming the
+    entry count. Omitted, start is the first entry and end the last. One
+    page holds at most SPILL_MAX_FILES_PER_RUN entries; a range asking for
+    more is cut to that many, and the returned end says where it stopped.
+
+    ``count`` is the number of entries in the whole listing, not in this
+    page; ``start`` and ``end`` are the bounds of the page actually
+    returned (both None when there is nothing to list); ``omitted`` is the
+    number of entries outside the page.
+    """
+    if (
+        (start is not None and start < 1)
+        or (end is not None and end < 1)
+        or (start is not None and end is not None and start > end)
+    ):
+        return spill_read_unavailable("invalid_range")
+    entries = _stored_result_entries(spill_dir)
+    total = len(entries)
+    if start is not None and start > total:
+        return spill_read_unavailable("invalid_range", item_count=total)
+    if not entries:
+        return {
+            "stored_results": [],
+            "count": 0,
+            "start": None,
+            "end": None,
+            "omitted": 0,
+        }
+    first = 1 if start is None else start
+    last = min(
+        total if end is None else end,
+        total,
+        first + SPILL_MAX_FILES_PER_RUN - 1,
+    )
+    page = entries[first - 1 : last]
     return {
-        "stored_results": listed,
-        "count": len(listed),
-        "omitted": len(found) - len(listed),
+        "stored_results": page,
+        "count": total,
+        "start": first,
+        "end": last,
+        "omitted": total - len(page),
     }
 
 
@@ -1920,14 +1958,14 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
         # header does not say what it is listing.
         omitted_line = (
             f"- ... {omitted} more stored file(s); call read_tool_result "
-            "with no path to list them all"
+            "with no path to list them"
         )
         while len(lines) > 1 and total_chars + 1 + len(omitted_line) > max_chars:
             total_chars -= 1 + len(lines.pop())
             omitted += 1
             omitted_line = (
                 f"- ... {omitted} more stored file(s); call read_tool_result "
-                "with no path to list them all"
+                "with no path to list them"
             )
         lines.append(omitted_line)
     return "\n".join(lines)

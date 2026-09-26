@@ -472,14 +472,11 @@ def test_spill_read_unavailable_messages_are_pinned():
             "unavailable and do not reconstruct it."
         ),
         "invalid_range": (
-            "start and end are 1-based item numbers: both must be 1 or "
-            "greater, and start must not exceed end. offset is a 0-based "
-            "character position: it must be 0 or greater and fall inside the "
-            "text the selected items render to."
-        ),
-        "listing_takes_no_range": (
-            "Omit start and end to list the stored results, or give a path to "
-            "read one of them."
+            "start and end are 1-based item numbers, or entry numbers when "
+            "listing: both must be 1 or greater, and start must not exceed end. "
+            "offset is a 0-based character position in the text of one stored "
+            "result's selected items: it must be 0 or greater and fall inside "
+            "that text, and it is not used when listing."
         ),
     }
 
@@ -502,6 +499,8 @@ def test_read_back_entry_points_treat_no_spill_directory_as_nothing_stored(
     assert list_spilled_results(spill_dir) == {
         "stored_results": [],
         "count": 0,
+        "start": None,
+        "end": None,
         "omitted": 0,
     }
 
@@ -2988,7 +2987,7 @@ def test_render_spill_notice_stays_inside_its_own_character_budget():
     assert rendered >= 1
     assert body_lines[-1] == (
         f"- ... {12 - rendered} more stored file(s); call read_tool_result "
-        "with no path to list them all"
+        "with no path to list them"
     )
 
 
@@ -3000,8 +2999,7 @@ def test_render_spill_notice_omitted_line_names_the_listing_call():
 
     assert len(body_lines) == 9
     assert body_lines[-1] == (
-        "- ... 1 more stored file(s); call read_tool_result with no path "
-        "to list them all"
+        "- ... 1 more stored file(s); call read_tool_result with no path to list them"
     )
 
 
@@ -3282,7 +3280,7 @@ def test_render_spill_notice_caps_entries_per_style(style, max_entries, max_char
     assert len(body_lines) == max_entries + 1
     assert body_lines[-1] == (
         f"- ... {total - max_entries} more stored file(s); call read_tool_result "
-        "with no path to list them all"
+        "with no path to list them"
     )
     for line in body_lines[:-1]:
         assert line.startswith("- tool-results/s")

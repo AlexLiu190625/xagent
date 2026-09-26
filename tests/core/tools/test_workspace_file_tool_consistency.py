@@ -1230,7 +1230,13 @@ class TestReadToolResult:
     def test_read_tool_result_lists_nothing_when_nothing_was_stored(self, tmp_path):
         workspace = TaskWorkspace("task-1", str(tmp_path))
         tools = WorkspaceFileTools(workspace)
-        empty = {"stored_results": [], "count": 0, "omitted": 0}
+        empty = {
+            "stored_results": [],
+            "count": 0,
+            "start": None,
+            "end": None,
+            "omitted": 0,
+        }
 
         assert tools.read_tool_result() == empty
         (workspace.output_dir / "tool-results").mkdir(parents=True)
@@ -1248,6 +1254,8 @@ class TestReadToolResult:
         assert tools.read_tool_result() == {
             "stored_results": [],
             "count": 0,
+            "start": None,
+            "end": None,
             "omitted": 0,
         }
 
@@ -1280,6 +1288,8 @@ class TestReadToolResult:
                 },
             ],
             "count": 2,
+            "start": 1,
+            "end": 2,
             "omitted": 0,
         }
         # Every listed path reads back through the same tool.
@@ -1296,40 +1306,123 @@ class TestReadToolResult:
         assert tools.read_tool_result(blank) == tools.read_tool_result()
         assert tools.read_tool_result(blank)["count"] == 1
 
-    @pytest.mark.usefixtures("mock_workspace_db")
-    @pytest.mark.parametrize(
-        "path, start, end",
-        [(None, 1, None), (None, None, 1), ("  ", 1, 2)],
-    )
-    def test_read_tool_result_listing_rejects_a_range(self, tmp_path, path, start, end):
-        workspace = TaskWorkspace("task-1", str(tmp_path))
-        tools = WorkspaceFileTools(workspace)
-        self._spill_file(workspace, "a" * 10)
-
-        result = tools.read_tool_result(path, start=start, end=end)
-        assert result == spill_read_unavailable("listing_takes_no_range")
-        assert result["output"] == (
-            "Omit start and end to list the stored results, or give a path to "
-            "read one of them."
-        )
+    @staticmethod
+    def _plant_listing(workspace, how_many):
+        spill_dir = workspace.output_dir / "tool-results"
+        spill_dir.mkdir(parents=True, exist_ok=True)
+        for index in range(how_many):
+            (spill_dir / f"t{index:03d}-{index:032d}.json").write_bytes(b"")
+        return [
+            f"tool-results/t{index:03d}-{index:032d}.json" for index in range(how_many)
+        ]
 
     @pytest.mark.usefixtures("mock_workspace_db")
     def test_read_tool_result_listing_is_capped_and_counts_the_rest(self, tmp_path):
         workspace = TaskWorkspace("task-1", str(tmp_path))
         tools = WorkspaceFileTools(workspace)
-        spill_dir = workspace.output_dir / "tool-results"
-        spill_dir.mkdir(parents=True)
-        for index in range(SPILL_MAX_FILES_PER_RUN + 1):
-            (spill_dir / f"t{index:03d}-{index:032d}.json").write_bytes(b"")
+        paths = self._plant_listing(workspace, SPILL_MAX_FILES_PER_RUN + 1)
 
         listing = tools.read_tool_result()
 
-        assert listing["count"] == SPILL_MAX_FILES_PER_RUN == 64
-        assert listing["omitted"] == 1
-        paths = [entry["relative_path"] for entry in listing["stored_results"]]
-        assert paths == sorted(paths)
-        assert paths[0] == f"tool-results/t000-{0:032d}.json"
-        assert f"tool-results/t064-{64:032d}.json" not in paths
+        assert SPILL_MAX_FILES_PER_RUN == 64
+        assert listing["count"] == 65
+        assert (listing["start"], listing["end"], listing["omitted"]) == (1, 64, 1)
+        listed = [entry["relative_path"] for entry in listing["stored_results"]]
+        assert listed == paths[:64]
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_read_tool_result_listing_pages_past_the_cap(self, tmp_path):
+        """Every stored file is reachable: the entries past the first page
+        are read by asking for the next page."""
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        paths = self._plant_listing(workspace, 150)
+
+        first = tools.read_tool_result()
+        second = tools.read_tool_result(start=first["end"] + 1)
+        third = tools.read_tool_result(start=second["end"] + 1)
+
+        assert [(page["start"], page["end"]) for page in (first, second, third)] == [
+            (1, 64),
+            (65, 128),
+            (129, 150),
+        ]
+        assert [page["count"] for page in (first, second, third)] == [150] * 3
+        assert [page["omitted"] for page in (first, second, third)] == [86, 86, 128]
+        listed = [
+            entry["relative_path"]
+            for page in (first, second, third)
+            for entry in page["stored_results"]
+        ]
+        assert listed == paths
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    @pytest.mark.parametrize(
+        "start, end, expected_bounds",
+        [
+            (3, 5, (3, 5)),
+            (None, 2, (1, 2)),
+            (8, None, (8, 10)),
+            (9, 100, (9, 10)),
+            (10, 10, (10, 10)),
+        ],
+    )
+    def test_read_tool_result_listing_returns_the_requested_entries(
+        self, tmp_path, start, end, expected_bounds
+    ):
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        paths = self._plant_listing(workspace, 10)
+
+        listing = tools.read_tool_result(start=start, end=end)
+
+        first, last = expected_bounds
+        assert (listing["start"], listing["end"]) == expected_bounds
+        assert listing["count"] == 10
+        assert listing["omitted"] == 10 - (last - first + 1)
+        assert [entry["relative_path"] for entry in listing["stored_results"]] == paths[
+            first - 1 : last
+        ]
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_read_tool_result_listing_page_is_cut_to_the_cap(self, tmp_path):
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        self._plant_listing(workspace, 100)
+
+        listing = tools.read_tool_result(start=2, end=100)
+
+        assert (listing["start"], listing["end"]) == (2, 65)
+        assert len(listing["stored_results"]) == SPILL_MAX_FILES_PER_RUN
+        assert listing["omitted"] == 36
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    @pytest.mark.parametrize(
+        "path, start, end",
+        [(None, 0, None), (None, None, 0), ("  ", 3, 2), (None, -1, 2)],
+    )
+    def test_read_tool_result_listing_rejects_an_invalid_range(
+        self, tmp_path, path, start, end
+    ):
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        self._plant_listing(workspace, 3)
+
+        result = tools.read_tool_result(path, start=start, end=end)
+        assert result == spill_read_unavailable("invalid_range")
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    @pytest.mark.parametrize("stored", [0, 3])
+    def test_read_tool_result_listing_start_past_the_last_entry_names_the_count(
+        self, tmp_path, stored
+    ):
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        self._plant_listing(workspace, stored)
+
+        result = tools.read_tool_result(start=stored + 1)
+        assert result == spill_read_unavailable("invalid_range", item_count=stored)
+        assert result["output"] == f"start exceeds the item count ({stored})."
 
     @pytest.mark.usefixtures("mock_workspace_db")
     def test_read_tool_result_listing_skips_an_entry_whose_stat_fails(
@@ -1372,7 +1465,7 @@ class TestReadToolResult:
             kept_second,
         ]
         assert listing["count"] == 2
-        assert listing["omitted"] == 0
+        assert (listing["start"], listing["end"], listing["omitted"]) == (1, 2, 0)
 
     def test_read_tool_result_listing_authority_failure_raises(self, tmp_path, mocker):
         workspace = TaskWorkspace("task-1", str(tmp_path))
