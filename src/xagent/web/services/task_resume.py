@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, assert_never
+from typing import Any, NoReturn, assert_never
 from uuid import uuid4
 
 from sqlalchemy import func
@@ -64,6 +64,25 @@ class TaskResumeOutcomeUnknownError(Exception):
     def __init__(self, command_id: str | None = None):
         self.command_id = command_id
         super().__init__("The accepted reply's outcome is not yet known")
+
+
+def _raise_outcome_unknown(exc: BaseException, command_id: str | None) -> NoReturn:
+    """Settle an uncertain reply as unknown, consuming any cancellation.
+
+    A cancellation after the reply may have applied is settled as outcome
+    unknown rather than propagated, so the original identity is reported and
+    never reinjected. When this task itself was cancelled, ``uncancel()``
+    records that the request was handled; otherwise structured-concurrency
+    code later in the task would still see it pending. Callers do not wrap
+    this in ``asyncio.timeout``, which would also uncancel.
+    """
+    if isinstance(exc, asyncio.CancelledError):
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            task.uncancel()
+    elif not isinstance(exc, Exception):
+        raise exc
+    raise TaskResumeOutcomeUnknownError(command_id) from exc
 
 
 class TaskResumeBusyError(Exception):
@@ -674,9 +693,7 @@ async def resume_a2a_task(
             coordinator = current_task_coordinator(task_id)
             assert coordinator is not None
             coordinator.require_recovery()
-            if not isinstance(exc, (Exception, asyncio.CancelledError)):
-                raise
-            raise TaskResumeOutcomeUnknownError(message_id) from exc
+            _raise_outcome_unknown(exc, message_id)
         # Ownership was never transferred, so restore the exact prelease
         # to the prior input-required status exactly like the absent-
         # checkpoint fallback above, then let the API translate the failure.
@@ -706,16 +723,12 @@ async def resume_a2a_task(
             coordinator.require_recovery()
             await stop_task_lease_heartbeat(heartbeat_task, heartbeat_stop)
             prelease_cleanup_done = True
-            if not isinstance(exc, (Exception, asyncio.CancelledError)):
-                raise
-            raise TaskResumeOutcomeUnknownError(message_id) from exc
+            _raise_outcome_unknown(exc, message_id)
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             await drain_async_task_cancellation_safe(cleanup_task)
         if injection_unknown:
-            if not isinstance(exc, (Exception, asyncio.CancelledError)):
-                raise
-            raise TaskResumeOutcomeUnknownError(message_id) from exc
+            _raise_outcome_unknown(exc, message_id)
         raise
     finally:
         if not ownership_transferred and not prelease_cleanup_done:
@@ -1243,9 +1256,7 @@ async def resume_task_reply(
             coordinator = current_task_coordinator(task_id)
             assert coordinator is not None
             coordinator.require_recovery()
-            if not isinstance(exc, (Exception, asyncio.CancelledError)):
-                raise
-            raise TaskResumeOutcomeUnknownError(turn_id) from exc
+            _raise_outcome_unknown(exc, turn_id)
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             if not await drain_async_task_cancellation_safe(cleanup_task):
@@ -1269,16 +1280,12 @@ async def resume_task_reply(
             coordinator.require_recovery()
             await stop_task_lease_heartbeat(heartbeat_task, heartbeat_stop)
             prelease_cleanup_done = True
-            if not isinstance(exc, (Exception, asyncio.CancelledError)):
-                raise
-            raise TaskResumeOutcomeUnknownError(turn_id) from exc
+            _raise_outcome_unknown(exc, turn_id)
         if not ownership_transferred and not prelease_cleanup_done:
             cleanup_task = asyncio.create_task(stop_and_restore_prelease())
             await drain_async_task_cancellation_safe(cleanup_task)
         if injection_unknown:
-            if not isinstance(exc, (Exception, asyncio.CancelledError)):
-                raise
-            raise TaskResumeOutcomeUnknownError(turn_id) from exc
+            _raise_outcome_unknown(exc, turn_id)
         raise
     finally:
         if not ownership_transferred and not prelease_cleanup_done:

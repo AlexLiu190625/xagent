@@ -491,6 +491,30 @@ async def test_registry_registers_handle_metadata() -> None:
     assert handle.to_dict()["is_resumable"] is False
 
 
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"success": True, "status": "completed"},
+        {"success": False, "status": "waiting_for_user"},
+        {"success": False, "status": "failed", "error": "tool failed"},
+    ],
+)
+def test_registry_reports_unknown_input_as_interrupted_whatever_the_run_said(
+    result: dict[str, Any],
+) -> None:
+    runner = AgentRunner(agent=Agent(name="writer", patterns=[SuccessfulPattern()]))
+    registry = ExecutionRegistry()
+    events: list[dict[str, Any]] = []
+    handle = registry.register("exec-unknown", runner, requested_task="task")
+    registry.subscribe(events.append)
+
+    registry._apply_result(handle, {**result, "injection_outcome_unknown": True})
+
+    assert handle.status == ExecutionLifecycleStatus.INTERRUPTED
+    assert [event["type"] for event in events] == ["execution.interrupted"]
+    assert handle.last_error == result.get("error")
+
+
 @pytest.mark.asyncio
 async def test_registry_emits_registered_event_for_manual_handle_registration() -> None:
     runner = AgentRunner(agent=Agent(name="writer", patterns=[SuccessfulPattern()]))

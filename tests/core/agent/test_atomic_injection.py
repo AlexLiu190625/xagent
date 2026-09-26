@@ -728,3 +728,148 @@ async def test_real_runner_outcomes_classify_at_the_write_boundary(live):
         classify_injection(attempt.outcome, error=cancelled.value)
         is InjectionDisposition.ACCEPTED
     )
+
+
+def _cold_checkpoint(execution_id: str | None) -> dict:
+    from xagent.core.agent.context import ExecutionContext
+
+    context = ExecutionContext(execution_id=execution_id or "unused")
+    context.add_user_message("original")
+    data = context.to_dict()
+    if execution_id is None:
+        data.pop("execution_id")
+    return {"context": data}
+
+
+def _yielding_reader(checkpoint: dict) -> AsyncMock:
+    async def read(_execution_id):
+        # Yield so a regression back into the lookup loop times out cleanly.
+        await asyncio.sleep(0)
+        return checkpoint
+
+    return AsyncMock(side_effect=read)
+
+
+@pytest.mark.asyncio
+async def test_cold_start_adopts_the_lookup_id_when_the_checkpoint_has_none():
+    manager = ContextManager()
+    manager._contexts.clear()
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=_yielding_reader(_cold_checkpoint(None)),
+        checkpoint=AsyncMock(),
+    )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+    )
+    try:
+        result = await asyncio.wait_for(
+            runner.inject_user_message("cold", "new", turn_id="turn"), 5
+        )
+        assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+        assert manager.get_context("cold") is result.context
+        assert result.context.execution_id == "cold"
+    finally:
+        manager._contexts.clear()
+
+
+@pytest.mark.asyncio
+async def test_cold_start_without_an_id_still_drops_a_derived_output_language():
+    from xagent.core.agent.language import (
+        OUTPUT_LANGUAGE_METADATA_KEY,
+        OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
+    )
+
+    checkpoint = _cold_checkpoint(None)
+    checkpoint["context"]["metadata"] = {
+        OUTPUT_LANGUAGE_METADATA_KEY: "fr",
+        OUTPUT_LANGUAGE_SOURCE_METADATA_KEY: "detected",
+    }
+    manager = ContextManager()
+    manager._contexts.clear()
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=_yielding_reader(checkpoint),
+        checkpoint=AsyncMock(),
+    )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+    )
+    try:
+        result = await asyncio.wait_for(
+            runner.inject_user_message("cold", "new", turn_id="turn"), 5
+        )
+        # The id is filled in on a copy; the migration must still reach it.
+        assert result.context.execution_id == "cold"
+        assert OUTPUT_LANGUAGE_METADATA_KEY not in result.context.metadata
+        assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in result.context.metadata
+    finally:
+        manager._contexts.clear()
+
+
+@pytest.mark.asyncio
+async def test_cold_start_rejects_a_checkpoint_of_another_execution():
+    from xagent.core.agent.checkpoint import CheckpointCorruptError
+
+    manager = ContextManager()
+    manager._contexts.clear()
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=_yielding_reader(_cold_checkpoint("other")),
+        checkpoint=AsyncMock(),
+    )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+    )
+    try:
+        with pytest.raises(CheckpointCorruptError, match="different execution"):
+            await asyncio.wait_for(
+                runner.inject_user_message("cold", "new", turn_id="turn"), 5
+            )
+        tracer.checkpoint.assert_not_awaited()
+    finally:
+        manager._contexts.clear()
+
+
+@pytest.mark.asyncio
+async def test_write_only_tracer_cannot_prove_a_failed_write_absent():
+    from xagent.core.agent.checkpoint import TraceCheckpointStore
+    from xagent.core.agent.trace import Tracer
+
+    manager = ContextManager()
+    manager._contexts.clear()
+    context = manager.create_context("write-only")
+    context.add_user_message("original")
+
+    class FailingWriter:
+        async def handle_event(self, event):
+            raise RuntimeError("write outcome unknown")
+
+    tracer = Tracer()
+    tracer.add_handler(FailingWriter())
+    runner = AgentRunner(
+        SimpleNamespace(llm=None),
+        tracer=TraceCheckpointStore(tracer),
+        context_manager=manager,
+    )
+    try:
+        # Tracer exposes load_latest_checkpoint but no handler can read, so its
+        # empty answer must not become "confirmed absent".
+        result = await runner.inject_user_message("write-only", "new", turn_id="t")
+        assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+        assert [m.content for m in context.messages] == ["original"]
+    finally:
+        manager._contexts.clear()
+
+
+@pytest.mark.asyncio
+async def test_lost_baseline_on_readback_is_uncertain_not_absent(live):
+    runner, context, tracer = live
+    tracer.load_latest_checkpoint.return_value = {"context": context.to_dict()}
+
+    async def write(**payload):
+        # The store answers, but the checkpoint read before the write is gone.
+        tracer.load_latest_checkpoint.return_value = None
+        raise RuntimeError("write outcome unknown")
+
+    tracer.checkpoint.side_effect = write
+    result = await runner.inject_user_message("atomic", "new", turn_id="turn")
+    assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    assert [m.content for m in context.messages] == ["original"]

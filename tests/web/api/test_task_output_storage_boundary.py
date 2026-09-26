@@ -505,6 +505,106 @@ def test_late_result_files_commit_only_with_a_pause_transition(
         get_unscoped_file_storage.cache_clear()
 
 
+@pytest.mark.parametrize(
+    "variant", ["unknown_success", "unknown_waiting", "interrupted"]
+)
+def test_first_run_keeps_a_pending_resume_for_input_accepted_earlier(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    """A resume requested for earlier input survives later unknown input.
+
+    Message A was accepted and its handoff is waiting on this run; message B
+    then became unknown. The finalizer keeps ``resume_requested`` and A's
+    handoff still acquires the lease, since acquisition never reads the
+    control state.
+    """
+    run_id = f"first-run-{variant}"
+    task_id, user_id = _seed_running_task(runner_id="first-runner", run_id=run_id)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.control_state = "resume_requested"
+        db.commit()
+    finally:
+        db.close()
+    uploads_dir = tmp_path / "uploads"
+    output_path = (
+        uploads_dir / f"user_{user_id}" / f"web_task_{task_id}" / "output" / "kept.txt"
+    )
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("kept output", encoding="utf-8")
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+    get_unscoped_file_storage.cache_clear()
+    try:
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
+            task_id=task_id,
+            task_user_id=user_id,
+            file_outputs=[{"path": str(output_path), "filename": "kept.txt"}],
+            resolved_scope_segments=(),
+        )
+        result: dict[str, Any] = {
+            "success": variant == "unknown_success",
+            "status": {
+                "unknown_success": "completed",
+                "unknown_waiting": "waiting_for_user",
+                "interrupted": "interrupted",
+            }[variant],
+            "output": "answer produced before the unknown input",
+            "file_outputs": [],
+        }
+        if variant != "interrupted":
+            result["injection_outcome_unknown"] = True
+
+        task_execution_service._finalize_task_execution_result_isolated(
+            task_id=task_id,
+            task_user_id=user_id,
+            pre_run_status=TaskStatus.RUNNING,
+            result=result,
+            expected_run_id=run_id,
+            task_lease=TaskLease(
+                attempt_id="test-attempt",
+                task_id=task_id,
+                runner_id="first-runner",
+                run_id=run_id,
+            ),
+            resolved_scope_segments=(),
+            prepared_outputs=prepared,
+        )
+
+        check_db = _direct_db_session()
+        try:
+            task = check_db.get(Task, task_id)
+            assert task.status == TaskStatus.PAUSED
+            assert task.control_state == "resume_requested"
+            # A pause transition owns its files, including an unknown success
+            # whose answer is preserved in history.
+            assert (
+                check_db.query(UploadedFile)
+                .filter(UploadedFile.task_id == task_id)
+                .count()
+                == 1
+            )
+            if variant == "unknown_success":
+                assert task.output == "answer produced before the unknown input"
+        finally:
+            check_db.close()
+
+        handoff = task_execution_service._acquire_resume_task_lease(
+            task_id, user_id, run_id
+        )
+        assert handoff is not None
+        check_db = _direct_db_session()
+        try:
+            assert check_db.get(Task, task_id).status == TaskStatus.RUNNING
+        finally:
+            check_db.close()
+    finally:
+        get_unscoped_file_storage.cache_clear()
+
+
 def test_metadata_version_change_rolls_back_entire_task_finalization(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -833,6 +933,52 @@ def test_resumed_unknown_failed_result_commits_only_a_confirmed_release(
             # A failed release must not commit anything flushed before it.
             assert task.runner_id == "failed-runner"
             assert task.error_message != "written before release"
+    finally:
+        check_db.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "success"),
+    [
+        ("waiting_for_user", False),
+        ("interrupted", False),
+        ("completed", True),
+    ],
+)
+def test_resumed_unknown_input_pauses_whatever_the_run_reported(
+    status: str, success: bool
+) -> None:
+    run_id = f"resumed-unknown-{status}"
+    task_id, user_id = _seed_running_task(runner_id="resumed-runner", run_id=run_id)
+    prepared = task_execution_service._prepare_task_file_outputs_isolated(
+        task_id=task_id,
+        task_user_id=user_id,
+        file_outputs=[],
+        resolved_scope_segments=(),
+    )
+
+    finalized = task_execution_service._finalize_resumed_task(
+        task_id,
+        status=status,
+        success=success,
+        output="answer before the unknown input" if success else None,
+        task_owner_user_id=user_id,
+        result={"success": success, "injection_outcome_unknown": True},
+        task_lease=TaskLease(
+            attempt_id="test-attempt",
+            task_id=task_id,
+            runner_id="resumed-runner",
+            run_id=run_id,
+        ),
+        prepared_outputs=prepared,
+    )
+
+    assert not finalized.get("late_result")
+    check_db = _direct_db_session()
+    try:
+        task = check_db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.PAUSED
+        assert task.control_state == "paused"
     finally:
         check_db.close()
 

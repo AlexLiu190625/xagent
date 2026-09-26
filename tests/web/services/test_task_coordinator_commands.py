@@ -355,6 +355,7 @@ async def test_unknown_reply_returns_original_identity_without_reinjection(
     from xagent.core.agent.runner import UserMessageInjectionOutcome
 
     post = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
+    cancelled_tasks: list[asyncio.Task] = []
     if failure == "unknown_result":
         post.return_value = UserMessageInjectionOutcome.OUTCOME_UNKNOWN
     elif failure in {"during_post", "guard_cancel"}:
@@ -390,6 +391,7 @@ async def test_unknown_reply_returns_original_identity_without_reinjection(
 
             async def cancel_at_child_completion(operation, heartbeat):
                 parent = asyncio.current_task()
+                cancelled_tasks.append(parent)
 
                 async def child():
                     value = await operation
@@ -418,6 +420,11 @@ async def test_unknown_reply_returns_original_identity_without_reinjection(
         await eventually(lambda: _has_pending(ctx.task_id))
         command = await claim(ctx.task_id)
         await task_command_execution.execute_durable_task_command(command)
+        if failure == "guard_cancel":
+            # The real resume_task_reply / resume_a2a_task call site settled
+            # the cancellation as unknown and consumed the request.
+            assert len(cancelled_tasks) == 1
+            assert cancelled_tasks[0].cancelling() == 0
         with pytest.raises(task_resume.TaskResumeOutcomeUnknownError) as unknown:
             await asyncio.wait_for(request, 10)
         assert unknown.value.command_id == ctx.command_id

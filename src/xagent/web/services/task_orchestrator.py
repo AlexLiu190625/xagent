@@ -1621,8 +1621,16 @@ def _get_agent_manager() -> Any:
     return get_agent_manager()
 
 
-async def pause_unknown_task_lease(lease: TaskLease) -> bool:
-    """Commit an unknown-input pause before publishing its fenced snapshot."""
+async def pause_unknown_task_lease(
+    lease: TaskLease,
+    *,
+    message: str = "Input outcome unknown; execution paused",
+) -> bool:
+    """Commit an input pause before publishing its fenced snapshot.
+
+    Used for an unknown outcome and for input the fence rejected; ``message``
+    tells clients which one paused the task.
+    """
     from ..models.database import get_session_local
     from .task_events import publish_task_event
     from .workforce_runtime import sync_workforce_run_status
@@ -1652,7 +1660,7 @@ async def pause_unknown_task_lease(lease: TaskLease) -> bool:
                 {
                     "type": "task_paused",
                     "task_id": lease.task_id,
-                    "message": "Input outcome unknown; execution paused",
+                    "message": message,
                     "timestamp": datetime.now(timezone.utc).timestamp(),
                     **snapshot.as_dict(),
                 },

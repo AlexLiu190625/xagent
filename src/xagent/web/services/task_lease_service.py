@@ -1192,12 +1192,19 @@ def release_task_lease(
     *,
     status: TaskStatus,
 ) -> bool:
-    """Release a task lease and set its final visible status."""
+    """Release a task lease and set its final visible status.
+
+    A failed release means the row is no longer this lease's, so work staged
+    in the same transaction is rolled back instead of committed with it.
+    """
     released = release_task_lease_no_commit(db, lease, status=status)
     if lease is None:
         return False
+    if not released:
+        db.rollback()
+        return False
     db.commit()
-    return released
+    return True
 
 
 def task_settlement_ownership_values(

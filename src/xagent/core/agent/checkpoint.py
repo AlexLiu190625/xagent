@@ -118,6 +118,30 @@ class CheckpointAccessRefusedError(CheckpointReadError):
         self.reason = reason
 
 
+def exposes_checkpoint_reader(reader: Any) -> bool:
+    """Whether ``reader`` has a checkpoint read method (it may still read nothing)."""
+    return any(
+        callable(getattr(reader, name, None)) for name in CHECKPOINT_READER_METHODS
+    )
+
+
+def can_read_checkpoints(reader: Any) -> bool:
+    """Whether a read through ``reader`` reaches a backend that can answer.
+
+    ``Tracer`` always exposes ``load_latest_checkpoint`` and returns ``None``
+    when no handler reads, so its handlers decide. An empty result from a
+    stack without one proves nothing about what was written.
+    """
+    while isinstance(reader, TraceCheckpointStore):
+        reader = reader.tracer
+    if isinstance(reader, Tracer):
+        return any(
+            callable(getattr(handler, "load_latest_checkpoint", None))
+            for handler in reader.handlers
+        )
+    return exposes_checkpoint_reader(reader)
+
+
 async def read_latest_checkpoint_payload(
     reader: Any,
     execution_id: str,
@@ -199,10 +223,7 @@ class TraceCheckpointStore:
         self,
         execution_id: str,
     ) -> dict[str, Any] | None:
-        if not any(
-            callable(getattr(self.tracer, name, None))
-            for name in CHECKPOINT_READER_METHODS
-        ):
+        if not exposes_checkpoint_reader(self.tracer):
             raise CheckpointUnavailableError("Checkpoint store has no readable backend")
         payload = await read_latest_checkpoint_payload(self.tracer, execution_id)
         return self._unwrap_checkpoint_payload(payload)

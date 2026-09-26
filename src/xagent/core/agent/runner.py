@@ -26,9 +26,9 @@ from ..task_runtime import (
 from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
 from .checkpoint import (
-    CHECKPOINT_READER_METHODS,
     CheckpointCorruptError,
     CheckpointPersistenceError,
+    can_read_checkpoints,
     read_latest_checkpoint_payload,
 )
 from .context import ContextManager, ExecutionContext
@@ -714,9 +714,21 @@ class AgentRunner:
                     raise CheckpointCorruptError(
                         "Stored checkpoint carries no execution context to restore."
                     )
-                cold_start_checkpoint = checkpoint
+                # Migrate the payload before copying from it, so the restored
+                # context sees every change whatever the migration rewrites.
                 reset_output_language_to_request_context(checkpoint)
-                context = ExecutionContext.from_dict(checkpoint["context"])
+                cold_start_checkpoint = checkpoint
+                context_data = checkpoint["context"]
+                stored_id = context_data.get("execution_id")
+                if not stored_id:
+                    # Restore under the key it was loaded by; a generated id
+                    # would never match the cache lookup below.
+                    context_data = {**context_data, "execution_id": execution_id}
+                elif stored_id != execution_id:
+                    raise CheckpointCorruptError(
+                        "Stored checkpoint context belongs to a different execution."
+                    )
+                context = ExecutionContext.from_dict(context_data)
                 warn_restored_compact_threshold(
                     context, getattr(self.agent, "llm", None)
                 )
@@ -866,6 +878,7 @@ class AgentRunner:
                                 execution_id,
                                 metadata["turn_id"],
                                 resolved_execution_message,
+                                baseline=checkpoint_baseline,
                             )
                     finally:
                         if confirmed is not None:
@@ -1487,7 +1500,12 @@ class AgentRunner:
         return payload if isinstance(payload, dict) else None
 
     async def _confirm_injected_turn(
-        self, execution_id: str, turn_id: str, message: str
+        self,
+        execution_id: str,
+        turn_id: str,
+        message: str,
+        *,
+        baseline: dict[str, Any] | None = None,
     ) -> bool | None:
         """True/False only for an authoritative read; None remains uncertain.
 
@@ -1495,15 +1513,14 @@ class AgentRunner:
         before raising. Do not timeout the exclusive section: a surviving write
         could otherwise race read-back and invalidate a negative confirmation.
         """
-        if not any(
-            callable(getattr(self.tracer, name, None))
-            for name in CHECKPOINT_READER_METHODS
-        ):
+        if not can_read_checkpoints(self.tracer):
             return None
         try:
             payload = await read_latest_checkpoint_payload(self.tracer, execution_id)
             if payload is None:
-                return False
+                # Losing a checkpoint that was read before the write is an
+                # inconsistent store, not evidence that this turn is absent.
+                return None if baseline is not None else False
             if not isinstance(payload, dict) or not isinstance(
                 payload.get("context"), dict
             ):
