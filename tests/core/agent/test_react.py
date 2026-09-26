@@ -5995,6 +5995,65 @@ async def test_forced_turn_refusals_once_an_allowance_is_used_up(
     assert run.pattern.forced_answer_extra_iterations == 1
 
 
+class _InterruptingReader(RecordingReadToolResultTool):
+    """A read_tool_result whose first run asks the runtime to stop and then
+    waits, so the stop lands while the read is running."""
+
+    def __init__(self) -> None:
+        super().__init__(concurrency_safe=True)
+        self.runtime: PatternRuntime | None = None
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        result = await super().run_json_async(args)
+        if len(self.calls) == 1 and self.runtime is not None:
+            self.runtime.request_interrupt("stop while reading")
+            await asyncio.sleep(5)
+        return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "concurrent"])
+async def test_a_read_interrupted_while_running_is_counted_once(
+    parallel: bool,
+) -> None:
+    """A forced-turn read stopped while it runs was admitted and counted
+    before it started. Resuming from the interrupted checkpoint runs the same
+    read again without counting it a second time."""
+    reads = 2 if parallel else 1
+    reader = _InterruptingReader()
+    pattern = _forced_turn_pattern(tool_parallel_enabled=parallel)
+    context = _forced_turn_context(True, _SPILL_PATH)
+    runtime = PatternRuntime(execution_id="interrupted-read")
+    reader.runtime = runtime
+
+    first = await pattern.run(
+        context=context,
+        tools=[FakeTool(), reader],
+        llm=FakeLLM([_read_batch([{"path": _SPILL_PATH}] * reads)]),
+        runtime=runtime,
+    )
+
+    assert first["status"] == "interrupted"
+    state = runtime.checkpoints[-1]["pattern_state"]
+    assert _forced_read_state(state) == (reads, 0, True, reads)
+    # Every admitted read of the batch was cut off, the one still waiting
+    # to start included; each stays pending and is recorded as interrupted.
+    assert len(state["pending_tool_calls"]) == reads
+    assert len(reader.calls) == 1
+
+    resumed = _react(max_iterations=4, tool_parallel_enabled=parallel)
+    resumed.load_state(state)
+    reader.runtime = None
+    run = await _run_pattern(
+        resumed, [_final_call()], context=context, tools=[FakeTool(), reader]
+    )
+
+    assert run.result["success"] is True
+    assert len(reader.calls) == 1 + reads
+    assert resumed.forced_answer_reads_used == reads
+    assert resumed.forced_answer_extra_iterations == reads
+
+
 def _successful_reads_ledger(pattern: ReActPattern, count: int) -> dict[str, Any]:
     """Record count completed reads in the ledger; return the last call."""
     call: dict[str, Any] = {}

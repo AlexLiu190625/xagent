@@ -2150,6 +2150,22 @@ class ReActPattern(AgentPattern):
             schemas.append(reader)
         return schemas
 
+    def _forced_answer_read_was_interrupted(self, tool_call: dict[str, Any]) -> bool:
+        """Whether this pending read was admitted, started and interrupted.
+
+        Only an admitted call runs, so a read whose ledger record says it was
+        interrupted mid-run has already been counted. Resuming replays that
+        same call, recognized by its id, name and arguments.
+        """
+        record = self.tool_ledger.get(str(tool_call.get("id")))
+        return (
+            record is not None
+            and record.status == "interrupted"
+            and record.tool_name == SPILL_READ_TOOL_NAME
+            and record.args_hash
+            == self._args_hash(self._tool_call_args_dict(tool_call))
+        )
+
     def _apply_forced_answer_read_policy(
         self, segment: list[dict[str, Any]], context: Any
     ) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], str]]]:
@@ -2160,6 +2176,8 @@ class ReActPattern(AgentPattern):
         Calls are judged one at a time, in order, before any of them runs:
 
         - not read_tool_result: admitted, nothing counted;
+        - a read that was admitted, started and interrupted, now replayed on
+          resume: admitted, nothing counted again;
         - read allowance used up: refused, nothing counted;
         - reject allowance used up: refused, nothing counted;
         - no path (the key is missing, None or blank, which lists the stored
@@ -2187,7 +2205,10 @@ class ReActPattern(AgentPattern):
                 lists_stored_results = path is None or (
                     isinstance(path, str) and not path.strip()
                 )
-                if self.forced_answer_reads_used >= FORCED_ANSWER_READ_BUDGET:
+                if self._forced_answer_read_was_interrupted(tool_call):
+                    # Counted when it was admitted; the replay runs uncounted.
+                    pass
+                elif self.forced_answer_reads_used >= FORCED_ANSWER_READ_BUDGET:
                     refusal = FORCED_ANSWER_READS_USED_UP_TEXT
                 elif self.forced_answer_reads_rejected >= FORCED_ANSWER_READ_REJECT_CAP:
                     refusal = FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT
