@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from xagent.core.tools import tool_result_spill as spill_module
 from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
-from xagent.core.tools.core import workspace_file_tool as core_workspace_file_tool
 from xagent.core.tools.tool_result_spill import (
     SPILL_MAX_FILE_BYTES,
     SPILL_MAX_FILES_PER_RUN,
@@ -712,7 +712,7 @@ class TestReadToolResult:
         tools = WorkspaceFileTools(workspace)
         rel = self._spill_file(workspace, json.dumps([1, 2, 3]), "array")
         kind_of = mocker.patch.object(
-            core_workspace_file_tool, "_spill_kind_of", side_effect=AssertionError
+            spill_module, "_spill_kind_of", side_effect=AssertionError
         )
 
         assert tools.read_tool_result(rel)["output"] == "[1, 2, 3]"
@@ -728,7 +728,7 @@ class TestReadToolResult:
         tools = WorkspaceFileTools(workspace)
         rel = self._spill_file(workspace, json.dumps([1, 2, 3]), "array")
         mocker.patch.object(
-            core_workspace_file_tool,
+            spill_module,
             "_spill_slice",
             side_effect=ValueError("caller bug"),
         )
@@ -995,7 +995,7 @@ class TestReadToolResult:
         large = tmp_path / "large.bin"
         with large.open("wb") as handle:
             handle.truncate(8 * SPILL_MAX_FILE_BYTES)
-        real_resolve = core_workspace_file_tool.resolve_spilled_under
+        real_resolve = spill_module.resolve_spilled_under
 
         def resolve_then_swap(spill_dir, name):
             resolved = real_resolve(spill_dir, name)
@@ -1003,9 +1003,7 @@ class TestReadToolResult:
             resolved.symlink_to(large)
             return resolved
 
-        monkeypatch.setattr(
-            core_workspace_file_tool, "resolve_spilled_under", resolve_then_swap
-        )
+        monkeypatch.setattr(spill_module, "resolve_spilled_under", resolve_then_swap)
         tracemalloc.start()
         try:
             result = tools.read_tool_result(rel)
@@ -1155,9 +1153,7 @@ class TestReadToolResult:
             with real_scandir(path) as entries:
                 yield (_StatFailingEntry(entry) for entry in entries)
 
-        mocker.patch.object(
-            core_workspace_file_tool.os, "scandir", scandir_with_one_failing_stat
-        )
+        mocker.patch.object(spill_module.os, "scandir", scandir_with_one_failing_stat)
 
         listing = tools.read_tool_result()
 

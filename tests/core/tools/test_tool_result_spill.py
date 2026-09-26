@@ -67,7 +67,9 @@ from xagent.core.tools.tool_result_spill import (
     _spill_kind_of,
     _spill_slice,
     _spill_text_lines,
+    list_spilled_results,
     normalize_spilled_relative_path,
+    read_spilled_result,
     render_spill_notice,
     resolve_spilled_under,
     spill_dir_for_workspace,
@@ -484,6 +486,22 @@ def test_spill_read_unavailable_names_the_item_count_for_a_range():
     result = spill_read_unavailable("invalid_range", item_count=7)
     assert "7" in result["output"]
     assert result["is_error"] is True
+
+
+@pytest.mark.parametrize("spill_dir", [None, ""])
+def test_read_back_entry_points_treat_no_spill_directory_as_nothing_stored(
+    spill_dir,
+):
+    """With no spill directory at all, a read finds nothing and a listing
+    is empty -- the same answers a task that never stored anything gets."""
+    name = f"tool-results/acme-{'0' * 32}.json"
+
+    assert read_spilled_result(spill_dir, name) == spill_read_unavailable("not_found")
+    assert list_spilled_results(spill_dir) == {
+        "stored_results": [],
+        "count": 0,
+        "omitted": 0,
+    }
 
 
 def test_read_tool_name_and_truncated_instruction_are_pinned():
