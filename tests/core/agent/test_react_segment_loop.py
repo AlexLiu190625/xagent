@@ -32,6 +32,7 @@ from tests.core.agent.concurrency_harness import (
 )
 from xagent.core.agent import PatternRuntime, ToolCallInterrupted
 from xagent.core.agent.context.components import SpillRegistryComponent
+from xagent.core.agent.pattern.react.react import FORCED_ANSWER_READS_USED_UP_TEXT
 from xagent.core.tools.tool_result_spill import SPILL_READ_TOOL_NAME
 
 
@@ -301,10 +302,6 @@ async def test_crash_during_batch_keeps_segment_pending_for_resume() -> None:
 
 _STORED_PATH = "tool-results/calculator-0123456789abcdef0123456789abcdef.json"
 _UNLISTED_PATH = "tool-results/unlisted-000000000000.json"
-_READS_USED_UP = (
-    "The read allowance for the final answer is used up. Answer from what you "
-    "have already read; do not state a value you did not read."
-)
 
 
 class _StoredResultsContext(RecordingContext):
@@ -426,7 +423,7 @@ async def test_forced_turn_policy_applies_within_one_batch(cell: str) -> None:
     refused = [
         entry["tool_call_id"]
         for entry in context.tool_results
-        if entry["result"] == {"output": _READS_USED_UP}
+        if entry["result"] == {"output": FORCED_ANSWER_READS_USED_UP_TEXT}
     ]
     read_ids = [call["id"] for call in calls if call["name"] == SPILL_READ_TOOL_NAME]
     assert refused == read_ids[3:]

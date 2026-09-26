@@ -29,6 +29,9 @@ from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from xagent.core.agent.pattern.final_answer_stream import ReActFinalAnswerStreamer
 from xagent.core.agent.pattern.react.react import (
     _INTERACTION_TRIM_CHARS,
+    FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT,
+    FORCED_ANSWER_READ_UNLISTED_PATH_TEXT,
+    FORCED_ANSWER_READS_USED_UP_TEXT,
     _normalize_ask_user_interactions,
 )
 from xagent.core.agent.result import tool_result_succeeded
@@ -5827,20 +5830,6 @@ async def test_forced_turn_protocol_retry_sends_the_turn_tools(
 
 _SPILL_NAME = "calculator-0123456789abcdef0123456789abcdef.json"
 _SPILL_PATH = f"tool-results/{_SPILL_NAME}"
-_READS_USED_UP = (
-    "The read allowance for the final answer is used up. Answer from what you "
-    "have already read; do not state a value you did not read."
-)
-_REJECTS_USED_UP = (
-    "Too many paths for the final answer did not match the stored results "
-    "listed above. Answer from what you have; do not state a value you did "
-    "not read."
-)
-_UNLISTED_PATH = (
-    "read_tool_result during the final answer turn is limited to the stored "
-    "results listed above. Copy one of those paths exactly. That path is not "
-    "one of them."
-)
 
 
 async def _run_forced_reads(
@@ -5888,7 +5877,9 @@ async def test_forced_turn_path_matching_and_counters(
     if admitted:
         assert reader.calls[0]["path"] == path
     else:
-        assert run.tool_outputs(SPILL_READ_TOOL_NAME) == [{"output": _UNLISTED_PATH}]
+        assert run.tool_outputs(SPILL_READ_TOOL_NAME) == [
+            {"output": FORCED_ANSWER_READ_UNLISTED_PATH_TEXT}
+        ]
 
 
 @pytest.mark.asyncio
@@ -5909,7 +5900,9 @@ async def test_forced_turn_offset_continuation_counts_as_one_read() -> None:
     assert [call["offset"] for call in reader.calls] == offsets[:3]
     assert run.pattern.forced_answer_reads_used == 3
     assert run.pattern.forced_answer_extra_iterations == 3
-    assert run.tool_outputs(SPILL_READ_TOOL_NAME)[-1] == {"output": _READS_USED_UP}
+    assert run.tool_outputs(SPILL_READ_TOOL_NAME)[-1] == {
+        "output": FORCED_ANSWER_READS_USED_UP_TEXT
+    }
 
 
 @pytest.mark.asyncio
@@ -5968,12 +5961,15 @@ async def test_forced_turn_read_keeps_relative_path_in_checkpoint(
 @pytest.mark.parametrize(
     ("used", "rejected", "paths", "outputs", "reads_run"),
     [
-        (2, 0, [_SPILL_PATH, _SPILL_PATH], [_READS_USED_UP], 1),
+        (2, 0, [_SPILL_PATH, _SPILL_PATH], [FORCED_ANSWER_READS_USED_UP_TEXT], 1),
         (
             0,
             2,
             ["tool-results/x.json", _SPILL_PATH],
-            [_UNLISTED_PATH, _REJECTS_USED_UP],
+            [
+                FORCED_ANSWER_READ_UNLISTED_PATH_TEXT,
+                FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT,
+            ],
             0,
         ),
     ],
@@ -6223,7 +6219,7 @@ async def test_forced_turn_prompt_tier_follows_tool_names(
     )
 
     prompt = run.prompt(0)
-    assert (_READS_USED_UP in prompt) is tier_b
+    assert (FORCED_ANSWER_READS_USED_UP_TEXT in prompt) is tier_b
     assert _BASELINE_TOOL_RULE in prompt
     assert _UNREAD_ITEMS_SENTENCE not in prompt
     assert SPILL_READ_TOOL_NAME not in prompt
