@@ -89,6 +89,7 @@ from ....tools.tool_result_spill import (
     SPILL_READ_TOOL_NAME,
     SPILL_RESERVED_RESULT_KEY,
     normalize_spilled_relative_path,
+    render_spill_notice,
 )
 from ....tools.user_interaction import (
     ToolInteractionSettlement,
@@ -918,9 +919,11 @@ class ReActPattern(AgentPattern):
                 "iteration": iteration,
                 **resolved_llm_metadata(call_llm),
             }
-            # A forced turn's schema is already down to final_answer alone,
-            # so compacting here deletes the values it must answer from and
-            # closes the only route back to them in the same breath. Every
+            # A forced turn's schema is down to final_answer, plus
+            # read_tool_result while this run holds stored results and both
+            # read allowances remain (never on the settlement-fence turn).
+            # Compacting here deletes the values it must answer from, and none
+            # of those tools can run the work that produced them again. Every
             # other turn still holds its tools and can fetch a compacted-away
             # value again. The cost is deliberate: this turn can now exceed
             # the model's window and fail instead of answering.
@@ -929,7 +932,7 @@ class ReActPattern(AgentPattern):
                 # so it carries no switch. Numbers and ids only -- never
                 # message text, a tool name, or a tool argument. The estimate
                 # counts what this turn actually sends -- the same messages
-                # and the one tool schema handed to the call below -- so it is
+                # and the tool schemas handed to the call below -- so it is
                 # comparable with the threshold logged beside it.
                 context_tokens = context.estimate_context_tokens(
                     route_messages, tool_schemas
@@ -1563,12 +1566,33 @@ class ReActPattern(AgentPattern):
                     "read and outcome=blocked when none of it is. "
                 )
             evidence_facts_text = evidence_facts(state)
+            # The read sentences follow what this turn actually sends: the
+            # reader and its stored-result list when it is offered, the
+            # used-up sentence when an allowance ran out, and nothing
+            # otherwise, which is the prompt a run with nothing stored gets.
+            if SPILL_READ_TOOL_NAME in (tool_names or []):
+                read_instruction = self._forced_answer_read_instruction(context)
+                tool_rule = (
+                    "Do not call any tool other than final_answer and "
+                    "read_tool_result, and do not output tool-call markup as "
+                    "plain text. "
+                )
+            else:
+                read_instruction = (
+                    ""
+                    if self._forced_answer_read_allowance_open()
+                    else f"{FORCED_ANSWER_READS_USED_UP_TEXT} "
+                )
+                tool_rule = (
+                    "Do not call any other tool and do not output "
+                    "tool-call markup as plain text. "
+                )
             instruction = (
                 "Produce the final user-facing answer by calling the final_answer "
                 f"control tool exactly once{source_phrase}. "
                 f"{evidence_facts_text}"
-                "Do not call any other tool and do not output "
-                f"tool-call markup as plain text. {outcome_rule}"
+                f"{read_instruction}"
+                f"{tool_rule}{outcome_rule}"
                 "If a "
                 "previous ask_user_question narrowed the request to a selected "
                 "subset of items or resources, the final answer must cover only "
@@ -1742,16 +1766,27 @@ class ReActPattern(AgentPattern):
             )
             retry_phase = "malformed_tool_arguments_recovery"
         elif recovery_reason == "empty_final_answer":
-            # On a forced turn ``tools`` above is final_answer alone, so offering
-            # a work tool would instruct the model to do something the schema
-            # forbids and waste the one repair attempt.
+            # On a forced turn ``tools`` above holds no work tool, so offering
+            # one would instruct the model to do something the schema forbids
+            # and waste the one repair attempt. When the turn also offers
+            # read_tool_result, the answer must still come in a turn of its
+            # own: a final_answer bundled with a read is discarded.
+            if SPILL_READ_TOOL_NAME in self._schema_tool_names(tools):
+                forced_retry_text = (
+                    "Call final_answer again with the complete user-facing "
+                    "response in its answer field, in a turn of its own."
+                )
+            else:
+                forced_retry_text = (
+                    "final_answer is the only tool available on this turn: call it "
+                    "again with the complete user-facing response in its answer "
+                    "field."
+                )
             retry_instruction = (
                 "The previous response called final_answer with an empty answer "
                 "field, so the user received no reply at all. "
                 + (
-                    "final_answer is the only tool available on this turn: call it "
-                    "again with the complete user-facing response in its answer "
-                    "field."
+                    forced_retry_text
                     if force_final_answer
                     else "Retry this turn: if the task is complete, call "
                     "final_answer again with the complete user-facing response in "
@@ -3574,8 +3609,8 @@ class ReActPattern(AgentPattern):
             ),
         ]
 
-    def _spilled_paths(self, context: Any) -> frozenset[str]:
-        """Exact relative paths this execution stored results into.
+    def _spilled_records(self, context: Any) -> Any:
+        """The records of this execution's stored results, possibly empty.
 
         Read-only on purpose: it goes through get_component and treats a
         missing component as empty. The context's spilled_results property
@@ -3588,11 +3623,36 @@ class ReActPattern(AgentPattern):
         component = (
             get_component("spilled_results") if callable(get_component) else None
         )
-        records = getattr(component, "records", ()) or ()
+        return getattr(component, "records", ()) or ()
+
+    def _spilled_paths(self, context: Any) -> frozenset[str]:
+        """Exact relative paths this execution stored results into."""
         return frozenset(
             str(record["relative_path"])
-            for record in records
+            for record in self._spilled_records(context)
             if isinstance(record, dict) and isinstance(record.get("relative_path"), str)
+        )
+
+    def _forced_answer_read_instruction(self, context: Any) -> str:
+        """The forced-turn prompt sentences for a turn that offers reads.
+
+        The stored-result list is the compaction-style notice, whose header
+        says what the list is and ends with "Stored results:".
+        """
+        remaining = FORCED_ANSWER_READ_BUDGET - self.forced_answer_reads_used
+        notice = render_spill_notice(self._spilled_records(context), style="compaction")
+        return (
+            "You may call read_tool_result to read them before answering, at "
+            f"most {remaining} more time(s) before the final answer. start and "
+            "end are 1-based item numbers for that file. Read in one turn and "
+            "answer in the next: a response that calls read_tool_result and "
+            "final_answer together loses the answer. Copy a path below exactly; "
+            "a path that is not listed does not work and is counted against a "
+            "separate small allowance.\n"
+            f"{notice}\n"
+            "If read_tool_result reports a result is no longer available, treat "
+            "it as unavailable and do not reconstruct it. State in your answer "
+            "which items you did not read. "
         )
 
     def _tool_schemas_with_spill_read(

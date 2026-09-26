@@ -6182,6 +6182,155 @@ async def test_forced_turn_reads_do_not_ask_for_a_decision() -> None:
     ]
 
 
+# --- forced-answer turn: prompt tiers ----------------------------------------
+
+_UNREAD_ITEMS_SENTENCE = "State in your answer which items you did not read."
+_BASELINE_TOOL_RULE = (
+    "Do not call any other tool and do not output tool-call markup as plain text."
+)
+_READ_TOOL_RULE = (
+    "Do not call any tool other than final_answer and read_tool_result, and do "
+    "not output tool-call markup as plain text."
+)
+
+
+def _system_prompt(call: dict[str, Any]) -> str:
+    return str(call["messages"][0]["content"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("used", [0, 1, 2])
+@pytest.mark.parametrize("path", ["main_loop", "protocol_retry"])
+async def test_forced_turn_tier_a_prompt_states_unread_items(
+    used: int, path: str
+) -> None:
+    """A forced turn that offers reads tells the model how many reads remain
+    before the final answer, lists the stored results, and asks it to say
+    which items it did not read -- on the turn itself and on its repair."""
+    pattern = _forced_turn_pattern(used=used)
+    responses: list[Any] = [_final_call()]
+    if path == "protocol_retry":
+        responses.insert(
+            0, _tool_call_response("call_empty", "final_answer", '{"answer": ""}')
+        )
+    llm = FakeLLM(responses)
+
+    await pattern.run(
+        context=_forced_turn_context(),
+        tools=[FakeTool(), NamedTool("read_file"), FakeReadToolResultTool()],
+        llm=llm,
+    )
+
+    prompt = _system_prompt(llm.calls[-1])
+    assert (
+        "You may call read_tool_result to read them before answering, at most "
+        f"{3 - used} more time(s) before the final answer."
+    ) in prompt
+    assert _UNREAD_ITEMS_SENTENCE in prompt
+    assert _READ_TOOL_RULE in prompt
+    assert _BASELINE_TOOL_RULE not in prompt
+    assert _STORED_PATH in prompt
+    assert "Stored results:" in prompt
+    assert "read_file" not in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cell", "overrides", "tier_b"),
+    [
+        ("reads_used_up", {"used": 3}, True),
+        ("rejects_used_up", {"rejected": 3}, True),
+        ("empty_registry", {"stored": False}, False),
+        ("settlement_fence", {"fence": True}, False),
+    ],
+)
+async def test_forced_turn_prompt_tier_follows_tool_names(
+    cell: str, overrides: dict[str, Any], tier_b: bool
+) -> None:
+    """A forced turn that does not offer reads gets the used-up sentence when
+    an allowance ran out, and otherwise the prompt a run with nothing stored
+    gets: no read sentence and the baseline tool rule."""
+    options = dict(overrides)
+    stored = options.pop("stored", True)
+    pattern = _forced_turn_pattern(**options)
+    llm = FakeLLM([_final_call()])
+
+    await pattern.run(
+        context=_forced_turn_context(stored=stored),
+        tools=[FakeTool(), FakeReadToolResultTool()],
+        llm=llm,
+    )
+
+    prompt = _system_prompt(llm.calls[0])
+    assert (_READS_USED_UP in prompt) is tier_b
+    assert _BASELINE_TOOL_RULE in prompt
+    assert _UNREAD_ITEMS_SENTENCE not in prompt
+    assert SPILL_READ_TOOL_NAME not in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("used", "expected", "absent"),
+    [
+        (
+            0,
+            "Call final_answer again with the complete user-facing response in "
+            "its answer field, in a turn of its own.",
+            "final_answer is the only tool available on this turn",
+        ),
+        (
+            3,
+            "final_answer is the only tool available on this turn: call it again "
+            "with the complete user-facing response in its answer field.",
+            "in a turn of its own",
+        ),
+    ],
+    ids=["reads_offered", "final_answer_alone"],
+)
+async def test_forced_turn_empty_answer_retry_text_follows_the_offered_tools(
+    used: int, expected: str, absent: str
+) -> None:
+    pattern = _forced_turn_pattern(used=used)
+    llm = FakeLLM(
+        [
+            _tool_call_response("call_empty", "final_answer", '{"answer": ""}'),
+            _final_call(),
+        ]
+    )
+
+    await pattern.run(
+        context=_forced_turn_context(),
+        tools=[FakeTool(), FakeReadToolResultTool()],
+        llm=llm,
+    )
+
+    retry_prompt = _system_prompt(llm.calls[1])
+    assert expected in retry_prompt
+    assert absent not in retry_prompt
+
+
+@pytest.mark.asyncio
+async def test_forced_turn_tier_a_lists_registry_records() -> None:
+    """The stored-result list on the forced turn is the compaction notice:
+    at most twelve entries, then a line that says how to list the rest."""
+    paths = [f"tool-results/r{index:02d}-000000000000.json" for index in range(13)]
+    context = _context_with_spill_records(*paths)
+    context.add_user_message("What is in the stored results?")
+    pattern = _forced_turn_pattern()
+    llm = FakeLLM([_final_call()])
+
+    await pattern.run(
+        context=context, tools=[FakeTool(), FakeReadToolResultTool()], llm=llm
+    )
+
+    prompt = _system_prompt(llm.calls[0])
+    listed = [path for path in paths if f"- {path}: " in prompt]
+    assert listed == paths[:12]
+    assert (
+        "- ... 1 more stored file(s); call read_tool_result with no path to list them"
+    ) in prompt
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_can_finish_with_final_answer_tool() -> None:
     llm = FakeLLM(
