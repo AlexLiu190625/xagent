@@ -404,3 +404,184 @@ async def test_ordinary_turn_reads_are_not_counted(parallel: bool) -> None:
         pattern.forced_answer_reads_rejected,
         pattern.forced_answer_extra_iterations,
     ) == (0, 0, 0)
+
+
+# --- forced-answer turn: extra iterations ------------------------------------
+
+_UNLISTED_PATH = "tool-results/unlisted-000000000000.json"
+
+
+class _InterruptAfterTools(FakeRuntime):
+    """Asks to stop once a given number of tool calls have finished."""
+
+    def __init__(self, after: int) -> None:
+        super().__init__()
+        self.after = after
+
+    async def should_interrupt(self) -> bool:
+        return len(self.events_of("on_tool_end")) >= self.after
+
+
+def _forced_read_counts(pattern) -> tuple[int, int, int]:
+    return (
+        pattern.forced_answer_reads_used,
+        pattern.forced_answer_reads_rejected,
+        pattern.forced_answer_extra_iterations,
+    )
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "concurrent"])
+@pytest.mark.parametrize(
+    ("interrupt_after", "remaining_path", "resumed_counts"),
+    [
+        (1, _STORED_PATH, (2, 0, 2)),
+        (2, _UNLISTED_PATH, (2, 1, 3)),
+        (3, _STORED_PATH, (3, 0, 3)),
+        (3, _UNLISTED_PATH, (3, 0, 3)),
+    ],
+)
+async def test_forced_answer_extra_iterations_survive_interrupt_and_resume(
+    parallel: bool,
+    interrupt_after: int,
+    remaining_path: str,
+    resumed_counts: tuple[int, int, int],
+) -> None:
+    """Every admitted read has already counted when the batch is interrupted,
+    and the resumed turn counts only what it does itself: a read refused
+    because the allowance is used up adds nothing, a path that matches no
+    stored result adds a reject and an extra iteration."""
+    reader = FakeTool(SPILL_READ_TOOL_NAME, read_only=True)
+    pattern = _forced_read_pattern(parallel=parallel)
+    pattern.tool_max_concurrency = interrupt_after
+    reads = _read_calls(interrupt_after)
+    pending_after = [
+        make_tool_call(SPILL_READ_TOOL_NAME, {"path": remaining_path}),
+    ]
+    pattern.pending_tool_calls = [*reads, *pending_after]
+    context = _StoredResultsContext()
+
+    result = await pattern._execute_pending_tool_calls(
+        context=context,
+        tools=[reader],
+        llm=None,
+        runtime=_InterruptAfterTools(interrupt_after),
+    )
+
+    assert result is not None
+    assert result.get("status") == "interrupted"
+    assert len(reader.calls) == interrupt_after
+    assert _forced_read_counts(pattern) == (interrupt_after, 0, interrupt_after)
+    assert pattern.pending_tool_calls == pending_after
+
+    resumed = _forced_read_pattern(parallel=parallel, read_open=False)
+    resumed.load_state(pattern.get_state())
+    result = await resumed._execute_pending_tool_calls(
+        context=context, tools=[reader], llm=None, runtime=FakeRuntime()
+    )
+
+    assert result is None
+    assert resumed.pending_tool_calls == []
+    assert _forced_read_counts(resumed) == resumed_counts
+
+
+async def test_forced_answer_extra_iterations_survive_a_second_interrupt() -> None:
+    """A resumed batch that is interrupted again keeps every count it made,
+    and the next resume carries on from there."""
+    reader = FakeTool(SPILL_READ_TOOL_NAME, read_only=True)
+    pattern = _forced_read_pattern(parallel=False)
+    pattern.pending_tool_calls = _read_calls(3)
+    context = _StoredResultsContext()
+
+    await pattern._execute_pending_tool_calls(
+        context=context, tools=[reader], llm=None, runtime=_InterruptAfterTools(1)
+    )
+    assert _forced_read_counts(pattern) == (1, 0, 1)
+
+    resumed = _forced_read_pattern(parallel=False, read_open=False)
+    resumed.load_state(pattern.get_state())
+    result = await resumed._execute_pending_tool_calls(
+        context=context, tools=[reader], llm=None, runtime=_InterruptAfterTools(1)
+    )
+    assert result is not None
+    assert result.get("status") == "interrupted"
+    assert _forced_read_counts(resumed) == (2, 0, 2)
+    assert len(resumed.pending_tool_calls) == 1
+
+    again = _forced_read_pattern(parallel=False, read_open=False)
+    again.load_state(resumed.get_state())
+    assert (
+        await again._execute_pending_tool_calls(
+            context=context, tools=[reader], llm=None, runtime=FakeRuntime()
+        )
+        is None
+    )
+    assert _forced_read_counts(again) == (3, 0, 3)
+    assert len(reader.calls) == 3
+
+
+async def test_batches_without_reads_add_no_extra_iterations() -> None:
+    other = FakeTool("s1", read_only=True)
+    pattern = _forced_read_pattern(parallel=True)
+    pattern.pending_tool_calls = [make_tool_call("s1") for _ in range(4)]
+
+    result = await pattern._execute_pending_tool_calls(
+        context=_StoredResultsContext(),
+        tools=[other],
+        llm=None,
+        runtime=FakeRuntime(),
+    )
+
+    assert result is None
+    assert len(other.calls) == 4
+    assert _forced_read_counts(pattern) == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("cell", "start", "paths", "read_open"),
+    [
+        ("all_admitted", (0, 0, 0), [_STORED_PATH] * 3, True),
+        ("all_unlisted", (0, 0, 0), [_UNLISTED_PATH] * 3, True),
+        (
+            "mixed",
+            (0, 0, 0),
+            [_STORED_PATH, _UNLISTED_PATH, _STORED_PATH, _UNLISTED_PATH],
+            True,
+        ),
+        ("allowance_used_up", (3, 1, 4), [_STORED_PATH] * 3, True),
+        ("with_a_non_read_call", (0, 0, 0), [_STORED_PATH, None, _STORED_PATH], True),
+        ("ordinary_turn", (0, 0, 0), [_STORED_PATH] * 3, False),
+    ],
+)
+async def test_extra_iterations_lock_step_with_read_counters(
+    cell: str, start: tuple[int, int, int], paths: list, read_open: bool
+) -> None:
+    """The extra iterations grow exactly as much as the two read counters
+    together, and never past their combined per-run caps."""
+    reader = FakeTool(SPILL_READ_TOOL_NAME, read_only=True)
+    other = FakeTool("s1", read_only=True)
+    pattern = _forced_read_pattern(parallel=True, read_open=read_open)
+    (
+        pattern.forced_answer_reads_used,
+        pattern.forced_answer_reads_rejected,
+        pattern.forced_answer_extra_iterations,
+    ) = start
+    pattern.pending_tool_calls = [
+        make_tool_call("s1")
+        if path is None
+        else make_tool_call(SPILL_READ_TOOL_NAME, {"path": path})
+        for path in paths
+    ]
+
+    await pattern._execute_pending_tool_calls(
+        context=_StoredResultsContext(),
+        tools=[reader, other],
+        llm=None,
+        runtime=FakeRuntime(),
+    )
+
+    used, rejected, extra = _forced_read_counts(pattern)
+    assert extra - start[2] == (used - start[0]) + (rejected - start[1])
+    assert extra >= start[2]
+    assert extra <= 6
+    if cell in {"allowance_used_up", "ordinary_turn"}:
+        assert (used, rejected, extra) == start

@@ -58,6 +58,7 @@ import asyncio
 import copy
 import hashlib
 import inspect
+import itertools
 import json
 import logging
 from dataclasses import dataclass, replace
@@ -579,6 +580,10 @@ class ReActPattern(AgentPattern):
         *,
         # Intentionally high for interactive and long-running agent tasks; callers
         # can pass a lower value when they need stricter cost or latency bounds.
+        # Reads on a forced answer turn add iterations on top of this bound
+        # (forced_answer_extra_iterations, at most FORCED_ANSWER_READ_BUDGET +
+        # FORCED_ANSWER_READ_REJECT_CAP per run); this value itself does not
+        # count them.
         max_iterations: int = 200,
         tool_choice: str | dict[str, Any] | None = "required",
         reasoning_mode: ReActReasoningMode | str = ReActReasoningMode.TOOL_CALLING,
@@ -839,7 +844,12 @@ class ReActPattern(AgentPattern):
             else self._build_tool_schema(spill_read_tool)
         )
 
-        for iteration in range(self.current_iteration, self.max_iterations):
+        # The bound is re-read on every pass because a forced-turn read raises
+        # it; with no such reads the iterations are exactly
+        # range(self.current_iteration, self.max_iterations).
+        for iteration in itertools.count(self.current_iteration):
+            if iteration >= self.max_iterations + self.forced_answer_extra_iterations:
+                break
             self.current_iteration = iteration
             if self.pending_tool_calls:
                 self._ensure_pending_tool_call_envelope(context)
@@ -1303,7 +1313,11 @@ class ReActPattern(AgentPattern):
         return PatternResult(
             success=False,
             error="ReActPattern reached max iterations without a final answer.",
-            metadata={"iterations": self.max_iterations, "status": self.status},
+            metadata={
+                "iterations": self.max_iterations,
+                "status": self.status,
+                "forced_answer_extra_iterations": self.forced_answer_extra_iterations,
+            },
         ).to_dict()
 
     async def _deliver_at_iteration_limit(

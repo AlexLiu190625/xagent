@@ -6331,6 +6331,233 @@ async def test_forced_turn_tier_a_lists_registry_records() -> None:
     ) in prompt
 
 
+# --- forced-answer turn: iteration bound -------------------------------------
+
+
+class _RespondingLLM:
+    """A fake model that answers each call from the tools it received."""
+
+    def __init__(self, respond: Any) -> None:
+        self.respond = respond
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self.respond(kwargs, len(self.calls))
+
+
+class _SpillingCalculator(FakeTool):
+    """A calculator whose result is large enough to be stored by the engine."""
+
+    def __init__(self, target: Any) -> None:
+        super().__init__()
+        self.target = target
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        from xagent.core.tools.tool_result_spill import (
+            SPILL_RESERVED_RESULT_KEY,
+            spill_oversized_values,
+        )
+
+        self.calls.append(args)
+        spilled, records = spill_oversized_values(
+            {"output": "x" * 300},
+            self.target,
+            tool_name="calculator",
+            max_recursion=20,
+        )
+        return {**spilled, SPILL_RESERVED_RESULT_KEY: records}
+
+
+def _stored_path(context: ExecutionContext) -> str:
+    component = context.get_component("spilled_results")
+    assert component is not None
+    return str(component.records[0]["relative_path"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "concurrent"])
+@pytest.mark.parametrize("reads", [1, 2, 3])
+async def test_single_call_forced_turn_reads_then_answers(
+    tmp_path, parallel: bool, reads: int
+) -> None:
+    """single_call keeps max_iterations=2, stores a large result, reads it on
+    the forced turn and still answers inside the loop -- not through the
+    iteration-limit delivery turn."""
+    from xagent.core.tools.tool_result_spill import (
+        SpillTarget,
+        spill_dir_for_workspace,
+    )
+
+    context = ExecutionContext()
+    context.attach_workspace("ws-single-call", str(tmp_path))
+    context.add_user_message("What is 1+1?")
+    tool = _SpillingCalculator(
+        SpillTarget(spill_dir=spill_dir_for_workspace(tmp_path), max_chars=100)
+    )
+    reader = RecordingReadToolResultTool()
+
+    def respond(kwargs: dict[str, Any], call_number: int) -> Any:
+        if call_number == 1:
+            return _tool_call_response(
+                "call_calc", "calculator", '{"expression": "1+1"}'
+            )
+        if call_number <= reads + 1:
+            return _read_call(f"call_read_{call_number}", _stored_path(context))
+        return _final_call("2")
+
+    llm = _RespondingLLM(respond)
+    pattern = ReActPattern(
+        max_iterations=2,
+        finalize_after_tool_result=True,
+        tool_parallel_enabled=parallel,
+    )
+
+    result = await pattern.run(context=context, tools=[tool, reader], llm=llm)
+
+    assert result["success"] is True
+    assert "termination_reason" not in result
+    assert result["response"] == "2"
+    assert pattern.max_iterations == 2
+    assert pattern.forced_answer_extra_iterations == reads
+    assert len(reader.calls) == reads
+    assert len(llm.calls) == reads + 2
+    assert SPILL_READ_TOOL_NAME in _schema_names(llm.calls[1])
+    assert (SPILL_READ_TOOL_NAME in _schema_names(llm.calls[-1])) is (reads < 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start", [0, 2, 3, 4])
+async def test_iterations_match_the_fixed_range_without_forced_reads(
+    start: int,
+) -> None:
+    """With no forced-turn read the loop visits exactly
+    range(current_iteration, max_iterations)."""
+    pattern = ReActPattern(
+        max_iterations=3,
+        repeated_tool_decision_after_consecutive_tool_calls=None,
+        repeated_tool_decision_after_consecutive_work_tool_calls=None,
+    )
+    pattern.task_text = "t"
+    pattern.current_iteration = start
+    context = ExecutionContext()
+    context.add_user_message("Keep calculating.")
+    runtime = PatternRuntime(execution_id="fixed-range")
+    llm = _RespondingLLM(
+        lambda kwargs, n: _tool_call_response(
+            f"call_{n}", "calculator", '{"expression": "1+1"}'
+        )
+    )
+
+    result = await pattern.run(
+        context=context, tools=[FakeTool()], llm=llm, runtime=runtime
+    )
+
+    assert result["success"] is False
+    assert [
+        payload["pattern_state"]["current_iteration"]
+        for payload in runtime.checkpoints
+        if payload["label"] == "before_llm"
+    ] == list(range(start, 3))
+    assert result["iterations"] == 3
+    assert result["forced_answer_extra_iterations"] == 0
+
+
+@pytest.mark.asyncio
+async def test_iteration_limit_failure_reports_the_extra_iterations() -> None:
+    pattern = ReActPattern(
+        max_iterations=2,
+        repeated_tool_decision_after_consecutive_tool_calls=None,
+        repeated_tool_decision_after_consecutive_work_tool_calls=None,
+    )
+    pattern.task_text = "t"
+    pattern.forced_answer_extra_iterations = 2
+    context = ExecutionContext()
+    context.add_user_message("Keep calculating.")
+    runtime = PatternRuntime(execution_id="extra-metadata")
+    llm = _RespondingLLM(
+        lambda kwargs, n: _tool_call_response(
+            f"call_{n}", "calculator", '{"expression": "1+1"}'
+        )
+    )
+
+    result = await pattern.run(
+        context=context, tools=[FakeTool()], llm=llm, runtime=runtime
+    )
+
+    assert result["success"] is False
+    assert result["iterations"] == 2
+    assert result["forced_answer_extra_iterations"] == 2
+    assert [
+        payload["pattern_state"]["current_iteration"]
+        for payload in runtime.checkpoints
+        if payload["label"] == "before_llm"
+    ] == [0, 1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_extra_iterations_are_bounded_per_run() -> None:
+    """A model that alternates a six-read batch on every forced turn that
+    offers reads with a work-tool call on every other turn cannot keep
+    raising the loop bound: the read allowances are per run, so the extra
+    iterations stay at most six and the run ends after a bounded number of
+    model calls. The repeated-tool decision is switched off, because it is
+    not a hard stop."""
+    extra_cap = 6
+    calls_cap = 2 * (2 + extra_cap) + 1
+    safety_stop = 200
+    bad_path = "tool-results/unlisted-000000000000.json"
+    batch = [_STORED_PATH, _STORED_PATH, bad_path, bad_path, bad_path, _STORED_PATH]
+    reader = RecordingReadToolResultTool()
+    calculator = FakeTool()
+
+    def respond(kwargs: dict[str, Any], call_number: int) -> Any:
+        if call_number > safety_stop:
+            return _final_call("stop")
+        names = _schema_names(kwargs) if kwargs.get("tools") else []
+        if names == ["final_answer", SPILL_READ_TOOL_NAME]:
+            return _batch_response(
+                *(
+                    (
+                        f"call_read_{call_number}_{index}",
+                        SPILL_READ_TOOL_NAME,
+                        {"path": path},
+                    )
+                    for index, path in enumerate(batch)
+                )
+            )
+        return _tool_call_response(
+            f"call_calc_{call_number}", "calculator", '{"expression": "1+1"}'
+        )
+
+    llm = _RespondingLLM(respond)
+    pattern = ReActPattern(
+        max_iterations=2,
+        finalize_after_tool_result=True,
+        repeated_tool_decision_after_consecutive_tool_calls=None,
+        repeated_tool_decision_after_consecutive_work_tool_calls=None,
+    )
+    pattern.task_text = "t"
+    runtime = PatternRuntime(execution_id="bounded")
+
+    result = await pattern.run(
+        context=_forced_turn_context(),
+        tools=[calculator, reader],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    observed_extra = [
+        payload["pattern_state"]["forced_answer_extra_iterations"]
+        for payload in runtime.checkpoints
+    ]
+    assert max(observed_extra) <= extra_cap
+    assert pattern.forced_answer_extra_iterations <= extra_cap
+    assert len(llm.calls) <= calls_cap
+    assert result["success"] is False
+    assert result["status"] == "max_iterations"
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_can_finish_with_final_answer_tool() -> None:
     llm = FakeLLM(
