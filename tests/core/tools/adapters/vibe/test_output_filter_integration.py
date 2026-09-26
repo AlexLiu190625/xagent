@@ -3,7 +3,9 @@ Integration tests for output filter with tool factory.
 """
 
 import asyncio
+import logging
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -17,16 +19,20 @@ from xagent.core.tools.adapters.vibe.output_filter import DEFAULT_TRUNCATION_MES
 from xagent.core.tools.adapters.vibe.output_filter_wrapper import (
     OutputFilteredToolWrapper,
 )
+from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import (
+    extract_bound_method_target,
+)
 from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
 from xagent.core.tools.tool_result_spill import (
     SPILL_PLACEHOLDER_TEXT,
     SPILL_RESERVED_RESULT_KEY,
     SpillRunBudget,
     SpillTarget,
+    spill_dir_for_workspace,
     spill_record_shape_is_valid,
 )
 from xagent.core.tools.user_interaction import WAITING_FOR_USER_STATUS
-from xagent.core.workspace import TaskWorkspace
+from xagent.core.workspace import MockWorkspace, TaskWorkspace
 
 
 @pytest.mark.asyncio
@@ -748,6 +754,102 @@ async def test_a_production_tool_set_wires_no_spill_target(tmp_path):
             assert tool._spill_target is None
     assert checked > 0
     assert not (tmp_path / "output" / "tool-results").exists()
+
+
+# --- the factory resolves a tool set's spill target from its read_file ----
+
+FACTORY_LOGGER = "xagent.core.tools.adapters.vibe.factory"
+
+
+def _only_tool_named(tools, name):
+    matches = [tool for tool in tools if tool.name == name]
+    assert len(matches) == 1, [tool.name for tool in tools]
+    return matches[0]
+
+
+def _bound_workspace(wrapper):
+    """The workspace object the wrapped file tool's bound instance holds."""
+    target = extract_bound_method_target(wrapper._target)
+    assert target is not None
+    instance, _ = target
+    return instance.workspace
+
+
+def _unwrapped(tools):
+    """The tool list as _apply_output_filters receives it."""
+    return [
+        tool._target if isinstance(tool, OutputFilteredToolWrapper) else tool
+        for tool in tools
+    ]
+
+
+@pytest.mark.asyncio
+async def test_factory_wires_a_spill_target_when_read_file_is_workspace_bound(
+    tmp_path,
+):
+    config = ToolConfig(
+        {"workspace": {"task_id": "spill-target-test", "base_dir": str(tmp_path)}}
+    )
+    tools = await ToolFactory.create_all_tools(config)
+    read_file = _only_tool_named(tools, "read_file")
+    workspace = _bound_workspace(read_file)
+    assert isinstance(workspace, TaskWorkspace)
+
+    target = ToolFactory._resolve_spill_target(
+        _unwrapped(tools), config.get_max_output_length()
+    )
+
+    assert target is not None
+    assert Path(target.spill_dir).parts[-2:] == ("output", "tool-results")
+    assert target.spill_dir == spill_dir_for_workspace(workspace.workspace_dir)
+    assert target.max_chars == read_file._filter.max_chars
+
+
+@pytest.mark.asyncio
+async def test_factory_leaves_spill_target_none_without_workspace(caplog):
+    config = ToolConfig({"workspace": None})
+    with caplog.at_level(logging.INFO, logger=FACTORY_LOGGER):
+        tools = await ToolFactory.create_all_tools(config)
+        target = ToolFactory._resolve_spill_target(
+            _unwrapped(tools), config.get_max_output_length()
+        )
+
+    assert target is None
+    assert not any(tool.name == "read_file" for tool in tools)
+    disabled = [
+        record.getMessage()
+        for record in caplog.records
+        if "spill disabled" in record.getMessage()
+    ]
+    assert disabled
+    assert all("no read_file tool" in message for message in disabled)
+
+
+@pytest.mark.asyncio
+async def test_factory_leaves_spill_target_none_for_a_mock_workspace(tmp_path, caplog):
+    """The tool-listing endpoint builds its tool set with task_id
+    "tools_list", which binds read_file to a MockWorkspace: a workspace
+    that never exists on disk must not be given a spill target."""
+    config = ToolConfig(
+        {"workspace": {"task_id": "tools_list", "base_dir": str(tmp_path)}}
+    )
+    with caplog.at_level(logging.INFO, logger=FACTORY_LOGGER):
+        tools = await ToolFactory.create_all_tools(config)
+        target = ToolFactory._resolve_spill_target(
+            _unwrapped(tools), config.get_max_output_length()
+        )
+    workspace = _bound_workspace(_only_tool_named(tools, "read_file"))
+    assert isinstance(workspace, MockWorkspace)
+
+    assert target is None
+    disabled = [
+        record.getMessage()
+        for record in caplog.records
+        if "spill disabled" in record.getMessage()
+    ]
+    assert disabled
+    assert all("not bound to a task workspace" in message for message in disabled)
+    assert not (Path(workspace.workspace_dir) / "output" / "tool-results").exists()
 
 
 # --- the engine's own spill report bypasses ordinary output filtering ------

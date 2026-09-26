@@ -23,6 +23,10 @@ from .....config import get_uploads_dir
 from .....core.task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from .....core.workspace import TaskWorkspace
 from ...core.knowledge_base_scope import KnowledgeBaseScopeError
+from ...tool_result_spill import (
+    SpillTarget,
+    spill_dir_for_workspace,
+)
 from .base import BINDING_AUTHORIZED_CATEGORIES, AbstractBaseTool, Tool
 from .config import (
     ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
@@ -866,6 +870,59 @@ class ToolFactory:
             )
 
         return filtered_tools
+
+    @staticmethod
+    def _resolve_spill_target(
+        tools: list[Tool], max_chars: int
+    ) -> "SpillTarget | None":
+        """Find this tool set's read_file tool bound to a real task workspace.
+
+        Looks for a tool literally named "read_file" whose underlying
+        function is a bound method on an instance exposing a `workspace`
+        attribute (WorkspaceFileTools), run before this tool has been
+        wrapped for output filtering. A target is built only when that
+        workspace is a TaskWorkspace: the tool-listing endpoint binds
+        read_file to a MockWorkspace, which never creates directories on
+        disk, so it must not get a spill target. The directory comes from
+        spill_dir_for_workspace, the same function the execution context
+        and the stored-result reader use.
+
+        No such read_file means no spill target: a deployment with no file
+        tools, one where read_file has been renamed or filtered out by tool
+        policy, or a tool set bound to a mock workspace keeps today's
+        truncation behavior unchanged.
+        """
+        from .sandboxed_tool.sandbox_config import extract_bound_method_target
+
+        found_read_file = False
+        for tool in tools:
+            if getattr(tool, "name", None) != "read_file":
+                continue
+            found_read_file = True
+            target = extract_bound_method_target(tool)
+            if target is None:
+                continue
+            instance, _ = target
+            workspace = getattr(instance, "workspace", None)
+            if not isinstance(workspace, TaskWorkspace):
+                continue
+            return SpillTarget(
+                spill_dir=spill_dir_for_workspace(workspace.workspace_dir),
+                max_chars=max_chars,
+            )
+        if found_read_file:
+            logger.info(
+                "Tool result spill disabled: read_file in this tool set is "
+                "not bound to a task workspace (tools=%d)",
+                len(tools),
+            )
+        else:
+            logger.info(
+                "Tool result spill disabled: no read_file tool in this tool "
+                "set (tools=%d)",
+                len(tools),
+            )
+        return None
 
     @staticmethod
     async def _wrap_sandbox_tools(tools: list[Tool], sandbox: Any) -> list[Tool]:
