@@ -1582,8 +1582,9 @@ class ReActPattern(AgentPattern):
             evidence_facts_text = evidence_facts(state)
             # The read sentences follow what this turn actually sends: the
             # reader and its stored-result list when it is offered, the
-            # used-up sentence when an allowance ran out, and nothing
-            # otherwise, which is the prompt a run with nothing stored gets.
+            # used-up sentence when an allowance ran out on a turn that would
+            # otherwise offer it, and nothing otherwise, which is the prompt
+            # a run with nothing stored gets.
             if SPILL_READ_TOOL_NAME in (tool_names or []):
                 read_instruction = self._forced_answer_read_instruction(context)
                 tool_rule = (
@@ -1592,10 +1593,17 @@ class ReActPattern(AgentPattern):
                     "plain text. "
                 )
             else:
+                # The used-up sentence belongs only to a turn whose reads were
+                # withheld by the allowance. The settlement-fence turn never
+                # offers reads, so its prompt stays exactly as before whatever
+                # the counters say; _settlement_fence_active has already
+                # synced the fence flag with this turn.
+                reads_used_up = (
+                    not self._forced_answer_read_allowance_open()
+                    and not self.settlement_final_answer_fence
+                )
                 read_instruction = (
-                    ""
-                    if self._forced_answer_read_allowance_open()
-                    else f"{FORCED_ANSWER_READS_USED_UP_TEXT} "
+                    f"{FORCED_ANSWER_READS_USED_UP_TEXT} " if reads_used_up else ""
                 )
                 tool_rule = (
                     "Do not call any other tool and do not output "

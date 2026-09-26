@@ -5508,15 +5508,16 @@ async def _forced_turn_call(
         ("reads_used_up", {"used": 3}),
         ("rejects_used_up", {"rejected": 3}),
         ("settlement_fence", {"fence": True}),
+        ("settlement_fence_reads_used_up", {"fence": True, "used": 3, "rejected": 3}),
     ],
 )
 async def test_forced_turn_stays_single_tool(
     cell: str, overrides: dict[str, Any]
 ) -> None:
     """When any condition for offering reads fails, the forced turn sends
-    exactly the baseline final_answer schema. Where no allowance is used up
-    the prompt is byte-identical to a run that stored nothing and has no
-    reader."""
+    exactly the baseline final_answer schema. Where no allowance is used up,
+    and on the settlement-fence turn whatever the counters say, the prompt is
+    byte-identical to a run that stored nothing and has no reader."""
     options: dict[str, Any] = {"stored": True, "reader": True, **overrides}
     pattern, call = await _forced_turn_call(**options)
 
@@ -6125,6 +6126,7 @@ async def test_forced_turn_tier_a_prompt_states_unread_items(
         ("rejects_used_up", {"rejected": 3}, True),
         ("empty_registry", {"stored": False}, False),
         ("settlement_fence", {"fence": True}, False),
+        ("settlement_fence_reads_used_up", {"fence": True, "used": 3}, False),
     ],
 )
 async def test_forced_turn_prompt_tier_follows_tool_names(
