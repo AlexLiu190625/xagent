@@ -24,6 +24,8 @@ from .....core.task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from .....core.workspace import TaskWorkspace
 from ...core.knowledge_base_scope import KnowledgeBaseScopeError
 from ...tool_result_spill import (
+    SPILL_READ_TOOL_NAME,
+    SpillRunBudget,
     SpillTarget,
     spill_dir_for_workspace,
 )
@@ -847,6 +849,14 @@ class ToolFactory:
         max_chars = config.get_max_output_length()
         max_fields = config.get_max_field_count()
         max_recursion = config.get_max_recursion_depth()
+        spill_target = ToolFactory._resolve_spill_target(tools, max_chars)
+        # One budget per tool-set construction, shared by reference with
+        # every wrapper built below: the 64-file cap accumulates across every
+        # tool result produced while this one set of tools is in use -- not
+        # per tool, not per call, and not per run. It holds a lock, so it must
+        # never be copied, deep-copied, asdict'ed or pickled -- see its
+        # docstring in tool_result_spill.py.
+        spill_run_budget = SpillRunBudget()
 
         filtered_tools: list[Tool] = []
         for tool in tools:
@@ -857,6 +867,14 @@ class ToolFactory:
                     max_chars=max_chars,
                     max_fields=max_fields,
                     max_recursion=max_recursion,
+                    # The stored-result reader never spills its own output:
+                    # its oversized-item shape carries content_preview, which
+                    # is not an envelope field and would be replaced by the
+                    # placeholder, so a read-back would return nothing.
+                    spill_target=(
+                        None if tool.name == SPILL_READ_TOOL_NAME else spill_target
+                    ),
+                    spill_run_budget=spill_run_budget,
                 )
                 filtered_tools.append(wrapper)
             else:

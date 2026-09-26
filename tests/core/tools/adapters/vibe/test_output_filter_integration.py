@@ -25,6 +25,7 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import (
 from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
 from xagent.core.tools.tool_result_spill import (
     SPILL_PLACEHOLDER_TEXT,
+    SPILL_READ_TOOL_NAME,
     SPILL_RESERVED_RESULT_KEY,
     SpillRunBudget,
     SpillTarget,
@@ -731,31 +732,6 @@ def test_a_keyboard_interrupt_is_not_swallowed_by_the_spill_boundary(
     assert not any(r.levelname == "WARNING" for r in caplog.records)
 
 
-# --- wiring the spill path in changes nothing yet ---------------------------
-
-
-@pytest.mark.asyncio
-async def test_a_production_tool_set_wires_no_spill_target(tmp_path):
-    """No production caller constructs a SpillTarget: factory.py is not
-    part of this change, so a workspace-bound tool set -- the shape a later
-    change resolves a real target from -- still wires every wrapper's
-    spill target to None. This is the executable form of "this change is
-    inert."."""
-    config = ToolConfig(
-        {
-            "workspace": {"task_id": "spill-wiring-test", "base_dir": str(tmp_path)},
-        }
-    )
-    tools = await ToolFactory.create_all_tools(config)
-    checked = 0
-    for tool in tools:
-        if hasattr(tool, "_spill_target"):
-            checked += 1
-            assert tool._spill_target is None
-    assert checked > 0
-    assert not (tmp_path / "output" / "tool-results").exists()
-
-
 # --- the factory resolves a tool set's spill target from its read_file ----
 
 FACTORY_LOGGER = "xagent.core.tools.adapters.vibe.factory"
@@ -775,14 +751,6 @@ def _bound_workspace(wrapper):
     return instance.workspace
 
 
-def _unwrapped(tools):
-    """The tool list as _apply_output_filters receives it."""
-    return [
-        tool._target if isinstance(tool, OutputFilteredToolWrapper) else tool
-        for tool in tools
-    ]
-
-
 @pytest.mark.asyncio
 async def test_factory_wires_a_spill_target_when_read_file_is_workspace_bound(
     tmp_path,
@@ -795,9 +763,7 @@ async def test_factory_wires_a_spill_target_when_read_file_is_workspace_bound(
     workspace = _bound_workspace(read_file)
     assert isinstance(workspace, TaskWorkspace)
 
-    target = ToolFactory._resolve_spill_target(
-        _unwrapped(tools), config.get_max_output_length()
-    )
+    target = read_file._spill_target
 
     assert target is not None
     assert Path(target.spill_dir).parts[-2:] == ("output", "tool-results")
@@ -810,12 +776,11 @@ async def test_factory_leaves_spill_target_none_without_workspace(caplog):
     config = ToolConfig({"workspace": None})
     with caplog.at_level(logging.INFO, logger=FACTORY_LOGGER):
         tools = await ToolFactory.create_all_tools(config)
-        target = ToolFactory._resolve_spill_target(
-            _unwrapped(tools), config.get_max_output_length()
-        )
 
-    assert target is None
     assert not any(tool.name == "read_file" for tool in tools)
+    wrappers = [tool for tool in tools if isinstance(tool, OutputFilteredToolWrapper)]
+    assert wrappers
+    assert all(wrapper._spill_target is None for wrapper in wrappers)
     disabled = [
         record.getMessage()
         for record in caplog.records
@@ -835,13 +800,12 @@ async def test_factory_leaves_spill_target_none_for_a_mock_workspace(tmp_path, c
     )
     with caplog.at_level(logging.INFO, logger=FACTORY_LOGGER):
         tools = await ToolFactory.create_all_tools(config)
-        target = ToolFactory._resolve_spill_target(
-            _unwrapped(tools), config.get_max_output_length()
-        )
     workspace = _bound_workspace(_only_tool_named(tools, "read_file"))
     assert isinstance(workspace, MockWorkspace)
 
-    assert target is None
+    wrappers = [tool for tool in tools if isinstance(tool, OutputFilteredToolWrapper)]
+    assert wrappers
+    assert all(wrapper._spill_target is None for wrapper in wrappers)
     disabled = [
         record.getMessage()
         for record in caplog.records
@@ -850,6 +814,176 @@ async def test_factory_leaves_spill_target_none_for_a_mock_workspace(tmp_path, c
     assert disabled
     assert all("not bound to a task workspace" in message for message in disabled)
     assert not (Path(workspace.workspace_dir) / "output" / "tool-results").exists()
+
+
+# --- a production tool set wires a spill target ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_production_tool_set_now_wires_a_spill_target(tmp_path):
+    """A workspace-bound tool set gives every wrapper but the stored-result
+    reader the same SpillTarget and every wrapper the same SpillRunBudget,
+    pointed at this workspace's own spill directory. Building the tool set
+    does not create that directory; the first spill does. The tool-listing
+    construction, bound to a MockWorkspace, wires no target at all."""
+    config = ToolConfig(
+        {"workspace": {"task_id": "spill-wiring-test", "base_dir": str(tmp_path)}}
+    )
+    tools = await ToolFactory.create_all_tools(config)
+    workspace = _bound_workspace(_only_tool_named(tools, "read_file"))
+    reader = _only_tool_named(tools, SPILL_READ_TOOL_NAME)
+    wrappers = [tool for tool in tools if isinstance(tool, OutputFilteredToolWrapper)]
+    others = [wrapper for wrapper in wrappers if wrapper is not reader]
+
+    assert reader._spill_target is None
+    assert others
+    assert all(wrapper._spill_target is not None for wrapper in others)
+    assert len({id(wrapper._spill_target) for wrapper in others}) == 1
+    assert len({id(wrapper._spill_run_budget) for wrapper in wrappers}) == 1
+    spill_dir = spill_dir_for_workspace(workspace.workspace_dir)
+    assert others[0]._spill_target.spill_dir == spill_dir
+    assert not Path(spill_dir).exists()
+
+    listing = await ToolFactory.create_all_tools(
+        ToolConfig({"workspace": {"task_id": "tools_list", "base_dir": str(tmp_path)}})
+    )
+    listed = [tool for tool in listing if isinstance(tool, OutputFilteredToolWrapper)]
+    assert listed
+    assert all(wrapper._spill_target is None for wrapper in listed)
+
+
+@pytest.mark.asyncio
+async def test_all_wrappers_from_one_construction_share_one_run_budget_object(
+    tmp_path,
+):
+    config = ToolConfig(
+        {"workspace": {"task_id": "spill-budget-test", "base_dir": str(tmp_path)}}
+    )
+    tools = await ToolFactory.create_all_tools(config)
+    wrappers = [tool for tool in tools if hasattr(tool, "_spill_run_budget")]
+
+    assert len(wrappers) > 1
+    first = wrappers[0]._spill_run_budget
+    assert isinstance(first, SpillRunBudget)
+    assert all(wrapper._spill_run_budget is first for wrapper in wrappers)
+
+
+def _store_for_reading(spill_dir, value, max_chars):
+    """Spill ``value`` into ``spill_dir`` as one file; return its relative path.
+
+    ``max_chars`` must sit below ``value`` and at or above each of its
+    items, so that ``value`` itself is the one spill point."""
+    _, records = tool_result_spill.spill_oversized_values(
+        {"value": value},
+        SpillTarget(spill_dir=str(spill_dir), max_chars=max_chars),
+        tool_name="acme",
+        max_recursion=20,
+    )
+    assert len(records) == 1
+    return records[0]["relative_path"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_chars", [12_000, 8_000])
+async def test_the_read_back_tool_gets_no_spill_target(tmp_path, max_chars):
+    """What read_tool_result returns is never spilled again, in either of its
+    success shapes: the whole shape carries the text in output, and the
+    preview shape for one item longer than SPILL_READ_MAX_CHARS carries it
+    in content_preview, which is not an envelope field. With the output
+    limit lowered to 12,000 or 8,000 a spill target on this wrapper would
+    write a file for either shape or put the placeholder where the text
+    was. Without one, the reply is exactly what the output filter alone
+    makes of it: unchanged at 12,000, and truncated the way every other
+    over-limit string is at 8,000."""
+    config = ToolConfig(
+        {
+            "workspace": {
+                "task_id": f"read-back-{max_chars}",
+                "base_dir": str(tmp_path),
+            },
+            "max_output_length": max_chars,
+        }
+    )
+    tools = await ToolFactory.create_all_tools(config)
+    reader = _only_tool_named(tools, SPILL_READ_TOOL_NAME)
+    assert reader._spill_target is None
+    spill_dir = Path(
+        spill_dir_for_workspace(
+            _bound_workspace(_only_tool_named(tools, "read_file")).workspace_dir
+        )
+    )
+    whole_text = "x" * tool_result_spill.SPILL_READ_MAX_CHARS
+    whole_path = _store_for_reading(spill_dir, whole_text, max_chars=100)
+    long_items = ["y" * 15_000, "z" * 15_000]
+    preview_path = _store_for_reading(spill_dir, long_items, max_chars=20_000)
+    stored_files = sorted(spill_dir.iterdir())
+    plain = OutputFilteredToolWrapper(
+        target_tool=reader._target,
+        max_chars=max_chars,
+        max_fields=config.get_max_field_count(),
+        max_recursion=config.get_max_recursion_depth(),
+    )
+
+    for args, text_key in (
+        ({"path": whole_path}, "output"),
+        ({"path": preview_path, "start": 1, "end": 1}, "content_preview"),
+    ):
+        raw = await reader._target.run_json_async(args)
+        assert len(raw[text_key]) == tool_result_spill.SPILL_READ_MAX_CHARS
+        reply = await reader.run_json_async(args)
+
+        assert SPILL_RESERVED_RESULT_KEY not in reply
+        assert reply[text_key] != SPILL_PLACEHOLDER_TEXT
+        assert reply == plain._filter_result(raw)
+        if max_chars >= tool_result_spill.SPILL_READ_MAX_CHARS:
+            assert reply[text_key] == raw[text_key]
+        assert sorted(spill_dir.iterdir()) == stored_files
+    assert set(raw) >= {
+        "content_preview",
+        "content_truncated",
+        "original_chars",
+        "item_count",
+        "offset",
+        "instruction",
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_factory_the_context_and_the_read_tool_agree_on_the_spill_directory(
+    tmp_path,
+):
+    """The factory's target, the execution context that registers a spill,
+    and read_tool_result all take the directory from spill_dir_for_workspace.
+    One workspace object feeds all three here, so this pins the shared
+    spelling, not two separately built workspace objects agreeing."""
+    config = ToolConfig(
+        {"workspace": {"task_id": "spill-dir-agree", "base_dir": str(tmp_path)}}
+    )
+    tools = await ToolFactory.create_all_tools(config)
+    read_file = _only_tool_named(tools, "read_file")
+    reader = _only_tool_named(tools, SPILL_READ_TOOL_NAME)
+    workspace = _bound_workspace(read_file)
+    ctx = ExecutionContext()
+    ctx.attach_workspace(workspace.id, str(workspace.workspace_dir))
+
+    expected = spill_dir_for_workspace(workspace.workspace_dir)
+    assert read_file._spill_target.spill_dir == ctx._spill_dir() == expected
+
+    spilled, records = tool_result_spill.spill_oversized_values(
+        {"content": "x" * (read_file._spill_target.max_chars + 1)},
+        read_file._spill_target,
+        tool_name="acme",
+        max_recursion=20,
+    )
+    relative_path = records[0]["relative_path"]
+    ctx.add_tool_result("acme", spilled)
+    assert [record["relative_path"] for record in ctx.spilled_results] == [
+        relative_path
+    ]
+    listing = await reader.run_json_async({})
+    assert [entry["relative_path"] for entry in listing["stored_results"]] == [
+        relative_path
+    ]
 
 
 # --- the engine's own spill report bypasses ordinary output filtering ------
