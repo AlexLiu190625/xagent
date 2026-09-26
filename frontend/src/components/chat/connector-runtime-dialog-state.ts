@@ -9,11 +9,17 @@ import { sendOutcomeMayHaveLanded } from "@/components/chat/clarification-delive
 // disposition union here adds no runtime dependency on the websocket hook.
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
 import {
+  buildSubmitItems,
   connectorRuntimeInputDraftKey,
+  isSubmitEnabled,
+  resolveDialogActions,
   resolveDialogOutcome,
   type ConnectorRuntimeConnector,
+  type ConnectorRuntimeDialogAction,
   type ConnectorRuntimeInput,
   type ConnectorRuntimeReport,
+  type ConnectorRuntimeSubmitItem,
+  type DialogOutcome,
 } from "@/lib/connector-runtime-api"
 
 // Why a draft failed the object-field blur check: "invalid" for anything
@@ -35,7 +41,7 @@ export type InvalidObjectDraftReason = "invalid" | "empty"
 export function hasLiveInvalidObjectMark(
   connector: ConnectorRuntimeConnector,
   input: ConnectorRuntimeInput,
-  invalidDraftKeys: Map<string, InvalidObjectDraftReason>,
+  invalidDraftKeys: ReadonlyMap<string, InvalidObjectDraftReason>,
 ): boolean {
   return (
     input.section === "context"
@@ -96,4 +102,194 @@ export function canResendReport(report: ConnectorRuntimeReport): boolean {
 export interface SendFailureState {
   snapshotId: string
   disposition: MessageDeliveryDisposition | null
+}
+
+/**
+ * Everything deriveGates needs, read fresh off the dialog's own state and
+ * the request it is currently showing. Flat facts rather than the dialog's
+ * storage shape itself: a caller holding twelve independent pieces of state
+ * today can feed this the same way a caller holding one combined state
+ * value will tomorrow, and neither has to restate the formulas below --
+ * only how to read its own storage into this shape.
+ */
+export interface GateFacts {
+  report: ConnectorRuntimeReport | null
+  reportSeq: number | null
+  settledReadKey: string | null
+  readNonce: number
+  // Whether any submission-shaped action is in flight: an explicit save
+  // (which may itself run a resend as part of "save and resend") or a
+  // standalone retry resend from the send-failed panel. The caller keeps
+  // this rather than deriveGates folding it from two flags of its own,
+  // because what those flags are and how many there are is the caller's
+  // storage question, not this module's.
+  busy: boolean
+  // The send the "saved but not sent" panel is about, or null when no send
+  // has failed. See `liveSendFailure` below for why this is joined against
+  // the request's own resend payload on every call rather than trusted as
+  // it stands.
+  heldFailure: SendFailureState | null
+  retrying: boolean
+  drafts: Readonly<Record<string, string>>
+  invalidDraftKeys: ReadonlyMap<string, InvalidObjectDraftReason>
+  request: { seq: number; resendPayload: { clientMessageId: string } | null }
+}
+
+export interface Gates {
+  liveSendFailure: SendFailureState | null
+  sendFailed: boolean
+  needsSnapshotRecycle: boolean
+  readKey: string
+  reading: boolean
+  reportIsStale: boolean
+  readFailed: boolean
+  outcome: DialogOutcome | null
+  submitItems: ConnectorRuntimeSubmitItem[]
+  hasInvalidObjectDraft: boolean
+  canSubmit: boolean
+  canSubmitNow: boolean
+  hasResendPayload: boolean
+  actions: ConnectorRuntimeDialogAction[]
+  hasSaveEntryPoint: boolean
+  metHoldingSnapshot: boolean
+  retryResendDisabled: boolean
+}
+
+/**
+ * Every value the connector-runtime dialog derives from its own state and
+ * the request it is currently showing, gathered in one place so the same
+ * formulas cannot drift between whatever state produces them and whatever
+ * renders off them. Everything here is computed fresh from `facts` on every
+ * call -- nothing is cached across calls -- so it is the caller's choice how
+ * often that happens (today, every render).
+ */
+export function deriveGates(facts: GateFacts): Gates {
+  // Joined against the request's own resend payload on every call, rather
+  // than trusted as it stands, because the panel and its retry button must
+  // be about the same message on every call, including the first one after
+  // a same-task retarget swaps in a newer resend candidate, or a
+  // settlement frame takes the snapshot away without moving `seq` at all.
+  // Nothing brings a clientMessageId back once it has stopped matching
+  // (a snapshot's own id is written once at send time), so a fact that
+  // stops matching never will again -- `needsSnapshotRecycle` below tells
+  // the caller so it can drop it.
+  const liveSendFailure = facts.heldFailure !== null
+    && facts.heldFailure.snapshotId === facts.request.resendPayload?.clientMessageId
+    ? facts.heldFailure
+    : null
+  const sendFailed = liveSendFailure !== null
+  // True for exactly one call after `heldFailure` stops matching the
+  // request's resend payload: the caller must drop it -- from render, not
+  // an effect, since an effect notices a frame late and never runs at all
+  // for a removal that does not move `seq` -- so the next call's
+  // `heldFailure` no longer disagrees with `liveSendFailure`.
+  const needsSnapshotRecycle = facts.heldFailure !== null && liveSendFailure === null
+
+  // The read attempt the dialog is currently on: the request it is for, and
+  // which try for that request it is. Both halves are needed -- `seq` alone
+  // cannot tell a fresh attempt for the same request from the one that just
+  // failed, so a "read again" press would leave `reading` false and the
+  // screen would say nothing while the retry was out.
+  const readKey = `${facts.request.seq}:${facts.readNonce}`
+  const reading = facts.settledReadKey !== readKey
+  // Whether the report on hand belongs to some earlier request than the one
+  // the dialog is now for. A same-task retarget bumps `seq` and starts a
+  // fresh read while the previous report is still on screen; submitting or
+  // resending against that report acts on rows the current one may no
+  // longer declare, and a stored context value is immutable, so there is no
+  // correcting it afterwards.
+  //
+  // This is the gate rather than `reading`, because the two come apart in
+  // exactly the case that matters: a read that fails settles without
+  // installing anything, so `reading` goes false while the report on hand
+  // is still the previous request's. `reportSeq` can only catch up when the
+  // attempt that installs a fresher report also records itself settled, so
+  // this is true whenever `reading` is -- one gate covers the pending read
+  // and the failed one both.
+  const reportIsStale = facts.reportSeq !== facts.request.seq
+  // The read for this request settled and left the previous request's
+  // report on hand: it failed. Derived rather than stored, so it cannot
+  // disagree with the two facts it is made of.
+  const readFailed = !reading && reportIsStale
+
+  const outcome: DialogOutcome | null = facts.report ? resolveDialogOutcome(facts.report) : null
+  const submitItems = facts.report ? buildSubmitItems(facts.report, facts.drafts) : []
+  // Only a mark on a row the current report still renders an editable
+  // control for may gate submission. A key a refreshed report reports
+  // satisfied loses its textarea, so its mark could never be cleared again
+  // -- submit would stay disabled with no error anywhere on screen. Reads
+  // the same `hasLiveInvalidObjectMark` predicate the row renderer reads
+  // for its error message, so the two can never disagree. `invalidDraftKeys`
+  // is read-only here the same way it is everywhere else this module reads
+  // it: nothing in this module ever needs to write it back.
+  const hasInvalidObjectDraft = facts.report !== null && facts.report.connectors.some(connector =>
+    connector.inputs.some(input => hasLiveInvalidObjectMark(
+      connector,
+      input,
+      facts.invalidDraftKeys,
+    )),
+  )
+  const canSubmit = isSubmitEnabled(submitItems, hasInvalidObjectDraft)
+  // The one value every entry point into a submission reads: both footer
+  // save buttons, the retry button a retryable failure offers, and the save
+  // handler itself. That matters because buildSubmitItems drops an
+  // unparsable object draft instead of failing: such a batch writes every
+  // other field, silently loses that one and closes the dialog -- and a
+  // stored context value is immutable, so there is no correcting it
+  // afterwards.
+  //
+  // `reportIsStale` is folded in here and not into `busy`, which the caller
+  // also uses to gate dismissal: nothing in flight may stand between the
+  // user and closing the dialog. That is not the whole picture today and
+  // this comment must not pretend it is -- `submitting` is part of `busy`,
+  // so the save POST, the refresh GET a failed save runs, and both sends do
+  // hold the dialog open while they are out. Each of those is now bounded
+  // (the two connector-runtime calls time out after 20 seconds, and a send
+  // settles or rejects), so none of them can hold it open indefinitely any
+  // more, but taking `submitting` out of `busy` would change what closing
+  // does on four separate paths mid-write and is not part of this change.
+  const canSubmitNow = canSubmit && !facts.busy && !reportIsStale
+  const hasResendPayload = facts.request.resendPayload !== null
+  const actions = outcome ? resolveDialogActions(outcome, hasResendPayload) : []
+  // Whether this shape offers any way to submit. The row renderer asks this
+  // instead of listing the outcome kinds that offer none, because that list
+  // was one kind short: a `met` report reaches the render whenever one is
+  // installed into a dialog that stays open, and an unfilled *optional*
+  // context key inside one was still drawn as an editable field with no
+  // button able to send it. Derived from the action set, so the rows and
+  // the footer cannot disagree about whether saving is possible.
+  const hasSaveEntryPoint = actions.includes("saveOnly")
+  // A met report that reached the render still carries the snapshot of the
+  // message that failed, and this shape offers no way to send it: the
+  // footer collapses to "Got it", and the save-and-resend button a
+  // fillable report offers cannot be reused here because a met report
+  // produces no submittable items, which leaves it permanently disabled.
+  // Not while the send-failed panel is up, and not while a submission for
+  // this same message is still in flight: saying it was not resent would
+  // be false in both cases.
+  const metHoldingSnapshot = outcome?.kind === "met" && hasResendPayload && !sendFailed && !facts.busy
+  // Mirrors the guard the send-failed panel's own retry button carries: no
+  // second attempt while one is already out, and none against a report the
+  // current request no longer produced.
+  const retryResendDisabled = facts.retrying || reportIsStale
+
+  return {
+    liveSendFailure,
+    sendFailed,
+    needsSnapshotRecycle,
+    readKey,
+    reading,
+    reportIsStale,
+    readFailed,
+    outcome,
+    submitItems,
+    hasInvalidObjectDraft,
+    canSubmit,
+    canSubmitNow,
+    hasResendPayload,
+    actions,
+    hasSaveEntryPoint,
+    metHoldingSnapshot,
+    retryResendDisabled,
+  }
 }
