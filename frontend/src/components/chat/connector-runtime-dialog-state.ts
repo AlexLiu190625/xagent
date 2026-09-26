@@ -6,6 +6,9 @@
 // or what it says.
 
 import { sendOutcomeMayHaveLanded } from "@/components/chat/clarification-delivery"
+// Type-only: naming the close outcomes adds no runtime dependency on the
+// dialog's React context.
+import type { ConnectorRuntimeDialogCloseOutcome } from "@/contexts/connector-runtime-dialog-context"
 // Type-only, like clarification-delivery's own import of it: naming the
 // disposition union here adds no runtime dependency on the websocket hook.
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
@@ -18,6 +21,7 @@ import {
   resolveDialogOutcome,
   type ConnectorRuntimeConnector,
   type ConnectorRuntimeDialogAction,
+  type ConnectorRuntimeErrorMessageKey,
   type ConnectorRuntimeFailureDisposition,
   type ConnectorRuntimeInput,
   type ConnectorRuntimeReport,
@@ -323,7 +327,7 @@ export type Phase =
   | { kind: "send-failed"; failure: SendFailureState }
   | { kind: "retrying"; failure: SendFailureState | null }
 
-function assertNever(value: never): never {
+export function assertNever(value: never): never {
   throw new Error(`unhandled value: ${JSON.stringify(value)}`)
 }
 
@@ -629,6 +633,73 @@ export function reduceDialog(state: DialogState, event: DialogEvent): DialogStat
     default:
       return assertNever(event)
   }
+}
+
+// ---------------------------------------------------------------------------
+// How a flow ends: what the dialog says, what it records, whether it closes.
+// ---------------------------------------------------------------------------
+
+/**
+ * Why an ending says nothing. Every silent ending names one, so a silence
+ * is a stated decision rather than a branch nobody wrote a toast for.
+ */
+export type SilenceReason =
+  // Nothing was written and nothing was sent.
+  | "nothing-irreversible"
+  // The user pressed "save only": no message was promised.
+  | "nothing-promised"
+  // The message went out and appears in the conversation on its own.
+  | "transcript-shows-it"
+  // The send-failed panel stands in this same frame and says it.
+  | "panel-carries-it"
+  // The rows, or an error on them, say it in this same frame.
+  | "rows-carry-it"
+  // The user closed the dialog themselves.
+  | "user-chose-it"
+  // The dialog was never on screen.
+  | "never-shown"
+  // The user left the pages the dialog lives on.
+  | "user-left"
+  // A defensive exit a rendered frame has already ruled out.
+  | "unreachable"
+
+/**
+ * What an ending tells the user. Only enum values and key names taken from
+ * the server's report: no free text, so nothing the user typed and nothing
+ * already translated can travel through one. Wording is the dialog's own
+ * business, re-resolved when shown.
+ */
+export type Notice =
+  | { kind: "saved-not-resent"; because: "unmounted" | "superseded" | "unavailable" | "incomplete" }
+  | { kind: "saved-not-resent"; because: "unsupported"; keys: readonly string[] }
+  | { kind: "only-unsupported-remaining"; keys: readonly string[] }
+  | { kind: "save-rejected-elsewhere"; messageKey: ConnectorRuntimeErrorMessageKey }
+  | { kind: "resend-not-sent"; disposition: MessageDeliveryDisposition | null }
+  | { kind: "resend-already-sent" }
+
+export type Tell = { notice: Notice } | { silent: SilenceReason }
+
+/** How a flow ends while its request is still the current one. */
+export interface Finish {
+  tell: Tell
+  event: FinishingEvent | null
+  close?: ConnectorRuntimeDialogCloseOutcome
+}
+
+/**
+ * The answers a flow gives at the moment an await returns, one per way it
+ * can find the dialog. All three are required, so no await can answer only
+ * for the case its author had in mind; the dialog, not the flow, decides
+ * which one applies. `unmounted` can only say something. `superseded` can
+ * also leave a panel retry's verdict on its panel, but has no event and no
+ * close: closing would close the request the user is looking at now, which
+ * this flow knows nothing about. `current` is how the flow ends, or
+ * "continue" when it goes on to its next step.
+ */
+export interface Exit {
+  unmounted: Tell
+  superseded: { tell: Tell; retryAttempt?: { merged: MessageDeliveryDisposition | null } }
+  current: Finish | "continue"
 }
 
 const NO_DRAFTS: Readonly<Record<string, string>> = Object.freeze({})

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs"
+import path from "node:path"
 import { describe, expect, it } from "vitest"
 
 import {
@@ -621,5 +623,82 @@ describe("reduceDialog", () => {
   ] as Array<[string, Phase, DialogEvent]>)("returns the state unchanged for %s", (_name, phase, event) => {
     const state = shown(phase)
     expect(reduceDialog(state, event)).toBe(state)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The dialog's endings go through its exits
+// ---------------------------------------------------------------------------
+
+describe("the dialog's endings", () => {
+  // Comments stripped, so prose that mentions a name does not count as one.
+  const source = readFileSync(path.resolve(__dirname, "./connector-runtime-dialog.tsx"), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1")
+
+  function within(src: string, index: number, ...names: string[]): boolean {
+    return names.some((name) => {
+      const start = src.indexOf(`  const ${name} = `)
+      expect(start, name).toBeGreaterThanOrEqual(0)
+      return index > start && index < src.indexOf("\n  }\n", start)
+    })
+  }
+  function lineAt(src: string, index: number): string {
+    return src.slice(src.lastIndexOf("\n", index) + 1, src.indexOf("\n", index)).trim()
+  }
+
+  const FINISHING_TYPES = [
+    "superseded",
+    "save-rejected",
+    "reject-refresh-settled",
+    "save-landed",
+    "resend-settled",
+    "retry-settled",
+    "retry-abandoned",
+  ] satisfies Array<FinishingEvent["type"]>
+
+  // Every mention of the name counts, not only a call spelled `name(`, so a
+  // method on it (`toast.error(`), a call on some other object (`ctl.close(`)
+  // or an alias is caught too. Each rule lists the only places a mention may
+  // stand and returns the lines of the ones that stand anywhere else.
+  const RULES = {
+    toast: (src: string) => strays(src, /\btoast\b/g, (i, line) => line.startsWith("import ") || within(src, i, "say")),
+    close: (src: string) => strays(src, /\bclose\b/g, (i, line) => (
+      line === "const { close } = useConnectorRuntimeDialog()"
+      || line.endsWith(", close])")
+      || src.startsWith("close: \"", i)
+      || within(src, i, "finish")
+    )),
+    // Outside the exits, only a literal non-finishing event, or the read
+    // effect's own "kept" read-settled event, may be dispatched.
+    dispatch: (src: string) => strays(src, /\bdispatch\b/g, (i, line) => {
+      if (line.startsWith("const [state, dispatch] = useReducer(") || within(src, i, "finish", "settle")) return true
+      if (!src.startsWith("dispatch(", i)) return false
+      const argument = src.slice(i + "dispatch(".length, i + "dispatch(".length + 80)
+      const literal = /^\{\s*type:\s*"([a-z-]+)"/.exec(argument)
+      return literal ? !(FINISHING_TYPES as string[]).includes(literal[1]) : argument.startsWith("kept)")
+    }),
+  }
+  function strays(src: string, name: RegExp, allowed: (index: number, line: string) => boolean): string[] {
+    return Array.from(src.matchAll(name), m => m.index ?? -1)
+      .filter(index => !allowed(index, lineAt(src, index)))
+      .map(index => lineAt(src, index))
+  }
+
+  it.each(["toast", "close", "dispatch"] as const)("names %s only where the exits allow", (rule) => {
+    expect(RULES[rule](source)).toEqual([])
+  })
+
+  it.each([
+    ["toast", "toast.error(\"x\")"],
+    ["toast", "const shout = toast"],
+    ["close", "ctl.close(\"dismissed\")"],
+    ["close", "const ctl = { close }"],
+    ["close", "const { close: shut } = useConnectorRuntimeDialog()"],
+    ["dispatch", "dispatch({ type: \"retry-abandoned\" })"],
+    ["dispatch", "const send = dispatch"],
+  ] as const)("catches a stray %s: %s", (rule, stray) => {
+    const at = source.indexOf("  const handleDismiss = ")
+    expect(RULES[rule](`${source.slice(0, at)}  ${stray}\n${source.slice(at)}`)).toEqual([stray])
   })
 })
