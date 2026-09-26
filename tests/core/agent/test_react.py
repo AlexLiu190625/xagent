@@ -4890,6 +4890,328 @@ async def test_a_run_with_a_registered_spill_offers_the_reader_on_ordinary_turns
     assert "calculator" in names
 
 
+# --- forced-answer turn: read state ------------------------------------------
+
+_FORCED_READ_STATE_KEYS = (
+    "forced_answer_reads_used",
+    "forced_answer_reads_rejected",
+    "forced_answer_read_open",
+    "forced_answer_extra_iterations",
+)
+
+
+def _forced_read_state(state: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(state[key] for key in _FORCED_READ_STATE_KEYS)
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        (0, 0),
+        (1, 1),
+        (3, 3),
+        (5, 5),
+        (None, 0),
+        (-2, 0),
+        ("missing", 0),
+    ],
+)
+@pytest.mark.parametrize(
+    ("key", "attribute"),
+    [
+        ("forced_answer_reads_used", "forced_answer_reads_used"),
+        ("forced_answer_reads_rejected", "forced_answer_reads_rejected"),
+        ("forced_answer_extra_iterations", "forced_answer_extra_iterations"),
+    ],
+)
+def test_read_policy_fields_round_trip_through_checkpoint(
+    key: str, attribute: str, stored: Any, expected: int
+) -> None:
+    source = ReActPattern()
+    source.forced_answer_reads_used = 2
+    source.forced_answer_reads_rejected = 1
+    source._forced_answer_read_open = True
+    source.forced_answer_extra_iterations = 3
+    state = source.get_state()
+    assert _forced_read_state(state) == (2, 1, True, 3)
+    restored = ReActPattern()
+    restored.load_state(state)
+    assert (
+        restored.forced_answer_reads_used,
+        restored.forced_answer_reads_rejected,
+        restored._forced_answer_read_open,
+        restored.forced_answer_extra_iterations,
+    ) == (2, 1, True, 3)
+
+    if stored == "missing":
+        del state[key]
+    else:
+        state[key] = stored
+    restored = ReActPattern()
+    setattr(restored, attribute, 7)
+    restored.load_state(state)
+    assert getattr(restored, attribute) == expected
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [(True, True), (False, False), ("missing", False), ("yes", True), (0, False)],
+)
+def test_read_open_flag_round_trips_through_checkpoint(
+    stored: Any, expected: bool
+) -> None:
+    state = ReActPattern().get_state()
+    if stored == "missing":
+        del state["forced_answer_read_open"]
+    else:
+        state["forced_answer_read_open"] = stored
+    restored = ReActPattern()
+    restored._forced_answer_read_open = not expected
+    restored.load_state(state)
+    assert restored._forced_answer_read_open is expected
+
+
+class _ProtocolErrorThenScriptLLM:
+    """Raises one LLMToolProtocolError, then replays scripted responses."""
+
+    def __init__(self, code: str, responses: list[Any]) -> None:
+        self.code = code
+        self.responses = responses
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            raise LLMToolProtocolError(
+                provider="deepseek",
+                code=self.code,
+                message="The model called a tool that is not available.",
+            )
+        return self.responses.pop(0)
+
+
+def _preset_forced_turn(pattern: ReActPattern) -> None:
+    pattern.force_final_answer_next = True
+    pattern._forced_answer_read_open = True
+    pattern.forced_answer_reads_used = 2
+    pattern.forced_answer_reads_rejected = 1
+    pattern.forced_answer_extra_iterations = 3
+
+
+def _checkpoint_states(runtime: PatternRuntime, label: str) -> list[dict[str, Any]]:
+    return [
+        payload["pattern_state"]
+        for payload in runtime.checkpoints
+        if payload["label"] == label
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exit_point",
+    ["protocol_exception_recovery", "protocol_retry_recovery", "pause", "finalize"],
+)
+async def test_releasing_forced_answer_resets_the_forced_turn_state(
+    exit_point: str,
+) -> None:
+    """The four places that leave the forced turn clear the force flag and
+    the read-open flag, and leave the per-run counters and the extra
+    iterations alone."""
+    pattern = ReActPattern(max_iterations=4)
+    pattern.task_text = "t"
+    _preset_forced_turn(pattern)
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    context.add_user_message("What is 1+1?")
+    runtime = PatternRuntime(execution_id="release")
+    tools = [FakeTool(), FakeReadToolResultTool()]
+    calculator_call = _tool_call_response(
+        "call_calc", "calculator", '{"expression": "1+1"}'
+    )
+    final_call = _tool_call_response("call_final", "final_answer", '{"answer": "2"}')
+
+    if exit_point == "pause":
+        pattern._discard_pending_tool_plan_after_pause(context)
+        state = pattern.get_state()
+    else:
+        if exit_point == "protocol_exception_recovery":
+            llm: Any = _ProtocolErrorThenScriptLLM(
+                "unavailable_tool_call", [calculator_call, final_call]
+            )
+        elif exit_point == "protocol_retry_recovery":
+            llm = FakeLLM([calculator_call, calculator_call, final_call])
+        else:
+            llm = FakeLLM([final_call])
+        result = await pattern.run(
+            context=context, tools=tools, llm=llm, runtime=runtime
+        )
+        assert result["success"] is True
+        label = "final" if exit_point == "finalize" else "after_llm"
+        state = _checkpoint_states(runtime, label)[0]
+        if exit_point != "finalize":
+            # The retry ran on the full tool set, so the call it returned ran.
+            assert "calculator" in _schema_names(llm.calls[1])
+            assert tools[0].calls == [{"expression": "1+1"}]
+
+    assert state["force_final_answer_next"] is False
+    assert _forced_read_state(state) == (2, 1, False, 3)
+
+
+@pytest.mark.asyncio
+async def test_invalid_protocol_exit_only_closes_the_forced_turn_reads() -> None:
+    """Ending the run on an invalid tool protocol closes the reads offered
+    to the forced turn and leaves the force flag, the per-run counters and
+    the extra iterations as they were."""
+    pattern = ReActPattern(max_iterations=4)
+    pattern.task_text = "t"
+    _preset_forced_turn(pattern)
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    context.add_user_message("What is 1+1?")
+    runtime = PatternRuntime(execution_id="invalid")
+    empty_answer = _tool_call_response("call_empty", "final_answer", '{"answer": ""}')
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool(), FakeReadToolResultTool()],
+        llm=FakeLLM([empty_answer, dict(empty_answer)]),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    (state,) = _checkpoint_states(runtime, "invalid_tool_protocol")
+    assert state["force_final_answer_next"] is True
+    assert _forced_read_state(state) == (2, 1, False, 3)
+
+
+def _decision_response(action: str) -> dict[str, Any]:
+    return _tool_call_response(
+        "call_decision",
+        "react_decision",
+        json.dumps({"action": action, "reason": "more"}),
+    )
+
+
+# Recorded on the parent commit with the same scripts: the checkpoint labels
+# with force_final_answer_next at each, and the tool names each model call
+# received. A run whose registry stays empty must reproduce both exactly.
+_EMPTY_REGISTRY_BASELINES: dict[str, dict[str, Any]] = {
+    "derived_forced_turn": {
+        "pattern": {
+            "max_iterations": 2,
+            "finalize_after_tool_result": True,
+            "repeated_tool_decision_after_consecutive_tool_calls": 1,
+        },
+        "responses": [
+            _tool_call_response("c1", "calculator", '{"expression": "1+1"}'),
+            _decision_response("tool_call"),
+            _tool_call_response("f1", "final_answer", '{"answer": "2"}'),
+        ],
+        "checkpoints": [
+            ("before_llm", False),
+            ("after_llm", False),
+            ("before_tool", False),
+            ("after_tool", False),
+            ("repeated_tool_decision_requested", False),
+            ("repeated_tool_decision_continue", False),
+            ("before_llm", False),
+            ("after_llm", False),
+            ("final", False),
+            ("completed", False),
+        ],
+        "tools": [
+            ["calculator", "final_answer", "send_message", "ask_user_question"],
+            ["react_decision"],
+            ["final_answer"],
+        ],
+        "status": "completed",
+    },
+    "invalid_protocol": {
+        "pattern": {"max_iterations": 2, "finalize_after_tool_result": True},
+        "responses": [
+            _tool_call_response("c1", "calculator", '{"expression": "1+1"}'),
+            _tool_call_response("f1", "final_answer", '{"answer": ""}'),
+            _tool_call_response("f2", "final_answer", '{"answer": ""}'),
+        ],
+        "checkpoints": [
+            ("before_llm", False),
+            ("after_llm", False),
+            ("before_tool", False),
+            ("after_tool", False),
+            ("before_llm", True),
+            ("empty_final_answer_recovery", True),
+            ("invalid_tool_protocol", True),
+        ],
+        "tools": [
+            ["calculator", "final_answer", "send_message", "ask_user_question"],
+            ["final_answer"],
+            ["final_answer"],
+        ],
+        "status": "invalid_tool_protocol",
+    },
+    "reader_call_recovers": {
+        "pattern": {"max_iterations": 2, "finalize_after_tool_result": True},
+        "responses": [
+            _tool_call_response("c1", "calculator", '{"expression": "1+1"}'),
+            _tool_call_response("r1", SPILL_READ_TOOL_NAME, "{}"),
+            _tool_call_response("c2", "calculator", '{"expression": "2+2"}'),
+            _tool_call_response("f1", "final_answer", '{"answer": "4"}'),
+        ],
+        "checkpoints": [
+            ("before_llm", False),
+            ("after_llm", False),
+            ("before_tool", False),
+            ("after_tool", False),
+            ("before_llm", True),
+            ("unavailable_tool_call_recovery", True),
+            ("after_llm", False),
+            ("before_tool", False),
+            ("after_tool", False),
+            ("before_iteration_limit_delivery", True),
+            ("max_iterations", True),
+        ],
+        "tools": [
+            ["calculator", "final_answer", "send_message", "ask_user_question"],
+            ["final_answer"],
+            ["calculator", "final_answer", "send_message", "ask_user_question"],
+            ["final_answer"],
+        ],
+        "status": "max_iterations",
+    },
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", sorted(_EMPTY_REGISTRY_BASELINES))
+async def test_empty_registry_flash_run_matches_the_baseline(scenario: str) -> None:
+    """With the reader tool present but nothing stored, a flash run sends the
+    model the same tools, walks the same checkpoints with the same force
+    flag, and every checkpoint carries the new read keys at their defaults."""
+    baseline = _EMPTY_REGISTRY_BASELINES[scenario]
+    llm = FakeLLM([dict(response) for response in baseline["responses"]])
+    pattern = ReActPattern(**baseline["pattern"])
+    pattern.task_text = "t"
+    context = ExecutionContext()
+    context.add_user_message("What is 1+1?")
+    runtime = PatternRuntime(execution_id="zero-change")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool(), FakeReadToolResultTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["status"] == baseline["status"]
+    assert [
+        (payload["label"], payload["pattern_state"]["force_final_answer_next"])
+        for payload in runtime.checkpoints
+    ] == baseline["checkpoints"]
+    assert [_schema_names(call) for call in llm.calls] == baseline["tools"]
+    for payload in runtime.checkpoints:
+        assert _forced_read_state(payload["pattern_state"]) == (0, 0, False, 0)
+    assert context.get_component("spilled_results") is None
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_can_finish_with_final_answer_tool() -> None:
     llm = FakeLLM(

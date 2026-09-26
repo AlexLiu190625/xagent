@@ -169,6 +169,11 @@ STRIP_LOG_MAX_TOOL_NAMES = 8
 STRIP_LOG_MAX_TOOL_NAME_CHARS = 64
 # One best-effort delivery turn after the work budget, never another work loop.
 ITERATION_LIMIT_DELIVERY_TIMEOUT_SECONDS = 30.0
+# Stored-result reads a forced answer turn may make, counted over the whole
+# run: reads that ran (the budget) and paths that matched no stored result
+# (the reject cap) are counted apart so neither kind uses up the other.
+FORCED_ANSWER_READ_BUDGET = 3
+FORCED_ANSWER_READ_REJECT_CAP = 3
 REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Target natural language for user-facing prose in this ReAct response, "
     "for example English, Simplified Chinese, Traditional Chinese, or Spanish. "
@@ -575,6 +580,17 @@ class ReActPattern(AgentPattern):
         self.pending_tool_call_content: dict[str, str] = {}
         self.tool_ledger: dict[str, ToolCallRecord] = {}
         self.force_final_answer_next = False
+        # Forced-answer read state. The two counters are per run and never
+        # reset, so a run makes at most FORCED_ANSWER_READ_BUDGET +
+        # FORCED_ANSWER_READ_REJECT_CAP forced-turn read dispositions.
+        # _forced_answer_read_open says whether the current forced turn offers
+        # read_tool_result; forced_answer_extra_iterations counts the
+        # iterations those dispositions added on top of max_iterations and is
+        # never reset either.
+        self.forced_answer_reads_used = 0
+        self.forced_answer_reads_rejected = 0
+        self._forced_answer_read_open = False
+        self.forced_answer_extra_iterations = 0
         # See _settlement_fence_active: a one-way latch for the single turn
         # that received a rejected / dispatch-unknown settlement.
         self.settlement_final_answer_fence = False
@@ -1003,7 +1019,7 @@ class ReActPattern(AgentPattern):
                         return interrupted
                     raise
                 if restore_full_tool_set:
-                    self.force_final_answer_next = False
+                    self._release_forced_answer()
                     force_final_answer_now = False
                 protocol_retry_performed = True
                 response_already_traced = True
@@ -1104,7 +1120,7 @@ class ReActPattern(AgentPattern):
                         return interrupted
                     raise
                 if recover_full_tool_set:
-                    self.force_final_answer_next = False
+                    self._release_forced_answer()
                     force_final_answer_now = False
                 self.last_response = response
                 normalized = self._normalize_llm_response(response)
@@ -1359,6 +1375,9 @@ class ReActPattern(AgentPattern):
         )
         if answer_streamer is not None:
             await answer_streamer.fail(stream_failure_message)
+        # The run ends here, so the forced turn no longer offers reads. The
+        # force flag keeps its value and the per-run counters are not reset.
+        self._forced_answer_read_open = False
         await runtime.checkpoint(
             "invalid_tool_protocol",
             context=context,
@@ -1929,6 +1948,17 @@ class ReActPattern(AgentPattern):
                 return schema
         raise RuntimeError("final_answer control tool schema is unavailable")
 
+    def _release_forced_answer(self) -> None:
+        """Leave the forced answer turn.
+
+        The two read counters are per run and are not reset here, so a later
+        forced turn in the same run gets no fresh read allowance.
+        forced_answer_extra_iterations is never reset: it is part of the
+        loop bound, and the iteration may already be past max_iterations.
+        """
+        self.force_final_answer_next = False
+        self._forced_answer_read_open = False
+
     def _schema_tool_names(self, tool_schemas: list[dict[str, Any]]) -> list[str]:
         names: list[str] = []
         for schema in tool_schemas:
@@ -2009,6 +2039,14 @@ class ReActPattern(AgentPattern):
                 self.repeated_tool_decision_after_consecutive_work_tool_calls
             ),
             "force_final_answer_next": self.force_final_answer_next,
+            # Scalars, only ever reassigned. forced_answer_read_open must
+            # survive a resume: the read policy also runs for pending calls
+            # replayed from the top of the loop, where the turn that offered
+            # the reads is no longer being computed.
+            "forced_answer_reads_used": self.forced_answer_reads_used,
+            "forced_answer_reads_rejected": self.forced_answer_reads_rejected,
+            "forced_answer_read_open": self._forced_answer_read_open,
+            "forced_answer_extra_iterations": self.forced_answer_extra_iterations,
             # Scalars, so no snapshot needed: the fence flag and the turn it
             # is scoped to are only ever reassigned (see
             # ``_settlement_fence_active`` and ``_record_settled_tool_call``).
@@ -2095,6 +2133,21 @@ class ReActPattern(AgentPattern):
                 int(raw_work_threshold) if raw_work_threshold is not None else None
             )
         self.force_final_answer_next = bool(state.get("force_final_answer_next", False))
+        # A missing, None or negative value reads as the default, so a
+        # checkpoint written before these keys existed resumes as a run that
+        # made no forced-turn reads.
+        self.forced_answer_reads_used = max(
+            0, int(state.get("forced_answer_reads_used", 0) or 0)
+        )
+        self.forced_answer_reads_rejected = max(
+            0, int(state.get("forced_answer_reads_rejected", 0) or 0)
+        )
+        self._forced_answer_read_open = bool(
+            state.get("forced_answer_read_open", False)
+        )
+        self.forced_answer_extra_iterations = max(
+            0, int(state.get("forced_answer_extra_iterations", 0) or 0)
+        )
         self.settlement_final_answer_fence = bool(
             state.get("settlement_final_answer_fence", False)
         )
@@ -3842,7 +3895,7 @@ class ReActPattern(AgentPattern):
         discarded_calls = self.pending_tool_calls
         self.pending_tool_calls = []
         self.repeated_tool_decision = None
-        self.force_final_answer_next = False
+        self._release_forced_answer()
         self._cancel_tool_calls(
             discarded_calls,
             context,
@@ -4748,7 +4801,7 @@ class ReActPattern(AgentPattern):
         self.pending_tool_calls = []
         self.waiting_for_user_request = None
         self.pending_tool_interaction_responses = []
-        self.force_final_answer_next = False
+        self._release_forced_answer()
         self.settlement_final_answer_fence = False
         self.settlement_fence_turn_id = None
         self.status = "completed"
