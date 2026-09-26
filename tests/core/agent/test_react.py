@@ -6023,24 +6023,33 @@ class _InterruptingReader(RecordingReadToolResultTool):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "concurrent"])
+@pytest.mark.parametrize(
+    ("parallel", "with_id"),
+    [(False, True), (True, True), (False, False)],
+    ids=["serial", "concurrent", "serial_without_id"],
+)
 async def test_a_read_interrupted_while_running_is_counted_once(
-    parallel: bool,
+    parallel: bool, with_id: bool
 ) -> None:
     """A forced-turn read stopped while it runs was admitted and counted
     before it started. Resuming from the interrupted checkpoint runs the same
-    read again without counting it a second time."""
+    read again without counting it a second time -- also for a call the
+    model sent without an id, which gets its ledger key before it runs."""
     reads = 2 if parallel else 1
     reader = _InterruptingReader()
     pattern = _forced_turn_pattern(tool_parallel_enabled=parallel)
     context = _forced_turn_context(True, _SPILL_PATH)
     runtime = PatternRuntime(execution_id="interrupted-read")
     reader.runtime = runtime
+    response = _read_batch([{"path": _SPILL_PATH}] * reads)
+    if not with_id:
+        for call in response["tool_calls"]:
+            del call["id"]
 
     first = await pattern.run(
         context=context,
         tools=[FakeTool(), reader],
-        llm=FakeLLM([_read_batch([{"path": _SPILL_PATH}] * reads)]),
+        llm=FakeLLM([response]),
         runtime=runtime,
     )
 
