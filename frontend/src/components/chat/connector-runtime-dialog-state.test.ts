@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest"
 
 import {
+  canResendReport,
   deriveGates,
+  mergeSendFailureDisposition,
+  uniqueKeys,
   type GateFacts,
   type InvalidObjectDraftReason,
   type SendFailureState,
@@ -36,6 +39,8 @@ const FILLABLE_REPORT = report(false, [
 ])
 
 const DRAFT_KEY = `${REF.connector_type}:${REF.connector_id}:context:k:string`
+const OBJECT_DRAFT_KEY = `${REF.connector_type}:${REF.connector_id}:context:obj:object`
+const FILLED_ITEMS = [{ connector_ref: REF, context: { k: "value" } }]
 
 function baseFacts(overrides: Partial<GateFacts> = {}): GateFacts {
   return {
@@ -142,24 +147,60 @@ describe("deriveGates", () => {
       expect: { actions: ["saveAndResend", "saveOnly"], hasSaveEntryPoint: true, hasResendPayload: true },
     },
     {
-      name: "canSubmitNow: a fillable report with its required row still empty cannot submit",
+      name: "submitItems/canSubmit/canSubmitNow: a fillable report with its required row still empty cannot submit",
       facts: baseFacts({ report: FILLABLE_REPORT, reportSeq: 1 }),
-      expect: { canSubmitNow: false },
+      expect: { submitItems: [], hasInvalidObjectDraft: false, canSubmit: false, canSubmitNow: false },
     },
     {
-      name: "canSubmitNow: filling the required row enables it",
+      name: "submitItems/canSubmit/canSubmitNow: filling the required row enables it",
       facts: baseFacts({ report: FILLABLE_REPORT, reportSeq: 1, drafts: { [DRAFT_KEY]: "value" } }),
-      expect: { canSubmitNow: true },
+      expect: { submitItems: FILLED_ITEMS, hasInvalidObjectDraft: false, canSubmit: true, canSubmitNow: true },
     },
     {
-      name: "canSubmitNow: busy holds it closed even once the row is filled",
+      name: "canSubmit/canSubmitNow: busy holds it closed even once the row is filled",
       facts: baseFacts({ report: FILLABLE_REPORT, reportSeq: 1, drafts: { [DRAFT_KEY]: "value" }, busy: true }),
-      expect: { canSubmitNow: false },
+      expect: { canSubmit: true, canSubmitNow: false },
     },
     {
-      name: "canSubmitNow: a stale report holds it closed even once the row is filled",
+      name: "canSubmit/canSubmitNow: a stale report holds it closed even once the row is filled",
       facts: baseFacts({ report: FILLABLE_REPORT, reportSeq: 1, drafts: { [DRAFT_KEY]: "value" }, request: { seq: 2, resendPayload: null } }),
-      expect: { canSubmitNow: false },
+      expect: { canSubmit: true, canSubmitNow: false },
+    },
+    {
+      name: "hasInvalidObjectDraft/canSubmit: a live mark on an object row blocks submission even while another row is validly filled",
+      facts: baseFacts({
+        report: report(false, [connector([
+          input({ section: "context", key: "k", type: "string", required: true }),
+          input({ section: "context", key: "obj", type: "object" }),
+        ])]),
+        reportSeq: 1,
+        drafts: { [DRAFT_KEY]: "value", [OBJECT_DRAFT_KEY]: "{" },
+        invalidDraftKeys: new Map<string, InvalidObjectDraftReason>([[OBJECT_DRAFT_KEY, "invalid"]]),
+      }),
+      expect: { submitItems: FILLED_ITEMS, hasInvalidObjectDraft: true, canSubmit: false, canSubmitNow: false },
+    },
+    {
+      name: "hasInvalidObjectDraft/canSubmit: a mark on an object row the report now reports satisfied is not live",
+      facts: baseFacts({
+        report: report(false, [connector([
+          input({ section: "context", key: "k", type: "string", required: true }),
+          input({ section: "context", key: "obj", type: "object", satisfied: true }),
+        ])]),
+        reportSeq: 1,
+        drafts: { [DRAFT_KEY]: "value" },
+        invalidDraftKeys: new Map<string, InvalidObjectDraftReason>([[OBJECT_DRAFT_KEY, "invalid"]]),
+      }),
+      expect: { submitItems: FILLED_ITEMS, hasInvalidObjectDraft: false, canSubmit: true, canSubmitNow: true },
+    },
+    {
+      name: "hasInvalidObjectDraft/canSubmit: a mark on a row the report declares string-typed is not live",
+      facts: baseFacts({
+        report: FILLABLE_REPORT,
+        reportSeq: 1,
+        drafts: { [DRAFT_KEY]: "value" },
+        invalidDraftKeys: new Map<string, InvalidObjectDraftReason>([[DRAFT_KEY, "invalid"]]),
+      }),
+      expect: { submitItems: FILLED_ITEMS, hasInvalidObjectDraft: false, canSubmit: true, canSubmitNow: true },
     },
     {
       name: "hasInvalidObjectDraft/canSubmitNow: a live invalid-object mark on the only required row blocks submission even though it is \"filled\"",
@@ -191,6 +232,15 @@ describe("deriveGates", () => {
       expect: { metHoldingSnapshot: false },
     },
     {
+      name: "metHoldingSnapshot: true when the held failure is for a snapshot the request no longer carries",
+      facts: baseFacts({
+        report: MET_REPORT,
+        heldFailure: FAILURE,
+        request: { seq: 1, resendPayload: { clientMessageId: "cid-2" } },
+      }),
+      expect: { sendFailed: false, needsSnapshotRecycle: true, metHoldingSnapshot: true },
+    },
+    {
       name: "metHoldingSnapshot: false while busy (a save-and-resend for this same message is still on the wire)",
       facts: baseFacts({ report: MET_REPORT, request: { seq: 1, resendPayload: { clientMessageId: "cid-1" } }, busy: true }),
       expect: { metHoldingSnapshot: false },
@@ -207,7 +257,7 @@ describe("deriveGates", () => {
     },
     {
       name: "retryResendDisabled: a retry is already out",
-      facts: baseFacts({ reportSeq: 1, request: { seq: 1, resendPayload: null }, retrying: true }),
+      facts: baseFacts({ reportSeq: 1, request: { seq: 1, resendPayload: null }, busy: true, retrying: true }),
       expect: { retryResendDisabled: true },
     },
     {
@@ -224,21 +274,29 @@ describe("deriveGates", () => {
   // the report's own outcome (met, fillable, ...) are independent
   // dimensions, not one flattened display phase. A same-task retarget's
   // re-read installs whatever report comes back regardless of what is in
-  // flight, so a report that reads "still needs a value" can land while a
-  // save-and-resend for an earlier, now-superseded snapshot is still out.
-  // Both facts must show up in the gates at once: busy holds every submit
-  // gate closed, and the fillable outcome still drives the row and footer
-  // content underneath it.
-  it("holds submission closed while busy, even when a same-task re-read replaces the report with one still asking for a value", () => {
+  // flight, so a report that reads "still needs a value" can land while the
+  // send-failed panel's retry resend for the earlier snapshot is still out.
+  // The retarget swapped in a newer snapshot, so the held failure no longer
+  // matches and the panel is gone; the retry is still in flight, so busy
+  // holds every submit gate closed even with the row filled; and the
+  // fillable outcome still drives the row and footer content underneath.
+  it("holds submission closed while a retry for a superseded snapshot is out, even when a same-task re-read replaces the report with one still asking for a value", () => {
     const gates = deriveGates(baseFacts({
       report: FILLABLE_REPORT,
       reportSeq: 7,
       settledReadKey: "7:0",
       busy: true,
+      retrying: true,
+      heldFailure: FAILURE,
+      drafts: { [DRAFT_KEY]: "value" },
       request: { seq: 7, resendPayload: { clientMessageId: "cid-9" } },
     }))
     expect(gates.reportIsStale).toBe(false)
     expect(gates.reading).toBe(false)
+    expect(gates.liveSendFailure).toBeNull()
+    expect(gates.sendFailed).toBe(false)
+    expect(gates.needsSnapshotRecycle).toBe(true)
+    expect(gates.canSubmit).toBe(true)
     // "blocking" on a fillable outcome lists the still-unsupported secrets
     // group, not the context row the report is fillable *because* of --
     // there is none here, so it is empty even though "k" is what makes this
@@ -248,5 +306,47 @@ describe("deriveGates", () => {
     expect(gates.hasSaveEntryPoint).toBe(true)
     expect(gates.canSubmitNow).toBe(false)
     expect(gates.metHoldingSnapshot).toBe(false)
+    expect(gates.retryResendDisabled).toBe(true)
+  })
+})
+
+describe("mergeSendFailureDisposition", () => {
+  it.each([
+    { previous: null, attempt: null, merged: null },
+    { previous: null, attempt: "not_sent", merged: "not_sent" },
+    { previous: null, attempt: "rejected", merged: "rejected" },
+    { previous: null, attempt: "outcome_unknown", merged: "outcome_unknown" },
+    { previous: "not_sent", attempt: "rejected", merged: "rejected" },
+    { previous: "rejected", attempt: "not_sent", merged: "not_sent" },
+    { previous: "not_sent", attempt: "outcome_unknown", merged: "outcome_unknown" },
+    // Uncertainty only accumulates: a later attempt that definitely did not
+    // land does not make an earlier unknown one un-sent.
+    { previous: "outcome_unknown", attempt: "not_sent", merged: "outcome_unknown" },
+    { previous: "outcome_unknown", attempt: "rejected", merged: "outcome_unknown" },
+    { previous: "outcome_unknown", attempt: null, merged: "outcome_unknown" },
+  ] as const)("($previous, $attempt) -> $merged", ({ previous, attempt, merged }) => {
+    expect(mergeSendFailureDisposition(previous, attempt)).toBe(merged)
+  })
+})
+
+describe("canResendReport", () => {
+  it.each([
+    { name: "met", report: MET_REPORT, expected: true },
+    { name: "fillable", report: FILLABLE_REPORT, expected: false },
+    { name: "unsupported_only", report: UNSUPPORTED_ONLY_REPORT, expected: false },
+    { name: "nothing_fillable", report: NOTHING_FILLABLE_REPORT, expected: false },
+  ])("$name -> $expected", ({ report: r, expected }) => {
+    expect(canResendReport(r)).toBe(expected)
+  })
+})
+
+describe("uniqueKeys", () => {
+  it.each([
+    { locations: [], keys: [] },
+    { locations: [{ key: "a" }], keys: ["a"] },
+    { locations: [{ key: "a" }, { key: "b" }, { key: "a" }], keys: ["a", "b"] },
+    { locations: [{ key: "b" }, { key: "a" }, { key: "b" }, { key: "a" }], keys: ["b", "a"] },
+  ])("$locations.length locations -> $keys", ({ locations, keys }) => {
+    expect(uniqueKeys(locations)).toEqual(keys)
   })
 })
