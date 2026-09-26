@@ -893,34 +893,39 @@ class ToolFactory:
     def _resolve_spill_target(
         tools: list[Tool], max_chars: int
     ) -> "SpillTarget | None":
-        """Find this tool set's read_file tool bound to a real task workspace.
+        """Find this tool set's read_tool_result bound to a real task workspace.
 
-        Looks for a tool literally named "read_file" whose underlying
+        A stored result is only useful if the model can read it back, so the
+        decision rests on the reader itself: a target is built only when the
+        tool set contains a FunctionTool named SPILL_READ_TOOL_NAME whose
         function is a bound method on an instance exposing a `workspace`
-        attribute (WorkspaceFileTools), run before this tool has been
-        wrapped for output filtering. A target is built only when that
-        workspace is a TaskWorkspace: the tool-listing endpoint binds
-        read_file to a MockWorkspace, which never creates directories on
-        disk, so it must not get a spill target. The directory comes from
-        spill_dir_for_workspace, the same function the execution context
-        and the stored-result reader use.
+        attribute (WorkspaceFileTools), looked at before any tool has been
+        wrapped for output filtering, and only when that workspace is a
+        TaskWorkspace. The tool-listing endpoint binds the file tools to a
+        MockWorkspace, which never creates directories on disk, so it must
+        not get a spill target. The directory comes from
+        spill_dir_for_workspace, the same function the execution context and
+        the stored-result reader use.
 
-        No such read_file means no spill target: a deployment with no file
-        tools, one where read_file has been renamed or filtered out by tool
-        policy, or a tool set bound to a mock workspace keeps today's
-        truncation behavior unchanged. A tool named read_file that is not a
-        FunctionTool -- a task runtime extension may contribute one when the
-        file tools are disabled -- has no bound method to inspect, so it is
-        treated the same as a read_file not bound to a task workspace.
+        No such reader means no spill target, and the tool set keeps today's
+        truncation behavior unchanged: a deployment with no file tools, one
+        whose tool policy removes read_tool_result by name (a legacy
+        allowed_tools list, a per-user disabled-tools table or a per-user
+        allowlist written before the reader existed, any of which can keep
+        read_file while dropping the reader), or a tool set bound to a mock
+        workspace. A tool with the reader's name that is not a FunctionTool
+        -- a task runtime extension may contribute one when the file tools
+        are disabled -- has no bound method to inspect, so it is treated the
+        same as a reader not bound to a task workspace.
         """
         from .function import FunctionTool
         from .sandboxed_tool.sandbox_config import extract_bound_method_target
 
-        found_read_file = False
+        found_reader = False
         for tool in tools:
-            if getattr(tool, "name", None) != "read_file":
+            if getattr(tool, "name", None) != SPILL_READ_TOOL_NAME:
                 continue
-            found_read_file = True
+            found_reader = True
             if not isinstance(tool, FunctionTool):
                 continue
             target = extract_bound_method_target(tool)
@@ -934,15 +939,15 @@ class ToolFactory:
                 spill_dir=spill_dir_for_workspace(workspace.workspace_dir),
                 max_chars=max_chars,
             )
-        if found_read_file:
+        if found_reader:
             logger.info(
-                "Tool result spill disabled: read_file in this tool set is "
-                "not bound to a task workspace (tools=%d)",
+                "Tool result spill disabled: read_tool_result is not bound "
+                "to a task workspace (tools=%d)",
                 len(tools),
             )
         else:
             logger.info(
-                "Tool result spill disabled: no read_file tool in this tool "
+                "Tool result spill disabled: no read_tool_result in the tool "
                 "set (tools=%d)",
                 len(tools),
             )

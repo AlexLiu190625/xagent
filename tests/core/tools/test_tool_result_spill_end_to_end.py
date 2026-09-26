@@ -74,9 +74,11 @@ def _bound_workspace(tools):
     return instance.workspace
 
 
-async def _tool_set(tmp_path, *extra_tools, task_id="spill-e2e", **config):
+async def _tool_set(
+    tmp_path, *extra_tools, task_id="spill-e2e", config_cls=ToolConfig, **config
+):
     return await ToolFactory.create_all_tools(
-        ToolConfig(
+        config_cls(
             {"workspace": {"task_id": task_id, "base_dir": str(tmp_path)}, **config}
         ),
         additional_tools=list(extra_tools),
@@ -234,38 +236,87 @@ async def test_a_result_at_exactly_the_threshold_is_not_stored(tmp_path):
     assert reply == result
 
 
-@pytest.mark.asyncio
-async def test_a_deployment_without_a_workspace_bound_read_file_is_unchanged(
-    tmp_path, caplog
-):
-    """Tool policy leaves write_file, still bound to the task workspace, but
-    no read_file: nothing in the set gets a spill target and an oversized
-    value is truncated exactly as before."""
+async def _assert_left_to_truncation(tmp_path, caplog, bound_tool_name, **config):
+    """Build a tool set whose policy removes read_tool_result and check that
+    an oversized value reaches the model exactly as it does without the
+    spill layer: no target anywhere, no file, and the same observation."""
+    big = _returning("acme_big", lambda: {"output": "x" * 60_000})
     with caplog.at_level(
         logging.INFO, logger="xagent.core.tools.adapters.vibe.factory"
     ):
-        tools = await _tool_set(
-            tmp_path,
-            _returning("acme_big", lambda: {"output": "x" * 60_000}),
-            allowed_tools=["write_file", "acme_big"],
-        )
-    assert sorted(tool.name for tool in tools) == ["acme_big", "write_file"]
+        tools = await _tool_set(tmp_path, big, **config)
+    assert not any(tool.name == SPILL_READ_TOOL_NAME for tool in tools)
     assert all(tool._spill_target is None for tool in tools)
     assert any(
         "spill disabled" in record.getMessage()
-        and "no read_file tool" in record.getMessage()
+        and "no read_tool_result in the tool set" in record.getMessage()
         for record in caplog.records
     )
-    bound = extract_bound_method_target(_only_tool_named(tools, "write_file")._target)
+    bound = extract_bound_method_target(
+        _only_tool_named(tools, bound_tool_name)._target
+    )
     assert bound is not None
     workspace = bound[0].workspace
     assert isinstance(workspace, TaskWorkspace)
+    wrapper = _only_tool_named(tools, "acme_big")
+    plain = OutputFilteredToolWrapper(
+        target_tool=big,
+        max_chars=wrapper._filter.max_chars,
+        max_fields=wrapper._filter.max_fields,
+        max_recursion=wrapper._filter.max_recursion,
+    )
 
-    reply = await _only_tool_named(tools, "acme_big").run_json_async({})
+    reply = await wrapper.run_json_async({})
+    observation = _context_for(workspace).add_tool_result("acme_big", reply)
+    today = _context_for(workspace).add_tool_result(
+        "acme_big", await plain.run_json_async({})
+    )
 
     assert SPILL_RESERVED_RESULT_KEY not in reply
     assert DEFAULT_TRUNCATION_MESSAGE in reply["output"]
     assert _stored_files(spill_dir_for_workspace(workspace.workspace_dir)) == []
+    assert observation.content == today.content
+
+
+@pytest.mark.asyncio
+async def test_a_deployment_without_a_workspace_bound_read_tool_result_is_unchanged(
+    tmp_path, caplog
+):
+    """Tool policy leaves write_file, still bound to the task workspace, but
+    none of the reading tools: nothing in the set gets a spill target and an
+    oversized value is truncated exactly as before."""
+    await _assert_left_to_truncation(
+        tmp_path, caplog, "write_file", allowed_tools=["write_file", "acme_big"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_allowlist_without_read_tool_result_stores_nothing(
+    tmp_path, caplog
+):
+    """A concrete allowed_tools list written before read_tool_result existed
+    keeps read_file and drops the reader. A stored value could not be read
+    back, so nothing is stored."""
+    await _assert_left_to_truncation(
+        tmp_path, caplog, "read_file", allowed_tools=["read_file", "acme_big"]
+    )
+
+
+class _ReaderDisabledConfig(ToolConfig):
+    """A per-user disabled-tools table that turns off only the reader."""
+
+    def get_user_tool_overrides(self):
+        return {SPILL_READ_TOOL_NAME: {"enabled": False}}
+
+
+@pytest.mark.asyncio
+async def test_a_per_user_disabled_read_tool_result_stores_nothing(tmp_path, caplog):
+    """A user can disable read_tool_result on its own from the tool list,
+    which keeps read_file. A stored value could not be read back, so
+    nothing is stored."""
+    await _assert_left_to_truncation(
+        tmp_path, caplog, "read_file", config_cls=_ReaderDisabledConfig
+    )
 
 
 @pytest.mark.asyncio

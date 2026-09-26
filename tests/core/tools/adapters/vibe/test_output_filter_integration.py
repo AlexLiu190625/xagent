@@ -734,7 +734,7 @@ def test_a_keyboard_interrupt_is_not_swallowed_by_the_spill_boundary(
     assert not any(r.levelname == "WARNING" for r in caplog.records)
 
 
-# --- the factory resolves a tool set's spill target from its read_file ----
+# --- the factory resolves a tool set's spill target from its reader -------
 
 FACTORY_LOGGER = "xagent.core.tools.adapters.vibe.factory"
 
@@ -754,16 +754,16 @@ def _bound_workspace(wrapper):
 
 
 @pytest.mark.asyncio
-async def test_factory_wires_a_spill_target_when_read_file_is_workspace_bound(
+async def test_factory_wires_a_spill_target_when_read_tool_result_is_workspace_bound(
     tmp_path,
 ):
     config = ToolConfig(
         {"workspace": {"task_id": "spill-target-test", "base_dir": str(tmp_path)}}
     )
     tools = await ToolFactory.create_all_tools(config)
-    read_file = _only_tool_named(tools, "read_file")
-    workspace = _bound_workspace(read_file)
+    workspace = _bound_workspace(_only_tool_named(tools, SPILL_READ_TOOL_NAME))
     assert isinstance(workspace, TaskWorkspace)
+    read_file = _only_tool_named(tools, "read_file")
 
     target = read_file._spill_target
 
@@ -779,7 +779,7 @@ async def test_factory_leaves_spill_target_none_without_workspace(caplog):
     with caplog.at_level(logging.INFO, logger=FACTORY_LOGGER):
         tools = await ToolFactory.create_all_tools(config)
 
-    assert not any(tool.name == "read_file" for tool in tools)
+    assert not any(tool.name == SPILL_READ_TOOL_NAME for tool in tools)
     wrappers = [tool for tool in tools if isinstance(tool, OutputFilteredToolWrapper)]
     assert wrappers
     assert all(wrapper._spill_target is None for wrapper in wrappers)
@@ -789,20 +789,21 @@ async def test_factory_leaves_spill_target_none_without_workspace(caplog):
         if "spill disabled" in record.getMessage()
     ]
     assert disabled
-    assert all("no read_file tool" in message for message in disabled)
+    assert all("no read_tool_result in the tool set" in message for message in disabled)
 
 
 @pytest.mark.asyncio
 async def test_factory_leaves_spill_target_none_for_a_mock_workspace(tmp_path, caplog):
     """The tool-listing endpoint builds its tool set with task_id
-    "tools_list", which binds read_file to a MockWorkspace: a workspace
-    that never exists on disk must not be given a spill target."""
+    "tools_list", which binds the file tools, read_tool_result included, to
+    a MockWorkspace: a workspace that never exists on disk must not be
+    given a spill target."""
     config = ToolConfig(
         {"workspace": {"task_id": "tools_list", "base_dir": str(tmp_path)}}
     )
     with caplog.at_level(logging.INFO, logger=FACTORY_LOGGER):
         tools = await ToolFactory.create_all_tools(config)
-    workspace = _bound_workspace(_only_tool_named(tools, "read_file"))
+    workspace = _bound_workspace(_only_tool_named(tools, SPILL_READ_TOOL_NAME))
     assert isinstance(workspace, MockWorkspace)
 
     wrappers = [tool for tool in tools if isinstance(tool, OutputFilteredToolWrapper)]
@@ -814,12 +815,15 @@ async def test_factory_leaves_spill_target_none_for_a_mock_workspace(tmp_path, c
         if "spill disabled" in record.getMessage()
     ]
     assert disabled
-    assert all("not bound to a task workspace" in message for message in disabled)
+    assert all(
+        "read_tool_result is not bound to a task workspace" in message
+        for message in disabled
+    )
     assert not (Path(workspace.workspace_dir) / "output" / "tool-results").exists()
 
 
-class _ExtensionReadFile(AbstractBaseTool):
-    """A tool named read_file that is not a FunctionTool: no func attribute."""
+class _ExtensionReader(AbstractBaseTool):
+    """A tool named read_tool_result that is not a FunctionTool: no func."""
 
     category = ToolCategory.OTHER
 
@@ -828,11 +832,11 @@ class _ExtensionReadFile(AbstractBaseTool):
 
     @property
     def name(self) -> str:
-        return "read_file"
+        return SPILL_READ_TOOL_NAME
 
     @property
     def description(self) -> str:
-        return "Read a file through a task runtime extension."
+        return "Read a stored result through a task runtime extension."
 
     def args_type(self):
         return self._Args
@@ -848,25 +852,26 @@ class _ExtensionReadFile(AbstractBaseTool):
 
 
 @pytest.mark.asyncio
-async def test_factory_leaves_spill_target_none_for_a_read_file_that_is_not_a_function_tool(
+async def test_factory_leaves_spill_target_none_for_a_read_tool_result_that_is_not_a_function_tool(
     tmp_path, caplog
 ):
     """With the file tools disabled, a task runtime extension may contribute
-    its own read_file. Having no bound method, it cannot name a workspace:
-    the tool set is still built, with no spill target anywhere."""
+    a tool under the reader's name. Having no bound method, it cannot name
+    a workspace: the tool set is still built, with no spill target
+    anywhere."""
     config = ToolConfig(
         {
-            "workspace": {"task_id": "extension-read-file", "base_dir": str(tmp_path)},
+            "workspace": {"task_id": "extension-reader", "base_dir": str(tmp_path)},
             "file_tools_enabled": False,
         }
     )
-    extension_read_file = _ExtensionReadFile()
+    extension_reader = _ExtensionReader()
     with caplog.at_level(logging.INFO, logger=FACTORY_LOGGER):
         tools = await ToolFactory.create_all_tools(
-            config, additional_tools=[extension_read_file]
+            config, additional_tools=[extension_reader]
         )
 
-    assert _only_tool_named(tools, "read_file")._target is extension_read_file
+    assert _only_tool_named(tools, SPILL_READ_TOOL_NAME)._target is extension_reader
     wrappers = [tool for tool in tools if isinstance(tool, OutputFilteredToolWrapper)]
     assert wrappers
     assert all(wrapper._spill_target is None for wrapper in wrappers)
@@ -876,7 +881,10 @@ async def test_factory_leaves_spill_target_none_for_a_read_file_that_is_not_a_fu
         if "spill disabled" in record.getMessage()
     ]
     assert disabled
-    assert all("not bound to a task workspace" in message for message in disabled)
+    assert all(
+        "read_tool_result is not bound to a task workspace" in message
+        for message in disabled
+    )
 
 
 # --- a production tool set wires a spill target ---------------------------
