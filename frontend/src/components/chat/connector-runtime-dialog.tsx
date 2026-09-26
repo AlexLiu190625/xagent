@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useEffect, useRef, useState } from "react"
+import React, { useEffect, useReducer, useRef } from "react"
 import { usePathname } from "next/navigation"
 
 import {
@@ -11,12 +11,13 @@ import {
 import {
   canResendReport,
   deriveGates,
+  gateFactsOf,
   hasLiveInvalidObjectMark,
+  INITIAL_DIALOG_STATE,
   mergeSendFailureDisposition,
-  reconcileFieldError,
+  reduceDialog,
   uniqueKeys,
   type InvalidObjectDraftReason,
-  type SendFailureState,
 } from "@/components/chat/connector-runtime-dialog-state"
 import { Button } from "@/components/ui/button"
 import {
@@ -210,11 +211,11 @@ type FieldErrorLocation =
  * Called fresh from render against whatever report the dialog currently
  * holds, never cached alongside the disposition that produced it. Every
  * disposition that asks for a refresh (`refresh: true`) is followed by
- * exactly one `setReport` call from one of three places -- the failed
+ * exactly one report install from one of three places -- the failed
  * save's own post-refresh install, the read effect's same-task re-request,
  * or that same effect's already-visible "met" branch -- and none of them
  * needs to also re-derive or clear a location: recomputing this on every
- * render against whatever `report` state currently holds means all three
+ * render against whatever report the dialog currently holds means all three
  * land on the right answer without any of them knowing this function
  * exists.
  */
@@ -313,10 +314,6 @@ function savedNotResentText(
   return null
 }
 
-interface FieldErrorState {
-  disposition: ConnectorRuntimeFailureDisposition
-}
-
 function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDialogRequest }) {
   const pathname = usePathname()
   const pathnameRef = useRef(pathname)
@@ -340,99 +337,37 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const requestRef = useRef(request)
   requestRef.current = request
 
-  const [report, setReport] = useState<ConnectorRuntimeReport | null>(null)
-  // Which read attempt has settled, or null before any has. Compared against
-  // the attempt the dialog is currently on during render (see `readKey` and
-  // `reading` below) rather than being a boolean the read effect raises and
-  // lowers: that effect has six exits, and a flag left raised on any one of
-  // them would disable saving for good, while a key that never catches up
-  // cannot outlive the attempt it names.
-  const [settledReadKey, setSettledReadKey] = useState<string | null>(null)
-  // The `seq` of the request the report currently on screen was read for, or
-  // null before any report is installed. Deliberately a second fact rather
-  // than being folded into `settledReadKey`: a read settles whichever way it
-  // goes, but only a read that succeeded installs a report, and a failed one
-  // leaves the previous request's report on screen. Telling the two apart is
-  // what lets saving stay closed over a report the current request never
-  // produced, while dismissal and the re-read below stay available.
-  const [reportSeq, setReportSeq] = useState<number | null>(null)
-  // Bumped by the "read again" button a failed read offers. The read effect
-  // depends on it, so a bump re-runs the read for the same request without
-  // needing a new request to arrive.
-  const [readNonce, setReadNonce] = useState(0)
-  const [visible, setVisible] = useState(false)
-  const [drafts, setDrafts] = useState<Record<string, string>>({})
-  const [invalidDraftKeys, setInvalidDraftKeys] = useState<Map<string, InvalidObjectDraftReason>>(new Map())
-  const [submitting, setSubmitting] = useState(false)
-  const [fieldError, setFieldError] = useState<FieldErrorState | null>(null)
-  const [lastAlsoResend, setLastAlsoResend] = useState(false)
-  // The send the "saved but not sent" panel is about, or null when no send
-  // has failed. It carries the failed snapshot's clientMessageId rather than
-  // being a bare flag because the panel names one message while its retry
-  // button sends whichever snapshot the request currently holds, and the
-  // request can stop carrying that snapshot underneath it: a same-task
-  // retarget swaps in a newer candidate (openForTask), and a settlement
-  // frame for this task takes it away without moving `seq` at all
-  // (forgetDelivery). It carries that send's disposition alongside, because
-  // the panel's text depends on it -- see sendFailureTextKey -- and the two
-  // must never be able to come from different attempts.
-  const [sendFailure, setSendFailure] = useState<SendFailureState | null>(null)
-  // Whether the standalone retry off the send-failed panel is in flight.
-  // Kept next to the rest of this dialog's state so every useState call
-  // happens before the `deriveGates` call further down reads this render's
-  // value of it.
-  const [resending, setResending] = useState(false)
+  // Moved only by reduceDialog. Declared before anything reads it, because
+  // the recycle check below dispatches during render.
+  const [state, dispatch] = useReducer(reduceDialog, INITIAL_DIALOG_STATE)
+  const visible = state.stage === "shown"
+  const view = state.stage === "shown" ? state.view : null
+  const report = view?.report ?? null
   // The client message id the most recent unresolved resend attempt used,
   // together with the clientMessageId of the snapshot it was sent for, so a
   // further retry can reuse the id only while it is still retrying that same
   // snapshot -- see doResend, which is the only reader and writer.
   const resendMessageIdRef = useRef<{ forSnapshotId: string, clientMessageId: string } | null>(null)
-  // What every failed resend so far has established about each snapshot's
-  // message, keyed by the snapshot's clientMessageId and merged with
-  // mergeSendFailureDisposition, so it only ever moves toward "may have
-  // landed". The send-failed panel carries the same verdict while it is up,
-  // but the panel can go while the message stays -- a retry the re-read
-  // report turns down takes it down, and a resend a retarget supersedes never
-  // raises one -- and the next resend of that message (which reuses the id of
-  // an attempt whose outcome was unknown) must not then be reported as
-  // "definitely not sent" just because the server refused that one attempt.
-  //
-  // Bookkeeping only: nothing renders from it, and only doResend reads or
-  // writes it, folding it into the disposition every failed outcome carries,
-  // so the panel and each toast that stands in for it receive the merged
-  // verdict without asking for it, and into whether an attempt that never
-  // left the client may drop the id it carried. Scoped to this instance, which is mounted
-  // per task, so it goes with the dialog and never reaches another task.
-  // Transitional: it belongs with the panel's own state and is folded into
-  // the send-failed phase's data once that state is restructured.
-  const deliveryVerdictRef = useRef(new Map<string, MessageDeliveryDisposition | null>())
 
-  // Whether any submission-shaped action is in flight: an explicit save
-  // (`submitting`, which may itself run a resend as part of "save and
-  // resend") or a standalone retry resend from the send-failed panel
-  // (`resending`). The footer `canSubmitNow` gate below is only ever
-  // rendered while `sendFailed` is false, and `resending` only runs while
-  // `sendFailed` is true -- its own button lives inside that panel -- so
-  // folding `resending` into `busy` makes no difference to the footer
-  // buttons today. What it does gate is `handleDismiss`/`handleOpenChange`
-  // further down, which must keep the dialog open while either kind of
-  // submission has not yet settled. `resending` is passed to deriveGates
-  // below as `retrying` as well, which is why that one must imply this one.
+  const facts = gateFactsOf(state, { seq: request.seq, resendPayload: request.resendPayload })
+  // `canSubmitNow` already folds this in; what reads it here is dismissal,
+  // which must keep the dialog open while any submission is in flight.
   //
   // That dismissal gate is not the whole picture today and this comment
-  // must not pretend it is -- `submitting` is part of `busy`, so the save
-  // POST, the refresh GET a failed save runs, and both sends do hold the
-  // dialog open while they are out. Each of those is now bounded (the two
-  // connector-runtime calls time out after 20 seconds, and a send settles
-  // or rejects), so none of them can hold it open indefinitely any more,
-  // but taking `submitting` out of `busy` would change what closing does on
-  // four separate paths mid-write and is not part of this change.
-  const busy = submitting || resending
+  // must not pretend it is -- the saving and sending phases are part of
+  // `busy`, so the save POST, the refresh GET a failed save runs, and both
+  // sends do hold the dialog open while they are out. Each of those is now
+  // bounded (the two connector-runtime calls time out after 20 seconds, and
+  // a send settles or rejects), so none of them can hold it open
+  // indefinitely any more, but taking those two phases out of `busy` would
+  // change what closing does on four separate paths mid-write and is not
+  // part of this change.
+  const busy = facts.busy
   // Every value this dialog derives from its own state and the request it
-  // is currently showing, gathered in one call placed after every useState
+  // is currently showing, gathered in one call placed after the reducer
   // above: the render-period recycle check right below needs
   // `needsSnapshotRecycle`, and the read effect further down needs
-  // `readKey` -- both must see this render's `sendFailure` and `resending`.
+  // `readKey` -- both must see this render's state.
   // See connector-runtime-dialog-state.ts for what each of these means and
   // how it is computed.
   const {
@@ -449,26 +384,16 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     hasSaveEntryPoint,
     metHoldingSnapshot,
     retryResendDisabled,
-  } = deriveGates({
-    report,
-    reportSeq,
-    settledReadKey,
-    readNonce,
-    busy,
-    heldFailure: sendFailure,
-    retrying: resending,
-    drafts,
-    invalidDraftKeys,
-    request: { seq: request.seq, resendPayload: request.resendPayload },
-  })
-  // Set during render, not from an effect. An effect noticing this
+  } = deriveGates(facts)
+  // Dispatched during render, not from an effect. An effect noticing this
   // afterwards is the shape this dialog already replaced once: it lands a
   // frame late, and it never runs at all for a removal that does not move
-  // `seq`. React re-runs this component with the reset value before
-  // committing anything, so the condition is false on the second pass and
-  // no frame is painted from the state being dropped.
+  // `seq`. React re-runs this component with the reduced state before
+  // committing anything, and snapshot-gone drops the held failure from
+  // both phases that carry one, so the condition is false on the second
+  // pass and no frame is painted from the state being dropped.
   if (needsSnapshotRecycle) {
-    setSendFailure(null)
+    dispatch({ type: "snapshot-gone" })
   }
 
   // Read on mount, on every subsequent request for this same task (the
@@ -479,8 +404,8 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // flight.
   //
   // `visible` is read at the moment this effect starts, which is exactly
-  // right here: setVisible is only ever called with `true` in this
-  // component, so if the dialog was already showing something when this
+  // right here: nothing moves the dialog back from shown to hidden, so if
+  // it was already showing something when this
   // request came in, it is still showing it by the time the fetch below
   // resolves (any path that would make it stop -- unmount, a task switch, a
   // host-page departure -- clears `request` and is caught by the seq/alive
@@ -507,16 +432,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     let cancelled = false
     fetchTaskConnectorRuntimeRequirements(request.taskId).then((result) => {
       if (cancelled || !aliveRef.current || requestRef.current.seq !== seqAtStart) return
-      // This attempt has settled, whichever way the branches below go.
-      // Recorded once, here, rather than at each of those branches: the three
-      // guards above are exactly the cases where it must not be recorded (a
-      // newer attempt owns the answer now), and every branch past this point
-      // either installs a report or deliberately keeps the one already on
-      // screen. This is only half the story -- it says a read finished, not
-      // that the report on screen is the current request's -- which is why
-      // `reportSeq` is written separately, next to the one place a report is
-      // actually installed.
-      setSettledReadKey(readKeyAtStart)
+      // This attempt has settled, whichever way the branches below go, and
+      // each records it through one read-settled event. The three guards
+      // above are exactly the cases where it must not be recorded (a newer
+      // attempt owns the answer now).
+      const kept = { type: "read-settled", key: readKeyAtStart, result: { kind: "kept" } } as const
       if (!result.ok) {
         console.warn(
           "[connector-runtime] requirements read failed",
@@ -528,10 +448,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         // which `reportIsStale` above keeps saving and resending closed over
         // until a later read installs the current one -- the dialog says so
         // and offers that read.
+        dispatch(kept)
         if (!wasVisible) close("not-shown")
         return
       }
       if (!isConnectorRuntimeDialogHostPath(pathnameRef.current)) {
+        dispatch(kept)
         close("not-shown")
         return
       }
@@ -540,19 +462,18 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // is installed at all: there is no dialog to keep open and nothing
       // for it to say.
       if (outcome.kind === "met" && !wasVisible) {
+        dispatch(kept)
         close("not-shown")
         return
       }
-      setReport(result.report)
-      setReportSeq(seqAtStart)
       // This point is only reached because another terminal frame for the
       // same task retargeted an already-open dialog (see this effect's
       // opening comment) -- never because the user resolved anything -- so
       // a live rejection or send failure must survive it. A type-mismatch
       // hint is reconciled against this fresher report -- cleared when the
       // row's declared type changed under it, re-derived when the row
-      // finally declares one at all, via reconcileFieldError, the same call
-      // handleSave's own post-failure refresh makes below; a
+      // finally declares one at all, via reconcileFieldError (see there for
+      // how handleSave's own post-failure refresh differs); a
       // 409 conflict hint has no such
       // report-derived staleness condition, so it is left alone here the
       // same way handleSave's refresh already leaves it alone. A met report
@@ -566,26 +487,19 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // actually completes (handleRetryResend), unmounting, and the
       // request no longer carrying the snapshot the panel is about, which
       // `sendFailed` derives during render rather than any effect here.
-      setFieldError((prev) => {
-        const current = prev?.disposition ?? null
-        const reconciled = reconcileFieldError(current, result.report, "current")
-        // The same disposition back means this report changed nothing about
-        // the hint, and returning `prev` keeps the field error referentially
-        // stable rather than re-rendering over an equal value.
-        if (reconciled === current) return prev
-        return reconciled ? { disposition: reconciled } : null
+      //
+      // An already-visible met report is installed the same way and stays
+      // on screen with its footer collapsed to "Got it", rather than
+      // silently discarding the user's in-progress draft.
+      dispatch({
+        type: "read-settled",
+        key: readKeyAtStart,
+        result: { kind: "installed", report: result.report, seq: seqAtStart },
       })
-      // An already-visible met report stays on screen with its footer
-      // collapsed to "Got it" (the same path handleSave's post-save refresh
-      // takes when a refresh finds nothing left to fill) rather than
-      // silently discarding the user's in-progress draft. `visible` is
-      // already true here, so there is nothing left to do for it.
-      if (outcome.kind === "met") return
-      setVisible(true)
     })
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [request.seq, readNonce])
+  }, [request.seq, state.read.nonce])
 
   // Leaving the host pages closes a dialog the user has already seen. A move
   // between two host pages is handled by the outer task-switch cleanup, not
@@ -595,17 +509,16 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   }, [visible, pathname, close])
 
   // Re-derived every render against the report currently on screen, rather
-  // than resolved once into `fieldError` and cached there -- see
+  // than resolved once into the field error and cached there -- see
   // locateFieldError's own docstring for why a cached location goes stale
-  // the moment any of this dialog's three setReport call sites installs a
-  // fresher report.
-  const activeFieldError = fieldError && report
-    ? { disposition: fieldError.disposition, location: locateFieldError(report, fieldError.disposition) }
+  // the moment any fresher report is installed.
+  const activeFieldError = view?.fieldError
+    ? { disposition: view.fieldError, location: locateFieldError(view.report, view.fieldError) }
     : null
 
   const handleDraftChange =(connector: ConnectorRuntimeConnector, input: ConnectorRuntimeInput, value: string) => {
     const draftKey = connectorRuntimeInputDraftKey(connector.connector_ref, input.section, input.key, input.type)
-    setDrafts(prev => ({ ...prev, [draftKey]: value }))
+    dispatch({ type: "draft-changed", draftKey, value })
   }
 
   const handleObjectBlur = (connector: ConnectorRuntimeConnector, input: ConnectorRuntimeInput, value: string) => {
@@ -628,12 +541,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         reason = "invalid"
       }
     }
-    setInvalidDraftKeys((prev) => {
-      const next = new Map(prev)
-      if (reason) next.set(draftKey, reason)
-      else next.delete(draftKey)
-      return next
-    })
+    dispatch({ type: "object-blurred", draftKey, reason })
   }
 
   const doResend = async (): Promise<ResendOutcome> => {
@@ -713,7 +621,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // value is arbitrary, so logging it could carry message content.
       console.warn("[connector-runtime] resend failed")
       const disposition = readSendDisposition(error)
-      const earlierVerdict = deliveryVerdictRef.current.get(snapshot.clientMessageId) ?? null
+      // The verdicts are read off the render this attempt was started from:
+      // both callers are held busy from their click until their own flow
+      // ends, and every earlier attempt recorded its verdict before the flow
+      // that ran it released that hold, so no verdict can be recorded
+      // between that render and this read.
+      const earlierVerdict = (state.stage === "shown" ? state.verdicts.get(snapshot.clientMessageId) : undefined) ?? null
       // The server refusing this id outright (`rejected`), or explicitly
       // demanding a new one, means this id is spent -- the next retry mints
       // fresh. An outcome_unknown one leaves open that the server already
@@ -738,11 +651,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       )
       resendMessageIdRef.current = mustMintNewId ? null : { forSnapshotId: snapshot.clientMessageId, clientMessageId }
       // What travels out is the message's verdict across every attempt so
-      // far (see deliveryVerdictRef), not this attempt's own disposition, so
-      // no caller can word a refusal of this attempt as "not sent" after an
-      // earlier attempt's outcome was unknown.
+      // far (see DeliveryVerdicts in connector-runtime-dialog-state.ts), not
+      // this attempt's own disposition, so no caller can word a refusal of
+      // this attempt as "not sent" after an earlier attempt's outcome was
+      // unknown.
       const verdict = mergeSendFailureDisposition(earlierVerdict, disposition)
-      deliveryVerdictRef.current.set(snapshot.clientMessageId, verdict)
+      dispatch({ type: "resend-failed", snapshotId: snapshot.clientMessageId, verdict })
       // The verdict travels out with the outcome rather than being turned
       // into text here: the caller decides whether this dialog is still on
       // screen to raise a panel or has to settle for a toast, and both have
@@ -752,11 +666,10 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   }
 
   const handleSave = async (alsoResend: boolean) => {
-    if (!report || !canSubmitNow) return
+    if (!view || !canSubmitNow) return
     const seqAtStart = request.seq
-    const items = buildSubmitItems(report, drafts)
-    setSubmitting(true)
-    setLastAlsoResend(alsoResend)
+    const items = buildSubmitItems(view.report, view.drafts)
+    dispatch({ type: "save-started", alsoResend })
     const result = await submitTaskConnectorRuntimeValues(request.taskId, items)
     if (!aliveRef.current) {
       // The dialog unmounted while the save was in flight (a task switch,
@@ -772,8 +685,8 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     }
     if (requestRef.current.seq !== seqAtStart) {
       // A newer request retargeted this same dialog instance while the save
-      // was in flight; the result is stale, but `submitting` must still
-      // reset or the save buttons and close handlers stay stuck forever.
+      // was in flight; the result is stale, but the dialog must still stop
+      // being busy or the save buttons and close handlers stay stuck forever.
       // A successful "save and resend" whose resend never got to run needs
       // to say so, matching the other two "did not resend" paths below --
       // this one only fires when the save itself landed, since a rejected
@@ -791,25 +704,25 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // wording is used for the same reason -- there is no field here this
       // rejection can claim to be about.
       if (!result.ok) {
-        toast(translateDialogScopeFailure(t, classifySubmitFailure(result, report).messageKey))
+        toast(translateDialogScopeFailure(t, classifySubmitFailure(result, view.report).messageKey))
       }
-      setSubmitting(false)
+      dispatch({ type: "superseded", retryAttempt: null })
       return
     }
 
     if (!result.ok) {
-      const disposition = classifySubmitFailure(result, report)
-      setFieldError({ disposition })
+      const disposition = classifySubmitFailure(result, view.report)
       if (!disposition.refresh) {
-        setSubmitting(false)
+        dispatch({ type: "save-rejected", disposition })
         return
       }
       // The save buttons stay disabled across the refresh: re-enabling before
       // it settles lets a second submit go out built from the report this
       // refresh is about to replace. Every path that settles the dialog below
-      // still resets `submitting`, or the buttons and the close handlers stay
+      // still ends the save, or the buttons and the close handlers stay
       // stuck forever; only an unmounted instance skips it, since it has no
       // buttons left to re-enable.
+      dispatch({ type: "save-rejected-refreshing", disposition })
       const refreshed = await fetchTaskConnectorRuntimeRequirements(request.taskId)
       if (!aliveRef.current) {
         // This branch only runs after the save itself failed a few lines
@@ -819,45 +732,37 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         return
       }
       if (requestRef.current.seq !== seqAtStart) {
-        setSubmitting(false)
+        dispatch({ type: "superseded", retryAttempt: null })
         return
       }
-      if (refreshed.ok) {
-        setReport(refreshed.report)
-        // Same seq the save started under, proved unchanged by the check
-        // above: this writes the value `reportSeq` already holds. Written
-        // anyway so that every place a report is installed also says which
-        // request it is for, and a fifth such place cannot be added without
-        // the question being asked.
-        setReportSeq(seqAtStart)
-        // A type-mismatch hint names a specific declared type; once the
-        // refreshed report shows this row now declares the other type, that
-        // hint no longer describes the row it is attached to and must be
-        // cleared outright rather than left to describe a type this row no
-        // longer has. The one hint that names no type -- "this connector
-        // does not say which type it expects" -- is re-derived rather than
-        // cleared when the refresh finally declares one, since that refresh
-        // is exactly what answers it.
-        // Reconciled against this rejection rather than whatever is on screen
-        // by now; `disposition` also stands in for the current value, so an
-        // unchanged answer comes back as that same object and nothing is
-        // written.
-        const reconciled = reconcileFieldError(disposition, refreshed.report, { rejection: disposition })
-        if (reconciled !== disposition) setFieldError(reconciled ? { disposition: reconciled } : null)
-      }
-      setSubmitting(false)
+      // A refreshed report is installed with the same seq the save started
+      // under, proved unchanged by the check above: every place a report is
+      // installed also says which request it is for. A type-mismatch hint
+      // names a specific declared type; once the refreshed report shows this
+      // row now declares the other type, that hint no longer describes the
+      // row it is attached to and must be cleared outright rather than left
+      // to describe a type this row no longer has. The one hint that names
+      // no type -- "this connector does not say which type it expects" -- is
+      // re-derived rather than cleared when the refresh finally declares
+      // one, since that refresh is exactly what answers it. Both are
+      // reconciled against this rejection rather than whatever is on screen
+      // by now. A failed refresh keeps the report and the rejection as they
+      // are.
+      dispatch({
+        type: "reject-refresh-settled",
+        disposition,
+        refreshed: refreshed.ok ? { report: refreshed.report, seq: seqAtStart } : null,
+      })
       return
     }
 
-    setReport(result.report)
-    setReportSeq(seqAtStart)
-    // A save that landed has no rejection left to show, even on the one path
-    // below that renders before this dialog settles (a "save and resend"
-    // whose report comes back met, which awaits the resend before closing):
-    // without this, that rejection would re-derive against the fresh report
-    // and land at whole-dialog scope, next to a send-failed panel for a save
-    // that in fact succeeded.
-    setFieldError(null)
+    // A save that landed installs its report and has no rejection left to
+    // show, even on the one path below that renders before this dialog
+    // settles (a "save and resend" whose report comes back met, which awaits
+    // the resend before closing): without that, the rejection would
+    // re-derive against the fresh report and land at whole-dialog scope,
+    // next to a send-failed panel for a save that in fact succeeded.
+    const landed = { report: result.report, seq: seqAtStart }
     const newOutcome = resolveDialogOutcome(result.report)
     // Only a met report can carry the resend the primary button promised --
     // see canResendReport, which handleRetryResend asks too, so the two
@@ -881,83 +786,90 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // Still blocked on something this dialog can collect (or, for
       // nothing_fillable, on nothing the user can act on beyond "Got it"):
       // stay open, re-render from the fresh report.
-      setSubmitting(false)
-      setFieldError(null)
+      dispatch({ type: "save-landed", ...landed })
       return
     }
 
-    if (alsoResend && canResendNow) {
-      const resendOutcome = await doResend()
-      if (!aliveRef.current) {
-        // The save has landed and the resend has run to completion. A sent
-        // message shows up in the transcript on its own, so that outcome
-        // stays silent. A failed one would normally surface in this dialog's
-        // send-failed panel, which an unmounted instance can never render --
-        // and doResend's console.warn reaches no user -- so say it once,
-        // globally, without touching state or the provider.
-        if (resendOutcome.kind !== "sent") toast(t(resendFailureTextKey(resendOutcome)))
+    if (!(alsoResend && canResendNow)) {
+      dispatch({ type: "save-landed", ...landed })
+      close("dismissed")
+      return
+    }
+
+    dispatch({ type: "save-landed-resending", ...landed })
+    const resendOutcome = await doResend()
+    if (!aliveRef.current) {
+      // The save has landed and the resend has run to completion. A sent
+      // message shows up in the transcript on its own, so that outcome
+      // stays silent. A failed one would normally surface in this dialog's
+      // send-failed panel, which an unmounted instance can never render --
+      // and doResend's console.warn reaches no user -- so say it once,
+      // globally, without touching state or the provider.
+      if (resendOutcome.kind !== "sent") toast(t(resendFailureTextKey(resendOutcome)))
+      return
+    }
+    if (requestRef.current.seq !== seqAtStart) {
+      // Same reason as the earlier seq check: a newer request retargeted
+      // this dialog instance while the resend was in flight, so this
+      // result is stale, but the dialog must still stop being busy. The resend's
+    // own outcome is not stale: the values are stored either way, and
+      // the message either went out or did not. Nothing the fresher
+      // request renders carries that fact -- this branch leaves
+      // `sendFailed` false, so no panel says it -- and the footer it
+      // draws next offers "Save and resend this message" again, which a
+      // user who was told nothing would press on a turn that already
+      // went out. A toast rather than the send-failed panel: that
+      // panel's retry button reads whichever snapshot the fresher
+      // request now carries, and once that snapshot has been replaced
+      // the retry goes out under a new client message id rather than the
+      // one the attempt that just settled here used
+      // (xorbitsai/xagent#2502).
+      // "nothing-to-send" takes the same toast path as "failed" on
+      // purpose: resendFailureTextKey words a failed outcome off the
+      // verdict it carries and a nothing-to-send one, which handed nothing
+      // to the send path, as not sent -- and it is unreachable from here
+      // anyway, since this block only runs when doResend was called with
+      // a snapshot.
+      dispatch({ type: "superseded", retryAttempt: null })
+      toast(resendOutcome.kind === "sent"
+        ? t("connectorRuntime.resendSupersededSent")
+        : t(resendFailureTextKey(resendOutcome)))
+      return
+    }
+    if (resendOutcome.kind !== "sent") {
+      // The seq check just above proves no retarget landed while the
+      // resend was in flight, so the snapshot the request carries here
+      // is still the one doResend read -- which is what the panel this
+      // raises is about, and what its retry button would send.
+      const failedSnapshotId = requestRef.current.resendPayload?.clientMessageId ?? null
+      if (failedSnapshotId === null) {
+        // A settlement frame for this task arrived while the save was in
+        // flight and took the snapshot with it (forgetDelivery), without
+        // reopening the dialog and so without moving `seq`. There is
+        // nothing left to retry, and a panel here would draw a retry
+        // button with nothing behind it -- so say the same thing the
+        // panel says, once, and leave the dialog on its report.
+        dispatch({ type: "resend-settled", failure: null })
+        toast(t(resendFailureTextKey(resendOutcome)))
         return
       }
-      if (requestRef.current.seq !== seqAtStart) {
-        // Same reason as the earlier seq check: a newer request retargeted
-        // this dialog instance while the resend was in flight, so this
-        // result is stale, but `submitting` must still reset. The resend's
-        // own outcome is not stale: the values are stored either way, and
-        // the message either went out or did not. Nothing the fresher
-        // request renders carries that fact -- this branch leaves
-        // `sendFailed` false, so no panel says it -- and the footer it
-        // draws next offers "Save and resend this message" again, which a
-        // user who was told nothing would press on a turn that already
-        // went out. A toast rather than the send-failed panel: that
-        // panel's retry button reads whichever snapshot the fresher
-        // request now carries, and once that snapshot has been replaced
-        // the retry goes out under a new client message id rather than the
-        // one the attempt that just settled here used
-        // (xorbitsai/xagent#2502).
-        // "nothing-to-send" takes the same toast path as "failed" on
-        // purpose: resendFailureTextKey words a failed outcome off the
-        // verdict it carries and a nothing-to-send one, which handed nothing
-        // to the send path, as not sent -- and it is unreachable from here
-        // anyway, since this block only runs when doResend was called with
-        // a snapshot.
-        setSubmitting(false)
-        toast(resendOutcome.kind === "sent"
-          ? t("connectorRuntime.resendSupersededSent")
-          : t(resendFailureTextKey(resendOutcome)))
-        return
-      }
-      if (resendOutcome.kind !== "sent") {
-        setSubmitting(false)
-        // The seq check just above proves no retarget landed while the
-        // resend was in flight, so the snapshot the request carries here
-        // is still the one doResend read -- which is what the panel this
-        // raises is about, and what its retry button would send.
-        const failedSnapshotId = requestRef.current.resendPayload?.clientMessageId ?? null
-        if (failedSnapshotId === null) {
-          // A settlement frame for this task arrived while the save was in
-          // flight and took the snapshot with it (forgetDelivery), without
-          // reopening the dialog and so without moving `seq`. There is
-          // nothing left to retry, and a panel here would draw a retry
-          // button with nothing behind it -- so say the same thing the
-          // panel says, once, and leave the dialog on its report.
-          toast(t(resendFailureTextKey(resendOutcome)))
-          return
-        }
-        setSendFailure({
+      dispatch({
+        type: "resend-settled",
+        failure: {
           snapshotId: failedSnapshotId,
           disposition: resendOutcome.kind === "failed" ? resendOutcome.disposition : null,
-        })
-        return
-      }
+        },
+      })
+      return
     }
-    setSubmitting(false)
-    close(alsoResend && canResendNow ? "resent" : "dismissed")
+    dispatch({ type: "resend-settled", failure: null })
+    close("resent")
   }
 
   const handleRetryResend = async () => {
     // A resend is one billed model call plus a possibly side-effecting tool
     // run; a double click here must not fire it twice.
-    if (resending) return
+    if (facts.retrying) return
     // The report this button's own gate reads has to be the current
     // request's. A same-task retarget starts a fresh read while the previous
     // report is still on screen, and a read that fails never replaces it at
@@ -980,11 +892,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     // panel's own state is dropped here as well, for the same reason the
     // render above drops it: the send it was about can no longer be retried
     // from this dialog.
+    const sendFailure = facts.heldFailure
     if (
       sendFailure === null
       || sendFailure.snapshotId !== requestRef.current.resendPayload?.clientMessageId
     ) {
-      setSendFailure(null)
+      dispatch({ type: "retry-abandoned" })
       return
     }
     // What the panel says right now, captured before the await below: a
@@ -992,10 +905,10 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     // and by the time it settles the state behind the wording may already
     // have moved.
     const dispositionBefore = sendFailure.disposition
-    // Which snapshot that wording is about, captured alongside it: a
-    // superseded attempt below only writes into the panel that raised it,
-    // and tells a retarget that kept this snapshot (the panel is still up)
-    // from one that replaced it (the panel is gone).
+    // Which snapshot that wording is about, captured alongside it: tells a
+    // retarget that kept this snapshot (the panel is still up) from one
+    // that replaced it (the panel is gone) when a superseded attempt below
+    // settles.
     const snapshotIdBefore = sendFailure.snapshotId
     // The report can change under a panel that stays up: this panel is about
     // a send that failed, not about the report, so a same-task re-read
@@ -1009,13 +922,13 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     // reason is said out loud, rather than leaving a disabled button with no
     // explanation next to it.
     if (!report || !canResendReport(report)) {
-      setSendFailure(null)
+      dispatch({ type: "retry-abandoned" })
       const reason = report ? savedNotResentText(t, resolveDialogOutcome(report)) : null
       if (reason) toast(reason)
       return
     }
     const seqAtStart = request.seq
-    setResending(true)
+    dispatch({ type: "retry-started" })
     const resendOutcome = await doResend()
     if (!aliveRef.current) {
       // A retry that went out shows up in the transcript on its own, so that
@@ -1025,16 +938,16 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // without this nothing would tell them the retry they pressed changed
       // nothing. Worded off the verdict doResend returns, which already
       // folds in every earlier attempt for this message (see
-      // deliveryVerdictRef), so a refusal cannot un-say an earlier unknown
-      // outcome. Counting every exit of this handler in one place is still
-      // tracked in xorbitsai/xagent#2478.
+      // DeliveryVerdicts in connector-runtime-dialog-state.ts), so a refusal
+      // cannot un-say an earlier unknown outcome. Counting every exit of
+      // this handler in one place is still tracked in xorbitsai/xagent#2478.
       if (resendOutcome.kind !== "sent") toast(t(resendFailureTextKey(resendOutcome)))
       return
     }
     if (requestRef.current.seq !== seqAtStart) {
       // A newer request retargeted this same dialog instance while the
-      // resend was in flight; the result is stale, but `resending` must
-      // still reset or the retry button stays stuck forever. A resend that
+      // resend was in flight; the result is stale, but the retry must still
+      // end or the retry button stays stuck forever. A resend that
       // did go out needs to say so: the send-failed panel this button
       // lives on may be replaced by whatever the fresher request renders
       // next, or, when the retarget kept this same snapshot, stay up with
@@ -1044,51 +957,56 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       //
       // A resend that did not go out is reported according to whether the
       // panel this attempt was about is still up. A retarget that replaced
-      // the snapshot has already taken the panel down (the render-time reset
-      // above), so -- as in the unmounted branch -- a toast is the only
+      // the snapshot has already taken the panel down (snapshot-gone, from
+      // render), so -- as in the unmounted branch -- a toast is the only
       // report left, and every failed outcome gets one. A retarget that
       // kept the snapshot leaves the panel up with its button re-enabled:
       // its wording takes doResend's verdict, which only ever moves toward
-      // uncertainty (see deliveryVerdictRef), and a toast fires only the
+      // uncertainty (see DeliveryVerdicts in
+      // connector-runtime-dialog-state.ts), and a toast fires only the
       // moment that wording crosses from "definitely not sent" to "may have
       // landed" -- the one fact this attempt adds that the user could not
       // already tell from the panel.
-      setResending(false)
       if (resendOutcome.kind === "sent") {
+        dispatch({ type: "superseded", retryAttempt: null })
         toast(t("connectorRuntime.resendSupersededSent"))
         return
       }
       if (requestRef.current.resendPayload?.clientMessageId !== snapshotIdBefore) {
+        // No panel is left to write the verdict into.
+        dispatch({ type: "superseded", retryAttempt: null })
         toast(t(resendFailureTextKey(resendOutcome)))
         return
       }
       const disposition = resendOutcome.kind === "failed" ? resendOutcome.disposition : null
-      // Defensive: the check above already established that the panel up
-      // now is the one this attempt was about, and nothing else can raise a
-      // panel while `resending` holds the dialog busy. Kept so the write can
-      // never land on a panel for a different snapshot.
-      setSendFailure(prev => (prev && prev.snapshotId === snapshotIdBefore ? { ...prev, disposition } : prev))
+      // Defensive: the check above already established that the request
+      // still carries the snapshot this attempt was about, so the retry
+      // phase still holds that panel's failure. The reducer only writes the
+      // verdict into a failure the retry phase still holds, and drops that
+      // failure the moment the request stops carrying its snapshot, so the
+      // write can never land on a panel for a different snapshot.
+      dispatch({ type: "superseded", retryAttempt: { merged: disposition } })
       if (sendOutcomeMayHaveLanded(disposition) && !sendOutcomeMayHaveLanded(dispositionBefore)) {
         toast(t(sendFailureTextKey(disposition)))
       }
       return
     }
-    setResending(false)
     if (resendOutcome.kind === "sent") {
-      setSendFailure(null)
+      dispatch({ type: "retry-settled", result: { kind: "sent" } })
       close("resent")
       return
     }
     // A retry that failed again. The panel's wording only ever moves toward
-    // uncertainty (doResend returns the merged verdict, see
-    // deliveryVerdictRef), which means that in the two cases where it does
-    // not move at all the panel says exactly what it said before the click:
-    // the user cannot tell "nothing happened" from "it failed again". So the
-    // panel is updated and the fact is said once, both off the same verdict
-    // -- the toast carries the new event, the panel carries the standing
-    // state, and the two cannot word the same message differently.
+    // uncertainty (doResend returns the merged verdict, see DeliveryVerdicts
+    // in connector-runtime-dialog-state.ts), which means that in the two
+    // cases where it does not move at all the panel says exactly what it
+    // said before the click: the user cannot tell "nothing happened" from
+    // "it failed again". So the panel is updated and the fact is said once,
+    // both off the same verdict -- the toast carries the new event, the
+    // panel carries the standing state, and the two cannot word the same
+    // message differently.
     const disposition = resendOutcome.kind === "failed" ? resendOutcome.disposition : null
-    setSendFailure(prev => (prev ? { ...prev, disposition } : prev))
+    dispatch({ type: "retry-settled", result: { kind: "failed", merged: disposition } })
     toast(t(sendFailureTextKey(disposition)))
   }
 
@@ -1107,7 +1025,9 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
 
   const dialogFieldError = activeFieldError?.location.scope === "dialog" ? activeFieldError.disposition : null
 
-  if (!visible || !report || !outcome) return null
+  if (state.stage !== "shown" || !outcome) return null
+  const { drafts, invalidDraftKeys, lastAlsoResend } = state.view
+  const { connectors } = state.view.report
 
   return (
     <Dialog open={visible} onOpenChange={handleOpenChange}>
@@ -1173,7 +1093,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
                 dialog, which would drop the stashed message with it (a
                 close counts as the user giving up) and take the one-click
                 resend away for good. */}
-            <Button variant="outline" onClick={() => setReadNonce(nonce => nonce + 1)}>
+            <Button variant="outline" onClick={() => dispatch({ type: "read-again" })}>
               {t("connectorRuntime.actions.readAgain")}
             </Button>
           </div>
@@ -1196,7 +1116,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
           </div>
         ) : (
           <div className="space-y-4">
-            {report.connectors.map((connector) => {
+            {connectors.map((connector) => {
               const connectorKey = connectorKeyOf(connector.connector_ref)
               const connectorError =
                 activeFieldError
@@ -1324,7 +1244,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
               // flight; without this the button still looks pressable and
               // does nothing when pressed. A met report renders this as the
               // only button, and a save-and-resend whose save came back met
-              // is still submitting for as long as its resend runs, so this
+              // is still busy for as long as its resend runs, so this
               // is a state the user can reach. The save buttons reach the
               // same guard through canSubmitNow, which folds busy in.
               <Button variant="outline" disabled={busy} onClick={handleDismiss}>

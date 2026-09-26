@@ -253,7 +253,7 @@ export function deriveGates(facts: GateFacts): Gates {
   // caller also uses `busy` to gate dismissal: a read still out for a
   // retargeted request must not stand between the user and closing the
   // dialog. What `busy` itself holds open is the caller's business; see
-  // where the dialog computes it.
+  // where the dialog reads it for dismissal.
   const canSubmitNow = canSubmit && !facts.busy && !reportIsStale
   const hasResendPayload = facts.request.resendPayload !== null
   const actions = outcome ? resolveDialogActions(outcome, hasResendPayload) : []
@@ -347,7 +347,8 @@ export interface View {
   report: ConnectorRuntimeReport
   // The `seq` of the request `report` was read for. Required rather than
   // nullable: a shown dialog always has a report, and a report is only ever
-  // installed together with the request it answers.
+  // installed together with the request it answers. Kept apart from the read
+  // cursor's `settledKey` for the reason deriveGates gives at `reportIsStale`.
   reportSeq: number
   drafts: Readonly<Record<string, string>>
   invalidDraftKeys: ReadonlyMap<string, InvalidObjectDraftReason>
@@ -363,7 +364,9 @@ export interface View {
 /**
  * Which read attempt the dialog is on for the current request (`nonce`,
  * bumped by "read again") and which attempt last settled (`settledKey`, in
- * the `${seq}:${nonce}` form deriveGates compares it against).
+ * the `${seq}:${nonce}` form deriveGates compares it against). A key rather
+ * than a flag the read raises and lowers: a flag left raised on any of the
+ * read's exits would disable saving for good.
  */
 export interface ReadCursor {
   nonce: number
@@ -377,6 +380,9 @@ export interface ReadCursor {
  * re-read report turns down takes the panel away, and a superseded resend
  * never raises one, yet the next resend of that message must still not be
  * reported as "definitely not sent" after an earlier outcome was unknown.
+ * It also decides whether a resend that never left the client may drop the
+ * id it carried: once a message's verdict is "may have landed", that id is
+ * kept so the next retry can still be coalesced with the earlier attempt.
  * Nothing renders from it.
  */
 export type DeliveryVerdicts = ReadonlyMap<string, MessageDeliveryDisposition | null>
