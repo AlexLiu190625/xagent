@@ -5847,6 +5847,341 @@ async def test_forced_turn_protocol_retry_sends_the_turn_tools(
     )
 
 
+# --- forced-answer turn: read policy -----------------------------------------
+
+_SPILL_NAME = "calculator-0123456789abcdef0123456789abcdef.json"
+_SPILL_PATH = f"tool-results/{_SPILL_NAME}"
+_READS_USED_UP = (
+    "The read allowance for the final answer is used up. Answer from what you "
+    "have already read; do not state a value you did not read."
+)
+_UNLISTED_PATH = (
+    "read_tool_result during the final answer turn is limited to the stored "
+    "results listed above. Copy one of those paths exactly. That path is not "
+    "one of them."
+)
+
+
+def _tool_result_outputs(context: ExecutionContext, name: str) -> list[Any]:
+    return [
+        message.metadata.get("raw_result")
+        for message in context.messages
+        if message.role == "tool" and message.metadata.get("tool_name") == name
+    ]
+
+
+def _batch_response(*calls: tuple[str, str, dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            {"id": call_id, "function": {"name": name, "arguments": json.dumps(args)}}
+            for call_id, name, args in calls
+        ]
+    }
+
+
+async def _run_forced_reads(
+    responses: list[Any], **pattern_kwargs: Any
+) -> tuple[ReActPattern, RecordingReadToolResultTool, ExecutionContext, Any]:
+    pattern = _forced_turn_pattern(max_iterations=8, **pattern_kwargs)
+    reader = RecordingReadToolResultTool()
+    context = _context_with_spill_records(_SPILL_PATH)
+    context.add_user_message("What is in the stored result?")
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool(), reader],
+        llm=FakeLLM([*responses, _final_call()]),
+    )
+    return pattern, reader, context, result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "admitted"),
+    [
+        (_SPILL_PATH, True),
+        (f"output/{_SPILL_PATH}", True),
+        (f"./{_SPILL_PATH}", True),
+        (f"input/{_SPILL_PATH}", False),
+        ("../../x", False),
+        (f"/workspace/output/{_SPILL_PATH}", False),
+        (12345, False),
+        (_SPILL_PATH.replace("0123", "1123", 1), False),
+        (f"{_SPILL_PATH}l", False),
+    ],
+)
+async def test_forced_turn_path_matching_and_counters(
+    path: Any, admitted: bool
+) -> None:
+    """A path that normalizes to a stored result runs and counts as a read;
+    any other path does not run and counts as a reject."""
+    pattern, reader, context, result = await _run_forced_reads(
+        [_batch_response(("call_read", SPILL_READ_TOOL_NAME, {"path": path}))]
+    )
+
+    assert result["success"] is True
+    assert len(reader.calls) == (1 if admitted else 0)
+    assert pattern.forced_answer_reads_used == (1 if admitted else 0)
+    assert pattern.forced_answer_reads_rejected == (0 if admitted else 1)
+    assert pattern.forced_answer_extra_iterations == 1
+    if admitted:
+        assert reader.calls[0]["path"] == path
+    else:
+        assert _tool_result_outputs(context, SPILL_READ_TOOL_NAME) == [
+            {"output": _UNLISTED_PATH}
+        ]
+
+
+@pytest.mark.asyncio
+async def test_forced_turn_offset_continuation_counts_as_one_read() -> None:
+    """Reading on through one stored result with a larger offset is one read
+    per call; the fourth call finds the allowance used up and does not run."""
+    offsets = [0, 12_000, 24_000, 36_000]
+    pattern, reader, context, result = await _run_forced_reads(
+        [
+            _batch_response(
+                *(
+                    (
+                        f"call_read_{offset}",
+                        SPILL_READ_TOOL_NAME,
+                        {"path": _SPILL_PATH, "start": 1, "end": 2, "offset": offset},
+                    )
+                    for offset in offsets
+                )
+            )
+        ]
+    )
+
+    assert result["success"] is True
+    assert [call["offset"] for call in reader.calls] == offsets[:3]
+    assert pattern.forced_answer_reads_used == 3
+    assert pattern.forced_answer_extra_iterations == 3
+    assert _tool_result_outputs(context, SPILL_READ_TOOL_NAME)[-1] == {
+        "output": _READS_USED_UP
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("args", [{}, {"path": None}], ids=["no_key", "null"])
+async def test_forced_turn_listing_call_disposition(args: dict[str, Any]) -> None:
+    """A forced-turn read_tool_result call without a path lists the stored
+    results: it runs and counts as one read."""
+    pattern, reader, _, result = await _run_forced_reads(
+        [_batch_response(("call_list", SPILL_READ_TOOL_NAME, args))]
+    )
+
+    assert result["success"] is True
+    assert len(reader.calls) == 1
+    assert reader.calls[0].get("path") is None
+    assert pattern.forced_answer_reads_used == 1
+    assert pattern.forced_answer_reads_rejected == 0
+    assert pattern.forced_answer_extra_iterations == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "concurrent"])
+async def test_forced_turn_read_keeps_relative_path_in_checkpoint(
+    tmp_path, parallel: bool
+) -> None:
+    """The admitted read runs with the path the model wrote; nothing on the
+    way rewrites it into the workspace's absolute path."""
+
+    class ConcurrentReader(RecordingReadToolResultTool):
+        def __init__(self) -> None:
+            super().__init__()
+            self.metadata = SimpleNamespace(
+                name=SPILL_READ_TOOL_NAME,
+                description="Read one engine-stored large tool result.",
+                concurrency_safe=True,
+            )
+
+    pattern = _forced_turn_pattern(tool_parallel_enabled=parallel)
+    reader = ConcurrentReader()
+    context = _context_with_spill_records(_SPILL_PATH)
+    context.attach_workspace("ws-forced-read", str(tmp_path))
+    context.add_user_message("What is in the stored result?")
+    runtime = PatternRuntime(execution_id="relative-path")
+    reads = [
+        (f"call_read_{index}", SPILL_READ_TOOL_NAME, {"path": _SPILL_PATH})
+        for index in range(2)
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool(), reader],
+        llm=FakeLLM([_batch_response(*reads), _final_call()]),
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert [call["path"] for call in reader.calls] == [_SPILL_PATH, _SPILL_PATH]
+    label = "before_tool_batch" if parallel else "before_tool"
+    payloads = [p for p in runtime.checkpoints if p["label"] == label]
+    assert payloads
+    for payload in payloads:
+        serialized = json.dumps(
+            {"metadata": payload["metadata"], "state": payload["pattern_state"]},
+            default=str,
+        )
+        assert _SPILL_PATH in serialized
+        assert str(tmp_path) not in serialized
+
+
+_REJECTS_USED_UP = (
+    "Too many paths for the final answer did not match the stored results "
+    "listed above. Answer from what you have; do not state a value you did "
+    "not read."
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("used", "rejected", "paths", "outputs", "reads_run"),
+    [
+        (2, 0, [_SPILL_PATH, _SPILL_PATH], [_READS_USED_UP], 1),
+        (
+            0,
+            2,
+            ["tool-results/x.json", _SPILL_PATH],
+            [_UNLISTED_PATH, _REJECTS_USED_UP],
+            0,
+        ),
+    ],
+    ids=["reads_used_up", "rejects_used_up"],
+)
+async def test_forced_turn_refusals_once_an_allowance_is_used_up(
+    used: int,
+    rejected: int,
+    paths: list[str],
+    outputs: list[str],
+    reads_run: int,
+) -> None:
+    """The observation a refused read gets names which allowance ran out;
+    once either is used up, even a stored path is refused and nothing more
+    is counted."""
+    pattern, reader, context, result = await _run_forced_reads(
+        [
+            _batch_response(
+                *(
+                    (f"call_read_{index}", SPILL_READ_TOOL_NAME, {"path": path})
+                    for index, path in enumerate(paths)
+                )
+            )
+        ],
+        used=used,
+        rejected=rejected,
+    )
+
+    assert result["success"] is True
+    assert len(reader.calls) == reads_run
+    assert _tool_result_outputs(context, SPILL_READ_TOOL_NAME)[reads_run:] == [
+        {"output": text} for text in outputs
+    ]
+    assert (pattern.forced_answer_reads_used, pattern.forced_answer_reads_rejected) == (
+        (3, 0) if used else (0, 3)
+    )
+    assert pattern.forced_answer_extra_iterations == 1
+
+
+def _successful_reads_ledger(pattern: ReActPattern, count: int) -> dict[str, Any]:
+    call: dict[str, Any] = {}
+    for index in range(count):
+        call = {
+            "id": f"call_read_{index}",
+            "name": SPILL_READ_TOOL_NAME,
+            "args": {"path": _SPILL_PATH},
+        }
+        pattern._record_tool_call(call, status="completed", result={"items": []})
+    return call
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cell", "read_open", "force_flag", "fires"),
+    [
+        ("flash_after_a_forced_turn_with_nothing_stored", False, True, True),
+        ("forced_turn_offering_reads", True, True, False),
+        ("forced_turn_with_the_allowance_used_up", False, True, True),
+    ],
+)
+async def test_repeated_tool_decision_still_fires_after_a_forced_turn(
+    cell: str, read_open: bool, force_flag: bool, fires: bool
+) -> None:
+    """Only the turn that actually offers reads skips the repeated-tool
+    decision; the force flag alone does not."""
+    pattern = ReActPattern(finalize_after_tool_result=True)
+    pattern.force_final_answer_next = force_flag
+    pattern._forced_answer_read_open = read_open
+    last_call = _successful_reads_ledger(pattern, 4)
+
+    stored = cell != "flash_after_a_forced_turn_with_nothing_stored"
+
+    requested = await pattern._request_repeated_tool_decision_if_needed(
+        tool_call=last_call,
+        context=_forced_turn_context(stored=stored),
+        runtime=PatternRuntime(execution_id="decision"),
+    )
+
+    assert requested is fires
+
+
+@pytest.mark.asyncio
+async def test_repeated_reads_on_ordinary_turns_still_ask_for_a_decision() -> None:
+    """With stored results, four reads in a row on ordinary turns still ask
+    the repeated-tool decision."""
+    pattern = ReActPattern(max_iterations=8)
+    pattern.task_text = "t"
+    reader = RecordingReadToolResultTool()
+    context = _context_with_spill_records(_SPILL_PATH)
+    context.add_user_message("Read the stored result.")
+    llm = FakeLLM(
+        [
+            *(
+                _read_call(f"call_read_{index}", _SPILL_PATH, start=index + 1)
+                for index in range(4)
+            ),
+            _decision_response("final_answer"),
+            _final_call(),
+        ]
+    )
+
+    result = await pattern.run(context=context, tools=[FakeTool(), reader], llm=llm)
+
+    assert result["success"] is True
+    assert len(reader.calls) == 4
+    assert _schema_names(llm.calls[4]) == ["react_decision"]
+    assert pattern.forced_answer_reads_used == 0
+
+
+@pytest.mark.asyncio
+async def test_forced_turn_reads_do_not_ask_for_a_decision() -> None:
+    """Reads admitted on a forced turn do not trigger the repeated-tool
+    decision, even past its threshold."""
+    pattern = _forced_turn_pattern(
+        max_iterations=8, repeated_tool_decision_after_consecutive_tool_calls=2
+    )
+    reader = RecordingReadToolResultTool()
+    context = _context_with_spill_records(_SPILL_PATH)
+    context.add_user_message("What is in the stored result?")
+    runtime = PatternRuntime(execution_id="no-decision")
+    reads = [
+        (f"call_read_{index}", SPILL_READ_TOOL_NAME, {"path": _SPILL_PATH})
+        for index in range(3)
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool(), reader],
+        llm=FakeLLM([_batch_response(*reads), _final_call()]),
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert len(reader.calls) == 3
+    assert "repeated_tool_decision_requested" not in [
+        payload["label"] for payload in runtime.checkpoints
+    ]
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_can_finish_with_final_answer_tool() -> None:
     llm = FakeLLM(

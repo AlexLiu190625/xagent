@@ -12,6 +12,9 @@ behavior:
 - batch checkpoints: before_tool_batch / after_tool_batch are emitted for a
   concurrent segment; before_tool / after_tool for a serial one.
 - repeated-tool-decision is evaluated once per segment.
+- forced-answer reads: on a forced turn that offers read_tool_result, each
+  read in the batch is admitted or refused on its own before anything runs,
+  and results still reach the context in call order.
 """
 
 from __future__ import annotations
@@ -28,6 +31,8 @@ from tests.core.agent.concurrency_harness import (
     make_tool_call,
 )
 from xagent.core.agent import PatternRuntime, ToolCallInterrupted
+from xagent.core.agent.context.components import SpillRegistryComponent
+from xagent.core.tools.tool_result_spill import SPILL_READ_TOOL_NAME
 
 
 def _checkpoint_statuses(runtime: FakeRuntime) -> list[str]:
@@ -290,3 +295,112 @@ async def test_crash_during_batch_keeps_segment_pending_for_resume() -> None:
 
     # Segment was not dequeued -> available for re-execution on resume.
     assert [tc["name"] for tc in pattern.pending_tool_calls] == ["s1", "s2"]
+
+
+# --- forced-answer turn: read policy inside one batch ------------------------
+
+_STORED_PATH = "tool-results/calculator-0123456789abcdef0123456789abcdef.json"
+_READS_USED_UP = (
+    "The read allowance for the final answer is used up. Answer from what you "
+    "have already read; do not state a value you did not read."
+)
+
+
+class _StoredResultsContext(RecordingContext):
+    """A RecordingContext whose run has stored one result."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._registry = SpillRegistryComponent(
+            records=[{"relative_path": _STORED_PATH, "kind": "array"}]
+        )
+
+    def get_component(self, name: str):
+        return self._registry if name == "spilled_results" else None
+
+
+def _read_calls(count: int) -> list[dict]:
+    return [
+        make_tool_call(SPILL_READ_TOOL_NAME, {"path": _STORED_PATH})
+        for _ in range(count)
+    ]
+
+
+def _forced_read_pattern(*, parallel: bool, read_open: bool = True):
+    pattern = make_react(
+        parallel=parallel,
+        max_concurrency=3,
+        repeated_tool_decision_after_consecutive_tool_calls=None,
+        repeated_tool_decision_after_consecutive_work_tool_calls=None,
+    )
+    pattern.task_text = "t"
+    pattern.force_final_answer_next = True
+    pattern._forced_answer_read_open = read_open
+    return pattern
+
+
+@pytest.mark.parametrize(
+    "cell", ["serial", "concurrent", "mixed_with_other_call", "resumed"]
+)
+async def test_forced_turn_policy_applies_within_one_batch(cell: str) -> None:
+    """Eight reads in one forced-turn response: the first three run, the
+    other five get the used-up observation without running, and every call
+    gets its result in call order."""
+    reader = FakeTool(SPILL_READ_TOOL_NAME, read_only=True)
+    other = FakeTool("s1", read_only=True)
+    pattern = _forced_read_pattern(parallel=cell != "serial")
+    calls = _read_calls(8)
+    if cell == "mixed_with_other_call":
+        calls.insert(2, make_tool_call("s1"))
+    if cell == "resumed":
+        restored = _forced_read_pattern(parallel=True, read_open=False)
+        restored.load_state(pattern.get_state())
+        pattern = restored
+    pattern.pending_tool_calls = list(calls)
+    context = _StoredResultsContext()
+
+    result = await pattern._execute_pending_tool_calls(
+        context=context, tools=[reader, other], llm=None, runtime=FakeRuntime()
+    )
+
+    assert result is None
+    assert pattern.pending_tool_calls == []
+    assert len(reader.calls) == 3
+    assert len(other.calls) == (1 if cell == "mixed_with_other_call" else 0)
+    assert [entry["tool_call_id"] for entry in context.tool_results] == [
+        call["id"] for call in calls
+    ]
+    refused = [
+        entry
+        for entry in context.tool_results
+        if entry["result"] == {"output": _READS_USED_UP}
+    ]
+    assert [entry["tool_call_id"] for entry in refused] == [
+        call["id"] for call in calls if call["name"] == SPILL_READ_TOOL_NAME
+    ][3:]
+    assert pattern.forced_answer_reads_used == 3
+    assert pattern.forced_answer_reads_rejected == 0
+    assert pattern.forced_answer_extra_iterations == 3
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+async def test_ordinary_turn_reads_are_not_counted(parallel: bool) -> None:
+    """Outside a forced turn that offers reads, every read runs and nothing
+    is counted."""
+    reader = FakeTool(SPILL_READ_TOOL_NAME, read_only=True)
+    pattern = _forced_read_pattern(parallel=parallel, read_open=False)
+    pattern.force_final_answer_next = False
+    pattern.pending_tool_calls = _read_calls(8)
+    context = _StoredResultsContext()
+
+    result = await pattern._execute_pending_tool_calls(
+        context=context, tools=[reader], llm=None, runtime=FakeRuntime()
+    )
+
+    assert result is None
+    assert len(reader.calls) == 8
+    assert (
+        pattern.forced_answer_reads_used,
+        pattern.forced_answer_reads_rejected,
+        pattern.forced_answer_extra_iterations,
+    ) == (0, 0, 0)

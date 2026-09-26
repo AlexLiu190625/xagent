@@ -85,7 +85,11 @@ from ....tools.adapters.vibe.mcp_approval_gate import (
     ToolCallExecutionContext,
     bind_tool_call_execution_context,
 )
-from ....tools.tool_result_spill import SPILL_READ_TOOL_NAME, SPILL_RESERVED_RESULT_KEY
+from ....tools.tool_result_spill import (
+    SPILL_READ_TOOL_NAME,
+    SPILL_RESERVED_RESULT_KEY,
+    normalize_spilled_relative_path,
+)
 from ....tools.user_interaction import (
     ToolInteractionSettlement,
     tool_result_waits_for_user,
@@ -174,6 +178,21 @@ ITERATION_LIMIT_DELIVERY_TIMEOUT_SECONDS = 30.0
 # (the reject cap) are counted apart so neither kind uses up the other.
 FORCED_ANSWER_READ_BUDGET = 3
 FORCED_ANSWER_READ_REJECT_CAP = 3
+# The observations a forced turn's refused read_tool_result calls receive.
+FORCED_ANSWER_READS_USED_UP_TEXT = (
+    "The read allowance for the final answer is used up. Answer from what you "
+    "have already read; do not state a value you did not read."
+)
+FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT = (
+    "Too many paths for the final answer did not match the stored results "
+    "listed above. Answer from what you have; do not state a value you did "
+    "not read."
+)
+FORCED_ANSWER_READ_UNLISTED_PATH_TEXT = (
+    "read_tool_result during the final answer turn is limited to the stored "
+    "results listed above. Copy one of those paths exactly. That path is not "
+    "one of them."
+)
 REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Target natural language for user-facing prose in this ReAct response, "
     "for example English, Simplified Chinese, Traditional Chinese, or Spanish. "
@@ -2073,6 +2092,64 @@ class ReActPattern(AgentPattern):
         if reader is not None:
             schemas.append(reader)
         return schemas
+
+    def _apply_forced_answer_read_policy(
+        self, segment: list[dict[str, Any]], context: Any
+    ) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], str]]]:
+        """Admit or refuse each read_tool_result call of a forced turn.
+
+        The one writer of both read counters and of
+        forced_answer_extra_iterations, which moves in lock step with them.
+        Calls are judged one at a time, in order, before any of them runs:
+
+        - not read_tool_result: admitted, nothing counted;
+        - read allowance used up: refused, nothing counted;
+        - reject allowance used up: refused, nothing counted;
+        - no path (the key is missing or None, which lists the stored
+          results): admitted as one read;
+        - a path that normalizes to a stored result: admitted as one read,
+          whatever start, end and offset it carries;
+        - any other path: refused and counted as one reject.
+
+        Returns (admitted, refused) for the leading calls of segment that
+        share the first call's outcome, so results still reach the context
+        in call order; the calls after them are judged when the loop reaches
+        them.
+        """
+        stored_paths = self._spilled_paths(context)
+        admitted: list[dict[str, Any]] = []
+        refused: list[tuple[dict[str, Any], str]] = []
+        for tool_call in segment:
+            refusal: str | None = None
+            counts_as_read = False
+            counts_as_reject = False
+            if tool_call.get("name") == SPILL_READ_TOOL_NAME:
+                path = self._tool_call_args_dict(tool_call).get("path")
+                if self.forced_answer_reads_used >= FORCED_ANSWER_READ_BUDGET:
+                    refusal = FORCED_ANSWER_READS_USED_UP_TEXT
+                elif self.forced_answer_reads_rejected >= FORCED_ANSWER_READ_REJECT_CAP:
+                    refusal = FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT
+                elif (
+                    path is None
+                    or normalize_spilled_relative_path(path) in stored_paths
+                ):
+                    counts_as_read = True
+                else:
+                    refusal = FORCED_ANSWER_READ_UNLISTED_PATH_TEXT
+                    counts_as_reject = True
+            if admitted if refusal is not None else refused:
+                break
+            if counts_as_read:
+                self.forced_answer_reads_used += 1
+                self.forced_answer_extra_iterations += 1
+            if counts_as_reject:
+                self.forced_answer_reads_rejected += 1
+                self.forced_answer_extra_iterations += 1
+            if refusal is None:
+                admitted.append(tool_call)
+            else:
+                refused.append((tool_call, refusal))
+        return admitted, refused
 
     def _schema_tool_names(self, tool_schemas: list[dict[str, Any]]) -> list[str]:
         names: list[str] = []
@@ -4337,6 +4414,25 @@ class ReActPattern(AgentPattern):
                 return interrupted
 
             segment, kind = self._next_segment(self.pending_tool_calls, tools)
+            if self._forced_answer_read_open:
+                admitted, refused = self._apply_forced_answer_read_policy(
+                    segment, context
+                )
+                for refused_call, refusal in refused:
+                    self._backfill_result(refused_call, {"output": refusal}, context)
+                if refused:
+                    refused_ids = {id(call) for call, _ in refused}
+                    self.pending_tool_calls = [
+                        call
+                        for call in self.pending_tool_calls
+                        if id(call) not in refused_ids
+                    ]
+                if not admitted:
+                    continue
+                if len(admitted) < len(segment):
+                    # The rest of the segment stays pending for the next pass;
+                    # re-slicing keeps the segment kind right for what is left.
+                    segment, kind = self._next_segment(admitted, tools)
 
             if kind == "control":
                 tool_call = segment[0]
@@ -4499,6 +4595,11 @@ class ReActPattern(AgentPattern):
         context: Any,
         runtime: PatternRuntime,
     ) -> bool:
+        if self._forced_answer_read_open:
+            # A forced turn's reads have allowances of their own. Only the
+            # turn that actually offers reads is exempt: ordinary turns,
+            # stored results or not, still get the decision.
+            return False
         if self.repeated_tool_decision is not None:
             return False
 
