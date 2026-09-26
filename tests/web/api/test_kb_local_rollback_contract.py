@@ -118,6 +118,7 @@ def _install_leaves(
         db, *, user_id, collection_file_ids, remaining_file_ids, collection_dir
     ):
         seen["collection_file_ids"] = collection_file_ids
+        seen["collection_dir"] = collection_dir
         _hit("del_coll_files")
 
     class _FileStore:
@@ -235,7 +236,7 @@ async def _rollback(
         pytest.param(
             {},
             {"uploaded_file_existed_before": True},
-            KEPT,
+            ["list:coll", "may_delete", "delete_document", "restore"],
             id="registered-kept-existing-upload",
         ),
         pytest.param(
@@ -320,6 +321,31 @@ async def test_collection_decision_compares_doc_ids(
     }
     assert seen["collection_file_ids"] == file_ids
     assert f"refs:{sorted(file_ids)}" in calls
+
+
+@pytest.mark.parametrize(
+    ("existed", "offered"),
+    [
+        pytest.param(False, {"file-1"}, id="new-row"),
+        pytest.param(True, set(), id="pre-existing-row"),
+    ],
+)
+async def test_whole_collection_offers_only_a_row_this_run_created(
+    monkeypatch, existed, offered
+) -> None:
+    calls: list[str] = []
+    db, seen = _install_leaves(
+        monkeypatch,
+        calls,
+        records=[{"doc_id": "doc-1", "file_id": "file-1"}],
+        may_delete=True,
+    )
+
+    await _rollback(db, uploaded_file_existed_before=existed)
+
+    assert seen["collection_file_ids"] == offered
+    assert seen["collection_dir"] is None
+    assert f"refs:{sorted(offered)}" in calls
 
 
 async def test_collection_existed_before_still_asks_the_decision(monkeypatch) -> None:

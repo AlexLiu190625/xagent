@@ -1421,6 +1421,8 @@ async def _rollback_failed_ingestion(
         )
 
     def _compensate_file() -> None:
+        if uploaded_file_existed_before:
+            return
         if register_created and doc_id:
             remaining_records = _list_document_records_for_file_ids(
                 [file_record_id],
@@ -1441,7 +1443,7 @@ async def _rollback_failed_ingestion(
                 remaining_file_ids=remaining_file_ids,
             )
             db.commit()
-        elif not uploaded_file_existed_before:
+        else:
             UploadedFileStore(db).delete(file_record, delete_local=False)
             db.commit()
 
@@ -1485,8 +1487,12 @@ async def _rollback_failed_ingestion(
                 raise RuntimeError(
                     f"delete collection physical directory during rollback failed: {error_detail}"
                 )
+            # Only this run's own row may go; the directory pass would take any row.
+            own_file_ids = (
+                set() if uploaded_file_existed_before else collection_file_ids
+            )
             remaining_records = _list_document_records_for_file_ids(
-                collection_file_ids,
+                own_file_ids,
                 user_id=user_id,
                 is_admin=bool(user.is_admin),
             )
@@ -1500,9 +1506,9 @@ async def _rollback_failed_ingestion(
             delete_collection_uploaded_files(
                 db,
                 user_id=user_id,
-                collection_file_ids=collection_file_ids,
+                collection_file_ids=own_file_ids,
                 remaining_file_ids=remaining_file_ids,
-                collection_dir=physical_cleanup.collection_dir,
+                collection_dir=None,
             )
             if not uploaded_file_existed_before:
                 # The collection cleanup above may already delete+commit the UploadedFile
@@ -1615,6 +1621,8 @@ async def _rollback_failed_cloud_ingestion(
         )
 
     def _compensate_file() -> None:
+        if uploaded_file_existed_before:
+            return
         remaining_records = _list_document_records_for_file_ids(
             [file_record_id] if file_record_id is not None else [],
             user_id=user_id,
@@ -3930,7 +3938,9 @@ async def ingest(
         .filter(UploadedFile.storage_path == str(file_path))
         .first()
     )
-    uploaded_file_existed_before = existing_file_record is not None
+    existing_file_id = (
+        str(existing_file_record.file_id) if existing_file_record is not None else None
+    )
     document_existed_before = await _document_existed_before_ingest(
         safe_collection, existing_file_record
     )
@@ -4041,6 +4051,12 @@ async def ingest(
             storage_path=file_path,
             mime_type=mime_type,
             file_size=int(total_size),
+        )
+        # An insert gets a fresh file_id, so a fresh doc id; only an in-place update
+        # keeps the ones the lookup found.
+        uploaded_file_existed_before = str(file_record.file_id) == existing_file_id
+        document_existed_before = (
+            document_existed_before and uploaded_file_existed_before
         )
 
         def _run_ingestion() -> KBApiOperationResult[IngestionResult]:
@@ -4725,7 +4741,11 @@ async def ingest_cloud(
                         .filter(UploadedFile.storage_path == str(file_path))
                         .first()
                     )
-                    uploaded_file_existed_before = existing_file_record is not None
+                    existing_file_id = (
+                        str(existing_file_record.file_id)
+                        if existing_file_record is not None
+                        else None
+                    )
                     document_existed_before = await _document_existed_before_ingest(
                         safe_collection, existing_file_record
                     )
@@ -4737,6 +4757,14 @@ async def ingest_cloud(
                         storage_path=file_path,
                         mime_type=stored_mime_type,
                         file_size=int(file_path.stat().st_size),
+                    )
+                    # An insert gets a fresh file_id, so a fresh doc id; only an
+                    # in-place update keeps the ones the lookup found.
+                    uploaded_file_existed_before = (
+                        str(file_record.file_id) == existing_file_id
+                    )
+                    document_existed_before = (
+                        document_existed_before and uploaded_file_existed_before
                     )
 
                     # Run ingestion (blocking)

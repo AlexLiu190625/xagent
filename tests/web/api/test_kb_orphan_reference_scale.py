@@ -139,6 +139,7 @@ async def _rollback(
     path: Path,
     collection: str,
     collection_existed_before: bool,
+    uploaded_file_existed_before: bool = False,
 ) -> None:
     db = sessions()
     try:
@@ -157,7 +158,7 @@ async def _rollback(
             file_path=path,
             file_record=db.query(UploadedFile).filter_by(file_id=file_id).one(),
             collection_existed_before=collection_existed_before,
-            uploaded_file_existed_before=True,
+            uploaded_file_existed_before=uploaded_file_existed_before,
             file_backup_path=None,
             had_existing_file=True,
         )
@@ -248,6 +249,7 @@ async def test_local_collection_rollback_keeps_file_referenced_past_scan_cap(
         path=path,
         collection="fresh",
         collection_existed_before=False,
+        uploaded_file_existed_before=True,
     )
 
     assert _row_exists(sessions, file_id)

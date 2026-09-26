@@ -139,6 +139,7 @@ async def _rollback(
     result: Optional[IngestionResult] = None,
     with_file_record: bool = True,
     embedding_model_id: Optional[str] = None,
+    uploaded_file_existed_before: bool = False,
 ) -> None:
     await kb_module._rollback_failed_cloud_ingestion(
         db=db,
@@ -148,7 +149,7 @@ async def _rollback(
         file_path=Path("/uploads/cloud__abc.csv"),
         file_record=SimpleNamespace(file_id="file-1") if with_file_record else None,
         collection_existed_before=False,
-        uploaded_file_existed_before=False,
+        uploaded_file_existed_before=uploaded_file_existed_before,
         file_backup_path=None,
         had_existing_file=False,
         embedding_model_id=embedding_model_id,
@@ -191,6 +192,29 @@ async def test_rollback_runs_leaves_in_order(
 
     await _rollback(
         db, result=_result(**result_kwargs), with_file_record=with_file_record
+    )
+
+    assert calls == expected
+
+
+@pytest.mark.parametrize(
+    ("result_kwargs", "expected"),
+    [
+        pytest.param({}, [FULL_CHAIN[0], *FULL_CHAIN[3:]], id="registered"),
+        pytest.param(
+            {"steps": []}, ["clear_status", *FULL_CHAIN[3:]], id="unregistered"
+        ),
+        pytest.param({"doc_id": None}, FULL_CHAIN[3:], id="no-doc-id"),
+    ],
+)
+async def test_pre_existing_row_skips_the_file_step(
+    monkeypatch, result_kwargs, expected
+) -> None:
+    calls: list[str] = []
+    db = _install_leaves(monkeypatch, calls)
+
+    await _rollback(
+        db, result=_result(**result_kwargs), uploaded_file_existed_before=True
     )
 
     assert calls == expected
