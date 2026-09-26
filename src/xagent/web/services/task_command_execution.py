@@ -1710,6 +1710,7 @@ async def handle_task_message(
                     task_setup_snapshot=task_setup_snapshot,
                     task_owner_user_id=task_owner_user_id,
                     resolved_execution_scope=resolved_execution_scope,
+                    connector_runtime_turn_id=turn_id,
                 )
                 if hasattr(agent_service, "set_outbound_message_handler"):
                     agent_service.set_outbound_message_handler(

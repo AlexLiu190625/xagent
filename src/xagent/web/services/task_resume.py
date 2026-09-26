@@ -573,6 +573,7 @@ async def resume_a2a_task(
             assert_never(active_interaction_read)
 
         injected_agent_service: Any = None
+        turn_id = f"a2a:{task_id}:{message_id}"
 
         async def inject_user_message() -> tuple[Any, UserMessageInjectionOutcome]:
             from .agent_service_manager import get_agent_manager
@@ -581,6 +582,7 @@ async def resume_a2a_task(
                 task_id,
                 None,
                 task_owner_user_id=task_owner_user_id,
+                connector_runtime_turn_id=turn_id,
             )
             nonlocal injected_agent_service
             injected_agent_service = agent_service
@@ -588,7 +590,7 @@ async def resume_a2a_task(
                 str(task_id),
                 execution_message=text,
                 display_message=text,
-                turn_id=f"a2a:{task_id}:{message_id}",
+                turn_id=turn_id,
                 request_interrupt=False,
                 reason="A2A input-required response",
             )
@@ -1144,6 +1146,7 @@ async def resume_task_reply(
                     task_id,
                     None,
                     task_owner_user_id=ctx.task_owner_user_id,
+                    connector_runtime_turn_id=turn_id,
                 )
             )
             nonlocal injected_agent_service
