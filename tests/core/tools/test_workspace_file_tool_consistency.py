@@ -691,17 +691,24 @@ class TestReadToolResult:
 
     @pytest.mark.usefixtures("mock_workspace_db")
     @pytest.mark.parametrize(
-        "start, end",
-        [(0, None), (None, 0), (3, 1), (-1, 2)],
+        "start, end, offset",
+        [
+            (0, None, 0),
+            (None, 0, 0),
+            (3, 1, 0),
+            (-1, 2, 0),
+            (None, None, -1),
+            (1, 2, -1),
+        ],
     )
     def test_read_tool_result_rejects_invalid_ranges_without_raising(
-        self, tmp_path, start, end
+        self, tmp_path, start, end, offset
     ):
         workspace = TaskWorkspace("task-1", str(tmp_path))
         tools = WorkspaceFileTools(workspace)
         rel = self._spill_file(workspace, json.dumps([1, 2, 3]), "array")
 
-        result = tools.read_tool_result(rel, start=start, end=end)
+        result = tools.read_tool_result(rel, start=start, end=end, offset=offset)
         assert result == spill_read_unavailable("invalid_range")
 
     @pytest.mark.usefixtures("mock_workspace_db")
@@ -745,11 +752,15 @@ class TestReadToolResult:
         rel = self._spill_file(workspace, "y" * 20_000)
 
         result = tools.read_tool_result(rel)
-        assert "output" not in result
-        assert result["content_truncated"] is True
-        assert result["content_preview"] == "y" * SPILL_READ_MAX_CHARS
-        assert result["original_chars"] == 20_000
-        assert result["instruction"] == SPILL_READ_TRUNCATED_INSTRUCTION
+        assert result == {
+            "relative_path": rel,
+            "content_preview": "y" * SPILL_READ_MAX_CHARS,
+            "content_truncated": True,
+            "original_chars": 20_000,
+            "item_count": 1,
+            "offset": 0,
+            "instruction": SPILL_READ_TRUNCATED_INSTRUCTION,
+        }
 
     @pytest.mark.usefixtures("mock_workspace_db")
     @pytest.mark.parametrize("length", [12_000, 12_001, 60_000])
@@ -778,6 +789,101 @@ class TestReadToolResult:
         assert "output" not in large
         assert large["content_truncated"] is True
         assert large["original_chars"] == len(json.dumps(["z" * 5_000] * 3))
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_read_tool_result_offset_reads_one_long_line_to_its_end(self, tmp_path):
+        """One line of 30,000 characters is a single item, so no start/end
+        range is narrower than it; offset reads it in three calls with the
+        same range, and the three pieces are the line."""
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        line = "".join(chr(ord("a") + index % 26) for index in range(30_000))
+        rel = self._spill_file(workspace, line)
+
+        pieces = [
+            tools.read_tool_result(rel, start=1, end=1, offset=offset)
+            for offset in (0, 12_000, 24_000)
+        ]
+
+        assert [piece["offset"] for piece in pieces] == [0, 12_000, 24_000]
+        assert [len(piece["content_preview"]) for piece in pieces] == [
+            12_000,
+            12_000,
+            6_000,
+        ]
+        assert [piece["content_truncated"] for piece in pieces] == [
+            True,
+            True,
+            False,
+        ]
+        assert [piece.get("instruction") for piece in pieces] == [
+            SPILL_READ_TRUNCATED_INSTRUCTION,
+            SPILL_READ_TRUNCATED_INSTRUCTION,
+            None,
+        ]
+        assert all(piece["item_count"] == 1 for piece in pieces)
+        assert all(piece["original_chars"] == 30_000 for piece in pieces)
+        assert all("output" not in piece for piece in pieces)
+        assert "".join(piece["content_preview"] for piece in pieces) == line
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_read_tool_result_offset_continues_inside_one_large_array_element(
+        self, tmp_path
+    ):
+        """The same holds for one oversized JSON element: offset moves
+        through the rendered text of the selected items, and item_count is
+        the stored result's own item count."""
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        rel = self._spill_file(workspace, json.dumps(["z" * 20_000, 1, 2]), "array")
+        rendered = json.dumps(["z" * 20_000])
+
+        first = tools.read_tool_result(rel, start=1, end=1)
+        rest = tools.read_tool_result(rel, start=1, end=1, offset=SPILL_READ_MAX_CHARS)
+
+        assert first["item_count"] == rest["item_count"] == 3
+        assert first["original_chars"] == rest["original_chars"] == len(rendered)
+        assert first["content_truncated"] is True
+        assert rest["content_truncated"] is False
+        assert first["content_preview"] + rest["content_preview"] == rendered
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_read_tool_result_offset_must_name_a_character_that_exists(self, tmp_path):
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        rel = self._spill_file(workspace, "abc")
+        empty = self._spill_file(workspace, "", tool_name="empty")
+
+        assert tools.read_tool_result(rel, offset=2) == {
+            "relative_path": rel,
+            "content_preview": "c",
+            "content_truncated": False,
+            "original_chars": 3,
+            "item_count": 1,
+            "offset": 2,
+        }
+        assert tools.read_tool_result(rel, offset=3) == spill_read_unavailable(
+            "invalid_range"
+        )
+        assert tools.read_tool_result(empty, offset=0) == {
+            "relative_path": empty,
+            "output": "",
+        }
+        assert tools.read_tool_result(empty, offset=1) == spill_read_unavailable(
+            "invalid_range"
+        )
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    @pytest.mark.parametrize("path", [None, "  "])
+    def test_read_tool_result_listing_rejects_an_offset(self, tmp_path, path):
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        self._spill_file(workspace, "a" * 10)
+
+        assert tools.read_tool_result(path, offset=5) == spill_read_unavailable(
+            "invalid_range"
+        )
+        assert tools.read_tool_result(path, offset=0)["count"] == 1
 
     @pytest.mark.usefixtures("mock_workspace_db")
     def test_read_tool_result_truncated_instruction_reaches_model_visible_content(

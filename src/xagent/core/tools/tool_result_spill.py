@@ -105,7 +105,9 @@ SPILL_READ_UNAVAILABLE_MESSAGES = {
     ),
     "invalid_range": (
         "start and end are 1-based item numbers: both must be 1 or "
-        "greater, and start must not exceed end."
+        "greater, and start must not exceed end. offset is a 0-based "
+        "character position: it must be 0 or greater and fall inside the "
+        "text the selected items render to."
     ),
     "listing_takes_no_range": (
         "Omit start and end to list the stored results, or give a path to "
@@ -119,7 +121,9 @@ SPILL_READ_UNAVAILABLE_MESSAGES = {
 SPILL_READ_TOOL_NAME = "read_tool_result"
 SPILL_READ_MAX_CHARS = 12_000
 SPILL_READ_TRUNCATED_INSTRUCTION = (
-    "Call read_tool_result again with a narrower start/end range."
+    "Call read_tool_result again with a narrower start/end range to read "
+    "fewer items, or with the same start/end and a larger offset to "
+    "continue reading within them."
 )
 
 # The union of every key the two OutputFilteredToolWrapper bypass branches
@@ -547,6 +551,7 @@ def read_spilled_result(
     *,
     start: int | None = None,
     end: int | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Read one stored result from ``spill_dir`` without any path search.
 
@@ -572,6 +577,15 @@ def read_spilled_result(
     every call: a JSON array addresses elements, a JSON object addresses
     top-level entries in document order, anything else addresses physical
     lines. The registry is not consulted and the extension is not trusted.
+
+    At most SPILL_READ_MAX_CHARS characters come back per call. offset is a
+    0-based character position in the text the selected items render to,
+    and the reply starts there; it is how a single item longer than the cap
+    -- one long line of text, or one large array element or object entry --
+    is read to its end, since no start/end range is narrower than one item.
+    A reply that is not the whole selected text uses the preview shape
+    below, which says where it starts, how long the whole text is, how many
+    items the stored result holds, and whether more follows.
 
     Every rejection is returned as a classified failure
     (spill_read_unavailable) rather than raised, because the caller
@@ -641,18 +655,21 @@ def read_spilled_result(
         return spill_read_unavailable("not_found")
     content = raw.decode("utf-8", errors="replace")
 
+    if (
+        (start is not None and start < 1)
+        or (end is not None and end < 1)
+        or (start is not None and end is not None and start > end)
+        or offset < 0
+    ):
+        return spill_read_unavailable("invalid_range")
+    parsed: tuple[str, Any] | None = None
     if start is None and end is None:
         # No range asked: hand back the file as written. Parsing it here
         # would cost the whole 8 MiB budget and change nothing.
         output = content
     else:
-        if (
-            (start is not None and start < 1)
-            or (end is not None and end < 1)
-            or (start is not None and end is not None and start > end)
-        ):
-            return spill_read_unavailable("invalid_range")
         kind, value = _spill_kind_of(content)
+        parsed = (kind, value)
         total = _spill_item_count(kind, value, content)
         first = 1 if start is None else start
         if first > total:
@@ -660,19 +677,35 @@ def read_spilled_result(
         last = total if end is None else min(end, total)
         output = _spill_slice(kind, value, content, first, last)
 
-    if len(output) <= SPILL_READ_MAX_CHARS:
+    if offset == 0 and len(output) <= SPILL_READ_MAX_CHARS:
         return {"relative_path": relative_path, "output": output}
+    # offset 0 always starts inside the text, even an empty one; any other
+    # offset has to name a character that exists.
+    if offset > 0 and offset >= len(output):
+        return spill_read_unavailable("invalid_range")
+    if parsed is None:
+        # Only a reply that cannot carry the whole text states the item
+        # count, so only this path parses a file read without a range.
+        parsed = _spill_kind_of(content)
+    item_count = _spill_item_count(parsed[0], parsed[1], content)
+    window_end = offset + SPILL_READ_MAX_CHARS
+    truncated = window_end < len(output)
     # Mirror read_file's over-limit shape (execution.py's
     # READ_FILE_CONTEXT_LIMIT branch): no "output" key, so
     # _format_tool_result renders the whole dict and the instruction
-    # stays visible to the model.
-    return {
+    # stays visible to the model. The instruction is there only while more
+    # of the selected text follows this preview.
+    preview: dict[str, Any] = {
         "relative_path": relative_path,
-        "content_preview": output[:SPILL_READ_MAX_CHARS],
-        "content_truncated": True,
+        "content_preview": output[offset:window_end],
+        "content_truncated": truncated,
         "original_chars": len(output),
-        "instruction": SPILL_READ_TRUNCATED_INSTRUCTION,
+        "item_count": item_count,
+        "offset": offset,
     }
+    if truncated:
+        preview["instruction"] = SPILL_READ_TRUNCATED_INSTRUCTION
+    return preview
 
 
 def list_spilled_results(

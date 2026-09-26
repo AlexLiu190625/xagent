@@ -16,7 +16,7 @@ from .....core.workspace import (
     TaskWorkspace,
 )
 from ...core.workspace_file_tool import FileInfo, WorkspaceFileOperations
-from ...tool_result_spill import SPILL_READ_TOOL_NAME
+from ...tool_result_spill import SPILL_READ_MAX_CHARS, SPILL_READ_TOOL_NAME
 from .base import ToolCategory
 from .function import FunctionTool
 
@@ -165,9 +165,10 @@ class WorkspaceFileTools(WorkspaceFileOperations):
         path: str | None = None,
         start: int | None = None,
         end: int | None = None,
+        offset: int = 0,
     ) -> Dict[str, Any]:
         """Read one engine-stored large tool result, or list them with no path."""
-        return self.inner.read_tool_result(path, start=start, end=end)
+        return self.inner.read_tool_result(path, start=start, end=end, offset=offset)
 
     def list_all_user_files(  # type: ignore[override]
         self,
@@ -324,11 +325,16 @@ class WorkspaceFileTools(WorkspaceFileOperations):
                 description=(
                     "Read one engine-stored large tool result by the exact path listed "
                     "in its notice. Omit path to list the stored results instead "
-                    "(relative_path and size in bytes of each); start and end must "
-                    "then be omitted too. start and end are 1-based item numbers, not "
+                    "(relative_path and size in bytes of each); start, end and offset "
+                    "must then be omitted too. start and end are 1-based item numbers, not "
                     "line numbers: array elements for a JSON array, top-level entries "
                     "for a JSON object, and lines only for plain text. Omit both to "
-                    "read the whole result."
+                    "read the whole result. One call returns at most "
+                    f"{SPILL_READ_MAX_CHARS:,} characters; offset is a 0-based character position in the "
+                    "text the selected items render to, and the reply starts there. "
+                    "When a reply is cut short, call again with the same start and "
+                    "end and a larger offset to continue, which is how a single "
+                    "item longer than the limit is read to its end."
                 ),
                 read_only=True,
                 concurrency_safe=True,

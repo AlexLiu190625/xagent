@@ -473,7 +473,9 @@ def test_spill_read_unavailable_messages_are_pinned():
         ),
         "invalid_range": (
             "start and end are 1-based item numbers: both must be 1 or "
-            "greater, and start must not exceed end."
+            "greater, and start must not exceed end. offset is a 0-based "
+            "character position: it must be 0 or greater and fall inside the "
+            "text the selected items render to."
         ),
         "listing_takes_no_range": (
             "Omit start and end to list the stored results, or give a path to "
@@ -510,7 +512,9 @@ def test_read_tool_name_and_truncated_instruction_are_pinned():
     # what the model sees when one read goes over the cap.
     assert SPILL_READ_TOOL_NAME == "read_tool_result"
     assert SPILL_READ_TRUNCATED_INSTRUCTION == (
-        "Call read_tool_result again with a narrower start/end range."
+        "Call read_tool_result again with a narrower start/end range to read "
+        "fewer items, or with the same start/end and a larger offset to "
+        "continue reading within them."
     )
     assert SPILL_READ_MAX_CHARS == 12_000
 

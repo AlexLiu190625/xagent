@@ -26,6 +26,7 @@ from ..tool_result_spill import (
     list_spilled_results,
     read_spilled_result,
     spill_dir_for_workspace,
+    spill_read_unavailable,
 )
 from .document_parser import DocumentCapabilities, DocumentParseArgs, parse_document
 from .file_tool import (
@@ -972,6 +973,7 @@ class WorkspaceFileOperations:
         *,
         start: int | None = None,
         end: int | None = None,
+        offset: int = 0,
     ) -> Dict[str, Any]:
         """Read one engine-stored tool result, or list them with no path.
 
@@ -982,6 +984,9 @@ class WorkspaceFileOperations:
         adds the one check that module cannot make, the workspace
         authority, and supplies this workspace's spill directory. A path
         that is None or blank lists the stored files instead of reading one.
+        offset is a position inside one stored result's text, so it has no
+        meaning for that listing; a non-zero offset without a path is
+        rejected rather than ignored.
 
         Rejections come back as classified failures rather than exceptions,
         because the caller records the return value as the tool observation
@@ -992,8 +997,10 @@ class WorkspaceFileOperations:
         self._require_workspace_authority()
         spill_dir = spill_dir_for_workspace(self.workspace.workspace_dir)
         if path is None or (isinstance(path, str) and not path.strip()):
+            if offset != 0:
+                return spill_read_unavailable("invalid_range")
             return list_spilled_results(spill_dir, start=start, end=end)
-        return read_spilled_result(spill_dir, path, start=start, end=end)
+        return read_spilled_result(spill_dir, path, start=start, end=end, offset=offset)
 
 
 def _get_workspace_ops(workspace_id: str) -> WorkspaceFileOperations:
