@@ -6186,8 +6186,9 @@ async def test_forced_turn_tier_a_prompt_states_unread_items(
 
     prompt = run.prompt(-1)
     assert (
-        "You may call read_tool_result to read them before answering, at most "
-        f"{3 - used} more time(s) before the final answer."
+        "You may call read_tool_result to read the stored results listed below "
+        f"before answering, at most {3 - used} more time(s) before the final "
+        "answer."
     ) in prompt
     assert _UNREAD_ITEMS_SENTENCE in prompt
     assert _READ_TOOL_RULE in prompt

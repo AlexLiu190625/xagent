@@ -580,7 +580,8 @@ class ReActPattern(AgentPattern):
         *,
         # Intentionally high for interactive and long-running agent tasks; callers
         # can pass a lower value when they need stricter cost or latency bounds.
-        # Reads on a forced answer turn add iterations on top of this bound
+        # Reads on a forced answer turn, and reads refused there because the
+        # path is not a stored result, add iterations on top of this bound
         # (forced_answer_extra_iterations, at most FORCED_ANSWER_READ_BUDGET +
         # FORCED_ANSWER_READ_REJECT_CAP per run); this value itself does not
         # count them.
@@ -3694,8 +3695,9 @@ class ReActPattern(AgentPattern):
         remaining = FORCED_ANSWER_READ_BUDGET - self.forced_answer_reads_used
         notice = render_spill_notice(self._spilled_records(context), style="compaction")
         return (
-            "You may call read_tool_result to read them before answering, at "
-            f"most {remaining} more time(s) before the final answer. start and "
+            "You may call read_tool_result to read the stored results listed "
+            f"below before answering, at most {remaining} more time(s) before "
+            "the final answer. start and "
             "end are 1-based item numbers for that file. Read in one turn and "
             "answer in the next: a response that calls read_tool_result and "
             "final_answer together loses the answer. Copy a path below exactly; "

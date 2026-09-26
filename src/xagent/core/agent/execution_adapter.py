@@ -340,9 +340,11 @@ class AgentExecutionAdapter:
             return (
                 ReActPattern(
                     # Two counted iterations: the tool call and the answer.
-                    # Each stored-result read on the forced answer turn adds
-                    # one more on top (forced_answer_extra_iterations), so a
-                    # read does not use up the answer's iteration.
+                    # Each stored-result read on the forced answer turn, and
+                    # each read refused there because its path is not a
+                    # stored result, adds one more on top
+                    # (forced_answer_extra_iterations), so a read does not use
+                    # up the answer's iteration.
                     max_iterations=2,
                     finalize_after_tool_result=True,
                     tool_parallel_enabled=self.config.tool_parallel_enabled,
