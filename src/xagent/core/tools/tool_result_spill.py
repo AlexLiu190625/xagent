@@ -586,24 +586,38 @@ def read_spilled_result(
     resolved = resolve_spilled_under(spill_dir, relative_path)
     if resolved is None:
         return spill_read_unavailable("not_found")
+    # resolve_spilled_under saw a regular file, but the entry can be
+    # replaced before it is opened, so everything below describes the one
+    # file this open reaches rather than whatever the path names later.
+    # O_NOFOLLOW refuses an entry that became a symlink (ELOOP). O_NONBLOCK
+    # keeps an entry that became a FIFO from blocking the open until a
+    # writer appears; the open then succeeds and fstat rejects it as not a
+    # regular file. On a regular file O_NONBLOCK has no effect on Linux or
+    # macOS: reading one never waits, so it never fails with EAGAIN.
+    #
+    # The writer never produces a file above SPILL_MAX_FILE_BYTES, so a
+    # larger file cannot be a stored result and is not read into memory.
+    # The size is taken from the open descriptor, not from the path, and
+    # the read is bounded to one byte past that size, so a file that grows
+    # after fstat still cannot be read whole; the length check below
+    # catches one that grew past the cap.
+    descriptor: int | None = None
     try:
-        # The writer never produces a file above SPILL_MAX_FILE_BYTES, so
-        # a larger file cannot be a stored result and is not read into
-        # memory. The size is taken from the open handle, not from the
-        # path: the entry can be replaced after resolve_spilled_under
-        # returned -- by a symlink to a far larger file, say -- and a
-        # size looked up by path describes whatever the path named at
-        # that moment, not what the open reaches. The read is bounded
-        # too, one byte past that size, so a file that grows after the
-        # size is taken still cannot be read whole; the length check
-        # below catches one that grew past the cap.
-        with resolved.open("rb") as handle:
-            size = os.fstat(handle.fileno()).st_size
-            if size > SPILL_MAX_FILE_BYTES:
-                return spill_read_unavailable("not_found")
+        descriptor = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return spill_read_unavailable("not_found")
+        size = metadata.st_size
+        if size > SPILL_MAX_FILE_BYTES:
+            return spill_read_unavailable("not_found")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
             raw = handle.read(size + 1)
     except OSError:
         return spill_read_unavailable("not_found")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if len(raw) > SPILL_MAX_FILE_BYTES:
         return spill_read_unavailable("not_found")
     # The digest is computed over the raw bytes and only then are they

@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import os
+import threading
 import tracemalloc
 from types import SimpleNamespace
 
@@ -1013,6 +1014,68 @@ class TestReadToolResult:
 
         assert result == spill_read_unavailable("not_found")
         assert peak < SPILL_MAX_FILE_BYTES
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
+    def test_read_tool_result_rejects_an_entry_swapped_for_a_fifo(
+        self, tmp_path, monkeypatch
+    ):
+        """An entry replaced by a FIFO after the lookup is reported
+        unavailable without the open waiting for a writer."""
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        raw = b"[1, 2, 3]"
+        rel = self._plant(workspace, f"acme-{self._digest(raw)}.json", raw)
+        real_resolve = spill_module.resolve_spilled_under
+        swapped = []
+
+        def resolve_then_swap(spill_dir, name):
+            resolved = real_resolve(spill_dir, name)
+            resolved.unlink()
+            os.mkfifo(resolved)
+            swapped.append(resolved)
+            return resolved
+
+        monkeypatch.setattr(spill_module, "resolve_spilled_under", resolve_then_swap)
+        outcome = []
+        reader = threading.Thread(
+            target=lambda: outcome.append(tools.read_tool_result(rel)), daemon=True
+        )
+        reader.start()
+        reader.join(timeout=5)
+        if reader.is_alive():
+            # Release the blocked open so the thread does not outlive the
+            # test, then fail on what the test is about.
+            os.close(os.open(swapped[0], os.O_WRONLY | os.O_NONBLOCK))
+            reader.join(timeout=5)
+            pytest.fail("read_tool_result blocked opening a FIFO")
+
+        assert outcome == [spill_read_unavailable("not_found")]
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_read_tool_result_does_not_follow_an_entry_swapped_for_a_symlink(
+        self, tmp_path, monkeypatch
+    ):
+        """An entry replaced by a symlink after the lookup is not followed,
+        even when the link target holds exactly the bytes the name's digest
+        describes: the open refuses the link itself."""
+        workspace = TaskWorkspace("task-1", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+        raw = b"[1, 2, 3]"
+        rel = self._plant(workspace, f"acme-{self._digest(raw)}.json", raw)
+        same_bytes = tmp_path / "same-bytes.json"
+        same_bytes.write_bytes(raw)
+        real_resolve = spill_module.resolve_spilled_under
+
+        def resolve_then_swap(spill_dir, name):
+            resolved = real_resolve(spill_dir, name)
+            resolved.unlink()
+            resolved.symlink_to(same_bytes)
+            return resolved
+
+        monkeypatch.setattr(spill_module, "resolve_spilled_under", resolve_then_swap)
+
+        assert tools.read_tool_result(rel) == spill_read_unavailable("not_found")
 
     # --- no path: list the stored results -----------------------------------
 
