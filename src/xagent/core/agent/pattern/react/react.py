@@ -2413,18 +2413,17 @@ class ReActPattern(AgentPattern):
                 int(raw_work_threshold) if raw_work_threshold is not None else None
             )
         self.force_final_answer_next = bool(state.get("force_final_answer_next", False))
-        # A missing, None or negative value reads as the default, so a
-        # checkpoint written before these keys existed resumes as a run that
-        # made no forced-turn reads.
+        # A missing, None or negative count reads as 0, and a read-open flag
+        # that is anything but True reads as False, so a checkpoint written
+        # before these keys existed resumes as a run that made no forced-turn
+        # reads.
         self.forced_answer_reads_used = max(
             0, int(state.get("forced_answer_reads_used", 0) or 0)
         )
         self.forced_answer_reads_rejected = max(
             0, int(state.get("forced_answer_reads_rejected", 0) or 0)
         )
-        self._forced_answer_read_open = bool(
-            state.get("forced_answer_read_open", False)
-        )
+        self._forced_answer_read_open = state.get("forced_answer_read_open") is True
         self.forced_answer_extra_iterations = max(
             0, int(state.get("forced_answer_extra_iterations", 0) or 0)
         )

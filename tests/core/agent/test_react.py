@@ -5199,11 +5199,22 @@ def test_read_policy_fields_round_trip_through_checkpoint(
 
 @pytest.mark.parametrize(
     ("stored", "expected"),
-    [(True, True), (False, False), ("missing", False), ("yes", True), (0, False)],
+    [
+        (True, True),
+        (False, False),
+        ("missing", False),
+        (None, False),
+        (-1, False),
+        ("yes", False),
+        (0, False),
+        (1, False),
+    ],
 )
 def test_read_open_flag_round_trips_through_checkpoint(
     stored: Any, expected: bool
 ) -> None:
+    """The read-open flag resumes True only from a stored True; a missing,
+    None, negative or otherwise non-boolean value resumes as False."""
     state = ReActPattern().get_state()
     if stored == "missing":
         del state["forced_answer_read_open"]
