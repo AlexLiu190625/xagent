@@ -7,6 +7,7 @@ import logging
 import re
 import threading
 import unicodedata
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -4607,28 +4608,16 @@ async def test_forced_answer_turn_offers_the_reader_only_with_a_non_empty_regist
     final_answer plus the reader while the registry holds a record, and
     final_answer alone when it is empty -- asserted on the tools the model
     call actually received."""
-    llm = FakeLLM(
-        responses=[
-            _tool_call_response("call_calc", "calculator", '{"expression": "1+1"}'),
-            _tool_call_response("call_final", "final_answer", '{"answer": "2"}'),
-        ]
-    )
-    pattern = ReActPattern(max_iterations=4, finalize_after_tool_result=True)
-    context = (
-        _context_with_spill_records("tool-results/a-000000000000.json")
-        if stored
-        else ExecutionContext()
-    )
-    context.add_user_message("What is 1+1?")
-
-    result = await pattern.run(
-        context=context, tools=[FakeTool(), FakeReadToolResultTool()], llm=llm
+    run = await _run_pattern(
+        _react(max_iterations=4, finalize_after_tool_result=True),
+        [_calculator_call(), _final_call("2")],
+        stored=stored,
     )
 
-    assert result["success"] is True
-    assert len(llm.calls) == 2
-    assert (SPILL_READ_TOOL_NAME in _schema_names(llm.calls[0])) is stored
-    assert _schema_names(llm.calls[1]) == forced_turn_tools
+    assert run.result["success"] is True
+    assert len(run.llm.calls) == 2
+    assert (SPILL_READ_TOOL_NAME in run.names(0)) is stored
+    assert run.names(1) == forced_turn_tools
 
 
 @pytest.mark.asyncio
@@ -4637,33 +4626,13 @@ async def test_settlement_fence_turn_sends_only_final_answer_with_a_non_empty_re
 ):
     """The settlement-fence turn keeps final_answer alone even while the
     registry holds a record and the reads are still open."""
-    llm = FakeLLM(
-        responses=[
-            _tool_call_response("call_final", "final_answer", '{"answer": "no"}'),
-        ]
-    )
-    pattern = ReActPattern(max_iterations=4)
-    pattern.force_final_answer_next = True
-    pattern.settlement_final_answer_fence = True
-    context = _context_with_spill_records("tool-results/a-000000000000.json")
-    context.add_user_message("Do not publish it.")
-    runtime = PatternRuntime(execution_id="fence")
+    pattern = _forced_turn_pattern(fence=True)
 
-    result = await pattern.run(
-        context=context,
-        tools=[FakeTool(), FakeReadToolResultTool()],
-        llm=llm,
-        runtime=runtime,
-    )
+    run = await _run_pattern(pattern, [_final_call("no")])
 
-    assert result["success"] is True
-    assert llm.calls[0]["tools"] == [pattern._final_answer_tool_schema()]
-    before_llm = next(
-        payload["pattern_state"]
-        for payload in runtime.checkpoints
-        if payload["label"] == "before_llm"
-    )
-    assert before_llm["forced_answer_read_open"] is False
+    assert run.result["success"] is True
+    assert run.tools(0) == [pattern._final_answer_tool_schema()]
+    assert run.states("before_llm")[0]["forced_answer_read_open"] is False
 
 
 @pytest.mark.asyncio
@@ -4937,18 +4906,254 @@ async def test_a_run_with_a_registered_spill_offers_the_reader_on_ordinary_turns
     assert "calculator" in names
 
 
-# --- forced-answer turn: read state ------------------------------------------
+# --- forced-answer turn: shared run setup ------------------------------------
 
+_STORED_PATH = "tool-results/a-000000000000.json"
 _FORCED_READ_STATE_KEYS = (
     "forced_answer_reads_used",
     "forced_answer_reads_rejected",
     "forced_answer_read_open",
     "forced_answer_extra_iterations",
 )
+_RETRY_LABELS = frozenset(
+    {
+        "tool_protocol_retry",
+        "unavailable_tool_call_recovery",
+        "empty_final_answer_recovery",
+        "settlement_final_answer_recovery",
+        "malformed_tool_arguments_recovery",
+    }
+)
+
+
+class ReadToolResultArgs(BaseModel):
+    path: str | None = None
+    start: int | None = None
+    end: int | None = None
+    offset: int = 0
+
+
+class RecordingReadToolResultTool:
+    """A read_tool_result that records what it was asked to read."""
+
+    def __init__(self, *, concurrency_safe: bool = False) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.metadata = SimpleNamespace(
+            name=SPILL_READ_TOOL_NAME,
+            description="Read one engine-stored large tool result.",
+            concurrency_safe=concurrency_safe,
+        )
+
+    def args_type(self) -> type[BaseModel]:
+        return ReadToolResultArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(dict(args))
+        return {"relative_path": args.get("path"), "items": ["stored item"]}
+
+
+class NamedTool:
+    """A work tool with a given name that records its calls."""
+
+    def __init__(self, name: str) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.metadata = SimpleNamespace(name=name, description=f"Run {name}.")
+
+    def args_type(self) -> type[BaseModel]:
+        return EmptyArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(dict(args))
+        return {"success": True}
+
+
+class _RespondingLLM:
+    """A fake model that answers each call from the tools it received."""
+
+    def __init__(self, respond: Any) -> None:
+        self.respond = respond
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self.respond(kwargs, len(self.calls))
 
 
 def _forced_read_state(state: dict[str, Any]) -> tuple[Any, ...]:
+    """The four forced-read keys of one checkpoint state, in a fixed order."""
     return tuple(state[key] for key in _FORCED_READ_STATE_KEYS)
+
+
+def _calculator_call(call_id: str = "call_calc") -> dict[str, Any]:
+    """A model response that calls the calculator once with 1+1."""
+    return _tool_call_response(call_id, "calculator", '{"expression": "1+1"}')
+
+
+def _final_call(answer: str = "done") -> dict[str, Any]:
+    """A model response that calls final_answer with the given answer."""
+    return _tool_call_response(
+        "call_final", "final_answer", json.dumps({"answer": answer})
+    )
+
+
+def _empty_answer() -> dict[str, Any]:
+    """A model response that calls final_answer with an empty answer."""
+    return _tool_call_response("call_empty", "final_answer", '{"answer": ""}')
+
+
+def _decision_response(action: str) -> dict[str, Any]:
+    """A repeated-tool decision response choosing the given action."""
+    return _tool_call_response(
+        "call_decision",
+        "react_decision",
+        json.dumps({"action": action, "reason": "more"}),
+    )
+
+
+def _read_call(call_id: str, path: str | None = _STORED_PATH, **extra: Any) -> Any:
+    """A model response with one read_tool_result call; path=None omits it."""
+    args: dict[str, Any] = dict(extra)
+    if path is not None:
+        args["path"] = path
+    return _tool_call_response(call_id, SPILL_READ_TOOL_NAME, json.dumps(args))
+
+
+def _batch_response(*calls: tuple[str, str, dict[str, Any]]) -> dict[str, Any]:
+    """One model response carrying every (id, name, args) call given."""
+    return {
+        "tool_calls": [
+            {"id": call_id, "function": {"name": name, "arguments": json.dumps(args)}}
+            for call_id, name, args in calls
+        ]
+    }
+
+
+def _read_batch(arguments: Any, prefix: str = "call_read") -> dict[str, Any]:
+    """One model response with a read_tool_result call per args mapping,
+    numbered in order."""
+    return _batch_response(
+        *(
+            (f"{prefix}_{index}", SPILL_READ_TOOL_NAME, args)
+            for index, args in enumerate(arguments)
+        )
+    )
+
+
+def _always_calculator() -> _RespondingLLM:
+    """A fake model that calls the calculator on every call."""
+    return _RespondingLLM(lambda kwargs, n: _calculator_call(f"call_{n}"))
+
+
+def _react(**kwargs: Any) -> ReActPattern:
+    """A ReActPattern with the given settings and a task text already set."""
+    pattern = ReActPattern(**kwargs)
+    pattern.task_text = "t"
+    return pattern
+
+
+def _forced_turn_pattern(
+    *, used: int = 0, rejected: int = 0, fence: bool = False, **kwargs: Any
+) -> ReActPattern:
+    """A pattern whose next turn is forced, with the two per-run read
+    counters preset and, with fence=True, the settlement fence raised."""
+    kwargs.setdefault("max_iterations", 4)
+    pattern = _react(**kwargs)
+    pattern.force_final_answer_next = True
+    pattern.forced_answer_reads_used = used
+    pattern.forced_answer_reads_rejected = rejected
+    if fence:
+        pattern.settlement_final_answer_fence = True
+    return pattern
+
+
+def _forced_turn_context(
+    stored: bool = True, *paths: str, message: str = "What is in the stored result?"
+) -> ExecutionContext:
+    """A context with one user message and, when stored, a registry holding
+    the given paths (_STORED_PATH when none are given)."""
+    context = (
+        _context_with_spill_records(*(paths or (_STORED_PATH,)))
+        if stored
+        else ExecutionContext()
+    )
+    context.add_user_message(message)
+    return context
+
+
+@dataclass
+class _ForcedRun:
+    """One finished run: the pattern, the context, the fake model with every
+    call it received, the runtime with every checkpoint, and the result."""
+
+    pattern: ReActPattern
+    context: ExecutionContext
+    llm: Any
+    runtime: PatternRuntime
+    result: dict[str, Any]
+
+    def tools(self, call: int) -> Any:
+        """The tool schemas the model received on that call."""
+        return self.llm.calls[call]["tools"]
+
+    def names(self, call: int) -> list[str]:
+        """The tool names the model received on that call."""
+        return _schema_names(self.llm.calls[call])
+
+    def prompt(self, call: int) -> str:
+        """The system prompt the model received on that call."""
+        return str(self.llm.calls[call]["messages"][0]["content"])
+
+    def labels(self) -> list[str]:
+        return [payload["label"] for payload in self.runtime.checkpoints]
+
+    def states(self, label: str) -> list[dict[str, Any]]:
+        """The pattern state of every checkpoint with that label, in order."""
+        return [
+            payload["pattern_state"]
+            for payload in self.runtime.checkpoints
+            if payload["label"] == label
+        ]
+
+    def retry_labels(self) -> list[str]:
+        """The labels of the protocol-repair checkpoints the run wrote."""
+        return [label for label in self.labels() if label in _RETRY_LABELS]
+
+    def tool_outputs(self, name: str) -> list[Any]:
+        """The raw results recorded in the context for calls to that tool."""
+        return [
+            message.metadata.get("raw_result")
+            for message in self.context.messages
+            if message.role == "tool" and message.metadata.get("tool_name") == name
+        ]
+
+
+async def _run_pattern(
+    pattern: ReActPattern,
+    llm: Any,
+    *,
+    stored: bool = True,
+    context: ExecutionContext | None = None,
+    tools: list[Any] | None = None,
+) -> _ForcedRun:
+    """Run the pattern once and keep everything the run left behind.
+
+    llm is a list of scripted responses (wrapped in FakeLLM) or a fake model.
+    The context defaults to _forced_turn_context(stored); the tools default
+    to a calculator and a reader that is offered but never executed.
+    """
+    fake_llm = FakeLLM(list(llm)) if isinstance(llm, list) else llm
+    run_context = context if context is not None else _forced_turn_context(stored)
+    runtime = PatternRuntime(execution_id="forced-answer")
+    result = await pattern.run(
+        context=run_context,
+        tools=tools if tools is not None else [FakeTool(), FakeReadToolResultTool()],
+        llm=fake_llm,
+        runtime=runtime,
+    )
+    return _ForcedRun(pattern, run_context, fake_llm, runtime, result)
+
+
+# --- forced-answer turn: read state ------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -4975,20 +5180,12 @@ def test_read_policy_fields_round_trip_through_checkpoint(
     key: str, attribute: str, stored: Any, expected: int
 ) -> None:
     source = ReActPattern()
-    source.forced_answer_reads_used = 2
-    source.forced_answer_reads_rejected = 1
-    source._forced_answer_read_open = True
-    source.forced_answer_extra_iterations = 3
+    _preset_forced_turn(source)
     state = source.get_state()
     assert _forced_read_state(state) == (2, 1, True, 3)
     restored = ReActPattern()
     restored.load_state(state)
-    assert (
-        restored.forced_answer_reads_used,
-        restored.forced_answer_reads_rejected,
-        restored._forced_answer_read_open,
-        restored.forced_answer_extra_iterations,
-    ) == (2, 1, True, 3)
+    assert _forced_read_state(restored.get_state()) == (2, 1, True, 3)
 
     if stored == "missing":
         del state[key]
@@ -5018,39 +5215,33 @@ def test_read_open_flag_round_trips_through_checkpoint(
     assert restored._forced_answer_read_open is expected
 
 
-class _ProtocolErrorThenScriptLLM:
+class _ProtocolErrorThenScriptLLM(FakeLLM):
     """Raises one LLMToolProtocolError, then replays scripted responses."""
 
     def __init__(self, code: str, responses: list[Any]) -> None:
+        super().__init__(responses)
         self.code = code
-        self.responses = responses
-        self.calls: list[dict[str, Any]] = []
 
     async def chat(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        if len(self.calls) == 1:
+        if not self.calls:
+            self.calls.append(kwargs)
             raise LLMToolProtocolError(
                 provider="deepseek",
                 code=self.code,
                 message="The model called a tool that is not available.",
             )
-        return self.responses.pop(0)
+        return await super().chat(**kwargs)
 
 
-def _preset_forced_turn(pattern: ReActPattern) -> None:
+def _preset_forced_turn(pattern: ReActPattern) -> ReActPattern:
+    """Put the pattern mid forced turn: flag set, reads open, counters at
+    2 reads, 1 reject and 3 extra iterations."""
     pattern.force_final_answer_next = True
     pattern._forced_answer_read_open = True
     pattern.forced_answer_reads_used = 2
     pattern.forced_answer_reads_rejected = 1
     pattern.forced_answer_extra_iterations = 3
-
-
-def _checkpoint_states(runtime: PatternRuntime, label: str) -> list[dict[str, Any]]:
-    return [
-        payload["pattern_state"]
-        for payload in runtime.checkpoints
-        if payload["label"] == label
-    ]
+    return pattern
 
 
 @pytest.mark.asyncio
@@ -5064,39 +5255,27 @@ async def test_releasing_forced_answer_resets_the_forced_turn_state(
     """The four places that leave the forced turn clear the force flag and
     the read-open flag, and leave the per-run counters and the extra
     iterations alone."""
-    pattern = ReActPattern(max_iterations=4)
-    pattern.task_text = "t"
-    _preset_forced_turn(pattern)
-    context = _context_with_spill_records("tool-results/a-000000000000.json")
-    context.add_user_message("What is 1+1?")
-    runtime = PatternRuntime(execution_id="release")
+    pattern = _preset_forced_turn(_react(max_iterations=4))
     tools = [FakeTool(), FakeReadToolResultTool()]
-    calculator_call = _tool_call_response(
-        "call_calc", "calculator", '{"expression": "1+1"}'
-    )
-    final_call = _tool_call_response("call_final", "final_answer", '{"answer": "2"}')
 
     if exit_point == "pause":
-        pattern._discard_pending_tool_plan_after_pause(context)
+        pattern._discard_pending_tool_plan_after_pause(_forced_turn_context())
         state = pattern.get_state()
     else:
         if exit_point == "protocol_exception_recovery":
             llm: Any = _ProtocolErrorThenScriptLLM(
-                "unavailable_tool_call", [calculator_call, final_call]
+                "unavailable_tool_call", [_calculator_call(), _final_call("2")]
             )
         elif exit_point == "protocol_retry_recovery":
-            llm = FakeLLM([calculator_call, calculator_call, final_call])
+            llm = FakeLLM([_calculator_call(), _calculator_call(), _final_call("2")])
         else:
-            llm = FakeLLM([final_call])
-        result = await pattern.run(
-            context=context, tools=tools, llm=llm, runtime=runtime
-        )
-        assert result["success"] is True
-        label = "final" if exit_point == "finalize" else "after_llm"
-        state = _checkpoint_states(runtime, label)[0]
+            llm = FakeLLM([_final_call("2")])
+        run = await _run_pattern(pattern, llm, tools=tools)
+        assert run.result["success"] is True
+        state = run.states("final" if exit_point == "finalize" else "after_llm")[0]
         if exit_point != "finalize":
             # The retry ran on the full tool set, so the call it returned ran.
-            assert "calculator" in _schema_names(llm.calls[1])
+            assert "calculator" in run.names(1)
             assert tools[0].calls == [{"expression": "1+1"}]
 
     assert state["force_final_answer_next"] is False
@@ -5108,39 +5287,29 @@ async def test_invalid_protocol_exit_only_closes_the_forced_turn_reads() -> None
     """Ending the run on an invalid tool protocol closes the reads offered
     to the forced turn and leaves the force flag, the per-run counters and
     the extra iterations as they were."""
-    pattern = ReActPattern(max_iterations=4)
-    pattern.task_text = "t"
-    _preset_forced_turn(pattern)
-    context = _context_with_spill_records("tool-results/a-000000000000.json")
-    context.add_user_message("What is 1+1?")
-    runtime = PatternRuntime(execution_id="invalid")
-    empty_answer = _tool_call_response("call_empty", "final_answer", '{"answer": ""}')
-
-    result = await pattern.run(
-        context=context,
-        tools=[FakeTool(), FakeReadToolResultTool()],
-        llm=FakeLLM([empty_answer, dict(empty_answer)]),
-        runtime=runtime,
+    run = await _run_pattern(
+        _preset_forced_turn(_react(max_iterations=4)),
+        [_empty_answer(), _empty_answer()],
     )
 
-    assert result["success"] is False
-    assert result["status"] == "invalid_tool_protocol"
-    (state,) = _checkpoint_states(runtime, "invalid_tool_protocol")
+    assert run.result["success"] is False
+    assert run.result["status"] == "invalid_tool_protocol"
+    (state,) = run.states("invalid_tool_protocol")
     assert state["force_final_answer_next"] is True
     assert _forced_read_state(state) == (2, 1, False, 3)
-
-
-def _decision_response(action: str) -> dict[str, Any]:
-    return _tool_call_response(
-        "call_decision",
-        "react_decision",
-        json.dumps({"action": action, "reason": "more"}),
-    )
 
 
 # Recorded on the parent commit with the same scripts: the checkpoint labels
 # with force_final_answer_next at each, and the tool names each model call
 # received. A run whose registry stays empty must reproduce both exactly.
+_ORDINARY_TOOLS = ["calculator", "final_answer", "send_message", "ask_user_question"]
+# The checkpoints of a first turn that calls the calculator once.
+_FIRST_TOOL_TURN = [
+    ("before_llm", False),
+    ("after_llm", False),
+    ("before_tool", False),
+    ("after_tool", False),
+]
 _EMPTY_REGISTRY_BASELINES: dict[str, dict[str, Any]] = {
     "derived_forced_turn": {
         "pattern": {
@@ -5154,10 +5323,7 @@ _EMPTY_REGISTRY_BASELINES: dict[str, dict[str, Any]] = {
             _tool_call_response("f1", "final_answer", '{"answer": "2"}'),
         ],
         "checkpoints": [
-            ("before_llm", False),
-            ("after_llm", False),
-            ("before_tool", False),
-            ("after_tool", False),
+            *_FIRST_TOOL_TURN,
             ("repeated_tool_decision_requested", False),
             ("repeated_tool_decision_continue", False),
             ("before_llm", False),
@@ -5165,11 +5331,7 @@ _EMPTY_REGISTRY_BASELINES: dict[str, dict[str, Any]] = {
             ("final", False),
             ("completed", False),
         ],
-        "tools": [
-            ["calculator", "final_answer", "send_message", "ask_user_question"],
-            ["react_decision"],
-            ["final_answer"],
-        ],
+        "tools": [_ORDINARY_TOOLS, ["react_decision"], ["final_answer"]],
         "status": "completed",
     },
     "invalid_protocol": {
@@ -5180,19 +5342,12 @@ _EMPTY_REGISTRY_BASELINES: dict[str, dict[str, Any]] = {
             _tool_call_response("f2", "final_answer", '{"answer": ""}'),
         ],
         "checkpoints": [
-            ("before_llm", False),
-            ("after_llm", False),
-            ("before_tool", False),
-            ("after_tool", False),
+            *_FIRST_TOOL_TURN,
             ("before_llm", True),
             ("empty_final_answer_recovery", True),
             ("invalid_tool_protocol", True),
         ],
-        "tools": [
-            ["calculator", "final_answer", "send_message", "ask_user_question"],
-            ["final_answer"],
-            ["final_answer"],
-        ],
+        "tools": [_ORDINARY_TOOLS, ["final_answer"], ["final_answer"]],
         "status": "invalid_tool_protocol",
     },
     "reader_call_recovers": {
@@ -5204,10 +5359,7 @@ _EMPTY_REGISTRY_BASELINES: dict[str, dict[str, Any]] = {
             _tool_call_response("f1", "final_answer", '{"answer": "4"}'),
         ],
         "checkpoints": [
-            ("before_llm", False),
-            ("after_llm", False),
-            ("before_tool", False),
-            ("after_tool", False),
+            *_FIRST_TOOL_TURN,
             ("before_llm", True),
             ("unavailable_tool_call_recovery", True),
             ("after_llm", False),
@@ -5216,12 +5368,7 @@ _EMPTY_REGISTRY_BASELINES: dict[str, dict[str, Any]] = {
             ("before_iteration_limit_delivery", True),
             ("max_iterations", True),
         ],
-        "tools": [
-            ["calculator", "final_answer", "send_message", "ask_user_question"],
-            ["final_answer"],
-            ["calculator", "final_answer", "send_message", "ask_user_question"],
-            ["final_answer"],
-        ],
+        "tools": [_ORDINARY_TOOLS, ["final_answer"], _ORDINARY_TOOLS, ["final_answer"]],
         "status": "max_iterations",
     },
 }
@@ -5234,126 +5381,25 @@ async def test_empty_registry_flash_run_matches_the_baseline(scenario: str) -> N
     model the same tools, walks the same checkpoints with the same force
     flag, and every checkpoint carries the new read keys at their defaults."""
     baseline = _EMPTY_REGISTRY_BASELINES[scenario]
-    llm = FakeLLM([dict(response) for response in baseline["responses"]])
-    pattern = ReActPattern(**baseline["pattern"])
-    pattern.task_text = "t"
-    context = ExecutionContext()
-    context.add_user_message("What is 1+1?")
-    runtime = PatternRuntime(execution_id="zero-change")
 
-    result = await pattern.run(
-        context=context,
-        tools=[FakeTool(), FakeReadToolResultTool()],
-        llm=llm,
-        runtime=runtime,
+    run = await _run_pattern(
+        _react(**baseline["pattern"]),
+        [dict(response) for response in baseline["responses"]],
+        context=_forced_turn_context(False, message="What is 1+1?"),
     )
 
-    assert result["status"] == baseline["status"]
+    assert run.result["status"] == baseline["status"]
     assert [
         (payload["label"], payload["pattern_state"]["force_final_answer_next"])
-        for payload in runtime.checkpoints
+        for payload in run.runtime.checkpoints
     ] == baseline["checkpoints"]
-    assert [_schema_names(call) for call in llm.calls] == baseline["tools"]
-    for payload in runtime.checkpoints:
+    assert [_schema_names(call) for call in run.llm.calls] == baseline["tools"]
+    for payload in run.runtime.checkpoints:
         assert _forced_read_state(payload["pattern_state"]) == (0, 0, False, 0)
-    assert context.get_component("spilled_results") is None
+    assert run.context.get_component("spilled_results") is None
 
 
 # --- forced-answer turn: tool surface and protocol ---------------------------
-
-_STORED_PATH = "tool-results/a-000000000000.json"
-
-
-class ReadToolResultArgs(BaseModel):
-    path: str | None = None
-    start: int | None = None
-    end: int | None = None
-    offset: int = 0
-
-
-class RecordingReadToolResultTool:
-    """A read_tool_result that records what it was asked to read."""
-
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
-
-        class Metadata:
-            name = SPILL_READ_TOOL_NAME
-            description = "Read one engine-stored large tool result."
-
-        self.metadata = Metadata()
-
-    def args_type(self) -> type[BaseModel]:
-        return ReadToolResultArgs
-
-    async def run_json_async(self, args: dict[str, Any]) -> Any:
-        self.calls.append(dict(args))
-        return {"relative_path": args.get("path"), "items": ["stored item"]}
-
-
-class NamedTool:
-    """A work tool with a given name that records its calls."""
-
-    def __init__(self, name: str) -> None:
-        self.calls: list[dict[str, Any]] = []
-        self.metadata = SimpleNamespace(name=name, description=f"Run {name}.")
-
-    def args_type(self) -> type[BaseModel]:
-        return EmptyArgs
-
-    async def run_json_async(self, args: dict[str, Any]) -> Any:
-        self.calls.append(dict(args))
-        return {"success": True}
-
-
-def _read_call(call_id: str, path: str | None = _STORED_PATH, **extra: Any) -> Any:
-    args: dict[str, Any] = dict(extra)
-    if path is not None:
-        args["path"] = path
-    return _tool_call_response(call_id, SPILL_READ_TOOL_NAME, json.dumps(args))
-
-
-def _final_call(answer: str = "done") -> dict[str, Any]:
-    return _tool_call_response(
-        "call_final", "final_answer", json.dumps({"answer": answer})
-    )
-
-
-def _forced_turn_pattern(
-    *, used: int = 0, rejected: int = 0, fence: bool = False, **kwargs: Any
-) -> ReActPattern:
-    kwargs.setdefault("max_iterations", 4)
-    pattern = ReActPattern(**kwargs)
-    pattern.task_text = "t"
-    pattern.force_final_answer_next = True
-    pattern.forced_answer_reads_used = used
-    pattern.forced_answer_reads_rejected = rejected
-    if fence:
-        pattern.settlement_final_answer_fence = True
-    return pattern
-
-
-def _forced_turn_context(stored: bool = True) -> ExecutionContext:
-    context = (
-        _context_with_spill_records(_STORED_PATH) if stored else ExecutionContext()
-    )
-    context.add_user_message("What is in the stored result?")
-    return context
-
-
-def _retry_labels(runtime: PatternRuntime) -> list[str]:
-    return [
-        payload["label"]
-        for payload in runtime.checkpoints
-        if payload["label"]
-        in {
-            "tool_protocol_retry",
-            "unavailable_tool_call_recovery",
-            "empty_final_answer_recovery",
-            "settlement_final_answer_recovery",
-            "malformed_tool_arguments_recovery",
-        }
-    ]
 
 
 @pytest.mark.asyncio
@@ -5369,109 +5415,88 @@ async def test_forced_turn_schema_has_exactly_one_final_answer(cell: str) -> Non
         tool_choice="none" if cell == "tool_choice_none" else "required",
     )
     many_tools: list[Any] = [NamedTool(f"work_tool_{index}") for index in range(12)]
-    llm = FakeLLM([_final_call()])
 
-    result = await pattern.run(
-        context=_forced_turn_context(stored=cell != "empty_registry"),
+    run = await _run_pattern(
+        pattern,
+        [_final_call()],
+        stored=cell != "empty_registry",
         tools=[*many_tools, NamedTool("read_file"), FakeReadToolResultTool()],
-        llm=llm,
     )
 
-    assert result["success"] is True
-    names = _schema_names(llm.calls[0])
+    assert run.result["success"] is True
+    names = run.names(0)
     assert names.count("final_answer") == 1
     assert len(names) <= 2
     assert (SPILL_READ_TOOL_NAME in names) is (cell == "reader_offered")
 
 
-def _set_point_run(set_point: str) -> tuple[ReActPattern, list[Any], FakeLLM, int]:
-    """A run that reaches a forced turn through one set-point of the flag.
-
-    Returns the pattern, the tools, the scripted model and the index of the
-    model call that is the forced turn.
-    """
-    tools: list[Any] = [
-        FakeTool(),
-        NamedTool("read_file"),
-        RecordingReadToolResultTool(),
-    ]
-    calculator = _tool_call_response("call_calc", "calculator", '{"expression": "1+1"}')
+def _set_point_run(set_point: str) -> tuple[ReActPattern, list[Any], int]:
+    """A pattern and a script that reach a forced turn through one set-point
+    of the flag, with the index of the model call that is the forced turn."""
     if set_point == "disabled_control_tool":
-        pattern = ReActPattern(max_iterations=4, user_interaction_enabled=False)
-        responses: list[Any] = [
-            _tool_call_response(
-                "call_ask", "ask_user_question", '{"message": "which one?"}'
-            ),
-            _final_call(),
-        ]
-        forced_index = 1
-    elif set_point == "empty_final_answer":
-        pattern = ReActPattern(max_iterations=4)
+        pattern = _react(max_iterations=4, user_interaction_enabled=False)
+        ask = _tool_call_response(
+            "call_ask", "ask_user_question", '{"message": "which one?"}'
+        )
+        return pattern, [ask, _final_call()], 1
+    if set_point == "empty_final_answer":
+        pattern = _react(max_iterations=4)
         pattern.pending_tool_calls = [
             {"id": "call_empty", "name": "final_answer", "args": {"answer": ""}}
         ]
-        responses = [_final_call()]
-        forced_index = 0
-    elif set_point == "finalize_after_tool_result":
-        pattern = ReActPattern(max_iterations=4, finalize_after_tool_result=True)
-        responses = [calculator, _final_call()]
-        forced_index = 1
-    else:  # repeated_tool_decision
-        pattern = ReActPattern(
-            max_iterations=4, repeated_tool_decision_after_consecutive_tool_calls=1
-        )
-        responses = [calculator, _decision_response("final_answer"), _final_call()]
-        forced_index = 2
-    pattern.task_text = "t"
-    return pattern, tools, FakeLLM(responses), forced_index
-
-
-_SET_POINTS = [
-    "disabled_control_tool",
-    "empty_final_answer",
-    "finalize_after_tool_result",
-    "repeated_tool_decision",
-]
+        return pattern, [_final_call()], 0
+    if set_point == "finalize_after_tool_result":
+        pattern = _react(max_iterations=4, finalize_after_tool_result=True)
+        return pattern, [_calculator_call(), _final_call()], 1
+    pattern = _react(
+        max_iterations=4, repeated_tool_decision_after_consecutive_tool_calls=1
+    )
+    script = [_calculator_call(), _decision_response("final_answer"), _final_call()]
+    return pattern, script, 2
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("set_point", _SET_POINTS)
+@pytest.mark.parametrize(
+    "set_point",
+    [
+        "disabled_control_tool",
+        "empty_final_answer",
+        "finalize_after_tool_result",
+        "repeated_tool_decision",
+    ],
+)
 async def test_forced_turn_exposes_read_tool_result(set_point: str) -> None:
     """Each way into the forced turn, other than the settlement fence, offers
     final_answer and read_tool_result -- never read_file -- while the
     registry holds a record."""
-    pattern, tools, llm, forced_index = _set_point_run(set_point)
-    context = _context_with_spill_records(_STORED_PATH)
-    context.add_user_message("What is 1+1?")
+    pattern, script, forced_index = _set_point_run(set_point)
 
-    result = await pattern.run(context=context, tools=tools, llm=llm)
+    run = await _run_pattern(
+        pattern,
+        script,
+        tools=[FakeTool(), NamedTool("read_file"), RecordingReadToolResultTool()],
+    )
 
-    assert result["success"] is True
-    assert len(llm.calls) == forced_index + 1
-    names = _schema_names(llm.calls[forced_index])
+    assert run.result["success"] is True
+    assert len(run.llm.calls) == forced_index + 1
+    names = run.names(forced_index)
     assert set(names) == {"final_answer", SPILL_READ_TOOL_NAME}
     assert "read_file" not in names
-    assert llm.calls[forced_index]["tool_choice"] == "required"
+    assert run.llm.calls[forced_index]["tool_choice"] == "required"
 
 
 async def _forced_turn_call(
-    *,
-    stored: bool,
-    reader: bool,
-    used: int = 0,
-    rejected: int = 0,
-    fence: bool = False,
+    *, stored: bool, reader: bool, **counters: Any
 ) -> tuple[ReActPattern, dict[str, Any]]:
-    pattern = _forced_turn_pattern(used=used, rejected=rejected, fence=fence)
+    """The first model call of a forced turn that answers at once."""
     tools: list[Any] = [FakeTool(), NamedTool("read_file")]
     if reader:
         tools.append(FakeReadToolResultTool())
-    llm = FakeLLM([_final_call()])
-    result = await pattern.run(
-        context=_forced_turn_context(stored=stored), tools=tools, llm=llm
+    run = await _run_pattern(
+        _forced_turn_pattern(**counters), [_final_call()], stored=stored, tools=tools
     )
-    assert result["success"] is True
-    return pattern, llm.calls[0]
+    assert run.result["success"] is True
+    return run.pattern, run.llm.calls[0]
 
 
 @pytest.mark.asyncio
@@ -5503,6 +5528,15 @@ async def test_forced_turn_stays_single_tool(
         assert call["messages"] == reference["messages"]
 
 
+def _final_answer_entry(tools: list[dict[str, Any]]) -> dict[str, Any]:
+    """The final_answer schema in a tool list."""
+    return next(s for s in tools if s["function"]["name"] == "final_answer")
+
+
+def _answer_description(schema: dict[str, Any]) -> str:
+    return schema["function"]["parameters"]["properties"]["answer"]["description"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stored", [True, False])
 @pytest.mark.parametrize("workspace_tool", [True, False])
@@ -5511,52 +5545,36 @@ async def test_forced_turn_final_answer_schema_is_the_baseline_one(
 ) -> None:
     """The forced turn's final_answer is the baseline schema, never the
     ordinary-turn variant that asks for get_workspace_output_files."""
-    pattern = ReActPattern(max_iterations=4, finalize_after_tool_result=True)
     tools: list[Any] = [FakeTool(), FakeReadToolResultTool()]
     if workspace_tool:
         tools.append(FakeWorkspaceOutputTool())
-    llm = FakeLLM(
-        [
-            _tool_call_response("call_calc", "calculator", '{"expression": "1+1"}'),
-            _final_call("2"),
-        ]
+
+    run = await _run_pattern(
+        _react(max_iterations=4, finalize_after_tool_result=True),
+        [_calculator_call(), _final_call("2")],
+        stored=stored,
+        tools=tools,
     )
 
-    result = await pattern.run(
-        context=_forced_turn_context(stored=stored), tools=tools, llm=llm
-    )
-
-    assert result["success"] is True
-
-    def final_answer_entry(call: dict[str, Any]) -> dict[str, Any]:
-        return next(
-            schema
-            for schema in call["tools"]
-            if schema["function"]["name"] == "final_answer"
-        )
-
-    def answer_description(schema: dict[str, Any]) -> str:
-        return schema["function"]["parameters"]["properties"]["answer"]["description"]
-
-    forced = final_answer_entry(llm.calls[1])
-    assert forced == pattern._final_answer_tool_schema()
-    assert "get_workspace_output_files" not in answer_description(forced)
-    ordinary = answer_description(final_answer_entry(llm.calls[0]))
+    assert run.result["success"] is True
+    forced = _final_answer_entry(run.tools(1))
+    assert forced == run.pattern._final_answer_tool_schema()
+    assert "get_workspace_output_files" not in _answer_description(forced)
+    ordinary = _answer_description(_final_answer_entry(run.tools(0)))
     assert ("get_workspace_output_files" in ordinary) is workspace_tool
 
 
 @pytest.mark.asyncio
 async def test_forced_turn_final_answer_schema_with_tool_choice_none() -> None:
     pattern = _forced_turn_pattern(tool_choice="none")
-    llm = FakeLLM([_final_call()])
 
-    await pattern.run(
-        context=_forced_turn_context(),
+    run = await _run_pattern(
+        pattern,
+        [_final_call()],
         tools=[FakeWorkspaceOutputTool(), FakeReadToolResultTool()],
-        llm=llm,
     )
 
-    assert llm.calls[0]["tools"] == [pattern._final_answer_tool_schema()]
+    assert run.tools(0) == [pattern._final_answer_tool_schema()]
 
 
 @pytest.mark.asyncio
@@ -5567,39 +5585,23 @@ async def test_forced_answer_latch_only_when_reads_are_open(
     """A forced turn reached only through the flash-mode derived condition
     (the flag itself is False) latches the flag when it offers reads, and
     leaves it as it was when the registry is empty."""
-    pattern = ReActPattern(
-        max_iterations=2,
-        finalize_after_tool_result=True,
-        repeated_tool_decision_after_consecutive_tool_calls=1,
-    )
-    pattern.task_text = "t"
-    llm = FakeLLM(
-        [
-            _tool_call_response("c1", "calculator", '{"expression": "1+1"}'),
-            _decision_response("tool_call"),
-            _final_call("2"),
-        ]
-    )
-    runtime = PatternRuntime(execution_id="latch")
-
-    result = await pattern.run(
-        context=_forced_turn_context(stored=stored),
-        tools=[FakeTool(), FakeReadToolResultTool()],
-        llm=llm,
-        runtime=runtime,
+    run = await _run_pattern(
+        _react(
+            max_iterations=2,
+            finalize_after_tool_result=True,
+            repeated_tool_decision_after_consecutive_tool_calls=1,
+        ),
+        [_calculator_call("c1"), _decision_response("tool_call"), _final_call("2")],
+        stored=stored,
     )
 
-    assert result["success"] is True
-    before_llm = [
-        payload["pattern_state"]
-        for payload in runtime.checkpoints
-        if payload["label"] == "before_llm"
-    ]
+    assert run.result["success"] is True
+    before_llm = run.states("before_llm")
     assert len(before_llm) == 2
     assert before_llm[0]["force_final_answer_next"] is False
     assert before_llm[1]["force_final_answer_next"] is latched
     assert before_llm[1]["forced_answer_read_open"] is latched
-    assert (SPILL_READ_TOOL_NAME in _schema_names(llm.calls[2])) is stored
+    assert (SPILL_READ_TOOL_NAME in run.names(2)) is stored
 
 
 @pytest.mark.asyncio
@@ -5622,24 +5624,22 @@ async def test_forced_turn_protocol_accepts_exactly_the_offered_tools(
     """A forced turn's response is accepted exactly when every call names a
     tool the turn sent: final_answer and read_tool_result while reads are
     open, final_answer alone once an allowance is used up."""
-    pattern = _forced_turn_pattern(used=used)
     reader = RecordingReadToolResultTool()
-    tools: list[Any] = [NamedTool("read_file"), NamedTool("write_file"), reader]
     if called == "final_answer":
         first = _final_call()
     elif called == SPILL_READ_TOOL_NAME:
         first = _read_call("call_read")
     else:
         first = _tool_call_response("call_other", called, "{}")
-    llm = FakeLLM([first, _final_call(), _final_call()])
-    runtime = PatternRuntime(execution_id="protocol")
 
-    result = await pattern.run(
-        context=_forced_turn_context(), tools=tools, llm=llm, runtime=runtime
+    run = await _run_pattern(
+        _forced_turn_pattern(used=used),
+        [first, _final_call(), _final_call()],
+        tools=[NamedTool("read_file"), NamedTool("write_file"), reader],
     )
 
-    assert result["success"] is True
-    assert (_retry_labels(runtime) == []) is accepted
+    assert run.result["success"] is True
+    assert (run.retry_labels() == []) is accepted
     assert (len(reader.calls) == 1) is (accepted and called == SPILL_READ_TOOL_NAME)
 
 
@@ -5707,77 +5707,61 @@ async def test_exhausted_read_allowance_does_not_recover_tool_set(
     back, as before."""
     pattern = _forced_turn_pattern(used=3)
     reader = RecordingReadToolResultTool()
-    tools: list[Any] = [
-        FakeTool(),
-        NamedTool("read_file"),
-        FakeWorkspaceOutputTool(),
-        reader,
-    ]
     first = (
         _tool_call_response("call_x", called, "{}")
         if entry == "plain_call"
         else _provider_rejected_call(pattern, called)
     )
-    llm = FakeLLM([first, _final_call()])
-    runtime = PatternRuntime(execution_id="exhausted")
 
-    result = await pattern.run(
-        context=_forced_turn_context(), tools=tools, llm=llm, runtime=runtime
+    run = await _run_pattern(
+        pattern,
+        [first, _final_call()],
+        tools=[FakeTool(), NamedTool("read_file"), FakeWorkspaceOutputTool(), reader],
     )
 
-    assert result["success"] is True
+    assert run.result["success"] is True
     assert reader.calls == []
-    assert llm.calls[0]["tools"] == [pattern._final_answer_tool_schema()]
-    (retry_label,) = _retry_labels(runtime)
-    retry_state = next(
-        payload["pattern_state"]
-        for payload in runtime.checkpoints
-        if payload["label"] == retry_label
-    )
+    assert run.tools(0) == [pattern._final_answer_tool_schema()]
+    (retry_label,) = run.retry_labels()
+    (retry_state,) = run.states(retry_label)
     assert retry_state["forced_answer_reads_used"] == 3
     assert retry_state["forced_answer_reads_rejected"] == 0
     if recovers:
         assert retry_label == "unavailable_tool_call_recovery"
-        assert "calculator" in _schema_names(llm.calls[1])
+        assert "calculator" in run.names(1)
     else:
         assert retry_label == "tool_protocol_retry"
         assert retry_state["force_final_answer_next"] is True
-        assert llm.calls[1]["tools"] == [pattern._final_answer_tool_schema()]
+        assert run.tools(1) == [pattern._final_answer_tool_schema()]
 
 
-@pytest.mark.parametrize("details", ["missing", "without_tool_name"])
-def test_unnamed_unavailable_tool_call_still_recovers(details: str) -> None:
+@pytest.mark.parametrize(
+    ("forced", "details"),
+    [
+        (True, "missing"),
+        (True, "without_tool_name"),
+        (False, "named"),
+        (False, "missing"),
+    ],
+)
+def test_unnamed_or_unforced_unavailable_tool_call_still_recovers(
+    forced: bool, details: str
+) -> None:
     """A violation that does not name the refused call restores the full
-    tool set, as before, rather than keep a narrowed set."""
+    tool set, as before, rather than keep a narrowed set; outside a forced
+    turn every unavailable_tool_call restores it, named or not."""
     pattern = ReActPattern()
     response = _provider_rejected_call(pattern, SPILL_READ_TOOL_NAME)
     error = response["_xagent_tool_protocol_error"]
     if details == "missing":
         del error["details"]
-    else:
+    elif details == "without_tool_name":
         error["details"] = {"original_arguments_preview": "{}"}
     normalized = pattern._normalize_llm_response(response)
 
     assert pattern._requires_full_tool_set_recovery(
         normalized,
-        force_final_answer=True,
-        allowed_tool_names=frozenset({"final_answer", SPILL_READ_TOOL_NAME}),
-    )
-
-
-@pytest.mark.parametrize("named", [True, False])
-def test_unavailable_tool_call_outside_a_forced_turn_still_recovers(
-    named: bool,
-) -> None:
-    pattern = ReActPattern()
-    response = _provider_rejected_call(pattern, SPILL_READ_TOOL_NAME)
-    if not named:
-        del response["_xagent_tool_protocol_error"]["details"]
-    normalized = pattern._normalize_llm_response(response)
-
-    assert pattern._requires_full_tool_set_recovery(
-        normalized,
-        force_final_answer=False,
+        force_final_answer=forced,
         allowed_tool_names=frozenset({"final_answer", SPILL_READ_TOOL_NAME}),
     )
 
@@ -5795,24 +5779,12 @@ async def test_empty_registry_forced_turn_reader_call_still_recovers(
         if entry == "plain_call"
         else _provider_rejected_call(pattern, SPILL_READ_TOOL_NAME)
     )
-    llm = FakeLLM([first, _final_call()])
-    runtime = PatternRuntime(execution_id="empty-reader")
 
-    result = await pattern.run(
-        context=_forced_turn_context(stored=False),
-        tools=[FakeTool(), FakeReadToolResultTool()],
-        llm=llm,
-        runtime=runtime,
-    )
+    run = await _run_pattern(pattern, [first, _final_call()], stored=False)
 
-    assert result["success"] is True
-    assert _retry_labels(runtime) == ["unavailable_tool_call_recovery"]
-    assert _schema_names(llm.calls[1]) == [
-        "calculator",
-        "final_answer",
-        "send_message",
-        "ask_user_question",
-    ]
+    assert run.result["success"] is True
+    assert run.retry_labels() == ["unavailable_tool_call_recovery"]
+    assert run.names(1) == _ORDINARY_TOOLS
 
 
 @pytest.mark.asyncio
@@ -5829,22 +5801,14 @@ async def test_forced_turn_protocol_retry_sends_the_turn_tools(
 ) -> None:
     """Within one forced turn, the protocol-repair retry sends exactly the
     tools the turn itself sent."""
-    pattern = _forced_turn_pattern(**overrides)
-    empty_answer = _tool_call_response("call_empty", "final_answer", '{"answer": ""}')
-    llm = FakeLLM([empty_answer, _final_call()])
-
-    result = await pattern.run(
-        context=_forced_turn_context(),
-        tools=[FakeTool(), FakeReadToolResultTool()],
-        llm=llm,
+    run = await _run_pattern(
+        _forced_turn_pattern(**overrides), [_empty_answer(), _final_call()]
     )
 
-    assert result["success"] is True
-    assert len(llm.calls) == 2
-    assert llm.calls[1]["tools"] == llm.calls[0]["tools"]
-    assert (SPILL_READ_TOOL_NAME in _schema_names(llm.calls[0])) is (
-        cell == "reads_open"
-    )
+    assert run.result["success"] is True
+    assert len(run.llm.calls) == 2
+    assert run.tools(1) == run.tools(0)
+    assert (SPILL_READ_TOOL_NAME in run.names(0)) is (cell == "reads_open")
 
 
 # --- forced-answer turn: read policy -----------------------------------------
@@ -5855,6 +5819,11 @@ _READS_USED_UP = (
     "The read allowance for the final answer is used up. Answer from what you "
     "have already read; do not state a value you did not read."
 )
+_REJECTS_USED_UP = (
+    "Too many paths for the final answer did not match the stored results "
+    "listed above. Answer from what you have; do not state a value you did "
+    "not read."
+)
 _UNLISTED_PATH = (
     "read_tool_result during the final answer turn is limited to the stored "
     "results listed above. Copy one of those paths exactly. That path is not "
@@ -5862,36 +5831,19 @@ _UNLISTED_PATH = (
 )
 
 
-def _tool_result_outputs(context: ExecutionContext, name: str) -> list[Any]:
-    return [
-        message.metadata.get("raw_result")
-        for message in context.messages
-        if message.role == "tool" and message.metadata.get("tool_name") == name
-    ]
-
-
-def _batch_response(*calls: tuple[str, str, dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "tool_calls": [
-            {"id": call_id, "function": {"name": name, "arguments": json.dumps(args)}}
-            for call_id, name, args in calls
-        ]
-    }
-
-
 async def _run_forced_reads(
     responses: list[Any], **pattern_kwargs: Any
-) -> tuple[ReActPattern, RecordingReadToolResultTool, ExecutionContext, Any]:
-    pattern = _forced_turn_pattern(max_iterations=8, **pattern_kwargs)
+) -> tuple[_ForcedRun, RecordingReadToolResultTool]:
+    """A forced turn over a registry holding _SPILL_PATH that replays the
+    given responses, then answers; returns the run and its recording reader."""
     reader = RecordingReadToolResultTool()
-    context = _context_with_spill_records(_SPILL_PATH)
-    context.add_user_message("What is in the stored result?")
-    result = await pattern.run(
-        context=context,
+    run = await _run_pattern(
+        _forced_turn_pattern(max_iterations=8, **pattern_kwargs),
+        [*responses, _final_call()],
+        context=_forced_turn_context(True, _SPILL_PATH),
         tools=[FakeTool(), reader],
-        llm=FakeLLM([*responses, _final_call()]),
     )
-    return pattern, reader, context, result
+    return run, reader
 
 
 @pytest.mark.asyncio
@@ -5914,21 +5866,17 @@ async def test_forced_turn_path_matching_and_counters(
 ) -> None:
     """A path that normalizes to a stored result runs and counts as a read;
     any other path does not run and counts as a reject."""
-    pattern, reader, context, result = await _run_forced_reads(
-        [_batch_response(("call_read", SPILL_READ_TOOL_NAME, {"path": path}))]
-    )
+    run, reader = await _run_forced_reads([_read_batch([{"path": path}])])
 
-    assert result["success"] is True
+    assert run.result["success"] is True
     assert len(reader.calls) == (1 if admitted else 0)
-    assert pattern.forced_answer_reads_used == (1 if admitted else 0)
-    assert pattern.forced_answer_reads_rejected == (0 if admitted else 1)
-    assert pattern.forced_answer_extra_iterations == 1
+    assert run.pattern.forced_answer_reads_used == (1 if admitted else 0)
+    assert run.pattern.forced_answer_reads_rejected == (0 if admitted else 1)
+    assert run.pattern.forced_answer_extra_iterations == 1
     if admitted:
         assert reader.calls[0]["path"] == path
     else:
-        assert _tool_result_outputs(context, SPILL_READ_TOOL_NAME) == [
-            {"output": _UNLISTED_PATH}
-        ]
+        assert run.tool_outputs(SPILL_READ_TOOL_NAME) == [{"output": _UNLISTED_PATH}]
 
 
 @pytest.mark.asyncio
@@ -5936,28 +5884,20 @@ async def test_forced_turn_offset_continuation_counts_as_one_read() -> None:
     """Reading on through one stored result with a larger offset is one read
     per call; the fourth call finds the allowance used up and does not run."""
     offsets = [0, 12_000, 24_000, 36_000]
-    pattern, reader, context, result = await _run_forced_reads(
+    run, reader = await _run_forced_reads(
         [
-            _batch_response(
-                *(
-                    (
-                        f"call_read_{offset}",
-                        SPILL_READ_TOOL_NAME,
-                        {"path": _SPILL_PATH, "start": 1, "end": 2, "offset": offset},
-                    )
-                    for offset in offsets
-                )
+            _read_batch(
+                {"path": _SPILL_PATH, "start": 1, "end": 2, "offset": offset}
+                for offset in offsets
             )
         ]
     )
 
-    assert result["success"] is True
+    assert run.result["success"] is True
     assert [call["offset"] for call in reader.calls] == offsets[:3]
-    assert pattern.forced_answer_reads_used == 3
-    assert pattern.forced_answer_extra_iterations == 3
-    assert _tool_result_outputs(context, SPILL_READ_TOOL_NAME)[-1] == {
-        "output": _READS_USED_UP
-    }
+    assert run.pattern.forced_answer_reads_used == 3
+    assert run.pattern.forced_answer_extra_iterations == 3
+    assert run.tool_outputs(SPILL_READ_TOOL_NAME)[-1] == {"output": _READS_USED_UP}
 
 
 @pytest.mark.asyncio
@@ -5965,16 +5905,14 @@ async def test_forced_turn_offset_continuation_counts_as_one_read() -> None:
 async def test_forced_turn_listing_call_disposition(args: dict[str, Any]) -> None:
     """A forced-turn read_tool_result call without a path lists the stored
     results: it runs and counts as one read."""
-    pattern, reader, _, result = await _run_forced_reads(
-        [_batch_response(("call_list", SPILL_READ_TOOL_NAME, args))]
-    )
+    run, reader = await _run_forced_reads([_read_batch([args])])
 
-    assert result["success"] is True
+    assert run.result["success"] is True
     assert len(reader.calls) == 1
     assert reader.calls[0].get("path") is None
-    assert pattern.forced_answer_reads_used == 1
-    assert pattern.forced_answer_reads_rejected == 0
-    assert pattern.forced_answer_extra_iterations == 1
+    assert run.pattern.forced_answer_reads_used == 1
+    assert run.pattern.forced_answer_reads_rejected == 0
+    assert run.pattern.forced_answer_extra_iterations == 1
 
 
 @pytest.mark.asyncio
@@ -5984,38 +5922,21 @@ async def test_forced_turn_read_keeps_relative_path_in_checkpoint(
 ) -> None:
     """The admitted read runs with the path the model wrote; nothing on the
     way rewrites it into the workspace's absolute path."""
-
-    class ConcurrentReader(RecordingReadToolResultTool):
-        def __init__(self) -> None:
-            super().__init__()
-            self.metadata = SimpleNamespace(
-                name=SPILL_READ_TOOL_NAME,
-                description="Read one engine-stored large tool result.",
-                concurrency_safe=True,
-            )
-
-    pattern = _forced_turn_pattern(tool_parallel_enabled=parallel)
-    reader = ConcurrentReader()
-    context = _context_with_spill_records(_SPILL_PATH)
+    reader = RecordingReadToolResultTool(concurrency_safe=True)
+    context = _forced_turn_context(True, _SPILL_PATH)
     context.attach_workspace("ws-forced-read", str(tmp_path))
-    context.add_user_message("What is in the stored result?")
-    runtime = PatternRuntime(execution_id="relative-path")
-    reads = [
-        (f"call_read_{index}", SPILL_READ_TOOL_NAME, {"path": _SPILL_PATH})
-        for index in range(2)
-    ]
 
-    result = await pattern.run(
+    run = await _run_pattern(
+        _forced_turn_pattern(tool_parallel_enabled=parallel),
+        [_read_batch([{"path": _SPILL_PATH}] * 2), _final_call()],
         context=context,
         tools=[FakeTool(), reader],
-        llm=FakeLLM([_batch_response(*reads), _final_call()]),
-        runtime=runtime,
     )
 
-    assert result["success"] is True
+    assert run.result["success"] is True
     assert [call["path"] for call in reader.calls] == [_SPILL_PATH, _SPILL_PATH]
     label = "before_tool_batch" if parallel else "before_tool"
-    payloads = [p for p in runtime.checkpoints if p["label"] == label]
+    payloads = [p for p in run.runtime.checkpoints if p["label"] == label]
     assert payloads
     for payload in payloads:
         serialized = json.dumps(
@@ -6024,13 +5945,6 @@ async def test_forced_turn_read_keeps_relative_path_in_checkpoint(
         )
         assert _SPILL_PATH in serialized
         assert str(tmp_path) not in serialized
-
-
-_REJECTS_USED_UP = (
-    "Too many paths for the final answer did not match the stored results "
-    "listed above. Answer from what you have; do not state a value you did "
-    "not read."
-)
 
 
 @pytest.mark.asyncio
@@ -6058,31 +5972,25 @@ async def test_forced_turn_refusals_once_an_allowance_is_used_up(
     """The observation a refused read gets names which allowance ran out;
     once either is used up, even a stored path is refused and nothing more
     is counted."""
-    pattern, reader, context, result = await _run_forced_reads(
-        [
-            _batch_response(
-                *(
-                    (f"call_read_{index}", SPILL_READ_TOOL_NAME, {"path": path})
-                    for index, path in enumerate(paths)
-                )
-            )
-        ],
-        used=used,
-        rejected=rejected,
+    run, reader = await _run_forced_reads(
+        [_read_batch({"path": path} for path in paths)], used=used, rejected=rejected
     )
 
-    assert result["success"] is True
+    assert run.result["success"] is True
     assert len(reader.calls) == reads_run
-    assert _tool_result_outputs(context, SPILL_READ_TOOL_NAME)[reads_run:] == [
+    assert run.tool_outputs(SPILL_READ_TOOL_NAME)[reads_run:] == [
         {"output": text} for text in outputs
     ]
-    assert (pattern.forced_answer_reads_used, pattern.forced_answer_reads_rejected) == (
-        (3, 0) if used else (0, 3)
+    counters = (
+        run.pattern.forced_answer_reads_used,
+        run.pattern.forced_answer_reads_rejected,
     )
-    assert pattern.forced_answer_extra_iterations == 1
+    assert counters == ((3, 0) if used else (0, 3))
+    assert run.pattern.forced_answer_extra_iterations == 1
 
 
 def _successful_reads_ledger(pattern: ReActPattern, count: int) -> dict[str, Any]:
+    """Record count completed reads in the ledger; return the last call."""
     call: dict[str, Any] = {}
     for index in range(count):
         call = {
@@ -6112,7 +6020,6 @@ async def test_repeated_tool_decision_still_fires_after_a_forced_turn(
     pattern.force_final_answer_next = force_flag
     pattern._forced_answer_read_open = read_open
     last_call = _successful_reads_ledger(pattern, 4)
-
     stored = cell != "flash_after_a_forced_turn_with_nothing_stored"
 
     requested = await pattern._request_repeated_tool_decision_if_needed(
@@ -6128,58 +6035,37 @@ async def test_repeated_tool_decision_still_fires_after_a_forced_turn(
 async def test_repeated_reads_on_ordinary_turns_still_ask_for_a_decision() -> None:
     """With stored results, four reads in a row on ordinary turns still ask
     the repeated-tool decision."""
-    pattern = ReActPattern(max_iterations=8)
-    pattern.task_text = "t"
     reader = RecordingReadToolResultTool()
-    context = _context_with_spill_records(_SPILL_PATH)
-    context.add_user_message("Read the stored result.")
-    llm = FakeLLM(
-        [
-            *(
-                _read_call(f"call_read_{index}", _SPILL_PATH, start=index + 1)
-                for index in range(4)
-            ),
-            _decision_response("final_answer"),
-            _final_call(),
-        ]
+    reads = [
+        _read_call(f"call_read_{index}", _SPILL_PATH, start=index + 1)
+        for index in range(4)
+    ]
+
+    run = await _run_pattern(
+        _react(max_iterations=8),
+        [*reads, _decision_response("final_answer"), _final_call()],
+        context=_forced_turn_context(True, _SPILL_PATH),
+        tools=[FakeTool(), reader],
     )
 
-    result = await pattern.run(context=context, tools=[FakeTool(), reader], llm=llm)
-
-    assert result["success"] is True
+    assert run.result["success"] is True
     assert len(reader.calls) == 4
-    assert _schema_names(llm.calls[4]) == ["react_decision"]
-    assert pattern.forced_answer_reads_used == 0
+    assert run.names(4) == ["react_decision"]
+    assert run.pattern.forced_answer_reads_used == 0
 
 
 @pytest.mark.asyncio
 async def test_forced_turn_reads_do_not_ask_for_a_decision() -> None:
     """Reads admitted on a forced turn do not trigger the repeated-tool
     decision, even past its threshold."""
-    pattern = _forced_turn_pattern(
-        max_iterations=8, repeated_tool_decision_after_consecutive_tool_calls=2
-    )
-    reader = RecordingReadToolResultTool()
-    context = _context_with_spill_records(_SPILL_PATH)
-    context.add_user_message("What is in the stored result?")
-    runtime = PatternRuntime(execution_id="no-decision")
-    reads = [
-        (f"call_read_{index}", SPILL_READ_TOOL_NAME, {"path": _SPILL_PATH})
-        for index in range(3)
-    ]
-
-    result = await pattern.run(
-        context=context,
-        tools=[FakeTool(), reader],
-        llm=FakeLLM([_batch_response(*reads), _final_call()]),
-        runtime=runtime,
+    run, reader = await _run_forced_reads(
+        [_read_batch([{"path": _SPILL_PATH}] * 3)],
+        repeated_tool_decision_after_consecutive_tool_calls=2,
     )
 
-    assert result["success"] is True
+    assert run.result["success"] is True
     assert len(reader.calls) == 3
-    assert "repeated_tool_decision_requested" not in [
-        payload["label"] for payload in runtime.checkpoints
-    ]
+    assert "repeated_tool_decision_requested" not in run.labels()
 
 
 # --- forced-answer turn: prompt tiers ----------------------------------------
@@ -6194,10 +6080,6 @@ _READ_TOOL_RULE = (
 )
 
 
-def _system_prompt(call: dict[str, Any]) -> str:
-    return str(call["messages"][0]["content"])
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("used", [0, 1, 2])
 @pytest.mark.parametrize("path", ["main_loop", "protocol_retry"])
@@ -6207,21 +6089,17 @@ async def test_forced_turn_tier_a_prompt_states_unread_items(
     """A forced turn that offers reads tells the model how many reads remain
     before the final answer, lists the stored results, and asks it to say
     which items it did not read -- on the turn itself and on its repair."""
-    pattern = _forced_turn_pattern(used=used)
-    responses: list[Any] = [_final_call()]
+    script = [_final_call()]
     if path == "protocol_retry":
-        responses.insert(
-            0, _tool_call_response("call_empty", "final_answer", '{"answer": ""}')
-        )
-    llm = FakeLLM(responses)
+        script.insert(0, _empty_answer())
 
-    await pattern.run(
-        context=_forced_turn_context(),
+    run = await _run_pattern(
+        _forced_turn_pattern(used=used),
+        script,
         tools=[FakeTool(), NamedTool("read_file"), FakeReadToolResultTool()],
-        llm=llm,
     )
 
-    prompt = _system_prompt(llm.calls[-1])
+    prompt = run.prompt(-1)
     assert (
         "You may call read_tool_result to read them before answering, at most "
         f"{3 - used} more time(s) before the final answer."
@@ -6252,16 +6130,12 @@ async def test_forced_turn_prompt_tier_follows_tool_names(
     gets: no read sentence and the baseline tool rule."""
     options = dict(overrides)
     stored = options.pop("stored", True)
-    pattern = _forced_turn_pattern(**options)
-    llm = FakeLLM([_final_call()])
 
-    await pattern.run(
-        context=_forced_turn_context(stored=stored),
-        tools=[FakeTool(), FakeReadToolResultTool()],
-        llm=llm,
+    run = await _run_pattern(
+        _forced_turn_pattern(**options), [_final_call()], stored=stored
     )
 
-    prompt = _system_prompt(llm.calls[0])
+    prompt = run.prompt(0)
     assert (_READS_USED_UP in prompt) is tier_b
     assert _BASELINE_TOOL_RULE in prompt
     assert _UNREAD_ITEMS_SENTENCE not in prompt
@@ -6290,21 +6164,11 @@ async def test_forced_turn_prompt_tier_follows_tool_names(
 async def test_forced_turn_empty_answer_retry_text_follows_the_offered_tools(
     used: int, expected: str, absent: str
 ) -> None:
-    pattern = _forced_turn_pattern(used=used)
-    llm = FakeLLM(
-        [
-            _tool_call_response("call_empty", "final_answer", '{"answer": ""}'),
-            _final_call(),
-        ]
+    run = await _run_pattern(
+        _forced_turn_pattern(used=used), [_empty_answer(), _final_call()]
     )
 
-    await pattern.run(
-        context=_forced_turn_context(),
-        tools=[FakeTool(), FakeReadToolResultTool()],
-        llm=llm,
-    )
-
-    retry_prompt = _system_prompt(llm.calls[1])
+    retry_prompt = run.prompt(1)
     assert expected in retry_prompt
     assert absent not in retry_prompt
 
@@ -6314,16 +6178,14 @@ async def test_forced_turn_tier_a_lists_registry_records() -> None:
     """The stored-result list on the forced turn is the compaction notice:
     at most twelve entries, then a line that says how to list the rest."""
     paths = [f"tool-results/r{index:02d}-000000000000.json" for index in range(13)]
-    context = _context_with_spill_records(*paths)
-    context.add_user_message("What is in the stored results?")
-    pattern = _forced_turn_pattern()
-    llm = FakeLLM([_final_call()])
 
-    await pattern.run(
-        context=context, tools=[FakeTool(), FakeReadToolResultTool()], llm=llm
+    run = await _run_pattern(
+        _forced_turn_pattern(),
+        [_final_call()],
+        context=_forced_turn_context(True, *paths),
     )
 
-    prompt = _system_prompt(llm.calls[0])
+    prompt = run.prompt(0)
     listed = [path for path in paths if f"- {path}: " in prompt]
     assert listed == paths[:12]
     assert (
@@ -6332,18 +6194,6 @@ async def test_forced_turn_tier_a_lists_registry_records() -> None:
 
 
 # --- forced-answer turn: iteration bound -------------------------------------
-
-
-class _RespondingLLM:
-    """A fake model that answers each call from the tools it received."""
-
-    def __init__(self, respond: Any) -> None:
-        self.respond = respond
-        self.calls: list[dict[str, Any]] = []
-
-    async def chat(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        return self.respond(kwargs, len(self.calls))
 
 
 class _SpillingCalculator(FakeTool):
@@ -6389,9 +6239,8 @@ async def test_single_call_forced_turn_reads_then_answers(
         spill_dir_for_workspace,
     )
 
-    context = ExecutionContext()
+    context = _forced_turn_context(False, message="What is 1+1?")
     context.attach_workspace("ws-single-call", str(tmp_path))
-    context.add_user_message("What is 1+1?")
     tool = _SpillingCalculator(
         SpillTarget(spill_dir=spill_dir_for_workspace(tmp_path), max_chars=100)
     )
@@ -6399,100 +6248,75 @@ async def test_single_call_forced_turn_reads_then_answers(
 
     def respond(kwargs: dict[str, Any], call_number: int) -> Any:
         if call_number == 1:
-            return _tool_call_response(
-                "call_calc", "calculator", '{"expression": "1+1"}'
-            )
+            return _calculator_call()
         if call_number <= reads + 1:
             return _read_call(f"call_read_{call_number}", _stored_path(context))
         return _final_call("2")
 
-    llm = _RespondingLLM(respond)
-    pattern = ReActPattern(
-        max_iterations=2,
-        finalize_after_tool_result=True,
-        tool_parallel_enabled=parallel,
+    run = await _run_pattern(
+        ReActPattern(
+            max_iterations=2,
+            finalize_after_tool_result=True,
+            tool_parallel_enabled=parallel,
+        ),
+        _RespondingLLM(respond),
+        context=context,
+        tools=[tool, reader],
     )
 
-    result = await pattern.run(context=context, tools=[tool, reader], llm=llm)
-
-    assert result["success"] is True
-    assert "termination_reason" not in result
-    assert result["response"] == "2"
-    assert pattern.max_iterations == 2
-    assert pattern.forced_answer_extra_iterations == reads
+    assert run.result["success"] is True
+    assert "termination_reason" not in run.result
+    assert run.result["response"] == "2"
+    assert run.pattern.max_iterations == 2
+    assert run.pattern.forced_answer_extra_iterations == reads
     assert len(reader.calls) == reads
-    assert len(llm.calls) == reads + 2
-    assert SPILL_READ_TOOL_NAME in _schema_names(llm.calls[1])
-    assert (SPILL_READ_TOOL_NAME in _schema_names(llm.calls[-1])) is (reads < 3)
+    assert len(run.llm.calls) == reads + 2
+    assert SPILL_READ_TOOL_NAME in run.names(1)
+    assert (SPILL_READ_TOOL_NAME in run.names(-1)) is (reads < 3)
+
+
+_NO_REPEATED_TOOL_DECISION = {
+    "repeated_tool_decision_after_consecutive_tool_calls": None,
+    "repeated_tool_decision_after_consecutive_work_tool_calls": None,
+}
+
+
+def _visited_iterations(run: _ForcedRun) -> list[int]:
+    """current_iteration at every before_llm checkpoint, in order."""
+    return [state["current_iteration"] for state in run.states("before_llm")]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("start", [0, 2, 3, 4])
+@pytest.mark.parametrize(
+    ("max_iterations", "start", "extra", "visited"),
+    [
+        (3, 0, 0, [0, 1, 2]),
+        (3, 2, 0, [2]),
+        (3, 3, 0, []),
+        (3, 4, 0, []),
+        (2, 0, 2, [0, 1, 2, 3]),
+    ],
+    ids=["from_0", "from_max_minus_1", "from_max", "from_max_plus_1", "extra_2"],
+)
 async def test_iterations_match_the_fixed_range_without_forced_reads(
-    start: int,
+    max_iterations: int, start: int, extra: int, visited: list[int]
 ) -> None:
     """With no forced-turn read the loop visits exactly
-    range(current_iteration, max_iterations)."""
-    pattern = ReActPattern(
-        max_iterations=3,
-        repeated_tool_decision_after_consecutive_tool_calls=None,
-        repeated_tool_decision_after_consecutive_work_tool_calls=None,
-    )
-    pattern.task_text = "t"
+    range(current_iteration, max_iterations); extra iterations extend that
+    range, and the iteration-limit failure reports them next to
+    max_iterations."""
+    pattern = _react(max_iterations=max_iterations, **_NO_REPEATED_TOOL_DECISION)
     pattern.current_iteration = start
-    context = ExecutionContext()
-    context.add_user_message("Keep calculating.")
-    runtime = PatternRuntime(execution_id="fixed-range")
-    llm = _RespondingLLM(
-        lambda kwargs, n: _tool_call_response(
-            f"call_{n}", "calculator", '{"expression": "1+1"}'
-        )
+    pattern.forced_answer_extra_iterations = extra
+
+    run = await _run_pattern(
+        pattern, _always_calculator(), stored=False, tools=[FakeTool()]
     )
 
-    result = await pattern.run(
-        context=context, tools=[FakeTool()], llm=llm, runtime=runtime
-    )
-
-    assert result["success"] is False
-    assert [
-        payload["pattern_state"]["current_iteration"]
-        for payload in runtime.checkpoints
-        if payload["label"] == "before_llm"
-    ] == list(range(start, 3))
-    assert result["iterations"] == 3
-    assert result["forced_answer_extra_iterations"] == 0
-
-
-@pytest.mark.asyncio
-async def test_iteration_limit_failure_reports_the_extra_iterations() -> None:
-    pattern = ReActPattern(
-        max_iterations=2,
-        repeated_tool_decision_after_consecutive_tool_calls=None,
-        repeated_tool_decision_after_consecutive_work_tool_calls=None,
-    )
-    pattern.task_text = "t"
-    pattern.forced_answer_extra_iterations = 2
-    context = ExecutionContext()
-    context.add_user_message("Keep calculating.")
-    runtime = PatternRuntime(execution_id="extra-metadata")
-    llm = _RespondingLLM(
-        lambda kwargs, n: _tool_call_response(
-            f"call_{n}", "calculator", '{"expression": "1+1"}'
-        )
-    )
-
-    result = await pattern.run(
-        context=context, tools=[FakeTool()], llm=llm, runtime=runtime
-    )
-
-    assert result["success"] is False
-    assert result["iterations"] == 2
-    assert result["forced_answer_extra_iterations"] == 2
-    assert [
-        payload["pattern_state"]["current_iteration"]
-        for payload in runtime.checkpoints
-        if payload["label"] == "before_llm"
-    ] == [0, 1, 2, 3]
+    assert run.result["success"] is False
+    assert _visited_iterations(run) == visited
+    assert run.result["iterations"] == max_iterations
+    assert run.result["forced_answer_extra_iterations"] == extra
 
 
 @pytest.mark.asyncio
@@ -6508,54 +6332,36 @@ async def test_extra_iterations_are_bounded_per_run() -> None:
     safety_stop = 200
     bad_path = "tool-results/unlisted-000000000000.json"
     batch = [_STORED_PATH, _STORED_PATH, bad_path, bad_path, bad_path, _STORED_PATH]
-    reader = RecordingReadToolResultTool()
-    calculator = FakeTool()
 
     def respond(kwargs: dict[str, Any], call_number: int) -> Any:
         if call_number > safety_stop:
             return _final_call("stop")
         names = _schema_names(kwargs) if kwargs.get("tools") else []
         if names == ["final_answer", SPILL_READ_TOOL_NAME]:
-            return _batch_response(
-                *(
-                    (
-                        f"call_read_{call_number}_{index}",
-                        SPILL_READ_TOOL_NAME,
-                        {"path": path},
-                    )
-                    for index, path in enumerate(batch)
-                )
+            return _read_batch(
+                ({"path": path} for path in batch), prefix=f"call_read_{call_number}"
             )
-        return _tool_call_response(
-            f"call_calc_{call_number}", "calculator", '{"expression": "1+1"}'
-        )
+        return _calculator_call(f"call_calc_{call_number}")
 
-    llm = _RespondingLLM(respond)
-    pattern = ReActPattern(
-        max_iterations=2,
-        finalize_after_tool_result=True,
-        repeated_tool_decision_after_consecutive_tool_calls=None,
-        repeated_tool_decision_after_consecutive_work_tool_calls=None,
-    )
-    pattern.task_text = "t"
-    runtime = PatternRuntime(execution_id="bounded")
-
-    result = await pattern.run(
-        context=_forced_turn_context(),
-        tools=[calculator, reader],
-        llm=llm,
-        runtime=runtime,
+    run = await _run_pattern(
+        _react(
+            max_iterations=2,
+            finalize_after_tool_result=True,
+            **_NO_REPEATED_TOOL_DECISION,
+        ),
+        _RespondingLLM(respond),
+        tools=[FakeTool(), RecordingReadToolResultTool()],
     )
 
     observed_extra = [
         payload["pattern_state"]["forced_answer_extra_iterations"]
-        for payload in runtime.checkpoints
+        for payload in run.runtime.checkpoints
     ]
     assert max(observed_extra) <= extra_cap
-    assert pattern.forced_answer_extra_iterations <= extra_cap
-    assert len(llm.calls) <= calls_cap
-    assert result["success"] is False
-    assert result["status"] == "max_iterations"
+    assert run.pattern.forced_answer_extra_iterations <= extra_cap
+    assert len(run.llm.calls) <= calls_cap
+    assert run.result["success"] is False
+    assert run.result["status"] == "max_iterations"
 
 
 @pytest.mark.asyncio
