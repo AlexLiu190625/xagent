@@ -4592,13 +4592,21 @@ def _schema_names(llm_call: dict[str, Any]) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_forced_answer_turn_sends_only_final_answer_with_a_non_empty_registry() -> (
-    None
-):
-    """With the registry already non-empty, the ordinary turn offers the
-    reader, but the forced-answer turn that follows a successful tool result
-    sends the model final_answer and nothing else -- asserted on the tools
-    the model call actually received."""
+@pytest.mark.parametrize(
+    ("stored", "forced_turn_tools"),
+    [
+        (True, ["final_answer", SPILL_READ_TOOL_NAME]),
+        (False, ["final_answer"]),
+    ],
+    ids=["non_empty_registry", "empty_registry"],
+)
+async def test_forced_answer_turn_offers_the_reader_only_with_a_non_empty_registry(
+    stored: bool, forced_turn_tools: list[str]
+) -> None:
+    """The forced-answer turn that follows a successful tool result sends
+    final_answer plus the reader while the registry holds a record, and
+    final_answer alone when it is empty -- asserted on the tools the model
+    call actually received."""
     llm = FakeLLM(
         responses=[
             _tool_call_response("call_calc", "calculator", '{"expression": "1+1"}'),
@@ -4606,7 +4614,11 @@ async def test_forced_answer_turn_sends_only_final_answer_with_a_non_empty_regis
         ]
     )
     pattern = ReActPattern(max_iterations=4, finalize_after_tool_result=True)
-    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    context = (
+        _context_with_spill_records("tool-results/a-000000000000.json")
+        if stored
+        else ExecutionContext()
+    )
     context.add_user_message("What is 1+1?")
 
     result = await pattern.run(
@@ -4615,8 +4627,43 @@ async def test_forced_answer_turn_sends_only_final_answer_with_a_non_empty_regis
 
     assert result["success"] is True
     assert len(llm.calls) == 2
-    assert SPILL_READ_TOOL_NAME in _schema_names(llm.calls[0])
-    assert _schema_names(llm.calls[1]) == ["final_answer"]
+    assert (SPILL_READ_TOOL_NAME in _schema_names(llm.calls[0])) is stored
+    assert _schema_names(llm.calls[1]) == forced_turn_tools
+
+
+@pytest.mark.asyncio
+async def test_settlement_fence_turn_sends_only_final_answer_with_a_non_empty_registry() -> (
+    None
+):
+    """The settlement-fence turn keeps final_answer alone even while the
+    registry holds a record and the reads are still open."""
+    llm = FakeLLM(
+        responses=[
+            _tool_call_response("call_final", "final_answer", '{"answer": "no"}'),
+        ]
+    )
+    pattern = ReActPattern(max_iterations=4)
+    pattern.force_final_answer_next = True
+    pattern.settlement_final_answer_fence = True
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    context.add_user_message("Do not publish it.")
+    runtime = PatternRuntime(execution_id="fence")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool(), FakeReadToolResultTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert llm.calls[0]["tools"] == [pattern._final_answer_tool_schema()]
+    before_llm = next(
+        payload["pattern_state"]
+        for payload in runtime.checkpoints
+        if payload["label"] == "before_llm"
+    )
+    assert before_llm["forced_answer_read_open"] is False
 
 
 @pytest.mark.asyncio
@@ -5210,6 +5257,594 @@ async def test_empty_registry_flash_run_matches_the_baseline(scenario: str) -> N
     for payload in runtime.checkpoints:
         assert _forced_read_state(payload["pattern_state"]) == (0, 0, False, 0)
     assert context.get_component("spilled_results") is None
+
+
+# --- forced-answer turn: tool surface and protocol ---------------------------
+
+_STORED_PATH = "tool-results/a-000000000000.json"
+
+
+class ReadToolResultArgs(BaseModel):
+    path: str | None = None
+    start: int | None = None
+    end: int | None = None
+    offset: int = 0
+
+
+class RecordingReadToolResultTool:
+    """A read_tool_result that records what it was asked to read."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = SPILL_READ_TOOL_NAME
+            description = "Read one engine-stored large tool result."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return ReadToolResultArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(dict(args))
+        return {"relative_path": args.get("path"), "items": ["stored item"]}
+
+
+class NamedTool:
+    """A work tool with a given name that records its calls."""
+
+    def __init__(self, name: str) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.metadata = SimpleNamespace(name=name, description=f"Run {name}.")
+
+    def args_type(self) -> type[BaseModel]:
+        return EmptyArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(dict(args))
+        return {"success": True}
+
+
+def _read_call(call_id: str, path: str | None = _STORED_PATH, **extra: Any) -> Any:
+    args: dict[str, Any] = dict(extra)
+    if path is not None:
+        args["path"] = path
+    return _tool_call_response(call_id, SPILL_READ_TOOL_NAME, json.dumps(args))
+
+
+def _final_call(answer: str = "done") -> dict[str, Any]:
+    return _tool_call_response(
+        "call_final", "final_answer", json.dumps({"answer": answer})
+    )
+
+
+def _forced_turn_pattern(
+    *, used: int = 0, rejected: int = 0, fence: bool = False, **kwargs: Any
+) -> ReActPattern:
+    kwargs.setdefault("max_iterations", 4)
+    pattern = ReActPattern(**kwargs)
+    pattern.task_text = "t"
+    pattern.force_final_answer_next = True
+    pattern.forced_answer_reads_used = used
+    pattern.forced_answer_reads_rejected = rejected
+    if fence:
+        pattern.settlement_final_answer_fence = True
+    return pattern
+
+
+def _forced_turn_context(stored: bool = True) -> ExecutionContext:
+    context = (
+        _context_with_spill_records(_STORED_PATH) if stored else ExecutionContext()
+    )
+    context.add_user_message("What is in the stored result?")
+    return context
+
+
+def _retry_labels(runtime: PatternRuntime) -> list[str]:
+    return [
+        payload["label"]
+        for payload in runtime.checkpoints
+        if payload["label"]
+        in {
+            "tool_protocol_retry",
+            "unavailable_tool_call_recovery",
+            "empty_final_answer_recovery",
+            "settlement_final_answer_recovery",
+            "malformed_tool_arguments_recovery",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cell",
+    ["reader_offered", "allowance_used_up", "empty_registry", "tool_choice_none"],
+)
+async def test_forced_turn_schema_has_exactly_one_final_answer(cell: str) -> None:
+    """Whatever the forced turn offers, it names final_answer exactly once
+    and offers at most one other tool, even for an agent carrying many."""
+    pattern = _forced_turn_pattern(
+        used=3 if cell == "allowance_used_up" else 0,
+        tool_choice="none" if cell == "tool_choice_none" else "required",
+    )
+    many_tools: list[Any] = [NamedTool(f"work_tool_{index}") for index in range(12)]
+    llm = FakeLLM([_final_call()])
+
+    result = await pattern.run(
+        context=_forced_turn_context(stored=cell != "empty_registry"),
+        tools=[*many_tools, NamedTool("read_file"), FakeReadToolResultTool()],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    names = _schema_names(llm.calls[0])
+    assert names.count("final_answer") == 1
+    assert len(names) <= 2
+    assert (SPILL_READ_TOOL_NAME in names) is (cell == "reader_offered")
+
+
+def _set_point_run(set_point: str) -> tuple[ReActPattern, list[Any], FakeLLM, int]:
+    """A run that reaches a forced turn through one set-point of the flag.
+
+    Returns the pattern, the tools, the scripted model and the index of the
+    model call that is the forced turn.
+    """
+    tools: list[Any] = [
+        FakeTool(),
+        NamedTool("read_file"),
+        RecordingReadToolResultTool(),
+    ]
+    calculator = _tool_call_response("call_calc", "calculator", '{"expression": "1+1"}')
+    if set_point == "disabled_control_tool":
+        pattern = ReActPattern(max_iterations=4, user_interaction_enabled=False)
+        responses: list[Any] = [
+            _tool_call_response(
+                "call_ask", "ask_user_question", '{"message": "which one?"}'
+            ),
+            _final_call(),
+        ]
+        forced_index = 1
+    elif set_point == "empty_final_answer":
+        pattern = ReActPattern(max_iterations=4)
+        pattern.pending_tool_calls = [
+            {"id": "call_empty", "name": "final_answer", "args": {"answer": ""}}
+        ]
+        responses = [_final_call()]
+        forced_index = 0
+    elif set_point == "finalize_after_tool_result":
+        pattern = ReActPattern(max_iterations=4, finalize_after_tool_result=True)
+        responses = [calculator, _final_call()]
+        forced_index = 1
+    else:  # repeated_tool_decision
+        pattern = ReActPattern(
+            max_iterations=4, repeated_tool_decision_after_consecutive_tool_calls=1
+        )
+        responses = [calculator, _decision_response("final_answer"), _final_call()]
+        forced_index = 2
+    pattern.task_text = "t"
+    return pattern, tools, FakeLLM(responses), forced_index
+
+
+_SET_POINTS = [
+    "disabled_control_tool",
+    "empty_final_answer",
+    "finalize_after_tool_result",
+    "repeated_tool_decision",
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("set_point", _SET_POINTS)
+async def test_forced_turn_exposes_read_tool_result(set_point: str) -> None:
+    """Each way into the forced turn, other than the settlement fence, offers
+    final_answer and read_tool_result -- never read_file -- while the
+    registry holds a record."""
+    pattern, tools, llm, forced_index = _set_point_run(set_point)
+    context = _context_with_spill_records(_STORED_PATH)
+    context.add_user_message("What is 1+1?")
+
+    result = await pattern.run(context=context, tools=tools, llm=llm)
+
+    assert result["success"] is True
+    assert len(llm.calls) == forced_index + 1
+    names = _schema_names(llm.calls[forced_index])
+    assert set(names) == {"final_answer", SPILL_READ_TOOL_NAME}
+    assert "read_file" not in names
+    assert llm.calls[forced_index]["tool_choice"] == "required"
+
+
+async def _forced_turn_call(
+    *,
+    stored: bool,
+    reader: bool,
+    used: int = 0,
+    rejected: int = 0,
+    fence: bool = False,
+) -> tuple[ReActPattern, dict[str, Any]]:
+    pattern = _forced_turn_pattern(used=used, rejected=rejected, fence=fence)
+    tools: list[Any] = [FakeTool(), NamedTool("read_file")]
+    if reader:
+        tools.append(FakeReadToolResultTool())
+    llm = FakeLLM([_final_call()])
+    result = await pattern.run(
+        context=_forced_turn_context(stored=stored), tools=tools, llm=llm
+    )
+    assert result["success"] is True
+    return pattern, llm.calls[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cell", "overrides"),
+    [
+        ("empty_registry", {"stored": False}),
+        ("no_reader_tool", {"reader": False}),
+        ("reads_used_up", {"used": 3}),
+        ("rejects_used_up", {"rejected": 3}),
+        ("settlement_fence", {"fence": True}),
+    ],
+)
+async def test_forced_turn_stays_single_tool(
+    cell: str, overrides: dict[str, Any]
+) -> None:
+    """When any condition for offering reads fails, the forced turn sends
+    exactly the baseline final_answer schema. Where no allowance is used up
+    the prompt is byte-identical to a run that stored nothing and has no
+    reader."""
+    options: dict[str, Any] = {"stored": True, "reader": True, **overrides}
+    pattern, call = await _forced_turn_call(**options)
+
+    assert call["tools"] == [pattern._final_answer_tool_schema()]
+    if cell not in {"reads_used_up", "rejects_used_up"}:
+        _, reference = await _forced_turn_call(
+            stored=False, reader=False, fence=options.get("fence", False)
+        )
+        assert call["messages"] == reference["messages"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored", [True, False])
+@pytest.mark.parametrize("workspace_tool", [True, False])
+async def test_forced_turn_final_answer_schema_is_the_baseline_one(
+    stored: bool, workspace_tool: bool
+) -> None:
+    """The forced turn's final_answer is the baseline schema, never the
+    ordinary-turn variant that asks for get_workspace_output_files."""
+    pattern = ReActPattern(max_iterations=4, finalize_after_tool_result=True)
+    tools: list[Any] = [FakeTool(), FakeReadToolResultTool()]
+    if workspace_tool:
+        tools.append(FakeWorkspaceOutputTool())
+    llm = FakeLLM(
+        [
+            _tool_call_response("call_calc", "calculator", '{"expression": "1+1"}'),
+            _final_call("2"),
+        ]
+    )
+
+    result = await pattern.run(
+        context=_forced_turn_context(stored=stored), tools=tools, llm=llm
+    )
+
+    assert result["success"] is True
+
+    def final_answer_entry(call: dict[str, Any]) -> dict[str, Any]:
+        return next(
+            schema
+            for schema in call["tools"]
+            if schema["function"]["name"] == "final_answer"
+        )
+
+    def answer_description(schema: dict[str, Any]) -> str:
+        return schema["function"]["parameters"]["properties"]["answer"]["description"]
+
+    forced = final_answer_entry(llm.calls[1])
+    assert forced == pattern._final_answer_tool_schema()
+    assert "get_workspace_output_files" not in answer_description(forced)
+    ordinary = answer_description(final_answer_entry(llm.calls[0]))
+    assert ("get_workspace_output_files" in ordinary) is workspace_tool
+
+
+@pytest.mark.asyncio
+async def test_forced_turn_final_answer_schema_with_tool_choice_none() -> None:
+    pattern = _forced_turn_pattern(tool_choice="none")
+    llm = FakeLLM([_final_call()])
+
+    await pattern.run(
+        context=_forced_turn_context(),
+        tools=[FakeWorkspaceOutputTool(), FakeReadToolResultTool()],
+        llm=llm,
+    )
+
+    assert llm.calls[0]["tools"] == [pattern._final_answer_tool_schema()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("stored", "latched"), [(True, True), (False, False)])
+async def test_forced_answer_latch_only_when_reads_are_open(
+    stored: bool, latched: bool
+) -> None:
+    """A forced turn reached only through the flash-mode derived condition
+    (the flag itself is False) latches the flag when it offers reads, and
+    leaves it as it was when the registry is empty."""
+    pattern = ReActPattern(
+        max_iterations=2,
+        finalize_after_tool_result=True,
+        repeated_tool_decision_after_consecutive_tool_calls=1,
+    )
+    pattern.task_text = "t"
+    llm = FakeLLM(
+        [
+            _tool_call_response("c1", "calculator", '{"expression": "1+1"}'),
+            _decision_response("tool_call"),
+            _final_call("2"),
+        ]
+    )
+    runtime = PatternRuntime(execution_id="latch")
+
+    result = await pattern.run(
+        context=_forced_turn_context(stored=stored),
+        tools=[FakeTool(), FakeReadToolResultTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    before_llm = [
+        payload["pattern_state"]
+        for payload in runtime.checkpoints
+        if payload["label"] == "before_llm"
+    ]
+    assert len(before_llm) == 2
+    assert before_llm[0]["force_final_answer_next"] is False
+    assert before_llm[1]["force_final_answer_next"] is latched
+    assert before_llm[1]["forced_answer_read_open"] is latched
+    assert (SPILL_READ_TOOL_NAME in _schema_names(llm.calls[2])) is stored
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("used", "called", "accepted"),
+    [
+        (0, SPILL_READ_TOOL_NAME, True),
+        (0, "final_answer", True),
+        (0, "read_file", False),
+        (0, "write_file", False),
+        (3, SPILL_READ_TOOL_NAME, False),
+        (3, "final_answer", True),
+        (3, "read_file", False),
+        (3, "write_file", False),
+    ],
+)
+async def test_forced_turn_protocol_accepts_exactly_the_offered_tools(
+    used: int, called: str, accepted: bool
+) -> None:
+    """A forced turn's response is accepted exactly when every call names a
+    tool the turn sent: final_answer and read_tool_result while reads are
+    open, final_answer alone once an allowance is used up."""
+    pattern = _forced_turn_pattern(used=used)
+    reader = RecordingReadToolResultTool()
+    tools: list[Any] = [NamedTool("read_file"), NamedTool("write_file"), reader]
+    if called == "final_answer":
+        first = _final_call()
+    elif called == SPILL_READ_TOOL_NAME:
+        first = _read_call("call_read")
+    else:
+        first = _tool_call_response("call_other", called, "{}")
+    llm = FakeLLM([first, _final_call(), _final_call()])
+    runtime = PatternRuntime(execution_id="protocol")
+
+    result = await pattern.run(
+        context=_forced_turn_context(), tools=tools, llm=llm, runtime=runtime
+    )
+
+    assert result["success"] is True
+    assert (_retry_labels(runtime) == []) is accepted
+    assert (len(reader.calls) == 1) is (accepted and called == SPILL_READ_TOOL_NAME)
+
+
+def test_protocol_check_without_allowed_names_accepts_only_final_answer() -> None:
+    pattern = ReActPattern()
+    read_call = {"tool_calls": [{"id": "r", "name": SPILL_READ_TOOL_NAME, "args": {}}]}
+    final = {
+        "tool_calls": [{"id": "f", "name": "final_answer", "args": {"answer": "a"}}]
+    }
+
+    assert pattern._response_requires_tool_protocol_retry(
+        read_call, force_final_answer=True
+    )
+    assert not pattern._response_requires_tool_protocol_retry(
+        final, force_final_answer=True
+    )
+    assert not pattern._response_requires_tool_protocol_retry(
+        read_call,
+        force_final_answer=True,
+        allowed_tool_names=frozenset({"final_answer", SPILL_READ_TOOL_NAME}),
+    )
+
+
+def _provider_rejected_call(pattern: ReActPattern, name: str) -> dict[str, Any]:
+    """The response DeepSeek's codec produces when the model calls a tool the
+    forced turn did not send."""
+    from xagent.core.model.chat.basic.deepseek_tool_protocol import (
+        normalize_deepseek_response,
+    )
+
+    response = normalize_deepseek_response(
+        {
+            "type": "tool_call",
+            "tool_calls": [
+                {
+                    "id": "call_x",
+                    "type": "function",
+                    "function": {"name": name, "arguments": "{}"},
+                }
+            ],
+        },
+        tools=[pattern._final_answer_tool_schema()],
+    )
+    assert response["tool_calls"] == []
+    return response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["plain_call", "provider_violation"])
+@pytest.mark.parametrize(
+    ("called", "recovers"),
+    [
+        (SPILL_READ_TOOL_NAME, False),
+        ("read_file", True),
+        (WORKSPACE_OUTPUT_FILES_TOOL_NAME, True),
+        ("calculator", True),
+    ],
+)
+async def test_exhausted_read_allowance_does_not_recover_tool_set(
+    entry: str, called: str, recovers: bool
+) -> None:
+    """Once the read allowance is used up, another read_tool_result call is
+    retried on final_answer alone: the flag stays set, the counters do not
+    move. Any other tool the turn did not offer still gets the full tool set
+    back, as before."""
+    pattern = _forced_turn_pattern(used=3)
+    reader = RecordingReadToolResultTool()
+    tools: list[Any] = [
+        FakeTool(),
+        NamedTool("read_file"),
+        FakeWorkspaceOutputTool(),
+        reader,
+    ]
+    first = (
+        _tool_call_response("call_x", called, "{}")
+        if entry == "plain_call"
+        else _provider_rejected_call(pattern, called)
+    )
+    llm = FakeLLM([first, _final_call()])
+    runtime = PatternRuntime(execution_id="exhausted")
+
+    result = await pattern.run(
+        context=_forced_turn_context(), tools=tools, llm=llm, runtime=runtime
+    )
+
+    assert result["success"] is True
+    assert reader.calls == []
+    assert llm.calls[0]["tools"] == [pattern._final_answer_tool_schema()]
+    (retry_label,) = _retry_labels(runtime)
+    retry_state = next(
+        payload["pattern_state"]
+        for payload in runtime.checkpoints
+        if payload["label"] == retry_label
+    )
+    assert retry_state["forced_answer_reads_used"] == 3
+    assert retry_state["forced_answer_reads_rejected"] == 0
+    if recovers:
+        assert retry_label == "unavailable_tool_call_recovery"
+        assert "calculator" in _schema_names(llm.calls[1])
+    else:
+        assert retry_label == "tool_protocol_retry"
+        assert retry_state["force_final_answer_next"] is True
+        assert llm.calls[1]["tools"] == [pattern._final_answer_tool_schema()]
+
+
+@pytest.mark.parametrize("details", ["missing", "without_tool_name"])
+def test_unnamed_unavailable_tool_call_still_recovers(details: str) -> None:
+    """A violation that does not name the refused call restores the full
+    tool set, as before, rather than keep a narrowed set."""
+    pattern = ReActPattern()
+    response = _provider_rejected_call(pattern, SPILL_READ_TOOL_NAME)
+    error = response["_xagent_tool_protocol_error"]
+    if details == "missing":
+        del error["details"]
+    else:
+        error["details"] = {"original_arguments_preview": "{}"}
+    normalized = pattern._normalize_llm_response(response)
+
+    assert pattern._requires_full_tool_set_recovery(
+        normalized,
+        force_final_answer=True,
+        allowed_tool_names=frozenset({"final_answer", SPILL_READ_TOOL_NAME}),
+    )
+
+
+@pytest.mark.parametrize("named", [True, False])
+def test_unavailable_tool_call_outside_a_forced_turn_still_recovers(
+    named: bool,
+) -> None:
+    pattern = ReActPattern()
+    response = _provider_rejected_call(pattern, SPILL_READ_TOOL_NAME)
+    if not named:
+        del response["_xagent_tool_protocol_error"]["details"]
+    normalized = pattern._normalize_llm_response(response)
+
+    assert pattern._requires_full_tool_set_recovery(
+        normalized,
+        force_final_answer=False,
+        allowed_tool_names=frozenset({"final_answer", SPILL_READ_TOOL_NAME}),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["plain_call", "provider_violation"])
+async def test_empty_registry_forced_turn_reader_call_still_recovers(
+    entry: str,
+) -> None:
+    """With nothing stored, a forced turn that calls read_tool_result anyway
+    gets the full tool set back and the flag cleared, exactly as before."""
+    pattern = _forced_turn_pattern()
+    first = (
+        _read_call("call_read")
+        if entry == "plain_call"
+        else _provider_rejected_call(pattern, SPILL_READ_TOOL_NAME)
+    )
+    llm = FakeLLM([first, _final_call()])
+    runtime = PatternRuntime(execution_id="empty-reader")
+
+    result = await pattern.run(
+        context=_forced_turn_context(stored=False),
+        tools=[FakeTool(), FakeReadToolResultTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert _retry_labels(runtime) == ["unavailable_tool_call_recovery"]
+    assert _schema_names(llm.calls[1]) == [
+        "calculator",
+        "final_answer",
+        "send_message",
+        "ask_user_question",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cell", "overrides"),
+    [
+        ("reads_open", {}),
+        ("reads_used_up", {"used": 3}),
+        ("settlement_fence", {"fence": True}),
+    ],
+)
+async def test_forced_turn_protocol_retry_sends_the_turn_tools(
+    cell: str, overrides: dict[str, Any]
+) -> None:
+    """Within one forced turn, the protocol-repair retry sends exactly the
+    tools the turn itself sent."""
+    pattern = _forced_turn_pattern(**overrides)
+    empty_answer = _tool_call_response("call_empty", "final_answer", '{"answer": ""}')
+    llm = FakeLLM([empty_answer, _final_call()])
+
+    result = await pattern.run(
+        context=_forced_turn_context(),
+        tools=[FakeTool(), FakeReadToolResultTool()],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    assert len(llm.calls) == 2
+    assert llm.calls[1]["tools"] == llm.calls[0]["tools"]
+    assert (SPILL_READ_TOOL_NAME in _schema_names(llm.calls[0])) is (
+        cell == "reads_open"
+    )
 
 
 @pytest.mark.asyncio

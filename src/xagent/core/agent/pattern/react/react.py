@@ -532,6 +532,24 @@ def _is_answerable(interaction: Any) -> bool:
     return not lacks_required_options(interaction)
 
 
+def _unavailable_tool_call_names(
+    protocol_error: dict[str, Any],
+) -> frozenset[str] | None:
+    """Names a provider refused as unavailable, or None when it does not say.
+
+    Only the structured details["tool_name"] counts. The violation's message
+    also names the call, but it is one adapter's prose and nothing promises
+    its wording.
+    """
+    details = protocol_error.get("details")
+    if not isinstance(details, dict):
+        return None
+    name = details.get("tool_name")
+    if isinstance(name, str) and name:
+        return frozenset({name})
+    return None
+
+
 class ReActPattern(AgentPattern):
     """Minimal ReAct loop for the execution runtime."""
 
@@ -839,11 +857,25 @@ class ReActPattern(AgentPattern):
             normal_tool_schemas = self._tool_schemas_with_spill_read(
                 base_tool_schemas, spill_read_schema, context
             )
-            tool_schemas = (
-                [self._final_answer_tool_schema()]
-                if force_final_answer_now
-                else normal_tool_schemas
+            if not force_final_answer_now:
+                tool_schemas = normal_tool_schemas
+            elif settlement_fence:
+                # The settlement-fence turn explains a refused or unknown
+                # write and must not reach any tool but final_answer.
+                tool_schemas = [self._final_answer_tool_schema()]
+            else:
+                tool_schemas = self._forced_answer_tool_schemas(normal_tool_schemas)
+            self._forced_answer_read_open = force_final_answer_now and (
+                SPILL_READ_TOOL_NAME in self._schema_tool_names(tool_schemas)
             )
+            if self._forced_answer_read_open:
+                # A forced turn that offers reads stays forced until it
+                # answers. A turn entered only through the flash-mode derived
+                # condition would otherwise drop out of it after a failed
+                # read and hand the next turn the full tool set. Latched only
+                # when reads are offered, so a run with nothing stored keeps
+                # the flag exactly as before.
+                self.force_final_answer_next = True
             interrupted = await self._interrupt_if_requested(
                 runtime=runtime,
                 context=context,
@@ -1034,6 +1066,7 @@ class ReActPattern(AgentPattern):
                 normalized,
                 force_final_answer=force_final_answer_now,
                 reject_mixed_control_calls=protocol_retry_performed,
+                allowed_tool_names=frozenset(self._schema_tool_names(tool_schemas)),
             )
             end_metadata: dict[str, Any] = dict(llm_metadata)
             if requires_protocol_retry:
@@ -1071,11 +1104,24 @@ class ReActPattern(AgentPattern):
                 # fails the run without the user seeing the preamble.
                 # As in the exception path above, the settlement fence wins:
                 # a fenced turn never gets its work tools back.
+                #
+                # While this run holds stored results, a read_tool_result call
+                # on a forced turn whose read allowance ran out is retried on
+                # the same narrowed tools rather than handed the full set
+                # back; otherwise one more read call would reopen every tool.
+                # With nothing stored the reader is not on the ordinary
+                # surface either, and such a call recovers as it always did.
+                recovery_allowed_names = frozenset(
+                    self._schema_tool_names(tool_schemas)
+                )
+                if SPILL_READ_TOOL_NAME in self._schema_tool_names(normal_tool_schemas):
+                    recovery_allowed_names |= {SPILL_READ_TOOL_NAME}
                 recover_full_tool_set = (
                     not settlement_fence
                     and self._requires_full_tool_set_recovery(
                         normalized,
                         force_final_answer=force_final_answer_now,
+                        allowed_tool_names=recovery_allowed_names,
                     )
                 )
                 empty_final_answer = self._empty_final_answer_call(normalized)
@@ -1128,6 +1174,7 @@ class ReActPattern(AgentPattern):
                     normalized,
                     force_final_answer=force_final_answer_now,
                     reject_mixed_control_calls=recover_full_tool_set,
+                    allowed_tool_names=frozenset(self._schema_tool_names(tool_schemas)),
                 ):
                     return await self._invalid_tool_protocol_result(
                         runtime=runtime,
@@ -1360,7 +1407,7 @@ class ReActPattern(AgentPattern):
 
         ``empty_final_answer`` distinguishes "the model never produced an answer"
         from the status's other producers (provider protocol errors, mixed
-        control calls, a non-``final_answer`` tool on a forced turn), whose
+        control calls, a tool the forced turn did not offer), whose
         ``error`` text is the only signal a caller has. Delegated-child
         classification reads it to avoid collapsing all four into "never
         produced an answer" - see ``agent_tool._classify_delegated_failure``.
@@ -1631,9 +1678,17 @@ class ReActPattern(AgentPattern):
         recovery_reason: str | None = None,
         empty_final_answer: bool = False,
     ) -> tuple[Any, ReActFinalAnswerStreamer]:
-        tools = (
-            [self._final_answer_tool_schema()] if force_final_answer else tool_schemas
-        )
+        # tool_schemas is the repaired turn's ordinary surface. Whether that
+        # turn, if forced, offered reads was decided when it was built
+        # (_forced_answer_read_open), so the retry sends exactly the tools the
+        # turn it repairs sent, the settlement-fence turn's final_answer alone
+        # included.
+        if not force_final_answer:
+            tools = tool_schemas
+        elif self._forced_answer_read_open:
+            tools = self._forced_answer_tool_schemas(tool_schemas)
+        else:
+            tools = [self._final_answer_tool_schema()]
         messages = self._messages_for_llm(
             context,
             has_tools=True,
@@ -1754,6 +1809,7 @@ class ReActPattern(AgentPattern):
             normalized,
             force_final_answer=force_final_answer,
             reject_mixed_control_calls=(recovery_reason == "unavailable_tool_call"),
+            allowed_tool_names=frozenset(self._schema_tool_names(tools)),
         )
         end_metadata = dict(metadata)
         if retry_is_invalid:
@@ -1774,9 +1830,17 @@ class ReActPattern(AgentPattern):
         *,
         force_final_answer: bool,
         reject_mixed_control_calls: bool = False,
+        allowed_tool_names: frozenset[str] | None = None,
     ) -> bool:
+        """Whether a response breaks this turn's tool protocol.
+
+        On a forced turn a call is allowed only if its name is in
+        allowed_tool_names, the names of the tools this turn actually sent;
+        without it only final_answer is allowed.
+        """
         if get_tool_protocol_error(normalized.get("raw")) is not None:
             return True
+        allowed_names = allowed_tool_names or frozenset({"final_answer"})
         tool_calls = normalized.get("tool_calls") or []
         if (
             reject_mixed_control_calls
@@ -1791,7 +1855,7 @@ class ReActPattern(AgentPattern):
         for tool_call in tool_calls:
             if not isinstance(tool_call, dict):
                 continue
-            if force_final_answer and tool_call.get("name") != "final_answer":
+            if force_final_answer and tool_call.get("name") not in allowed_names:
                 return True
         if self._batch_carries_work_tool(tool_calls):
             # A final_answer sharing the batch with a work tool is removed by
@@ -1927,17 +1991,33 @@ class ReActPattern(AgentPattern):
         normalized: dict[str, Any],
         *,
         force_final_answer: bool,
+        allowed_tool_names: frozenset[str] | None = None,
     ) -> bool:
+        """Whether a rejected response should get the full tool set back.
+
+        On a forced turn only a call outside allowed_tool_names does: a
+        provider-rejected call and a plain call are judged against the same
+        names. Without allowed_tool_names only final_answer is allowed.
+        """
+        allowed_names = allowed_tool_names or frozenset({"final_answer"})
         protocol_error = get_tool_protocol_error(normalized.get("raw"))
         if (
             isinstance(protocol_error, dict)
             and protocol_error.get("code") == "unavailable_tool_call"
         ):
-            return True
+            # Outside a forced turn the answer is unchanged: restore.
+            if not force_final_answer:
+                return True
+            rejected = _unavailable_tool_call_names(protocol_error)
+            if rejected is None:
+                # The violation does not name the call. Restore, as before,
+                # rather than keep a narrowed set the model cannot leave.
+                return True
+            return not rejected <= allowed_names
         if not force_final_answer:
             return False
         return any(
-            isinstance(tool_call, dict) and tool_call.get("name") != "final_answer"
+            isinstance(tool_call, dict) and tool_call.get("name") not in allowed_names
             for tool_call in normalized.get("tool_calls") or []
         )
 
@@ -1958,6 +2038,41 @@ class ReActPattern(AgentPattern):
         """
         self.force_final_answer_next = False
         self._forced_answer_read_open = False
+
+    def _forced_answer_read_allowance_open(self) -> bool:
+        """Both per-run forced-turn read allowances still have room."""
+        return (
+            self.forced_answer_reads_used < FORCED_ANSWER_READ_BUDGET
+            and self.forced_answer_reads_rejected < FORCED_ANSWER_READ_REJECT_CAP
+        )
+
+    def _forced_answer_tool_schemas(
+        self, normal_tool_schemas: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """The tools a forced answer turn offers.
+
+        Built, never filtered. final_answer always comes from
+        _final_answer_tool_schema(): the same-named entry of the ordinary
+        surface can be the variant whose answer description sends the model
+        to get_workspace_output_files, a tool this turn does not offer.
+        read_tool_result is appended only when the turn's ordinary surface
+        carries it -- the one fact that says this run stored a result and has
+        a reader to offer -- and both read allowances still have room.
+        """
+        schemas = [self._final_answer_tool_schema()]
+        if not self._forced_answer_read_allowance_open():
+            return schemas
+        reader = next(
+            (
+                schema
+                for schema in normal_tool_schemas
+                if self._schema_tool_names([schema]) == [SPILL_READ_TOOL_NAME]
+            ),
+            None,
+        )
+        if reader is not None:
+            schemas.append(reader)
+        return schemas
 
     def _schema_tool_names(self, tool_schemas: list[dict[str, Any]]) -> list[str]:
         names: list[str] = []
@@ -3767,9 +3882,10 @@ class ReActPattern(AgentPattern):
         path restores the full tool set. That bounds the run: a second empty
         answer ends it as ``invalid_tool_protocol`` rather than looping. It does
         not prevent tool re-execution outright - if the forced turn calls a
-        non-``final_answer`` tool, ``_requires_full_tool_set_recovery`` restores
-        the full set and clears the flag, so a discarded work tool can be
-        re-invoked on that turn.
+        tool other than ``final_answer`` or, while this run holds stored
+        results, ``read_tool_result``, ``_requires_full_tool_set_recovery``
+        restores the full set and clears the flag, so a discarded work tool
+        can be re-invoked on that turn.
         """
 
         logger.warning(
