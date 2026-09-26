@@ -9,10 +9,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import BaseModel
 
 from xagent.core.agent.context import ExecutionContext
 from xagent.core.tools import tool_result_spill
 from xagent.core.tools.adapters.vibe import output_filter_wrapper
+from xagent.core.tools.adapters.vibe.base import AbstractBaseTool, ToolCategory
 from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.output_filter import DEFAULT_TRUNCATION_MESSAGE
@@ -814,6 +816,67 @@ async def test_factory_leaves_spill_target_none_for_a_mock_workspace(tmp_path, c
     assert disabled
     assert all("not bound to a task workspace" in message for message in disabled)
     assert not (Path(workspace.workspace_dir) / "output" / "tool-results").exists()
+
+
+class _ExtensionReadFile(AbstractBaseTool):
+    """A tool named read_file that is not a FunctionTool: no func attribute."""
+
+    category = ToolCategory.OTHER
+
+    class _Args(BaseModel):
+        path: str = ""
+
+    @property
+    def name(self) -> str:
+        return "read_file"
+
+    @property
+    def description(self) -> str:
+        return "Read a file through a task runtime extension."
+
+    def args_type(self):
+        return self._Args
+
+    def return_type(self):
+        return self._Args
+
+    def run_json_sync(self, args):
+        return {"output": "ok"}
+
+    async def run_json_async(self, args):
+        return {"output": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_factory_leaves_spill_target_none_for_a_read_file_that_is_not_a_function_tool(
+    tmp_path, caplog
+):
+    """With the file tools disabled, a task runtime extension may contribute
+    its own read_file. Having no bound method, it cannot name a workspace:
+    the tool set is still built, with no spill target anywhere."""
+    config = ToolConfig(
+        {
+            "workspace": {"task_id": "extension-read-file", "base_dir": str(tmp_path)},
+            "file_tools_enabled": False,
+        }
+    )
+    extension_read_file = _ExtensionReadFile()
+    with caplog.at_level(logging.INFO, logger=FACTORY_LOGGER):
+        tools = await ToolFactory.create_all_tools(
+            config, additional_tools=[extension_read_file]
+        )
+
+    assert _only_tool_named(tools, "read_file")._target is extension_read_file
+    wrappers = [tool for tool in tools if isinstance(tool, OutputFilteredToolWrapper)]
+    assert wrappers
+    assert all(wrapper._spill_target is None for wrapper in wrappers)
+    disabled = [
+        record.getMessage()
+        for record in caplog.records
+        if "spill disabled" in record.getMessage()
+    ]
+    assert disabled
+    assert all("not bound to a task workspace" in message for message in disabled)
 
 
 # --- a production tool set wires a spill target ---------------------------

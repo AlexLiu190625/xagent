@@ -908,8 +908,12 @@ class ToolFactory:
         No such read_file means no spill target: a deployment with no file
         tools, one where read_file has been renamed or filtered out by tool
         policy, or a tool set bound to a mock workspace keeps today's
-        truncation behavior unchanged.
+        truncation behavior unchanged. A tool named read_file that is not a
+        FunctionTool -- a task runtime extension may contribute one when the
+        file tools are disabled -- has no bound method to inspect, so it is
+        treated the same as a read_file not bound to a task workspace.
         """
+        from .function import FunctionTool
         from .sandboxed_tool.sandbox_config import extract_bound_method_target
 
         found_read_file = False
@@ -917,6 +921,8 @@ class ToolFactory:
             if getattr(tool, "name", None) != "read_file":
                 continue
             found_read_file = True
+            if not isinstance(tool, FunctionTool):
+                continue
             target = extract_bound_method_target(tool)
             if target is None:
                 continue
