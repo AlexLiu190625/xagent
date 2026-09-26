@@ -43,7 +43,7 @@ from fastapi.responses import JSONResponse
 from googleapiclient.discovery import build  # type: ignore
 from googleapiclient.http import MediaIoBaseDownload  # type: ignore
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from ...config import (
     get_google_drive_download_timeout_seconds,
@@ -118,6 +118,7 @@ from ..services.background_jobs import (
     is_background_job_enqueue_available,
     mark_job_failed,
 )
+from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.google_drive_download import download_google_workspace_file
 from ..services.kb_collection_service import (
     delete_collection_physical_dir,
@@ -3400,6 +3401,13 @@ async def _save_collection_config_after_ingest(
         ) from exc
 
 
+def _load_google_credentials(
+    user_id: int, session_factory: sessionmaker[Session]
+) -> Any:
+    with session_factory() as db:
+        return get_google_credentials(user_id, db)
+
+
 def _build_cloud_storage_filename(original_filename: str, file_id: str) -> str:
     """Generate a collision-resistant filename within filesystem byte limits."""
     original_path = Path(original_filename)
@@ -4456,6 +4464,8 @@ async def ingest_cloud(
 
     # Concurrency limit for cloud ingestion to avoid overloading
     semaphore = asyncio.Semaphore(5)
+    actor_user_id = int(actor_user.id)
+    credential_sessions = sessionmaker(bind=db.get_bind().engine, autoflush=False)
 
     async def process_file(
         file_info: CloudFile,
@@ -4481,8 +4491,10 @@ async def ingest_cloud(
                         f"{file_info.fileId}/{file_info.resourceKey}"
                     )
                 try:
-                    creds = await asyncio.to_thread(
-                        get_google_credentials, int(actor_user.id), db
+                    creds = await run_db_io_cancellation_safe(
+                        lambda: _load_google_credentials(
+                            actor_user_id, credential_sessions
+                        )
                     )
                 except HTTPException as e:
                     return KBApiOperationResult(
@@ -4882,7 +4894,28 @@ async def ingest_cloud(
                 return rollback_execution.operation_result
 
     # Run all file processings concurrently
-    api_results = await asyncio.gather(*[process_file(f) for f in request.files])
+    outcomes = await asyncio.gather(
+        *[process_file(f) for f in request.files], return_exceptions=True
+    )
+    api_results: List[KBApiOperationResult[IngestionResult]] = []
+    for file_info, outcome in zip(request.files, outcomes):
+        if isinstance(outcome, BaseException):
+            # gather returns a child's CancelledError as a value; keep it propagating.
+            if not isinstance(outcome, Exception):
+                raise outcome
+            logger.error(
+                "Cloud ingest of %s raised", file_info.fileName, exc_info=outcome
+            )
+            # Only steps before the first ingest write can raise out of process_file;
+            # later steps must catch their own errors or this entry hides their writes.
+            outcome = KBApiOperationResult(
+                result=IngestionResult(
+                    status="error",
+                    message=f"Unexpected error: {outcome}",
+                    doc_id=Path(file_info.fileName).name,
+                )
+            )
+        api_results.append(outcome)
     results = [api_result.result for api_result in api_results]
 
     # `partial` and `error` files were rolled back inside `process_file` above,
