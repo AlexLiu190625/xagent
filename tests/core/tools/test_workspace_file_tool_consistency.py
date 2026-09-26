@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import threading
-import tracemalloc
 from types import SimpleNamespace
 
 import pytest
@@ -983,37 +982,79 @@ class TestReadToolResult:
         )
 
     @pytest.mark.usefixtures("mock_workspace_db")
-    def test_read_tool_result_bounds_the_read_when_the_entry_is_swapped(
-        self, tmp_path, monkeypatch
+    def test_read_tool_result_bounds_the_read_to_the_size_fstat_reported(
+        self, tmp_path, monkeypatch, mocker
     ):
-        """The size bound holds for whatever the path names when it is read,
-        not only for what the lookup saw: an entry replaced by a symlink to a
-        far larger file after the lookup is not read into memory whole."""
+        """The size comes from the open descriptor, and it bounds the read.
+
+        Right after the open, the path is pointed at a far larger file; right
+        after fstat, the opened file itself grows by 1 MiB. The size gate has
+        to see the small opened file (a size looked up by path would see the
+        large one and refuse without reading), the read has to stop one byte
+        past that size (an unbounded read would take the whole 1 MiB), and
+        that extra byte has to be enough to report the file unavailable
+        before any digest is computed.
+        """
         workspace = TaskWorkspace("task-1", str(tmp_path))
         tools = WorkspaceFileTools(workspace)
         raw = b"[1, 2, 3]"
         rel = self._plant(workspace, f"acme-{self._digest(raw)}.json", raw)
-        large = tmp_path / "large.bin"
-        with large.open("wb") as handle:
-            handle.truncate(8 * SPILL_MAX_FILE_BYTES)
-        real_resolve = spill_module.resolve_spilled_under
+        entry = workspace.output_dir / rel
+        opened_inode = entry.with_name("opened-inode")
+        growth = 1024 * 1024
+        opened = []
+        read_lengths = []
+        real_open, real_fstat, real_fdopen = os.open, os.fstat, os.fdopen
 
-        def resolve_then_swap(spill_dir, name):
-            resolved = real_resolve(spill_dir, name)
-            resolved.unlink()
-            resolved.symlink_to(large)
-            return resolved
+        def open_then_repoint_path(path, flags, *args, **kwargs):
+            descriptor = real_open(path, flags, *args, **kwargs)
+            if os.fspath(path) == os.fspath(entry) and not opened:
+                opened.append(descriptor)
+                os.rename(entry, opened_inode)
+                with entry.open("wb") as large:
+                    large.truncate(8 * SPILL_MAX_FILE_BYTES)
+            return descriptor
 
-        monkeypatch.setattr(spill_module, "resolve_spilled_under", resolve_then_swap)
-        tracemalloc.start()
-        try:
-            result = tools.read_tool_result(rel)
-            _, peak = tracemalloc.get_traced_memory()
-        finally:
-            tracemalloc.stop()
+        def fstat_then_grow(descriptor):
+            result = real_fstat(descriptor)
+            if opened and descriptor == opened[0]:
+                with opened_inode.open("ab") as handle:
+                    handle.write(b"x" * growth)
+            return result
+
+        class _RecordingReader:
+            def __init__(self, handle):
+                self._handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                self._handle.close()
+
+            def read(self, *args):
+                data = self._handle.read(*args)
+                read_lengths.append(len(data))
+                return data
+
+        def fdopen_recording(descriptor, *args, **kwargs):
+            handle = real_fdopen(descriptor, *args, **kwargs)
+            if opened and descriptor == opened[0]:
+                return _RecordingReader(handle)
+            return handle
+
+        monkeypatch.setattr(spill_module.os, "open", open_then_repoint_path)
+        monkeypatch.setattr(spill_module.os, "fstat", fstat_then_grow)
+        monkeypatch.setattr(spill_module.os, "fdopen", fdopen_recording)
+        sha256 = mocker.patch.object(
+            spill_module.hashlib, "sha256", wraps=hashlib.sha256
+        )
+
+        result = tools.read_tool_result(rel)
 
         assert result == spill_read_unavailable("not_found")
-        assert peak < SPILL_MAX_FILE_BYTES
+        assert read_lengths == [len(raw) + 1]
+        sha256.assert_not_called()
 
     @pytest.mark.usefixtures("mock_workspace_db")
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")

@@ -599,8 +599,7 @@ def read_spilled_result(
     # larger file cannot be a stored result and is not read into memory.
     # The size is taken from the open descriptor, not from the path, and
     # the read is bounded to one byte past that size, so a file that grows
-    # after fstat still cannot be read whole; the length check below
-    # catches one that grew past the cap.
+    # after fstat still cannot be read whole.
     descriptor: int | None = None
     try:
         descriptor = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
@@ -618,7 +617,12 @@ def read_spilled_result(
     finally:
         if descriptor is not None:
             os.close(descriptor)
-    if len(raw) > SPILL_MAX_FILE_BYTES:
+    # The writer replaces a file atomically and never extends one in place,
+    # so a read that returns more bytes than fstat reported means the file
+    # changed after it was opened: it is reported unavailable before any
+    # digest is computed. size is at most SPILL_MAX_FILE_BYTES here, so this
+    # also keeps every read at or under the cap.
+    if len(raw) > size:
         return spill_read_unavailable("not_found")
     # The digest is computed over the raw bytes and only then are they
     # decoded: errors="replace" rewrites invalid bytes, so decoding first
