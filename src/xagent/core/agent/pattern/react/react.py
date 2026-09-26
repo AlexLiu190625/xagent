@@ -2154,7 +2154,7 @@ class ReActPattern(AgentPattern):
         - not read_tool_result: admitted, nothing counted;
         - read allowance used up: refused, nothing counted;
         - reject allowance used up: refused, nothing counted;
-        - no path (the key is missing or None, which lists the stored
+        - no path (the key is missing, None or blank, which lists the stored
           results): admitted as one read;
         - a path that normalizes to a stored result: admitted as one read,
           whatever start, end and offset it carries;
@@ -2174,12 +2174,17 @@ class ReActPattern(AgentPattern):
             counts_as_reject = False
             if tool_call.get("name") == SPILL_READ_TOOL_NAME:
                 path = self._tool_call_args_dict(tool_call).get("path")
+                # The same test read_tool_result itself uses to decide that
+                # a call lists the stored results instead of reading one.
+                lists_stored_results = path is None or (
+                    isinstance(path, str) and not path.strip()
+                )
                 if self.forced_answer_reads_used >= FORCED_ANSWER_READ_BUDGET:
                     refusal = FORCED_ANSWER_READS_USED_UP_TEXT
                 elif self.forced_answer_reads_rejected >= FORCED_ANSWER_READ_REJECT_CAP:
                     refusal = FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT
                 elif (
-                    path is None
+                    lists_stored_results
                     or normalize_spilled_relative_path(path) in stored_paths
                 ):
                     counts_as_read = True

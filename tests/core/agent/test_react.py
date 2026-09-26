@@ -5901,15 +5901,20 @@ async def test_forced_turn_offset_continuation_counts_as_one_read() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("args", [{}, {"path": None}], ids=["no_key", "null"])
+@pytest.mark.parametrize(
+    "args",
+    [{}, {"path": None}, {"path": ""}, {"path": "   "}],
+    ids=["no_key", "null", "empty", "whitespace"],
+)
 async def test_forced_turn_listing_call_disposition(args: dict[str, Any]) -> None:
-    """A forced-turn read_tool_result call without a path lists the stored
-    results: it runs and counts as one read."""
+    """A forced-turn read_tool_result call without a path -- the key missing,
+    null, or blank, exactly as the tool itself reads it -- lists the stored
+    results: it runs and counts as one read, not as a reject."""
     run, reader = await _run_forced_reads([_read_batch([args])])
 
     assert run.result["success"] is True
     assert len(reader.calls) == 1
-    assert reader.calls[0].get("path") is None
+    assert reader.calls[0].get("path") == args.get("path")
     assert run.pattern.forced_answer_reads_used == 1
     assert run.pattern.forced_answer_reads_rejected == 0
     assert run.pattern.forced_answer_extra_iterations == 1
