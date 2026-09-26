@@ -1212,6 +1212,11 @@ def _accept_turn_no_commit(
             raise TaskTurnError("interaction_response_required")
         raise TaskTurnError("busy")
 
+    if not queued:
+        from .task_admission_execution import require_execution_admission
+
+        require_execution_admission(db, task_id)
+
     result = _persist_accepted_turn_no_commit(
         db,
         task_id=task_id,

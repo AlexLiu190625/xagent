@@ -21,6 +21,9 @@ def test_upgrade_preserves_tasks_and_matches_metadata_then_downgrades(engine, ta
         / "src/xagent/migrations/versions/20260923_task_admission.py",
         "task_admission_migration",
     )
+    from xagent.web.models.task_admission_pacing import TaskAdmissionPacing
+
+    TaskAdmissionPacing.__table__.drop(engine)
     TaskAdmissionTicket.__table__.drop(engine)
     TaskAdmissionBucket.__table__.drop(engine)
     with engine.begin() as connection:

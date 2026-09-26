@@ -114,7 +114,7 @@ FIFO prompt dispatch, cancellation, continuation commands, cleanup, and owner
 recovery. Executors in these tests control completion timing; no live model is
 required. Existing start/resume/coordinator tests cover their execution wiring.
 
-Upgrade to head (`20260924_merge_admission_google`) before enabling the host policy
+Upgrade to head (`20260925_merge_admission_pacing`) before enabling the host policy
 and run the same version on every executor. Resolve the known FIFO eligibility
 limits ([#2648](https://github.com/xorbitsai/xagent/issues/2648)) and recovered/
 attempted-command control classification

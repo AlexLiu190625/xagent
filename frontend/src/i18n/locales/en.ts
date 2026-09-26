@@ -1,6 +1,7 @@
 const en = {
   sharedStream: { interrupted: "Live updates were interrupted. The displayed answer may be incomplete; saved results will appear when available." },
   clientErrors: {
+    executionQueueFull: "The team execution queue is full. Please retry shortly.",
     messageProcessingFailed: "The message could not be processed. Please try again.",
     taskExecutionFailed: "Task execution failed.",
     guidanceInProgress: "A previous guidance message is still being applied. Please wait for it to finish.",

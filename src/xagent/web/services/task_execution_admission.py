@@ -22,6 +22,13 @@ from ...config import get_shared_task_execution_enabled
 from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from ..models.task_command import TaskExecutionCommand
+from .task_admission_observation import record_queue_full
+from .task_admission_pacing import (
+    StartupPacing,
+    reserve_startup,
+    stage_startup_pacing,
+    startup_eligible,
+)
 from .task_coordinator_service import TaskLease
 
 if TYPE_CHECKING:
@@ -39,6 +46,7 @@ class AdmissionPolicy:
     bucket: str
     capacity: int
     max_pending: int
+    pacing: StartupPacing | None = None
 
     def __post_init__(self) -> None:
         if not self.bucket or len(self.bucket) > 255:
@@ -87,7 +95,9 @@ def stage_task_admission(db: Session, command: TaskExecutionCommand) -> None:
     bucket = _lock_bucket(db, policy.bucket)
     if (bucket.capacity, bucket.max_pending) != (policy.capacity, policy.max_pending):
         raise ValueError("Drain the admission bucket before changing its policy")
+    stage_startup_pacing(db, policy.bucket, policy.pacing)
     if _pending_count(db, policy.bucket) >= policy.max_pending:
+        record_queue_full(db, policy.bucket)
         raise AdmissionQueueFull("Execution queue is full")
     db.add(
         TaskAdmissionTicket(
@@ -128,6 +138,7 @@ def prepare_task_admission_retry(db: Session, command_id: int) -> None:
     if command is None or command.status != "failed":
         return
     if _pending_count(db, str(bucket.key)) >= int(bucket.max_pending):
+        record_queue_full(db, str(bucket.key))
         raise AdmissionQueueFull("Execution queue is full")
 
 
@@ -196,6 +207,7 @@ def admission_eligible() -> ColumnElement[bool]:
                 _live_count(TaskAdmissionTicket.bucket_key)
                 >= TaskAdmissionBucket.capacity,
                 _older_waiter(),
+                ~startup_eligible(),
             ),
         )
         .correlate(TaskExecutionCommand, Task)
@@ -266,6 +278,8 @@ def reserve_task_admission(db: Session, command_id: int, lease: TaskLease) -> bo
         return False
     active = db.scalar(select(_live_count(ticket.bucket_key)))
     if active is not None and active >= bucket.capacity:
+        return False
+    if not reserve_startup(db, str(ticket.bucket_key)):
         return False
     setattr(ticket, "runner_id", lease.runner_id)
     setattr(ticket, "owner_attempt_id", lease.attempt_id)

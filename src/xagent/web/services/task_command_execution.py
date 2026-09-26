@@ -44,6 +44,11 @@ from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from . import task_execution as task_execution_service
+from .task_admission_execution import (
+    AdmissionWaiting,
+    allow_injected_guidance,
+    require_execution_admission_isolated,
+)
 from .task_execution import (
     ClientVisibleError,
     ClientVisibleValidationError,
@@ -1985,6 +1990,12 @@ async def handle_task_message(
                             "until the resume owner is ready",
                             task_id,
                         )
+                    if posted:
+                        allow_injected_guidance(task_id, task_run_id)
+                    else:
+                        await run_db_io_cancellation_safe(
+                            lambda: require_execution_admission_isolated(task_id)
+                        )
                     handoff_snapshot = await task_execution_controller.transition(
                         task_id,
                         TaskControlState.RESUME_REQUESTED,
@@ -2536,6 +2547,8 @@ async def handle_task_message(
                 ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE
             ):
                 return
+        except AdmissionWaiting:
+            raise
         except RuntimeError as e:
             # RuntimeError is incidental server detail. Reuse the same
             # audience split as the durable-failure arms above: the initiator
@@ -2660,6 +2673,8 @@ async def handle_task_message(
             client_error_message(ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE),
             error_code=ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE.value,
         )
+        raise
+    except AdmissionWaiting:
         raise
     except Exception as e:
         # Other errors, re-raise
@@ -4027,6 +4042,8 @@ async def _execute_and_report_task_command(
 
     try:
         result = await _execute_durable_task_command(command)
+    except AdmissionWaiting:
+        raise
     except TaskCommandDeferred as exc:
         if command.defer_count + 1 >= max_command_defers():
             finish_task_command_delivery(command.command_id, command.task_id)

@@ -1,6 +1,7 @@
 const zh = {
   sharedStream: { interrupted: "实时更新已中断，当前显示的回答可能不完整；已保存的完整结果可用后会自动同步。" },
   clientErrors: {
+    executionQueueFull: "团队执行队列已满，请稍后重试。",
     messageProcessingFailed: "消息处理失败，请重试。",
     taskExecutionFailed: "任务执行失败。",
     guidanceInProgress: "上一条指导消息仍在处理中，请等待处理完成。",

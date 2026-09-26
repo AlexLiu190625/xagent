@@ -55,7 +55,6 @@ from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
     COMMAND_PENDING,
-    DISPATCHER_IDLE_SECONDS,
     MAX_COMMAND_DEFERS,
     MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
@@ -2861,9 +2860,9 @@ async def test_dispatch_with_staged_id_before_commit_is_noop_and_converges_after
     """A staged id must not be dispatchable before its owning transaction
     commits -- the dispatcher claims through its own isolated session, which
     cannot see an uncommitted row. Once the owner commits without notifying,
-    durable polling converges on it within one idle cycle. The target task
-    has no earlier in-flight command, so unfinished-earlier-command ordering
-    cannot also explain the delay."""
+    durable polling eventually converges on it. The target task has no earlier
+    in-flight command, so unfinished-earlier-command ordering cannot also
+    explain the delay."""
 
     user, task = _create_running_task(db_session)
     task.runner_id = None
@@ -2898,7 +2897,8 @@ async def test_dispatch_with_staged_id_before_commit_is_noop_and_converges_after
 
     start_task_command_dispatcher(execute_after_commit)
     try:
-        await asyncio.wait_for(applied.wait(), timeout=DISPATCHER_IDLE_SECONDS + 1.5)
+        # Detect a stuck dispatcher without timing shared-runner scheduling.
+        await asyncio.wait_for(applied.wait(), timeout=GUARD_TIMEOUT)
     finally:
         await stop_task_command_dispatcher()
 

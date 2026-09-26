@@ -937,6 +937,11 @@ def acquire_task_lease_no_commit(
     stored_run_id = result.scalar_one_or_none()
     if stored_run_id is None:
         return None
+    from .task_admission_execution import require_execution_admission
+
+    require_execution_admission(
+        db, task_id, continuing_run_id=None if new_run else str(stored_run_id)
+    )
     return TaskLease(
         task_id=task_id,
         runner_id=runner,
