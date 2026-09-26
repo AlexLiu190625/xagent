@@ -428,12 +428,17 @@ async def test_unknown_reply_returns_original_identity_without_reinjection(
         with pytest.raises(task_resume.TaskResumeOutcomeUnknownError) as unknown:
             await asyncio.wait_for(request, 10)
         assert unknown.value.command_id == ctx.command_id
-        assert (
-            task_resume_command._read_reply_outcome(command.id)["outcome"] == "unknown"
-        )
+        stored = task_resume_command._read_reply_outcome(command.id)
+        assert stored["outcome"] == "unknown"
         with pytest.raises(task_resume.TaskResumeOutcomeUnknownError):
             await reply(TaskStatus.RUNNING)
         post.assert_awaited_once()
+        if failure not in {"after_post", "guard_cancel"}:
+            # The reply outcome precedes the coordinator's asynchronous idle
+            # release. Observe that release without forcing coordinator shutdown.
+            await eventually(
+                lambda: task_completion._is_run_finished(ctx.task_id, stored["run_id"])
+            )
         with get_session_local()() as db:
             task = db.get(Task, ctx.task_id)
             if failure in {"after_post", "guard_cancel"}:
@@ -832,6 +837,9 @@ async def test_proven_absent_reply_replays_retry_with_new_id_for_same_identity(
         stored = task_resume_command._read_reply_outcome(command.id)
         assert stored["outcome"] == "busy"
         assert stored["retry_with_new_id"] is True
+        await eventually(
+            lambda: task_completion._is_run_finished(ctx.task_id, stored["run_id"])
+        )
         with get_session_local()() as db:
             task = db.get(Task, ctx.task_id)
             assert task.status == TaskStatus.WAITING_FOR_USER

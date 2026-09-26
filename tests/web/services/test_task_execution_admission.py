@@ -12,6 +12,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
 from tests.web.services.task_database_shared import engine as engine_fixture
+from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
@@ -28,6 +29,8 @@ engine = engine_fixture
 
 @pytest.fixture
 async def host(engine, monkeypatch):
+    # Match production: concurrent readers must not block worker commits.
+    apply_sqlite_concurrency_pragmas(engine)
     Base.metadata.create_all(engine)
     sessions = sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
@@ -478,6 +481,7 @@ def _dispatch_process(url, barrier, release, results):
     from xagent.web.models import database
 
     engine = create_engine(url)
+    apply_sqlite_concurrency_pragmas(engine)
     sessions = sessionmaker(engine, expire_on_commit=False)
     database.get_session_local = lambda: sessions
     worker = f"process-{os.getpid()}"
