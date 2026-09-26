@@ -416,7 +416,17 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // folding `resending` into `busy` makes no difference to the footer
   // buttons today. What it does gate is `handleDismiss`/`handleOpenChange`
   // further down, which must keep the dialog open while either kind of
-  // submission has not yet settled.
+  // submission has not yet settled. `resending` is passed to deriveGates
+  // below as `retrying` as well, which is why that one must imply this one.
+  //
+  // That dismissal gate is not the whole picture today and this comment
+  // must not pretend it is -- `submitting` is part of `busy`, so the save
+  // POST, the refresh GET a failed save runs, and both sends do hold the
+  // dialog open while they are out. Each of those is now bounded (the two
+  // connector-runtime calls time out after 20 seconds, and a send settles
+  // or rejects), so none of them can hold it open indefinitely any more,
+  // but taking `submitting` out of `busy` would change what closing does on
+  // four separate paths mid-write and is not part of this change.
   const busy = submitting || resending
   // Every value this dialog derives from its own state and the request it
   // is currently showing, gathered in one call placed after every useState

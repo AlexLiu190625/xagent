@@ -123,12 +123,19 @@ export interface GateFacts {
   // this rather than deriveGates folding it from two flags of its own,
   // because what those flags are and how many there are is the caller's
   // storage question, not this module's.
+  //
+  // The caller must keep `retrying` implying `busy`: a retry resend is one
+  // of the submission-shaped actions `busy` covers. A fact set with
+  // `retrying` true and `busy` false describes no state the dialog can be
+  // in, and nothing below is written to give it a meaning.
   busy: boolean
   // The send the "saved but not sent" panel is about, or null when no send
   // has failed. See `liveSendFailure` below for why this is joined against
   // the request's own resend payload on every call rather than trusted as
   // it stands.
   heldFailure: SendFailureState | null
+  // Whether the send-failed panel's own retry resend is in flight. Implies
+  // `busy`; see there.
   retrying: boolean
   drafts: Readonly<Record<string, string>>
   invalidDraftKeys: ReadonlyMap<string, InvalidObjectDraftReason>
@@ -169,20 +176,21 @@ export function deriveGates(facts: GateFacts): Gates {
   // be about the same message on every call, including the first one after
   // a same-task retarget swaps in a newer resend candidate, or a
   // settlement frame takes the snapshot away without moving `seq` at all.
-  // Nothing brings a clientMessageId back once it has stopped matching
-  // (a snapshot's own id is written once at send time), so a fact that
-  // stops matching never will again -- `needsSnapshotRecycle` below tells
-  // the caller so it can drop it.
+  // Today nothing brings a clientMessageId back once it has stopped
+  // matching (a snapshot's own id is written once at send time), so a held
+  // failure that stops matching is unreachable rather than wrong.
+  // `needsSnapshotRecycle` below tells the caller, which drops it so it
+  // cannot become wrong if an id ever does come back.
   const liveSendFailure = facts.heldFailure !== null
     && facts.heldFailure.snapshotId === facts.request.resendPayload?.clientMessageId
     ? facts.heldFailure
     : null
   const sendFailed = liveSendFailure !== null
-  // True for exactly one call after `heldFailure` stops matching the
-  // request's resend payload: the caller must drop it -- from render, not
-  // an effect, since an effect notices a frame late and never runs at all
-  // for a removal that does not move `seq` -- so the next call's
-  // `heldFailure` no longer disagrees with `liveSendFailure`.
+  // True while `heldFailure` no longer matches the request's resend
+  // payload. The caller must drop it -- from render, not an effect, since
+  // an effect notices a frame late and never runs at all for a removal that
+  // does not move `seq` -- so that the next call's facts no longer carry
+  // it. How many calls this stays true for depends on the caller doing so.
   const needsSnapshotRecycle = facts.heldFailure !== null && liveSendFailure === null
 
   // The read attempt the dialog is currently on: the request it is for, and
@@ -238,16 +246,11 @@ export function deriveGates(facts: GateFacts): Gates {
   // stored context value is immutable, so there is no correcting it
   // afterwards.
   //
-  // `reportIsStale` is folded in here and not into `busy`, which the caller
-  // also uses to gate dismissal: nothing in flight may stand between the
-  // user and closing the dialog. That is not the whole picture today and
-  // this comment must not pretend it is -- `submitting` is part of `busy`,
-  // so the save POST, the refresh GET a failed save runs, and both sends do
-  // hold the dialog open while they are out. Each of those is now bounded
-  // (the two connector-runtime calls time out after 20 seconds, and a send
-  // settles or rejects), so none of them can hold it open indefinitely any
-  // more, but taking `submitting` out of `busy` would change what closing
-  // does on four separate paths mid-write and is not part of this change.
+  // `reportIsStale` is folded in here and not into `busy`, because the
+  // caller also uses `busy` to gate dismissal: a read still out for a
+  // retargeted request must not stand between the user and closing the
+  // dialog. What `busy` itself holds open is the caller's business; see
+  // where the dialog computes it.
   const canSubmitNow = canSubmit && !facts.busy && !reportIsStale
   const hasResendPayload = facts.request.resendPayload !== null
   const actions = outcome ? resolveDialogActions(outcome, hasResendPayload) : []
