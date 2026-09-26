@@ -208,11 +208,15 @@ async def test_an_oversized_single_item_is_read_back_with_offset(tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_result_at_exactly_the_threshold_is_not_stored(tmp_path):
-    """Both spill tiers compare a serialized length with max_chars using >,
-    the exact complement of the output filter's own <=. A result whose
-    whole serialization is exactly 51,200 characters is over neither: no
-    child is over, and neither is the root, so nothing is written and the
-    result is exactly what the output filter alone makes of it."""
+    """Both spill tiers store only what serializes to more than max_chars.
+    The output filter's own <= applies to one string at a time, while the
+    whole-result tier compares the serialized result as a whole, so the two
+    limits are not complements: a single string of exactly max_chars
+    characters passes the filter but makes its result too long. This cell
+    pins the case that is left alone: a result whose whole serialization is
+    exactly 51,200 characters has no child over the limit and is not over
+    it itself, so nothing is written and the result is exactly what the
+    output filter alone makes of it."""
     overhead = len(json.dumps({"output": ""}, ensure_ascii=False))
     result = {"output": "x" * (51_200 - overhead)}
     assert len(json.dumps(result, ensure_ascii=False)) == 51_200
