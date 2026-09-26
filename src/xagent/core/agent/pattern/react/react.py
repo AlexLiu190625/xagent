@@ -586,12 +586,6 @@ class ReActPattern(AgentPattern):
         self.memory_input_text: str | None = None
         self._memory_store: Any | None = None
         self._tool_decision_groups_by_name: dict[str, str] = {}
-        # Rebuilt per run in _run_tool_calling_loop, right before
-        # base_tool_schemas is computed: the cached schema comes from that
-        # call's tools, and the same pattern instance can be run again with
-        # a different set. Not part of get_state()/load_state() -- it is
-        # cheap to recompute and carries no run-lifecycle meaning.
-        self._spill_read_schema: dict[str, Any] | None = None
 
     async def run(
         self,
@@ -764,16 +758,31 @@ class ReActPattern(AgentPattern):
             "generate_image" in self._tool_decision_groups_by_name
             and "edit_image" not in self._tool_decision_groups_by_name
         )
-        # Rebuilt per run: the cached schema comes from this call's tools,
-        # and the same pattern instance can be run again with a different
-        # set. The cache's only reader is _tool_schemas_with_spill_read,
-        # which runs only inside this loop, so there is no writer between
-        # this reset and that first read.
-        self._spill_read_schema = None
         base_tool_schemas = (
             []
             if self.tool_choice == "none"
             else self._tool_schemas_with_builtin_controls(tools)
+        )
+        # base_tool_schemas never lists the stored-result reader; its schema
+        # is built here from this run's tools and added back per iteration
+        # by _tool_schemas_with_spill_read. None when the run offers no tools
+        # at all or has no reader tool, and then it is never offered.
+        spill_read_tool = (
+            None
+            if self.tool_choice == "none"
+            else next(
+                (
+                    tool
+                    for tool in tools
+                    if self._tool_name(tool) == SPILL_READ_TOOL_NAME
+                ),
+                None,
+            )
+        )
+        spill_read_schema = (
+            None
+            if spill_read_tool is None
+            else self._build_tool_schema(spill_read_tool)
         )
 
         for iteration in range(self.current_iteration, self.max_iterations):
@@ -812,7 +821,7 @@ class ReActPattern(AgentPattern):
                 )
             )
             normal_tool_schemas = self._tool_schemas_with_spill_read(
-                base_tool_schemas, tools, context
+                base_tool_schemas, spill_read_schema, context
             )
             tool_schemas = (
                 [self._final_answer_tool_schema()]
@@ -3324,28 +3333,23 @@ class ReActPattern(AgentPattern):
         )
 
     def _tool_schemas_with_spill_read(
-        self, base_schemas: list[dict[str, Any]], tools: list[Any], context: Any
+        self,
+        base_schemas: list[dict[str, Any]],
+        spill_read_schema: dict[str, Any] | None,
+        context: Any,
     ) -> list[dict[str, Any]]:
         """Add the stored-result reader once this run has actually stored one.
 
         base_schemas is built once per run, before the iteration loop, so it
         cannot know about a registry that fills up mid-run. This runs on
         every iteration instead, which is the only place that sees the
-        spill that just happened.
+        spill that just happened. spill_read_schema is None when the run
+        has no reader to offer (tool_choice "none", or no reader tool), and
+        base_schemas then comes back unchanged whatever the registry holds.
         """
-        if not base_schemas:
-            return base_schemas  # tool_choice == "none"
-        if not self._spilled_paths(context):
+        if spill_read_schema is None or not self._spilled_paths(context):
             return base_schemas  # byte-identical to the baseline surface
-        if self._spill_read_schema is None:
-            read_tool = next(
-                (t for t in tools if self._tool_name(t) == SPILL_READ_TOOL_NAME),
-                None,
-            )
-            if read_tool is None:
-                return base_schemas  # agent has no file tools at all
-            self._spill_read_schema = self._build_tool_schema(read_tool)
-        return [*base_schemas, self._spill_read_schema]
+        return [*base_schemas, spill_read_schema]
 
     def _control_tool_names(self) -> set[str]:
         return set(CONTROL_TOOL_NAMES)

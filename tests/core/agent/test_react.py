@@ -4476,142 +4476,56 @@ def test_spilled_paths_reflects_registry_contents() -> None:
     )
 
 
-def test_schema_gate_returns_base_object_unchanged_when_registry_empty() -> None:
-    pattern = ReActPattern()
-    tools = [FakeReadToolResultTool()]
-    base = pattern._tool_schemas_with_builtin_controls(tools)
-    result = pattern._tool_schemas_with_spill_read(base, tools, ExecutionContext())
-    assert result is base  # byte-identical to the baseline surface
-    names = [schema["function"]["name"] for schema in result]
-    assert SPILL_READ_TOOL_NAME not in names
-
-
-def test_schema_gate_adds_read_tool_result_when_registry_non_empty() -> None:
-    pattern = ReActPattern()
-    tools = [FakeReadToolResultTool()]
-    base = pattern._tool_schemas_with_builtin_controls(tools)
-    context = _context_with_spill_records("tool-results/a-000000000000.json")
-
-    result = pattern._tool_schemas_with_spill_read(base, tools, context)
-
-    names = [schema["function"]["name"] for schema in result]
-    assert SPILL_READ_TOOL_NAME in names
-    assert result is not base
-
-
-def test_gate_function_offers_the_reader_with_a_non_empty_registry() -> None:
-    """Called directly, the gate leaves the reader out for a context whose
-    registry is empty and adds it for one whose registry holds a record."""
-    pattern = ReActPattern()
-    tools = [FakeReadToolResultTool()]
-    base = pattern._tool_schemas_with_builtin_controls(tools)
-    empty_context = ExecutionContext()
-
-    first = pattern._tool_schemas_with_spill_read(base, tools, empty_context)
-    assert SPILL_READ_TOOL_NAME not in [s["function"]["name"] for s in first]
-
-    filled_context = _context_with_spill_records("tool-results/a-000000000000.json")
-    second = pattern._tool_schemas_with_spill_read(base, tools, filled_context)
-    assert SPILL_READ_TOOL_NAME in [s["function"]["name"] for s in second]
-
-
-@pytest.mark.parametrize("record_count", [0, 1, 64])
-def test_read_tool_result_stays_dispatchable_whatever_the_registry_holds(
-    record_count: int,
+@pytest.mark.parametrize(
+    "record_count, has_reader",
+    [(0, True), (1, True), (64, True), (0, False), (1, False)],
+)
+def test_schema_gate_offers_the_reader_only_with_a_record_and_a_reader_tool(
+    record_count: int, has_reader: bool
 ) -> None:
-    """The gate only decides what the model is shown; the tool object itself
-    never leaves the tools list, so a call to it can always be dispatched."""
+    """The gate appends the reader's schema only when the run's registry
+    holds a record and the run has a reader to offer; otherwise it returns
+    the base list object itself. The base list never names the reader, and
+    the tool object never leaves the tools list, so a call to it can always
+    be dispatched whatever the model was shown."""
     pattern = ReActPattern()
     read_tool = FakeReadToolResultTool()
-    tools = [FakeWorkspaceOutputTool(), read_tool]
+    tools: list[Any] = [FakeWorkspaceOutputTool()]
+    if has_reader:
+        tools.append(read_tool)
     base = pattern._tool_schemas_with_builtin_controls(tools)
+    reader_schema = pattern._build_tool_schema(read_tool) if has_reader else None
     context = _context_with_spill_records(
         *(f"tool-results/r{i:02d}-000000000000.json" for i in range(record_count))
     )
 
-    names = [
-        schema["function"]["name"]
-        for schema in pattern._tool_schemas_with_spill_read(base, tools, context)
-    ]
+    result = pattern._tool_schemas_with_spill_read(base, reader_schema, context)
 
     assert SPILL_READ_TOOL_NAME not in [s["function"]["name"] for s in base]
-    assert (SPILL_READ_TOOL_NAME in names) is (record_count > 0)
-    assert pattern._find_tool(SPILL_READ_TOOL_NAME, tools) is read_tool
-
-
-def test_schema_gate_absent_when_agent_has_no_read_tool_result_object() -> None:
-    pattern = ReActPattern()
-    tools: list[Any] = []  # no file tools at all
-    base = pattern._tool_schemas_with_builtin_controls(tools)
-    context = _context_with_spill_records("tool-results/a-000000000000.json")
-
-    result = pattern._tool_schemas_with_spill_read(base, tools, context)
-    assert result is base
-
-
-def test_schema_gate_short_circuits_when_tool_choice_none() -> None:
-    pattern = ReActPattern()
-    pattern.tool_choice = "none"
-    context = _context_with_spill_records("tool-results/a-000000000000.json")
-    result = pattern._tool_schemas_with_spill_read(
-        [], [FakeReadToolResultTool()], context
-    )
-    assert result == []
+    if record_count and has_reader:
+        assert result == [*base, reader_schema]
+    else:
+        assert result is base
+    if has_reader:
+        assert pattern._find_tool(SPILL_READ_TOOL_NAME, tools) is read_tool
 
 
 @pytest.mark.asyncio
-async def test_schema_cache_is_reset_at_the_start_of_each_run() -> None:
-    """A stale cached schema from a prior run must not leak into the next.
+async def test_tool_choice_none_run_sends_no_tools_with_a_non_empty_registry() -> None:
+    """A run with tool_choice="none" sends the model no tools at all, and a
+    registry that already holds a record does not bring the reader back."""
+    llm = FakeLLM(responses=["Direct answer"])
+    pattern = ReActPattern(max_iterations=1, tool_choice="none")
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    context.add_user_message("Say hi")
 
-    Runs the same ReActPattern instance through _run_tool_calling_loop
-    twice (via the public run() entry point, the only real caller of that
-    loop), never touching _spill_read_schema by hand -- only the
-    production reset at the top of the loop is allowed to clear it.
-    """
+    result = await pattern.run(
+        context=context, tools=[FakeTool(), FakeReadToolResultTool()], llm=llm
+    )
 
-    def _final_answer_response(text: str) -> dict[str, Any]:
-        return {
-            "tool_calls": [
-                {
-                    "id": "call_final",
-                    "function": {
-                        "name": "final_answer",
-                        "arguments": f'{{"answer":"{text}"}}',
-                    },
-                }
-            ],
-        }
-
-    pattern = ReActPattern(max_iterations=5)
-
-    tools_v1 = [FakeReadToolResultTool()]
-    context_v1 = _context_with_spill_records("tool-results/a-000000000000.json")
-    context_v1.add_user_message("first")
-    llm_v1 = FakeLLM(responses=[_final_answer_response("done 1")])
-    result_v1 = await pattern.run(context=context_v1, tools=tools_v1, llm=llm_v1)
-    assert result_v1["success"] is True
-    schema_v1 = pattern._spill_read_schema
-    assert schema_v1 is not None
-    assert schema_v1["function"]["name"] == SPILL_READ_TOOL_NAME
-
-    # A fresh run on the same instance: different tools object (same name),
-    # registry still non-empty. current_iteration is reset the way a new
-    # task would start it -- this test is about the schema cache, not
-    # iteration bookkeeping across unrelated runs.
-    pattern.current_iteration = 0
-    tools_v2 = [FakeReadToolResultTool()]
-    context_v2 = _context_with_spill_records("tool-results/b-000000000000.json")
-    context_v2.add_user_message("second")
-    llm_v2 = FakeLLM(responses=[_final_answer_response("done 2")])
-    result_v2 = await pattern.run(context=context_v2, tools=tools_v2, llm=llm_v2)
-    assert result_v2["success"] is True
-    schema_v2 = pattern._spill_read_schema
-    assert schema_v2 is not None
-    assert schema_v2 is not schema_v1
-
-
-def test_spill_read_schema_field_starts_as_none() -> None:
-    assert ReActPattern()._spill_read_schema is None
+    assert result["success"] is True
+    assert llm.calls[0]["tools"] is None
+    assert llm.calls[0]["tool_choice"] is None
 
 
 def _tool_call_response(call_id: str, name: str, arguments: str) -> dict[str, Any]:
