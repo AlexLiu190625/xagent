@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -3892,7 +3893,38 @@ async def test_execute_resume_background_rejects_owner_mismatch(db_session) -> N
     ]
     assert task_errors[0]["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
     assert task_errors[0]["error"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
-    assert str(int(owner.id) + 999) not in repr(task_errors[0])
+    assert not _mentions_number(task_errors[0], int(owner.id) + 999)
+
+
+def _mentions_number(payload: Any, number: int) -> bool:
+    """Whether ``number`` appears as a value or a whole token in ``payload``.
+
+    A substring search over ``repr(payload)`` also matches digits inside
+    unrelated values, such as the event's float timestamp, so it fails
+    intermittently.
+    """
+    if isinstance(payload, bool):
+        return False
+    if isinstance(payload, int):
+        return payload == number
+    if isinstance(payload, str):
+        return re.search(rf"(?<!\d){number}(?!\d)", payload) is not None
+    if isinstance(payload, dict):
+        return any(
+            _mentions_number(key, number) or _mentions_number(value, number)
+            for key, value in payload.items()
+        )
+    if isinstance(payload, (list, tuple, set)):
+        return any(_mentions_number(item, number) for item in payload)
+    return False
+
+
+def test_mentions_number_ignores_digits_inside_other_values() -> None:
+    # The CI timestamp that made a repr() substring check report a leak.
+    assert not _mentions_number({"timestamp": 1790404311.310002}, 1000)
+    assert not _mentions_number({"message": "task 51000 failed"}, 1000)
+    assert _mentions_number({"message": "owner 1000 mismatch"}, 1000)
+    assert _mentions_number({"details": [{"owner_id": 1000}]}, 1000)
 
 
 @pytest.mark.asyncio
