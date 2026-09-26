@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import logging
+import time
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -17,7 +18,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import tiktoken
 
-from ....config import get_compact_threshold_ratio
+from ....config import (
+    get_checkpoint_gate_stall_warning_seconds,
+    get_compact_threshold_ratio,
+)
 from ...context_ref import (
     CONTEXT_REFS_KEY,
     ContextReference,
@@ -30,6 +34,7 @@ from ...model.chat.types import (
     CONTENT_SOURCE_KEY,
     CONTENT_SOURCE_REASONING_FALLBACK,
 )
+from ...runtime_performance import increment_counter, observe_value
 from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
@@ -519,7 +524,27 @@ class _ContextCheckpointGate:
                 self._wake()
 
     @asynccontextmanager
-    async def exclusive(self) -> AsyncIterator[None]:
+    async def exclusive(self, owner: str | None = None) -> AsyncIterator[None]:
+        """Hold the gate alone; ``owner`` only labels stall reports.
+
+        Never timed out (see ``get_checkpoint_gate_stall_warning_seconds``):
+        a long hold is reported while it lasts and measured on release.
+        """
+        # Resolve everything that can fail before acquiring, so nothing runs
+        # between taking the gate and the ``finally`` that releases it.
+        loop = asyncio.get_running_loop()
+        interval = get_checkpoint_gate_stall_warning_seconds()
+        stall: list[asyncio.TimerHandle] = []
+
+        def report_stall() -> None:
+            increment_counter("xagent.agent.checkpoint_gate.exclusive.stalls")
+            logger.warning(
+                "Exclusive checkpoint section for %s still held after %.1fs",
+                owner or "unknown execution",
+                time.monotonic() - started,
+            )
+            stall[0] = loop.call_later(interval, report_stall)
+
         self._writers_waiting += 1
         try:
             while self._exclusive or self._shared:
@@ -531,11 +556,20 @@ class _ContextCheckpointGate:
             # acquisitions were blocked, even while other readers remain.
             if not self._exclusive:
                 self._wake()
+        started = time.monotonic()
         try:
+            stall.append(loop.call_later(interval, report_stall))
             yield
         finally:
+            if stall:
+                stall[0].cancel()
             self._exclusive = False
             self._wake()
+            observe_value(
+                "xagent.agent.checkpoint_gate.exclusive.duration",
+                (time.monotonic() - started) * 1_000.0,
+                unit="ms",
+            )
 
 
 def context_checkpoint_gate(context: ExecutionContext) -> _ContextCheckpointGate:

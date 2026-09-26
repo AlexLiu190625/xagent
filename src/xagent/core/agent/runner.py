@@ -755,7 +755,7 @@ class AgentRunner:
             )
             requested_turn_id = turn_id.strip() if turn_id and turn_id.strip() else None
             gate = context_checkpoint_gate(context)
-            async with gate.exclusive():
+            async with gate.exclusive(execution_id):
                 if self.context_manager.get_context(execution_id) is not context:
                     continue
                 if gate.injection_uncertain:
@@ -938,7 +938,7 @@ class AgentRunner:
             if (
                 watermark_after and watermark_after != watermark_before
             ) or traced_turn_ids_after != traced_turn_ids_before:
-                async with gate.exclusive():
+                async with gate.exclusive(execution_id):
                     if gate.injection_uncertain:
                         # A later injection became uncertain during this callback.
                         # Never overwrite its durable candidate with stale live state.
@@ -1512,6 +1512,7 @@ class AgentRunner:
         Requires read-your-writes storage and a writer that drains pending work
         before raising. Do not timeout the exclusive section: a surviving write
         could otherwise race read-back and invalidate a negative confirmation.
+        The gate reports a section held past its stall interval instead.
         """
         if not can_read_checkpoints(self.tracer):
             return None

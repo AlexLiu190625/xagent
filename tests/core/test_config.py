@@ -2771,6 +2771,38 @@ class TestGetSandboxAllowLocalFallbackOnCapacity:
             assert get_sandbox_allow_local_fallback_on_capacity() is False
 
 
+class TestCheckpointGateStallWarningConfig:
+    """Config for reporting a long-held exclusive checkpoint section."""
+
+    def test_defaults_to_30_seconds(self, monkeypatch):
+        from xagent.config import (
+            CHECKPOINT_GATE_STALL_WARNING_SECONDS,
+            get_checkpoint_gate_stall_warning_seconds,
+        )
+
+        monkeypatch.delenv(CHECKPOINT_GATE_STALL_WARNING_SECONDS, raising=False)
+        assert get_checkpoint_gate_stall_warning_seconds() == 30.0
+
+    def test_env_override(self, monkeypatch):
+        from xagent.config import (
+            CHECKPOINT_GATE_STALL_WARNING_SECONDS,
+            get_checkpoint_gate_stall_warning_seconds,
+        )
+
+        monkeypatch.setenv(CHECKPOINT_GATE_STALL_WARNING_SECONDS, "2.5")
+        assert get_checkpoint_gate_stall_warning_seconds() == 2.5
+
+    @pytest.mark.parametrize("value", ["abc", "0", "-1", "nan", "inf"])
+    def test_invalid_values_fall_back(self, monkeypatch, value):
+        from xagent.config import (
+            CHECKPOINT_GATE_STALL_WARNING_SECONDS,
+            get_checkpoint_gate_stall_warning_seconds,
+        )
+
+        monkeypatch.setenv(CHECKPOINT_GATE_STALL_WARNING_SECONDS, value)
+        assert get_checkpoint_gate_stall_warning_seconds() == 30.0
+
+
 class TestCompactThresholdConfig:
     """Config for context-compaction threshold derivation."""
 
