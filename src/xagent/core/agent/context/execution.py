@@ -166,6 +166,11 @@ COMPACT_WATERMARK_METADATA_KEY = "watermark_message_id"
 # restores the summary must restore them too or it silently drops images the
 # compaction judged worth the budget.
 COMPACT_CONTEXT_REFS_METADATA_KEY = "summary_context_refs"
+# Marks the system message a compaction inserts to list this execution's
+# stored tool results. That message is written by the engine from the spill
+# registry; it is not history, so it is kept out of the persisted summary and
+# out of every count of history a compaction reports.
+COMPACT_SPILL_INDEX_METADATA_KEY = "compacted_spill_index"
 
 # Floor for the per-message cap on what compaction is asked to read. Unlike
 # the summary's output budget this has no ceiling: providers cap output far
@@ -1997,7 +2002,8 @@ class ExecutionContext:
             self._context_refs_removed_by_compaction(latest_user)
         )
         dropped_refs_notice = self._dropped_context_refs_notice(dropped_context_refs)
-        # next_messages below keeps only the system summary and, at most, a
+        # next_messages below keeps only the system summary, at most one
+        # engine-written list of stored tool results, and at most a
         # role=="user" message, so no tool observation survives: here the whole
         # list is the diff. truncate needs a real diff; this does not.
         dropped_tool_counts = self._dropped_tool_result_counts(self.messages)
@@ -2034,6 +2040,16 @@ class ExecutionContext:
         next_messages = [summary_message]
         if latest_user is not None:
             next_messages.append(latest_user)
+        removed_count = max(0, original_count - len(next_messages))
+        # The stored-result list is its own message rather than part of
+        # summary_content: the summary is persisted below and replayed into a
+        # later turn as a system message, while the list names files that only
+        # this execution's registry vouches for -- a later turn's registry may
+        # not hold them, and its tool set may not include the tool that reads
+        # them. It goes right after the summary it supplements.
+        spill_notice = self._spilled_tool_results_notice()
+        if spill_notice:
+            next_messages.insert(1, self._spill_index_message(spill_notice))
         self.messages = next_messages
         result = CompactResult(
             compacted=True,
@@ -2041,7 +2057,7 @@ class ExecutionContext:
             final_count=len(self.messages),
             strategy="llm_summary",
             metadata={
-                "removed_count": max(0, original_count - len(self.messages)),
+                "removed_count": removed_count,
                 "summary_chars": len(summary),
                 "compact_model": getattr(llm, "model_name", None),
                 "retained_context_ref_count": len(compacted_context_refs),
@@ -2206,6 +2222,57 @@ class ExecutionContext:
                 f"- ... {omitted} additional distinct tool {name_label} omitted"
             )
         return prefix + "\n".join(lines)
+
+    def _spilled_tool_results_notice(self) -> str:
+        """List this execution's stored tool results for a compacted context.
+
+        Compaction removes the observations whose notices named these files,
+        so the list is drawn from the spill registry rather than from the
+        messages being removed: every later compaction lists what the first
+        one did, even after the list inserted by an earlier one is gone.
+
+        The registry is read through get_component, never _spill_component
+        or the spilled_results property: both attach an empty registry to a
+        context that never stored anything, and such a context's checkpoint
+        must read exactly as it would without spill support. An empty
+        registry returns "" before anything else is looked at.
+
+        Each record's file is looked up again, with the same lookup
+        registration uses, and a record whose file cannot be found is left
+        out. A registry restored from a checkpoint is not re-checked on
+        load, and the workspace behind it may be gone by now; listing such a
+        record would name a file the model cannot read. Field shape is left
+        to render_spill_notice, which drops a malformed record itself: this
+        method writes no text of its own.
+        """
+        component = self.get_component("spilled_results")
+        records = (
+            component.records if isinstance(component, SpillRegistryComponent) else []
+        )
+        if not records:
+            return ""
+        spill_dir = self._spill_dir()
+        present = [
+            record
+            for record in records
+            if isinstance(record, dict)
+            and resolve_spilled_under(spill_dir, record.get("relative_path"))
+            is not None
+        ]
+        if len(present) < len(records):
+            # A count only: the paths are the tool's own strings.
+            logger.info(
+                "Compaction left %d stored tool result(s) out of its list; "
+                "their files could not be found",
+                len(records) - len(present),
+            )
+        return render_spill_notice(present, style="compaction")
+
+    @staticmethod
+    def _spill_index_message(notice: str) -> Message:
+        return Message.role_system(
+            notice, metadata={COMPACT_SPILL_INDEX_METADATA_KEY: True}
+        )
 
     def _latest_visible_user_message(self) -> Message | None:
         for message in reversed(self.messages):
