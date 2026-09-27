@@ -374,7 +374,7 @@ const VIEW: View = {
   drafts: {},
   invalidDraftKeys: new Map(),
   fieldError: null,
-  lastAlsoResend: false,
+  lastResendFor: null,
 }
 
 function shown(phase: Phase, view: Partial<View> = {}): DialogState {
@@ -614,7 +614,7 @@ describe("reduceDialog", () => {
 
   it.each<[string, DialogEvent]>([
     ["draft-changed", { type: "draft-changed", draftKey: DRAFT_KEY, value: "v" }],
-    ["save-started", { type: "save-started", alsoResend: true }],
+    ["save-started", { type: "save-started", resendFor: "orig-1" }],
     ["snapshot-gone", { type: "snapshot-gone" }],
   ])("ignores %s while hidden", (_name, event) => {
     expect(reduceDialog(INITIAL_DIALOG_STATE, event)).toBe(INITIAL_DIALOG_STATE)
@@ -637,7 +637,7 @@ describe("reduceDialog", () => {
   })
 
   it.each([
-    ["save-started outside the rows", { kind: "sending" }, { type: "save-started", alsoResend: false }],
+    ["save-started outside the rows", { kind: "sending" }, { type: "save-started", resendFor: null }],
     ["retry-started with no panel", { kind: "open" }, { type: "retry-started" }],
     ["snapshot-gone with nothing held", { kind: "open" }, { type: "snapshot-gone" }],
     ["save-landed-resending outside a save POST", { kind: "sending" }, { type: "save-landed-resending", report: MET_REPORT, seq: 1 }],
