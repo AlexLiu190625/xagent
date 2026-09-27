@@ -37,7 +37,12 @@ from pydantic import BaseModel, Field, ValidationError, create_model
 from ..... import config as _root_config
 from .....sandbox.base import Sandbox
 from ....utils.security import redact_sensitive_text
-from ...core.mcp.sessions import Connection, create_session
+from ...core.mcp.sessions import (
+    Connection,
+    McpHttpClientFactory,
+    create_mcp_http_client,
+    create_session,
+)
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
 from .base import AbstractBaseTool, ToolVisibility
 from .connector_runtime import (
@@ -2456,6 +2461,196 @@ async def load_execution_scoped_chrome_tools(
     )
 
 
+# Grace given to an abandoned initialization to unwind on its own before its
+# HTTP transports are force-closed. It must exceed every cleanup bound the
+# transport libraries own, or a well-behaved unwind would be reported as a stall:
+#   stdio     : 2s wait + 2s SIGTERM/SIGKILL escalation (measured: 4.04s)
+#   websocket : the websockets client's close_timeout default (10s)
+#   http      : bounded by this grace alone; the SDK's terminate-session DELETE
+#               inherits the connection's read timeout, which is far longer.
+# It must also exceed the retry backoff a load can still be sleeping through
+# when it notices it was abandoned (one 1s sleep in _load_direct_mcp_tools), or
+# a sealed load that is still backing off would be reported as alive after its
+# transports were force-closed.
+# Measured on mcp 1.19.0 / websockets 16.0; a test re-checks all three bounds.
+_HANDSHAKE_RECLAIM_GRACE_SECONDS = 15.0
+
+# Transports whose session creator in sessions.py accepts an httpx client
+# factory. create_session forwards the connection dict with **, so adding the
+# key for stdio or websocket raises TypeError before a byte is sent. A test
+# re-derives this set from the creators' signatures.
+_INSTRUMENTABLE_TRANSPORTS = frozenset({"sse", "streamable_http"})
+
+
+class _TransportReclaimedError(RuntimeError):
+    """A load tried to go on after it was abandoned: to start another attempt,
+    or to build another HTTP client."""
+
+
+class _TransportRecorder:
+    """Remembers the HTTP clients one MCP load opens, so an abandoned load can
+    be force-closed instead of waiting for the peer.
+
+    The recorder is sealed the moment its load is abandoned (timed out, or its
+    caller cancelled). The load's retry loop checks the seal before every
+    attempt, whatever the transport, so it cannot open a new session to a peer
+    the caller has already given up on; the client factory checks it too, as a
+    backstop inside an attempt. Force-closing later drops the sockets the load
+    still holds, which unblocks whatever its cleanup is waiting on, without
+    depending on the peer or on cancellation being honoured.
+
+    Only ``sse`` and ``streamable_http`` connections are instrumented. stdio
+    and websocket connections are returned unchanged and this recorder stays
+    empty for them: their libraries bound their own cleanup.
+    """
+
+    def __init__(self, server_name: str) -> None:
+        self._server_name = server_name
+        self._clients: list[httpx.AsyncClient] = []
+        self._sealed = False
+
+    def instrument(self, connection: Connection) -> Connection:
+        """Return the connection to hand to ``create_session``.
+
+        For an instrumentable transport this is a shallow copy whose client
+        factory records every client it builds, delegating construction to the
+        factory the connection already carries, or to the same default
+        ``create_session`` would use. Any other connection, including one with
+        no ``transport`` key or an unknown one, is returned as the same object,
+        so ``create_session`` keeps owning that error.
+
+        Instrument only the connection given to ``create_session``. The
+        connection handed to tool adapters and to ``gate_mcp_tools`` must stay
+        the original, or every later tool call would add a client to a recorder
+        nobody closes. A load path that replaces the whole connection dict and
+        retries must instrument the replacement too.
+        """
+        if connection.get("transport") not in _INSTRUMENTABLE_TRANSPORTS:
+            return connection
+        build = cast(
+            McpHttpClientFactory,
+            connection.get("httpx_client_factory") or create_mcp_http_client,
+        )
+
+        def record(
+            headers: dict[str, str] | None = None,
+            timeout: httpx.Timeout | None = None,
+            auth: httpx.Auth | None = None,
+        ) -> httpx.AsyncClient:
+            self.raise_if_sealed()
+            client = build(headers=headers, timeout=timeout, auth=auth)
+            self._clients.append(client)
+            return client
+
+        instrumented = dict(connection)
+        instrumented["httpx_client_factory"] = record
+        return cast(Connection, instrumented)
+
+    def seal(self) -> None:
+        """Mark the load abandoned. Idempotent; closes nothing."""
+        self._sealed = True
+
+    def raise_if_sealed(self) -> None:
+        """Raise if the load was abandoned; called before each attempt."""
+        if self._sealed:
+            raise _TransportReclaimedError(
+                f"MCP server {self._server_name}: initialization was abandoned"
+            )
+
+    async def force_close(self) -> None:
+        """Seal, then close every recorded client. Never raises.
+
+        References are dropped before closing because a closed client still
+        carries the connection's auth headers. Closing an already closed
+        client is a no-op in httpx, so clients from earlier retry attempts
+        cost nothing.
+        """
+        self.seal()
+        clients, self._clients = self._clients, []
+        for client in clients:
+            try:
+                await client.aclose()
+            except Exception as exc:  # no caller can act on it: log and go on
+                logger.warning(
+                    "MCP server %s: closing an abandoned transport failed (%s)",
+                    self._server_name,
+                    type(exc).__name__,
+                )
+
+
+# Reaper tasks. The caller that abandons a load does not wait for its reaper,
+# so this set owns each reaper until it finishes; each removes itself.
+_RECLAIM_TASKS: "set[asyncio.Task[None]]" = set()
+
+
+async def _reclaim_abandoned_load(
+    server_name: str,
+    task: "asyncio.Task[Any]",
+    recorder: _TransportRecorder,
+    grace: float,
+) -> None:
+    """Bound how long one abandoned load keeps its transports.
+
+    Nobody awaits this; it only logs. Waiting uses ``asyncio.wait``, which
+    never retrieves the task's exception, so the load's own done-callback
+    stays the single reader of it.
+    """
+    try:
+        await asyncio.wait({task}, timeout=grace)
+        if task.done():
+            return
+        logger.warning(
+            "MCP server %s: abandoned initialization did not unwind within "
+            "%.0fs; force-closing its transports",
+            server_name,
+            grace,
+        )
+        await recorder.force_close()
+        task.cancel()
+        await asyncio.wait({task}, timeout=grace)
+        if not task.done():
+            logger.warning(
+                "MCP server %s: abandoned initialization still alive %.0fs after "
+                "its transports were force-closed (%d MCP load tasks alive in "
+                "this process)",
+                server_name,
+                grace,
+                len(_active_load_tasks),
+            )
+    except Exception as exc:  # no caller: never let it escape unretrieved
+        logger.warning(
+            "MCP server %s: reclaiming an abandoned initialization failed (%s)",
+            server_name,
+            type(exc).__name__,
+        )
+
+
+def _schedule_reclaim(
+    server_name: str,
+    task: "asyncio.Task[Any]",
+    recorder: "_TransportRecorder | None",
+) -> None:
+    """Hand an abandoned load to a reaper. Called at the moment of abandonment.
+
+    ``recorder`` is None only when the handshake does not run in this process
+    (the sandbox branch): there is nothing here to close.
+    """
+    if recorder is None:
+        return
+    # Seal first, before the reaper even starts: the grace period is for the
+    # load to unwind, not to reconnect.
+    recorder.seal()
+    # ensure_future, not a TaskGroup: this runs from a caller that may be
+    # unwinding a cancellation, and an aborting TaskGroup refuses new tasks.
+    reaper = asyncio.ensure_future(
+        _reclaim_abandoned_load(
+            server_name, task, recorder, _HANDSHAKE_RECLAIM_GRACE_SECONDS
+        )
+    )
+    _RECLAIM_TASKS.add(reaper)
+    reaper.add_done_callback(_RECLAIM_TASKS.discard)
+
+
 async def _load_direct_mcp_tools(
     server_name: str,
     connection: Connection,
@@ -2463,8 +2658,15 @@ async def _load_direct_mcp_tools(
     name_prefix: str,
     visibility: Optional[ToolVisibility],
     allow_users: Optional[List[str]],
+    recorder: "_TransportRecorder | None" = None,
 ) -> MCPLoadResult:
-    """Load MCP tools directly on the host."""
+    """Load MCP tools directly on the host.
+
+    ``recorder``, when given, instruments only the connection handed to
+    ``create_session``; tool adapters always receive ``connection`` itself.
+    Once the recorder is sealed (the caller abandoned this load), no further
+    attempt starts, whatever the transport.
+    """
     agent_tools: list[AbstractBaseTool] = []
     mcp_tools: list[MCPTool] = []
     transport = connection.get("transport", "")
@@ -2473,11 +2675,20 @@ async def _load_direct_mcp_tools(
     concurrency_safe, concurrent_tools = _connection_concurrency_config(connection)
     failure_phase = MCPFailurePhase.SESSION_START
     error_type: str | None = None
+    # Outside the retry try-block: instrumenting is a dict copy, and a failure
+    # here would be our bug, not a server fault to retry.
+    session_connection = (
+        recorder.instrument(connection) if recorder is not None else connection
+    )
 
     for attempt in range(max_attempts):
+        if recorder is not None:
+            # Also outside the try-block, so it ends the load instead of being
+            # retried: an abandoned load must not open another session.
+            recorder.raise_if_sealed()
         current_phase = MCPFailurePhase.SESSION_START
         try:
-            async with create_session(connection) as session:
+            async with create_session(session_connection) as session:
                 current_phase = MCPFailurePhase.INITIALIZE
                 await session.initialize()
                 # Use the shared loader to keep pagination behavior consistent.
@@ -2594,6 +2805,8 @@ async def _load_server_tools_bounded(
     server_name: str,
     load_coro: "Coroutine[Any, Any, _BoundedLoadResult]",
     timeout_seconds: int,
+    *,
+    recorder: "_TransportRecorder | None" = None,
 ) -> _BoundedLoadResult:
     """Run one server's tool load with a hard wall-clock bound.
 
@@ -2607,9 +2820,13 @@ async def _load_server_tools_bounded(
     retrieved".
 
     Concurrency is deliberately not capped: every caller opens its own
-    transport and is bounded only by its own timeout. Against a permanently
-    hung server, abandoned load tasks (and their sockets) accumulate until
-    their cleanup eventually returns or the process restarts.
+    transport and is bounded only by its own timeout. An abandoned load (timed
+    out, or its caller cancelled) is handed to a reaper when a recorder is
+    given: the recorder is sealed at once so the load starts no further
+    attempt, and after a grace period the reaper force-closes the HTTP clients
+    the load still holds. stdio and websocket transports are not force-closed;
+    their libraries bound their own cleanup. A timeout of 0 disables both the
+    deadline and the reclaim.
     """
     if timeout_seconds <= 0:
         return await load_coro
@@ -2640,6 +2857,7 @@ async def _load_server_tools_bounded(
         # transport -- forever.
         task.cancel()
         task.add_done_callback(_consume_result)
+        _schedule_reclaim(server_name, task, recorder)
         raise
 
     if task in done:
@@ -2647,6 +2865,7 @@ async def _load_server_tools_bounded(
 
     task.cancel()
     task.add_done_callback(_consume_result)
+    _schedule_reclaim(server_name, task, recorder)
     raise TimeoutError(
         f"MCP server {server_name} initialization timed out after "
         f"{timeout_seconds}s (including cleanup); abandoning it"
@@ -2714,6 +2933,12 @@ async def load_mcp_tools_as_agent_tools(
                     )
 
                 try:
+                    # No recorder: the handshake runs inside the sandbox, so this
+                    # process holds no MCP transport to close. What this process
+                    # does hold on this path is an executor thread (the sandbox
+                    # exec runs through asyncio.to_thread), and cancelling a
+                    # to_thread call stops the wait, not the thread; this
+                    # mechanism does not reclaim that thread.
                     sandbox_result = await _load_server_tools_bounded(
                         server_name,
                         load_sandboxed_mcp_tools(
@@ -2782,6 +3007,7 @@ async def load_mcp_tools_as_agent_tools(
                         )
                     )
             else:
+                recorder = _TransportRecorder(server_name)
                 direct_result = await _load_server_tools_bounded(
                     server_name,
                     _load_direct_mcp_tools(
@@ -2790,8 +3016,10 @@ async def load_mcp_tools_as_agent_tools(
                         name_prefix=name_prefix,
                         visibility=visibility,
                         allow_users=allow_users,
+                        recorder=recorder,
                     ),
                     timeout_seconds,
+                    recorder=recorder,
                 )
                 server_tools = direct_result.tools
                 failures.extend(direct_result.failures)
